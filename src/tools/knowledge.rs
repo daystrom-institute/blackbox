@@ -1,9 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::knowledge::{
-    DecideParams, ForgetParams, KnowledgeLinkParams, KnowledgeListParams, LearnParams,
-    RememberParams, ResponseFormat,
-};
+use crate::knowledge::{ForgetParams, KnowledgeListParams, LearnParams, ResponseFormat};
 use crate::packets::packet_matches_query;
 use crate::server::BlackboxServer;
 use crate::system_memory;
@@ -65,16 +62,13 @@ impl QueuedKnowledgeEdit<'_> {
             .ok_or_else(|| {
                 anyhow::anyhow!("knowledge entry not found in the mutation scope: {id}")
             })?;
-        let entry: crate::knowledge::KnowledgeEntry = serde_json::from_str(&content)?;
+        let entry = crate::knowledge::KnowledgeEntry::from_stored_slice(content.as_bytes())?
+            .ok_or_else(|| anyhow::anyhow!("knowledge entry has been deleted: {id}"))?;
         anyhow::ensure!(
             entry.id == id
                 && entry.scope == crate::knowledge::Scope::Project
                 && entry.project_id.as_deref() == Some(self.project_id),
             "knowledge entry {id} does not belong to the mutation scope"
-        );
-        anyhow::ensure!(
-            entry.status != crate::knowledge::Status::Deleted,
-            "knowledge entry has been deleted: {id}"
         );
         Ok(entry)
     }
@@ -125,12 +119,7 @@ pub(crate) fn router() -> ToolRouter<BlackboxServer> {
 }
 
 fn has_runtime_knowledge_filter(p: &KnowledgeListParams) -> bool {
-    p.scope.is_some()
-        || p.project.is_some()
-        || p.provider.is_some()
-        || p.status.is_some()
-        || p.approval.is_some()
-        || p.provisional.is_some()
+    p.scope.is_some() || p.project.is_some() || p.provider.is_some() || p.provisional.is_some()
 }
 
 /// Extract the top knowledge entry id from a `kb.list` entries block for the
@@ -725,12 +714,14 @@ impl BlackboxServer {
         entry.title = Self::checkout_lane_title(&p.content, &p.title);
         entry.category = category;
         entry.priority = Self::checkout_lane_priority(p.priority.as_deref())?;
-        entry.weight = p.weight.unwrap_or(100);
+        if let Some(render) = p.render {
+            entry.render = render;
+        }
+        if let Some(placement) = p.render_placement {
+            entry.render_placement = placement;
+        }
         entry.providers = p.providers.clone().unwrap_or_default();
         entry.updated_at = bbox_util::util::now_iso();
-        if let Some(exp) = p.expires_at.clone() {
-            entry.expires_at = Some(exp);
-        }
         Ok(())
     }
 
@@ -756,88 +747,6 @@ impl BlackboxServer {
         Ok(Some((message, entry_id)))
     }
 
-    /// Covered-project review (approve/reject), id-addressed.
-    pub(crate) fn enqueue_review_via_checkout_owner(
-        &self,
-        action: &str,
-        id: &str,
-        project: Option<&str>,
-    ) -> anyhow::Result<Option<String>> {
-        let Some((project_id, scope)) = self.covered_knowledge_mutation_scope(id, project)? else {
-            return Ok(None);
-        };
-        self.mutate_queued_knowledge(&project_id, scope, "bbox_review", |transaction| {
-            let mut entry = transaction.entry(id)?;
-            entry.updated_at = bbox_util::util::now_iso();
-            let verb = match action {
-                "approve" => {
-                    entry.approval = crate::knowledge::Approval::UserConfirmed;
-                    "Approved"
-                }
-                "reject" => "Rejected",
-                other => anyhow::bail!("unknown review action {other}"),
-            };
-            transaction.stage(&entry, action == "reject")?;
-            Ok(format!("{verb} entry {}", entry.id))
-        })
-        .map(Some)
-    }
-
-    /// Covered-project knowledge link: append the edge to the served
-    /// source entry and enqueue its rewrite.
-    fn enqueue_link_via_checkout_owner(
-        &self,
-        p: &KnowledgeLinkParams,
-    ) -> anyhow::Result<Option<String>> {
-        let source_id = match bbox_corpus_core::entity_ref::EntityRef::parse(&p.source) {
-            Ok(bbox_corpus_core::entity_ref::EntityRef::Knowledge { id }) => id,
-            Ok(other) => anyhow::bail!("source must be a knowledge ref, got {other}"),
-            Err(_) => p.source.trim_start_matches("knowledge:").to_string(),
-        };
-        let Some((project_id, scope)) =
-            self.covered_knowledge_mutation_scope(&source_id, p.project.as_deref())?
-        else {
-            return Ok(None);
-        };
-        bbox_corpus_core::entity_ref::EntityRef::parse(&p.target)
-            .map_err(|err| anyhow::anyhow!("target must be a valid entity ref: {err}"))?;
-        let kind = crate::knowledge::KnowledgeEdgeKind::parse(&p.kind)?;
-        let confidence = match p.confidence.as_deref().unwrap_or("heuristic") {
-            "exact" | "Exact" | "EXACT" => bbox_chunker::EdgeConfidence::Exact,
-            "heuristic" | "Heuristic" | "HEURISTIC" => bbox_chunker::EdgeConfidence::Heuristic,
-            "unknown" | "Unknown" | "UNKNOWN" => bbox_chunker::EdgeConfidence::Unknown,
-            other => anyhow::bail!(
-                "invalid edge confidence '{other}' (expected exact, heuristic, or unknown)"
-            ),
-        };
-        let edge = crate::knowledge::KnowledgeEdge {
-            target: p.target.clone(),
-            kind,
-            note: p.note.clone(),
-            source_arc: p.source_arc.clone(),
-            confidence,
-        };
-        self.mutate_queued_knowledge(&project_id, scope, "bbox_knowledge_link", |transaction| {
-            let mut entry = transaction.entry(&source_id)?;
-            let duplicate = entry.links.iter().any(|existing| {
-                existing.target == edge.target
-                    && existing.kind == edge.kind
-                    && existing.source_arc == edge.source_arc
-            });
-            if duplicate {
-                return Ok(format!(
-                    "Link already present on {} (same target, kind, and arc)",
-                    entry.id
-                ));
-            }
-            entry.links.push(edge);
-            entry.updated_at = bbox_util::util::now_iso();
-            transaction.stage(&entry, false)?;
-            Ok(format!("Linked {} -> {}", entry.id, p.target))
-        })
-        .map(Some)
-    }
-
     /// Covered-project learn: create or update through the checkout-owner
     /// backchannel, mirroring the store's field semantics.
     fn enqueue_learn_via_checkout_owner(
@@ -853,7 +762,6 @@ impl BlackboxServer {
             .map_err(|_| anyhow::anyhow!("invalid category: {}", p.category))?;
         let title = Self::checkout_lane_title(&p.content, &p.title);
         let priority = Self::checkout_lane_priority(p.priority.as_deref())?;
-        let weight = p.weight.unwrap_or(100);
         let cluster = p
             .cluster
             .as_deref()
@@ -876,29 +784,18 @@ impl BlackboxServer {
             );
         }
         let entry = crate::knowledge::KnowledgeEntry {
-            render_placement: Default::default(),
+            render_placement: p.render_placement.unwrap_or_default(),
             id: String::new(),
             title,
             content: p.content.clone(),
             cluster,
-            variants: std::collections::HashMap::new(),
             category,
             scope: crate::knowledge::Scope::Project,
             project: None,
             project_id: Some(project_id.to_string()),
             providers,
             priority,
-            weight,
-            render: true,
-            decay: true,
-            review_at: None,
-            status: crate::knowledge::Status::Active,
-            approval: crate::knowledge::Approval::UserConfirmed,
-            supersedes: None,
-            links: Vec::new(),
-            rationale: None,
-            expires_at: p.expires_at.clone(),
-            source: "user".to_string(),
+            render: p.render.unwrap_or(true),
             created_at: now.clone(),
             updated_at: now,
             recall_count: 0,
@@ -906,7 +803,6 @@ impl BlackboxServer {
         };
         self.mutate_queued_knowledge(project_id, scope, "bbox_learn create", |transaction| {
             let entry = crate::knowledge::KnowledgeEntry {
-                render_placement: Default::default(),
                 id: transaction.mint_id(),
                 ..entry
             };
@@ -915,136 +811,9 @@ impl BlackboxServer {
         })
     }
 
-    /// Covered-project remember: create an indexed-only entry through the
-    /// backchannel.
-    fn enqueue_remember_via_checkout_owner(
-        &self,
-        p: &RememberParams,
-        _raw: &str,
-        project_id: &str,
-        scope: bbox_corpus_core::identity::PublishedScope,
-    ) -> anyhow::Result<String> {
-        let category = match p.category.as_deref() {
-            None => crate::knowledge::Category::Memory,
-            Some(raw_category) => raw_category
-                .parse::<crate::knowledge::Category>()
-                .map_err(|_| anyhow::anyhow!("invalid category: {raw_category}"))?,
-        };
-        let now = bbox_util::util::now_iso();
-        let entry = crate::knowledge::KnowledgeEntry {
-            render_placement: Default::default(),
-            id: String::new(),
-            title: Self::checkout_lane_title(&p.content, &p.title),
-            content: p.content.clone(),
-            cluster: None,
-            variants: std::collections::HashMap::new(),
-            category,
-            scope: crate::knowledge::Scope::Project,
-            project: None,
-            project_id: Some(project_id.to_string()),
-            providers: Vec::new(),
-            priority: crate::knowledge::Priority::Standard,
-            weight: 100,
-            render: false,
-            decay: p.decay.unwrap_or(true),
-            review_at: p.review_at.clone(),
-            status: crate::knowledge::Status::Active,
-            approval: crate::knowledge::Approval::UserConfirmed,
-            supersedes: None,
-            links: Vec::new(),
-            rationale: None,
-            expires_at: p.expires_at.clone(),
-            source: "user".to_string(),
-            created_at: now.clone(),
-            updated_at: now,
-            recall_count: 0,
-            last_recalled: None,
-        };
-        self.mutate_queued_knowledge(project_id, scope, "bbox_remember", |transaction| {
-            let entry = crate::knowledge::KnowledgeEntry {
-                render_placement: Default::default(),
-                id: transaction.mint_id(),
-                ..entry
-            };
-            transaction.stage(&entry, false)?;
-            Ok(format!(
-                "Remembered entry {} (indexed only, not rendered)",
-                entry.id
-            ))
-        })
-    }
-
-    /// Covered-project decide: create the decision and, when superseding,
-    /// enqueue the predecessor's superseded rewrite too.
-    fn enqueue_decide_via_checkout_owner(
-        &self,
-        p: &DecideParams,
-        _raw: &str,
-        project_id: &str,
-        scope: bbox_corpus_core::identity::PublishedScope,
-    ) -> anyhow::Result<String> {
-        if p.content.trim().is_empty() {
-            anyhow::bail!("'content' is required");
-        }
-        if p.rationale.trim().is_empty() {
-            anyhow::bail!(
-                "'rationale' is required: a decision without justification is just a command"
-            );
-        }
-        let priority = Self::checkout_lane_priority(p.priority.as_deref())?;
-        let now = bbox_util::util::now_iso();
-        let entry = crate::knowledge::KnowledgeEntry {
-            render_placement: Default::default(),
-            id: String::new(),
-            title: Self::checkout_lane_title(&p.content, &p.title),
-            content: p.content.clone(),
-            cluster: None,
-            variants: std::collections::HashMap::new(),
-            category: crate::knowledge::Category::Decision,
-            scope: crate::knowledge::Scope::Project,
-            project: None,
-            project_id: Some(project_id.to_string()),
-            providers: Vec::new(),
-            priority,
-            weight: 100,
-            render: p.render.unwrap_or(true),
-            decay: false,
-            review_at: None,
-            status: crate::knowledge::Status::Active,
-            approval: crate::knowledge::Approval::UserConfirmed,
-            supersedes: None,
-            links: Vec::new(),
-            rationale: Some(p.rationale.clone()),
-            expires_at: None,
-            source: "user".to_string(),
-            created_at: now.clone(),
-            updated_at: now.clone(),
-            recall_count: 0,
-            last_recalled: None,
-        };
-        self.mutate_queued_knowledge(project_id, scope, "bbox_decide", |transaction| {
-            let entry = crate::knowledge::KnowledgeEntry {
-                render_placement: Default::default(),
-                id: transaction.mint_id(),
-                ..entry
-            };
-            let mut message = format!("Decided entry {}", entry.id);
-            if let Some(old_id) = p.supersedes.as_deref() {
-                let mut old = transaction.entry(old_id)?;
-                old.status = crate::knowledge::Status::Superseded;
-                old.supersedes = Some(entry.id.clone());
-                old.updated_at = now;
-                transaction.stage(&old, false)?;
-                message.push_str(&format!("; superseded {}", old.id));
-            }
-            transaction.stage(&entry, false)?;
-            Ok(message)
-        })
-    }
-
     /// Covered-project forget, id-addressed: coverage comes from the
-    /// served entry's stamped project id, not a selector. Supersede
-    /// rewrites the record; a plain forget deletes the file. Entries the
+    /// served entry's stamped project id, not a selector. Forget deletes
+    /// the file. Entries the
     /// published view does not serve (legacy central rows) fall through to
     /// the store path unchanged.
     fn enqueue_forget_via_checkout_owner(
@@ -1058,16 +827,9 @@ impl BlackboxServer {
             return Ok(None);
         };
         self.mutate_queued_knowledge(&project_id, scope, "bbox_forget", |transaction| {
-            let mut entry = transaction.entry(id)?;
-            entry.updated_at = bbox_util::util::now_iso();
-            if let Some(by) = p.superseded_by.as_deref() {
-                entry.status = crate::knowledge::Status::Superseded;
-                entry.supersedes = Some(by.to_string());
-                transaction.stage(&entry, false)?;
-                return Ok(format!("Superseded entry {}", entry.id));
-            }
+            let entry = transaction.entry(id)?;
             transaction.stage(&entry, true)?;
-            Ok(format!("Removed entry {}", entry.id))
+            Ok(format!("Deleted entry {}", entry.id))
         })
         .map(Some)
     }
@@ -1496,8 +1258,6 @@ fn knowledge_query_scope(p: &KnowledgeListParams) -> serde_json::Value {
         "scope": p.scope,
         "project": p.project,
         "provider": p.provider,
-        "status": p.status,
-        "approval": p.approval,
         "query": p.query,
         "mode": p.mode,
         "provisional": p.provisional,
@@ -1766,16 +1526,7 @@ fn exact_entry_detail_response(
 
 fn bound_entry_metadata(entry: &mut serde_json::Map<String, serde_json::Value>) -> bool {
     let mut truncated = false;
-    for field in [
-        "title",
-        "cluster",
-        "project",
-        "project_id",
-        "supersedes",
-        "rationale",
-        "expires_at",
-        "source",
-    ] {
+    for field in ["title", "cluster", "project", "project_id"] {
         let Some(value) = entry
             .get(field)
             .and_then(serde_json::Value::as_str)
@@ -1796,7 +1547,7 @@ fn bound_entry_metadata(entry: &mut serde_json::Map<String, serde_json::Value>) 
             truncated = true;
         }
     }
-    for field in ["variants", "providers", "links"] {
+    for field in ["providers"] {
         let Some(value) = entry.get(field).cloned() else {
             continue;
         };
@@ -1895,7 +1646,7 @@ fn validate_knowledge_detail_selection(
 impl BlackboxServer {
     #[tool(
         name = "bbox_learn",
-        description = "Persist an operator-approved rule or convention that should bind future sessions; rendered into provider markdown files. Use for narrative rules (\"we always X\", \"never Y\") only after the operator has approved the exact content and scope. If the rule you're storing is actually a priority-ordered decision function, classification rubric, or structured mechanism, use `bbox_compile` instead; that produces a shareable packet any agent can apply deterministically."
+        description = "Persist an operator-approved rule or convention that should bind future sessions; rendered into provider markdown files. Pass render=false for an indexed-only recall entry that search finds but no rendered file carries. Use for narrative rules (\"we always X\", \"never Y\") only after the operator has approved the exact content and scope. If the rule you're storing is actually a priority-ordered decision function, classification rubric, or structured mechanism, use `bbox_compile` instead; that produces a shareable packet any agent can apply deterministically."
     )]
     pub(crate) async fn bbox_learn(
         &self,
@@ -1992,7 +1743,6 @@ impl BlackboxServer {
             let mut kb = server.state.kb.write();
             let result = kb.learn_result_with_checkout(
                 &p,
-                false,
                 write_dir
                     .as_ref()
                     .map(|carrier| carrier.carrier_id.as_str()),
@@ -2066,197 +1816,6 @@ impl BlackboxServer {
             }
             Err(e) => {
                 log_tool_err("bbox_learn", start, &e);
-                Self::err_text(&format!("Error: {e:#}"))
-            }
-        }
-    }
-
-    #[tool(
-        name = "bbox_remember",
-        description = "Persist a fact for later recall; indexed but NOT rendered."
-    )]
-    pub(crate) async fn bbox_remember(
-        &self,
-        Parameters(p): Parameters<RememberParams>,
-    ) -> CallToolResult {
-        if let Err(error) = self.guard_workspace_bound_project_knowledge(p.scope.as_deref()) {
-            return Self::err_text(&format!("Error: {error:#}"));
-        }
-        let start = std::time::Instant::now();
-        let server = self.clone();
-        let covered = p
-            .project
-            .as_deref()
-            .filter(|s| !s.trim().is_empty())
-            .and_then(|raw| {
-                self.covered_project_scope(raw)
-                    .map(|(project_id, scope)| (raw.to_string(), project_id, scope))
-            });
-        if let Some((raw, project_id, scope)) = covered {
-            let delivered = tokio::task::spawn_blocking(move || {
-                server.enqueue_remember_via_checkout_owner(&p, &raw, &project_id, scope)
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("knowledge write task failed: {e}"))
-            .and_then(std::convert::identity);
-            return self
-                .finish_knowledge_mutation(match delivered {
-                    Ok(message) => Self::ok_text(&message),
-                    Err(e) => Self::err_text(&format!("Error: {e:#}")),
-                })
-                .await;
-        }
-        let server = self.clone();
-        let write_result = tokio::task::spawn_blocking(move || {
-            let mut p = p;
-            let (write_dir, checkout) =
-                server.prepare_knowledge_write(&mut p.project, &mut p.project_id)?;
-            let mut kb = server.state.kb.write();
-            let result = kb.remember_result_with_write_dir(
-                &p,
-                false,
-                write_dir
-                    .as_ref()
-                    .map(|carrier| carrier.carrier_id.as_str()),
-            )?;
-            let rider = kb.repo_record_rider_at(&result.id, write_dir.as_ref())?;
-            drop(kb);
-            let overlay_refreshed = checkout.is_some();
-            if let Some(checkout) = checkout.as_ref() {
-                server.refresh_dark_knowledge_overlay(checkout);
-            }
-            Ok::<_, anyhow::Error>((result, rider, overlay_refreshed))
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("knowledge write task failed: {e}"))
-        .and_then(std::convert::identity);
-
-        match write_result {
-            Ok((result, rider, overlay_refreshed)) => {
-                if let Err(e) = self.state.kb_persister.request_durable().await {
-                    log_tool_err("bbox_remember", start, &e);
-                    return Self::err_text(&format!("Error: {e:#}"));
-                }
-                if !overlay_refreshed
-                    && let Err(err) = self.sync_knowledge_entry_to_index(&result.id)
-                {
-                    tracing::warn!(error = %err, entry = %result.id, "knowledge index sync failed; will reconstruct on next reindex cycle");
-                }
-                let mut message = result.message;
-                if let Some(rider) = rider {
-                    message.push_str(&rider);
-                }
-                log_tool_ok("bbox_remember", start, message.len());
-                Self::ok_text(&message)
-            }
-            Err(e) => {
-                log_tool_err("bbox_remember", start, &e);
-                Self::err_text(&format!("Error: {e:#}"))
-            }
-        }
-    }
-
-    #[tool(
-        name = "bbox_decide",
-        description = "Record a durable commitment with required rationale; supports supersession."
-    )]
-    pub(crate) async fn bbox_decide(
-        &self,
-        Parameters(p): Parameters<DecideParams>,
-    ) -> CallToolResult {
-        if let Err(error) = self.guard_workspace_bound_project_knowledge(p.scope.as_deref()) {
-            return Self::err_text(&format!("Error: {error:#}"));
-        }
-        let start = std::time::Instant::now();
-        let server = self.clone();
-        let covered = p
-            .project
-            .as_deref()
-            .filter(|s| !s.trim().is_empty())
-            .and_then(|raw| {
-                self.covered_project_scope(raw)
-                    .map(|(project_id, scope)| (raw.to_string(), project_id, scope))
-            });
-        if let Some((raw, project_id, scope)) = covered {
-            let delivered = tokio::task::spawn_blocking(move || {
-                server.enqueue_decide_via_checkout_owner(&p, &raw, &project_id, scope)
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("knowledge write task failed: {e}"))
-            .and_then(std::convert::identity);
-            return self
-                .finish_knowledge_mutation(match delivered {
-                    Ok(message) => Self::ok_text(&message),
-                    Err(e) => Self::err_text(&format!("Error: {e:#}")),
-                })
-                .await;
-        }
-        let server = self.clone();
-        let write_result = tokio::task::spawn_blocking(move || {
-            let mut p = p;
-            let (write_dir, checkout) = server.prepare_knowledge_write(&mut p.project, &mut p.project_id)?;
-            let superseded = match p.supersedes.as_deref() {
-                Some(old_ref) => {
-                    let existing = server.prepare_existing_knowledge_mutation(old_ref)?;
-                    if existing.carrier.as_ref() != write_dir.as_ref()
-                        || existing.checkout.as_ref().map(|scope| &scope.checkout_id)
-                            != checkout.as_ref().map(|scope| &scope.checkout_id)
-                    {
-                        anyhow::bail!(
-                            "a superseding decision and its predecessor must use the same checkout authority"
-                        );
-                    }
-                    p.supersedes = Some(existing.id);
-                    existing.seed
-                }
-                None => None,
-            };
-            let mut kb = server.state.kb.write();
-            let result = kb.decide_result_with_checkout(
-                &p,
-                false,
-                write_dir
-                    .as_ref()
-                    .map(|carrier| carrier.carrier_id.as_str()),
-                superseded.as_ref(),
-            )?;
-            let rider = kb.repo_record_rider_at(&result.id, write_dir.as_ref())?;
-            drop(kb);
-            let overlay_refreshed = checkout.is_some();
-            if let Some(checkout) = checkout.as_ref() {
-                server.refresh_dark_knowledge_overlay(checkout);
-            }
-            Ok::<_, anyhow::Error>((result, rider, overlay_refreshed))
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("knowledge write task failed: {e}"))
-        .and_then(std::convert::identity);
-
-        match write_result {
-            Ok((result, rider, overlay_refreshed)) => {
-                if let Err(e) = self.state.kb_persister.request_durable().await {
-                    log_tool_err("bbox_decide", start, &e);
-                    return Self::err_text(&format!("Error: {e:#}"));
-                }
-                if !overlay_refreshed
-                    && let Err(err) = self.sync_knowledge_entry_to_index(&result.id)
-                {
-                    tracing::warn!(error = %err, entry = %result.id, "knowledge index sync failed; will reconstruct on next reindex cycle");
-                }
-                if !overlay_refreshed && let Some(old_id) = result.superseded.as_deref() {
-                    if let Err(err) = self.tombstone_knowledge_entry_in_index(old_id) {
-                        tracing::warn!(error = %err, entry = %old_id, "knowledge index tombstone failed; will reconstruct on next reindex cycle");
-                    }
-                }
-                let mut message = result.message;
-                if let Some(rider) = rider {
-                    message.push_str(&rider);
-                }
-                log_tool_ok("bbox_decide", start, message.len());
-                Self::ok_text(&message)
-            }
-            Err(e) => {
-                log_tool_err("bbox_decide", start, &e);
                 Self::err_text(&format!("Error: {e:#}"))
             }
         }
@@ -2485,61 +2044,7 @@ impl BlackboxServer {
         .await
     }
 
-    #[tool(name = "bbox_knowledge_link", description = "Append a knowledge edge.")]
-    pub(crate) async fn bbox_knowledge_link(
-        &self,
-        Parameters(p): Parameters<KnowledgeLinkParams>,
-    ) -> CallToolResult {
-        let start = std::time::Instant::now();
-        let server = self.clone();
-        let write_result = tokio::task::spawn_blocking(move || {
-            let mut p = p;
-            if let Some(text) = server.enqueue_link_via_checkout_owner(&p)? {
-                return Ok::<_, anyhow::Error>((text, KnowledgeMutationOwner::CheckoutQueue));
-            }
-            let target = server.prepare_existing_knowledge_mutation(&p.source)?;
-            p.source = format!("knowledge:{}", target.id);
-            let edge = server.state.kb.write().append_link_with_write_dir(
-                &p,
-                target
-                    .carrier
-                    .as_ref()
-                    .map(|carrier| carrier.carrier_id.as_str()),
-                target.seed.as_ref(),
-            )?;
-            server.finish_existing_knowledge_mutation(target.checkout.as_ref());
-            Ok::<_, anyhow::Error>((
-                serde_json::to_string_pretty(&json!({
-                    "status": "linked",
-                    "source": p.source,
-                    "target": p.target,
-                    "kind": edge.kind.edge_kind(),
-                    "confidence": edge.confidence,
-                }))?,
-                KnowledgeMutationOwner::Local,
-            ))
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("knowledge link task failed: {e}"))
-        .and_then(std::convert::identity);
-
-        match write_result {
-            Ok((text, owner)) => {
-                if let Err(e) = self.persist_knowledge_mutation(owner).await {
-                    log_tool_err("bbox_knowledge_link", start, &e);
-                    return Self::err_text(&format!("Error: {e:#}"));
-                }
-                log_tool_ok("bbox_knowledge_link", start, text.len());
-                Self::ok_text(&text)
-            }
-            Err(e) => {
-                log_tool_err("bbox_knowledge_link", start, &e);
-                Self::err_text(&format!("Error: {e:#}"))
-            }
-        }
-    }
-
-    #[tool(name = "bbox_forget", description = "Retire or supersede an entry.")]
+    #[tool(name = "bbox_forget", description = "Delete a knowledge entry.")]
     pub(crate) async fn bbox_forget(
         &self,
         Parameters(p): Parameters<ForgetParams>,
@@ -3260,31 +2765,20 @@ mod tests {
         content: &str,
         project_id: &str,
     ) -> crate::knowledge::KnowledgeEntry {
-        use bbox_knowledge::knowledge::{Approval, Category, Priority, Scope, Status};
+        use bbox_knowledge::knowledge::{Category, Priority, Scope};
         crate::knowledge::KnowledgeEntry {
             render_placement: Default::default(),
             id: id.into(),
             title: id.into(),
             content: content.into(),
             cluster: None,
-            variants: Default::default(),
             category: Category::Convention,
             scope: Scope::Project,
             project: None,
             project_id: Some(project_id.to_string()),
             providers: Vec::new(),
             priority: Priority::Standard,
-            weight: 100,
-            status: Status::Active,
-            approval: Approval::UserConfirmed,
             render: true,
-            decay: false,
-            review_at: None,
-            supersedes: None,
-            links: Vec::new(),
-            rationale: None,
-            expires_at: None,
-            source: "test".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
             recall_count: 0,
@@ -3476,7 +2970,8 @@ mod tests {
     #[test]
     fn structured_knowledge_rows_bound_oversized_metadata_and_collections() {
         let title = "\"metadata\"\t".repeat(256);
-        let rationale = "decision ".repeat(128);
+        let cluster = "cluster ".repeat(128);
+        let providers = vec!["\"provider\" ".repeat(32); 8];
         let mut structured = json!({
             "rows": [{
                 "entity_ref": "provisional_knowledge:project:checkout:metadata",
@@ -3484,9 +2979,8 @@ mod tests {
                     "id": "metadata",
                     "title": title,
                     "content": "compact",
-                    "rationale": rationale,
-                    "variants": {"provider": "\"variant\" ".repeat(128)},
-                    "providers": ["a", "b"],
+                    "cluster": cluster,
+                    "providers": providers,
                 },
             }]
         });
@@ -3499,11 +2993,11 @@ mod tests {
         assert!(entry["title"].as_str().unwrap().len() <= STRUCTURED_KNOWLEDGE_METADATA_BYTES + 32);
         assert_eq!(entry["title_bytes"], title.len());
         assert!(
-            entry["rationale"].as_str().unwrap().len() <= STRUCTURED_KNOWLEDGE_METADATA_BYTES + 32
+            entry["cluster"].as_str().unwrap().len() <= STRUCTURED_KNOWLEDGE_METADATA_BYTES + 32
         );
-        assert_eq!(entry["rationale_bytes"], rationale.len());
-        assert_eq!(entry["variants"]["count"], 1);
-        assert_eq!(entry["variants"]["truncated"], true);
+        assert_eq!(entry["cluster_bytes"], cluster.len());
+        assert_eq!(entry["providers"]["count"], 8);
+        assert_eq!(entry["providers"]["truncated"], true);
         let arguments = &structured["rows"][0]["detail"]["arguments"];
         assert_eq!(
             arguments["entry_detail"],
@@ -3519,7 +3013,7 @@ mod tests {
         let own_ref = "provisional_knowledge:project:own-checkout:shared".to_string();
         let peer_ref = "provisional_knowledge:project:peer-checkout:shared".to_string();
         let published_ref = "knowledge:shared".to_string();
-        let mut published = stamped_entry("shared", "published variant", "project");
+        let published = stamped_entry("shared", "published variant", "project");
         let mut own = stamped_entry("shared", "own variant", "project");
         own.content = "own ".repeat(256);
         let mut peer = stamped_entry("shared", "peer variant", "project");
@@ -3688,7 +3182,7 @@ mod tests {
             );
             entry.title = format!("{large}{index:08}");
             entry.providers = vec![large.clone(); 10];
-            entry.rationale = Some(large.clone());
+            entry.cluster = Some(large.clone());
             server.state.kb.write().upsert_generated(entry).unwrap();
         }
         let mut offset = 0;
@@ -3754,7 +3248,7 @@ mod tests {
         let (server, record) = server_with_registered(&tmp_root, &base);
         let mut entry = stamped_entry("metadata-entry", "small content", &record.project_id);
         entry.title = "\"metadata title\"\t".repeat(2_000);
-        entry.rationale = Some("\"rationale\"\n".repeat(2_000));
+        entry.cluster = Some("\"cluster\"\n".repeat(2_000));
         server
             .state
             .kb
@@ -3792,7 +3286,7 @@ mod tests {
         let recovered: crate::knowledge::KnowledgeEntry =
             serde_json::from_str(&reconstructed).unwrap();
         assert_eq!(recovered.title, entry.title);
-        assert_eq!(recovered.rationale, entry.rationale);
+        assert_eq!(recovered.cluster, entry.cluster);
     }
 
     /// gap-40ab1102 (1): a `project` filter must match rows by their stamped

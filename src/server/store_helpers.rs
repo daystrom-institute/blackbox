@@ -199,10 +199,7 @@ impl BlackboxServer {
 }
 
 fn enqueue_knowledge_documents(documents: &[crate::index::KnowledgeIndexDocument]) {
-    for document in documents
-        .iter()
-        .filter(|document| crate::index::indexable_knowledge_entry(&document.entry))
-    {
+    for document in documents.iter() {
         embed_queue::enqueue_knowledge(
             &document.entry,
             &document.entity_id,
@@ -214,13 +211,13 @@ fn enqueue_knowledge_documents(documents: &[crate::index::KnowledgeIndexDocument
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::BTreeMap;
     use std::path::Path;
     use std::process::Command;
     use std::sync::Arc;
 
     use bbox_corpus_core::identity::PublishedScope;
-    use bbox_knowledge::knowledge::{Approval, Category, KnowledgeEntry, Priority, Scope, Status};
+    use bbox_knowledge::knowledge::{Category, KnowledgeEntry, Priority, Scope};
     use bbox_knowledge::overlay::{
         OverlayKey, OverlaySnapshot, OverlayStatus, OverlayValue, provisional_entity_ref,
     };
@@ -254,24 +251,13 @@ mod tests {
             title: id.into(),
             content: content.into(),
             cluster: None,
-            variants: HashMap::new(),
             category: Category::Memory,
             scope: Scope::Project,
             project: None,
             project_id: None,
             providers: Vec::new(),
             priority: Priority::Standard,
-            weight: 100,
-            status: Status::Active,
-            approval: Approval::UserConfirmed,
             render: true,
-            decay: false,
-            review_at: None,
-            supersedes: None,
-            links: Vec::new(),
-            rationale: None,
-            expires_at: None,
-            source: "test".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
             recall_count: 0,

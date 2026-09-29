@@ -961,13 +961,11 @@ fn build_edge_index_from_shared_at_authority(
     //    held removes A from the cycle entirely.
     let (mut rebuilt, mut seen) = {
         let idx = state.idx.read();
-        let kb = state.kb.read();
         let threads = state.threads.read();
         let notes = state.notes.read();
         let task_store = state.task_store.read();
         edge_index::EdgeIndex::project_store_edges(&edge_index::EdgeStoreRefs {
             index: &idx,
-            knowledge: &kb,
             threads: &threads,
             notes: &notes,
             session_brofile_rows: task_store.session_brofile_rows(),
@@ -1768,13 +1766,10 @@ pub(crate) fn enqueue_project_knowledge_embeds(
         None => None,
     };
     let mut enqueued = 0usize;
-    for entry in entries.iter().filter(|e| {
-        knowledge_entry_belongs_to_project(e, project_dir, &project.project_id)
-            && matches!(
-                e.status,
-                crate::knowledge::Status::Active | crate::knowledge::Status::Superseded
-            )
-    }) {
+    for entry in entries
+        .iter()
+        .filter(|e| knowledge_entry_belongs_to_project(e, project_dir, &project.project_id))
+    {
         let entity_id = crate::index::knowledge_entity_id(&entry.id);
         let chunk_hash = crate::index::knowledge_chunk_hash(entry);
         crate::embed_queue::enqueue_knowledge(entry, &entity_id, &chunk_hash);
@@ -2281,24 +2276,13 @@ mod tests {
             title: "embed source".into(),
             content: content.into(),
             cluster: None,
-            variants: Default::default(),
             category: crate::knowledge::Category::Memory,
             scope: crate::knowledge::Scope::Project,
             project: None,
             project_id: None,
             providers: Vec::new(),
             priority: crate::knowledge::Priority::Standard,
-            weight: 100,
-            status: crate::knowledge::Status::Active,
-            approval: crate::knowledge::Approval::UserConfirmed,
             render: false,
-            decay: false,
-            review_at: None,
-            supersedes: None,
-            links: Vec::new(),
-            rationale: None,
-            expires_at: None,
-            source: "test".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
             recall_count: 0,

@@ -1310,7 +1310,6 @@ fn enrich_knowledge_features(
         if feature.doc_type.is_none() {
             feature.doc_type = Some("knowledge".into());
         }
-        feature.approval = Some(format!("{:?}", entry.approval));
         feature.created_at = Some(entry.created_at.clone());
         feature.last_recalled = entry.last_recalled.clone();
         feature.recall_count = entry.recall_count.min(u64::from(u32::MAX)) as u32;
@@ -1521,7 +1520,6 @@ fn knowledge_properties(
     let mut properties = BTreeMap::new();
     properties.insert("title".into(), entry.title.clone());
     properties.insert("doc_type".into(), "knowledge".into());
-    properties.insert("approval".into(), format!("{:?}", entry.approval));
     properties.insert("created_at".into(), entry.created_at.clone());
     if let Some(last_recalled) = &entry.last_recalled {
         properties.insert("last_recalled".into(), last_recalled.clone());
@@ -1652,12 +1650,9 @@ fn sanitize_error(err: &anyhow::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
 
     use bbox_corpus_core::search::rrf::{FusedHit, RankedList};
-    use bbox_knowledge::knowledge::{
-        Approval, Category, KnowledgeEntry, KnowledgeStore, Priority, Scope, Status,
-    };
+    use bbox_knowledge::knowledge::{Category, KnowledgeEntry, KnowledgeStore, Priority, Scope};
 
     #[test]
     fn rerank_mode_parses_and_rejects_unknown() {
@@ -1686,24 +1681,13 @@ mod tests {
             title: "visible".into(),
             content: "visible content".into(),
             cluster: None,
-            variants: HashMap::new(),
             category: Category::Memory,
             scope: Scope::Project,
             project: Some("/tmp/project".into()),
             project_id: None,
             providers: Vec::new(),
             priority: Priority::Standard,
-            weight: 100,
-            status: Status::Active,
-            approval: Approval::UserConfirmed,
             render: true,
-            decay: true,
-            review_at: None,
-            supersedes: None,
-            links: Vec::new(),
-            rationale: None,
-            expires_at: None,
-            source: "test".into(),
             created_at: "2026-07-21T00:00:00Z".into(),
             updated_at: "2026-07-21T00:00:00Z".into(),
             recall_count: 0,
@@ -2451,7 +2435,7 @@ pdf_figure = "voyage_visual"
     }
 
     #[test]
-    fn vector_only_knowledge_features_receive_approval_multiplier() {
+    fn vector_only_knowledge_features_receive_knowledge_multiplier() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("knowledge.json");
         let store = KnowledgeStore {
@@ -2464,24 +2448,13 @@ pdf_figure = "voyage_visual"
                 title: "Vector only".into(),
                 content: "semantic-only content".into(),
                 cluster: None,
-                variants: HashMap::new(),
                 category: Category::Memory,
                 scope: Scope::Project,
                 project: Some("/tmp/project".into()),
                 project_id: None,
                 providers: Vec::new(),
                 priority: Priority::Standard,
-                weight: 100,
-                status: Status::Active,
-                approval: Approval::UserConfirmed,
                 render: true,
-                decay: true,
-                review_at: None,
-                supersedes: None,
-                links: Vec::new(),
-                rationale: None,
-                expires_at: None,
-                source: "test".into(),
                 created_at: "2026-05-05T00:00:00Z".into(),
                 updated_at: "2026-05-05T00:00:00Z".into(),
                 recall_count: 0,
@@ -2499,7 +2472,6 @@ pdf_figure = "voyage_visual"
 
         let feature = &features["knowledge:vector-only"];
         assert_eq!(feature.doc_type.as_deref(), Some("knowledge"));
-        assert_eq!(feature.approval.as_deref(), Some("UserConfirmed"));
         assert_eq!(rerank::type_multiplier(feature), 1.35);
     }
 

@@ -14,7 +14,7 @@ use std::borrow::Cow;
 use anyhow::Result;
 
 use bbox_knowledge::knowledge::{
-    Approval, Category, GuidanceTopic, KnowledgeEntry, Priority, RenderPlacement, Scope, Status,
+    Category, GuidanceTopic, KnowledgeEntry, Priority, RenderPlacement, Scope,
 };
 
 pub const TOOL_DOC_ENTRY_ID: &str = "bb-tool-reference";
@@ -75,7 +75,7 @@ impl ToolCategory {
                 "Durable project-catalog administration: attach and detach local checkouts, select the default attachment, promote a legacy-local project to its committed scope, migrate a published scope, and rebind the publisher attachment. Every one of these refuses with `error.project_catalog_inactive` while the version-1 registry is the runtime authority; the proofless-authority operations (catalog add, alias accept and reject, retire) live on the offline `blackbox project-catalog` CLI instead. Operator tools, served on the `ops` surface: `bro mcp call <tool> '<json>' --surface ops`."
             }
             Self::Knowledge => {
-                "Memory lanes: `bbox_learn` for operator-approved rendered rules, `bbox_remember` for approved cold recall, `bbox_decide` for approved durable commitments, and `bbox_pin` for scoped active context."
+                "Memory lanes: `bbox_learn` for operator-approved rendered rules and, with `render=false`, approved cold recall; `bbox_pin` for scoped active context."
             }
             Self::Threads => {
                 "Track non-dispatchable work that spans sessions (investigations, QC walks, debugging, refinement loops). Lighter than the full dispatch pipeline, heavier than memory. Use `kind=work_item` for orchestrator-led propose→execute→review→refine loops."
@@ -407,28 +407,10 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_learn",
         category: ToolCategory::Knowledge,
-        summary: "Persist an operator-approved rule or convention that should bind future sessions; rendered into provider markdown files. Use for narrative rules (\"we always X\", \"never Y\") only after the operator has approved the exact content and scope. If the rule you're storing is actually a priority-ordered decision function, classification rubric, or structured mechanism, use `bbox_compile` instead; that produces a shareable packet any agent can apply deterministically.",
+        summary: "Persist an operator-approved rule or convention that should bind future sessions; rendered into provider markdown files. Pass render=false for an indexed-only recall entry that search finds but no rendered file carries. Use for narrative rules (\"we always X\", \"never Y\") only after the operator has approved the exact content and scope. If the rule you're storing is actually a priority-ordered decision function, classification rubric, or structured mechanism, use `bbox_compile` instead; that produces a shareable packet any agent can apply deterministically.",
         when_to_use: "Use only after the operator has approved the exact text and scope for a standing user rule that must outlive the current edit AND would still be correct a year from now with all current arcs complete. Anti-trigger: content naming a specific migration, phase, active arc, current initiative, or \"finish X before Y\" sequencing is arc-bound; route to `bbox_pin`. Not for one-off task constraints, not for facts you discovered yourself (that's `bbox_note(kind=\"learned\")`). Query `bbox_knowledge` first to avoid duplicate entries. On a transport-governed estate, project-scoped writes ride the checkout-owner backchannel: the daemon enqueues the committed `.bbox/knowledge/` bytes and the collector applies them within one cycle; commit the file to publish. See `sm-persistence-taxonomy` via `bbox_knowledge` for the deeper split.",
         example: Some(
             r#"bbox_learn(content="use rustls, not openssl", category="convention", scope="project", project="/repo/x")"#,
-        ),
-    },
-    ToolDoc {
-        name: "bbox_remember",
-        category: ToolCategory::Knowledge,
-        summary: "Persist a fact for later recall; indexed but NOT rendered.",
-        when_to_use: "Observations, decisions, and context worth grepping for later but not worth every session loading. Use when you want persistence without prompt residency. Safer default than `learn` when unsure; use `bbox_pin` instead when the context must stay hot for one active execution lane.",
-        example: Some(
-            r#"bbox_remember(content="port 7263 conflicts with helper-daemon on host bravo", title="port clash")"#,
-        ),
-    },
-    ToolDoc {
-        name: "bbox_decide",
-        category: ToolCategory::Knowledge,
-        summary: "Record a durable commitment with required rationale; supports supersession.",
-        when_to_use: "Use for real commitments or reversals that need rationale and audit trail. Query `bbox_knowledge` first to find the prior decision you may be superseding; `supersedes` takes the bare 8-hex entry ID. See `sm-persistence-taxonomy` via `bbox_knowledge` for the deeper split.",
-        example: Some(
-            r#"bbox_decide(content="use RocksDB for cache", rationale="SQLite locking conflicted with concurrent writers", supersedes="8a3f12cd")"#,
         ),
     },
     ToolDoc {
@@ -444,21 +426,14 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_knowledge",
         category: ToolCategory::Knowledge,
         summary: "Query durable knowledge entries by free-text or filters. Use early when prior decisions, conventions, remembered facts, or system runbooks could change the answer. Also surfaces bounded rule-packet and system-memory sidecars; system memories include system_memory:<id> refs usable with bbox_inspect_entity or bbox_bundle_evidence. Pass category=\"packet\" to list compiled packets, category=\"system_memory\" to list memory metadata, or bbox_packet_list for structured packet filters.",
-        when_to_use: "Use near the start of tasks where durable knowledge-store context could matter: prior decisions, project conventions, rendered rules, remembered facts, or system runbooks. This is not the surface for scoped pins (`bbox_pin`), side-channel notes (`bbox_notes`), active threads (`bbox_thread_list`), or transcript history (`bbox_hybrid_search`). Prefer a short phrase from the user's request over a single generic keyword; adjacent terms broaden recall, quoted phrases stay exact, `AND` / `OR` work explicitly, and `-term` excludes. If the first query is empty or too broad, try one sharper phrase. Use `mode=substring` for literal whole-query matching. Add `project=<cwd>` when looking for a prior decision to supersede; `project` also accepts a project_id or a registered operator alias and matches entries by project identity, and a value that resolves to no registered project keeps literal substring matching and says so in the response diagnostics. System memories can also be paged by canonical `sm-*` ID. Oversized structured entry content or metadata becomes a bounded preview whose detail recovery arguments carry the canonical entity_ref and the same filters; pass entry_detail=<entity_ref>, then concatenate body.text pages from detail_cursor through next_cursor and parse the complete JSON. Pass diagnostics_detail=true with the same filters to page exact omitted diagnostics. Content changes invalidate cursors; restart the same read without detail_cursor. Rule-packets appear in a separate section when the query hits their id / domain / rule ids / classifications; reach for bbox_packet_list when you want structured filters (scope, latest_per_domain) or richer per-packet previews. offset continues the selected ranked knowledge page or system-memory catalog. Requests cap at 100 rows and 16 KiB selectors; complete-envelope budgeting can return fewer. Follow structuredContent.page.next_offset for knowledge. The selection is live, so concurrent changes can move rows.",
+        when_to_use: "Use near the start of tasks where durable knowledge-store context could matter: prior decisions, project conventions, rendered rules, remembered facts, or system runbooks. This is not the surface for scoped pins (`bbox_pin`), side-channel notes (`bbox_notes`), active threads (`bbox_thread_list`), or transcript history (`bbox_hybrid_search`). Prefer a short phrase from the user's request over a single generic keyword; adjacent terms broaden recall, quoted phrases stay exact, `AND` / `OR` work explicitly, and `-term` excludes. If the first query is empty or too broad, try one sharper phrase. Use `mode=substring` for literal whole-query matching. Add `project=<cwd>` when looking for an entry to update or replace; `project` also accepts a project_id or a registered operator alias and matches entries by project identity, and a value that resolves to no registered project keeps literal substring matching and says so in the response diagnostics. System memories can also be paged by canonical `sm-*` ID. Oversized structured entry content or metadata becomes a bounded preview whose detail recovery arguments carry the canonical entity_ref and the same filters; pass entry_detail=<entity_ref>, then concatenate body.text pages from detail_cursor through next_cursor and parse the complete JSON. Pass diagnostics_detail=true with the same filters to page exact omitted diagnostics. Content changes invalidate cursors; restart the same read without detail_cursor. Rule-packets appear in a separate section when the query hits their id / domain / rule ids / classifications; reach for bbox_packet_list when you want structured filters (scope, latest_per_domain) or richer per-packet previews. offset continues the selected ranked knowledge page or system-memory catalog. Requests cap at 100 rows and 16 KiB selectors; complete-envelope budgeting can return fewer. Follow structuredContent.page.next_offset for knowledge. The selection is live, so concurrent changes can move rows.",
         example: Some(r#"bbox_knowledge(query="retry policy")"#),
-    },
-    ToolDoc {
-        name: "bbox_knowledge_link",
-        category: ToolCategory::Knowledge,
-        summary: "Append a knowledge edge.",
-        when_to_use: "Pass project to select the source entry's checkout-owner project when IDs overlap or unrelated publications are unavailable. The selected project must contain the source entry; there is no fallback to another owner. Omit project for global or local-store entries. Unscoped mutations refuse when a unique owner cannot be established.",
-        example: None,
     },
     ToolDoc {
         name: "bbox_forget",
         category: ToolCategory::Knowledge,
-        summary: "Retire or supersede an entry.",
-        when_to_use: "Entry is stale or replaced. Prefer `bbox_decide` with `supersedes` if the replacement is itself a decision. Pass project to select a checkout-owner project when IDs overlap or unrelated publications are unavailable; the selected project must contain the entry, with no fallback to another owner. Omit project for global or local-store entries. Unscoped mutations refuse when a unique owner cannot be established.",
+        summary: "Delete a knowledge entry.",
+        when_to_use: "Entry is stale or replaced: forget it, then `bbox_learn` the replacement. Git history keeps prior versions of project entries. Pass project to select a checkout-owner project when IDs overlap or unrelated publications are unavailable; the selected project must contain the entry, with no fallback to another owner. Omit project for global or local-store entries. Unscoped mutations refuse when a unique owner cannot be established.",
         example: None,
     },
     ToolDoc {
@@ -467,34 +442,6 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         summary: "Render entries into CLAUDE.md / AGENTS.md / GEMINI.md.",
         when_to_use: "Use to publish standing approved knowledge into managed files. `global` patches the DAEMON HOST's memory files; when the daemon is remote (cage) or its store is isolated it refuses with `error.global_render_authority` instead of writing files nobody reads. To refresh an operator host's global files from a remote daemon, run `bro render global` ON THAT HOST (`--check` previews): it requests `bbox_render(scope=\"global\", global_plan={host_common_target})` and applies the returned managed bodies locally with backups. `project` renders the project's provider files (CLAUDE.md / AGENTS.md / GEMINI.md, which include PROJECT.md by reference) plus `.bbox/guidance` satellites IN THE CHECKOUT THAT OWNS IT: the code collector whose producer grant covers the project's published scope applies a daemon-built plan and returns a path-free receipt (`status`, per-output `dispositions`, `current`). The caller's visibility is kept: unbound defaults to `published`, `provisional=\"own\"` needs checkout context, `all` keeps its meaning. Hand-authored provider files are preserved (`refused`); generated ones are replaced. If the owner has not answered within the wait, the response is `render_pending` with an `operation` id: call `bbox_render(project, operation)` to retrieve that operation's recorded receipt (it never re-applies; a newer render makes it historical). Refusals name the fix: `error.render_owner_*` for an owner that is stale, lacks the render lane, or does not hold the checkout, and `error.render_locality_required` when no owner covers the project (enroll the checkout with `bbox-code-collector add <path>` on its host). Do not use render as a way to keep active-work guidance hot across turns — that is what `bbox_pin` is for. See `sm-render-lifecycle` via `bbox_knowledge` for the full lifecycle.",
         example: Some(r#"bbox_render(scope="project", project="/repo/x")"#),
-    },
-    ToolDoc {
-        name: "bbox_absorb",
-        category: ToolCategory::Knowledge,
-        summary: "Compatibility no-op retained for callable-name compatibility; it imports no rendered-file content.",
-        when_to_use: "Rendered provider files are unidirectional projections now. Use indexed instruction refs or the checkout owner to inspect hand-authored content; knowledge imports use the explicit knowledge write tools. See `sm-render-lifecycle` via `bbox_knowledge` for the full lifecycle.",
-        example: None,
-    },
-    ToolDoc {
-        name: "bbox_lint",
-        category: ToolCategory::Knowledge,
-        summary: "Health check for contradictions, stale entries, duplicates.",
-        when_to_use: "Use for periodic hygiene, before large knowledge-store refactors, or when the render/review state looks inconsistent. See `sm-render-lifecycle` via `bbox_knowledge` for the full lifecycle. Large issue sets are bounded and point to bbox_review and bbox_knowledge for recovery.",
-        example: None,
-    },
-    ToolDoc {
-        name: "bbox_review",
-        category: ToolCategory::Knowledge,
-        summary: "Approve or reject entries awaiting review, or page bounded review-queue records.",
-        when_to_use: "Use to approve or reject existing unverified entries. Review controls render eligibility; it does not import rendered-file edits. For approve/reject, pass project to select a checkout-owner project when IDs overlap or unrelated publications are unavailable; the selected project must contain the entry, with no fallback to another owner. Reads use the closed actions list and get: action=list pages bounded row previews with cursor and limit, while action=get plus id pages the exact record with cursor and limit. Concatenate body.text pages, then parse the complete JSON. Queue or record changes invalidate cursors; restart action=list or repeat action=get with the same id and no cursor. See `sm-render-lifecycle` via `bbox_knowledge` for the full lifecycle.",
-        example: None,
-    },
-    ToolDoc {
-        name: "bbox_bootstrap",
-        category: ToolCategory::Knowledge,
-        summary: "Retired compatibility refusal retained for callable-name compatibility. Use bbox_hybrid_search for indexed instruction-file discovery and bbox_inspect_entity to expand refs; this operation imports no knowledge and reads no caller files.",
-        when_to_use: "Retained only as a migration refusal. It performs no import or onboarding. Use bbox_hybrid_search(project=..., doc_type=project_file) to discover indexed instructions and bbox_inspect_entity to expand exact refs. Missing indexed files require producer enrollment or checkout-owner inspection; daemon paths cannot substitute for either.",
-        example: None,
     },
     // ── Threads ──────────────────────────────────────────────────────
     ToolDoc {
@@ -542,7 +489,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_gap",
         category: ToolCategory::Gaps,
         summary: "File a first-class substrate gap note into the repo-owned gap store.",
-        when_to_use: "When the blocker is in the blackbox substrate or shared agent workflow — a missing tool primitive, MCP surface, refactor atom, workflow shape, ontology edge, or runbook that agents in other projects could plausibly hit too — NOT an ordinary TODO in the current product codebase and NOT a user-stated rule (those go to bbox_learn / bbox_decide). Dedupe first with `bbox_gaps` and reuse the same `dedupe_key` (`<gap_kind>/<domain>/<slug>`); an open gap with that key dedupes by default (pass `allow_recurrence=true` to tally a recurrence). Project-scoped by default (committed in-repo under `.bbox/gaps/`); pass `scope=\"global\"` for cross-project substrate gaps. On a transport-governed estate the daemon holds no checkout authority: the call still works, but the daemon enqueues the committed-file bytes and the checkout-owner collector writes them into the checkout within one collector cycle (the response says where; commit the file to publish). While authoring a rule-packet, use `bbox_packet_gap` instead (it emits the companion gap for you). See `sm-gap-notes` via `bbox_knowledge`.",
+        when_to_use: "When the blocker is in the blackbox substrate or shared agent workflow: a missing tool primitive, MCP surface, refactor atom, workflow shape, ontology edge, or runbook that agents in other projects could plausibly hit too, NOT an ordinary TODO in the current product codebase and NOT a user-stated rule (those go to bbox_learn). Dedupe first with `bbox_gaps` and reuse the same `dedupe_key` (`<gap_kind>/<domain>/<slug>`); an open gap with that key dedupes by default (pass `allow_recurrence=true` to tally a recurrence). Project-scoped by default (committed in-repo under `.bbox/gaps/`); pass `scope=\"global\"` for cross-project substrate gaps. On a transport-governed estate the daemon holds no checkout authority: the call still works, but the daemon enqueues the committed-file bytes and the checkout-owner collector writes them into the checkout within one collector cycle (the response says where; commit the file to publish). While authoring a rule-packet, use `bbox_packet_gap` instead (it emits the companion gap for you). See `sm-gap-notes` via `bbox_knowledge`.",
         example: Some(
             r#"bbox_gap(title="Packet AST cannot express rate predicates", gap_kind="packet_ast", domain="review-policy", wanted_capability="Classify entities by count/rate within a time window.", dedupe_key="packet_ast/review-policy/rate-window-predicate", impact="medium")"#,
         ),
@@ -866,7 +813,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_doctor",
         category: ToolCategory::Operations,
         summary: "Diagnose Blackbox health with ranked, paginated findings. format selects summary text or JSON; detail=full returns exact bounded body pages (cursor/body_limit). Narrow with section: the section name is validated before collection and collects only that section.",
-        when_to_use: "Use as the first call when asking \"what do I need to know about Blackbox right now?\"; replaces the scattered manual smoke checklist (bbox_stats, bbox_embed_status, bbox_project_list, bbox_lint) with one ranked surface. Route findings distinguish real failures (action) from opt-in absence like unconfigured visual chunk kinds (info). Default detail=summary returns up to 20 findings (max 100) ordered worst severity, section, then message; next_offset continues. Section status is separate from the findings page. detail=full returns a JSON envelope with exact body pages (body_limit default/max 4096 bytes, minimum 4). Concatenate body.text and replay body.next_cursor as cursor with the same section and format. Health is collected on each page; changed evidence rejects continuation, so restart without cursor. A requested section is validated BEFORE collection and collects only that section's existing producer instead of the full report. format=json does not imply full detail. Restart pagination after a state change.",
+        when_to_use: "Use as the first call when asking \"what do I need to know about Blackbox right now?\"; replaces the scattered manual smoke checklist (bbox_stats, bbox_embed_status, bbox_project_list) with one ranked surface. Route findings distinguish real failures (action) from opt-in absence like unconfigured visual chunk kinds (info). Default detail=summary returns up to 20 findings (max 100) ordered worst severity, section, then message; next_offset continues. Section status is separate from the findings page. detail=full returns a JSON envelope with exact body pages (body_limit default/max 4096 bytes, minimum 4). Concatenate body.text and replay body.next_cursor as cursor with the same section and format. Health is collected on each page; changed evidence rejects continuation, so restart without cursor. A requested section is validated BEFORE collection and collects only that section's existing producer instead of the full report. format=json does not imply full detail. Restart pagination after a state change.",
         example: Some(r#"bbox_doctor(format="summary")"#),
     },
     // ── Storage health ──────────────────────────────────────────────
@@ -954,8 +901,8 @@ before dissolving ad hoc teams, and ask the operator to prune terminal tasks \
 (`bro mcp call bro_prune '{\"task_ids\":[\"<id>\"]}' --surface ops`; offer \
 `retro=true`). Cleanup is operator-gated, not automatic.
 - Memory lanes: `bbox_thread` (investigation state), \
-`bbox_learn`/`bbox_decide` (operator-approved standing rules / commitments), \
-`bbox_remember` (cold grep-able facts), `bbox_pin` (arc-bound hot context). \
+`bbox_learn` (operator-approved standing rules; `render=false` for cold \
+grep-able facts), `bbox_pin` (arc-bound hot context). \
 The one-year test picks between rendered and pin — would it still be correct \
 a year from now with current arcs done?
 - Compose gates, retries, schedules and review protocols in your caller. Blackbox \
@@ -1032,9 +979,7 @@ pub fn render_markdown() -> String {
         } else {
             out.push_str(cat.intro());
             out.push_str("\n\n");
-            for doc in TOOL_DOCS.iter().filter(|d| {
-                d.category == *cat && !matches!(d.name, "bbox_absorb" | "bbox_bootstrap")
-            }) {
+            for doc in TOOL_DOCS.iter().filter(|d| d.category == *cat) {
                 out.push_str(&format!(
                     "- **`{}`** — {}\n",
                     doc.name,
@@ -1065,12 +1010,12 @@ fn render_retrieval_workflow(out: &mut String) {
 
 fn render_persistence_workflow(out: &mut String) {
     out.push_str("## CORE RULE: operator-approved persistence\n\n");
-    out.push_str("**When the user states a rule, convention, or preference that may need to bind future sessions, do not immediately call `bbox_learn`, `bbox_remember`, or `bbox_decide`.** First decide whether persistence is warranted, then present the proposed memory text, lane, and scope to the operator and wait for explicit approval. Mechanical enforcement in code/config can enforce the current edit but does not transmit intent to future sessions; persistence still requires approval unless the operator has already approved the exact memory write in the current turn.\n\n");
+    out.push_str("**When the user states a rule, convention, or preference that may need to bind future sessions, do not immediately call `bbox_learn`.** First decide whether persistence is warranted, then present the proposed memory text, lane, and scope to the operator and wait for explicit approval. Mechanical enforcement in code/config can enforce the current edit but does not transmit intent to future sessions; persistence still requires approval unless the operator has already approved the exact memory write in the current turn.\n\n");
     out.push_str("Triggers (positive and negative bind equally): \"from now on\", \"always X\", \"never X\", \"we (don't) use Y\", \"prefer Y\", \"X is banned / retired / out of scope\", \"stop using X\", \"no more X\", \"house rule\", \"standing order\", \"keep X out of\", \"X must not\".\n\n");
     out.push_str("Lane selection - when preparing a persistence proposal, walk the ladder and stop at the first yes:\n\n");
     out.push_str("1. Is this investigation state tied to one debug/QC walk? → `bbox_thread`\n");
-    out.push_str("2. Would the statement still be correct a year from now with all current arcs complete? → propose `bbox_learn` or `bbox_decide`\n");
-    out.push_str("3. Is it a cold searchable fact worth grepping for later but not worth every session loading? → propose `bbox_remember`\n");
+    out.push_str("2. Would the statement still be correct a year from now with all current arcs complete? → propose `bbox_learn`\n");
+    out.push_str("3. Is it a cold searchable fact worth grepping for later but not worth every session loading? → propose `bbox_learn` with `render=false`\n");
     out.push_str("4. Otherwise - arc-bound guidance that must stay hot for one execution lane - → `bbox_pin`\n\n");
     out.push_str("The one-year test at step 2 is the load-bearing filter. Content naming a specific migration, phase, active arc, current initiative, or \"finish X before Y\" sequencing fails it and belongs in `bbox_pin`, not `bbox_learn`. Ephemeral task constraints (\"for this fix, skip tests\", \"just for today\") don't get persisted at all.\n\n");
     out.push_str("After implementing any user directive in code/config, explicitly ask yourself: did the user just state a standing rule? If yes, propose the exact storage text, lane, and scope before replying; only emit the storage call after the operator approves it.\n\n");
@@ -1219,11 +1164,7 @@ fn sync_entry(
     let existing = kb.all_entries().iter().find(|e| e.id == id).cloned();
 
     if let Some(ref e) = existing {
-        if e.content == content
-            && e.render_placement == placement
-            && e.render
-            && e.status == Status::Active
-        {
+        if e.content == content && e.render_placement == placement && e.render {
             return Ok(SyncResult {
                 wrote: false,
                 bytes,
@@ -1238,24 +1179,13 @@ fn sync_entry(
         title: title.to_string(),
         content,
         cluster: None,
-        variants: Default::default(),
         category: Category::Tool,
         scope: Scope::Global,
         project: None,
         project_id: None,
         providers: Vec::new(),
         priority: Priority::Standard,
-        weight: 100,
         render: true,
-        decay: false, // generated; managed by code
-        review_at: None,
-        status: Status::Active,
-        approval: Approval::UserConfirmed,
-        supersedes: None,
-        links: Vec::new(),
-        rationale: None,
-        expires_at: None,
-        source: "tool_docs".to_string(),
         created_at: existing
             .as_ref()
             .map(|e| e.created_at.clone())
@@ -1338,9 +1268,7 @@ mod tests {
     fn render_contains_hot_tool_names() {
         let md = render_markdown();
         for doc in TOOL_DOCS {
-            if !HOT_RENDER_CATEGORIES.contains(&doc.category)
-                || matches!(doc.name, "bbox_absorb" | "bbox_bootstrap")
-            {
+            if !HOT_RENDER_CATEGORIES.contains(&doc.category) {
                 continue;
             }
             if deferred_system_memory(doc.category).is_some() {

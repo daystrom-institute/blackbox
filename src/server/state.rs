@@ -1530,13 +1530,8 @@ mod clause_one_exit_proof {
         .unwrap();
 
         for server in [&populated, &recordless] {
-            let mut base = knowledge_entry("edge-seed-old", "superseded seed");
-            let mut newer = knowledge_entry("edge-seed-new", "superseding seed");
-            // A SUPERSEDES link is what actually projects an edge; an
-            // isolated entry projects none, which the non-triviality guard
-            // below caught on the first attempt.
-            newer.supersedes = Some(base.id.clone());
-            base.status = bbox_knowledge::knowledge::Status::Superseded;
+            let base = knowledge_entry("edge-seed-old", "older seed");
+            let newer = knowledge_entry("edge-seed-new", "newer seed");
             let mut kb = server.state.kb.write();
             kb.upsert_generated(base).expect("seed entry");
             kb.upsert_generated(newer).expect("seed entry");
@@ -1911,24 +1906,13 @@ mod code_read_view_tests {
             title: "pinned view commit test".into(),
             content: content.into(),
             cluster: None,
-            variants: Default::default(),
             category: bbox_knowledge::knowledge::Category::Memory,
             scope: bbox_knowledge::knowledge::Scope::Global,
             project: None,
             project_id: None,
             providers: Vec::new(),
             priority: bbox_knowledge::knowledge::Priority::Standard,
-            weight: 100,
-            status: bbox_knowledge::knowledge::Status::Active,
-            approval: bbox_knowledge::knowledge::Approval::UserConfirmed,
             render: true,
-            decay: true,
-            review_at: None,
-            supersedes: None,
-            links: Vec::new(),
-            rationale: None,
-            expires_at: None,
-            source: "test".into(),
             created_at: "2026-07-22T00:00:00Z".into(),
             updated_at: "2026-07-22T00:00:00Z".into(),
             recall_count: 0,
@@ -2658,7 +2642,7 @@ pub(crate) mod catalog_fixture {
         rebind_accepted_pointer_for_test,
     };
     use bbox_indexing::project_catalog_store::ProjectCatalogStore;
-    use bbox_knowledge::knowledge::{Approval, Category, KnowledgeEntry, Priority, Scope, Status};
+    use bbox_knowledge::knowledge::{Category, KnowledgeEntry, Priority, Scope};
 
     use super::{BlackboxServer, SharedState};
 
@@ -3195,7 +3179,6 @@ pub(crate) mod catalog_fixture {
             title: format!("entry {id}"),
             content: content.to_string(),
             cluster: None,
-            variants: Default::default(),
             category: Category::Convention,
             scope: Scope::Project,
             // A committed repo-owned file carries no host path, and the
@@ -3204,17 +3187,7 @@ pub(crate) mod catalog_fixture {
             project_id: None,
             providers: Vec::new(),
             priority: Priority::Standard,
-            weight: 100,
-            status: Status::Active,
-            approval: Approval::UserConfirmed,
             render: true,
-            decay: false,
-            review_at: None,
-            supersedes: None,
-            links: Vec::new(),
-            rationale: None,
-            expires_at: None,
-            source: "user".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-02T00:00:00Z".to_string(),
             recall_count: 7,

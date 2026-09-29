@@ -12,9 +12,7 @@ use std::time::Duration;
 use bbox_corpus_core::identity::PublishedScope;
 
 use super::*;
-use crate::model::{
-    Approval, Category, GuidanceTopic, KnowledgeEntry, Priority, RenderPlacement, Scope, Status,
-};
+use crate::model::{Category, GuidanceTopic, KnowledgeEntry, Priority, RenderPlacement, Scope};
 use crate::transport::{
     PROJECT_RENDER_TRANSPORT_SCOPE, ProjectRenderOutcomeV1, ProjectRenderProducerAuthorityV1,
     ProjectRenderViewV1, format_render_operation_id,
@@ -59,25 +57,14 @@ fn entry(id: &str, content: &str) -> KnowledgeEntry {
         title: id.into(),
         content: content.into(),
         cluster: None,
-        variants: HashMap::new(),
         category: Category::Convention,
         scope: Scope::Project,
         project: Some(PROJECT_RENDER_TRANSPORT_SCOPE.into()),
         project_id: Some(PROJECT.into()),
         providers: Vec::new(),
         priority: Priority::Standard,
-        weight: 100,
-        status: Status::Active,
-        approval: Approval::UserConfirmed,
         render: true,
         render_placement: RenderPlacement::Inline,
-        decay: false,
-        review_at: None,
-        supersedes: None,
-        links: Vec::new(),
-        rationale: None,
-        expires_at: None,
-        source: "test".into(),
         created_at: "2026-09-01T00:00:00Z".into(),
         updated_at: "2026-09-01T00:00:00Z".into(),
         recall_count: 0,
@@ -763,40 +750,6 @@ fn an_interrupted_application_is_reconciled_without_replacing_owner_edits() {
         reconciled.receipt.outcome(),
         ProjectRenderOutcomeV1::Converged
     );
-}
-
-#[test]
-fn an_entry_expiring_after_publication_is_validated_at_the_plan_issuance() {
-    let (_directory, root) = temp_root();
-    // The entry is live at issuance and expires after the output is
-    // published, before the receipt is validated.
-    let issued_at_ms = now_unix_ms();
-    let expires_at = crate::transport::iso_from_unix_ms(issued_at_ms);
-    let mut plan = plan_issued_at("EXPIRING_LEAF_MARKER", OPERATION, issued_at_ms);
-    plan.entries[0].expires_at = Some(expires_at.clone());
-    let execution = with_interleave(
-        move |point, _| {
-            if point == "sync_root" {
-                while crate::transport::iso_from_unix_ms(now_unix_ms()) <= expires_at {
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-            }
-            Ok(())
-        },
-        || execute_operation(&plan, &root),
-    )
-    .unwrap();
-    assert_eq!(
-        disposition_of(&execution.receipt, "CLAUDE.md"),
-        ProjectRenderDispositionV1::Written
-    );
-    assert!(
-        fs::read_to_string(root.join("CLAUDE.md"))
-            .unwrap()
-            .contains("EXPIRING_LEAF_MARKER")
-    );
-    // A delayed submission, long after the expiry, validates the same way.
-    execution.receipt.validate_against(&plan).unwrap();
 }
 
 #[test]

@@ -12,7 +12,7 @@ use super::{FieldHandles, FileMeta};
 use bbox_corpus_core::entity_ref::{EntityRef, PARSER_VERSION};
 use bbox_corpus_core::identity::{PublishedScope, bbox_root_relpath, resolve_recorded_repo_id};
 use bbox_corpus_core::project_record::ProjectRecord;
-use bbox_knowledge::knowledge::{Knowledge, KnowledgeEntry, Status};
+use bbox_knowledge::knowledge::{Knowledge, KnowledgeEntry};
 use bbox_knowledge::overlay::{load_published_snapshot, published_scope_hash};
 
 #[derive(Debug, Clone)]
@@ -108,10 +108,7 @@ pub fn apply_knowledge_replace(
     documents: &[KnowledgeIndexDocument],
 ) -> Result<()> {
     writer.delete_term(Term::from_field_text(fields.doc_type, "knowledge"));
-    for document in documents
-        .iter()
-        .filter(|document| indexable_knowledge_entry(&document.entry))
-    {
+    for document in documents.iter() {
         writer.add_document(build_knowledge_index_doc(document, knowledge_path, fields))?;
     }
     Ok(())
@@ -130,7 +127,6 @@ pub fn apply_knowledge_logical_replace(
     for document in documents
         .iter()
         .filter(|document| document.logical_ref == logical_ref)
-        .filter(|document| indexable_knowledge_entry(&document.entry))
     {
         writer.add_document(build_knowledge_index_doc(document, knowledge_path, fields))?;
     }
@@ -154,17 +150,10 @@ pub fn apply_knowledge_scope_replace(
     for document in documents
         .iter()
         .filter(|document| document.scope_hash.as_deref() == Some(scope_hash))
-        .filter(|document| indexable_knowledge_entry(&document.entry))
     {
         writer.add_document(build_knowledge_index_doc(document, knowledge_path, fields))?;
     }
     Ok(())
-}
-
-pub fn indexable_knowledge_entry(entry: &KnowledgeEntry) -> bool {
-    // Superseded entries remain searchable so history queries can find the
-    // original decision; H1 rerank should downweight them by status.
-    matches!(entry.status, Status::Active | Status::Superseded)
 }
 
 /// Explicit, caller-authorized roots for one committed project knowledge
@@ -407,10 +396,7 @@ pub fn reindex_knowledge_store_with_access(
         .chain(refreshed_documents)
         .collect::<Vec<_>>();
     let mut docs = 0;
-    for document in documents
-        .iter()
-        .filter(|document| indexable_knowledge_entry(&document.entry))
-    {
+    for document in documents.iter() {
         writer.add_document(build_knowledge_index_doc(document, knowledge_path, fields))?;
         docs += 1;
     }
@@ -441,9 +427,7 @@ pub fn apply_knowledge_upsert(
 ) -> Result<()> {
     let entity_id = knowledge_entity_id(&entry.id);
     writer.delete_term(Term::from_field_text(fields.entity_id, &entity_id));
-    if indexable_knowledge_entry(entry) {
-        writer.add_document(build_knowledge_doc(entry, knowledge_path, fields))?;
-    }
+    writer.add_document(build_knowledge_doc(entry, knowledge_path, fields))?;
     Ok(())
 }
 
@@ -479,7 +463,7 @@ fn file_meta(path: &Path) -> Option<FileMeta> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bbox_knowledge::knowledge::{Approval, Category, Priority, Scope};
+    use bbox_knowledge::knowledge::{Category, Priority, Scope};
 
     #[test]
     fn knowledge_doc_carries_entity_id_and_content() {
@@ -490,24 +474,13 @@ mod tests {
             title: "Render lifecycle".into(),
             content: "bbox_render publishes approved knowledge".into(),
             cluster: None,
-            variants: Default::default(),
             category: Category::Memory,
             scope: Scope::Global,
             project: None,
             project_id: None,
             providers: Vec::new(),
             priority: Priority::Standard,
-            weight: 100,
-            status: Status::Active,
-            approval: Approval::UserConfirmed,
             render: true,
-            decay: true,
-            review_at: None,
-            supersedes: None,
-            links: Vec::new(),
-            rationale: None,
-            expires_at: None,
-            source: "test".into(),
             created_at: "2026-05-05T17:30:00Z".into(),
             updated_at: "2026-05-05T17:30:00Z".into(),
             recall_count: 0,
@@ -521,42 +494,6 @@ mod tests {
         assert_eq!(first_text(&doc, fields.account), "");
         assert_eq!(first_text(&doc, fields.role), "");
         assert!(first_text(&doc, fields.content).contains("bbox_render"));
-    }
-
-    #[test]
-    fn superseded_knowledge_entries_remain_indexable() {
-        let mut entry = KnowledgeEntry {
-            render_placement: Default::default(),
-            id: "abc12345".into(),
-            title: "Original decision".into(),
-            content: "first decision about postgres consolidation".into(),
-            cluster: None,
-            variants: Default::default(),
-            category: Category::Decision,
-            scope: Scope::Global,
-            project: None,
-            project_id: None,
-            providers: Vec::new(),
-            priority: Priority::Standard,
-            weight: 100,
-            status: Status::Superseded,
-            approval: Approval::UserConfirmed,
-            render: true,
-            decay: true,
-            review_at: None,
-            supersedes: None,
-            links: Vec::new(),
-            rationale: Some("fixture".into()),
-            expires_at: None,
-            source: "test".into(),
-            created_at: "2026-05-05T17:30:00Z".into(),
-            updated_at: "2026-05-05T17:30:00Z".into(),
-            recall_count: 0,
-            last_recalled: None,
-        };
-        assert!(indexable_knowledge_entry(&entry));
-        entry.status = Status::Deleted;
-        assert!(!indexable_knowledge_entry(&entry));
     }
 
     #[test]
@@ -585,24 +522,13 @@ mod tests {
             title: "retained generation".into(),
             content: "LAST_GOOD_SCOPE".into(),
             cluster: None,
-            variants: Default::default(),
             category: Category::Convention,
             scope: Scope::Project,
             project: Some("/logical/project".into()),
             project_id: None,
             providers: Vec::new(),
             priority: Priority::Standard,
-            weight: 100,
-            status: Status::Active,
-            approval: Approval::UserConfirmed,
             render: true,
-            decay: true,
-            review_at: None,
-            supersedes: None,
-            links: Vec::new(),
-            rationale: None,
-            expires_at: None,
-            source: "test".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
             recall_count: 0,
@@ -773,24 +699,13 @@ mod tests {
             title: "repo convention".into(),
             content: "REPO_OWNED_SEARCHABLE".into(),
             cluster: None,
-            variants: Default::default(),
             category: Category::Convention,
             scope: Scope::Project,
             project: None,
             project_id: None,
             providers: Vec::new(),
             priority: Priority::Standard,
-            weight: 100,
-            status: Status::Active,
-            approval: Approval::UserConfirmed,
             render: true,
-            decay: true,
-            review_at: None,
-            supersedes: None,
-            links: Vec::new(),
-            rationale: None,
-            expires_at: None,
-            source: "test".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
             recall_count: 0,
@@ -916,24 +831,13 @@ mod tests {
             title: "legacy project knowledge".into(),
             content: "LEGACY_SCOPE_STAYS_SEARCHABLE".into(),
             cluster: None,
-            variants: Default::default(),
             category: Category::Convention,
             scope: Scope::Project,
             project: Some(project.to_string_lossy().into_owned()),
             project_id: None,
             providers: Vec::new(),
             priority: Priority::Standard,
-            weight: 100,
-            status: Status::Active,
-            approval: Approval::UserConfirmed,
             render: true,
-            decay: true,
-            review_at: None,
-            supersedes: None,
-            links: Vec::new(),
-            rationale: None,
-            expires_at: None,
-            source: "test".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
             recall_count: 0,

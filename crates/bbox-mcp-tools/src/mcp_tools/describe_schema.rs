@@ -122,14 +122,8 @@ fn edge_families() -> Vec<serde_json::Value> {
         ),
         family(
             "Knowledge",
-            &[
-                "SUPERSEDES",
-                "DERIVED_FROM",
-                "Contradicts",
-                "KNOWLEDGE_FROM_SESSION",
-                "KNOWLEDGE_FROM_BOARD",
-            ],
-            "Use knowledge edges for lifecycle, replacement, provenance, and governance questions.",
+            &["KNOWLEDGE_FROM_SESSION", "KNOWLEDGE_FROM_BOARD"],
+            "Use knowledge edges to move from an entry back to the session or board it came from.",
         ),
         family(
             "Provenance",

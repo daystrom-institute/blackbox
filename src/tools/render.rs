@@ -1,7 +1,6 @@
 use crate::knowledge::{
-    AbsorbParams, BootstrapParams, PROJECT_RENDER_TRANSPORT_SCOPE,
-    PROJECT_RENDER_TRANSPORT_VERSION, ProjectRenderLocalityRequestV1, ProjectRenderPlanV1,
-    ProjectRenderViewV1, RenderParams, ReviewParams, Scope,
+    PROJECT_RENDER_TRANSPORT_SCOPE, PROJECT_RENDER_TRANSPORT_VERSION,
+    ProjectRenderLocalityRequestV1, ProjectRenderPlanV1, ProjectRenderViewV1, RenderParams, Scope,
 };
 use crate::server::BlackboxServer;
 
@@ -128,46 +127,6 @@ fn rescope_render_project(p: &mut RenderParams, projects: &[crate::projects::Pro
 
 #[tool_router(router = render_tools)]
 impl BlackboxServer {
-    pub(crate) fn lint_session_knowledge(&self) -> anyhow::Result<String> {
-        let view = self.session_knowledge_view(None, None)?;
-        let mut output = view.knowledge.lint()?;
-        if !view.diagnostics.is_empty() {
-            output.push_str(&format!("\n{} source visibility notices; results may be incomplete. Inspect bbox_knowledge(diagnostics_detail=true) for bounded visibility detail.", view.diagnostics.len()));
-        }
-        Ok(output)
-    }
-
-    pub(crate) fn review_session_knowledge(&self, p: &ReviewParams) -> anyhow::Result<String> {
-        let mut view = self.session_knowledge_view(None, None)?;
-        let output = view.knowledge.review(p)?;
-        Ok(view.append_diagnostics(output))
-    }
-
-    pub(crate) fn absorb_session_knowledge(&self, p: &AbsorbParams) -> anyhow::Result<String> {
-        let requested_project = (p.scope.as_deref().unwrap_or("project") == "project")
-            .then_some(p.project.as_deref())
-            .flatten();
-        let mut view = self.session_knowledge_view(requested_project, None)?;
-        let output = view.knowledge.absorb(p)?;
-        Ok(view.append_diagnostics(output))
-    }
-
-    pub(crate) fn bootstrap_session_knowledge(
-        &self,
-        p: &BootstrapParams,
-    ) -> anyhow::Result<String> {
-        // Filter-class engine resolution (phase-2 §9.2): bootstrap tolerates
-        // an unrecognized selector by proceeding unscoped, exactly as before.
-        let scope_project = self
-            .resolve_project_filter(&p.project)
-            .and_then(|resolution| resolution.store_key().map(str::to_owned));
-        let view = self.session_knowledge_view(Some(&p.project), None)?;
-        let output = view
-            .knowledge
-            .bootstrap_with_scope(p, scope_project.as_deref())?;
-        Ok(view.append_diagnostics(output))
-    }
-
     #[tool(
         name = "bbox_render",
         description = "Render entries into CLAUDE.md / AGENTS.md / GEMINI.md."
@@ -229,9 +188,7 @@ impl BlackboxServer {
                             "error.render_plan_stale: project render authority changed after the checkout plan was issued"
                         );
                     }
-                    // The harness projected the plan at its issuance, so the
-                    // receipt is checked at that same instant.
-                    receipt.validate_against_issued(&current, issued_at_ms)?;
+                    receipt.validate_against(&current)?;
                     // Evidence is ordered by the plan's issuance. A
                     // completion whose issuance this daemon cannot confirm
                     // (absent, unknown, or from before a restart) is
@@ -403,130 +360,6 @@ impl BlackboxServer {
         })
         .await
     }
-
-    #[tool(
-        name = "bbox_absorb",
-        description = "Compatibility no-op retained for callable-name compatibility; it imports no rendered-file content."
-    )]
-    pub(crate) async fn bbox_absorb(
-        &self,
-        Parameters(p): Parameters<AbsorbParams>,
-    ) -> CallToolResult {
-        let server = self.clone();
-        Self::run_blocking("bbox_absorb", move || server.absorb_session_knowledge(&p)).await
-    }
-
-    #[tool(
-        name = "bbox_lint",
-        description = "Health check for contradictions, stale entries, duplicates."
-    )]
-    pub(crate) async fn bbox_lint(&self) -> CallToolResult {
-        let server = self.clone();
-        Self::run_blocking("bbox_lint", move || server.lint_session_knowledge()).await
-    }
-
-    #[tool(
-        name = "bbox_review",
-        description = "Approve or reject entries awaiting review, or page bounded review-queue records."
-    )]
-    pub(crate) async fn bbox_review(
-        &self,
-        Parameters(p): Parameters<ReviewParams>,
-    ) -> CallToolResult {
-        let server = self.clone();
-        let owner = std::sync::Arc::new(parking_lot::Mutex::new(None));
-        let worker_owner = owner.clone();
-        let result = Self::run_blocking("bbox_review", move || {
-            let mut p = p;
-            // Both local and checkout-owner mutations share the read/write
-            // shape contract. Validate before admitting a queued mutation.
-            crate::knowledge::Knowledge::validate_review_params(&p)?;
-            if !matches!(p.action.as_deref().unwrap_or("list"), "approve" | "reject") {
-                anyhow::ensure!(
-                    p.project.is_none(),
-                    "project selects a mutation owner and applies only to approve/reject"
-                );
-                return server.review_session_knowledge(&p);
-            }
-            if let Some(text) = server.enqueue_review_via_checkout_owner(
-                p.action.as_deref().unwrap_or("list"),
-                p.id.as_deref().unwrap_or_default(),
-                p.project.as_deref(),
-            )? {
-                *worker_owner.lock() =
-                    Some(super::knowledge::KnowledgeMutationOwner::CheckoutQueue);
-                return Ok(text);
-            }
-            let target =
-                server.prepare_existing_knowledge_mutation(p.id.as_deref().unwrap_or_default())?;
-            p.id = Some(target.id.clone());
-            let out = server.state.kb.write().review_with_write_dir(
-                &p,
-                target
-                    .carrier
-                    .as_ref()
-                    .map(|carrier| carrier.carrier_id.as_str()),
-                target.seed.as_ref(),
-            )?;
-            server.finish_existing_knowledge_mutation(target.checkout.as_ref());
-            *worker_owner.lock() = Some(super::knowledge::KnowledgeMutationOwner::Local);
-            Ok(out)
-        })
-        .await;
-        let owner = *owner.lock();
-        if result.is_error != Some(true)
-            && let Some(owner) = owner
-            && let Err(error) = self.persist_knowledge_mutation(owner).await
-        {
-            return Self::err_text(&format!("Error: knowledge durability failed: {error:#}"));
-        }
-        result
-    }
-
-    #[tool(
-        name = "bbox_bootstrap",
-        description = "Retired compatibility refusal retained for callable-name compatibility. Use bbox_hybrid_search for indexed instruction-file discovery and bbox_inspect_entity to expand refs; this operation imports no knowledge and reads no caller files."
-    )]
-    pub(crate) async fn bbox_bootstrap(
-        &self,
-        Parameters(p): Parameters<BootstrapParams>,
-    ) -> CallToolResult {
-        Self::err_text(&serde_json::json!({
-            "error": "error.bootstrap_retired",
-            "message": "Bootstrap never imported knowledge; its instruction scan required a local checkout. Discover indexed instruction refs or read files through the checkout owner's file tools, then review proposed knowledge entries before saving them.",
-            "replacement": {"tool": "bbox_hybrid_search", "arguments": {
-                "project": p.project, "query": "AGENTS.md CLAUDE.md GEMINI.md PROJECT.md instructions",
-                "doc_type": "project_file", "limit": 5,
-            }},
-            "expand": {"tool": "bbox_inspect_entity", "arguments": {"entity_ref": "<returned ref>", "property_mode": "full", "per_type_limit": 0}},
-            "coverage": "Search reflects the collected index. Missing instruction refs do not establish that the checkout has no instructions.",
-        }).to_string())
-    }
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn bootstrap_mcp_refuses_without_reading_instruction_files() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().canonicalize().unwrap();
-    let server = BlackboxServer::new(std::sync::Arc::new(
-        crate::server::state::SharedState::for_test(&root),
-    ));
-    let result = server
-        .bbox_bootstrap(Parameters(BootstrapParams {
-            project: root
-                .join("unavailable-checkout")
-                .to_string_lossy()
-                .into_owned(),
-        }))
-        .await;
-    assert_eq!(result.is_error, Some(true));
-    let response: serde_json::Value =
-        serde_json::from_str(&result.content[0].as_text().unwrap().text).unwrap();
-    assert_eq!(response["error"], "error.bootstrap_retired");
-    assert_eq!(response["replacement"]["tool"], "bbox_hybrid_search");
-    assert_eq!(response["expand"]["tool"], "bbox_inspect_entity");
-    assert!(!root.join("unavailable-checkout").exists());
 }
 
 #[cfg(test)]
@@ -584,11 +417,11 @@ mod tests {
     use super::*;
     use bbox_corpus_core::identity::PublishedScope;
     use bbox_corpus_core::project_record::ResolvedCheckoutScope;
-    use bbox_knowledge::knowledge::{Approval, Category, KnowledgeEntry, Priority, Scope, Status};
+    use bbox_knowledge::knowledge::{Category, KnowledgeEntry, Priority, Scope};
     use bbox_knowledge::overlay::{
         OverlayKey, OverlaySnapshot, OverlayStatus, OverlayValue, provisional_entity_ref,
     };
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::Arc;
@@ -661,24 +494,13 @@ mod tests {
             title: id.into(),
             content,
             cluster: None,
-            variants: HashMap::new(),
             category: Category::Memory,
             scope: Scope::Project,
             project: None,
             project_id: None,
             providers: Vec::new(),
             priority: Priority::Standard,
-            weight: 100,
-            status: Status::Active,
-            approval: Approval::Imported,
             render: true,
-            decay: false,
-            review_at: None,
-            supersedes: None,
-            links: Vec::new(),
-            rationale: None,
-            expires_at: None,
-            source: "test".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
             recall_count: 0,
@@ -912,111 +734,6 @@ mod tests {
             }
         }
     }
-
-    #[test]
-    fn read_only_knowledge_consumers_share_session_visibility() {
-        let temp = tempfile::tempdir().unwrap();
-        let fixture = visibility_fixture(&temp);
-        let list = ReviewParams {
-            project: None,
-            action: Some("list".into()),
-            id: None,
-            ..Default::default()
-        };
-
-        let lint = fixture.server.lint_session_knowledge().unwrap();
-        assert!(lint.contains("1 unverified"), "{lint}");
-        assert!(!lint.contains("2 unverified"), "{lint}");
-
-        let review = fixture.server.review_session_knowledge(&list).unwrap();
-        assert!(review.contains(&fixture.own_ref), "{review}");
-        assert!(review.contains("OWN_REVIEW"), "{review}");
-        assert!(!review.contains(&fixture.peer_ref), "{review}");
-        assert!(!review.contains("PEER_REVIEW"), "{review}");
-
-        let absorb = fixture
-            .server
-            .absorb_session_knowledge(&AbsorbParams {
-                project: Some(fixture.project.to_string_lossy().into_owned()),
-                scope: Some("project".into()),
-            })
-            .unwrap();
-        assert!(absorb.contains("no-op"), "{absorb}");
-
-        let bootstrap = fixture
-            .server
-            .bootstrap_session_knowledge(&BootstrapParams {
-                project: fixture.project.to_string_lossy().into_owned(),
-            })
-            .unwrap();
-        assert!(
-            bootstrap.contains("1 active project-scoped entries"),
-            "{bootstrap}"
-        );
-
-        let published_server = BlackboxServer::new(fixture.state.clone());
-        let published = published_server.review_session_knowledge(&list).unwrap();
-        let published_json: serde_json::Value = serde_json::from_str(&published).unwrap();
-        assert_eq!(published_json["total"], 1);
-        assert!(published.contains("PUBLISHED_REVIEW"), "{published}");
-        assert!(!published.contains("OWN_REVIEW"), "{published}");
-        assert!(!published.contains("PEER_REVIEW"), "{published}");
-    }
-
-    #[test]
-    fn read_only_knowledge_consumers_fail_consistently_on_invalid_own_overlay() {
-        let temp = tempfile::tempdir().unwrap();
-        let fixture = visibility_fixture(&temp);
-        fixture
-            .state
-            .knowledge_overlays
-            .write()
-            .publish(OverlaySnapshot {
-                snapshot_id: "invalid-own-snapshot".into(),
-                key: OverlayKey {
-                    published_scope: fixture.scope.clone(),
-                    checkout_id: fixture.own_checkout.checkout_id.clone(),
-                },
-                stamp: None,
-                status: OverlayStatus::Invalid,
-                values: BTreeMap::new(),
-                diagnostics: vec!["malformed own entry".into()],
-            });
-        let project = fixture.project.to_string_lossy().into_owned();
-        let errors = vec![
-            fixture.server.lint_session_knowledge().unwrap_err(),
-            fixture
-                .server
-                .review_session_knowledge(&ReviewParams {
-                    project: None,
-                    action: Some("list".into()),
-                    id: None,
-                    ..Default::default()
-                })
-                .unwrap_err(),
-            fixture
-                .server
-                .absorb_session_knowledge(&AbsorbParams {
-                    project: Some(project.clone()),
-                    scope: Some("project".into()),
-                })
-                .unwrap_err(),
-            fixture
-                .server
-                .bootstrap_session_knowledge(&BootstrapParams {
-                    project: project.clone(),
-                })
-                .unwrap_err(),
-        ];
-        for error in errors {
-            assert!(
-                error
-                    .to_string()
-                    .contains("own checkout overlay is invalid"),
-                "{error:#}"
-            );
-        }
-    }
 }
 
 /// Catalog-mode render tests (plan section 13.5).
@@ -1024,7 +741,7 @@ mod tests {
 mod catalog_render_tests {
     use super::*;
     use crate::server::state::catalog_fixture::{COMMIT_ONE, CatalogFixture};
-    use bbox_knowledge::knowledge::{Approval, Category, Priority, Scope, Status};
+    use bbox_knowledge::knowledge::{Category, Priority, Scope};
     use rmcp::handler::server::wrapper::Parameters;
 
     const PROJECT: &str = "p_000000000000000000000000000000a1";
@@ -1045,24 +762,13 @@ mod catalog_render_tests {
             title: "Project render locality".into(),
             content: "DAEMON_RENDER_LOCALITY_MARKER".into(),
             cluster: None,
-            variants: Default::default(),
             category: Category::Convention,
             scope: Scope::Project,
             project: None,
             project_id: Some(PROJECT.into()),
             providers: vec![],
             priority: Priority::Standard,
-            weight: 100,
-            status: Status::Active,
-            approval: Approval::UserConfirmed,
             render: true,
-            decay: false,
-            review_at: None,
-            supersedes: None,
-            links: vec![],
-            rationale: None,
-            expires_at: None,
-            source: "test".into(),
             created_at: "2026-08-09T00:00:00Z".into(),
             updated_at: "2026-08-09T00:00:00Z".into(),
             recall_count: 0,

@@ -641,8 +641,10 @@ fn inspect_repo_owned_files(
                 continue;
             }
         };
-        let parsed: KnowledgeEntry = match serde_json::from_slice(&bytes) {
-            Ok(parsed) => parsed,
+        let parsed = match KnowledgeEntry::from_stored_slice(&bytes) {
+            Ok(Some(parsed)) => parsed,
+            // A retired record is not an entry: loading skips it too.
+            Ok(None) => continue,
             Err(err) => {
                 quarantined.push(QuarantinedKnowledgeFile {
                     project: project.clone(),
@@ -724,7 +726,7 @@ fn row(entry: &KnowledgeEntry, reason: QuarantineReason) -> QuarantineRow {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::knowledge::{Approval, Category, Priority, Scope, Status};
+    use crate::knowledge::{Category, Priority, Scope};
     use crate::repo_io::test_support::TestKnowledgeRepoIo;
     use std::path::{Path, PathBuf};
 
@@ -774,24 +776,13 @@ mod tests {
             title: "t".into(),
             content: "c".into(),
             cluster: None,
-            variants: Default::default(),
             category: Category::Convention,
             scope: Scope::Project,
             project: project.map(str::to_string),
             project_id: None,
             providers: vec![],
             priority: Priority::Standard,
-            weight: 100,
-            status: Status::Active,
-            approval: Approval::UserConfirmed,
             render: true,
-            decay: true,
-            review_at: None,
-            supersedes: None,
-            links: vec![],
-            rationale: None,
-            expires_at: None,
-            source: "test".into(),
             created_at: "2026-01-01".into(),
             updated_at: "2026-01-01".into(),
             recall_count: 0,

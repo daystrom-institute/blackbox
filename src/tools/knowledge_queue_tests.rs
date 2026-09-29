@@ -1,5 +1,5 @@
 use super::*;
-use crate::knowledge::{Approval, KnowledgeEntry, ReviewParams, Status};
+use crate::knowledge::KnowledgeEntry;
 use crate::server::state::catalog_fixture::{CatalogFixture, knowledge_entry};
 use bbox_corpus_core::identity::PublishedScope;
 
@@ -107,13 +107,16 @@ fn learn(id: Option<&str>, content: &str) -> LearnParams {
     }
 }
 
-fn link(target: &str) -> KnowledgeLinkParams {
-    serde_json::from_value(json!({
-        "source": format!("knowledge:{ENTRY}"),
-        "target": target,
-        "kind": "RelatesTo"
-    }))
-    .unwrap()
+/// An id-addressed update through the checkout owner: the entry's owner
+/// comes from the served entry, not a project selector.
+fn update_by_id(
+    server: &BlackboxServer,
+    id: &str,
+    content: &str,
+) -> anyhow::Result<Option<(String, String)>> {
+    let mut params = learn(Some(id), content);
+    params.project = None;
+    server.enqueue_learn_update_by_id_via_checkout_owner(&params, id)
 }
 
 fn latest(server: &BlackboxServer, scope: &PublishedScope, id: &str) -> KnowledgeEntry {
@@ -143,126 +146,6 @@ fn serialized_text(result: &CallToolResult) -> (usize, String) {
 }
 
 #[tokio::test]
-async fn review_rejects_read_fields_before_checkout_owner_admission() {
-    let (_fixture, server, _scope) = fixture();
-    for action in ["approve", "reject"] {
-        for value in [
-            json!({"action":action,"id":ENTRY,"project":PROJECT,"cursor":"invalid"}),
-            json!({"action":action,"id":ENTRY,"project":PROJECT,"limit":128}),
-            json!({"action":action,"id":"","project":PROJECT}),
-        ] {
-            let params: ReviewParams = serde_json::from_value(value).unwrap();
-            let result = server.bbox_review(Parameters(params)).await;
-            assert_eq!(result.is_error, Some(true), "{result:?}");
-            assert_eq!(
-                server
-                    .state
-                    .checkout_mutations
-                    .read()
-                    .outstanding_writes()
-                    .count(),
-                0
-            );
-        }
-    }
-}
-
-#[tokio::test]
-async fn review_list_serialized_envelope_bounds_worst_case_escaping() {
-    let (fixture, scope) = published_fixture();
-    let entries: Vec<_> = (0..100)
-        .map(|index| {
-            let id = format!("{index:016x}");
-            let mut entry = knowledge_entry(&id, &"\"escaped\"\t".repeat(256));
-            entry.title = "\"title\"\n".repeat(128);
-            entry.approval = Approval::AgentInferred;
-            entry
-        })
-        .collect();
-    fixture.install_publication(PROJECT, &scope, &"2".repeat(40), &entries, &[]);
-    let server = queue_server(&fixture);
-    let result = server
-        .bbox_review(Parameters(ReviewParams {
-            action: Some("list".into()),
-            limit: Some(100),
-            ..Default::default()
-        }))
-        .await;
-    assert_ne!(result.is_error, Some(true), "{result:?}");
-    let (wire_bytes, text) = serialized_text(&result);
-    assert!(
-        wire_bytes <= BlackboxServer::MCP_RESPONSE_CAP_BYTES,
-        "serialized review list was {wire_bytes} bytes"
-    );
-    let reply: serde_json::Value = serde_json::from_str(&text).unwrap();
-    let first_count = reply["rows"].as_array().unwrap().len();
-    assert!(first_count > 0 && first_count < 100);
-    assert_eq!(reply["next_offset"], first_count);
-    let mut recovered = first_count;
-    let mut cursor = reply["next_cursor"].as_str().map(str::to_owned);
-    while cursor.is_some() {
-        let page = server
-            .bbox_review(Parameters(ReviewParams {
-                action: Some("list".into()),
-                limit: Some(100),
-                cursor,
-                ..Default::default()
-            }))
-            .await;
-        assert_ne!(page.is_error, Some(true));
-        let (bytes, text) = serialized_text(&page);
-        assert!(bytes <= BlackboxServer::MCP_RESPONSE_CAP_BYTES);
-        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
-        recovered += value["rows"].as_array().unwrap().len();
-        cursor = value["next_cursor"].as_str().map(str::to_owned);
-    }
-    assert_eq!(recovered, 100);
-    for row in reply["rows"].as_array().unwrap() {
-        assert!(row["title_preview"].as_str().unwrap().len() < 192);
-        assert!(row["content_preview"].as_str().unwrap().len() < 192);
-    }
-}
-
-#[tokio::test]
-async fn review_exact_serialized_envelope_pages_one_huge_record() {
-    let (fixture, scope) = published_fixture();
-    let mut entry = knowledge_entry(ENTRY, &"\"escaped content\"\t".repeat(4_000));
-    entry.title = "\"escaped title\"\n".repeat(2_000);
-    entry.approval = Approval::AgentInferred;
-    fixture.install_publication(PROJECT, &scope, &"2".repeat(40), &[entry.clone()], &[]);
-    let server = queue_server(&fixture);
-    let mut params = ReviewParams {
-        action: Some("get".into()),
-        id: Some(ENTRY.into()),
-        limit: Some(257),
-        ..Default::default()
-    };
-    let first = server.bbox_review(Parameters(params.clone())).await;
-    assert_ne!(first.is_error, Some(true), "{first:?}");
-    let (wire_bytes, text) = serialized_text(&first);
-    assert!(
-        wire_bytes <= BlackboxServer::MCP_RESPONSE_CAP_BYTES,
-        "serialized exact review page was {wire_bytes} bytes"
-    );
-    let first: serde_json::Value = serde_json::from_str(&text).unwrap();
-    let mut reconstructed = first["body"]["text"].as_str().unwrap().to_string();
-    let mut cursor = first["next_cursor"].as_str().map(str::to_string);
-    while let Some(active_cursor) = cursor {
-        params.cursor = Some(active_cursor);
-        let page = server.bbox_review(Parameters(params.clone())).await;
-        assert_ne!(page.is_error, Some(true), "{page:?}");
-        let (wire_bytes, text) = serialized_text(&page);
-        assert!(wire_bytes <= BlackboxServer::MCP_RESPONSE_CAP_BYTES);
-        let page: serde_json::Value = serde_json::from_str(&text).unwrap();
-        reconstructed.push_str(page["body"]["text"].as_str().unwrap());
-        cursor = page["next_cursor"].as_str().map(str::to_string);
-    }
-    let recovered: KnowledgeEntry = serde_json::from_str(&reconstructed).unwrap();
-    assert_eq!(recovered.title, entry.title);
-    assert_eq!(recovered.content, entry.content);
-}
-
-#[tokio::test]
 async fn queued_knowledge_edits_compose_before_and_after_delivery_and_publication() {
     let (fixture, server, scope) = fixture();
     let result = server
@@ -271,11 +154,13 @@ async fn queued_knowledge_edits_compose_before_and_after_delivery_and_publicatio
     assert_ne!(result.is_error, Some(true), "{result:?}");
     let restarted = queue_server(&fixture);
     assert_eq!(latest(&restarted, &scope, ENTRY).content, "queued content");
-    let result = server
-        .bbox_knowledge_link(Parameters(link("knowledge:1111111111111111")))
-        .await;
+    let mut params = learn(Some(ENTRY), "queued content");
+    params.render = Some(false);
+    let result = server.bbox_learn(Parameters(params)).await;
     assert_ne!(result.is_error, Some(true), "{result:?}");
-    assert_eq!(latest(&fixture.server(), &scope, ENTRY).links.len(), 1);
+    let queued = latest(&fixture.server(), &scope, ENTRY);
+    assert_eq!(queued.content, "queued content");
+    assert!(!queued.render);
     let rows = server
         .state
         .checkout_mutations
@@ -296,12 +181,12 @@ async fn queued_knowledge_edits_compose_before_and_after_delivery_and_publicatio
             )
             .unwrap();
     }
-    server
-        .enqueue_link_via_checkout_owner(&link("knowledge:2222222222222222"))
+    update_by_id(&server, ENTRY, "delivered content")
+        .unwrap()
         .unwrap();
     let entry = latest(&server, &scope, ENTRY);
-    assert_eq!(entry.content, "queued content");
-    assert_eq!(entry.links.len(), 2);
+    assert_eq!(entry.content, "delivered content");
+    assert!(!entry.render, "an update composes on the delivered write");
     publish(&fixture, &server, &scope, "2", &[entry.clone()]);
     server
         .session_knowledge_view(Some(PROJECT), Some("published"))
@@ -317,11 +202,17 @@ async fn queued_knowledge_edits_compose_before_and_after_delivery_and_publicatio
     );
     let mut external = entry;
     external.content = "later publication".into();
+    external.render = true;
     publish(&fixture, &server, &scope, "3", &[external]);
-    server
-        .enqueue_link_via_checkout_owner(&link("knowledge:3333333333333333"))
+    update_by_id(&server, ENTRY, "after later publication")
+        .unwrap()
         .unwrap();
-    assert_eq!(latest(&server, &scope, ENTRY).content, "later publication");
+    let updated = latest(&server, &scope, ENTRY);
+    assert_eq!(updated.content, "after later publication");
+    assert!(
+        updated.render,
+        "the update starts from the later publication"
+    );
 }
 
 #[tokio::test]
@@ -330,20 +221,19 @@ async fn queued_knowledge_preserves_the_complete_canonical_entry() {
     let mut entry = knowledge_entry(ENTRY, "complete");
     entry.project_id = Some(PROJECT.into());
     entry.cluster = Some("cluster".into());
-    entry.variants.insert("provider".into(), "variant".into());
     entry.providers = vec!["provider".into()];
-    entry.review_at = Some("2027-01-01".into());
-    entry.expires_at = Some("2028-01-01".into());
-    entry.rationale = Some("rationale".into());
-    entry.supersedes = Some("1111111111111111".into());
-    entry.weight = 83;
-    entry.approval = Approval::AgentInferred;
+    entry.priority = crate::knowledge::Priority::Critical;
+    entry.render = false;
     publish(&fixture, &server, &scope, "2", &[entry.clone()]);
     server
-        .enqueue_review_via_checkout_owner("approve", ENTRY, None)
+        .mutate_queued_knowledge(PROJECT, scope.clone(), "touch", |transaction| {
+            let mut entry = transaction.entry(ENTRY)?;
+            entry.updated_at = bbox_util::util::now_iso();
+            transaction.stage(&entry, false)?;
+            Ok("touched".into())
+        })
         .unwrap();
     let updated = latest(&server, &scope, ENTRY);
-    entry.approval = Approval::UserConfirmed;
     entry.updated_at = updated.updated_at.clone();
     assert_eq!(
         crate::knowledge::committed_knowledge_entry_bytes(&updated).unwrap(),
@@ -390,9 +280,7 @@ async fn queued_knowledge_refuses_publication_conflicts_and_retries_capture_race
         &[knowledge_entry(ENTRY, "conflicting publication")],
     );
     let count = server.state.checkout_mutations.read().pending_count();
-    let error = server
-        .enqueue_link_via_checkout_owner(&link("knowledge:1111111111111111"))
-        .unwrap_err();
+    let error = update_by_id(&server, ENTRY, "conflicting update").unwrap_err();
     assert!(
         error.to_string().contains("checkout_mutation_conflict"),
         "{error:#}"
@@ -418,7 +306,6 @@ async fn queued_knowledge_delete_is_a_tombstone_until_publication() {
         .bbox_forget(Parameters(ForgetParams {
             project: None,
             id: ENTRY.into(),
-            superseded_by: None,
         }))
         .await;
     assert_ne!(result.is_error, Some(true), "{result:?}");
@@ -444,16 +331,7 @@ async fn queued_knowledge_delete_is_a_tombstone_until_publication() {
             )
             .unwrap();
     }
-    assert!(
-        restarted
-            .enqueue_link_via_checkout_owner(&link("knowledge:1111111111111111"))
-            .is_err()
-    );
-    assert!(
-        restarted
-            .enqueue_review_via_checkout_owner("approve", ENTRY, None)
-            .is_err()
-    );
+    assert!(update_by_id(&restarted, ENTRY, "resurrect by id").is_err());
     assert!(
         restarted
             .enqueue_learn_via_checkout_owner(
@@ -515,8 +393,7 @@ async fn queued_knowledge_scope_and_id_ambiguity_never_cross_project_boundaries(
     assert_eq!(latest(&server, &scope, ENTRY).content, "first scope");
     assert_eq!(latest(&server, &other_scope, ENTRY).content, "second scope");
     assert!(
-        server
-            .enqueue_link_via_checkout_owner(&link("knowledge:1111111111111111"))
+        update_by_id(&server, ENTRY, "ambiguous owner")
             .unwrap_err()
             .to_string()
             .contains("multiple projects")
@@ -536,77 +413,73 @@ async fn queued_knowledge_scope_and_id_ambiguity_never_cross_project_boundaries(
 }
 
 #[tokio::test]
-async fn queued_knowledge_supersession_validates_both_records_before_admission() {
-    let (fixture, scope) = published_fixture();
-    let other_scope = CatalogFixture::scope("other");
-    fixture.add_published_project("p_other", &other_scope);
-    fixture.install_publication(
-        "p_other",
-        &other_scope,
-        &"2".repeat(40),
-        &[knowledge_entry("2222222222222222", "foreign")],
-        &[],
-    );
-    let server = queue_server(&fixture);
-    assert_eq!(
-        server.covered_scope_for_project_id("p_other"),
-        Some(other_scope),
-    );
-    let mut params = DecideParams {
-        content: "replacement".into(),
-        rationale: "justification".into(),
-        supersedes: Some("2222222222222222".into()),
-        ..Default::default()
-    };
+async fn queued_knowledge_oversized_content_is_refused_before_admission() {
+    let (_fixture, server, scope) = fixture();
+    let oversized = "x".repeat(bbox_code_source::MAX_CHECKOUT_MUTATION_CONTENT_BYTES + 1);
     assert!(
         server
-            .enqueue_decide_via_checkout_owner(&params, PROJECT, PROJECT, scope.clone())
+            .enqueue_learn_via_checkout_owner(
+                &learn(None, &oversized),
+                PROJECT,
+                PROJECT,
+                scope.clone()
+            )
+            .is_err()
+    );
+    assert!(
+        server
+            .enqueue_learn_via_checkout_owner(
+                &learn(Some(ENTRY), &oversized),
+                PROJECT,
+                PROJECT,
+                scope.clone()
+            )
             .is_err()
     );
     assert_eq!(server.state.checkout_mutations.read().pending_count(), 0);
-    params.supersedes = Some(ENTRY.into());
-    params.content = "x".repeat(bbox_code_source::MAX_CHECKOUT_MUTATION_CONTENT_BYTES + 1);
-    assert!(
-        server
-            .enqueue_decide_via_checkout_owner(&params, PROJECT, PROJECT, scope.clone())
-            .is_err()
-    );
-    assert_eq!(server.state.checkout_mutations.read().pending_count(), 0);
-    params.content = "replacement".into();
     server
-        .enqueue_decide_via_checkout_owner(&params, PROJECT, PROJECT, scope.clone())
+        .enqueue_learn_via_checkout_owner(
+            &learn(Some(ENTRY), "bounded"),
+            PROJECT,
+            PROJECT,
+            scope.clone(),
+        )
         .unwrap();
-    let old = latest(&server, &scope, ENTRY);
-    assert_eq!(old.status, Status::Superseded);
-    let replacement = latest(&server, &scope, old.supersedes.as_deref().unwrap());
-    assert_eq!(replacement.content, "replacement");
-    assert_eq!(server.state.checkout_mutations.read().pending_count(), 2);
+    assert_eq!(latest(&server, &scope, ENTRY).content, "bounded");
+    assert_eq!(server.state.checkout_mutations.read().pending_count(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn queued_knowledge_concurrent_links_compose_and_duplicate_links_do_not_enqueue() {
+async fn queued_knowledge_concurrent_creates_mint_distinct_records() {
     let (_fixture, server, scope) = fixture();
     let mut tasks = Vec::new();
     for index in 0..12 {
         let server = server.clone();
+        let scope = scope.clone();
         tasks.push(tokio::task::spawn_blocking(move || {
             server
-                .enqueue_link_via_checkout_owner(&link(&format!("knowledge:{index:016x}")))
+                .enqueue_learn_via_checkout_owner(
+                    &learn(None, &format!("concurrent {index}")),
+                    PROJECT,
+                    PROJECT,
+                    scope,
+                )
                 .unwrap();
         }));
     }
     for task in tasks {
         task.await.unwrap();
     }
-    assert_eq!(latest(&server, &scope, ENTRY).links.len(), 12);
-    let count = server.state.checkout_mutations.read().pending_count();
-    server
-        .enqueue_link_via_checkout_owner(&link("knowledge:0000000000000000"))
-        .unwrap();
-    assert_eq!(
-        server.state.checkout_mutations.read().pending_count(),
-        count
-    );
+    let paths = server
+        .state
+        .checkout_mutations
+        .read()
+        .outstanding_writes()
+        .filter(|row| row.mutation.scope == scope)
+        .map(|row| row.mutation.relative_path.clone())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(paths.len(), 12);
+    assert_eq!(server.state.checkout_mutations.read().pending_count(), 12);
 }
 
 #[tokio::test]
@@ -639,19 +512,13 @@ async fn queued_knowledge_genesis_and_id_addressed_updates_survive_restart() {
         "id addressed"
     );
     let result = server
-        .bbox_review(Parameters(ReviewParams {
+        .bbox_forget(Parameters(ForgetParams {
             project: None,
-            action: Some("reject".into()),
-            id: Some(id.into()),
-            ..Default::default()
+            id: id.into(),
         }))
         .await;
     assert_ne!(result.is_error, Some(true), "{result:?}");
-    assert!(
-        queue_server(&fixture)
-            .enqueue_review_via_checkout_owner("approve", id, None)
-            .is_err()
-    );
+    assert!(update_by_id(&queue_server(&fixture), id, "after delete").is_err());
 }
 
 #[tokio::test]
@@ -702,14 +569,19 @@ async fn queued_knowledge_unrelated_broken_publication_preserves_known_global_au
                 scope: Some("global".into()),
                 ..Default::default()
             },
-            false,
             None,
             None,
         )
         .unwrap();
-    let mut params = link("knowledge:1111111111111111");
-    params.source = format!("knowledge:{}", global.id);
-    let result = server.bbox_knowledge_link(Parameters(params)).await;
+    let result = server
+        .bbox_learn(Parameters(LearnParams {
+            id: Some(global.id.clone()),
+            content: "global rule updated".into(),
+            category: "convention".into(),
+            scope: Some("global".into()),
+            ..Default::default()
+        }))
+        .await;
     assert_ne!(result.is_error, Some(true), "{result:?}");
     assert_eq!(server.state.checkout_mutations.read().pending_count(), 0);
     server
@@ -724,11 +596,7 @@ async fn queued_knowledge_unrelated_broken_publication_preserves_known_global_au
         latest(&server, &scope, ENTRY).content,
         "explicit healthy project"
     );
-    assert!(
-        server
-            .enqueue_review_via_checkout_owner("approve", "unknown", None)
-            .is_err()
-    );
+    assert!(update_by_id(&server, "unknown", "unknown owner").is_err());
 }
 
 #[tokio::test]
@@ -758,7 +626,6 @@ async fn queued_knowledge_genesis_delete_does_not_retire_on_preexisting_absence(
         .enqueue_forget_via_checkout_owner(&ForgetParams {
             project: None,
             id: created.id.clone(),
-            superseded_by: None,
         })
         .unwrap();
     publish(&fixture, &server, &scope, "1", &[]);
@@ -774,11 +641,7 @@ async fn queued_knowledge_genesis_delete_does_not_retire_on_preexisting_absence(
             .count(),
         2
     );
-    assert!(
-        server
-            .enqueue_review_via_checkout_owner("approve", &created.id, None)
-            .is_err()
-    );
+    assert!(update_by_id(&server, &created.id, "after delete").is_err());
     publish(&fixture, &server, &scope, "2", &[created.clone()]);
     server
         .session_knowledge_view(Some(PROJECT), Some("published"))
@@ -792,11 +655,7 @@ async fn queued_knowledge_genesis_delete_does_not_retire_on_preexisting_absence(
             .count(),
         1
     );
-    assert!(
-        server
-            .enqueue_review_via_checkout_owner("approve", &created.id, None)
-            .is_err()
-    );
+    assert!(update_by_id(&server, &created.id, "after delete").is_err());
     let rows = server
         .state
         .checkout_mutations
@@ -868,7 +727,6 @@ async fn queued_knowledge_acknowledged_create_delete_survives_delayed_publicatio
         .bbox_forget(Parameters(ForgetParams {
             id: created.id.clone(),
             project: Some(PROJECT.into()),
-            superseded_by: None,
         }))
         .await;
     assert_ne!(result.is_error, Some(true), "{result:?}");
@@ -913,7 +771,10 @@ async fn queued_knowledge_acknowledged_create_delete_survives_delayed_publicatio
     );
     assert!(
         server
-            .enqueue_review_via_checkout_owner("approve", &created.id, Some(PROJECT))
+            .enqueue_forget_via_checkout_owner(&ForgetParams {
+                id: created.id.clone(),
+                project: Some(PROJECT.into()),
+            })
             .is_err()
     );
     publish(&fixture, &server, &scope, "2", &[created.clone()]);
@@ -931,7 +792,10 @@ async fn queued_knowledge_acknowledged_create_delete_survives_delayed_publicatio
     );
     assert!(
         server
-            .enqueue_review_via_checkout_owner("approve", &created.id, Some(PROJECT))
+            .enqueue_forget_via_checkout_owner(&ForgetParams {
+                id: created.id.clone(),
+                project: Some(PROJECT.into()),
+            })
             .is_err()
     );
     publish(&fixture, &server, &scope, "3", &[]);
@@ -950,7 +814,7 @@ async fn queued_knowledge_acknowledged_create_delete_survives_delayed_publicatio
 }
 
 #[tokio::test]
-async fn queued_knowledge_explicit_owner_isolates_review_link_and_forget_from_broken_projects() {
+async fn queued_knowledge_explicit_owner_isolates_update_and_forget_from_broken_projects() {
     let (fixture, scope) = published_fixture();
     let broken_scope = CatalogFixture::scope("broken");
     fixture.add_published_project("p_broken", &broken_scope);
@@ -978,14 +842,12 @@ async fn queued_knowledge_explicit_owner_isolates_review_link_and_forget_from_br
                 scope: Some("global".into()),
                 ..Default::default()
             },
-            false,
             None,
             None,
         )
         .unwrap();
     assert!(
-        server
-            .enqueue_link_via_checkout_owner(&link("knowledge:1111111111111111"))
+        update_by_id(&server, ENTRY, "ambiguous owner")
             .unwrap_err()
             .to_string()
             .contains("multiple projects")
@@ -994,45 +856,33 @@ async fn queued_knowledge_explicit_owner_isolates_review_link_and_forget_from_br
     server.invalidate_catalog_published_content(
         &bbox_corpus_core::project_catalog::ProjectId::parse("p_broken").unwrap(),
     );
-    let ambiguous = server
-        .bbox_review(Parameters(ReviewParams {
-            id: Some(ENTRY.into()),
-            action: Some("approve".into()),
-            project: None,
-            ..Default::default()
-        }))
-        .await;
+    let mut ambiguous = learn(Some(ENTRY), "unscoped update");
+    ambiguous.project = None;
+    let ambiguous = server.bbox_learn(Parameters(ambiguous)).await;
     assert_eq!(ambiguous.is_error, Some(true));
     assert!(format!("{ambiguous:?}").contains("pass project"));
     assert!(
         server
-            .enqueue_link_via_checkout_owner(&link("knowledge:1111111111111111"))
-            .is_err()
-    );
-    assert!(
-        server
             .enqueue_forget_via_checkout_owner(&ForgetParams {
                 id: ENTRY.into(),
-                superseded_by: None,
                 project: None,
             })
             .is_err()
     );
     assert_eq!(server.state.checkout_mutations.read().pending_count(), 0);
     let mismatch = server
-        .bbox_review(Parameters(ReviewParams {
-            id: Some(global.id.clone()),
-            action: Some("approve".into()),
+        .bbox_forget(Parameters(ForgetParams {
+            id: global.id.clone(),
             project: Some(PROJECT.into()),
-            ..Default::default()
         }))
         .await;
     assert_eq!(mismatch.is_error, Some(true));
     let local = server
-        .bbox_review(Parameters(ReviewParams {
-            id: Some(global.id),
-            action: Some("approve".into()),
-            project: None,
+        .bbox_learn(Parameters(LearnParams {
+            id: Some(global.id.clone()),
+            content: "global owner updated".into(),
+            category: "convention".into(),
+            scope: Some("global".into()),
             ..Default::default()
         }))
         .await;
@@ -1040,41 +890,35 @@ async fn queued_knowledge_explicit_owner_isolates_review_link_and_forget_from_br
     assert_eq!(server.state.checkout_mutations.read().pending_count(), 0);
     for selector in ["p_broken", "p_nonexistent"] {
         let result = server
-            .bbox_review(Parameters(ReviewParams {
-                id: Some(ENTRY.into()),
-                action: Some("approve".into()),
+            .bbox_forget(Parameters(ForgetParams {
+                id: ENTRY.into(),
                 project: Some(selector.into()),
-                ..Default::default()
             }))
             .await;
         assert_eq!(result.is_error, Some(true));
     }
     assert_eq!(server.state.checkout_mutations.read().pending_count(), 0);
     let result = server
-        .bbox_review(Parameters(ReviewParams {
-            id: Some(ENTRY.into()),
-            action: Some("approve".into()),
-            project: Some(PROJECT.into()),
-            ..Default::default()
-        }))
+        .bbox_learn(Parameters(learn(Some(ENTRY), "explicit owner update")))
         .await;
     assert_ne!(result.is_error, Some(true), "{result:?}");
-    let mut params = link("knowledge:1111111111111111");
-    params.project = Some(PROJECT.into());
-    let result = server.bbox_knowledge_link(Parameters(params)).await;
-    assert_ne!(result.is_error, Some(true), "{result:?}");
-    assert_eq!(latest(&server, &scope, ENTRY).links.len(), 1);
+    assert_eq!(
+        latest(&server, &scope, ENTRY).content,
+        "explicit owner update"
+    );
     let result = server
         .bbox_forget(Parameters(ForgetParams {
             id: ENTRY.into(),
-            superseded_by: None,
             project: Some(PROJECT.into()),
         }))
         .await;
     assert_ne!(result.is_error, Some(true), "{result:?}");
     assert!(
         server
-            .enqueue_review_via_checkout_owner("approve", ENTRY, Some(PROJECT))
+            .enqueue_forget_via_checkout_owner(&ForgetParams {
+                id: ENTRY.into(),
+                project: Some(PROJECT.into()),
+            })
             .is_err()
     );
     let restarted = queue_server(&fixture);
@@ -1084,41 +928,43 @@ async fn queued_knowledge_explicit_owner_isolates_review_link_and_forget_from_br
         .read()
         .poll(&BTreeSet::from([scope.clone(), broken_scope]), false)
         .mutations;
-    assert_eq!(rows.len(), 3);
+    assert_eq!(rows.len(), 2);
     assert!(rows.iter().all(|row| row.scope == scope));
     assert_eq!(rows.last().unwrap().mode, "delete");
 }
-
 #[tokio::test]
-async fn queued_knowledge_create_receipts_durably_admit_remember_and_decide() {
-    let (fixture, server, scope) = fixture();
-    let result = server
-        .bbox_remember(Parameters(RememberParams {
-            content: "queued memory".into(),
-            scope: Some("project".into()),
-            project: Some(PROJECT.into()),
-            ..Default::default()
-        }))
-        .await;
+async fn queued_knowledge_create_receipts_durably_admit_recall_entries_and_deletes() {
+    let (fixture, server, _scope) = fixture();
+    let mut recall = learn(None, "queued memory");
+    recall.category = "memory".into();
+    recall.render = Some(false);
+    let result = server.bbox_learn(Parameters(recall)).await;
     assert_ne!(result.is_error, Some(true), "{result:?}");
     let restarted = fixture.server();
     assert_eq!(restarted.state.checkout_mutations.read().pending_count(), 1);
+    let queued = restarted
+        .state
+        .checkout_mutations
+        .read()
+        .outstanding_writes()
+        .map(|row| {
+            serde_json::from_str::<KnowledgeEntry>(row.mutation.content_json.as_deref().unwrap())
+                .unwrap()
+        })
+        .next()
+        .unwrap();
+    assert!(!queued.render);
+    assert_eq!(queued.category, crate::knowledge::Category::Memory);
     let result = server
-        .bbox_decide(Parameters(DecideParams {
-            content: "queued decision".into(),
-            rationale: "paired durable admission".into(),
-            supersedes: Some(ENTRY.into()),
-            scope: Some("project".into()),
+        .bbox_forget(Parameters(ForgetParams {
+            id: ENTRY.into(),
             project: Some(PROJECT.into()),
-            ..Default::default()
         }))
         .await;
     assert_ne!(result.is_error, Some(true), "{result:?}");
     let restarted = fixture.server();
-    assert_eq!(restarted.state.checkout_mutations.read().pending_count(), 3);
-    assert_eq!(latest(&restarted, &scope, ENTRY).status, Status::Superseded);
+    assert_eq!(restarted.state.checkout_mutations.read().pending_count(), 2);
 }
-
 #[tokio::test]
 async fn queued_knowledge_broken_queue_does_not_block_durable_global_mutations() {
     let (fixture, mut server, _scope) = fixture();
@@ -1172,10 +1018,11 @@ async fn queued_knowledge_broken_queue_does_not_block_durable_global_mutations()
             .any(|entry| entry.content == "updated durable global")
     );
     let result = server
-        .bbox_decide(Parameters(DecideParams {
-            content: "durable global decision".into(),
-            rationale: "keep local authority independent".into(),
+        .bbox_learn(Parameters(LearnParams {
+            content: "durable global recall".into(),
+            category: "memory".into(),
             scope: Some("global".into()),
+            render: Some(false),
             ..Default::default()
         }))
         .await;
@@ -1188,40 +1035,12 @@ async fn queued_knowledge_broken_queue_does_not_block_durable_global_mutations()
             .read()
             .all_entries()
             .iter()
-            .any(|entry| entry.content == "durable global decision")
+            .any(|entry| entry.content == "durable global recall" && !entry.render)
     );
-    let mut params = link("knowledge:1111111111111111");
-    params.source = global.id.clone();
-    let result = server.bbox_knowledge_link(Parameters(params)).await;
-    assert_ne!(result.is_error, Some(true), "{result:?}");
-    assert_eq!(
-        fixture
-            .server()
-            .state
-            .kb
-            .read()
-            .all_entries()
-            .iter()
-            .find(|entry| entry.id == global.id)
-            .unwrap()
-            .links
-            .len(),
-        1
-    );
-    let result = server
-        .bbox_review(Parameters(ReviewParams {
-            project: None,
-            action: Some("approve".into()),
-            id: Some(global.id.clone()),
-            ..Default::default()
-        }))
-        .await;
-    assert_ne!(result.is_error, Some(true), "{result:?}");
     let result = server
         .bbox_forget(Parameters(ForgetParams {
             project: None,
             id: global.id.clone(),
-            superseded_by: None,
         }))
         .await;
     assert_ne!(result.is_error, Some(true), "{result:?}");
@@ -1233,6 +1052,6 @@ async fn queued_knowledge_broken_queue_does_not_block_durable_global_mutations()
             .read()
             .all_entries()
             .iter()
-            .any(|entry| entry.id == global.id && entry.status == Status::Active)
+            .any(|entry| entry.id == global.id)
     );
 }

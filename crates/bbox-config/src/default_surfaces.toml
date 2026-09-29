@@ -34,10 +34,6 @@ disallow = [
     "bbox_doctor",
     "bbox_artifact_*",
     "bro_broadcast",
-    "bbox_absorb",
-    "bbox_bootstrap",
-    "bbox_lint",
-    "bbox_review",
 ]
 
 [surfaces.interactive]
@@ -98,10 +94,6 @@ disallow = [
     "bbox_edge_compact",
     "bbox_doctor",
     "bbox_artifact_*",
-    "bbox_absorb",
-    "bbox_bootstrap",
-    "bbox_lint",
-    "bbox_review",
 ]
 
 [surfaces.readonly]

@@ -904,7 +904,6 @@ pub(super) fn open_shared_state(
     let edge_index = build_startup_edge_index(
         &cfg,
         &idx,
-        &kb_store.read(),
         &threads_store.read(),
         &notes_store.read(),
         &task_store,
@@ -1195,7 +1194,6 @@ fn spawn_reindex_thread(
 fn build_startup_edge_index(
     cfg: &config::Config,
     idx: &TranscriptIndex,
-    kb: &Knowledge,
     th: &Threads,
     notes_store: &Notes,
     task_store: &TaskStore,
@@ -1206,7 +1204,6 @@ fn build_startup_edge_index(
         edge_index::EdgeIndex::rebuild_admitting_fully_absent(
             &edge_index::EdgeStoreRefs {
                 index: idx,
-                knowledge: kb,
                 threads: th,
                 notes: notes_store,
                 session_brofile_rows: task_store.session_brofile_rows(),

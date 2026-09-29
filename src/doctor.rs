@@ -258,11 +258,7 @@ pub(crate) fn run(server: &crate::server::BlackboxServer) -> anyhow::Result<Doct
             artifact_watcher_section(statuses),
         ]);
     }
-    sections.extend([
-        memories_section(state),
-        knowledge_section(state),
-        attention_section(state),
-    ]);
+    sections.extend([memories_section(state), attention_section(state)]);
     let mut report = DoctorReport::from_sections(sections).with_checkout_access(checkout_access);
     if let Some(observations) = knowledge_transport {
         report = report.with_knowledge_transport(observations);
@@ -297,7 +293,7 @@ pub(crate) fn section_names(state: &crate::server::state::SharedState) -> Vec<&'
             "artifact_watcher",
         ]);
     }
-    names.extend(["memories", "knowledge", "attention"]);
+    names.extend(["memories", "attention"]);
     names
 }
 
@@ -350,7 +346,6 @@ pub(crate) fn run_section(
             }
         }
         "memories" => memories_section(state),
-        "knowledge" => knowledge_section(state),
         "attention" => attention_section(state),
         _ => unreachable!("section vocabulary was validated above"),
     };
@@ -1627,25 +1622,6 @@ fn memories_section(state: &crate::server::state::SharedState) -> SectionReport 
     }
 }
 
-fn knowledge_section(state: &crate::server::state::SharedState) -> SectionReport {
-    let finding = match state.kb.read().lint() {
-        Ok(report) => {
-            if report.starts_with("No issues") {
-                Finding::ok("knowledge lint clean")
-            } else {
-                let headline = report.lines().next().unwrap_or("issues found").to_string();
-                Finding::warn(format!("knowledge lint: {headline}"))
-                    .with_next("bbox_lint() for the full report".to_string())
-            }
-        }
-        Err(err) => Finding::warn(format!("knowledge lint failed: {err:#}")),
-    };
-    SectionReport {
-        section: "knowledge",
-        findings: vec![finding],
-    }
-}
-
 fn attention_section(state: &crate::server::state::SharedState) -> SectionReport {
     use bbox_threads::notes::{NoteKind, NoteResolution};
     let mut findings = Vec::new();
@@ -1972,7 +1948,6 @@ mod tests {
                 "checkout_access",
                 "resolver_compat",
                 "memories",
-                "knowledge",
                 "attention"
             ]
         );

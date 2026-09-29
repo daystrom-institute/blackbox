@@ -202,12 +202,7 @@ fn insert_entry_properties(properties: &mut BTreeMap<String, String>, entry: &Kn
     properties.insert("content".into(), entry.content.clone());
     properties.insert("category".into(), format!("{:?}", entry.category));
     properties.insert("scope".into(), format!("{:?}", entry.scope));
-    properties.insert("status".into(), format!("{:?}", entry.status));
-    properties.insert("approval".into(), format!("{:?}", entry.approval));
     if let Some(project) = &entry.project {
         properties.insert("project".into(), project.clone());
-    }
-    if let Some(supersedes) = &entry.supersedes {
-        properties.insert("supersedes".into(), supersedes.clone());
     }
 }

@@ -24,8 +24,11 @@ fn main() -> Result<()> {
         if path.extension().is_none_or(|ext| ext != "json") {
             continue;
         }
-        let mut entry: KnowledgeEntry = serde_json::from_slice(&fs::read(&path)?)
-            .with_context(|| format!("reading {}", path.display()))?;
+        let Some(mut entry) = KnowledgeEntry::from_stored_slice(&fs::read(&path)?)
+            .with_context(|| format!("reading {}", path.display()))?
+        else {
+            continue;
+        };
         anyhow::ensure!(
             entry.scope == Scope::Project,
             "non-project entry in project source"

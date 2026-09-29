@@ -28,24 +28,13 @@ fn delete_knowledge_entry_removes_tantivy_doc() {
         title: "Delete fixture".into(),
         content: "tombstone searchable knowledge phrase".into(),
         cluster: None,
-        variants: Default::default(),
         category: bbox_knowledge::knowledge::Category::Memory,
         scope: bbox_knowledge::knowledge::Scope::Global,
         project: None,
         project_id: None,
         providers: Vec::new(),
         priority: bbox_knowledge::knowledge::Priority::Standard,
-        weight: 100,
-        status: bbox_knowledge::knowledge::Status::Active,
-        approval: bbox_knowledge::knowledge::Approval::UserConfirmed,
         render: true,
-        decay: true,
-        review_at: None,
-        supersedes: None,
-        links: Vec::new(),
-        rationale: None,
-        expires_at: None,
-        source: "test".into(),
         created_at: "2026-05-05T17:30:00Z".into(),
         updated_at: "2026-05-05T17:30:00Z".into(),
         recall_count: 0,
@@ -92,20 +81,13 @@ fn knowledge_entries_are_searchable_after_reindex() {
     let knowledge_path = dir.path().join("knowledge.json");
     let mut knowledge = bbox_knowledge::knowledge::Knowledge::open(&knowledge_path).unwrap();
     knowledge
-        .remember(
-            &bbox_knowledge::knowledge::RememberParams {
-                content: "durable zebra phrase for knowledge indexing".into(),
-                category: None,
-                title: Some("Knowledge indexing fixture".into()),
-                scope: None,
-                project: None,
-                project_id: None,
-                decay: None,
-                review_at: None,
-                expires_at: None,
-            },
-            false,
-        )
+        .learn(&bbox_knowledge::knowledge::LearnParams {
+            content: "durable zebra phrase for knowledge indexing".into(),
+            category: "memory".into(),
+            title: Some("Knowledge indexing fixture".into()),
+            render: Some(false),
+            ..Default::default()
+        })
         .unwrap();
     bbox_corpus_core::json_store::atomic_write_json_locked(
             &knowledge_path,

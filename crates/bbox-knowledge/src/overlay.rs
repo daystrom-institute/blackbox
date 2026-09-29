@@ -15,7 +15,7 @@ use bbox_corpus_core::project_record::ResolvedCheckoutScope;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::knowledge::{KnowledgeEntry, Scope};
+use crate::knowledge::{KnowledgeEntry, Scope, StoredKnowledgeEntry};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -528,18 +528,21 @@ pub fn load_published_snapshot_at_commit_unhydrated(
     let files = read_committed_map(publisher_root, publisher_commit, &tree_dir, None)?;
     let mut entries = BTreeMap::new();
     for (filename, bytes) in files {
-        let mut entry: KnowledgeEntry = serde_json::from_slice(&bytes)
+        let stored: StoredKnowledgeEntry = serde_json::from_slice(&bytes)
             .with_context(|| format!("parsing published knowledge file {filename}"))?;
         let stem = Path::new(&filename)
             .file_stem()
             .and_then(|stem| stem.to_str())
             .with_context(|| format!("knowledge filename is not UTF-8: {filename}"))?;
-        if stem != entry.id {
+        if stem != stored.id() {
             anyhow::bail!(
                 "published knowledge filename/id mismatch: {filename} contains id {}",
-                entry.id
+                stored.id()
             );
         }
+        let Some(mut entry) = stored.into_entry() else {
+            continue;
+        };
         // Repository-owned knowledge is always project-scoped. Committed
         // bytes are untrusted input and may not promote themselves into the
         // operator's global rendered memory or assert catalog identity.
@@ -647,16 +650,16 @@ pub fn load_published_knowledge_sources_at_commit(
         if total_bytes > limits.max_total_bytes {
             anyhow::bail!("published knowledge sources exceed their total byte limit");
         }
-        let entry: KnowledgeEntry = serde_json::from_slice(&source_bytes)
+        let stored: StoredKnowledgeEntry = serde_json::from_slice(&source_bytes)
             .with_context(|| format!("parsing published knowledge source {repo_path}"))?;
         let stem = Path::new(filename)
             .file_stem()
             .and_then(|stem| stem.to_str())
             .context("published knowledge filename is not UTF-8")?;
-        if stem != entry.id {
+        if stem != stored.id() {
             anyhow::bail!("published knowledge filename and record id disagree");
         }
-        if !ids.insert(entry.id) {
+        if !ids.insert(stored.id().to_string()) {
             anyhow::bail!("published knowledge sources contain a duplicate record id");
         }
         sources.push(PublishedKnowledgeSourceFile {
@@ -877,7 +880,7 @@ fn overlay_values_from_maps(
                 if published.matches(&filename, after) {
                     continue;
                 }
-                let entry: KnowledgeEntry = serde_json::from_slice(after)
+                let stored: StoredKnowledgeEntry = serde_json::from_slice(after)
                     .with_context(|| format!("parsing working knowledge file {filename}"))
                     .map_err(OverlayRecomputeError::invalid_content)?;
                 let stem = Path::new(&filename)
@@ -885,18 +888,27 @@ fn overlay_values_from_maps(
                     .and_then(|stem| stem.to_str())
                     .with_context(|| format!("knowledge filename is not UTF-8: {filename}"))
                     .map_err(OverlayRecomputeError::invalid_content)?;
-                if stem != entry.id {
+                if stem != stored.id() {
                     return Err(OverlayRecomputeError::invalid_content(anyhow::anyhow!(
                         "knowledge filename/id mismatch: {filename} contains id {}",
-                        entry.id
+                        stored.id()
                     )));
                 }
-                if !seen_ids.insert(entry.id.clone()) {
+                if !seen_ids.insert(stored.id().to_string()) {
                     return Err(OverlayRecomputeError::invalid_content(anyhow::anyhow!(
                         "duplicate knowledge id in checkout overlay: {}",
-                        entry.id
+                        stored.id()
                     )));
                 }
+                // A retired working record is a deletion of whatever the
+                // published generation carries under this name.
+                let id = stored.id().to_string();
+                let Some(entry) = stored.into_entry() else {
+                    if published.contains(&filename) {
+                        values.insert(id, OverlayValue::Tombstone);
+                    }
+                    continue;
+                };
                 values.insert(
                     entry.id.clone(),
                     OverlayValue::Upsert {
@@ -911,17 +923,17 @@ fn overlay_values_from_maps(
                     .and_then(|stem| stem.to_str())
                     .with_context(|| format!("knowledge filename is not UTF-8: {filename}"))
                     .map_err(OverlayRecomputeError::invalid_content)?;
-                let entry: KnowledgeEntry = serde_json::from_slice(before)
+                let stored: StoredKnowledgeEntry = serde_json::from_slice(before)
                     .with_context(|| format!("parsing baseline knowledge file {filename}"))
                     .map_err(OverlayRecomputeError::invalid_content)?;
-                if stem != entry.id {
+                if stem != stored.id() {
                     return Err(OverlayRecomputeError::invalid_content(anyhow::anyhow!(
                         "baseline knowledge filename/id mismatch: {filename} contains id {}",
-                        entry.id
+                        stored.id()
                     )));
                 }
                 if published.contains(&filename) {
-                    values.insert(entry.id, OverlayValue::Tombstone);
+                    values.insert(stored.id().to_string(), OverlayValue::Tombstone);
                 }
             }
             (None, None) => {}
@@ -1005,20 +1017,20 @@ pub fn recompute_overlay_result(
 fn validate_knowledge_map(files: &BTreeMap<String, Vec<u8>>, label: &str) -> Result<()> {
     let mut ids = BTreeSet::new();
     for (filename, bytes) in files {
-        let entry: KnowledgeEntry = serde_json::from_slice(bytes)
+        let stored: StoredKnowledgeEntry = serde_json::from_slice(bytes)
             .with_context(|| format!("parsing {label} knowledge file {filename}"))?;
         let stem = Path::new(filename)
             .file_stem()
             .and_then(|stem| stem.to_str())
             .with_context(|| format!("knowledge filename is not UTF-8: {filename}"))?;
-        if stem != entry.id {
+        if stem != stored.id() {
             anyhow::bail!(
                 "{label} knowledge filename/id mismatch: {filename} contains id {}",
-                entry.id
+                stored.id()
             );
         }
-        if !ids.insert(entry.id.clone()) {
-            anyhow::bail!("duplicate {label} knowledge id: {}", entry.id);
+        if !ids.insert(stored.id().to_string()) {
+            anyhow::bail!("duplicate {label} knowledge id: {}", stored.id());
         }
     }
     Ok(())
@@ -1140,9 +1152,8 @@ fn snapshot_id(stamp: &OverlayStamp, values: &BTreeMap<String, OverlayValue>) ->
     let mut hasher = Sha256::new();
     hasher.update(b"bbox-knowledge-overlay-v1\0");
     hasher.update(serde_json::to_vec(stamp)?);
-    // KnowledgeEntry contains maps whose serde iteration order is not stable
-    // across processes. Hash the byte-derived content hash instead of the
-    // parsed entry so an identical snapshot has one deterministic identity.
+    // Hash the byte-derived content hash instead of the parsed entry so a
+    // snapshot's identity follows the exact source bytes.
     for (entry_id, value) in values {
         hasher.update((entry_id.len() as u64).to_be_bytes());
         hasher.update(entry_id.as_bytes());
@@ -1175,8 +1186,7 @@ fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::knowledge::{Approval, Category, Priority, Scope, Status};
-    use std::collections::HashMap;
+    use crate::knowledge::{Category, Priority, Scope};
 
     #[test]
     fn explicit_own_requires_checkout_authority() {
@@ -1208,24 +1218,13 @@ mod tests {
             title: id.into(),
             content: content.into(),
             cluster: None,
-            variants: HashMap::new(),
             category: Category::Memory,
             scope: Scope::Project,
             project: None,
             project_id: None,
             providers: Vec::new(),
             priority: Priority::Standard,
-            weight: 100,
-            status: Status::Active,
-            approval: Approval::UserConfirmed,
             render: false,
-            decay: false,
-            review_at: None,
-            supersedes: None,
-            links: Vec::new(),
-            rationale: None,
-            expires_at: None,
-            source: "test".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
             recall_count: 0,
@@ -1966,40 +1965,6 @@ mod tests {
         assert_eq!(
             store.preserve_transient_if_latest(after_reset, prior),
             TransientPreservationOutcome::Preserved { attempt: 1 }
-        );
-    }
-
-    #[test]
-    fn snapshot_id_ignores_hash_map_iteration_order() {
-        let stamp = OverlayStamp {
-            published_scope: PublishedScope::try_new("repo", ".").unwrap(),
-            checkout_id: "checkout".into(),
-            published_ref: "refs/heads/main".into(),
-            publisher_commit: "p".into(),
-            checkout_head: "h".into(),
-            merge_base: "b".into(),
-            working_fingerprint: "w".into(),
-            accepted_generation: None,
-        };
-        let mut left_entry = entry("entry", "same bytes");
-        left_entry.variants.insert("a".into(), "1".into());
-        left_entry.variants.insert("b".into(), "2".into());
-        let mut right_entry = entry("entry", "same bytes");
-        right_entry.variants.insert("b".into(), "2".into());
-        right_entry.variants.insert("a".into(), "1".into());
-        let values = |entry| {
-            BTreeMap::from([(
-                "entry".into(),
-                OverlayValue::Upsert {
-                    entry: Box::new(entry),
-                    content_hash: "fixed-byte-hash".into(),
-                },
-            )])
-        };
-
-        assert_eq!(
-            snapshot_id(&stamp, &values(left_entry)).unwrap(),
-            snapshot_id(&stamp, &values(right_entry)).unwrap()
         );
     }
 

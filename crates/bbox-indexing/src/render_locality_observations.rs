@@ -133,7 +133,7 @@ impl RenderLocalityObservationsV1 {
         issued_at_ms: u64,
     ) -> Result<Option<u64>> {
         plan.validate()?;
-        receipt.validate_against_issued(plan, Some(issued_at_ms))?;
+        receipt.validate_against(plan)?;
         if receipt.incomplete {
             return Ok(None);
         }
@@ -445,7 +445,7 @@ mod tests {
         let plan = plan(ProjectRenderViewV1::Published);
         let mut written = receipt(&plan);
         written.project_doc_nonempty = true;
-        written.projections = plan.expected_projections(true, Some(200)).unwrap();
+        written.projections = plan.expected_projections(true).unwrap();
         let mut refused = written.clone();
         refused.projections[0].disposition = ProjectRenderDispositionV1::Refused;
         observations

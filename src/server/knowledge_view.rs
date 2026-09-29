@@ -9,8 +9,7 @@ use bbox_corpus_core::identity::PublishedScope;
 use bbox_corpus_core::project_catalog::{AttachmentStatus, ProjectId};
 use bbox_corpus_core::project_record::{ProjectRecord, ResolvedCheckoutScope};
 use bbox_indexing::accepted_publication_runtime::{
-    AcceptedEdgeConfidenceV1, AcceptedKnowledgeApprovalV1, AcceptedKnowledgeCategoryV1,
-    AcceptedKnowledgeEdgeKindV1, AcceptedKnowledgeEntryV1, AcceptedKnowledgePriorityV1,
+    AcceptedKnowledgeCategoryV1, AcceptedKnowledgeEntryV1, AcceptedKnowledgePriorityV1,
     AcceptedKnowledgeStatusV1, AcceptedPublicationContentStamp, AcceptedPublicationRuntimeError,
     AcceptedPublicationScopeAgreement, AcceptedPublicationSelection,
     ERROR_ACCEPTED_PUBLICATION_MISSING, VerifiedAcceptedPublication,
@@ -21,8 +20,8 @@ use bbox_indexing::checkout_access::{
     ValidatedCheckoutLease,
 };
 use bbox_knowledge::knowledge::{
-    Approval, Category, Knowledge, KnowledgeEdge, KnowledgeEdgeKind, KnowledgeEntry,
-    KnowledgeViewMetadata, Priority, Scope, Status, committed_knowledge_entry_bytes,
+    Category, Knowledge, KnowledgeEntry, KnowledgeViewMetadata, Priority, Scope, append_rationale,
+    committed_knowledge_entry_bytes,
 };
 use bbox_knowledge::overlay::{
     AcceptedPublishedDigests, CatalogOverlayPublished, OverlayKey, OverlayRecomputeError,
@@ -295,13 +294,6 @@ impl SessionKnowledgeView {
                 self.diagnostics.join("\n- ")
             )
         })
-    }
-
-    pub(crate) fn append_diagnostics(&self, output: String) -> String {
-        match self.diagnostics_text() {
-            Some(diagnostics) => format!("{output}\n{diagnostics}"),
-            None => output,
-        }
     }
 }
 
@@ -2467,6 +2459,7 @@ pub(crate) fn published_knowledge_from_accepted(
     verified: &VerifiedAcceptedPublication,
 ) -> PublishedKnowledgeSnapshot {
     let content_stamp = verified.content_stamp();
+    let now = bbox_util::util::now_iso();
     let mut entries = BTreeMap::new();
     for manifest in verified.knowledge_manifest().values() {
         // Generation validation makes the manifest and the normalized
@@ -2475,7 +2468,10 @@ pub(crate) fn published_knowledge_from_accepted(
         let Some(record) = verified.knowledge_records().get(&manifest.record_id) else {
             continue;
         };
-        let entry = knowledge_entry_from_accepted(record, content_stamp.project_id());
+        let Some(entry) = knowledge_entry_from_accepted(record, content_stamp.project_id(), &now)
+        else {
+            continue;
+        };
         entries.insert(
             entry.id.clone(),
             PublishedKnowledgeEntry {
@@ -2492,7 +2488,14 @@ pub(crate) fn published_knowledge_from_accepted(
     }
 }
 
-/// Rebuild the domain entry from its accepted record.
+/// Rebuild the domain entry from its accepted record, or `None` for a
+/// retired record.
+///
+/// Version-1 rows carry fields the entry model no longer has. The same
+/// legacy rules as stored entry files apply: a status other than active or
+/// an expiry already past at `now` retires the row, a rationale is appended
+/// to the content, and the `decision` category reads as `convention`. The
+/// other legacy fields are ignored.
 ///
 /// The host-local fields accepted normalization dropped stay dropped.
 /// `project` is a checkout path and a catalog read has no checkout, so
@@ -2503,18 +2506,28 @@ pub(crate) fn published_knowledge_from_accepted(
 fn knowledge_entry_from_accepted(
     record: &AcceptedKnowledgeEntryV1,
     project_id: &ProjectId,
-) -> KnowledgeEntry {
-    KnowledgeEntry {
+    now: &str,
+) -> Option<KnowledgeEntry> {
+    if record.status != AcceptedKnowledgeStatusV1::Active
+        || record
+            .expires_at
+            .as_deref()
+            .is_some_and(|expires| expires < now)
+    {
+        return None;
+    }
+    let content = match record.rationale.as_deref().map(str::trim) {
+        Some(rationale) if !rationale.is_empty() && !record.content.contains(rationale) => {
+            append_rationale(&record.content, rationale)
+        }
+        _ => record.content.clone(),
+    };
+    Some(KnowledgeEntry {
         render_placement: Default::default(),
         id: record.id.as_str().to_string(),
         title: record.title.clone(),
-        content: record.content.clone(),
+        content,
         cluster: record.cluster.clone(),
-        variants: record
-            .variants
-            .iter()
-            .map(|(provider, content)| (provider.clone(), content.clone()))
-            .collect(),
         category: match record.category {
             AcceptedKnowledgeCategoryV1::Profile => Category::Profile,
             AcceptedKnowledgeCategoryV1::Convention => Category::Convention,
@@ -2523,7 +2536,7 @@ fn knowledge_entry_from_accepted(
             AcceptedKnowledgeCategoryV1::Tool => Category::Tool,
             AcceptedKnowledgeCategoryV1::Memory => Category::Memory,
             AcceptedKnowledgeCategoryV1::Workflow => Category::Workflow,
-            AcceptedKnowledgeCategoryV1::Decision => Category::Decision,
+            AcceptedKnowledgeCategoryV1::Decision => Category::Convention,
         },
         // An accepted project generation cannot contain global knowledge:
         // normalization refuses it.
@@ -2536,55 +2549,12 @@ fn knowledge_entry_from_accepted(
             AcceptedKnowledgePriorityV1::Standard => Priority::Standard,
             AcceptedKnowledgePriorityV1::Supplementary => Priority::Supplementary,
         },
-        weight: record.weight,
-        status: match record.status {
-            AcceptedKnowledgeStatusV1::Active => Status::Active,
-            AcceptedKnowledgeStatusV1::Draft => Status::Draft,
-            AcceptedKnowledgeStatusV1::Superseded => Status::Superseded,
-            AcceptedKnowledgeStatusV1::Disabled => Status::Disabled,
-            AcceptedKnowledgeStatusV1::Deleted => Status::Deleted,
-        },
-        approval: match record.approval {
-            AcceptedKnowledgeApprovalV1::UserConfirmed => Approval::UserConfirmed,
-            AcceptedKnowledgeApprovalV1::AgentInferred => Approval::AgentInferred,
-            AcceptedKnowledgeApprovalV1::Imported => Approval::Imported,
-        },
         render: record.render,
-        decay: record.decay,
-        review_at: record.review_at.clone(),
-        supersedes: record.supersedes.clone(),
-        links: record
-            .links
-            .iter()
-            .map(|edge| KnowledgeEdge {
-                target: edge.target.clone(),
-                kind: match edge.kind {
-                    AcceptedKnowledgeEdgeKindV1::Contradicts => KnowledgeEdgeKind::Contradicts,
-                    AcceptedKnowledgeEdgeKindV1::RelatesTo => KnowledgeEdgeKind::RelatesTo,
-                    AcceptedKnowledgeEdgeKindV1::TensionWith => KnowledgeEdgeKind::TensionWith,
-                    AcceptedKnowledgeEdgeKindV1::Supports => KnowledgeEdgeKind::Supports,
-                    AcceptedKnowledgeEdgeKindV1::DependsOn => KnowledgeEdgeKind::DependsOn,
-                    AcceptedKnowledgeEdgeKindV1::DerivedFrom => KnowledgeEdgeKind::DerivedFrom,
-                    AcceptedKnowledgeEdgeKindV1::Supersedes => KnowledgeEdgeKind::Supersedes,
-                    AcceptedKnowledgeEdgeKindV1::References => KnowledgeEdgeKind::References,
-                },
-                note: edge.note.clone(),
-                source_arc: edge.source_arc.clone(),
-                confidence: match edge.confidence {
-                    AcceptedEdgeConfidenceV1::Exact => bbox_chunker::EdgeConfidence::Exact,
-                    AcceptedEdgeConfidenceV1::Heuristic => bbox_chunker::EdgeConfidence::Heuristic,
-                    AcceptedEdgeConfidenceV1::Unknown => bbox_chunker::EdgeConfidence::Unknown,
-                },
-            })
-            .collect(),
-        rationale: record.rationale.clone(),
-        expires_at: record.expires_at.clone(),
-        source: record.source.clone(),
         created_at: record.created_at.clone(),
         updated_at: record.updated_at.clone(),
         recall_count: 0,
         last_recalled: None,
-    }
+    })
 }
 
 fn hydrate_published_snapshot(publisher_root: &Path, snapshot: &mut PublishedKnowledgeSnapshot) {
@@ -2749,9 +2719,8 @@ fn intern_overlay_stamp(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bbox_knowledge::knowledge::{Approval, Category, KnowledgeListParams, Priority, Status};
+    use bbox_knowledge::knowledge::{Category, KnowledgeListParams, Priority};
     use bbox_knowledge::overlay::{OverlayKey, OverlaySnapshot, OverlayStamp};
-    use std::collections::HashMap;
     use std::process::Command;
 
     fn git(root: &Path, args: &[&str]) {
@@ -2768,6 +2737,75 @@ mod tests {
         );
     }
 
+    /// Already-published version-1 rows keep their bytes; reading them
+    /// applies the same legacy rules as stored entry files.
+    #[test]
+    fn published_version_one_rows_read_under_the_legacy_rules() {
+        let row = |id: &str, category: &str, status: &str, expires_at: Option<&str>| {
+            serde_json::from_value::<AcceptedKnowledgeEntryV1>(serde_json::json!({
+                "id": id,
+                "title": format!("row {id}"),
+                "content": "the commitment",
+                "cluster": null,
+                "variants": {"claude": "claude-only"},
+                "category": category,
+                "scope": "project",
+                "providers": [],
+                "priority": "standard",
+                "weight": 9,
+                "status": status,
+                "approval": "agent_inferred",
+                "render": true,
+                "decay": false,
+                "review_at": null,
+                "supersedes": "0000000000000000",
+                "links": [{"target": "knowledge:x", "kind": "supports", "note": null, "source_arc": null, "confidence": "exact"}],
+                "rationale": "the recorded reason",
+                "expires_at": expires_at,
+                "source": "agent",
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-02T00:00:00Z"
+            }))
+            .unwrap()
+        };
+        let project = ProjectId::parse("p_legacy_rows").unwrap();
+        let now = "2026-06-01T00:00:00Z";
+
+        let decision = row("decision-row", "decision", "active", None);
+        assert_eq!(decision.category, AcceptedKnowledgeCategoryV1::Decision);
+        let entry = knowledge_entry_from_accepted(&decision, &project, now)
+            .expect("an active version-1 row is an entry");
+        assert_eq!(entry.category, Category::Convention);
+        assert_eq!(
+            entry.content,
+            "the commitment\n\nRationale: the recorded reason"
+        );
+        assert_eq!(entry.project_id.as_deref(), Some("p_legacy_rows"));
+
+        let convention = row("convention-row", "convention", "active", Some("2027-01-01"));
+        let entry = knowledge_entry_from_accepted(&convention, &project, now).unwrap();
+        assert_eq!(entry.category, Category::Convention);
+
+        for status in ["superseded", "deleted", "draft", "disabled"] {
+            assert!(
+                knowledge_entry_from_accepted(
+                    &row("retired", "convention", status, None),
+                    &project,
+                    now
+                )
+                .is_none(),
+                "{status}"
+            );
+        }
+        let expired = row(
+            "expired",
+            "convention",
+            "active",
+            Some("2026-01-01T00:00:00Z"),
+        );
+        assert!(knowledge_entry_from_accepted(&expired, &project, now).is_none());
+    }
+
     fn entry(id: &str, content: &str) -> KnowledgeEntry {
         KnowledgeEntry {
             render_placement: Default::default(),
@@ -2775,24 +2813,13 @@ mod tests {
             title: id.into(),
             content: content.into(),
             cluster: None,
-            variants: HashMap::new(),
             category: Category::Memory,
             scope: Scope::Project,
             project: None,
             project_id: None,
             providers: Vec::new(),
             priority: Priority::Standard,
-            weight: 100,
-            status: Status::Active,
-            approval: Approval::UserConfirmed,
             render: true,
-            decay: false,
-            review_at: None,
-            supersedes: None,
-            links: Vec::new(),
-            rationale: None,
-            expires_at: None,
-            source: "test".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
             recall_count: 0,

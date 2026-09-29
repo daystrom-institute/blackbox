@@ -12,7 +12,6 @@ use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use bbox_chunker::EdgeConfidence;
 use bbox_corpus_core::identity::PublishedScope;
 use bbox_corpus_core::json_store::{
     NofollowDirectory, StoreLockGuard, acquire_store_lock_nofollow_with_timeout,
@@ -20,9 +19,7 @@ use bbox_corpus_core::json_store::{
 };
 use bbox_corpus_core::project_catalog::{AttachmentId, ProjectId};
 use bbox_gaps::gaps::{BlockingLevel, GapImpact, GapKind, GapNote, GapResolution};
-use bbox_knowledge::knowledge::{
-    Approval, Category, KnowledgeEdgeKind, KnowledgeEntry, Priority, Scope, Status,
-};
+use bbox_knowledge::knowledge::{Category, KnowledgeEntry, Priority, Scope, StoredKnowledgeEntry};
 use bbox_knowledge_source::validate_publication_generation_id;
 use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -1005,6 +1002,12 @@ fn ensure_matching_guard(
     Ok(())
 }
 
+/// Version-1 accepted rows carry fields the entry model no longer has. A
+/// row normalized from a current entry records them with these fixed
+/// values; readers ignore them.
+const ACCEPTED_KNOWLEDGE_V1_WEIGHT: u32 = 100;
+const ACCEPTED_KNOWLEDGE_V1_SOURCE: &str = "user";
+
 pub(crate) fn normalize_knowledge_entry_v1(
     entry: &KnowledgeEntry,
 ) -> AcceptedPublicationStoreResult<AcceptedKnowledgeEntryV1> {
@@ -1025,79 +1028,33 @@ pub(crate) fn normalize_knowledge_entry_v1(
         Category::Tool => AcceptedKnowledgeCategoryV1::Tool,
         Category::Memory => AcceptedKnowledgeCategoryV1::Memory,
         Category::Workflow => AcceptedKnowledgeCategoryV1::Workflow,
-        Category::Decision => AcceptedKnowledgeCategoryV1::Decision,
     };
     let priority = match &entry.priority {
         Priority::Critical => AcceptedKnowledgePriorityV1::Critical,
         Priority::Standard => AcceptedKnowledgePriorityV1::Standard,
         Priority::Supplementary => AcceptedKnowledgePriorityV1::Supplementary,
     };
-    let status = match &entry.status {
-        Status::Active => AcceptedKnowledgeStatusV1::Active,
-        Status::Draft => AcceptedKnowledgeStatusV1::Draft,
-        Status::Superseded => AcceptedKnowledgeStatusV1::Superseded,
-        Status::Disabled => AcceptedKnowledgeStatusV1::Disabled,
-        Status::Deleted => AcceptedKnowledgeStatusV1::Deleted,
-    };
-    let approval = match &entry.approval {
-        Approval::UserConfirmed => AcceptedKnowledgeApprovalV1::UserConfirmed,
-        Approval::AgentInferred => AcceptedKnowledgeApprovalV1::AgentInferred,
-        Approval::Imported => AcceptedKnowledgeApprovalV1::Imported,
-    };
-    let links = entry
-        .links
-        .iter()
-        .map(|edge| {
-            let kind = match edge.kind {
-                KnowledgeEdgeKind::Contradicts => AcceptedKnowledgeEdgeKindV1::Contradicts,
-                KnowledgeEdgeKind::RelatesTo => AcceptedKnowledgeEdgeKindV1::RelatesTo,
-                KnowledgeEdgeKind::TensionWith => AcceptedKnowledgeEdgeKindV1::TensionWith,
-                KnowledgeEdgeKind::Supports => AcceptedKnowledgeEdgeKindV1::Supports,
-                KnowledgeEdgeKind::DependsOn => AcceptedKnowledgeEdgeKindV1::DependsOn,
-                KnowledgeEdgeKind::DerivedFrom => AcceptedKnowledgeEdgeKindV1::DerivedFrom,
-                KnowledgeEdgeKind::Supersedes => AcceptedKnowledgeEdgeKindV1::Supersedes,
-                KnowledgeEdgeKind::References => AcceptedKnowledgeEdgeKindV1::References,
-            };
-            let confidence = match edge.confidence {
-                EdgeConfidence::Exact => AcceptedEdgeConfidenceV1::Exact,
-                EdgeConfidence::Heuristic => AcceptedEdgeConfidenceV1::Heuristic,
-                EdgeConfidence::Unknown => AcceptedEdgeConfidenceV1::Unknown,
-            };
-            AcceptedKnowledgeEdgeV1 {
-                target: edge.target.clone(),
-                kind,
-                note: edge.note.clone(),
-                source_arc: edge.source_arc.clone(),
-                confidence,
-            }
-        })
-        .collect();
-
     Ok(AcceptedKnowledgeEntryV1 {
         id,
         title: entry.title.clone(),
         content: entry.content.clone(),
         cluster: entry.cluster.clone(),
-        variants: entry
-            .variants
-            .iter()
-            .map(|(provider, content)| (provider.clone(), content.clone()))
-            .collect(),
+        variants: BTreeMap::new(),
         category,
         scope,
         providers: entry.providers.clone(),
         priority,
-        weight: entry.weight,
-        status,
-        approval,
+        weight: ACCEPTED_KNOWLEDGE_V1_WEIGHT,
+        status: AcceptedKnowledgeStatusV1::Active,
+        approval: AcceptedKnowledgeApprovalV1::UserConfirmed,
         render: entry.render,
-        decay: entry.decay,
-        review_at: entry.review_at.clone(),
-        supersedes: entry.supersedes.clone(),
-        links,
-        rationale: entry.rationale.clone(),
-        expires_at: entry.expires_at.clone(),
-        source: entry.source.clone(),
+        decay: true,
+        review_at: None,
+        supersedes: None,
+        links: Vec::new(),
+        rationale: None,
+        expires_at: None,
+        source: ACCEPTED_KNOWLEDGE_V1_SOURCE.to_string(),
         created_at: entry.created_at.clone(),
         updated_at: entry.updated_at.clone(),
     })
@@ -1306,18 +1263,23 @@ pub(crate) fn prepare_accepted_publication_v1(
         if encoded_bytes > limits.max_source_file_bytes {
             return Err(byte_limit("accepted knowledge source file"));
         }
+        let stored: StoredKnowledgeEntry =
+            serde_json::from_slice(&source.source_bytes).map_err(|error| {
+                invalid_generation(format!(
+                    "accepted knowledge source is invalid JSON: {error}"
+                ))
+            })?;
+        // A retired record (a legacy non-active status) is not an entry and
+        // is not published, exactly as if its file were absent.
+        let Some(entry) = stored.into_entry() else {
+            continue;
+        };
         knowledge_source_bytes = knowledge_source_bytes
             .checked_add(encoded_bytes)
             .ok_or_else(|| byte_limit("accepted knowledge source lane"))?;
         if knowledge_source_bytes > limits.max_knowledge_source_bytes {
             return Err(byte_limit("accepted knowledge source lane"));
         }
-        let entry: KnowledgeEntry =
-            serde_json::from_slice(&source.source_bytes).map_err(|error| {
-                invalid_generation(format!(
-                    "accepted knowledge source is invalid JSON: {error}"
-                ))
-            })?;
         let normalized = normalize_knowledge_entry_v1(&entry)?;
         let expected = expected_repository_relative_filename(
             &input.scope,
@@ -3094,11 +3056,10 @@ fn accepted_io_error(error: impl fmt::Display) -> AcceptedPublicationStoreError 
 /// only honest way to produce them is the real preparation path.
 #[cfg(test)]
 pub(crate) mod fixtures {
-    use std::collections::HashMap;
     use std::fs;
 
     use bbox_gaps::gaps::GapNote;
-    use bbox_knowledge::knowledge::{KnowledgeEdge, KnowledgeEntry};
+    use bbox_knowledge::knowledge::KnowledgeEntry;
 
     use super::*;
 
@@ -3109,24 +3070,13 @@ pub(crate) mod fixtures {
             title: "Accepted publication is path-free".to_string(),
             content: content.to_string(),
             cluster: Some("runtime".to_string()),
-            variants: HashMap::new(),
             category: Category::Convention,
             scope: Scope::Project,
             project: None,
             project_id: None,
             providers: vec!["provider-a".to_string()],
             priority: Priority::Standard,
-            weight: 100,
-            status: Status::Active,
-            approval: Approval::UserConfirmed,
             render: true,
-            decay: false,
-            review_at: None,
-            supersedes: None,
-            links: Vec::<KnowledgeEdge>::new(),
-            rationale: None,
-            expires_at: None,
-            source: "user".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-02T00:00:00Z".to_string(),
             recall_count: 0,
@@ -3256,10 +3206,7 @@ pub(crate) mod fixtures {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use std::fs;
-
-    use bbox_knowledge::knowledge::KnowledgeEdge;
 
     use super::*;
 
@@ -3282,33 +3229,13 @@ mod tests {
             title: "Keep publication strict".to_string(),
             content: "Accepted bytes are detached from checkout paths.".to_string(),
             cluster: Some("runtime".to_string()),
-            variants: HashMap::from([
-                ("zeta".to_string(), "last".to_string()),
-                ("alpha".to_string(), "first".to_string()),
-            ]),
             category: Category::Convention,
             scope: Scope::Project,
             project: Some("/temporary/checkout".to_string()),
             project_id: None,
             providers: vec!["provider-a".to_string()],
             priority: Priority::Critical,
-            weight: 140,
-            status: Status::Active,
-            approval: Approval::UserConfirmed,
             render: true,
-            decay: false,
-            review_at: Some("2030-01-01T00:00:00Z".to_string()),
-            supersedes: None,
-            links: vec![KnowledgeEdge {
-                target: "other".to_string(),
-                kind: KnowledgeEdgeKind::DependsOn,
-                note: Some("ordered".to_string()),
-                source_arc: Some("arc-example".to_string()),
-                confidence: EdgeConfidence::Exact,
-            }],
-            rationale: Some("one authority".to_string()),
-            expires_at: None,
-            source: "user".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-02T00:00:00Z".to_string(),
             recall_count: 99,
@@ -3837,20 +3764,94 @@ mod tests {
 
     #[test]
     fn knowledge_normalization_is_frozen_and_drops_host_fields() {
-        let normalized = normalize_knowledge_entry_v1(&knowledge("knowledge-a")).unwrap();
-        assert_eq!(
-            normalized.variants.keys().cloned().collect::<Vec<_>>(),
-            vec!["alpha", "zeta"]
-        );
+        let entry = knowledge("knowledge-a");
+        let normalized = normalize_knowledge_entry_v1(&entry).unwrap();
         assert_eq!(normalized.scope, AcceptedKnowledgeScopeV1::Project);
+        assert_eq!(normalized.category, AcceptedKnowledgeCategoryV1::Convention);
+        assert_eq!(normalized.priority, AcceptedKnowledgePriorityV1::Critical);
+        assert_eq!(normalized.cluster, entry.cluster);
+        assert_eq!(normalized.providers, entry.providers);
+        // Version-1 fields the entry model no longer has carry fixed values.
+        assert!(normalized.variants.is_empty());
+        assert_eq!(normalized.weight, ACCEPTED_KNOWLEDGE_V1_WEIGHT);
+        assert_eq!(normalized.status, AcceptedKnowledgeStatusV1::Active);
         assert_eq!(
-            normalized.links[0].kind,
-            AcceptedKnowledgeEdgeKindV1::DependsOn
+            normalized.approval,
+            AcceptedKnowledgeApprovalV1::UserConfirmed
         );
+        assert!(normalized.decay);
+        assert!(normalized.links.is_empty());
+        assert_eq!(normalized.review_at, None);
+        assert_eq!(normalized.supersedes, None);
+        assert_eq!(normalized.rationale, None);
+        assert_eq!(normalized.expires_at, None);
+        assert_eq!(normalized.source, ACCEPTED_KNOWLEDGE_V1_SOURCE);
         let json = serde_json::to_value(normalized).unwrap();
         assert!(json.get("project").is_none());
         assert!(json.get("recall_count").is_none());
         assert!(json.get("last_recalled").is_none());
+    }
+
+    /// Committed entry files written before the model slimdown still
+    /// publish: removed fields are ignored, a rationale is appended to the
+    /// content, `decision` reads as `convention`, and a record whose legacy
+    /// status is not active is left out, exactly as if its file were absent.
+    #[test]
+    fn legacy_shaped_knowledge_sources_publish_as_current_entries() {
+        let current = serde_json::to_value(knowledge("knowledge-a")).unwrap();
+        assert!(
+            current.get("status").is_none() && current.get("rationale").is_none(),
+            "the current writer must emit only kept fields"
+        );
+        let legacy = |id: &str, status: &str| {
+            let mut value = serde_json::to_value(knowledge(id)).unwrap();
+            let object = value.as_object_mut().unwrap();
+            object.insert("category".into(), "decision".into());
+            object.insert("status".into(), status.into());
+            object.insert("approval".into(), "agent_inferred".into());
+            object.insert("rationale".into(), "the recorded reason".into());
+            object.insert("supersedes".into(), "0000000000000000".into());
+            object.insert("weight".into(), 7.into());
+            object.insert("decay".into(), false.into());
+            object.insert("variants".into(), serde_json::json!({"claude": "variant"}));
+            object.insert(
+                "links".into(),
+                serde_json::json!([{"target": "knowledge:x", "kind": "RelatesTo", "confidence": "Exact"}]),
+            );
+            object.insert("source".into(), "agent".into());
+            AcceptedKnowledgeSourceV1 {
+                repository_relative_filename: format!(".bbox/knowledge/{id}.json"),
+                source_bytes: serde_json::to_vec(&value).unwrap(),
+            }
+        };
+        let mut input = build_input();
+        input.knowledge = vec![
+            legacy("legacy-active", "active"),
+            legacy("legacy-superseded", "superseded"),
+            legacy("legacy-deleted", "deleted"),
+            knowledge_source("knowledge-a", ".bbox/knowledge/knowledge-a.json"),
+        ];
+        let prepared =
+            prepare_accepted_publication_v1(input, &AcceptedPublicationLimits::default()).unwrap();
+        let records = &prepared.generation.normalized_knowledge;
+        assert_eq!(
+            records.keys().map(|id| id.as_str()).collect::<Vec<_>>(),
+            vec!["knowledge-a", "legacy-active"]
+        );
+        assert_eq!(prepared.generation.knowledge_file_manifest.len(), 2);
+        let legacy = &records[&PublicationRecordId::parse("legacy-active".to_string()).unwrap()];
+        assert_eq!(legacy.category, AcceptedKnowledgeCategoryV1::Convention);
+        assert!(
+            legacy
+                .content
+                .ends_with("\n\nRationale: the recorded reason")
+        );
+        assert_eq!(legacy.status, AcceptedKnowledgeStatusV1::Active);
+        assert_eq!(legacy.approval, AcceptedKnowledgeApprovalV1::UserConfirmed);
+        assert_eq!(legacy.weight, ACCEPTED_KNOWLEDGE_V1_WEIGHT);
+        assert!(legacy.variants.is_empty() && legacy.links.is_empty());
+        assert_eq!(legacy.rationale, None);
+        assert_eq!(legacy.supersedes, None);
     }
 
     #[test]

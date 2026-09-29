@@ -90,9 +90,7 @@ fn write_legacy_store(root: &Path, projects: Vec<LegacyProjectRecordV1>) {
 /// One central knowledge row carrying a literal project selector, which is
 /// exactly the row shape the owner capture counts.
 fn write_project_scoped_knowledge_entry(root: &Path) {
-    use bbox_knowledge::knowledge::{
-        Approval, Category, KnowledgeEntry, KnowledgeStore, Priority, Scope, Status,
-    };
+    use bbox_knowledge::knowledge::{Category, KnowledgeEntry, KnowledgeStore, Priority, Scope};
 
     let mut store = KnowledgeStore::new();
     store.entries.push(KnowledgeEntry {
@@ -101,24 +99,13 @@ fn write_project_scoped_knowledge_entry(root: &Path) {
         title: "scoped row".into(),
         content: "scoped row".into(),
         cluster: None,
-        variants: Default::default(),
         category: Category::Convention,
         scope: Scope::Project,
         project: Some(root.join("absent-checkout").display().to_string()),
         project_id: None,
         providers: Vec::new(),
         priority: Priority::Standard,
-        weight: 1,
-        status: Status::Active,
-        approval: Approval::UserConfirmed,
         render: true,
-        decay: true,
-        review_at: None,
-        supersedes: None,
-        links: Vec::new(),
-        rationale: None,
-        expires_at: None,
-        source: "fixture".into(),
         created_at: "2026-08-08T00:00:00Z".into(),
         updated_at: "2026-08-08T00:00:00Z".into(),
         recall_count: 0,

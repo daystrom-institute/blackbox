@@ -3388,31 +3388,20 @@ fn publishable_checkout(
 }
 
 fn fixture_knowledge_entry(id: &str, content: &str) -> bbox_knowledge::knowledge::KnowledgeEntry {
-    use bbox_knowledge::knowledge::{Approval, Category, Priority, Scope, Status};
+    use bbox_knowledge::knowledge::{Category, Priority, Scope};
     bbox_knowledge::knowledge::KnowledgeEntry {
         render_placement: Default::default(),
         id: id.to_string(),
         title: format!("entry {id}"),
         content: content.to_string(),
         cluster: None,
-        variants: Default::default(),
         category: Category::Convention,
         scope: Scope::Project,
         project: None,
         project_id: None,
         providers: Vec::new(),
         priority: Priority::Standard,
-        weight: 100,
-        status: Status::Active,
-        approval: Approval::UserConfirmed,
         render: true,
-        decay: false,
-        review_at: None,
-        supersedes: None,
-        links: Vec::new(),
-        rationale: None,
-        expires_at: None,
-        source: "user".to_string(),
         created_at: "2026-01-01T00:00:00Z".to_string(),
         updated_at: "2026-01-02T00:00:00Z".to_string(),
         recall_count: 0,

@@ -15,10 +15,8 @@ use bbox_corpus_core::identity::PublishedScope;
 use bbox_gaps::gaps::{GapFileParams, GapResolveParams, GapStore, GapUpdateParams};
 use bbox_gaps::repo_io::{GapRepoCarrier, GapRepoRead, GapRepoWrite};
 use bbox_knowledge::knowledge::{
-    DecideParams, ForgetParams, Knowledge, KnowledgeLinkParams, LearnParams,
-    ProjectRenderExecutionV1, ProjectRenderPlanAssemblerV1, ProjectRenderPlanChunkV1,
-    ProjectRenderPlanV1, RememberParams, ResponseFormat, ReviewParams,
-    execute_workspace_render_plan,
+    ForgetParams, Knowledge, LearnParams, ProjectRenderExecutionV1, ProjectRenderPlanAssemblerV1,
+    ProjectRenderPlanChunkV1, ProjectRenderPlanV1, ResponseFormat, execute_workspace_render_plan,
 };
 use bbox_knowledge::repo_io::{KnowledgeRepoCarrier, KnowledgeRepoRead, KnowledgeRepoWrite};
 use bbox_knowledge_source_client::{CaptureOutcome, WorkspaceCaptureClient};
@@ -32,11 +30,7 @@ const BOUND_WORKSPACE_RENDER_SELECTOR: &str = "$bound-workspace";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MutationKind {
     Learn,
-    Remember,
-    Decide,
-    KnowledgeLink,
     Forget,
-    Review,
     GapFile,
     GapResolve,
     GapUpdate,
@@ -48,11 +42,7 @@ impl MutationKind {
         let local = name.strip_prefix(&prefix)?;
         match local {
             "bbox_learn" => Some(Self::Learn),
-            "bbox_remember" => Some(Self::Remember),
-            "bbox_decide" => Some(Self::Decide),
-            "bbox_knowledge_link" => Some(Self::KnowledgeLink),
             "bbox_forget" => Some(Self::Forget),
-            "bbox_review" => Some(Self::Review),
             "bbox_gap" => Some(Self::GapFile),
             "bbox_gap_resolve" => Some(Self::GapResolve),
             "bbox_gap_update" => Some(Self::GapUpdate),
@@ -565,11 +555,7 @@ impl LocalProjectRuntime {
     fn mutate(&self, kind: MutationKind, input: Value) -> Result<Option<ToolResult>> {
         match kind {
             MutationKind::Learn => self.learn(input),
-            MutationKind::Remember => self.remember(input),
-            MutationKind::Decide => self.decide(input),
-            MutationKind::KnowledgeLink => self.knowledge_link(input),
             MutationKind::Forget => self.forget(input),
-            MutationKind::Review => self.review(input),
             MutationKind::GapFile => self.gap_file(input),
             MutationKind::GapResolve => self.gap_resolve(input),
             MutationKind::GapUpdate => self.gap_update(input),
@@ -593,7 +579,6 @@ impl LocalProjectRuntime {
             .cloned();
         let result = knowledge.learn_result_with_checkout(
             &params,
-            false,
             Some(&self.knowledge_carrier.carrier_id),
             seed.as_ref(),
         )?;
@@ -626,84 +611,6 @@ impl LocalProjectRuntime {
         }))
     }
 
-    fn remember(&self, input: Value) -> Result<Option<ToolResult>> {
-        let mut params: RememberParams = serde_json::from_value(input)?;
-        if params.scope.as_deref() != Some("project") {
-            return Ok(None);
-        }
-        self.bind_project(&mut params.project)?;
-        params.project_id = None;
-        let mut knowledge = self.knowledge.lock().map_err(poisoned_lock)?;
-        knowledge.reload()?;
-        let result = knowledge.remember_result_with_write_dir(
-            &params,
-            false,
-            Some(&self.knowledge_carrier.carrier_id),
-        )?;
-        let rider = knowledge.repo_record_rider_at(&result.id, Some(&self.knowledge_carrier))?;
-        let mut message = result.message;
-        if let Some(rider) = rider {
-            message.push_str(&rider);
-        }
-        Ok(Some(ToolResult::Text(message)))
-    }
-
-    fn decide(&self, input: Value) -> Result<Option<ToolResult>> {
-        let mut params: DecideParams = serde_json::from_value(input)?;
-        if params.scope.as_deref() != Some("project") {
-            return Ok(None);
-        }
-        self.bind_project(&mut params.project)?;
-        params.project_id = None;
-        let mut knowledge = self.knowledge.lock().map_err(poisoned_lock)?;
-        knowledge.reload()?;
-        let superseded = params
-            .supersedes
-            .as_deref()
-            .and_then(|id| knowledge.entry(id.trim_start_matches("knowledge:")))
-            .cloned();
-        if let Some(old) = params.supersedes.as_mut() {
-            *old = old.trim_start_matches("knowledge:").to_string();
-        }
-        let result = knowledge.decide_result_with_checkout(
-            &params,
-            false,
-            Some(&self.knowledge_carrier.carrier_id),
-            superseded.as_ref(),
-        )?;
-        let rider = knowledge.repo_record_rider_at(&result.id, Some(&self.knowledge_carrier))?;
-        let mut message = result.message;
-        if let Some(rider) = rider {
-            message.push_str(&rider);
-        }
-        Ok(Some(ToolResult::Text(message)))
-    }
-
-    fn knowledge_link(&self, input: Value) -> Result<Option<ToolResult>> {
-        let mut params: KnowledgeLinkParams = serde_json::from_value(input)?;
-        let id = params.source.trim_start_matches("knowledge:").to_string();
-        let mut knowledge = self.knowledge.lock().map_err(poisoned_lock)?;
-        knowledge.reload()?;
-        let Some(seed) = knowledge.entry(&id).cloned() else {
-            return Ok(None);
-        };
-        params.source = format!("knowledge:{id}");
-        let edge = knowledge.append_link_with_write_dir(
-            &params,
-            Some(&self.knowledge_carrier.carrier_id),
-            Some(&seed),
-        )?;
-        Ok(Some(ToolResult::Text(serde_json::to_string_pretty(
-            &json!({
-                "status": "linked",
-                "source": params.source,
-                "target": params.target,
-                "kind": edge.kind.edge_kind(),
-                "confidence": edge.confidence,
-            }),
-        )?)))
-    }
-
     fn forget(&self, input: Value) -> Result<Option<ToolResult>> {
         let mut params: ForgetParams = serde_json::from_value(input)?;
         params.id = params.id.trim_start_matches("knowledge:").to_string();
@@ -713,34 +620,6 @@ impl LocalProjectRuntime {
             return Ok(None);
         };
         let message = knowledge.forget_with_write_dir(
-            &params,
-            Some(&self.knowledge_carrier.carrier_id),
-            Some(&seed),
-        )?;
-        Ok(Some(ToolResult::Text(message)))
-    }
-
-    fn review(&self, input: Value) -> Result<Option<ToolResult>> {
-        let mut params: ReviewParams = serde_json::from_value(input)?;
-        if !matches!(
-            params.action.as_deref().unwrap_or("list"),
-            "approve" | "reject"
-        ) {
-            return Ok(None);
-        }
-        let id = params
-            .id
-            .as_deref()
-            .context("review approve/reject requires an entry id")?
-            .trim_start_matches("knowledge:")
-            .to_string();
-        let mut knowledge = self.knowledge.lock().map_err(poisoned_lock)?;
-        knowledge.reload()?;
-        let Some(seed) = knowledge.entry(&id).cloned() else {
-            return Ok(None);
-        };
-        params.id = Some(id);
-        let message = knowledge.review_with_write_dir(
             &params,
             Some(&self.knowledge_carrier.carrier_id),
             Some(&seed),
@@ -1186,7 +1065,7 @@ mod tests {
         let mutation = ProjectMutationTool {
             upstream: upstream.clone(),
             runtime: runtime.clone(),
-            kind: MutationKind::Remember,
+            kind: MutationKind::Learn,
         };
         let render = LocalRenderTool {
             upstream: upstream.clone(),
@@ -1208,7 +1087,7 @@ mod tests {
         let cx = tool_cx(&root);
         let response = mutation
             .call(
-                json!({"scope":"project","content":"local envelope fixture"}),
+                json!({"scope":"project","category":"memory","render":false,"content":"local envelope fixture"}),
                 &cx,
             )
             .await;
@@ -1218,7 +1097,7 @@ mod tests {
         assert_eq!(envelope["isError"], false);
         assert!(envelope["content"].is_array());
         assert_eq!(knowledge_files(&root).len(), 1);
-        let global = json!({"scope":"global","content":"remote fixture"});
+        let global = json!({"scope":"global","category":"memory","content":"remote fixture"});
         let expected = upstream.call(global.clone(), &cx).await.into_content();
         assert_eq!(
             mutation.call(global.clone(), &cx).await.into_content(),
@@ -1295,9 +1174,11 @@ mod tests {
         let other = tempfile::tempdir().unwrap();
         let error = runtime
             .mutate(
-                MutationKind::Remember,
+                MutationKind::Learn,
                 json!({
                     "content": "must not escape",
+                    "category": "memory",
+                    "render": false,
                     "scope": "project",
                     "project": other.path(),
                 }),
@@ -1446,9 +1327,11 @@ mod tests {
         let (_directory, _root, runtime) = runtime();
         let local = runtime
             .mutate(
-                MutationKind::Remember,
+                MutationKind::Learn,
                 json!({
                     "content": "survives transport outage",
+                    "category": "memory",
+                    "render": false,
                     "scope": "project",
                 }),
             )
@@ -1456,7 +1339,7 @@ mod tests {
             .unwrap();
         let response = runtime.finish_local_mutation(local).await;
         let ToolResult::Text(response) = response else {
-            panic!("remember response should be text");
+            panic!("learn response should be text");
         };
         assert!(response.contains("Provisional sync: pending"));
         assert_eq!(knowledge_files(&runtime.project_root).len(), 1);

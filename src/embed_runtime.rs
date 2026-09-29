@@ -33,7 +33,6 @@ use crate::orchestration::agents::types::{AgentEmbedding, AgentEmbeddingComponen
 use bbox_chunker::Chunk;
 use bbox_corpus_core::entity_ref::EntityRef;
 use bbox_corpus_index::index::EmbeddingSourceDoc;
-use bbox_knowledge::knowledge::KnowledgeEntry;
 use bbox_threads::notes::NoteParams;
 
 /// Adapter with the queue worker's hook signature; registered via
@@ -638,11 +637,6 @@ pub(crate) fn route_coverage(
     let mut active_by_route = BTreeMap::new();
     if buckets.contains(&Bucket::Knowledge) {
         for entry in stores.kb.read().all_entries() {
-            // Non-indexable entries (Deleted/Draft/Disabled) aren't in the
-            // searchable index — skip so coverage reflects indexable knowledge.
-            if !crate::index::indexable_knowledge_entry(entry) {
-                continue;
-            }
             record_coverage(
                 &router,
                 &mut coverage,
@@ -986,12 +980,6 @@ fn enqueue_reembed_routes(
     if buckets.contains(&Bucket::Knowledge) {
         let published = crate::server::routes::published_knowledge_for_embedding(state, None)?;
         for entry in &published {
-            // Don't re-embed retired entries — `all_entries()` includes Deleted,
-            // which would revive a forgotten entry in vector search. Mirror the
-            // tantivy reindex's indexable filter (Active|Superseded only).
-            if !crate::index::indexable_knowledge_entry(entry) {
-                continue;
-            }
             if limit_reached(max_entities, enqueued) {
                 return Ok(enqueued);
             }
@@ -2147,9 +2135,6 @@ pub(crate) fn maybe_detect_knowledge_contradiction(
         }
         let id = hit.id.strip_prefix("knowledge:")?;
         let target = kb.entry(id)?.clone();
-        if supersession_related(&source, &target) {
-            return None;
-        }
         Some((target, cosine))
     }) else {
         return;
@@ -2174,10 +2159,6 @@ pub(crate) fn maybe_detect_knowledge_contradiction(
     }) {
         tracing::warn!(error = %err, "failed to surface contradiction fallback note");
     }
-}
-
-fn supersession_related(a: &KnowledgeEntry, b: &KnowledgeEntry) -> bool {
-    a.supersedes.as_deref() == Some(b.id.as_str()) || b.supersedes.as_deref() == Some(a.id.as_str())
 }
 
 #[cfg(test)]

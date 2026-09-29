@@ -683,12 +683,10 @@ async fn submit_result(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bbox_project_render::model::{
-        Approval, Category, KnowledgeEntry, Priority, RenderPlacement, Scope, Status,
-    };
+    use bbox_project_render::model::{Category, KnowledgeEntry, Priority, RenderPlacement, Scope};
     use bbox_project_render::transport::{
         PROJECT_RENDER_TRANSPORT_SCOPE, ProjectRenderProducerAuthorityV1, ProjectRenderViewV1,
-        format_render_operation_id, iso_from_unix_ms, transport_chunk_of,
+        format_render_operation_id, transport_chunk_of,
     };
     use bbox_project_render::wire::RENDER_PROJECT_COMMAND_KIND;
     use std::sync::Mutex;
@@ -901,25 +899,14 @@ mod tests {
                 title: "collector render".into(),
                 content: content.into(),
                 cluster: None,
-                variants: Default::default(),
                 category: Category::Convention,
                 scope: Scope::Project,
                 project: Some(PROJECT_RENDER_TRANSPORT_SCOPE.into()),
                 project_id: Some("p_collector_render".into()),
                 providers: Vec::new(),
                 priority: Priority::Standard,
-                weight: 100,
-                status: Status::Active,
-                approval: Approval::UserConfirmed,
                 render: true,
                 render_placement: RenderPlacement::Inline,
-                decay: false,
-                review_at: None,
-                supersedes: None,
-                links: Vec::new(),
-                rationale: None,
-                expires_at: None,
-                source: "test".into(),
                 created_at: "2026-09-01T00:00:00Z".into(),
                 updated_at: "2026-09-01T00:00:00Z".into(),
                 recall_count: 0,
@@ -984,62 +971,6 @@ mod tests {
             receipt.producer.as_ref().unwrap().operation_id,
             format_render_operation_id(1)
         );
-        server.abort();
-    }
-
-    static EXPIRES_AT: Mutex<Option<String>> = Mutex::new(None);
-
-    /// Holds the render between projection and receipt validation until the
-    /// wall clock is past the plan entry's expiry.
-    fn wait_past_expiry() -> Result<()> {
-        let expires_at = EXPIRES_AT.lock().unwrap().clone().unwrap();
-        while iso_from_unix_ms(bbox_project_render::execute::now_unix_ms()) <= expires_at {
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn an_entry_expiring_after_projection_still_completes_as_written() {
-        let directory = tempfile::tempdir().unwrap();
-        let directory = directory.path().canonicalize().unwrap();
-        let (root, scope) = owned_checkout(&directory);
-        let config = config(&directory, &root, &scope);
-        let (runtime, server, daemon) = fake_daemon(true).await;
-        // The entry is live at issuance and expires while the owner applies.
-        let issued_at_ms = bbox_project_render::execute::now_unix_ms();
-        let expires_at = iso_from_unix_ms(issued_at_ms);
-        let expiring = expires_at.clone();
-        operation_with(&daemon, &scope, 8, 70, "EXPIRING_RENDER_MARKER", |plan| {
-            plan.producer.as_mut().unwrap().issued_at_ms = issued_at_ms;
-            plan.entries[0].expires_at = Some(expiring);
-        });
-        *EXPIRES_AT.lock().unwrap() = Some(expires_at);
-        *AFTER_PREFLIGHT.lock().unwrap() = Some((journal_path(&config), wait_past_expiry));
-        let mut lane = RenderLaneState::default();
-
-        let reported = apply_render_operations(&runtime, &config, &mut lane).await;
-        *AFTER_PREFLIGHT.lock().unwrap() = None;
-        assert_eq!(reported.unwrap(), 1);
-        assert!(
-            fs::read_to_string(root.join("CLAUDE.md"))
-                .unwrap()
-                .contains("EXPIRING_RENDER_MARKER")
-        );
-        let results = daemon.lock().unwrap().results.clone();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].outcome, "applied", "{:?}", results[0].error);
-        let receipt = results[0].receipt.clone().unwrap();
-        assert_eq!(
-            receipt.projections[0].disposition,
-            bbox_project_render::transport::ProjectRenderDispositionV1::Written
-        );
-        // A delayed submission after the expiry still validates: the plan is
-        // projected at its issuance, not when the receipt is checked.
-        let plan: ProjectRenderPlanV1 =
-            serde_json::from_slice(&daemon.lock().unwrap().plans[&format_render_operation_id(8)])
-                .unwrap();
-        receipt.validate_against(&plan).unwrap();
         server.abort();
     }
 

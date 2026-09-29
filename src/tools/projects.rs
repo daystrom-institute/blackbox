@@ -266,7 +266,7 @@ fn init_project_path(project_dir: &Path, force: bool) -> anyhow::Result<ProjectI
         bbox_dir.join("agents"),
         bbox_dir.join("local"),
         // Marks the project repo-owned for durable knowledge: project-scoped
-        // bbox_learn/decide land here and travel with the checkout.
+        // bbox_learn writes land here and travel with the checkout.
         bbox_dir.join("knowledge"),
         // Marks the project repo-owned for substrate gap notes: project-scoped
         // bbox_gap records land here (top-level) and travel with the checkout.
@@ -1593,24 +1593,13 @@ mod tests {
             title: "repo rule".into(),
             content: "committed convention".into(),
             cluster: None,
-            variants: Default::default(),
             category: knowledge::Category::Convention,
             scope: knowledge::Scope::Project,
             project: None,
             project_id: None,
             providers: vec![],
             priority: knowledge::Priority::Standard,
-            weight: 100,
-            status: knowledge::Status::Active,
-            approval: knowledge::Approval::UserConfirmed,
             render: true,
-            decay: true,
-            review_at: None,
-            supersedes: None,
-            links: vec![],
-            rationale: None,
-            expires_at: None,
-            source: "user".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
             recall_count: 0,
@@ -2004,20 +1993,15 @@ mod tests {
             .state
             .kb
             .write()
-            .remember(
-                &knowledge::RememberParams {
-                    content: "project fact".into(),
-                    category: None,
-                    title: Some("project fact".into()),
-                    scope: Some("project".into()),
-                    project: Some(old_project.clone()),
-                    project_id: None,
-                    decay: None,
-                    review_at: None,
-                    expires_at: None,
-                },
-                false,
-            )
+            .learn(&knowledge::LearnParams {
+                content: "project fact".into(),
+                category: "memory".into(),
+                title: Some("project fact".into()),
+                scope: Some("project".into()),
+                project: Some(old_project.clone()),
+                render: Some(false),
+                ..Default::default()
+            })
             .unwrap();
         server
             .state

@@ -455,7 +455,7 @@ impl BlackboxServer {
         // Global entries live in the host store and do not depend on the
         // session project's publisher or overlay health. Resolve them before
         // preparing the project-scoped own view so an unrelated broken scope
-        // cannot block a global forget/review/link/update mutation.
+        // cannot block a global update or forget.
         let authoritative_global = if provisional_checkout.is_none() {
             self.state
                 .kb
@@ -1612,9 +1612,8 @@ pub(crate) fn checkout_access_error_is_definitively_stale(
 mod tests {
     use super::*;
     use crate::server::state::SharedState;
-    use bbox_knowledge::knowledge::{Approval, Category, Priority, Status};
+    use bbox_knowledge::knowledge::{Category, Priority};
     use bbox_knowledge::overlay::{OverlayStatus, OverlayValue, provisional_entity_ref};
-    use std::collections::HashMap;
 
     #[test]
     fn reconciliation_deletes_only_definitively_stale_checkout_errors() {
@@ -1661,24 +1660,13 @@ mod tests {
             title: id.into(),
             content: content.into(),
             cluster: None,
-            variants: HashMap::new(),
             category: Category::Memory,
             scope: Scope::Project,
             project: None,
             project_id: None,
             providers: Vec::new(),
             priority: Priority::Standard,
-            weight: 100,
-            status: Status::Active,
-            approval: Approval::UserConfirmed,
             render: false,
-            decay: false,
-            review_at: None,
-            supersedes: None,
-            links: Vec::new(),
-            rationale: None,
-            expires_at: None,
-            source: "test".into(),
             created_at: "2026-07-21T00:00:00Z".into(),
             updated_at: "2026-07-21T00:00:00Z".into(),
             recall_count: 0,
@@ -1889,40 +1877,21 @@ mod tests {
             title: "global entry".into(),
             content: "global content".into(),
             cluster: None,
-            variants: Default::default(),
             category: Category::Memory,
             scope: Scope::Global,
             project: None,
             project_id: None,
             providers: Vec::new(),
             priority: Priority::Standard,
-            weight: 100,
-            status: Status::Active,
-            approval: Approval::UserConfirmed,
             render: false,
-            decay: false,
-            review_at: None,
-            supersedes: None,
-            links: Vec::new(),
-            rationale: None,
-            expires_at: None,
-            source: "test".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
             recall_count: 0,
             last_recalled: None,
         };
-        for id in [
-            "global-update",
-            "global-link",
-            "global-review",
-            "global-forget",
-        ] {
+        for id in ["global-update", "global-forget"] {
             let mut entry = global.clone();
             entry.id = id.into();
-            if id == "global-review" {
-                entry.approval = Approval::AgentInferred;
-            }
             server.state.kb.write().upsert_generated(entry).unwrap();
         }
         server
@@ -1972,50 +1941,8 @@ mod tests {
                     scope: Some("global".into()),
                     ..Default::default()
                 },
-                false,
                 None,
                 update.seed.as_ref(),
-            )
-            .unwrap();
-
-        let link = server
-            .prepare_existing_knowledge_mutation("knowledge:global-link")
-            .unwrap();
-        server
-            .state
-            .kb
-            .write()
-            .append_link_with_write_dir(
-                &bbox_knowledge::knowledge::KnowledgeLinkParams {
-                    project: None,
-                    source: format!("knowledge:{}", link.id),
-                    target: "knowledge:global-update".into(),
-                    kind: "RelatesTo".into(),
-                    note: None,
-                    source_arc: None,
-                    confidence: None,
-                },
-                None,
-                link.seed.as_ref(),
-            )
-            .unwrap();
-
-        let review = server
-            .prepare_existing_knowledge_mutation("knowledge:global-review")
-            .unwrap();
-        server
-            .state
-            .kb
-            .write()
-            .review_with_write_dir(
-                &bbox_knowledge::knowledge::ReviewParams {
-                    project: None,
-                    action: Some("approve".into()),
-                    id: Some(review.id),
-                    ..Default::default()
-                },
-                None,
-                review.seed.as_ref(),
             )
             .unwrap();
 
@@ -2030,7 +1957,6 @@ mod tests {
                 &bbox_knowledge::knowledge::ForgetParams {
                     project: None,
                     id: forget.id,
-                    superseded_by: None,
                 },
                 None,
                 forget.seed.as_ref(),
@@ -2042,12 +1968,7 @@ mod tests {
             kb.entry("global-update").unwrap().content,
             "updated global content"
         );
-        assert_eq!(kb.entry("global-link").unwrap().links.len(), 1);
-        assert_eq!(
-            kb.entry("global-review").unwrap().approval,
-            Approval::UserConfirmed
-        );
-        assert_eq!(kb.entry("global-forget").unwrap().status, Status::Deleted);
+        assert!(kb.entry("global-forget").is_none());
     }
 
     #[test]

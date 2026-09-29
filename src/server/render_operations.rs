@@ -899,9 +899,7 @@ fn sync_directory(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bbox_project_render::model::{
-        Approval, Category, KnowledgeEntry, Priority, RenderPlacement, Scope, Status,
-    };
+    use bbox_project_render::model::{Category, KnowledgeEntry, Priority, RenderPlacement, Scope};
     use bbox_project_render::transport::{
         PROJECT_RENDER_TRANSPORT_SCOPE, PROJECT_RENDER_TRANSPORT_VERSION,
         ProjectRenderProducerAuthorityV1,
@@ -941,25 +939,14 @@ mod tests {
             title: "entry".into(),
             content: content.into(),
             cluster: None,
-            variants: Default::default(),
             category: Category::Convention,
             scope: Scope::Project,
             project: Some(PROJECT_RENDER_TRANSPORT_SCOPE.into()),
             project_id: Some(PROJECT.into()),
             providers: Vec::new(),
             priority: Priority::Standard,
-            weight: 100,
-            status: Status::Active,
-            approval: Approval::UserConfirmed,
             render: true,
             render_placement: RenderPlacement::Inline,
-            decay: false,
-            review_at: None,
-            supersedes: None,
-            links: Vec::new(),
-            rationale: None,
-            expires_at: None,
-            source: "test".into(),
             created_at: "2026-09-01T00:00:00Z".into(),
             updated_at: "2026-09-01T00:00:00Z".into(),
             recall_count: 0,
@@ -1136,35 +1123,6 @@ mod tests {
             runtime.plan_page("producer-a", &record.operation_id, 0, &grant()),
             Err(RenderLaneError::Settled)
         );
-    }
-
-    #[test]
-    fn a_receipt_submitted_after_its_entry_expired_still_validates() {
-        let runtime = RenderOperationRuntime::in_memory();
-        // Live at the plan's issuance, expired on the wall clock by the time
-        // the owner's receipt is submitted.
-        let mut expiring = entry("expiring");
-        expiring.expires_at = Some("2000-01-01T00:00:00Z".into());
-        let record = create_with(&runtime, expiring);
-        let receipt = receipt_for(&runtime, &record);
-        assert_eq!(
-            receipt.projections[0].disposition,
-            bbox_project_render::transport::ProjectRenderDispositionV1::Written,
-            "the entry is projected as it was at issuance"
-        );
-        runtime
-            .settle(
-                "producer-a",
-                &record.operation_id,
-                &record.plan_sha256,
-                &grant(),
-                Ok(receipt),
-            )
-            .unwrap();
-        assert!(matches!(
-            runtime.record(&record.operation_id).unwrap().state,
-            RenderOperationState::Completed { .. }
-        ));
     }
 
     #[test]

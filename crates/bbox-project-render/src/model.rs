@@ -1,10 +1,7 @@
 //! Durable knowledge entry model shared by the store, the renderer, and
 //! checkout-owner render executors.
 
-use std::collections::HashMap;
-
 use anyhow::Result;
-use bbox_corpus_core::edge::EdgeConfidence;
 use serde::{Deserialize, Serialize};
 
 #[derive(
@@ -53,7 +50,6 @@ pub enum Category {
     Tool,
     Memory,
     Workflow,
-    Decision,
 }
 
 impl Category {
@@ -69,13 +65,23 @@ impl Category {
             Self::Tool => "Tools",
             Self::Memory => "Memory",
             Self::Workflow => "Workflow",
-            Self::Decision => "Decisions",
         }
     }
 }
 
+/// Ordering tier. Variant order is the render and recall order: critical
+/// entries first, then standard, then supplementary.
 #[derive(
-    Debug, Clone, Serialize, Deserialize, PartialEq, schemars::JsonSchema, strum::EnumString,
+    Debug,
+    Clone,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    schemars::JsonSchema,
+    strum::EnumString,
 )]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
@@ -99,33 +105,18 @@ impl Priority {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum Status {
-    Active,
-    Draft,
-    Superseded,
-    Disabled,
-    Deleted,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum Approval {
-    UserConfirmed,
-    AgentInferred,
-    Imported,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// One durable knowledge entry. Every stored entry is active: retiring an
+/// entry deletes it.
+///
+/// Deserialization accepts the stored shapes older writers produced (see
+/// [`StoredKnowledgeEntry`]); serialization emits only these fields.
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct KnowledgeEntry {
     pub id: String,
     pub title: String,
     pub content: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cluster: Option<String>,
-    #[serde(default)]
-    pub variants: HashMap<String, String>, // provider → alternative content
     pub category: Category,
     pub scope: Scope,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -134,104 +125,197 @@ pub struct KnowledgeEntry {
     /// written before the catalog cut: those stay on the path lane.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_id: Option<String>,
+    /// Providers whose rendered files carry this entry (empty = all).
     #[serde(default)]
     pub providers: Vec<String>,
     pub priority: Priority,
-    #[serde(default = "default_weight")]
-    pub weight: u32,
-    pub status: Status,
-    pub approval: Approval,
     #[serde(default = "default_true")]
     pub render: bool, // false = indexed only, never rendered into markdown
     #[serde(default, skip_serializing_if = "RenderPlacement::is_inline")]
     pub render_placement: RenderPlacement,
-    #[serde(default = "default_true")]
-    pub decay: bool, // false = invariant, never ages out or gets staleness-reviewed
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub review_at: Option<String>, // soft staleness checkpoint (ISO 8601)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub supersedes: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub links: Vec<KnowledgeEdge>,
-    /// For `decision` entries: the rationale behind this commitment.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rationale: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub expires_at: Option<String>,
-    pub source: String,
     pub created_at: String,
     pub updated_at: String,
+    /// Recall telemetry: ranking input for hybrid search. Repo-owned
+    /// entries keep it in the host-local stats sidecar, never in the
+    /// committed file.
     #[serde(default)]
     pub recall_count: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_recalled: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct KnowledgeEdge {
-    pub target: String,
-    pub kind: KnowledgeEdgeKind,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub note: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_arc: Option<String>,
-    pub confidence: EdgeConfidence,
+/// Error text for a stored record that no longer loads as an entry.
+pub const RETIRED_KNOWLEDGE_RECORD: &str =
+    "retired knowledge record: its stored status is not active or it has expired";
+
+/// The stored shape of a knowledge entry as any writer produced it.
+///
+/// Older writers emitted fields the model no longer carries. Loading keeps
+/// the kept fields, ignores the rest, and applies three rules:
+///
+/// - a `status` other than `active` retires the record, and so does an
+///   `expires_at` already in the past: [`Self::into_entry`] returns `None`;
+/// - a non-empty `rationale` is appended to `content`, so its text is kept;
+/// - the `decision` category reads as `convention`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct StoredKnowledgeEntry {
+    id: String,
+    title: String,
+    content: String,
+    #[serde(default)]
+    cluster: Option<String>,
+    #[serde(deserialize_with = "deserialize_stored_category")]
+    category: Category,
+    scope: Scope,
+    #[serde(default)]
+    project: Option<String>,
+    #[serde(default)]
+    project_id: Option<String>,
+    #[serde(default)]
+    providers: Vec<String>,
+    priority: Priority,
+    #[serde(default = "default_true")]
+    render: bool,
+    #[serde(default)]
+    render_placement: RenderPlacement,
+    created_at: String,
+    updated_at: String,
+    #[serde(default)]
+    recall_count: u64,
+    #[serde(default)]
+    last_recalled: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    rationale: Option<String>,
+    #[serde(default)]
+    expires_at: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum KnowledgeEdgeKind {
-    #[serde(alias = "Contradicts", alias = "CONTRADICTS")]
-    Contradicts,
-    #[serde(alias = "RelatesTo", alias = "RELATES_TO")]
-    RelatesTo,
-    #[serde(alias = "TensionWith", alias = "TENSION_WITH")]
-    TensionWith,
-    #[serde(alias = "Supports", alias = "SUPPORTS")]
-    Supports,
-    #[serde(alias = "DependsOn", alias = "DEPENDS_ON")]
-    DependsOn,
-    #[serde(alias = "DerivedFrom", alias = "DERIVED_FROM")]
-    DerivedFrom,
-    #[serde(alias = "SUPERSEDES", alias = "Supersedes")]
-    Supersedes,
-    #[serde(alias = "REFERENCES", alias = "References")]
-    References,
-}
-
-impl KnowledgeEdgeKind {
-    pub fn parse(input: &str) -> Result<Self> {
-        match input {
-            "Contradicts" | "contradicts" | "CONTRADICTS" => Ok(Self::Contradicts),
-            "RelatesTo" | "relates_to" | "RELATES_TO" | "related" => Ok(Self::RelatesTo),
-            "TensionWith" | "tension_with" | "TENSION_WITH" => Ok(Self::TensionWith),
-            "Supports" | "supports" | "SUPPORTS" => Ok(Self::Supports),
-            "DependsOn" | "depends_on" | "DEPENDS_ON" => Ok(Self::DependsOn),
-            "DerivedFrom" | "derived_from" | "DERIVED_FROM" => Ok(Self::DerivedFrom),
-            "SUPERSEDES" | "Supersedes" | "supersedes" => Ok(Self::Supersedes),
-            "REFERENCES" | "References" | "references" => Ok(Self::References),
-            other => anyhow::bail!(
-                "invalid knowledge edge kind '{other}' (expected Contradicts, RelatesTo, TensionWith, Supports, DependsOn, DerivedFrom, SUPERSEDES, REFERENCES)"
-            ),
-        }
+impl StoredKnowledgeEntry {
+    pub fn id(&self) -> &str {
+        &self.id
     }
 
-    pub fn edge_kind(self) -> &'static str {
-        match self {
-            Self::Contradicts => "Contradicts",
-            Self::RelatesTo => "RelatesTo",
-            Self::TensionWith => "TensionWith",
-            Self::Supports => "Supports",
-            Self::DependsOn => "DependsOn",
-            Self::DerivedFrom => "DERIVED_FROM",
-            Self::Supersedes => "SUPERSEDES",
-            Self::References => "REFERENCES",
+    /// Whether the stored record is still an entry at instant `now`
+    /// (ISO 8601; ISO strings order chronologically).
+    pub fn is_active_at(&self, now: &str) -> bool {
+        self.status
+            .as_deref()
+            .is_none_or(|status| status == "active")
+            && self
+                .expires_at
+                .as_deref()
+                .is_none_or(|expires| expires >= now)
+    }
+
+    /// The entry this record loads as, or `None` for a retired record.
+    pub fn into_entry(self) -> Option<KnowledgeEntry> {
+        self.into_entry_at(&bbox_util::util::now_iso())
+    }
+
+    pub fn into_entry_at(self, now: &str) -> Option<KnowledgeEntry> {
+        if !self.is_active_at(now) {
+            return None;
         }
+        let mut content = self.content;
+        if let Some(rationale) = self.rationale.as_deref().map(str::trim)
+            && !rationale.is_empty()
+            && !content.contains(rationale)
+        {
+            content = append_rationale(&content, rationale);
+        }
+        Some(KnowledgeEntry {
+            id: self.id,
+            title: self.title,
+            content,
+            cluster: self.cluster,
+            category: self.category,
+            scope: self.scope,
+            project: self.project,
+            project_id: self.project_id,
+            providers: self.providers,
+            priority: self.priority,
+            render: self.render,
+            render_placement: self.render_placement,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+            recall_count: self.recall_count,
+            last_recalled: self.last_recalled,
+        })
     }
 }
 
-fn default_weight() -> u32 {
-    100
+/// A stored category. The `decision` category is no longer written, but
+/// older entry files and published rows carry it: it reads as `convention`.
+fn deserialize_stored_category<'de, D>(deserializer: D) -> std::result::Result<Category, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StoredCategory {
+        Current(Category),
+        Legacy(LegacyCategory),
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum LegacyCategory {
+        Decision,
+    }
+    Ok(match StoredCategory::deserialize(deserializer)? {
+        StoredCategory::Current(category) => category,
+        StoredCategory::Legacy(LegacyCategory::Decision) => Category::Convention,
+    })
+}
+
+/// `content` with a stored rationale appended as its own paragraph.
+pub fn append_rationale(content: &str, rationale: &str) -> String {
+    let content = content.trim_end();
+    if content.is_empty() {
+        format!("Rationale: {rationale}")
+    } else {
+        format!("{content}\n\nRationale: {rationale}")
+    }
+}
+
+impl KnowledgeEntry {
+    /// Parse one stored record. `Ok(None)` is a retired record, which
+    /// callers skip rather than treat as malformed.
+    pub fn from_stored_slice(bytes: &[u8]) -> serde_json::Result<Option<Self>> {
+        serde_json::from_slice::<StoredKnowledgeEntry>(bytes).map(StoredKnowledgeEntry::into_entry)
+    }
+
+    pub fn from_stored_value(value: serde_json::Value) -> serde_json::Result<Option<Self>> {
+        serde_json::from_value::<StoredKnowledgeEntry>(value).map(StoredKnowledgeEntry::into_entry)
+    }
+}
+
+/// A single record that must be an entry: a retired record is an error.
+/// Collections of stored records use [`deserialize_stored_entries`].
+impl<'de> Deserialize<'de> for KnowledgeEntry {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        StoredKnowledgeEntry::deserialize(deserializer)?
+            .into_entry()
+            .ok_or_else(|| serde::de::Error::custom(RETIRED_KNOWLEDGE_RECORD))
+    }
+}
+
+/// `deserialize_with` for a stored entry list: retired records are dropped.
+pub fn deserialize_stored_entries<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<KnowledgeEntry>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let now = bbox_util::util::now_iso();
+    Ok(Vec::<StoredKnowledgeEntry>::deserialize(deserializer)?
+        .into_iter()
+        .filter_map(|stored| stored.into_entry_at(&now))
+        .collect())
 }
 
 fn default_true() -> bool {

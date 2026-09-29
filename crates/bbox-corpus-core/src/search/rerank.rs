@@ -6,7 +6,6 @@ pub struct RerankFeatures {
     pub doc_type: Option<String>,
     pub chunk_kind: Option<String>,
     pub role: Option<String>,
-    pub approval: Option<String>,
     pub created_at: Option<String>,
     pub last_recalled: Option<String>,
     pub recall_count: u32,
@@ -14,11 +13,8 @@ pub struct RerankFeatures {
 
 pub fn type_multiplier(features: &RerankFeatures) -> f32 {
     match features.doc_type.as_deref() {
-        Some("knowledge") => match features.approval.as_deref() {
-            Some("UserConfirmed") | Some("user_confirmed") => 1.35,
-            Some("Imported") | Some("imported") => 0.85,
-            _ => 1.0,
-        },
+        // Every stored entry was approved by the operator before its write.
+        Some("knowledge") => 1.35,
         Some("project_file") => match features.chunk_kind.as_deref() {
             Some("doc_section") => 1.20,
             Some("code_block") => 1.0,
@@ -62,7 +58,7 @@ pub fn temporal_decay(features: &RerankFeatures, now: DateTime<Utc>) -> f32 {
 /// {1.0, 1.25, 1.5, 1.75, 2.0, 2.5} over the 30-query eval suite against
 /// the live corpus, MRR rose monotonically to 1.75 (0.066 → 0.175,
 /// recall@1 0 → 0.13) and plateaued exactly from there — today's maximum
-/// legitimate boost product is UserConfirmed 1.35 × temporal 1.25 =
+/// legitimate boost product is knowledge 1.35 × temporal 1.25 =
 /// 1.6875, so 1.5 truncated real knowledge promotions while any cap
 /// ≥ 1.6875 never binds. 1.75 is the smallest plateau value: it frees the
 /// current signals and still backstops future boost stacking.
@@ -98,10 +94,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn type_multiplier_prefers_confirmed_knowledge_over_code() {
+    fn type_multiplier_prefers_knowledge_over_code() {
         let knowledge = RerankFeatures {
             doc_type: Some("knowledge".into()),
-            approval: Some("UserConfirmed".into()),
             ..RerankFeatures::default()
         };
         let code = RerankFeatures {
@@ -160,7 +155,6 @@ mod tests {
             .with_timezone(&Utc);
         let fresh_confirmed = RerankFeatures {
             doc_type: Some("knowledge".into()),
-            approval: Some("UserConfirmed".into()),
             created_at: Some("2026-05-05T00:00:00Z".into()),
             last_recalled: Some("2026-05-05T00:00:00Z".into()),
             recall_count: 10,

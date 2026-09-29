@@ -592,9 +592,8 @@ mod tests {
     use bbox_config::config::{self, CodeCollectionProducerConfig};
     use bbox_corpus_core::project_catalog::{CorpusProject, ProjectScope};
     use bbox_knowledge::knowledge::{
-        Approval, Category, KnowledgeEntry, PROJECT_RENDER_TRANSPORT_SCOPE,
-        PROJECT_RENDER_TRANSPORT_VERSION, Priority, ProjectRenderPlanV1, Scope, Status,
-        execute_project_render_plan,
+        Category, KnowledgeEntry, PROJECT_RENDER_TRANSPORT_SCOPE, PROJECT_RENDER_TRANSPORT_VERSION,
+        Priority, ProjectRenderPlanV1, Scope, execute_project_render_plan,
     };
     use std::sync::Arc;
 
@@ -637,24 +636,13 @@ mod tests {
             title: "Render cutover".into(),
             content: "render cutover positive control".into(),
             cluster: None,
-            variants: Default::default(),
             category: Category::Convention,
             scope: Scope::Project,
             project: Some(PROJECT_RENDER_TRANSPORT_SCOPE.into()),
             project_id: Some(PROJECT.into()),
             providers: vec![],
             priority: Priority::Standard,
-            weight: 100,
-            status: Status::Active,
-            approval: Approval::UserConfirmed,
             render: true,
-            decay: false,
-            review_at: None,
-            supersedes: None,
-            links: vec![],
-            rationale: None,
-            expires_at: None,
-            source: "test".into(),
             created_at: "unix:1".into(),
             updated_at: "unix:1".into(),
             recall_count: 0,

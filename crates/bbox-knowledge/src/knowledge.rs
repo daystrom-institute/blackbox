@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -9,9 +9,7 @@ use std::time::SystemTime;
 use anyhow::{Context, Result};
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
 
-use bbox_chunker::EdgeConfidence;
 use bbox_corpus_core::entity_ref::EntityRef;
 use bbox_stores::store_persister::StoreSnapshot;
 
@@ -28,8 +26,8 @@ pub use bbox_project_render::execute::{
     execute_project_render_plan_as, execute_workspace_render_plan, lock_checkout_for_render,
 };
 pub use bbox_project_render::model::{
-    Approval, Category, GuidanceTopic, KnowledgeEdge, KnowledgeEdgeKind, KnowledgeEntry, Priority,
-    RenderPlacement, Scope, Status,
+    Category, GuidanceTopic, KnowledgeEntry, Priority, RETIRED_KNOWLEDGE_RECORD, RenderPlacement,
+    Scope, StoredKnowledgeEntry, append_rationale, deserialize_stored_entries,
 };
 #[cfg(test)]
 use bbox_project_render::projection::PROJECT_DOC_FILE;
@@ -75,15 +73,15 @@ pub struct LearnParams {
     /// Provider filter (empty = all)
     #[serde(default)]
     pub providers: Option<Vec<String>>,
-    /// Priority: critical, standard, supplementary
+    /// Priority: critical, standard, supplementary. Entries order by
+    /// priority, then title.
     #[serde(default)]
     pub priority: Option<String>,
-    /// Ordering within priority tier
+    /// Render into provider files (default true). `false` stores an
+    /// indexed-only recall entry that search finds but no rendered file
+    /// carries. Omitted updates preserve the current value.
     #[serde(default)]
-    pub weight: Option<u32>,
-    /// ISO 8601 expiry time
-    #[serde(default)]
-    pub expires_at: Option<String>,
+    pub render: Option<bool>,
     /// Optional subsection heading within the category render block
     #[serde(default)]
     pub cluster: Option<String>,
@@ -93,39 +91,6 @@ pub struct LearnParams {
     /// Update existing entry by ID
     #[serde(default)]
     pub id: Option<String>,
-    /// Internal, not part of the MCP schema: the resolving authority's
-    /// project id. Set by the daemon adapter from the resolver, never
-    /// accepted from the wire, so identity cannot be caller-asserted.
-    #[serde(skip)]
-    pub project_id: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema, Default)]
-pub struct RememberParams {
-    /// The fact, observation, or note
-    pub content: String,
-    /// Category (default: memory)
-    #[serde(default)]
-    #[schemars(with = "Option<Category>")]
-    pub category: Option<String>,
-    /// Short title
-    #[serde(default)]
-    pub title: Option<String>,
-    /// global or project (default: global)
-    #[serde(default)]
-    pub scope: Option<String>,
-    /// Project path
-    #[serde(default)]
-    pub project: Option<String>,
-    /// Set false for invariants (default: true)
-    #[serde(default)]
-    pub decay: Option<bool>,
-    /// ISO 8601 date to revisit
-    #[serde(default)]
-    pub review_at: Option<String>,
-    /// ISO 8601 expiry
-    #[serde(default)]
-    pub expires_at: Option<String>,
     /// Internal, not part of the MCP schema: the resolving authority's
     /// project id. Set by the daemon adapter from the resolver, never
     /// accepted from the wire, so identity cannot be caller-asserted.
@@ -148,10 +113,6 @@ pub struct KnowledgeListParams {
     pub project: Option<String>,
     #[serde(default)]
     pub provider: Option<String>,
-    #[serde(default)]
-    pub status: Option<String>,
-    #[serde(default)]
-    pub approval: Option<String>,
     /// Free-text query. By default adjacent terms broaden recall, quoted
     /// phrases stay exact, explicit `AND` / `OR` work, and `-term` excludes.
     #[serde(default)]
@@ -210,11 +171,8 @@ pub struct KnowledgeListParams {
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ForgetParams {
-    /// Entry ID to remove
+    /// Entry ID to delete
     pub id: String,
-    /// Mark as superseded instead of deleted
-    #[serde(default)]
-    pub superseded_by: Option<String>,
     #[serde(default)]
     #[schemars(
         description = "Project selector for checkout-owner mutations. Omit for global or local-store entries."
@@ -308,101 +266,6 @@ pub struct KnowledgeContradiction {
     pub negative_id: String,
 }
 
-#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct AbsorbParams {
-    /// Project directory path. Required for scope=project (default);
-    /// ignored for scope=global.
-    #[serde(default)]
-    pub project: Option<String>,
-    /// Absorb is a compatibility no-op for generated projections. Use
-    /// indexed search and explicit bbox_learn/bbox_remember writes to retain
-    /// selected knowledge; rendered files are not import sources.
-    #[serde(default)]
-    pub scope: Option<String>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct ReviewParams {
-    /// Closed action set: list, get, approve, or reject (default: list).
-    #[serde(default)]
-    pub action: Option<String>,
-    /// Entry ID. Required for get, approve, and reject.
-    #[serde(default)]
-    pub id: Option<String>,
-    /// Content-bound continuation cursor returned by a previous list or get.
-    #[serde(default)]
-    pub cursor: Option<String>,
-    /// List rows per page (1..100) or exact-record body bytes per page
-    /// (256..4096).
-    #[serde(default)]
-    pub limit: Option<u64>,
-    #[serde(default)]
-    #[schemars(
-        description = "Project selector for checkout-owner approve/reject mutations. Omit for global or local-store entries."
-    )]
-    pub project: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct BootstrapParams {
-    /// Absolute path to the repo root
-    pub project: String,
-}
-
-#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema, Default)]
-pub struct DecideParams {
-    /// The decision itself — the commitment being made
-    pub content: String,
-    /// Why — the justification for this decision (required)
-    pub rationale: String,
-    /// ID of the decision this one replaces (optional). Marks the old
-    /// entry as superseded and links it to this one.
-    #[serde(default)]
-    pub supersedes: Option<String>,
-    /// Short title (auto-generated from content if omitted)
-    #[serde(default)]
-    pub title: Option<String>,
-    /// global or project (default: global)
-    #[serde(default)]
-    pub scope: Option<String>,
-    /// Project path for project-scoped decisions
-    #[serde(default)]
-    pub project: Option<String>,
-    /// Priority: critical, standard, supplementary (default: standard)
-    #[serde(default)]
-    pub priority: Option<String>,
-    /// Render into provider markdown files (default: true)
-    #[serde(default)]
-    pub render: Option<bool>,
-    /// Internal, not part of the MCP schema: the resolving authority's
-    /// project id. Set by the daemon adapter from the resolver, never
-    /// accepted from the wire, so identity cannot be caller-asserted.
-    #[serde(skip)]
-    pub project_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct KnowledgeLinkParams {
-    /// Source knowledge entry id or `knowledge:<id>` entity ref.
-    pub source: String,
-    /// Target entity ref string.
-    pub target: String,
-    /// One of: Contradicts, RelatesTo, TensionWith, Supports, DependsOn,
-    /// DerivedFrom, SUPERSEDES.
-    pub kind: String,
-    #[serde(default)]
-    pub note: Option<String>,
-    #[serde(default)]
-    pub source_arc: Option<String>,
-    #[serde(default)]
-    pub confidence: Option<String>,
-    #[serde(default)]
-    #[schemars(
-        description = "Project selector for the source entry's checkout-owner mutation. Omit for global or local-store entries."
-    )]
-    pub project: Option<String>,
-}
-
 // ── Schema ─────────────────────────────────────────────────────────
 
 #[derive(
@@ -443,24 +306,6 @@ pub struct LearnWriteResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
     pub message: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct KnowledgeWriteResult {
-    pub id: String,
-    pub message: String,
-    pub superseded: Option<String>,
-}
-
-fn parse_edge_confidence(input: Option<&str>) -> Result<EdgeConfidence> {
-    match input.unwrap_or("heuristic") {
-        "exact" | "Exact" | "EXACT" => Ok(EdgeConfidence::Exact),
-        "heuristic" | "Heuristic" | "HEURISTIC" => Ok(EdgeConfidence::Heuristic),
-        "unknown" | "Unknown" | "UNKNOWN" => Ok(EdgeConfidence::Unknown),
-        other => anyhow::bail!(
-            "invalid edge confidence '{other}' (expected exact, heuristic, or unknown)"
-        ),
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -943,8 +788,12 @@ fn load_repo_kb_entries(
                 continue;
             }
         };
-        let mut entry: KnowledgeEntry = match serde_json::from_slice(&raw) {
-            Ok(entry) => entry,
+        let mut entry = match KnowledgeEntry::from_stored_slice(&raw) {
+            Ok(Some(entry)) => entry,
+            Ok(None) => {
+                tracing::debug!("kb load: skipping retired record {}", path.display());
+                continue;
+            }
             Err(e) => {
                 tracing::warn!("kb load: skipping unparseable {}: {e}", path.display());
                 skipped += 1;
@@ -1159,6 +1008,9 @@ fn persist_repo_kb_entries(
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KnowledgeStore {
     pub version: u32,
+    /// Stored records that are retired (a legacy non-active status) are
+    /// dropped on load, so the next persist deletes them.
+    #[serde(deserialize_with = "deserialize_stored_entries")]
     pub entries: Vec<KnowledgeEntry>,
     /// Load-time published-vs-provisional label per entry id (design §3.4 /
     /// slice 3.2). An entry whose committed-tree blob is byte-identical to its
@@ -1660,6 +1512,16 @@ impl Knowledge {
     }
 
     fn persist_repo_owned_entries(&self) -> Result<()> {
+        self.persist_repo_owned_carriers(None)
+    }
+
+    /// [`Self::persist_repo_owned_entries`] that also purges one just-deleted
+    /// entry: its carrier is visited even when no entry remains there, and
+    /// its id counts as known so the purge removes its file.
+    fn persist_repo_owned_carriers(
+        &self,
+        deleted: Option<(KnowledgeRepoCarrier, &str)>,
+    ) -> Result<()> {
         // Persistence is split by scope. The central store owns only global
         // (non-project) entries and is written by StorePersister. Project-scoped
         // entries for repo-owned projects stay synchronous one-file writes here,
@@ -1670,6 +1532,9 @@ impl Knowledge {
                 continue;
             };
             by_carrier.entry(carrier).or_default().push(e);
+        }
+        if let Some((carrier, _)) = &deleted {
+            by_carrier.entry(carrier.clone()).or_default();
         }
         // Purge only for projects whose repo entries we actually loaded (root is
         // tracked) — otherwise our in-memory set is not authoritative and
@@ -1688,13 +1553,18 @@ impl Knowledge {
         let no_loaded_ids = BTreeSet::new();
         for (carrier, entries) in &by_carrier {
             let purge = loaded.contains(carrier.carrier_id.as_str());
-            let known_ids = self
+            let mut known_ids = self
                 .repo_loaded_ids
                 .get(&carrier.carrier_id)
                 .unwrap_or(&no_loaded_ids)
                 .iter()
                 .map(String::as_str)
                 .collect::<BTreeSet<_>>();
+            if let Some((deleted_carrier, id)) = &deleted
+                && deleted_carrier == carrier
+            {
+                known_ids.insert(id);
+            }
             self.with_repo_write(carrier, |root| {
                 persist_repo_kb_entries(root, entries, purge, &known_ids, &redirected_ids)
             })?;
@@ -1824,6 +1694,92 @@ impl Knowledge {
                 // authoritative carriers before returning the write failure so a
                 // later unrelated save cannot publish a mutation that was reported
                 // as failed or race an unresolved transaction claim.
+                if let Err(reload_error) = self.reload() {
+                    return Err(error.context(format!(
+                        "repo-owned knowledge transaction failed and in-memory rollback reload also failed: {reload_error:#}"
+                    )));
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Persist the deletion of `removed`, already taken out of the mutable
+    /// store. `base_carrier` is the repo-owned carrier it was loaded from.
+    /// A checkout-scoped deletion removes only that checkout's file; the base
+    /// generation keeps its copy until the checkout's change is published.
+    fn persist_repo_owned_removal_at(
+        &mut self,
+        removed: &KnowledgeEntry,
+        base_carrier: Option<KnowledgeRepoCarrier>,
+        write_dir: Option<&str>,
+    ) -> Result<()> {
+        let Some(write_carrier_id) = write_dir.map(str::trim).filter(|dir| !dir.is_empty()) else {
+            let deleted = base_carrier.map(|carrier| (carrier, removed.id.as_str()));
+            let persisted = self.persist_repo_owned_carriers(deleted);
+            if let Err(error) = persisted {
+                if let Err(reload_error) = self.reload() {
+                    return Err(error.context(format!(
+                        "knowledge persistence failed and in-memory rollback reload also failed: {reload_error:#}"
+                    )));
+                }
+                return Err(error);
+            }
+            return Ok(());
+        };
+        let project = removed
+            .project
+            .as_deref()
+            .context("checkout knowledge mutation requires a durable project scope")?;
+        let carrier = self.write_carrier(project, write_carrier_id)?;
+        let id = removed.id.as_str();
+        let persisted = self.with_repo_write(&carrier, |project_dir| {
+            if !project_is_repo_owned(project_dir) {
+                anyhow::bail!(
+                    "checkout knowledge carrier {} is unavailable; refusing to retain provisional bytes centrally",
+                    carrier.carrier_id
+                );
+            }
+            validate_repo_knowledge_id(id)?;
+            let checkout_dir = match bbox_corpus_core::git::git_root_for_path(project_dir) {
+                Some(root) => root,
+                None => project_dir.canonicalize().with_context(|| {
+                    format!(
+                        "resolving non-git knowledge transaction root at {}",
+                        project_dir.display()
+                    )
+                })?,
+            };
+            let path = repo_kb_dir(project_dir).join(format!("{id}.json"));
+            let writes = match fs::symlink_metadata(&path) {
+                Ok(metadata)
+                    if metadata.file_type().is_file() && !metadata.file_type().is_symlink() =>
+                {
+                    vec![crate::transaction::TransactionWrite {
+                        target: path,
+                        new_bytes: None,
+                    }]
+                }
+                Ok(_) => anyhow::bail!(
+                    "refusing to delete non-regular or symlink knowledge file {}",
+                    path.display()
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("inspecting knowledge file {}", path.display()));
+                }
+            };
+            crate::transaction::apply_transaction(&checkout_dir, writes)?;
+            let mut stats = load_repo_kb_stats(project_dir);
+            if stats.remove(id).is_some() {
+                persist_repo_kb_stats(project_dir, &stats)?;
+            }
+            Ok(())
+        });
+        match persisted {
+            Ok(()) => Ok(()),
+            Err(error) => {
                 if let Err(reload_error) = self.reload() {
                     return Err(error.context(format!(
                         "repo-owned knowledge transaction failed and in-memory rollback reload also failed: {reload_error:#}"
@@ -1973,24 +1929,8 @@ impl Knowledge {
         format!("{:016x}", h.finish())
     }
 
-    fn is_expired(entry: &KnowledgeEntry) -> bool {
-        if let Some(ref exp) = entry.expires_at {
-            let now = Self::now_iso();
-            exp.as_str() < now.as_str() // ISO 8601 string comparison works for ordering
-        } else {
-            false
-        }
-    }
-
-    fn active_entries(&self) -> impl Iterator<Item = &KnowledgeEntry> {
-        self.store
-            .entries
-            .iter()
-            .filter(|e| e.status == Status::Active && !Self::is_expired(e))
-    }
-
-    /// Immutable slice of all stored entries (any status), for in-process
-    /// readers that can't go through the MCP layer.
+    /// Immutable slice of all stored entries, for in-process readers that
+    /// can't go through the MCP layer.
     pub fn all_entries(&self) -> &[KnowledgeEntry] {
         &self.store.entries
     }
@@ -2098,10 +2038,6 @@ impl Knowledge {
             .store
             .entries
             .iter()
-            .filter(|entry| {
-                matches!(entry.status, Status::Active | Status::Superseded)
-                    && !Self::is_expired(entry)
-            })
             .filter_map(|entry| {
                 let corpus = SearchCorpus {
                     id: entry.id.to_lowercase(),
@@ -2142,73 +2078,8 @@ impl Knowledge {
         hits
     }
 
-    pub fn append_link(&mut self, p: &KnowledgeLinkParams) -> Result<KnowledgeEdge> {
-        self.append_link_locked(p, None, None)
-    }
-
-    pub fn append_link_with_write_dir(
-        &mut self,
-        p: &KnowledgeLinkParams,
-        write_dir: Option<&str>,
-        checkout_entry: Option<&KnowledgeEntry>,
-    ) -> Result<KnowledgeEdge> {
-        self.append_link_locked(p, write_dir, checkout_entry)
-    }
-
-    fn append_link_locked(
-        &mut self,
-        p: &KnowledgeLinkParams,
-        write_dir: Option<&str>,
-        checkout_entry: Option<&KnowledgeEntry>,
-    ) -> Result<KnowledgeEdge> {
-        let source_id = match EntityRef::parse(&p.source) {
-            Ok(EntityRef::Knowledge { id }) => id,
-            Ok(other) => anyhow::bail!("source must be a knowledge ref, got {other}"),
-            Err(_) => p.source.trim_start_matches("knowledge:").to_string(),
-        };
-        if source_id.trim().is_empty() {
-            anyhow::bail!("source knowledge id is required");
-        }
-        self.ensure_existing_write_authority(&[&source_id], write_dir)?;
-        EntityRef::parse(&p.target)
-            .map_err(|err| anyhow::anyhow!("target must be a valid entity ref: {err}"))?;
-        let kind = KnowledgeEdgeKind::parse(&p.kind)?;
-        let confidence = parse_edge_confidence(p.confidence.as_deref())?;
-        let edge = KnowledgeEdge {
-            target: p.target.clone(),
-            kind,
-            note: p.note.clone(),
-            source_arc: p.source_arc.clone(),
-            confidence,
-        };
-        let restore = self.install_checkout_mutation_seed(&source_id, checkout_entry, write_dir)?;
-        let now = Self::now_iso();
-        let entry = self
-            .store
-            .entries
-            .iter_mut()
-            .find(|entry| entry.id == source_id)
-            .ok_or_else(|| anyhow::anyhow!("source knowledge entry not found: {source_id}"))?;
-        let duplicate = entry.links.iter().any(|existing| {
-            existing.target == edge.target
-                && existing.kind == edge.kind
-                && existing.source_arc == edge.source_arc
-        });
-        if !duplicate {
-            entry.links.push(edge.clone());
-            entry.updated_at = now;
-            let persisted = self.persist_repo_owned_mutation_at(&[&source_id], write_dir);
-            self.restore_checkout_mutation_seed(restore);
-            persisted?;
-        } else {
-            self.restore_checkout_mutation_seed(restore);
-        }
-        Ok(edge)
-    }
-
     /// Insert-or-replace a code-generated entry by its stable ID.
-    /// Bypasses the normal `learn` flow (no ID generation, no approval
-    /// defaulting). Used by `tool_docs::sync_into_knowledge` to keep
+    /// Bypasses the normal `learn` flow (no ID generation). Used by `tool_docs::sync_into_knowledge` to keep
     /// the auto-generated tool reference in sync with the binary.
     pub fn upsert_generated(&mut self, entry: KnowledgeEntry) -> Result<()> {
         self.ensure_scope_write_authority(entry.scope, None)?;
@@ -2230,8 +2101,8 @@ impl Knowledge {
 
     // ── CRUD ───────────────────────────────────────────────────────
 
-    pub fn learn_result(&mut self, p: &LearnParams, from_agent: bool) -> Result<LearnWriteResult> {
-        self.learn_result_locked(p, from_agent, None, None)
+    pub fn learn_result(&mut self, p: &LearnParams) -> Result<LearnWriteResult> {
+        self.learn_result_locked(p, None, None)
     }
 
     /// `learn_result` with an explicit checkout carrier. The entry keeps
@@ -2243,11 +2114,10 @@ impl Knowledge {
     pub fn learn_result_with_write_dir(
         &mut self,
         p: &LearnParams,
-        from_agent: bool,
         write_dir: Option<&str>,
     ) -> Result<LearnWriteResult> {
         let seed = p.id.as_deref().and_then(|id| self.entry(id)).cloned();
-        self.learn_result_locked(p, from_agent, write_dir, seed.as_ref())
+        self.learn_result_locked(p, write_dir, seed.as_ref())
     }
 
     /// Checkout-scoped learn/create-or-update with the visible generation of
@@ -2255,20 +2125,19 @@ impl Knowledge {
     pub fn learn_result_with_checkout(
         &mut self,
         p: &LearnParams,
-        from_agent: bool,
         write_dir: Option<&str>,
         checkout_entry: Option<&KnowledgeEntry>,
     ) -> Result<LearnWriteResult> {
         if write_dir.is_some() && p.id.is_some() && checkout_entry.is_none() {
             anyhow::bail!("checkout-scoped knowledge update requires its visible entry seed");
         }
-        self.learn_result_locked(p, from_agent, write_dir, checkout_entry)
+        self.learn_result_locked(p, write_dir, checkout_entry)
     }
 
     /// Commit-this rider for a just-written entry, when it persisted into a
     /// repo-owned project's committed `.bbox/knowledge/`. Returns `None` for
     /// global/central entries (host-local, nothing to commit) or unknown ids.
-    /// Read-only; safe to call after any learn/remember/decide write.
+    /// Read-only; safe to call after any learn write.
     pub fn repo_record_rider(&self, id: &str) -> Result<Option<String>> {
         let Some(entry) = self.store.entries.iter().find(|e| e.id == id) else {
             return Ok(None);
@@ -2312,7 +2181,6 @@ impl Knowledge {
     fn learn_result_locked(
         &mut self,
         p: &LearnParams,
-        from_agent: bool,
         write_dir: Option<&str>,
         checkout_entry: Option<&KnowledgeEntry>,
     ) -> Result<LearnWriteResult> {
@@ -2326,7 +2194,6 @@ impl Knowledge {
         }
         let providers = p.providers.clone().unwrap_or_default();
         let priority = Priority::parse_optional(p.priority.as_deref())?;
-        let weight = p.weight.unwrap_or(100);
         let cluster = p
             .cluster
             .as_deref()
@@ -2335,11 +2202,6 @@ impl Knowledge {
             .map(str::to_string);
 
         let now = Self::now_iso();
-        let approval = if from_agent {
-            Approval::AgentInferred
-        } else {
-            Approval::UserConfirmed
-        };
         let update_restore = match (p.id.as_deref(), checkout_entry) {
             (Some(id), Some(seed)) => {
                 self.install_checkout_mutation_seed(id, Some(seed), write_dir)?
@@ -2360,7 +2222,7 @@ impl Knowledge {
                 let old_cluster = entry.cluster.clone();
                 let old_category = format!("{:?}", entry.category);
                 let old_priority = format!("{:?}", entry.priority);
-                let old_weight = entry.weight;
+                let old_render = entry.render;
                 let old_providers = entry.providers.clone();
                 let old_scope = format!("{:?}", entry.scope);
                 let old_project = entry.project.clone();
@@ -2373,12 +2235,11 @@ impl Knowledge {
                 entry.title = title;
                 entry.category = category;
                 entry.priority = priority;
-                entry.weight = weight;
+                if let Some(render) = p.render {
+                    entry.render = render;
+                }
                 entry.providers = providers;
                 entry.updated_at = now;
-                if let Some(exp) = p.expires_at.clone() {
-                    entry.expires_at = Some(exp);
-                }
                 if let Some(s) = p.scope.as_deref() {
                     if let Ok(parsed) = s.parse::<Scope>() {
                         entry.scope = parsed;
@@ -2433,8 +2294,8 @@ impl Knowledge {
                 if old_priority != new_priority {
                     changes.push(format!("priority: {old_priority} → {new_priority}"));
                 }
-                if old_weight != entry.weight {
-                    changes.push(format!("weight: {} → {}", old_weight, entry.weight));
+                if old_render != entry.render {
+                    changes.push(format!("render: {} → {}", old_render, entry.render));
                 }
                 if old_providers != entry.providers {
                     changes.push(format!(
@@ -2493,28 +2354,13 @@ impl Knowledge {
             title,
             content: p.content.clone(),
             cluster,
-            variants: HashMap::new(),
             category,
             scope,
             project: p.project.clone(),
             project_id: p.project_id.clone(),
             providers,
             priority,
-            weight,
-            render: true,
-            decay: true,
-            review_at: None,
-            status: Status::Active,
-            approval,
-            supersedes: None,
-            links: Vec::new(),
-            rationale: None,
-            expires_at: p.expires_at.clone(),
-            source: if from_agent {
-                "agent".to_string()
-            } else {
-                "user".to_string()
-            },
+            render: p.render.unwrap_or(true),
             created_at: now.clone(),
             updated_at: now,
             recall_count: 0,
@@ -2549,281 +2395,8 @@ impl Knowledge {
     // Test-only convenience wrapper around learn_result; production callers
     // use the structured variant.
     #[allow(dead_code)]
-    pub fn learn(&mut self, p: &LearnParams, from_agent: bool) -> Result<String> {
-        self.learn_result(p, from_agent)
-            .map(|result| result.message)
-    }
-
-    /// Remember — store for on-demand recall only, never rendered into markdown.
-    pub fn remember_result(
-        &mut self,
-        p: &RememberParams,
-        from_agent: bool,
-    ) -> Result<KnowledgeWriteResult> {
-        self.remember_result_locked(p, from_agent, None)
-    }
-
-    /// `remember_result` with an explicit checkout carrier (see
-    /// [`Self::learn_result_with_write_dir`]).
-    pub fn remember_result_with_write_dir(
-        &mut self,
-        p: &RememberParams,
-        from_agent: bool,
-        write_dir: Option<&str>,
-    ) -> Result<KnowledgeWriteResult> {
-        self.remember_result_locked(p, from_agent, write_dir)
-    }
-
-    fn remember_result_locked(
-        &mut self,
-        p: &RememberParams,
-        from_agent: bool,
-        write_dir: Option<&str>,
-    ) -> Result<KnowledgeWriteResult> {
-        // None → Memory (schema default). Some(invalid) → error rather than
-        // silently landing the entry in the wrong bucket.
-        let category = match p.category.as_deref() {
-            None => Category::Memory,
-            Some(raw) => {
-                Category::from_str(raw).map_err(|_| anyhow::anyhow!("invalid category: {raw}"))?
-            }
-        };
-        let title = p.title.clone().unwrap_or_else(|| derive_title(&p.content));
-        let scope = Scope::parse_optional(p.scope.as_deref())?;
-        self.ensure_scope_write_authority(scope, write_dir)?;
-
-        let now = Self::now_iso();
-        let id = Self::gen_id();
-
-        self.store.entries.push(KnowledgeEntry {
-            render_placement: Default::default(),
-            id: id.clone(),
-            title,
-            content: p.content.clone(),
-            cluster: None,
-            variants: HashMap::new(),
-            category,
-            scope,
-            project: p.project.clone(),
-            project_id: p.project_id.clone(),
-            providers: Vec::new(),
-            priority: Priority::Standard,
-            weight: 100,
-            render: false,
-            decay: p.decay.unwrap_or(true),
-            review_at: p.review_at.clone(),
-            status: Status::Active,
-            approval: if from_agent {
-                Approval::AgentInferred
-            } else {
-                Approval::UserConfirmed
-            },
-            supersedes: None,
-            links: Vec::new(),
-            rationale: None,
-            expires_at: p.expires_at.clone(),
-            source: if from_agent {
-                "agent".to_string()
-            } else {
-                "user".to_string()
-            },
-            created_at: now.clone(),
-            updated_at: now,
-            recall_count: 0,
-            last_recalled: None,
-        });
-
-        let checkout_scoped = self.mutation_uses_checkout_carrier(&id, write_dir);
-        let persisted = self.persist_repo_owned_mutation_at(&[&id], write_dir);
-        if checkout_scoped || persisted.is_err() {
-            self.store.entries.retain(|entry| entry.id != id);
-        }
-        persisted?;
-        Ok(KnowledgeWriteResult {
-            id: id.clone(),
-            message: format!("Remembered entry {id} (indexed only, not rendered)"),
-            superseded: None,
-        })
-    }
-
-    #[allow(dead_code)]
-    pub fn remember(&mut self, p: &RememberParams, from_agent: bool) -> Result<String> {
-        Ok(self.remember_result(p, from_agent)?.message)
-    }
-
-    /// Decide — a durable commitment with rationale. When `supersedes`
-    /// is set, marks the prior entry as superseded and records a link
-    /// from the old to the new (via the existing `supersedes` field).
-    pub fn decide_result(
-        &mut self,
-        p: &DecideParams,
-        from_agent: bool,
-    ) -> Result<KnowledgeWriteResult> {
-        self.decide_result_locked(p, from_agent, None, None)
-    }
-
-    /// `decide_result` with an explicit checkout carrier (see
-    /// [`Self::learn_result_with_write_dir`]).
-    pub fn decide_result_with_write_dir(
-        &mut self,
-        p: &DecideParams,
-        from_agent: bool,
-        write_dir: Option<&str>,
-    ) -> Result<KnowledgeWriteResult> {
-        self.decide_result_locked(p, from_agent, write_dir, None)
-    }
-
-    /// Checkout-scoped decision write with the visible generation of the
-    /// superseded entry. Both files are persisted by one knowledge transaction.
-    pub fn decide_result_with_checkout(
-        &mut self,
-        p: &DecideParams,
-        from_agent: bool,
-        write_dir: Option<&str>,
-        superseded_entry: Option<&KnowledgeEntry>,
-    ) -> Result<KnowledgeWriteResult> {
-        self.decide_result_locked(p, from_agent, write_dir, superseded_entry)
-    }
-
-    fn decide_result_locked(
-        &mut self,
-        p: &DecideParams,
-        from_agent: bool,
-        write_dir: Option<&str>,
-        superseded_entry: Option<&KnowledgeEntry>,
-    ) -> Result<KnowledgeWriteResult> {
-        if p.content.trim().is_empty() {
-            anyhow::bail!("'content' is required");
-        }
-        if p.rationale.trim().is_empty() {
-            anyhow::bail!(
-                "'rationale' is required — a decision without justification is just a command"
-            );
-        }
-
-        let title = p.title.clone().unwrap_or_else(|| derive_title(&p.content));
-        let scope = Scope::parse_optional(p.scope.as_deref())?;
-        self.ensure_scope_write_authority(scope, write_dir)?;
-        if let Some(old_id) = p.supersedes.as_deref() {
-            self.ensure_existing_write_authority(&[old_id], write_dir)?;
-        }
-        let priority = Priority::parse_optional(p.priority.as_deref())?;
-        let render_flag = p.render.unwrap_or(true);
-
-        let superseded_restore = match p.supersedes.as_deref() {
-            Some(old_id) => {
-                self.install_checkout_mutation_seed(old_id, superseded_entry, write_dir)?
-            }
-            None => None,
-        };
-        let superseded_before = p.supersedes.as_deref().and_then(|old_id| {
-            self.store
-                .entries
-                .iter()
-                .find(|entry| entry.id == old_id)
-                .cloned()
-        });
-
-        // Validate the checkout-visible supersedes target before creating the
-        // new decision. Restore the published generation on every exit path.
-        if let Some(old_id) = p.supersedes.as_deref() {
-            if !self.store.entries.iter().any(|e| e.id == old_id) {
-                self.restore_checkout_mutation_seed(superseded_restore);
-                anyhow::bail!("Supersedes target not found: {old_id}");
-            }
-        }
-
-        let now = Self::now_iso();
-        let id = Self::gen_id();
-
-        self.store.entries.push(KnowledgeEntry {
-            render_placement: Default::default(),
-            id: id.clone(),
-            title,
-            content: p.content.clone(),
-            cluster: None,
-            variants: HashMap::new(),
-            category: Category::Decision,
-            scope,
-            project: p.project.clone(),
-            project_id: p.project_id.clone(),
-            providers: Vec::new(),
-            priority,
-            weight: 100,
-            render: render_flag,
-            decay: false, // decisions are durable by default; invariants until explicitly superseded
-            review_at: None,
-            status: Status::Active,
-            approval: if from_agent {
-                Approval::AgentInferred
-            } else {
-                Approval::UserConfirmed
-            },
-            supersedes: None,
-            links: Vec::new(),
-            rationale: Some(p.rationale.clone()),
-            expires_at: None,
-            source: if from_agent {
-                "agent".to_string()
-            } else {
-                "user".to_string()
-            },
-            created_at: now.clone(),
-            updated_at: now.clone(),
-            recall_count: 0,
-            last_recalled: None,
-        });
-
-        // If this decision supersedes a prior entry, mark it.
-        if let Some(old_id) = p.supersedes.as_deref() {
-            if let Some(old) = self.store.entries.iter_mut().find(|e| e.id == old_id) {
-                old.status = Status::Superseded;
-                old.supersedes = Some(id.clone());
-                old.updated_at = now;
-            }
-        }
-
-        let mut changed_ids = vec![id.as_str()];
-        if let Some(old_id) = p.supersedes.as_deref() {
-            changed_ids.push(old_id);
-        }
-        let checkout_scoped = self.mutation_uses_checkout_carrier(&id, write_dir);
-        let persisted = self.persist_repo_owned_mutation_at(&changed_ids, write_dir);
-        if checkout_scoped || persisted.is_err() {
-            self.store.entries.retain(|entry| entry.id != id);
-        }
-        self.restore_checkout_mutation_seed(superseded_restore);
-        if persisted.is_err()
-            && !checkout_scoped
-            && let Some(prior) = superseded_before
-        {
-            if let Some(current) = self
-                .store
-                .entries
-                .iter_mut()
-                .find(|entry| entry.id == prior.id)
-            {
-                *current = prior;
-            } else {
-                self.store.entries.push(prior);
-            }
-        }
-        persisted?;
-        let message = if let Some(old_id) = p.supersedes.as_deref() {
-            format!("Decided entry {id} (supersedes {old_id})")
-        } else {
-            format!("Decided entry {id}")
-        };
-        Ok(KnowledgeWriteResult {
-            id,
-            message,
-            superseded: p.supersedes.clone(),
-        })
-    }
-
-    #[allow(dead_code)]
-    pub fn decide(&mut self, p: &DecideParams, from_agent: bool) -> Result<String> {
-        Ok(self.decide_result(p, from_agent)?.message)
+    pub fn learn(&mut self, p: &LearnParams) -> Result<String> {
+        self.learn_result(p).map(|result| result.message)
     }
 
     pub fn forget(&mut self, p: &ForgetParams) -> Result<String> {
@@ -2849,18 +2422,13 @@ impl Knowledge {
         self.ensure_existing_write_authority(&[id], write_dir)?;
         let restore = self.install_checkout_mutation_seed(id, checkout_entry, write_dir)?;
 
-        if let Some(entry) = self.store.entries.iter_mut().find(|e| &e.id == id) {
-            if let Some(by) = p.superseded_by.as_deref() {
-                entry.status = Status::Superseded;
-                entry.supersedes = Some(by.to_string());
-            } else {
-                entry.status = Status::Deleted;
-            }
-            entry.updated_at = Self::now_iso();
-            let persisted = self.persist_repo_owned_mutation_at(&[id], write_dir);
+        if let Some(position) = self.store.entries.iter().position(|e| &e.id == id) {
+            let carrier = self.repo_owned_carrier(&self.store.entries[position]);
+            let removed = self.store.entries.remove(position);
+            let persisted = self.persist_repo_owned_removal_at(&removed, carrier, write_dir);
             self.restore_checkout_mutation_seed(restore);
             persisted?;
-            Ok(format!("Removed entry {id}"))
+            Ok(format!("Deleted entry {id}"))
         } else {
             self.restore_checkout_mutation_seed(restore);
             Ok(format!("Entry {id} not found"))
@@ -2875,8 +2443,6 @@ impl Knowledge {
         let project_id_filter = p.project_id.as_deref();
         let ledger_paths = p.project_ledger_paths.as_slice();
         let provider_filter = p.provider.as_deref();
-        let status_filter = p.status.as_deref().unwrap_or("active");
-        let approval_filter = p.approval.as_deref();
         let query = p.query.as_deref();
         let query_mode = KnowledgeQueryMode::parse_optional(p.mode.as_deref())?;
         let parsed_query = match (query_mode, query) {
@@ -2894,20 +2460,6 @@ impl Knowledge {
             .entries
             .iter()
             .filter_map(|e| {
-                // Status filter
-                let status_ok = match status_filter {
-                    "active" => e.status == Status::Active && !Self::is_expired(e),
-                    "all" => true,
-                    "draft" => e.status == Status::Draft,
-                    "superseded" => e.status == Status::Superseded,
-                    "disabled" => e.status == Status::Disabled,
-                    "deleted" => e.status == Status::Deleted,
-                    _ => e.status == Status::Active,
-                };
-                if !status_ok {
-                    return None;
-                }
-
                 if let Some(cat) = category_filter {
                     if let Ok(c) = Category::from_str(cat) {
                         if e.category != c {
@@ -2947,17 +2499,6 @@ impl Knowledge {
                         return None;
                     }
                 }
-                if let Some(ap) = approval_filter {
-                    let matches = match ap {
-                        "user_confirmed" => e.approval == Approval::UserConfirmed,
-                        "agent_inferred" => e.approval == Approval::AgentInferred,
-                        "imported" => e.approval == Approval::Imported,
-                        _ => true,
-                    };
-                    if !matches {
-                        return None;
-                    }
-                }
 
                 let corpus = SearchCorpus {
                     id: e.id.to_lowercase(),
@@ -2990,7 +2531,7 @@ impl Knowledge {
                 .score
                 .partial_cmp(&a_match.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a_entry.weight.cmp(&b_entry.weight))
+                .then_with(|| a_entry.priority.cmp(&b_entry.priority))
                 .then_with(|| a_entry.title.cmp(&b_entry.title))
         });
         let total_results = results.len();
@@ -3010,13 +2551,7 @@ impl Knowledge {
                 } else {
                     knowledge_excerpt(&e.providers.join(","), 256)
                 };
-                let approval_mark = match e.approval {
-                    Approval::UserConfirmed => "",
-                    Approval::AgentInferred => " [unverified]",
-                    Approval::Imported => " [imported]",
-                };
                 let render_mark = if !e.render { " [indexed-only]" } else { "" };
-                let decay_mark = if !e.decay { " [invariant]" } else { "" };
                 let built_from = self
                     .view_metadata(&e.id)
                     .map(|metadata| {
@@ -3041,15 +2576,13 @@ impl Knowledge {
                 };
                 let excerpt = knowledge_excerpt(&e.content, KNOWLEDGE_EXCERPT_BYTES);
                 format!(
-                    "[{}] {:?}/{} | {} | {}{}{}{}{}{}\n  content_bytes={}\n  {}",
+                    "[{}] {:?}/{} | {} | {}{}{}{}\n  content_bytes={}\n  {}",
                     e.id,
                     e.category,
                     e.scope,
                     prov,
                     knowledge_excerpt(&e.title, 256),
-                    approval_mark,
                     render_mark,
-                    decay_mark,
                     built_from,
                     query_line,
                     e.content.len(),
@@ -3338,10 +2871,7 @@ impl Knowledge {
         let project = project_dir.to_string_lossy();
         let mut subjects = BTreeMap::<String, (BTreeSet<String>, BTreeSet<String>)>::new();
         for entry in self.store.entries.iter().filter(|entry| {
-            entry.scope == Scope::Project
-                && entry.status == Status::Active
-                && entry.project.as_deref() == Some(project.as_ref())
-                && !Self::is_expired(entry)
+            entry.scope == Scope::Project && entry.project.as_deref() == Some(project.as_ref())
         }) {
             for (positive, subject) in directive_subjects(&entry.content) {
                 let pair = subjects.entry(subject).or_default();
@@ -3537,456 +3067,6 @@ impl Knowledge {
         self.projection()
             .render_guidance_breadcrumbs(provider, filter, root, out);
     }
-
-    // ── Absorb ─────────────────────────────────────────────────────
-
-    pub fn absorb(&mut self, p: &AbsorbParams) -> Result<String> {
-        self.absorb_locked(p)
-    }
-
-    fn absorb_locked(&mut self, p: &AbsorbParams) -> Result<String> {
-        let scope = p.scope.as_deref().unwrap_or("project");
-        match scope {
-            "project" => {
-                let project_dir = p
-                    .project
-                    .as_deref()
-                    .context("'project' is required when scope=project (or default)")?;
-                self.absorb_project(project_dir)
-            }
-            "global" => self.absorb_global(),
-            other => anyhow::bail!("Unknown scope: {other}. Use: project, global"),
-        }
-    }
-
-    fn absorb_project(&mut self, project_dir: &str) -> Result<String> {
-        Ok(format!(
-            "Project absorb is no-op for {project_dir}: project CLAUDE.md/AGENTS.md/GEMINI.md are unidirectional bbox projections. No knowledge was imported. Use indexed search to find instruction content and bbox_learn or bbox_remember to retain selected facts."
-        ))
-    }
-
-    /// Global provider files are unidirectional projections. Explicit
-    /// knowledge writes populate the store; render publishes managed files.
-    fn absorb_global(&mut self) -> Result<String> {
-        Ok("Global absorb is no-op: rendered global files are unidirectional bbox projections. No knowledge was imported. Use bbox_learn or bbox_remember for explicit knowledge writes.".to_string())
-    }
-
-    // ── Lint ───────────────────────────────────────────────────────
-
-    pub fn lint(&self) -> Result<String> {
-        let mut issues = Vec::new();
-
-        let mut unverified = 0u32;
-        let mut expired = 0u32;
-        let mut disabled = 0u32;
-
-        for entry in &self.store.entries {
-            if (entry.approval == Approval::AgentInferred || entry.approval == Approval::Imported)
-                && entry.status == Status::Active
-            {
-                unverified += 1;
-            }
-            if Self::is_expired(entry) && entry.status == Status::Active {
-                expired += 1;
-                issues.push(format!("[{}] expired: {}", entry.id, entry.title));
-            }
-            if entry.status == Status::Disabled {
-                disabled += 1;
-            }
-        }
-
-        if unverified > 0 {
-            issues.push(format!(
-                "{} unverified entries (use bbox_review)",
-                unverified
-            ));
-        }
-        if expired > 0 {
-            issues.push(format!("{} expired entries", expired));
-        }
-        if disabled > 0 {
-            issues.push(format!("{} disabled entries", disabled));
-        }
-
-        // Check for entries past review_at
-        let now = Self::now_iso();
-        let mut needs_review = 0u32;
-        for entry in self.active_entries() {
-            if let Some(ref review) = entry.review_at {
-                if review.as_str() < now.as_str() && entry.decay {
-                    needs_review += 1;
-                    issues.push(format!("[{}] past review date: {}", entry.id, entry.title));
-                }
-            }
-        }
-        if needs_review > 0 {
-            issues.push(format!("{} entries past review date", needs_review));
-        }
-
-        // Check for never-recalled entries (potential dead weight)
-        let mut never_recalled = 0u32;
-        for entry in self.active_entries() {
-            if entry.recall_count == 0 && entry.decay {
-                never_recalled += 1;
-            }
-        }
-        if never_recalled > 0 {
-            issues.push(format!(
-                "{} entries never recalled (may be dead weight)",
-                never_recalled
-            ));
-        }
-
-        // Check for potential duplicates (same title)
-        let mut titles: HashMap<String, Vec<String>> = HashMap::new();
-        for entry in self.active_entries() {
-            titles
-                .entry(entry.title.to_lowercase())
-                .or_default()
-                .push(entry.id.clone());
-        }
-        for (title, ids) in &titles {
-            if ids.len() > 1 {
-                issues.push(format!(
-                    "Possible duplicates for '{}': {}",
-                    title,
-                    ids.join(", ")
-                ));
-            }
-        }
-
-        if issues.is_empty() {
-            Ok("No issues found.".to_string())
-        } else {
-            let total = issues.len();
-            let lines = issues
-                .iter()
-                .take(20)
-                .map(|issue| knowledge_excerpt(issue, 512))
-                .collect::<Vec<_>>();
-            Ok(format!(
-                "{total} issues (showing {}): unverified={unverified}, expired={expired}, disabled={disabled}, past_review={needs_review}, never_recalled={never_recalled}\n\n{}\n\nThis is a bounded diagnostic preview. Use bbox_review for unverified entries; page bbox_knowledge(status=all, limit=20, offset=0) for the underlying records and entry_detail for exact metadata.",
-                lines.len(),
-                lines.join("\n")
-            ))
-        }
-    }
-
-    // ── Review ─────────────────────────────────────────────────────
-
-    pub fn review(&mut self, p: &ReviewParams) -> Result<String> {
-        self.review_locked(p, None, None)
-    }
-
-    pub fn review_with_write_dir(
-        &mut self,
-        p: &ReviewParams,
-        write_dir: Option<&str>,
-        checkout_entry: Option<&KnowledgeEntry>,
-    ) -> Result<String> {
-        self.review_locked(p, write_dir, checkout_entry)
-    }
-
-    pub fn validate_review_params(p: &ReviewParams) -> Result<()> {
-        let action = p.action.as_deref().unwrap_or("list");
-        match action {
-            "list" => {
-                anyhow::ensure!(p.id.is_none(), "review list does not accept id");
-                anyhow::ensure!(
-                    p.project.is_none(),
-                    "project selects a mutation owner and applies only to approve/reject"
-                );
-            }
-            "get" => {
-                let entry_id = p.id.as_deref().context("'id' required for get")?;
-                anyhow::ensure!(
-                    !entry_id.trim().is_empty(),
-                    "'id' must not be empty for get"
-                );
-                anyhow::ensure!(
-                    p.project.is_none(),
-                    "project selects a mutation owner and applies only to approve/reject"
-                );
-            }
-            "approve" | "reject" => {
-                anyhow::ensure!(
-                    p.cursor.is_none() && p.limit.is_none(),
-                    "cursor and limit apply only to review list/get reads"
-                );
-                let entry_id =
-                    p.id.as_deref()
-                        .context(format!("'id' required for {action}"))?;
-                anyhow::ensure!(!entry_id.trim().is_empty(), "'id' must not be empty");
-            }
-            other => {
-                anyhow::bail!("invalid review action {other:?}: use list, get, approve, or reject")
-            }
-        }
-        Ok(())
-    }
-
-    fn review_list_response(
-        &self,
-        cursor: Option<&str>,
-        requested_limit: Option<u64>,
-    ) -> Result<String> {
-        let unverified = self.unverified_review_entries();
-        let revision = review_snapshot_revision(&unverified);
-        let offset = match cursor {
-            Some(cursor) => parse_review_cursor(cursor, &revision)?,
-            None => 0,
-        };
-        let total = unverified.len();
-        anyhow::ensure!(
-            offset <= total,
-            "stale review cursor: page offset {offset} is past {total} rows; restart with action=\"list\" and no cursor"
-        );
-        let limit = review_list_limit(requested_limit);
-        let end = (offset + limit).min(total);
-        let mut envelope = serde_json::json!({
-            "action": "list",
-            "total": total,
-            "offset": offset,
-            "limit": limit,
-            "rows": unverified[offset..end].iter().map(|entry| {
-                serde_json::json!({
-                    "id": entry.id,
-                    "entity_ref": format!("knowledge:{}", entry.id),
-                    "title_preview": review_content_preview(&entry.title),
-                    "category": format!("{:?}", entry.category),
-                    "approval": format!("{:?}", entry.approval),
-                    "content_preview": review_content_preview(&entry.content),
-                    "content_bytes": entry.content.len(),
-                    "detail": {"action": "get", "id": entry.id},
-                })
-            }).collect::<Vec<_>>(),
-            "continuation": {
-                "kind": "content_sha256_row_offset",
-                "content_sha256": revision,
-                "live_view": true,
-                "changed_behavior": "A changed queue invalidates cursor; restart with action=\"list\" and no cursor.",
-            },
-        });
-        envelope = bbox_corpus_core::response_page::bound_page(envelope, "rows")?;
-        if let Some(next) = envelope["next_offset"].as_u64() {
-            envelope["next_cursor"] = serde_json::json!(format!("{revision}:{next}"));
-        }
-        Ok(serde_json::to_string(&envelope)?)
-    }
-
-    fn review_record_response(
-        &self,
-        entry_id: &str,
-        cursor: Option<&str>,
-        requested_limit: Option<u64>,
-    ) -> Result<String> {
-        let entry = self
-            .unverified_review_entries()
-            .into_iter()
-            .find(|entry| entry.id == entry_id)
-            .with_context(|| format!("entry {entry_id} is not pending review"))?;
-        let body = serde_json::to_string(entry)?;
-        let revision = content_review_hash(["review-record", entry_id, body.as_str()]);
-        let page = review_body_page(&body, &revision, cursor, requested_limit)?;
-        let mut envelope = serde_json::json!({
-            "action": "get",
-            "id": entry_id,
-            "record": {
-                "id": entry.id,
-                "entity_ref": format!("knowledge:{}", entry.id),
-                "title_preview": review_content_preview(&entry.title),
-                "category": format!("{:?}", entry.category),
-                "approval": format!("{:?}", entry.approval),
-                "content_preview": review_content_preview(&entry.content),
-                "content_bytes": entry.content.len(),
-            },
-            "body": page,
-            "provenance": {
-                "source": "bbox-knowledge review queue",
-                "format": "json",
-                "content_sha256": revision,
-                "live_view": true,
-            },
-            "continuation": {
-                "changed_behavior": "A changed record invalidates cursor; restart with action=\"get\", the same id, and no cursor.",
-            },
-        });
-        if let Some(next_cursor) = page["next_cursor"].as_str() {
-            envelope["next_cursor"] = serde_json::json!(next_cursor);
-        }
-        Ok(serde_json::to_string_pretty(&envelope)?)
-    }
-
-    fn unverified_review_entries(&self) -> Vec<&KnowledgeEntry> {
-        let mut entries: Vec<&KnowledgeEntry> = self
-            .store
-            .entries
-            .iter()
-            .filter(|entry| {
-                entry.status == Status::Active
-                    && (entry.approval == Approval::AgentInferred
-                        || entry.approval == Approval::Imported)
-            })
-            .collect();
-        entries.sort_by(|left, right| left.id.cmp(&right.id));
-        entries
-    }
-
-    fn review_locked(
-        &mut self,
-        p: &ReviewParams,
-        write_dir: Option<&str>,
-        checkout_entry: Option<&KnowledgeEntry>,
-    ) -> Result<String> {
-        let action = p.action.as_deref().unwrap_or("list");
-        let id = p.id.as_deref();
-        Self::validate_review_params(p)?;
-        match action {
-            "list" => self.review_list_response(p.cursor.as_deref(), p.limit),
-            "get" => {
-                let entry_id = id.context("'id' required for get")?;
-                self.review_record_response(entry_id, p.cursor.as_deref(), p.limit)
-            }
-            "approve" | "reject" => {
-                let entry_id = id.context(format!("'id' required for {action}"))?;
-                self.ensure_existing_write_authority(&[entry_id], write_dir)?;
-                let restore =
-                    self.install_checkout_mutation_seed(entry_id, checkout_entry, write_dir)?;
-                if let Some(entry) = self.store.entries.iter_mut().find(|e| e.id == entry_id) {
-                    if action == "approve" {
-                        entry.approval = Approval::UserConfirmed;
-                    } else {
-                        entry.status = Status::Deleted;
-                    }
-                    entry.updated_at = Self::now_iso();
-                    let persisted = self.persist_repo_owned_mutation_at(&[entry_id], write_dir);
-                    self.restore_checkout_mutation_seed(restore);
-                    persisted?;
-                    let outcome = if action == "approve" {
-                        "Approved"
-                    } else {
-                        "Rejected"
-                    };
-                    Ok(format!("{outcome} entry {entry_id}"))
-                } else {
-                    self.restore_checkout_mutation_seed(restore);
-                    Ok(format!("Entry {entry_id} not found"))
-                }
-            }
-            other => {
-                anyhow::bail!("invalid review action {other:?}: use list, get, approve, or reject")
-            }
-        }
-    }
-}
-
-const DEFAULT_REVIEW_LIST_LIMIT: usize = 20;
-const MAX_REVIEW_LIST_LIMIT: usize = 100;
-const REVIEW_PREVIEW_BYTES: usize = 128;
-const REVIEW_DETAIL_PAGE_BYTES: usize = 4096;
-const MIN_REVIEW_DETAIL_PAGE_BYTES: usize = 256;
-
-fn review_list_limit(requested: Option<u64>) -> usize {
-    requested
-        .map(|limit| limit as usize)
-        .unwrap_or(DEFAULT_REVIEW_LIST_LIMIT)
-        .clamp(1, MAX_REVIEW_LIST_LIMIT)
-}
-
-fn review_body_limit(requested: Option<u64>) -> usize {
-    requested
-        .map(|limit| limit as usize)
-        .unwrap_or(REVIEW_DETAIL_PAGE_BYTES)
-        .clamp(MIN_REVIEW_DETAIL_PAGE_BYTES, REVIEW_DETAIL_PAGE_BYTES)
-}
-
-fn content_review_hash<'a>(parts: impl IntoIterator<Item = &'a str>) -> String {
-    let mut hasher = Sha256::new();
-    for part in parts {
-        hasher.update(part.as_bytes());
-        hasher.update([0]);
-    }
-    format!("{:x}", hasher.finalize())
-}
-
-fn review_snapshot_revision(entries: &[&KnowledgeEntry]) -> String {
-    let mut hasher = Sha256::new();
-    for entry in entries {
-        hasher.update(entry.id.as_bytes());
-        hasher.update([0]);
-        hasher.update(serde_json::to_vec(entry).expect("review entries serialize"));
-        hasher.update([0]);
-    }
-    format!("{:x}", hasher.finalize())
-}
-
-fn parse_review_cursor(cursor: &str, expected_revision: &str) -> Result<usize> {
-    let (revision, offset) = cursor
-        .split_once(':')
-        .with_context(|| "invalid review cursor: expected <content_sha256>:<offset>")?;
-    anyhow::ensure!(
-        revision == expected_revision,
-        "stale review cursor: the queued content changed; restart the same read without a cursor"
-    );
-    let offset = offset
-        .parse::<usize>()
-        .with_context(|| "invalid review cursor offset")?;
-    Ok(offset)
-}
-
-fn review_body_page(
-    body: &str,
-    revision: &str,
-    cursor: Option<&str>,
-    requested_limit: Option<u64>,
-) -> Result<serde_json::Value> {
-    let offset = match cursor {
-        Some(cursor) if !cursor.is_empty() => parse_review_cursor(cursor, revision)?,
-        Some(_) | None => 0,
-    };
-    anyhow::ensure!(
-        offset <= body.len(),
-        "stale review cursor: page offset {offset} is past the {} byte record; restart with action=\"get\" and no cursor",
-        body.len()
-    );
-    anyhow::ensure!(
-        body.is_char_boundary(offset),
-        "invalid review cursor: offset splits a Unicode character"
-    );
-    let limit = review_body_limit(requested_limit);
-    let mut end = (offset + limit).min(body.len());
-    while end > offset && !body.is_char_boundary(end) {
-        end -= 1;
-    }
-    let mut page = serde_json::json!({
-        "text": &body[offset..end],
-        "format": "json",
-        "offset": offset,
-        "end": end,
-        "total_bytes": body.len(),
-        "complete": end == body.len(),
-        "content_sha256": revision,
-    });
-    if end < body.len() {
-        page["next_cursor"] = serde_json::json!(format!("{revision}:{end}"));
-    }
-    Ok(page)
-}
-
-fn review_content_preview(content: &str) -> String {
-    let mut end = REVIEW_PREVIEW_BYTES.min(content.len());
-    while end > 0 && !content.is_char_boundary(end) {
-        end -= 1;
-    }
-    let preview = &content[..end];
-    if content.len() == preview.len() {
-        preview.to_string()
-    } else {
-        format!(
-            "{preview}... [{} more chars]",
-            content.len() - preview.len()
-        )
-    }
 }
 
 // ── Helpers ────────────────────────────────────────────────────────
@@ -4088,18 +3168,6 @@ fn render_global_common_core_rules(out: &mut String) {
     out.push_str("Report Blackbox substrate gaps with gap notes: list with `bbox_gaps` before creating with `bbox_gap`. Read the operations guide when recording or resolving a gap.\n\n");
 }
 
-// ── Bootstrap ─────────────────────────────────────────────────────
-
-/// Candidate instruction files to scan during bootstrap, in priority order.
-const BOOTSTRAP_CANDIDATES: &[&str] = &[
-    "CLAUDE.md",
-    "AGENTS.md",
-    "GEMINI.md",
-    ".cursorrules",
-    ".cursor/rules/rules.md",
-    ".github/copilot-instructions.md",
-];
-
 impl Knowledge {
     /// Build a read-only request view. Callers must not persist or mutate this
     /// detached value; it exists to reuse ranking and render semantics over an
@@ -4140,173 +3208,6 @@ impl Knowledge {
     pub fn with_source_store_path(mut self, store_path: &Path) -> Self {
         self.store_path = store_path.to_path_buf();
         self
-    }
-
-    /// Bootstrap: scan a project for existing instruction files and return their
-    /// contents for the agent to decompose into PROJECT.md + knowledge entries.
-    pub fn bootstrap(&self, p: &BootstrapParams) -> Result<String> {
-        self.bootstrap_with_scope(p, None)
-    }
-
-    /// Bootstrap using a separately resolved durable project scope for the
-    /// existing-entry check while continuing to scan the caller's checkout.
-    /// Managed worktrees write and read knowledge under the registered base
-    /// path, but their instruction files remain checkout-local.
-    pub fn bootstrap_with_scope(
-        &self,
-        p: &BootstrapParams,
-        scope_project: Option<&str>,
-    ) -> Result<String> {
-        let project_dir = p.project.as_str();
-        let scope_project = scope_project.unwrap_or(project_dir);
-        let dir = Path::new(project_dir);
-        if !dir.exists() {
-            anyhow::bail!("project directory does not exist: {project_dir}");
-        }
-
-        let mut out = String::new();
-
-        // ── Check for existing blackbox entries for this project ──
-        let existing_count = self
-            .store
-            .entries
-            .iter()
-            .filter(|e| {
-                e.status == Status::Active
-                    && e.scope == Scope::Project
-                    && e.project.as_deref() == Some(scope_project)
-            })
-            .count();
-
-        if existing_count > 0 {
-            out.push_str(&format!(
-                "⚠ {} active project-scoped entries already exist for this project.\n\
-                 Use blackbox_knowledge with project=\"{}\" to review them.\n\
-                 Re-bootstrapping will create duplicates unless you blackbox_forget the old entries first.\n\n",
-                existing_count, project_dir
-            ));
-        }
-
-        // ── Check for PROJECT.md ──
-        let project_md = dir.join("PROJECT.md");
-        if project_md.exists() {
-            out.push_str("⚠ PROJECT.md already exists. Bootstrap will not overwrite it.\n\n");
-        }
-
-        // ── Scan instruction files ──
-        let mut found_files: Vec<(String, String)> = Vec::new();
-        for candidate in BOOTSTRAP_CANDIDATES {
-            let path = dir.join(candidate);
-            if path.exists() {
-                match fs::read_to_string(&path) {
-                    Ok(content) if !content.trim().is_empty() => {
-                        found_files.push((candidate.to_string(), content));
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        // Also check .cursor/rules/ for any .md files beyond rules.md
-        let cursor_rules_dir = dir.join(".cursor").join("rules");
-        if cursor_rules_dir.is_dir() {
-            if let Ok(entries) = fs::read_dir(&cursor_rules_dir) {
-                for entry in entries.filter_map(|e| e.ok()) {
-                    let name = entry.file_name().to_string_lossy().to_string();
-                    if name.ends_with(".md") && name != "rules.md" {
-                        let rel = format!(".cursor/rules/{}", name);
-                        if let Ok(content) = fs::read_to_string(entry.path()) {
-                            if !content.trim().is_empty() {
-                                found_files.push((rel, content));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if found_files.is_empty() {
-            out.push_str("No instruction files found. Nothing to bootstrap.\n");
-            out.push_str("Create PROJECT.md with your project's build commands, architecture, and conventions,\n");
-            out.push_str("then use blackbox_learn for cross-project knowledge.\n");
-            return Ok(out);
-        }
-
-        // ── Check if any files are already blackbox-generated ──
-        let mut generated_files: Vec<&str> = Vec::new();
-        let mut authored_files: Vec<&str> = Vec::new();
-        for (name, content) in &found_files {
-            if content.contains("<!-- Generated by blackbox") {
-                generated_files.push(name);
-            } else {
-                authored_files.push(name);
-            }
-        }
-
-        if !generated_files.is_empty() {
-            out.push_str(&format!(
-                "Already managed by blackbox: {}\n",
-                generated_files.join(", ")
-            ));
-            if authored_files.is_empty() {
-                out.push_str(
-                    "All instruction files are already blackbox-generated. Nothing to bootstrap.\n",
-                );
-                return Ok(out);
-            }
-            out.push_str("Bootstrapping only the hand-authored files.\n\n");
-        }
-
-        // ── Emit file contents with classification guidance ──
-        out.push_str(&format!(
-            "Found {} hand-authored instruction file(s). Decompose each into:\n\n",
-            authored_files.len()
-        ));
-        out.push_str(
-            "**PROJECT.md** — project-specific, provider-neutral documentation:\n\
-             - Build/test/lint commands\n\
-             - Architecture overview, module descriptions\n\
-             - Code conventions specific to THIS repo\n\
-             - API/schema details, data models\n\
-             - Anything a new contributor needs to know about the project itself\n\n",
-        );
-        out.push_str(
-            "**blackbox_learn entries** — cross-project or provider-specific knowledge:\n\
-             - User profile, preferences, communication style → category=profile, scope=global\n\
-             - Universal conventions (naming, error handling, testing) → category=convention, scope=global\n\
-             - Provider-specific behavioral instructions → category=steering, providers=[\"claude\"/etc]\n\
-             - Tool configuration/awareness → category=tool\n\
-             - Workflow patterns → category=workflow\n\
-             - Project-specific conventions that ALSO apply to other repos → category=convention, scope=global\n\
-             - Project-specific conventions that ONLY apply here → put in PROJECT.md instead\n\n",
-        );
-        out.push_str("──────────────────────────────────────\n\n");
-
-        for (name, content) in &found_files {
-            if generated_files.contains(&name.as_str()) {
-                continue;
-            }
-            out.push_str(&format!("### {}\n\n```\n{}\n```\n\n", name, content));
-        }
-
-        // ── Emit action plan ──
-        out.push_str("──────────────────────────────────────\n\n");
-        out.push_str("## Action plan\n\n");
-        out.push_str("1. Read each file above and classify every section/instruction.\n");
-        out.push_str("2. Write PROJECT.md with the project-specific documentation.\n");
-        out.push_str(&format!(
-            "3. Call blackbox_learn for each cross-project entry (scope=global or scope=project, project=\"{}\").\n",
-            project_dir
-        ));
-        out.push_str("4. Call blackbox_render with project=\"");
-        out.push_str(project_dir);
-        out.push_str("\" to generate the new CLAUDE.md/AGENTS.md/GEMINI.md.\n");
-        out.push_str("5. Verify the rendered output includes everything from the originals.\n");
-        out.push_str(
-            "6. Delete or git-rm the original hand-authored files that are now generated.\n",
-        );
-
-        Ok(out)
     }
 }
 
@@ -4353,36 +3254,31 @@ mod tests {
     }
 
     #[test]
-    fn guidance_legacy_defaults_and_provider_variants_are_preserved() {
+    fn guidance_legacy_defaults_and_satellite_placement_are_preserved() {
         let mut common = entry("inline", "Inline", "essential rule", Scope::Global);
         let wire = serde_json::to_value(&common).unwrap();
         assert!(wire.get("render_placement").is_none());
         common = serde_json::from_value(wire).unwrap();
         assert!(common.render_placement.is_inline());
-        let mut satellite = entry("satellite", "Procedure", "shared detail", Scope::Global);
+        let mut satellite = entry("satellite", "Procedure", "satellite detail", Scope::Global);
         satellite.render_placement = RenderPlacement::Satellite {
             topic: GuidanceTopic::Retrieval,
         };
-        satellite
-            .variants
-            .insert("claude".into(), "claude detail".into());
         let mut hidden = satellite.clone();
         hidden.id = "hidden".into();
         hidden.render = false;
         hidden.content = "hidden detail".into();
-        hidden.variants.clear();
         let kb = Knowledge::detached_view(vec![common, satellite, hidden], BTreeMap::new());
         let path = Path::new("/fixture/BLACKBOX.md");
         let body = kb.render_global_body("claude", path).unwrap();
         assert!(body.contains("essential rule"));
         assert!(body.contains("Retrieving code evidence"));
-        assert!(!body.contains("claude detail"));
+        assert!(!body.contains("satellite detail"));
         assert!(!body.contains("@/fixture"));
         let files = kb.guidance_files("claude", ScopeFilter::Global);
         assert_eq!(files.len(), 1);
-        assert!(files[0].body.contains("claude detail"));
+        assert!(files[0].body.contains("satellite detail"));
         assert!(!files[0].body.contains("hidden detail"));
-        assert!(!files[0].body.contains("shared detail"));
         assert!(body.contains(&files[0].path));
         let plan = kb
             .global_render_plan(
@@ -4456,16 +3352,6 @@ mod tests {
         (dir, kb)
     }
 
-    /// Process-global mutex serializing access to the BLACKBOX_GLOBAL_*_MD
-    /// env vars. Cargo runs tests in parallel by default; without this,
-    /// concurrent absorb_global tests collide on shared env state.
-    fn global_env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-    }
-
     fn push_entry(kb: &mut Knowledge, id: &str, title: &str, content: &str) {
         kb.store.entries.push(KnowledgeEntry {
             render_placement: Default::default(),
@@ -4473,24 +3359,13 @@ mod tests {
             title: title.into(),
             content: content.into(),
             cluster: None,
-            variants: HashMap::new(),
             category: Category::Memory,
             scope: Scope::Project,
             project: Some("/tmp/proj".into()),
             project_id: None,
             providers: vec![],
             priority: Priority::Standard,
-            weight: 100,
             render: true,
-            decay: true,
-            review_at: None,
-            status: Status::Active,
-            approval: Approval::UserConfirmed,
-            supersedes: None,
-            links: Vec::new(),
-            rationale: None,
-            expires_at: None,
-            source: "test".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
             recall_count: 0,
@@ -4511,29 +3386,339 @@ mod tests {
             title: title.into(),
             content: content.into(),
             cluster: None,
-            variants: HashMap::new(),
             category: Category::Memory,
             scope,
             project: None,
             project_id: None,
             providers: vec![],
             priority: Priority::Standard,
-            weight: 100,
             render: true,
-            decay: true,
-            review_at: None,
-            status: Status::Active,
-            approval: Approval::UserConfirmed,
-            supersedes: None,
-            links: Vec::new(),
-            rationale: None,
-            expires_at: None,
-            source: "test".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
             recall_count: 0,
             last_recalled: None,
         }
+    }
+
+    /// The fields a current writer emits for an entry. Everything else an
+    /// older writer produced is a legacy field.
+    const KEPT_ENTRY_FIELDS: &[&str] = &[
+        "id",
+        "title",
+        "content",
+        "cluster",
+        "category",
+        "scope",
+        "project",
+        "project_id",
+        "providers",
+        "priority",
+        "render",
+        "render_placement",
+        "created_at",
+        "updated_at",
+        "recall_count",
+        "last_recalled",
+    ];
+
+    /// One stored record in the shape the pre-slimdown writer produced,
+    /// carrying every field the model has since dropped.
+    fn legacy_record(id: &str, content: &str, status: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "title": format!("legacy {id}"),
+            "content": content,
+            "variants": {"claude": "claude-only text"},
+            "category": "decision",
+            "scope": "project",
+            "providers": [],
+            "priority": "critical",
+            "weight": 7,
+            "status": status,
+            "approval": "agent_inferred",
+            "render": true,
+            "decay": false,
+            "review_at": "2027-01-01T00:00:00Z",
+            "supersedes": "0000000000000000",
+            "links": [{"target": "knowledge:other", "kind": "RelatesTo", "confidence": "Exact"}],
+            "rationale": "the recorded reason",
+            "source": "agent",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-02T00:00:00Z",
+            "recall_count": 0
+        })
+    }
+
+    fn write_record(dir: &Path, id: &str, value: &serde_json::Value) -> PathBuf {
+        let path = repo_kb_dir(dir).join(format!("{id}.json"));
+        std::fs::write(&path, serde_json::to_vec_pretty(value).unwrap()).unwrap();
+        path
+    }
+
+    #[test]
+    fn stored_legacy_record_loads_as_a_current_entry() {
+        let entry = KnowledgeEntry::from_stored_value(legacy_record("a", "keep it", "active"))
+            .unwrap()
+            .expect("an active legacy record is an entry");
+        assert_eq!(entry.category, Category::Convention);
+        assert_eq!(entry.priority, Priority::Critical);
+        assert_eq!(entry.content, "keep it\n\nRationale: the recorded reason");
+        let wire = serde_json::to_value(&entry).unwrap();
+        let keys = wire
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(
+            keys.iter()
+                .all(|key| KEPT_ENTRY_FIELDS.contains(&key.as_str())),
+            "a current write emits only kept fields: {keys:?}"
+        );
+        // Re-reading the written form is a fixed point: the rationale is not
+        // appended twice and nothing else changes.
+        let reread: KnowledgeEntry = serde_json::from_value(wire).unwrap();
+        assert_eq!(reread, entry);
+        // A legacy record whose content already carries its rationale keeps
+        // one copy, and an empty rationale adds nothing.
+        let mut folded = legacy_record("b", "why: the recorded reason", "active");
+        let folded_entry = KnowledgeEntry::from_stored_value(folded.clone())
+            .unwrap()
+            .unwrap();
+        assert_eq!(folded_entry.content, "why: the recorded reason");
+        folded["rationale"] = "  ".into();
+        folded["content"] = "plain".into();
+        let plain = KnowledgeEntry::from_stored_value(folded).unwrap().unwrap();
+        assert_eq!(plain.content, "plain");
+    }
+
+    #[test]
+    fn stored_retired_records_are_not_entries() {
+        for status in ["superseded", "deleted", "draft", "disabled"] {
+            let record = legacy_record("retired", "gone", status);
+            assert!(
+                KnowledgeEntry::from_stored_value(record.clone())
+                    .unwrap()
+                    .is_none(),
+                "{status}"
+            );
+            let error = serde_json::from_value::<KnowledgeEntry>(record).unwrap_err();
+            assert!(
+                error.to_string().contains(RETIRED_KNOWLEDGE_RECORD),
+                "{error}"
+            );
+        }
+        let mut expired = legacy_record("expired", "gone", "active");
+        expired["expires_at"] = "2000-01-01T00:00:00Z".into();
+        assert!(
+            KnowledgeEntry::from_stored_value(expired)
+                .unwrap()
+                .is_none()
+        );
+        let mut unexpired = legacy_record("unexpired", "kept", "active");
+        unexpired["expires_at"] = "9999-01-01T00:00:00Z".into();
+        assert!(
+            KnowledgeEntry::from_stored_value(unexpired)
+                .unwrap()
+                .is_some()
+        );
+        // A clean record carries no status at all and is always an entry.
+        let clean = serde_json::to_value(entry("clean", "Clean", "body", Scope::Global)).unwrap();
+        assert!(clean.get("status").is_none());
+        assert!(KnowledgeEntry::from_stored_value(clean).unwrap().is_some());
+    }
+
+    #[test]
+    fn repo_knowledge_loads_legacy_files_skips_retired_and_writes_clean_bytes() {
+        let central = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path().canonicalize().unwrap();
+        let project = root.to_string_lossy().into_owned();
+
+        // Absent: no repo knowledge directory, nothing loads, nothing is written.
+        let mut kb = Knowledge::open(&central.path().join("kb.json")).unwrap();
+        kb.set_project_roots(vec![root.clone()]).unwrap();
+        assert!(kb.all_entries().is_empty());
+        assert!(!repo_kb_dir(&root).exists());
+
+        std::fs::create_dir_all(repo_kb_dir(&root)).unwrap();
+        write_record(
+            &root,
+            "legacy-active",
+            &legacy_record("legacy-active", "use rustls", "active"),
+        );
+        for status in ["superseded", "deleted", "draft"] {
+            let id = format!("legacy-{status}");
+            write_record(&root, &id, &legacy_record(&id, "retired", status));
+        }
+        let clean = entry("clean-entry", "Clean", "already clean", Scope::Project);
+        let clean_bytes = committed_knowledge_entry_bytes(&clean).unwrap();
+        std::fs::write(repo_kb_dir(&root).join("clean-entry.json"), &clean_bytes).unwrap();
+
+        kb.reload().unwrap();
+        let ids = kb
+            .all_entries()
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(ids, BTreeSet::from(["clean-entry", "legacy-active"]));
+        let legacy = kb.entry("legacy-active").unwrap();
+        assert_eq!(legacy.category, Category::Convention);
+        assert_eq!(
+            legacy.content,
+            "use rustls\n\nRationale: the recorded reason"
+        );
+        assert_eq!(legacy.project.as_deref(), Some(project.as_str()));
+
+        // Loading rewrites nothing: the clean file is present and unchanged,
+        // and the retired files stay on disk for their owner to delete.
+        assert_eq!(
+            std::fs::read(repo_kb_dir(&root).join("clean-entry.json")).unwrap(),
+            clean_bytes
+        );
+        for status in ["superseded", "deleted", "draft"] {
+            assert!(
+                repo_kb_dir(&root)
+                    .join(format!("legacy-{status}.json"))
+                    .is_file()
+            );
+        }
+
+        // A write through the single lane emits only kept fields.
+        kb.learn_result(&LearnParams {
+            id: Some("legacy-active".into()),
+            content: "use rustls, not openssl".into(),
+            category: "convention".into(),
+            scope: Some("project".into()),
+            project: Some(project.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+        let written: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(repo_kb_dir(&root).join("legacy-active.json")).unwrap(),
+        )
+        .unwrap();
+        let keys = written
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(
+            keys.iter()
+                .all(|key| KEPT_ENTRY_FIELDS.contains(&key.as_str())),
+            "{keys:?}"
+        );
+        assert_eq!(written["category"], "convention");
+        assert_eq!(written["content"], "use rustls, not openssl");
+    }
+
+    #[test]
+    fn central_store_drops_retired_rows_and_persists_kept_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kb.json");
+        let mut active = legacy_record("central-active", "global rule", "active");
+        active["scope"] = "global".into();
+        let mut superseded = legacy_record("central-superseded", "old rule", "superseded");
+        superseded["scope"] = "global".into();
+        let clean =
+            serde_json::to_value(entry("central-clean", "Clean", "clean", Scope::Global)).unwrap();
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "entries": [active, superseded, clean],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let kb = Knowledge::open(&path).unwrap();
+        let ids = kb
+            .all_entries()
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["central-active", "central-clean"]);
+        assert_eq!(
+            kb.entry("central-active").unwrap().content,
+            "global rule\n\nRationale: the recorded reason"
+        );
+
+        kb.save().unwrap();
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let rows = persisted["entries"].as_array().unwrap();
+        assert_eq!(rows.len(), 2, "the retired row is deleted on persist");
+        for row in rows {
+            assert!(
+                row.as_object()
+                    .unwrap()
+                    .keys()
+                    .all(|key| KEPT_ENTRY_FIELDS.contains(&key.as_str())),
+                "{row}"
+            );
+        }
+    }
+
+    #[test]
+    fn forget_deletes_the_entry_and_its_repo_file() {
+        let central = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path().canonicalize().unwrap();
+        let project = root.to_string_lossy().into_owned();
+        std::fs::create_dir_all(repo_kb_dir(&root)).unwrap();
+        let mut kb = Knowledge::open(&central.path().join("kb.json")).unwrap();
+        kb.set_project_roots(vec![root.clone()]).unwrap();
+        let id = kb
+            .learn_result(&LearnParams {
+                content: "a project rule".into(),
+                category: "convention".into(),
+                scope: Some("project".into()),
+                project: Some(project),
+                ..Default::default()
+            })
+            .unwrap()
+            .id;
+        let file = repo_kb_dir(&root).join(format!("{id}.json"));
+        assert!(
+            file.is_file(),
+            "the fixture must write the entry file first"
+        );
+
+        let message = kb
+            .forget(&ForgetParams {
+                id: id.clone(),
+                project: None,
+            })
+            .unwrap();
+        assert!(message.starts_with("Deleted entry"), "{message}");
+        assert!(kb.entry(&id).is_none());
+        assert!(!file.exists());
+        kb.reload().unwrap();
+        assert!(kb.entry(&id).is_none());
+
+        let global = kb
+            .learn_result(&LearnParams {
+                content: "a global rule".into(),
+                category: "convention".into(),
+                ..Default::default()
+            })
+            .unwrap()
+            .id;
+        kb.forget(&ForgetParams {
+            id: global.clone(),
+            project: None,
+        })
+        .unwrap();
+        assert!(kb.entry(&global).is_none());
+        assert!(
+            !kb.central_snapshot()
+                .unwrap()
+                .entries
+                .iter()
+                .any(|entry| entry.id == global)
+        );
     }
 
     fn persist_repo_entries_for_test(
@@ -4596,25 +3781,21 @@ mod tests {
 
         // The load-bearing regression: a global write succeeds while an
         // unrelated carrier is unreadable.
-        kb.learn(
-            &LearnParams {
-                render_placement: None,
-                content: "global still writes".into(),
-                category: "convention".into(),
-                format: None,
-                title: Some("global write".into()),
-                scope: Some("global".into()),
-                project: None,
-                project_id: None,
-                providers: None,
-                priority: None,
-                weight: None,
-                expires_at: None,
-                cluster: None,
-                id: None,
-            },
-            false,
-        )
+        kb.learn(&LearnParams {
+            render_placement: None,
+            content: "global still writes".into(),
+            category: "convention".into(),
+            format: None,
+            title: Some("global write".into()),
+            scope: Some("global".into()),
+            project: None,
+            project_id: None,
+            providers: None,
+            priority: None,
+            render: None,
+            cluster: None,
+            id: None,
+        })
         .unwrap();
         assert!(kb.degraded_carriers().contains_key(&broken_project));
     }
@@ -4793,26 +3974,6 @@ mod tests {
         assert!(out.contains("matched_by="));
         assert!(out.contains("title:glob"));
         assert!(out.contains("content:disallow"));
-    }
-
-    #[test]
-    fn lint_bounds_large_issue_sets_and_names_real_recovery_tools() {
-        let (_tmp, mut kb) = mk_kb();
-        let title = "界\n\"expired\"".repeat(2000);
-        for index in 0..100 {
-            let id = format!("{index:08x}");
-            push_entry(&mut kb, &id, &format!("{title}{index}"), "fixture");
-            let entry = kb.store.entries.last_mut().unwrap();
-            entry.expires_at = Some("2000-01-01T00:00:00Z".into());
-            entry.approval = Approval::AgentInferred;
-        }
-        let output = kb.lint().unwrap();
-        assert!(output.len() < 16 * 1024);
-        assert!(output.contains("expired=100"));
-        assert!(output.contains("bbox_review"));
-        assert!(output.contains("bbox_knowledge"));
-        assert!(!output.contains("blackbox_review"));
-        assert!(!output.contains(&title));
     }
 
     #[test]
@@ -5161,7 +4322,6 @@ mod tests {
                     project: Some(base_root.to_string_lossy().into_owned()),
                     ..Default::default()
                 },
-                false,
                 Some(wt_root.to_str().unwrap()),
             )
             .expect("learn should succeed");
@@ -5209,7 +4369,6 @@ mod tests {
         let first = kb
             .learn_result_with_write_dir(
                 &params("first base entry"),
-                false,
                 Some(base_root.to_str().unwrap()),
             )
             .unwrap()
@@ -5219,7 +4378,6 @@ mod tests {
         let second = kb
             .learn_result_with_write_dir(
                 &params("second base entry"),
-                false,
                 Some(base_root.to_str().unwrap()),
             )
             .unwrap()
@@ -5262,7 +4420,6 @@ mod tests {
                     project: Some(project.clone()),
                     ..Default::default()
                 },
-                false,
                 Some(&project),
             )
             .unwrap_err();
@@ -5304,7 +4461,6 @@ mod tests {
                     project: Some(project.clone()),
                     ..Default::default()
                 },
-                false,
                 Some(&project),
             )
             .unwrap()
@@ -5330,7 +4486,6 @@ mod tests {
                     project: Some(project.clone()),
                     ..Default::default()
                 },
-                false,
                 Some(&project),
             )
             .unwrap_err();
@@ -5367,21 +4522,23 @@ mod tests {
                     project: Some(project.clone()),
                     ..Default::default()
                 },
-                false,
                 Some(&project),
             )
             .unwrap()
             .id;
 
         let mut fresh_seed = kb.entry(&id).unwrap().clone();
-        fresh_seed.rationale = Some("external edit observed before watcher reload".into());
+        // An external edit observed before the watcher reload.
+        fresh_seed.render_placement = RenderPlacement::Satellite {
+            topic: GuidanceTopic::Build,
+        };
         std::fs::write(
             repo_kb_dir(&base_root).join(format!("{id}.json")),
             serde_json::to_vec_pretty(&fresh_seed).unwrap(),
         )
         .unwrap();
         assert!(
-            kb.entry(&id).unwrap().rationale.is_none(),
+            kb.entry(&id).unwrap().render_placement.is_inline(),
             "fixture must leave the in-memory generation stale"
         );
 
@@ -5395,7 +4552,6 @@ mod tests {
                 project: Some(project.clone()),
                 ..Default::default()
             },
-            false,
             Some(&project),
             Some(&fresh_seed),
         )
@@ -5405,8 +4561,11 @@ mod tests {
             &std::fs::read(repo_kb_dir(&base_root).join(format!("{id}.json"))).unwrap(),
         )
         .unwrap();
-        assert_eq!(on_disk.rationale, fresh_seed.rationale);
-        assert_eq!(kb.entry(&id).unwrap().rationale, fresh_seed.rationale);
+        assert_eq!(on_disk.render_placement, fresh_seed.render_placement);
+        assert_eq!(
+            kb.entry(&id).unwrap().render_placement,
+            fresh_seed.render_placement
+        );
         assert_eq!(kb.entry(&id).unwrap().content, "operator update");
     }
 
@@ -5435,7 +4594,6 @@ mod tests {
                     project: Some(base_root.to_string_lossy().into_owned()),
                     ..Default::default()
                 },
-                false,
                 Some(wt_root.to_str().unwrap()),
             )
             .unwrap()
@@ -5475,17 +4633,14 @@ mod tests {
         // Seed the pre-cutover shape while the project is still central-owned.
         let mut kb = Knowledge::open(&kb_path).unwrap();
         let id = kb
-            .learn_result(
-                &LearnParams {
-                    render_placement: None,
-                    content: "legacy retained checkout bytes".into(),
-                    category: "convention".into(),
-                    scope: Some("project".into()),
-                    project: Some(base_root.to_string_lossy().into_owned()),
-                    ..Default::default()
-                },
-                false,
-            )
+            .learn_result(&LearnParams {
+                render_placement: None,
+                content: "legacy retained checkout bytes".into(),
+                category: "convention".into(),
+                scope: Some("project".into()),
+                project: Some(base_root.to_string_lossy().into_owned()),
+                ..Default::default()
+            })
             .unwrap()
             .id;
         kb.save().unwrap();
@@ -5535,7 +4690,6 @@ mod tests {
                     project: Some(base_root.to_string_lossy().into_owned()),
                     ..Default::default()
                 },
-                false,
                 Some(wt_root.to_str().unwrap()),
             )
             .unwrap()
@@ -5561,7 +4715,7 @@ mod tests {
 
     /// Updating a base-committed entry from a worktree redirects the rewrite
     /// into the worktree WITHOUT purging the already-committed base file:
-    /// redirection is not reassignment — the branch, not the daemon, updates
+    /// redirection is not reassignment: the branch, not the daemon, updates
     /// the base checkout.
     #[test]
     fn redirected_update_protects_base_committed_file_from_purge() {
@@ -5585,15 +4739,9 @@ mod tests {
             project: Some(base_root.to_string_lossy().into_owned()),
             ..Default::default()
         };
-        let kept = kb
-            .learn_result(&base_params("kept in base"), false)
-            .unwrap()
-            .id;
+        let kept = kb.learn_result(&base_params("kept in base")).unwrap().id;
         let redirected = kb
-            .learn_result(
-                &base_params("authored in base, edited from worktree"),
-                false,
-            )
+            .learn_result(&base_params("authored in base, edited from worktree"))
             .unwrap()
             .id;
         assert!(
@@ -5617,7 +4765,6 @@ mod tests {
                 content: "edited from worktree".into(),
                 ..base_params("ignored")
             },
-            false,
             Some(wt_root.to_str().unwrap()),
         )
         .expect("redirected update should succeed");
@@ -5683,577 +4830,6 @@ mod tests {
     }
 
     #[test]
-    fn review_list_pages_bounded_previews_with_content_bound_cursor() {
-        let (_tmp, mut kb) = mk_kb();
-        for index in 0..25 {
-            let id = format!("entry{index:02}");
-            push_entry(&mut kb, &id, &format!("Review {index}"), &"x".repeat(500));
-            kb.store.entries[index].approval = Approval::AgentInferred;
-        }
-
-        let first = kb
-            .review(&ReviewParams::default())
-            .expect("first review page");
-        let first: serde_json::Value = serde_json::from_str(&first).unwrap();
-        assert_eq!(first["total"], 25);
-        assert_eq!(first["rows"].as_array().unwrap().len(), 20);
-        assert!(first["rows"][0]["content_preview"].as_str().unwrap().len() < 500);
-        let next_cursor = first["next_cursor"].as_str().unwrap().to_string();
-
-        let second = kb
-            .review(&ReviewParams {
-                cursor: Some(next_cursor.clone()),
-                ..Default::default()
-            })
-            .expect("second review page");
-        let second: serde_json::Value = serde_json::from_str(&second).unwrap();
-        assert_eq!(second["offset"], 20);
-        assert_eq!(second["rows"].as_array().unwrap().len(), 5);
-        assert!(second.get("next_cursor").is_none());
-
-        let mut extra = kb.store.entries[0].clone();
-        extra.id = "entry99".into();
-        extra.status = Status::Active;
-        extra.approval = Approval::Imported;
-        kb.store.entries.push(extra);
-        let stale = kb.review(&ReviewParams {
-            cursor: Some(next_cursor),
-            ..Default::default()
-        });
-        assert!(
-            stale
-                .expect_err("queue cursor must invalidate")
-                .to_string()
-                .contains("stale review cursor")
-        );
-    }
-
-    #[test]
-    fn review_exact_record_pages_reconstruct_unicode_and_reject_stale_cursor() {
-        let (_tmp, mut kb) = mk_kb();
-        let content = "边界".repeat(3_000);
-        push_entry(&mut kb, "unicode1", "Unicode record", &content);
-        kb.store.entries[0].approval = Approval::AgentInferred;
-
-        let listed = kb.review(&ReviewParams::default()).unwrap();
-        let listed: serde_json::Value = serde_json::from_str(&listed).unwrap();
-        let entry_id = listed["rows"][0]["detail"]["id"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        let mut cursor = None;
-        let mut reconstructed = String::new();
-        for _ in 0..200 {
-            let page = kb
-                .review(&ReviewParams {
-                    action: Some("get".into()),
-                    id: Some(entry_id.clone()),
-                    cursor,
-                    limit: Some(257),
-                    ..Default::default()
-                })
-                .expect("record page");
-            let page: serde_json::Value = serde_json::from_str(&page).unwrap();
-            reconstructed.push_str(page["body"]["text"].as_str().unwrap());
-            match page["next_cursor"].as_str() {
-                Some(next_cursor) => cursor = Some(next_cursor.to_string()),
-                None => break,
-            }
-        }
-        let recovered: KnowledgeEntry = serde_json::from_str(&reconstructed).unwrap();
-        assert_eq!(recovered.content, content);
-        assert_eq!(recovered.id, "unicode1");
-
-        let first_page = kb
-            .review(&ReviewParams {
-                action: Some("get".into()),
-                id: Some(entry_id),
-                limit: Some(257),
-                ..Default::default()
-            })
-            .unwrap();
-        let first_page: serde_json::Value = serde_json::from_str(&first_page).unwrap();
-        let continuation = first_page["next_cursor"].as_str().unwrap().to_string();
-        kb.store.entries[0].content = "changed".into();
-        let stale = kb.review(&ReviewParams {
-            action: Some("get".into()),
-            id: Some("unicode1".into()),
-            cursor: Some(continuation),
-            limit: Some(257),
-            ..Default::default()
-        });
-        assert!(
-            stale
-                .expect_err("record cursor must invalidate")
-                .to_string()
-                .contains("stale review cursor")
-        );
-    }
-
-    #[test]
-    fn review_rejects_invalid_actions_and_parameter_combinations() {
-        let (_tmp, mut kb) = mk_kb();
-        push_entry(&mut kb, "entry01", "Pending", "content");
-        kb.store.entries[0].approval = Approval::AgentInferred;
-
-        let cases = [
-            ReviewParams {
-                action: Some("list:get".into()),
-                ..Default::default()
-            },
-            ReviewParams {
-                action: Some("list".into()),
-                id: Some("entry01".into()),
-                ..Default::default()
-            },
-            ReviewParams {
-                action: Some("list".into()),
-                project: Some("/project".into()),
-                ..Default::default()
-            },
-            ReviewParams {
-                action: Some("get".into()),
-                project: Some("/project".into()),
-                ..Default::default()
-            },
-            ReviewParams {
-                action: Some("approve".into()),
-                cursor: Some("cursor".into()),
-                id: Some("entry01".into()),
-                ..Default::default()
-            },
-            ReviewParams {
-                action: Some("reject".into()),
-                limit: Some(20),
-                id: Some("entry01".into()),
-                ..Default::default()
-            },
-        ];
-        for params in cases {
-            assert!(
-                kb.review(&params).is_err(),
-                "review must reject invalid combination {params:?}"
-            );
-        }
-        assert_eq!(kb.store.entries[0].approval, Approval::AgentInferred);
-    }
-
-    #[test]
-    fn absorb_global_extracts_only_managed_region() {
-        let _env = bbox_util::util::test_env_lock();
-        let _env_guard = global_env_lock();
-        let (_t, mut kb) = mk_kb();
-        // Stand up a fake claude global memory file. Use the env override
-        // so the absorb path doesn't need a real ~/.claude-shared.
-        let tmpdir = tempfile::tempdir().unwrap();
-        let claude_md = tmpdir.path().join("CLAUDE.md");
-        std::fs::write(
-            &claude_md,
-            "\
-@/home/invidious/.claude/EXTRA.md
-
-## User-authored steerage outside the managed region
-
-This text is OUTSIDE the markers and must NEVER be absorbed.
-
-<!-- bb:managed-start -->
-## Standing Orders
-
-<!-- bb:entry=test-existing -->
-**Existing tracked entry**
-
-body of existing entry
-<!-- /bb:entry=test-existing -->
-
-## New imported section
-
-This text is INSIDE the managed region but has no entry markers — it should
-be absorbed as a new Imported entry.
-<!-- bb:managed-end -->
-
-## More user content after the managed region
-
-This is also OUTSIDE the markers and must NEVER be absorbed.
-",
-        )
-        .unwrap();
-
-        // Pre-seed the store with a global entry that won't be found in
-        // the file — should get disabled.
-        let mk_global_entry = |id: &str, title: &str, content: &str| KnowledgeEntry {
-            render_placement: Default::default(),
-            id: id.into(),
-            title: title.into(),
-            content: content.into(),
-            cluster: None,
-            variants: HashMap::new(),
-            category: Category::Memory,
-            scope: Scope::Global,
-            project: None,
-            project_id: None,
-            providers: vec![],
-            priority: Priority::Standard,
-            weight: 100,
-            render: true,
-            decay: true,
-            review_at: None,
-            status: Status::Active,
-            approval: Approval::UserConfirmed,
-            supersedes: None,
-            links: Vec::new(),
-            rationale: None,
-            expires_at: None,
-            source: "user".into(),
-            created_at: Knowledge::now_iso(),
-            updated_at: Knowledge::now_iso(),
-            recall_count: 0,
-            last_recalled: None,
-        };
-        kb.store.entries.push(mk_global_entry(
-            "test-existing",
-            "Existing tracked entry",
-            "body of existing entry",
-        ));
-        kb.store.entries.push(mk_global_entry(
-            "test-missing",
-            "Stale entry to disable",
-            "no longer present in any rendered file",
-        ));
-        // Persist before `absorb` reloads: global entries are saved to the
-        // central store in production, so seed them to disk here too. Otherwise
-        // the reload inside `absorb` correctly discards the unsaved in-memory
-        // state (central kb.json absent → reset) and the entries vanish.
-        kb.save().expect("persist seeded global entries");
-
-        unsafe {
-            std::env::set_var("BLACKBOX_GLOBAL_CLAUDE_MD", claude_md.to_str().unwrap());
-        }
-        // Make sure no other provider files are scanned (set to nonexistent paths).
-        unsafe {
-            std::env::set_var(
-                "BLACKBOX_GLOBAL_CODEX_MD",
-                tmpdir.path().join("nope-codex").to_str().unwrap(),
-            )
-        };
-        unsafe {
-            std::env::set_var(
-                "BLACKBOX_GLOBAL_GEMINI_MD",
-                tmpdir.path().join("nope-gemini").to_str().unwrap(),
-            )
-        };
-
-        let report = kb
-            .absorb(&AbsorbParams {
-                project: None,
-                scope: Some("global".into()),
-            })
-            .unwrap();
-
-        unsafe {
-            std::env::remove_var("BLACKBOX_GLOBAL_CLAUDE_MD");
-        }
-        unsafe {
-            std::env::remove_var("BLACKBOX_GLOBAL_CODEX_MD");
-        }
-        unsafe {
-            std::env::remove_var("BLACKBOX_GLOBAL_GEMINI_MD");
-        }
-
-        assert!(
-            report.contains("Global absorb is no-op"),
-            "report: {report}"
-        );
-        // Rendered files are projections now; external additions are not
-        // imported back from provider files.
-        let imported: Vec<_> = kb
-            .store
-            .entries
-            .iter()
-            .filter(|e| e.approval == Approval::Imported && e.scope == Scope::Global)
-            .collect();
-        assert!(
-            imported.is_empty(),
-            "projected files should not import entries"
-        );
-        // Missing rendered markers no longer disable entries.
-        let stale = kb
-            .store
-            .entries
-            .iter()
-            .find(|e| e.id == "test-missing")
-            .unwrap();
-        assert_eq!(
-            stale.status,
-            Status::Active,
-            "projection no-op should not disable missing entries"
-        );
-        // The existing tracked entry should remain Active.
-        let existing = kb
-            .store
-            .entries
-            .iter()
-            .find(|e| e.id == "test-existing")
-            .unwrap();
-        assert_eq!(existing.status, Status::Active);
-    }
-
-    #[test]
-    fn absorb_global_no_managed_region_is_noop() {
-        let _env = bbox_util::util::test_env_lock();
-        let _env_guard = global_env_lock();
-        let (_t, mut kb) = mk_kb();
-        let tmpdir = tempfile::tempdir().unwrap();
-        let claude_md = tmpdir.path().join("CLAUDE.md");
-        // No markers — entire file is hand-authored. Should not absorb anything.
-        std::fs::write(&claude_md, "@EXTRA.md\n\n## Hand-authored only\n\nbody\n").unwrap();
-        unsafe {
-            std::env::set_var("BLACKBOX_GLOBAL_CLAUDE_MD", claude_md.to_str().unwrap());
-        }
-        unsafe {
-            std::env::set_var(
-                "BLACKBOX_GLOBAL_CODEX_MD",
-                tmpdir.path().join("nope-codex").to_str().unwrap(),
-            )
-        };
-        unsafe {
-            std::env::set_var(
-                "BLACKBOX_GLOBAL_GEMINI_MD",
-                tmpdir.path().join("nope-gemini").to_str().unwrap(),
-            )
-        };
-
-        let report = kb
-            .absorb(&AbsorbParams {
-                project: None,
-                scope: Some("global".into()),
-            })
-            .unwrap();
-
-        unsafe {
-            std::env::remove_var("BLACKBOX_GLOBAL_CLAUDE_MD");
-        }
-        unsafe {
-            std::env::remove_var("BLACKBOX_GLOBAL_CODEX_MD");
-        }
-        unsafe {
-            std::env::remove_var("BLACKBOX_GLOBAL_GEMINI_MD");
-        }
-
-        assert!(
-            report.contains("Global absorb is no-op"),
-            "report: {report}"
-        );
-        assert!(
-            kb.store
-                .entries
-                .iter()
-                .all(|e| e.approval != Approval::Imported)
-        );
-    }
-
-    #[test]
-    fn absorb_unknown_scope_errors() {
-        let (_t, mut kb) = mk_kb();
-        let r = kb.absorb(&AbsorbParams {
-            project: Some("/tmp/x".into()),
-            scope: Some("everywhere".into()),
-        });
-        assert!(r.is_err());
-        let msg = format!("{}", r.unwrap_err());
-        assert!(msg.contains("Unknown scope"), "{msg}");
-    }
-
-    #[test]
-    fn absorb_project_requires_project_param() {
-        let (_t, mut kb) = mk_kb();
-        let r = kb.absorb(&AbsorbParams {
-            project: None,
-            scope: None, // defaults to "project"
-        });
-        assert!(r.is_err());
-    }
-
-    #[test]
-    fn decide_requires_rationale() {
-        let (_t, mut kb) = mk_kb();
-        let e = kb
-            .decide(
-                &DecideParams {
-                    content: "use Tokio runtime everywhere".into(),
-                    rationale: "  ".into(),
-                    supersedes: None,
-                    title: None,
-                    scope: None,
-                    project: None,
-                    project_id: None,
-                    priority: None,
-                    render: None,
-                },
-                false,
-            )
-            .unwrap_err();
-        assert!(e.to_string().contains("rationale"));
-    }
-
-    #[test]
-    fn decide_supersedes_marks_prior() {
-        let (_t, mut kb) = mk_kb();
-        let r1 = kb
-            .decide(
-                &DecideParams {
-                    content: "use SQLite for the cache".into(),
-                    rationale: "zero ops, fits in proc".into(),
-                    supersedes: None,
-                    title: None,
-                    scope: None,
-                    project: None,
-                    project_id: None,
-                    priority: None,
-                    render: None,
-                },
-                false,
-            )
-            .unwrap();
-        // "Decided entry <id>"
-        let old_id = r1.trim_start_matches("Decided entry ").to_string();
-        kb.save().unwrap();
-
-        let r2 = kb
-            .decide(
-                &DecideParams {
-                    content: "use RocksDB for the cache".into(),
-                    rationale: "SQLite locking conflicted with concurrent writers".into(),
-                    supersedes: Some(old_id.clone()),
-                    title: None,
-                    scope: None,
-                    project: None,
-                    project_id: None,
-                    priority: None,
-                    render: None,
-                },
-                false,
-            )
-            .unwrap();
-        assert!(r2.contains(&format!("supersedes {old_id}")));
-
-        let old = kb.store.entries.iter().find(|e| e.id == old_id).unwrap();
-        assert_eq!(old.status, Status::Superseded);
-        assert!(
-            old.supersedes.is_some(),
-            "old entry should now point at successor"
-        );
-    }
-
-    #[test]
-    fn decide_supersedes_missing_rejected() {
-        let (_t, mut kb) = mk_kb();
-        let e = kb
-            .decide(
-                &DecideParams {
-                    content: "x".into(),
-                    rationale: "y".into(),
-                    supersedes: Some("no-such-id".into()),
-                    title: None,
-                    scope: None,
-                    project: None,
-                    project_id: None,
-                    priority: None,
-                    render: None,
-                },
-                false,
-            )
-            .unwrap_err();
-        assert!(e.to_string().contains("not found"));
-    }
-
-    #[test]
-    fn base_supersession_persists_both_decisions_in_one_transaction() {
-        let central = tempfile::tempdir().unwrap();
-        let repo = tempfile::tempdir().unwrap();
-        let root = repo.path().canonicalize().unwrap();
-        git_init_commit(&root);
-        std::fs::create_dir_all(repo_kb_dir(&root)).unwrap();
-        let project = root.to_string_lossy().into_owned();
-        let mut kb = Knowledge::open(&central.path().join("kb.json")).unwrap();
-        kb.set_project_roots(vec![root.clone()]).unwrap();
-
-        let first = kb
-            .decide_result_with_write_dir(
-                &DecideParams {
-                    content: "use the first storage engine".into(),
-                    rationale: "it is already deployed".into(),
-                    supersedes: None,
-                    title: None,
-                    scope: Some("project".into()),
-                    project: Some(project.clone()),
-                    project_id: None,
-                    priority: None,
-                    render: None,
-                },
-                false,
-                Some(&project),
-            )
-            .unwrap();
-        kb.reload().unwrap();
-        let old_seed = kb.entry(&first.id).unwrap().clone();
-
-        let second = kb
-            .decide_result_with_checkout(
-                &DecideParams {
-                    content: "use the replacement storage engine".into(),
-                    rationale: "it supports the required concurrency".into(),
-                    supersedes: Some(first.id.clone()),
-                    title: None,
-                    scope: Some("project".into()),
-                    project: Some(project.clone()),
-                    project_id: None,
-                    priority: None,
-                    render: None,
-                },
-                false,
-                Some(&project),
-                Some(&old_seed),
-            )
-            .unwrap();
-
-        let old_on_disk: KnowledgeEntry = serde_json::from_slice(
-            &std::fs::read(repo_kb_dir(&root).join(format!("{}.json", first.id))).unwrap(),
-        )
-        .unwrap();
-        let new_on_disk: KnowledgeEntry = serde_json::from_slice(
-            &std::fs::read(repo_kb_dir(&root).join(format!("{}.json", second.id))).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(old_on_disk.status, Status::Superseded);
-        assert_eq!(old_on_disk.supersedes.as_deref(), Some(second.id.as_str()));
-        assert_eq!(new_on_disk.status, Status::Active);
-        assert!(
-            kb.entry(&first.id)
-                .is_some_and(|entry| entry.status == Status::Superseded),
-            "a base-carrier mutation must update the published in-memory generation"
-        );
-        assert!(
-            kb.entry(&second.id)
-                .is_some_and(|entry| entry.status == Status::Active),
-            "a base-carrier mutation must retain the new published decision"
-        );
-
-        let completed = root.join(".bbox/local/knowledge-transactions/completed");
-        let manifests = std::fs::read_dir(completed)
-            .unwrap()
-            .map(|entry| {
-                let bytes = std::fs::read(entry.unwrap().path()).unwrap();
-                serde_json::from_slice::<crate::transaction::KnowledgeTransactionManifest>(&bytes)
-                    .unwrap()
-            })
-            .collect::<Vec<_>>();
-        assert!(
-            manifests.iter().any(|manifest| manifest.files.len() == 2),
-            "supersession must record one terminal manifest for both files"
-        );
-    }
-
-    #[test]
     fn checkout_mutations_accumulate_without_touching_published_carrier() {
         let central = tempfile::tempdir().unwrap();
         let repo = tempfile::tempdir().unwrap();
@@ -6267,24 +4843,13 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             title: "checkout mutation".into(),
             content: "mutate only the checkout generation".into(),
             cluster: None,
-            variants: HashMap::new(),
             category: Category::Convention,
             scope: Scope::Project,
             project: None,
             project_id: None,
             providers: Vec::new(),
             priority: Priority::Standard,
-            weight: 100,
             render: true,
-            decay: true,
-            review_at: None,
-            status: Status::Active,
-            approval: Approval::AgentInferred,
-            supersedes: None,
-            links: Vec::new(),
-            rationale: None,
-            expires_at: None,
-            source: "agent".into(),
             created_at: "2026-07-21T00:00:00Z".into(),
             updated_at: "2026-07-21T00:00:00Z".into(),
             recall_count: 0,
@@ -6340,69 +4905,40 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
                 project_id: None,
                 providers: None,
                 priority: None,
-                weight: None,
-                expires_at: None,
+                render: None,
                 cluster: None,
                 id: Some(id.into()),
             },
-            false,
             Some(&checkout_path),
             Some(&published),
         )
         .unwrap();
         let updated = read_checkout_seed();
         assert_eq!(updated.content, "updated only in the checkout generation");
-        kb.append_link_with_write_dir(
-            &KnowledgeLinkParams {
+        let checkout_file = repo_kb_dir(&checkout).join(format!("{id}.json"));
+        assert!(checkout_file.is_file());
+        kb.forget_with_write_dir(
+            &ForgetParams {
                 project: None,
-                source: format!("knowledge:{id}"),
-                target: "knowledge:related".into(),
-                kind: "related".into(),
-                note: None,
-                source_arc: None,
-                confidence: None,
+                id: id.into(),
             },
             Some(&checkout_path),
             Some(&updated),
         )
         .unwrap();
-
-        let linked = read_checkout_seed();
-        assert_eq!(linked.links.len(), 1);
-        kb.review_with_write_dir(
-            &ReviewParams {
-                project: None,
-                action: Some("approve".into()),
-                id: Some(id.into()),
-                ..Default::default()
-            },
-            Some(&checkout_path),
-            Some(&linked),
-        )
-        .unwrap();
-        let approved = read_checkout_seed();
-        assert_eq!(approved.approval, Approval::UserConfirmed);
-        kb.forget_with_write_dir(
-            &ForgetParams {
-                project: None,
-                id: id.into(),
-                superseded_by: None,
-            },
-            Some(&checkout_path),
-            Some(&approved),
-        )
-        .unwrap();
-        let retired = read_checkout_seed();
-        assert_eq!(retired.status, Status::Deleted);
-        assert_eq!(retired.links.len(), 1);
+        // Forget deletes the checkout's file; the published carrier keeps
+        // its generation until the checkout's change is merged.
+        assert!(!checkout_file.exists());
 
         let base_entry: KnowledgeEntry = serde_json::from_slice(
             &std::fs::read(repo_kb_dir(&base).join(format!("{id}.json"))).unwrap(),
         )
         .unwrap();
-        assert_eq!(base_entry.status, Status::Active);
-        assert_eq!(base_entry.approval, Approval::AgentInferred);
-        assert!(base_entry.links.is_empty());
+        assert_eq!(base_entry.content, "mutate only the checkout generation");
+        assert_eq!(
+            kb.entry(id).map(|entry| entry.content.as_str()),
+            Some("mutate only the checkout generation")
+        );
         git_run(
             &base,
             &["worktree", "remove", "--force", checkout.to_str().unwrap()],
@@ -6429,25 +4965,21 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
         let mut kb = Knowledge::open(&kb_path).unwrap();
         kb.set_project_roots(vec![repo_root.clone()]).unwrap();
         let id = kb
-            .learn_result(
-                &LearnParams {
-                    render_placement: None,
-                    content: "always run cargo test --lib before pushing".into(),
-                    category: "convention".into(),
-                    format: None,
-                    title: Some("test before push".into()),
-                    scope: Some("project".into()),
-                    project: Some(proj.clone()),
-                    project_id: None,
-                    providers: None,
-                    priority: None,
-                    weight: None,
-                    expires_at: None,
-                    cluster: None,
-                    id: None,
-                },
-                false,
-            )
+            .learn_result(&LearnParams {
+                render_placement: None,
+                content: "always run cargo test --lib before pushing".into(),
+                category: "convention".into(),
+                format: None,
+                title: Some("test before push".into()),
+                scope: Some("project".into()),
+                project: Some(proj.clone()),
+                project_id: None,
+                providers: None,
+                priority: None,
+                render: None,
+                cluster: None,
+                id: None,
+            })
             .unwrap()
             .id;
 
@@ -6525,25 +5057,21 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             .unwrap();
 
         let id = kb
-            .learn_result(
-                &LearnParams {
-                    render_placement: None,
-                    content: "prefer rustls over openssl".into(),
-                    category: "convention".into(),
-                    format: None,
-                    title: Some("tls backend".into()),
-                    scope: Some("project".into()),
-                    project: Some(worktree_root.to_string_lossy().into_owned()),
-                    project_id: None,
-                    providers: None,
-                    priority: None,
-                    weight: None,
-                    expires_at: None,
-                    cluster: None,
-                    id: None,
-                },
-                false,
-            )
+            .learn_result(&LearnParams {
+                render_placement: None,
+                content: "prefer rustls over openssl".into(),
+                category: "convention".into(),
+                format: None,
+                title: Some("tls backend".into()),
+                scope: Some("project".into()),
+                project: Some(worktree_root.to_string_lossy().into_owned()),
+                project_id: None,
+                providers: None,
+                priority: None,
+                render: None,
+                cluster: None,
+                id: None,
+            })
             .unwrap()
             .id;
 
@@ -6590,25 +5118,21 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
 
         // Project-scoped entry on a repo-owned project → committed file → rider.
         let proj_id = kb
-            .learn_result(
-                &LearnParams {
-                    render_placement: None,
-                    content: "always run cargo test --lib before pushing".into(),
-                    category: "convention".into(),
-                    format: None,
-                    title: Some("test before push".into()),
-                    scope: Some("project".into()),
-                    project: Some(proj.clone()),
-                    project_id: None,
-                    providers: None,
-                    priority: None,
-                    weight: None,
-                    expires_at: None,
-                    cluster: None,
-                    id: None,
-                },
-                false,
-            )
+            .learn_result(&LearnParams {
+                render_placement: None,
+                content: "always run cargo test --lib before pushing".into(),
+                category: "convention".into(),
+                format: None,
+                title: Some("test before push".into()),
+                scope: Some("project".into()),
+                project: Some(proj.clone()),
+                project_id: None,
+                providers: None,
+                priority: None,
+                render: None,
+                cluster: None,
+                id: None,
+            })
             .unwrap()
             .id;
         let rider = kb
@@ -6631,25 +5155,21 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
 
         // Global entry → host-local, nothing committed → no rider.
         let global_id = kb
-            .learn_result(
-                &LearnParams {
-                    render_placement: None,
-                    content: "prefer fd over find".into(),
-                    category: "convention".into(),
-                    format: None,
-                    title: Some("fd over find".into()),
-                    scope: Some("global".into()),
-                    project: None,
-                    project_id: None,
-                    providers: None,
-                    priority: None,
-                    weight: None,
-                    expires_at: None,
-                    cluster: None,
-                    id: None,
-                },
-                false,
-            )
+            .learn_result(&LearnParams {
+                render_placement: None,
+                content: "prefer fd over find".into(),
+                category: "convention".into(),
+                format: None,
+                title: Some("fd over find".into()),
+                scope: Some("global".into()),
+                project: None,
+                project_id: None,
+                providers: None,
+                priority: None,
+                render: None,
+                cluster: None,
+                id: None,
+            })
             .unwrap()
             .id;
         assert!(
@@ -6676,25 +5196,21 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
         let mut kb = Knowledge::open(&kb_path).unwrap();
         kb.set_project_roots(vec![repo_root.clone()]).unwrap();
         let id = kb
-            .learn_result(
-                &LearnParams {
-                    render_placement: None,
-                    content: "stays in central until ejected".into(),
-                    category: "convention".into(),
-                    format: None,
-                    title: Some("legacy project rule".into()),
-                    scope: Some("project".into()),
-                    project: Some(proj.clone()),
-                    project_id: None,
-                    providers: None,
-                    priority: None,
-                    weight: None,
-                    expires_at: None,
-                    cluster: None,
-                    id: None,
-                },
-                false,
-            )
+            .learn_result(&LearnParams {
+                render_placement: None,
+                content: "stays in central until ejected".into(),
+                category: "convention".into(),
+                format: None,
+                title: Some("legacy project rule".into()),
+                scope: Some("project".into()),
+                project: Some(proj.clone()),
+                project_id: None,
+                providers: None,
+                priority: None,
+                render: None,
+                cluster: None,
+                id: None,
+            })
             .unwrap()
             .id;
 
@@ -6735,17 +5251,14 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
         let mut kb = Knowledge::open(&central.path().join("kb.json")).unwrap();
         kb.set_path_fallback_cut(true);
         let err = kb
-            .learn_result(
-                &LearnParams {
-                    render_placement: None,
-                    content: "must not become path-authoritative".into(),
-                    category: "convention".into(),
-                    scope: Some("project".into()),
-                    project: Some(project.path().to_string_lossy().into_owned()),
-                    ..Default::default()
-                },
-                false,
-            )
+            .learn_result(&LearnParams {
+                render_placement: None,
+                content: "must not become path-authoritative".into(),
+                category: "convention".into(),
+                scope: Some("project".into()),
+                project: Some(project.path().to_string_lossy().into_owned()),
+                ..Default::default()
+            })
             .unwrap_err();
         assert!(err.to_string().contains("checkout authority"));
         assert!(kb.all_entries().is_empty());
@@ -6778,24 +5291,13 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             title: "durable title".into(),
             content: "durable body".into(),
             cluster: None,
-            variants: HashMap::new(),
             category: Category::Convention,
             scope: Scope::Project,
             project: Some(repo_root.to_string_lossy().to_string()),
             project_id: None,
             providers: vec![],
             priority: Priority::Standard,
-            weight: 100,
             render: true,
-            decay: true,
-            review_at: None,
-            status: Status::Active,
-            approval: Approval::UserConfirmed,
-            supersedes: None,
-            links: Vec::new(),
-            rationale: None,
-            expires_at: None,
-            source: "user".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
             recall_count: 7,
@@ -6867,24 +5369,13 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             title: "t".into(),
             content: "durable".into(),
             cluster: None,
-            variants: HashMap::new(),
             category: Category::Convention,
             scope: Scope::Project,
             project: Some(repo_root.to_string_lossy().to_string()),
             project_id: None,
             providers: vec![],
             priority: Priority::Standard,
-            weight: 100,
             render: true,
-            decay: true,
-            review_at: None,
-            status: Status::Active,
-            approval: Approval::UserConfirmed,
-            supersedes: None,
-            links: Vec::new(),
-            rationale: None,
-            expires_at: None,
-            source: "user".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
             recall_count: 5,
@@ -6944,25 +5435,21 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
         // Open WITHOUT set_project_roots: committed.json is not loaded.
         let mut kb = Knowledge::open(&kb_path).unwrap();
         // A global write triggers save() while roots are unset.
-        kb.learn_result(
-            &LearnParams {
-                render_placement: None,
-                content: "global".into(),
-                category: "memory".into(),
-                format: None,
-                title: Some("g".into()),
-                scope: Some("global".into()),
-                project: None,
-                project_id: None,
-                providers: None,
-                priority: None,
-                weight: None,
-                expires_at: None,
-                cluster: None,
-                id: None,
-            },
-            false,
-        )
+        kb.learn_result(&LearnParams {
+            render_placement: None,
+            content: "global".into(),
+            category: "memory".into(),
+            format: None,
+            title: Some("g".into()),
+            scope: Some("global".into()),
+            project: None,
+            project_id: None,
+            providers: None,
+            priority: None,
+            render: None,
+            cluster: None,
+            id: None,
+        })
         .unwrap();
 
         assert!(
@@ -7170,24 +5657,13 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
                 title: "old convention".into(),
                 content: "LEGACY_MARKER".into(),
                 cluster: None,
-                variants: HashMap::new(),
                 category: Category::Convention,
                 scope: Scope::Project,
                 project: Some(proj.clone()),
                 project_id: None,
                 providers: vec![],
                 priority: Priority::Standard,
-                weight: 100,
                 render: true,
-                decay: true,
-                review_at: None,
-                status: Status::Active,
-                approval: Approval::UserConfirmed,
-                supersedes: None,
-                links: vec![],
-                rationale: None,
-                expires_at: None,
-                source: "user".into(),
                 created_at: "2026-01-01T00:00:00Z".into(),
                 updated_at: "2026-01-01T00:00:00Z".into(),
                 recall_count: 0,
@@ -7236,24 +5712,13 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             title: "house rule".into(),
             content: "PROJECT_CONVENTION_MARKER: always canonicalize tempdirs".into(),
             cluster: None,
-            variants: HashMap::new(),
             category: Category::Convention,
             scope: Scope::Project,
             project: None,
             project_id: None,
             providers: vec![],
             priority: Priority::Standard,
-            weight: 100,
             render: true,
-            decay: true,
-            review_at: None,
-            status: Status::Active,
-            approval: Approval::UserConfirmed,
-            supersedes: None,
-            links: vec![],
-            rationale: None,
-            expires_at: None,
-            source: "user".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
             recall_count: 0,
@@ -7363,25 +5828,21 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
         let (_t, mut kb) = mk_kb();
         push_entry(&mut kb, "diffid01", "orig title", "original body text");
         let out = kb
-            .learn(
-                &LearnParams {
-                    render_placement: None,
-                    content: "brand new much longer replacement body text with extras".into(),
-                    category: "convention".into(),
-                    format: None,
-                    title: Some("new title".into()),
-                    scope: Some("project".into()),
-                    project: Some("/tmp/proj".into()),
-                    project_id: None,
-                    providers: None,
-                    priority: None,
-                    weight: None,
-                    expires_at: None,
-                    cluster: Some("lifecycle rules".into()),
-                    id: Some("diffid01".into()),
-                },
-                false,
-            )
+            .learn(&LearnParams {
+                render_placement: None,
+                content: "brand new much longer replacement body text with extras".into(),
+                category: "convention".into(),
+                format: None,
+                title: Some("new title".into()),
+                scope: Some("project".into()),
+                project: Some("/tmp/proj".into()),
+                project_id: None,
+                providers: None,
+                priority: None,
+                render: None,
+                cluster: Some("lifecycle rules".into()),
+                id: Some("diffid01".into()),
+            })
             .unwrap();
         assert!(out.starts_with("Updated entry diffid01 ["), "got: {out}");
         assert!(out.contains("title:"), "title diff missing: {out}");
@@ -7403,25 +5864,21 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
         let (_t, mut kb) = mk_kb();
         push_entry(&mut kb, "diffid02", "same title", "abcdefghij");
         let out = kb
-            .learn(
-                &LearnParams {
-                    render_placement: None,
-                    content: "klmnopqrst".into(),
-                    category: "memory".into(),
-                    format: None,
-                    title: Some("same title".into()),
-                    scope: Some("global".into()),
-                    project: None,
-                    project_id: None,
-                    providers: None,
-                    priority: None,
-                    weight: None,
-                    expires_at: None,
-                    cluster: None,
-                    id: Some("diffid02".into()),
-                },
-                false,
-            )
+            .learn(&LearnParams {
+                render_placement: None,
+                content: "klmnopqrst".into(),
+                category: "memory".into(),
+                format: None,
+                title: Some("same title".into()),
+                scope: Some("global".into()),
+                project: None,
+                project_id: None,
+                providers: None,
+                priority: None,
+                render: None,
+                cluster: None,
+                id: Some("diffid02".into()),
+            })
             .unwrap();
         assert!(out.starts_with("Updated entry diffid02 ["), "got: {out}");
         assert!(
@@ -7435,25 +5892,21 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
         let (_t, mut kb) = mk_kb();
         push_entry(&mut kb, "noopid01", "same title", "same body");
         let out = kb
-            .learn(
-                &LearnParams {
-                    render_placement: None,
-                    content: "same body".into(),
-                    category: "memory".into(),
-                    format: None,
-                    title: Some("same title".into()),
-                    scope: Some("project".into()),
-                    project: Some("/tmp/proj".into()),
-                    project_id: None,
-                    providers: None,
-                    priority: Some("standard".into()),
-                    weight: Some(100),
-                    expires_at: None,
-                    cluster: None,
-                    id: Some("noopid01".into()),
-                },
-                false,
-            )
+            .learn(&LearnParams {
+                render_placement: None,
+                content: "same body".into(),
+                category: "memory".into(),
+                format: None,
+                title: Some("same title".into()),
+                scope: Some("project".into()),
+                project: Some("/tmp/proj".into()),
+                project_id: None,
+                providers: None,
+                priority: Some("standard".into()),
+                render: None,
+                cluster: None,
+                id: Some("noopid01".into()),
+            })
             .unwrap();
         assert!(out.contains("no-op"), "expected no-op summary, got: {out}");
     }
@@ -7468,37 +5921,21 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             title: "Flat rule".into(),
             content: "flat body".into(),
             cluster: None,
-            variants: HashMap::new(),
             category: Category::Convention,
             scope: Scope::Project,
             project: Some(project.into()),
             project_id: None,
             providers: vec![],
             priority: Priority::Standard,
-            weight: 10,
             render: true,
-            decay: true,
-            review_at: None,
-            status: Status::Active,
-            approval: Approval::UserConfirmed,
-            supersedes: None,
-            links: Vec::new(),
-            rationale: None,
-            expires_at: None,
-            source: "test".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
             recall_count: 0,
             last_recalled: None,
         });
-        for (id, title, body, weight) in [
-            (
-                "clust001",
-                "Foreground push",
-                "keep lt push in foreground",
-                20,
-            ),
-            ("clust002", "Require change", "gate on actual changes", 30),
+        for (id, title, body) in [
+            ("clust001", "Foreground push", "keep lt push in foreground"),
+            ("clust002", "Require change", "gate on actual changes"),
         ] {
             kb.store.entries.push(KnowledgeEntry {
                 render_placement: Default::default(),
@@ -7506,24 +5943,13 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
                 title: title.into(),
                 content: body.into(),
                 cluster: Some("Lifecycle Rules".into()),
-                variants: HashMap::new(),
                 category: Category::Convention,
                 scope: Scope::Project,
                 project: Some(project.into()),
                 project_id: None,
                 providers: vec![],
                 priority: Priority::Standard,
-                weight,
                 render: true,
-                decay: true,
-                review_at: None,
-                status: Status::Active,
-                approval: Approval::UserConfirmed,
-                supersedes: None,
-                links: Vec::new(),
-                rationale: None,
-                expires_at: None,
-                source: "test".into(),
                 created_at: "2026-01-01T00:00:00Z".into(),
                 updated_at: "2026-01-01T00:00:00Z".into(),
                 recall_count: 0,
@@ -7569,24 +5995,13 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             title: "Local rule".into(),
             content: "provider-specific project memory".into(),
             cluster: None,
-            variants: HashMap::new(),
             category: Category::Memory,
             scope: Scope::Project,
             project: Some(project.into()),
             project_id: None,
             providers: vec![],
             priority: Priority::Standard,
-            weight: 100,
             render: true,
-            decay: true,
-            review_at: None,
-            status: Status::Active,
-            approval: Approval::UserConfirmed,
-            supersedes: None,
-            links: Vec::new(),
-            rationale: None,
-            expires_at: None,
-            source: "test".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
             recall_count: 0,
@@ -7619,24 +6034,13 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             title: "Gemini local rule".into(),
             content: "provider-specific project memory".into(),
             cluster: None,
-            variants: HashMap::new(),
             category: Category::Memory,
             scope: Scope::Project,
             project: Some(project.into()),
             project_id: None,
             providers: vec![],
             priority: Priority::Standard,
-            weight: 100,
             render: true,
-            decay: true,
-            review_at: None,
-            status: Status::Active,
-            approval: Approval::UserConfirmed,
-            supersedes: None,
-            links: Vec::new(),
-            rationale: None,
-            expires_at: None,
-            source: "test".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
             recall_count: 0,
@@ -7664,24 +6068,13 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             title: "Common global rule".into(),
             content: "provider-neutral global body".into(),
             cluster: None,
-            variants: HashMap::new(),
             category: Category::Convention,
             scope: Scope::Global,
             project: None,
             project_id: None,
             providers: vec![],
             priority: Priority::Standard,
-            weight: 10,
             render: true,
-            decay: true,
-            review_at: None,
-            status: Status::Active,
-            approval: Approval::UserConfirmed,
-            supersedes: None,
-            links: Vec::new(),
-            rationale: None,
-            expires_at: None,
-            source: "test".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
             recall_count: 0,
@@ -7693,24 +6086,13 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             title: "Claude-only rule".into(),
             content: "claude-specific global body".into(),
             cluster: None,
-            variants: HashMap::new(),
             category: Category::Convention,
             scope: Scope::Global,
             project: None,
             project_id: None,
             providers: vec!["claude".into()],
             priority: Priority::Standard,
-            weight: 20,
             render: true,
-            decay: true,
-            review_at: None,
-            status: Status::Active,
-            approval: Approval::UserConfirmed,
-            supersedes: None,
-            links: Vec::new(),
-            rationale: None,
-            expires_at: None,
-            source: "test".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
             recall_count: 0,
@@ -7756,24 +6138,13 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             title: "Local rule".into(),
             content: "project memory".into(),
             cluster: None,
-            variants: HashMap::new(),
             category: Category::Memory,
             scope: Scope::Project,
             project: Some(project.into()),
             project_id: None,
             providers: vec![],
             priority: Priority::Standard,
-            weight: 100,
             render: true,
-            decay: true,
-            review_at: None,
-            status: Status::Active,
-            approval: Approval::UserConfirmed,
-            supersedes: None,
-            links: Vec::new(),
-            rationale: None,
-            expires_at: None,
-            source: "test".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
             recall_count: 0,
@@ -7840,7 +6211,6 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
                 "tool",
                 "memory",
                 "workflow",
-                "decision",
             ]
         );
     }
@@ -7849,25 +6219,21 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
     fn learn_result_exposes_stable_machine_fields() {
         let (_t, mut kb) = mk_kb();
         let out = kb
-            .learn_result(
-                &LearnParams {
-                    render_placement: None,
-                    content: "use rustls, not openssl".into(),
-                    category: "convention".into(),
-                    format: Some("json".into()),
-                    title: None,
-                    scope: Some("project".into()),
-                    project: Some("/tmp/proj".into()),
-                    project_id: None,
-                    providers: None,
-                    priority: None,
-                    weight: None,
-                    expires_at: None,
-                    cluster: Some("Lifecycle Rules".into()),
-                    id: None,
-                },
-                false,
-            )
+            .learn_result(&LearnParams {
+                render_placement: None,
+                content: "use rustls, not openssl".into(),
+                category: "convention".into(),
+                format: Some("json".into()),
+                title: None,
+                scope: Some("project".into()),
+                project: Some("/tmp/proj".into()),
+                project_id: None,
+                providers: None,
+                priority: None,
+                render: None,
+                cluster: Some("Lifecycle Rules".into()),
+                id: None,
+            })
             .unwrap();
         assert_eq!(out.action, "created");
         assert!(!out.rendered);
@@ -8047,24 +6413,13 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             title: "t".into(),
             content: content.into(),
             cluster: None,
-            variants: Default::default(),
             category: Category::Convention,
             scope: Scope::Project,
             project: None,
             project_id: None,
             providers: vec![],
             priority: Priority::Standard,
-            weight: 100,
-            status: Status::Active,
-            approval: Approval::UserConfirmed,
             render: true,
-            decay: true,
-            review_at: None,
-            supersedes: None,
-            links: vec![],
-            rationale: None,
-            expires_at: None,
-            source: "test".into(),
             created_at: "2026-01-01".into(),
             updated_at: "2026-01-01".into(),
             recall_count: 0,

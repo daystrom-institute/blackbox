@@ -79,8 +79,8 @@ mod harness {
         committed_gap_note_bytes,
     };
     use bbox_knowledge::knowledge::{
-        Approval, Category, KnowledgeEntry, KnowledgeListParams, Priority, RenderParams, Scope,
-        Status, committed_knowledge_entry_bytes,
+        Category, KnowledgeEntry, KnowledgeListParams, Priority, RenderParams, Scope,
+        committed_knowledge_entry_bytes,
     };
     use rmcp::handler::server::wrapper::Parameters;
     use rmcp::model::CallToolResult;
@@ -235,24 +235,13 @@ mod harness {
             title: format!("entry {id}"),
             content: content.to_string(),
             cluster: None,
-            variants: Default::default(),
             category: Category::Convention,
             scope: Scope::Project,
             project: None,
             project_id: None,
             providers: Vec::new(),
             priority: Priority::Standard,
-            weight: 100,
-            status: Status::Active,
-            approval: Approval::UserConfirmed,
             render: true,
-            decay: false,
-            review_at: None,
-            supersedes: None,
-            links: Vec::new(),
-            rationale: None,
-            expires_at: None,
-            source: "user".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-02T00:00:00Z".to_string(),
             recall_count: 0,

@@ -9070,8 +9070,6 @@ mod tests {
                 "bbox_note.project",
                 "bbox_knowledge",
                 "bbox_learn",
-                "bbox_remember",
-                "bbox_decide",
                 // bbox_gaps (list): `project` is a result filter, None = all.
                 "bbox_gaps",
                 "bbox_thread",
