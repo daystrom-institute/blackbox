@@ -808,7 +808,7 @@ test exercising the documented mitigation.
 - §12.2 embedding poisoning: deliberately-poisoned manifest fixture
   (description over-broad); confirm anti-pattern penalty downranks.
 - §12.3 session leak: documented limitation; test ensures
-  `bbox_remember` surface stores `AgentSession` not bare
+  recall-only `bbox_learn` surface stores `AgentSession` not bare
   `session_id` (lint).
 - §12.4 distillation drift: this lives in badgey-impl; agent-system
   side ensures auto-deprecation proposals route through the badgey

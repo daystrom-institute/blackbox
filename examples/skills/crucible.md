@@ -1,6 +1,6 @@
 ---
 description: Orchestrator-led implementation workflow — durable pair-programmer implementer, continuous red-team ensemble, coordinated through bbox work-item threads with structured notes as the signal channel
-allowed-tools: mcp__blackbox__bro_exec, mcp__blackbox__bro_resume, mcp__blackbox__bro_wait, mcp__blackbox__bro_when_all, mcp__blackbox__bro_when_any, mcp__blackbox__bro_broadcast, mcp__blackbox__bro_team, mcp__blackbox__bro_brofile, mcp__blackbox__bro_providers, mcp__blackbox__bro_status, mcp__blackbox__bro_cancel, mcp__blackbox__bro_dashboard, mcp__blackbox__bbox_thread, mcp__blackbox__bbox_thread_list, mcp__blackbox__bbox_notes, mcp__blackbox__bbox_note_resolve, mcp__blackbox__bbox_knowledge, mcp__blackbox__bbox_decide, Read, Edit, Write, Bash, Glob, Grep, AskUserQuestion, TaskCreate, TaskUpdate
+allowed-tools: mcp__blackbox__bro_exec, mcp__blackbox__bro_resume, mcp__blackbox__bro_wait, mcp__blackbox__bro_when_all, mcp__blackbox__bro_when_any, mcp__blackbox__bro_broadcast, mcp__blackbox__bro_team, mcp__blackbox__bro_brofile, mcp__blackbox__bro_providers, mcp__blackbox__bro_status, mcp__blackbox__bro_cancel, mcp__blackbox__bro_dashboard, mcp__blackbox__bbox_thread, mcp__blackbox__bbox_thread_list, mcp__blackbox__bbox_notes, mcp__blackbox__bbox_note_resolve, mcp__blackbox__bbox_knowledge, mcp__blackbox__bbox_learn, Read, Edit, Write, Bash, Glob, Grep, AskUserQuestion, TaskCreate, TaskUpdate
 argument-hint: <task description>
 ---
 
@@ -503,10 +503,10 @@ bbox_note(
 ### 7b. Durable decision record
 
 ```
-bbox_decide(
-  content="<what shipped and what was chosen>",
-  rationale="<why — cite ensemble convergence, key tradeoffs>",
-  category="decision",
+bbox_learn(
+  content="<what shipped and what was chosen>. Reason: <why; cite ensemble convergence, key tradeoffs>",
+  category="memory",
+  render=false,
   scope="project",
   project=<cwd>
 )

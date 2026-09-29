@@ -36,7 +36,7 @@ That means create first, reconcile later is how duplicate state accumulates.
 - `bro_team(action="list_templates")` before `save_template`
 - `bro_team(action="list")` before `create`
 - `bbox_thread_list(...)` before `bbox_thread(action="open", ...)`
-- `bbox_knowledge(query="...")` before `bbox_learn(...)` or `bbox_decide(...)`
+- `bbox_knowledge(query="...")` before `bbox_learn(...)`
 
 ## What "existing match" means
 
@@ -46,7 +46,7 @@ Also check for:
 
 - same topic under a slightly different title
 - same object in project scope vs global scope
-- same intent represented as an older decision that should be superseded rather than duplicated
+- same intent represented as an older entry that should be updated or replaced rather than duplicated
 
 ## Hot/cold split
 

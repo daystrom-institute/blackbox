@@ -615,8 +615,8 @@ It does not mean:
 future agents must obey this as rendered bbox knowledge
 ```
 
-Promotion to `bbox_learn`, `bbox_remember`, or `bbox_decide` remains explicit
-and operator-gated. The project graph can provide evidence and candidates, but
+Promotion to `bbox_learn` (rendered or `render=false`) remains explicit and
+operator-gated. The project graph can provide evidence and candidates, but
 it should not become a weaker back door into durable memory.
 
 ## Non-goals

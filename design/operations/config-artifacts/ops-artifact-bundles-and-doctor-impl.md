@@ -797,8 +797,7 @@ Implement sections incrementally:
   missing workflow assets (unresolved script/fixture paths);
 - `memories`: system-memory catalog loaded and `defaults_memories_dir` resolved
   (auto-loaded surface, verify-only);
-- `knowledge`: `bbox_lint` severity summary and rendered-file freshness when
-  available;
+- `knowledge`: rendered-file freshness when available;
 - `attention`: unresolved note and gap counts by kind.
 
 ### 5.3 Finding Classification

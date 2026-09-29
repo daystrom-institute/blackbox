@@ -120,8 +120,7 @@ real decomposition errors).
    - `brofile_inline`: provider/model/effort + reconciled pathfinder lens.
    - `filter_overlay.disallow`: ["Edit", "Write", "Bash",
      "NotebookEdit", "mcp__blackbox__bro_*",
-     "mcp__blackbox__bbox_learn", "mcp__blackbox__bbox_remember",
-     "mcp__blackbox__bbox_decide", "mcp__blackbox__bbox_forget"]
+     "mcp__blackbox__bbox_learn", "mcp__blackbox__bbox_forget"]
    - `inputs.schema`: `{question_shape, query, scope_hint?,
      known_evidence?}`
    - `outputs.schema`: strict-typed JSON — `{tldr, leads_symbols_files,

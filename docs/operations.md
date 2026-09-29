@@ -231,7 +231,7 @@ old inode until systemd restarts it.
 
 `bbox_doctor(format="summary")` is the first call for "what needs attention
 right now": it aggregates the old manual smoke checks (`bbox_stats`,
-`bbox_embed_status`, `bbox_project_list`, `bbox_lint`) into one
+`bbox_embed_status`, `bbox_project_list`) into one
 classified report (ok/info/warn/action/blocked) with suggested next commands.
 
 ```bash
@@ -472,7 +472,6 @@ start taking noticeably longer.
 ### Periodic knowledge hygiene
 
 ```bash
-bbox_lint()               # contradictions, stale entries, duplicates
 bbox_render(scope="global")  # re-sync provider markdown files if out of date
 ```
 

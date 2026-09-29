@@ -333,11 +333,10 @@ retrieval regressions would invalidate the later implementation review.
 
 #### 0.5 Route knowledge readers through one visibility view
 
-- Route `bbox_lint`, `bbox_review` list mode, compatibility absorb/bootstrap
-  reads, and workspace enrichment through `session_knowledge_view` or a small
-  shared read-only facade built directly on it.
-- Keep review approve/reject mutation authority on the existing prepared
-  mutation path. The detached view must never become a second writer.
+- Route `bbox_knowledge` reads and workspace enrichment through
+  `session_knowledge_view` or a small shared read-only facade built directly
+  on it.
+- Keep knowledge mutation authority on the existing prepared mutation path. The detached view must never become a second writer.
 - Preserve published-only behavior for sessions without checkout authority and
   default-own behavior for authoritative checkout sessions.
 - Add cross-check tests proving these readers see own provisional data, never a

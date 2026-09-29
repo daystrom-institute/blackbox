@@ -238,8 +238,6 @@ allow = [
 deny = [
   "bro_*",
   "bbox_learn",
-  "bbox_remember",
-  "bbox_decide",
   "bbox_forget",
   "bbox_render"
 ]

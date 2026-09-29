@@ -198,7 +198,7 @@ Acceptance criteria:
 - Flag unsafe compound operations outside an explicit `synchronized(collection)`
   block.
 - Report file, line, variable, collection wrapper, operation, and confidence.
-- Prefer a `bbox_lint` / audit surface or a read-only refactor analysis plan;
+- Prefer an audit surface or a read-only refactor analysis plan;
   do not auto-rewrite to concurrent collections.
 
 Status in worktree: read-only refactor analysis plan implemented with

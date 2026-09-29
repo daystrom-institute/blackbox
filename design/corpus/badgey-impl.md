@@ -562,7 +562,7 @@ something once W5 lands).
 **Scope.** The component that owns the user-driven `apply P-N` path
 end-to-end: state-machine transitions, kind-specific dispatch
 (`bbox_artifact_install` / pre-mint spawn helper), audit writes
-(`bbox_decide` + thread-of-record post), retry / reject semantics.
+(`bbox_learn` recall entry + thread-of-record post), retry / reject semantics.
 
 W3 (command parser) recognizes `apply P-N` and routes here; B3 is
 the underlying store; this phase wires them together with the
@@ -588,7 +588,7 @@ recovery semantics.
        - `RedispatchTask` → call D1 helper with the proposal's
          `idempotency_key`; record dispatched task id under
          `applied_task_id` BEFORE the spawn returns control.
-    4. CAS `applying → applied` AND write `bbox_decide` citing
+    4. CAS `applying → applied` AND write a `bbox_learn` recall entry citing
        proposal_id AND post `proposal_applied` event on
        thread-of-record.
     5. on action failure: CAS `applying → failed`; surface error.
@@ -1012,7 +1012,7 @@ through W5 → ProposalStore → user-tap apply.
   times in last 30d"; resulting proposal lands in ProposalStore
   pending; `apply P-N` installs the artifact.
 - Apply state machine fully exercised: pending → applying → applied;
-  audit trail (`bbox_decide` + thread post) present.
+  audit trail (`bbox_learn` recall entry + thread post) present.
 - Repeat apply on same proposal returns `already_applied`.
 
 ---

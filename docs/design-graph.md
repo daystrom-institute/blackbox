@@ -61,7 +61,7 @@ The graph holds STATE; the design docs hold STORY.
 | A mirror of one gap-log record (target of `SOURCED_FROM`) | `dsg:GapRef` | `gap/<gap-id>` |
 
 If it is about agent behavior or cross-project operating rules, it belongs in
-knowledge (`bbox_learn` / `bbox_decide`), not here. Prospective concepts and inquiries belong in the campaign layer described
+knowledge (`bbox_learn`), not here. Prospective concepts and inquiries belong in the campaign layer described
 below; active execution belongs in threads.
 If it is normative clause content, it belongs in `specs/`. The graph links
 to other stores without automatically absorbing their historical records.

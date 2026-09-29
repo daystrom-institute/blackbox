@@ -228,9 +228,9 @@ The rebaseline result is therefore:
 Non-normative operator snapshot, taken during this rebaseline: the current
 catalog contains nineteen projects, one in the Published lane and eighteen
 in LegacyLocal; one has an accepted publication pointer. Names and paths are
-deliberately omitted. `bbox_lint` consequently reports published visibility
-unavailable for those eighteen projects and legacy-compatibility knowledge
-rows without provable `built_from` stamps. This is operational evidence that
+deliberately omitted. Consequently, published visibility is unavailable for
+those eighteen projects and legacy-compatibility knowledge rows lack provable
+`built_from` stamps. This is operational evidence that
 bridge retirement is not ready, not a durable architecture invariant or a
 target count.
 
@@ -332,8 +332,8 @@ to it:
    and checkout identity queryable. If the lane proves noisy in practice,
    demoting to branch-private is a deletion, not a redesign.
 5. **Semantic merge defense.** One-file-per-entry makes textual conflicts
-   rare and semantic conflicts silent; `bbox_lint` at the merge gate (CI
-   or closeout) is required, not hygiene, once many branches carry
+   rare and semantic conflicts silent; a knowledge consistency check at the
+   merge gate (CI or closeout) is required, not hygiene, once many branches carry
    knowledge deltas. `render --check` rides the same gate so a stale
    committed render is caught where it is created.
 6. **Identity before motion.** Persisted `repo_id` authority,

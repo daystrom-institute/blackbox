@@ -118,7 +118,7 @@ version + supersession tracking. Lands BEFORE the first artifact ships
 - `bbox_artifact_list` MCP tool: list installed artifacts with version +
   source.
 - `bbox_artifact_supersede` MCP tool: mark an artifact superseded by
-  another (analogous to `bbox_decide` supersession).
+  another.
 - HTTP `/admin/artifact/*` endpoints for shell-script installers (the
   keystone pattern).
 - Per-project install discovery: when bbox detects a `<project>/.bbox/`
@@ -284,8 +284,7 @@ multipliers reach knowledge), §5.4 (knowledge bucket route).
 
 **Components.**
 - Extend reindex thread: scan `~/.claude-shared/blackbox-knowledge.json` on
-  startup + on every knowledge mutation hook (`bbox_learn`,
-  `bbox_remember`, `bbox_decide`, `bbox_forget`).
+  startup + on every knowledge mutation hook (`bbox_learn`, `bbox_forget`).
 - Emit one tantivy doc per entry with `doc_type=knowledge`, `entity_id`,
   `content` (title + body concatenated), `chunk_hash` (sha256 of body).
 - Wire knowledge mutation hooks to enqueue embedding via the `knowledge`

@@ -300,7 +300,7 @@ The duplication boundary, stated once and held:
 
 - Structure and relations of the design corpus itself -> `dsg:` vertices.
 - Agent-behavior rulings and cross-project operating rules -> knowledge
-  (`bbox_learn` / `bbox_decide`) stays.
+  (`bbox_learn`) stays.
 - Substrate gaps -> `bbox_gap` stays (a design-graph Finding analog, if ever
   needed, files drift between docs and tree and cites evidence; it does not
   replace gap notes).
@@ -382,7 +382,7 @@ hold.
   clusters (current lean: distinct-but-lazy, mint on second articulation).
 - Module seeding grain: crate- and plane-level only, or finer? Coarse is
   useful and maintainable; finer awaits a `binding` query that actually hurts.
-- Decision home confirmation: the `dsg:Decision` vs `bbox_decide` boundary
+- Decision home confirmation: the `dsg:Decision` vs knowledge `convention` entry boundary
   above is this design's proposal, not an established rule.
 - Whether the minted state block renders for hub docs too, or leaves only.
 - Held-out suite discipline: who guarantees the held-out questions stay

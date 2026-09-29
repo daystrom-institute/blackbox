@@ -16,9 +16,8 @@ system or source memory.
 
 Durable memories are operator-gated. If a new lesson seems worth remembering,
 first check existing Blackbox memory, then present the proposed verbatim text and
-wait for approval before calling `bbox_learn`, `bbox_remember`, or
-`bbox_decide`. Task-local workflow notes are still allowed when the active
-workflow requires them.
+wait for approval before calling `bbox_learn`. Task-local workflow notes are
+still allowed when the active workflow requires them.
 
 ## Versioning & Releases
 

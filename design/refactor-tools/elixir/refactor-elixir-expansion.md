@@ -226,9 +226,7 @@ mirroring `rust-refactor-persona`:
     ],
     "disallow": [
       "mcp__blackbox__bbox_forget",
-      "mcp__blackbox__bbox_decide",
       "mcp__blackbox__bbox_learn",
-      "mcp__blackbox__bbox_remember",
       "mcp__blackbox__bbox_render",
       "mcp__blackbox__bro_*",
       "Bash",

@@ -14,7 +14,7 @@ brief: "Invert the system-of-record for project scope: durable project knowledge
 **Status:** Partial (rev 4, 2026-05-30; landed on `main` 2026-05-30) —
 durable-knowledge layer + activity→record seam + live in-memory refresh shipped;
 identity model, the designed generation/purge spooler, `render --check`, and
-`bbox_lint` merge-gating not yet. See CHANGELOG "Unreleased" for the shipped surface.
+knowledge-consistency merge-gating not yet. See CHANGELOG "Unreleased" for the shipped surface.
 **Scope:** Where project-scoped durable knowledge (and the durable record of
 project activity) physically lives, who owns it, and what the daemon's role
 becomes for the project layer.
@@ -89,7 +89,7 @@ the issue log that prompted this design has since been resolved and removed.
 >   (scope is still keyed on the absolute path / repo-owned-by-existence), the
 >   `BbxWatcher` `project_id` reconstruction concern from rev 2/3 (already false
 >   in current code — id is passed, never reconstructed), `render --check` CI
->   gating, and `bbox_lint` as a required merge gate.
+>   gating, and a knowledge consistency check as a required merge gate.
 
 ---
 
@@ -157,7 +157,7 @@ system-of-record being in the wrong place for the project scope.
 - **Global scope stays host/daemon-owned.** "I always use `fd`", "prefer rustls" —
   machine/user-level, no repo to anchor to. This proposal flips only the *project*
   layer.
-- **Not resurrecting `bbox_absorb`.** This removes the need to round-trip markdown
+- **No markdown import path.** This removes the need to round-trip markdown
   by making the structured form the committed source; markdown becomes a derived
   view.
 - **Not committing live activity.** High-churn, session-bound activity stays local
@@ -263,7 +263,7 @@ Today `bbox_learn` and friends mutate the central JSON store directly
 is no longer authoritative for project scope, so the write path must change or you
 get **two systems of record disagreeing**:
 
-- A project-scope `bbox_learn` / `bbox_decide` / `bbox_forget` **writes the
+- A project-scope `bbox_learn` / `bbox_forget` **writes the
   corresponding `.bbox/<kind>/<id>.json` file** (one-file-per-entry) and lets the
   spooler re-index; it does not write the central project JSON as authority.
 - The central store may keep a **read-through cache** of project entries for query
@@ -272,7 +272,7 @@ get **two systems of record disagreeing**:
 
 Open sub-decision: whether writes commit (`git add` the entry file) or leave it
 staged/working for the human to commit. Default: leave it in the working tree,
-surfaced by `bbox_lint`/status — see source-of-truth below.
+surfaced by status (see source-of-truth below).
 
 ## Source-of-truth tree (new)
 
@@ -346,8 +346,8 @@ and no scrub gate.** The activity→record seam must be built:
 - **One file per entry** under `.bbox/<kind>/<id>.json` (the layout this repo's own
   `memory/` dir uses). Minimizes textual conflicts; each entry is a reviewable diff.
 - **Separate files avoid textual conflicts but not *semantic* ones** — two branches
-  can add contradictory conventions that merge cleanly as text. `bbox_lint` must run
-  at merge / in CI to catch contradictions and duplicates; this is a required gate,
+  can add contradictory conventions that merge cleanly as text. A knowledge
+  consistency check must run at merge / in CI to catch contradictions and duplicates; this is a required gate,
   not optional hygiene.
 - **Entry IDs are UUID/content-hash**, never host-local sequence, so they survive
   rebase, cherry-pick, and cross-machine merge. Supersession is a marked edge, not a
@@ -400,7 +400,7 @@ Mapped to the second-machine bootstrap issues (scratch log since resolved and re
   per-repo indexes?
 - **`verified` granularity** — per-entry field vs a branch-protection-derived "this
   ref is reviewed" signal.
-- **Conflict UX** — is a contradictory merge a `bbox_lint` CI failure, a normal git
+- **Conflict UX**: is a contradictory merge a CI consistency failure, a normal git
   conflict, or a structured merge driver for `.bbox/`?
 
 ## Relationship to prior art

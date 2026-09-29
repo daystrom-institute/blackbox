@@ -60,8 +60,8 @@ These three phases provide the prerequisites every atom needs.
 
 **Scope.** Author the narrow `rust-refactor-persona` brofile whose
 allow list contains only the refactor + grounding tool set, denying
-`Write` / `Edit` / `Bash` / `bbox_learn` / `bbox_remember` /
-`bbox_decide` / `bbox_forget` / `bbox_render` / `bro_*`. Ship as a
+`Write` / `Edit` / `Bash` / `bbox_learn` / `bbox_forget` /
+`bbox_render` / `bro_*`. Ship as a
 shipped artifact (see follow-up below for the alternative).
 
 **Realizes.** `design/refactor-agents.md` "Prerequisite: the narrow
@@ -93,9 +93,7 @@ refactor brofiles — `rust-refactor-persona`".
     plus `Read`, `Grep`, `Glob`.
   - `filters.disallow`:
     `mcp__blackbox__bbox_forget`,
-    `mcp__blackbox__bbox_decide`,
     `mcp__blackbox__bbox_learn`,
-    `mcp__blackbox__bbox_remember`,
     `mcp__blackbox__bbox_render`,
     `mcp__blackbox__bro_*`,
     `Bash`, `Write`, `Edit`.

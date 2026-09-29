@@ -456,7 +456,7 @@ Ten entity types plus two virtual.
 
 | Entity type | Backing store | Notes |
 |---|---|---|
-| `knowledge` | existing `~/.claude-shared/blackbox-knowledge.json` | `bbox_learn` / `bbox_remember` / `bbox_decide` entries; new `links` field carries authored edges |
+| `knowledge` | existing `~/.claude-shared/blackbox-knowledge.json` | `bbox_learn` entries; new `links` field carries authored edges |
 | `project_file` | tantivy index (chunks) + chunker registry | discriminated by `chunk_kind` (§7.2) |
 | `transcript` | tantivy index (existing) | one doc per content block |
 | `session` | derived from transcript scan | aggregated view of a session |
@@ -880,8 +880,8 @@ policy_packet: workflow-policy/arc-budget
 
 Constraints baked into the gate packet:
 - `auto_apply` only for indexed-only, non-rendered, source-backed notes
-  (`bbox_remember`-shaped). Rendered `bbox_learn` / `bbox_decide` always go to
-  `hold_for_review`.
+  (`bbox_learn` with `render=false`). Rendered `bbox_learn` entries always go
+  to `hold_for_review`.
 - Missing provenance → `reject` or `hold_for_review` per operator preference.
 - Daily cap **configurable** via packet predicate; default high (e.g. 50/day)
   with a config knob.
@@ -1274,7 +1274,7 @@ multi-run orchestration problem, not just a local loop over test cases.
 - Lens-scoped retrieval as a first-class search parameter.
 - Concept aliases / lifecycle vocabulary / convergence metric / per-edge
   graph weights — daystrom-grade refinements unjustified at bbox scale.
-- Compiled lint packets — existing `bbox_lint` heuristics adequate.
+- Compiled lint packets.
 - Auto-cosine provenance backfill on existing knowledge entries — forward-only.
 - Per-call query-shape classification — overengineering.
 - Hand-authored eval matrix workflows — generate from manifest via shell.

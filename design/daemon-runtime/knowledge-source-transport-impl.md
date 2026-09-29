@@ -90,7 +90,7 @@ The provisional semantic core is also mostly source-neutral:
 | Provisional gap capture | gap-view twin | Same, for `.bbox/gaps`. |
 | Lifecycle | `register_dark_knowledge_checkout`, `reconcile_dark_knowledge_checkouts`, watcher callbacks | Register host paths, watch them, refresh from them, and tear down by checkout registry observation. |
 | Session `own` authority | MCP `?project=` initialization plus `resolve_project_write` | Convert a daemon-visible path into `ResolvedCheckoutScope`; no remote workspace identity is carried by `WorkerSpawnSpec`. |
-| Project knowledge mutation | `bbox_learn`, `bbox_remember`, `bbox_decide`, link/review/forget, `prepare_knowledge_write`, and `RepoIoAuthority` | Resolve a daemon-visible checkout and perform repo-owned writes under a blackboxd `RepositoryMutation` lease, then refresh the local overlay. |
+| Project knowledge mutation | `bbox_learn`, `bbox_forget`, `prepare_knowledge_write`, and `RepoIoAuthority` | Resolve a daemon-visible checkout and perform repo-owned writes under a blackboxd `RepositoryMutation` lease, then refresh the local overlay. |
 | Project gap mutation | `bbox_gap`, resolve/update, gap spool recovery, and `RepoIoAuthority` | Resolve and mutate the daemon-visible checkout under the same repository-mutation authority. |
 
 ### 1.3 Existing transport and authority substrate
@@ -361,10 +361,9 @@ state explicitly.
 ### KT-D13: Project mutations become confined harness-native tools
 
 For a workspace-bound session, the harness owns project-scoped implementations
-of `bbox_learn`, `bbox_remember`, `bbox_decide`, link/review/forget, and the gap
-file/resolve/update family. They link the existing `bbox-knowledge` and
+of `bbox_learn`, `bbox_forget`, and the gap file/resolve/update family. They link the existing `bbox-knowledge` and
 `bbox-gaps` domain code through a checkout-confined repo-I/O adapter. They
-preserve one-file-per-entry, transaction-pending, supersession, dedupe,
+preserve one-file-per-entry, transaction-pending, dedupe,
 validation, and response semantics.
 
 The composite tool binding routes by authority:

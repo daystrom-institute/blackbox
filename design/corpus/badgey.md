@@ -470,7 +470,7 @@ The walkthrough adds two structured fields beyond the standard bundle:
 
 ```json
 {
-  "narrative": "to find why a knowledge entry got superseded, you...",
+  "narrative": "to find why a knowledge entry changed, you...",
   "steps": [
     { "tool": "bbox_inspect_entity", "args": "...", "rationale": "..." },
     { "tool": "bbox_find_paths", "args": "edge_family=SUPERSEDES", "rationale": "..." }
@@ -562,7 +562,7 @@ line of code exists.
 # turn 5: apply
 > badgey_resume(badgey_id="bg-3f7a91c4-91ff04cc", prompt="apply P-1")
 < { applied: true, artifact: "packet:catch-superseded-symbols-v1",
-<   bbox_decide_id: "...", thread_post: "..." }
+<   audit_entry_id: "...", thread_post: "..." }
 
 > badgey_dismiss(badgey_id="bg-3f7a91c4-91ff04cc")
 < { final_summary: "...", proposals_applied: 1 }
@@ -687,7 +687,7 @@ Wrapper apply path:
      bro
 4. on success: transition `applying → applied`, record
    `applied_artifact_ref` / `applied_task_id`. Then write audit trail
-   (`bbox_decide` citing proposal id, thread post). Audit failures
+   (`bbox_learn` recall entry citing proposal id, thread post). Audit failures
    leave state `applied` but trigger §11.6 audit-replay on next
    restart or retry.
 5. on action failure: transition `applying → failed`; surface error.
@@ -862,8 +862,8 @@ Operating constraints:
 
 6. Never apply destructive actions. Drafts go through bbox_artifact_install
    only after user types "apply P-N". Re-dispatches go through bro_exec
-   only after user approval. Mark every state mutation with bbox_decide
-   citing the proposal id.
+   only after user approval. Mark every state mutation with a bbox_learn
+   recall entry citing the proposal id.
 
 7. Teach toward graduation. In teach mode, every walkthrough ends with
    `next_time_skip_badgey_when`: name the conditions under which the
@@ -914,7 +914,7 @@ with version tracking. They are themselves valid targets of
 | Entity-ref bag | instance | mirrored to thread-of-record `refs_consumed[]` |
 | Proposals (`P-3`…) | instance + global | BadgeyProposalStore (§8.3) at `$BLACKBOX_STATE_DIR/badgey/proposals/<instance_id>/<P-N>.json` |
 | Scout threads | global | full `bbox_thread` persistence |
-| Self-tuning learned-notes | per-scope | `bbox_remember(scope=project)` |
+| Self-tuning learned-notes | per-scope | `bbox_learn(scope=project, category="memory", render=false)` |
 | Accept/reject log per proposal | per-scope | thread + structured note bodies |
 | Live wrapper memory (resume queue, scout monitors) | wrapper process | rebuilt on daemon start from durable stores |
 
@@ -1320,8 +1320,8 @@ Recovery: on daemon start (or on retry-apply user request):
   - `bbox_artifact_install` → was the artifact installed? (read catalog)
   - `bro_exec` → was the task spawned? (check by idempotency key)
 - if action committed: replay audit writes idempotently
-  (`bbox_decide` with the proposal id as supersedes-key prevents
-  duplicates), transition to `applied`
+  (the audit entry is looked up by proposal id before writing, which
+  prevents duplicates), transition to `applied`
 - if action did not commit: transition to `pending`, emit a `surprise`
   note documenting the partial state, surface in `bbox_inbox`
 - never silently transition `applying → applied` without verifying the

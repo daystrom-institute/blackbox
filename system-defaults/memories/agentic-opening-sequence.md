@@ -47,7 +47,7 @@ and edge families.
 
 - **Structural** (`IN_FILE`, `IN_SESSION`, `THREAD_HAS_SESSION`, `THREAD_SPAWNED_FROM`, `THREAD_BLOCKED_BY`, `THREAD_RELATES_TO`, `THREAD_SUBSUMES`, `NEXT_SECTION`, `NEXT_CHUNK`, `PREV_CHUNK`) — containment, thread relations, and sequence
 - **AST** (`DEFINED_IN`, `CONTAINS_SYMBOL`, `HAS_FIELD`, `IMPLEMENTS_TRAIT`, `CALLS`, `USES_TYPE`) — code navigation
-- **Knowledge** (`SUPERSEDES`, `DERIVED_FROM`, `Contradicts`, `KNOWLEDGE_FROM_SESSION`, `KNOWLEDGE_FROM_BOARD`) — rule lifecycle
+- **Knowledge** (`KNOWLEDGE_FROM_SESSION`, `KNOWLEDGE_FROM_BOARD`): knowledge provenance
 - **Provenance** (`SESSION_USED_BROFILE`, `ARC_USED_BROFILE`, `ARC_OPENED_BOARD`, `NOTE_FROM_SESSION`, `NOTE_IN_THREAD`, `NOTE_FROM_TASK`, `TASK_PRODUCED_NOTE`) — origin trails
 - **Git** (`COMMIT_PARENT`, `COMMIT_TOUCHED_FILE`, `COMMIT_PRODUCED_BY_ARC`) — version control history
 - **Format-specific** (`LINKS_TO_FILE`, `LINKS_TO_SECTION`, `DESCRIBES`, `ON_PAGE`, `FIGURE_OF`, `TABLE_OF`) — cross-reference within docs
@@ -111,7 +111,9 @@ the file path to find the sessions that touched it.
 
 **WHY** ("why does X exist?", "what was the rationale?"): trace
 `KNOWLEDGE_FROM_SESSION` from a knowledge entry to the originating
-session, OR `DERIVED_FROM`/`SUPERSEDES` to the lineage. A bare
+session; for a project entry, the git history of
+`.bbox/knowledge/<id>.json` carries prior versions and the reason for
+each change. A bare
 "this is the current rule" answer without the originating trail is
 incomplete.
 
@@ -152,7 +154,7 @@ edge-confidence drops to `Heuristic` and surface that as a caveat.
 ```
 1. bbox_knowledge(query="X policy")           # rendered rules first
 2. If empty: bbox_hybrid_search(query="X")    # broader recall
-3. For decisions: bbox_inspect_entity(ref) and follow SUPERSEDES out.
+3. For a project entry's history: git log .bbox/knowledge/<id>.json
 ```
 
 ### "What did session S do?"
@@ -167,8 +169,9 @@ edge-confidence drops to `Heuristic` and surface that as a caveat.
 
 ```
 1. bbox_knowledge(query="Y")
-2. For each entry: bbox_inspect_entity(ref, edge_types="KNOWLEDGE_FROM_SESSION,DERIVED_FROM,SUPERSEDES")
-3. Walk DERIVED_FROM until you reach the original session or commit.
+2. For each entry: bbox_inspect_entity(ref, edge_types="KNOWLEDGE_FROM_SESSION")
+3. Follow it to the originating session; for a project entry, read the
+   git history of .bbox/knowledge/<id>.json for prior versions.
 ```
 
 ## Anti-patterns

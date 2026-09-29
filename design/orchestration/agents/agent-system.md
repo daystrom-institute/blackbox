@@ -1041,7 +1041,7 @@ from `description` field, when_to_use synthesized from `description`
 | Artifact catalog | Agents install through `bbox_artifact_install(kind="agent")`, same path as workflow / packet / brofile. F4 supersession unchanged. |
 | Agentic-corpus | Manifest embeddings live in a new `agent_manifest` bucket (§2 storage; required substrate extension §16.1). Provenance edges (DERIVED_FROM) extend the entity graph. `agent` becomes a new entity type (§6.1 of agentic-corpus.md). |
 | Threads | `AgentSession` handles are portable. Posting one in a thread = handing off agent state. |
-| Knowledge entries | Same — store an `AgentSession` (not bare `session_id`) in a `bbox_remember` body for later resume. |
+| Knowledge entries | Same: store an `AgentSession` (not bare `session_id`) in a recall-only `bbox_learn` entry (`render=false`) for later resume. |
 
 ## 11. Migration: badgey under agent infra
 

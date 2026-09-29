@@ -145,16 +145,14 @@ Edges are directional and typed.
 |---|---|
 | Structural | `IN_FILE`, `IN_SESSION`, `NEXT_SECTION`, `NEXT_CHUNK`, `PREV_CHUNK`, `THREAD_HAS_SESSION`, `THREAD_SPAWNED_FROM`, `THREAD_BLOCKED_BY`, `THREAD_RELATES_TO`, `THREAD_SUBSUMES` |
 | AST | `DEFINED_IN`, `CONTAINS_SYMBOL`, `CALLS`, `USES_TYPE`, `HAS_FIELD`, `IMPLEMENTS_TRAIT` |
-| Knowledge | `SUPERSEDES`, `DERIVED_FROM`, `Contradicts`, `RelatesTo`, `TensionWith`, `Supports`, `DependsOn`, `REFERENCES`, `KNOWLEDGE_FROM_SESSION`, `KNOWLEDGE_FROM_BOARD` |
+| Knowledge | `KNOWLEDGE_FROM_SESSION`, `KNOWLEDGE_FROM_BOARD` |
 | Provenance | `SESSION_USED_BROFILE`, `ARC_USED_BROFILE`, `ARC_OPENED_BOARD`, `NOTE_FROM_SESSION`, `NOTE_IN_THREAD`, `NOTE_FROM_TASK`, `TASK_PRODUCED_NOTE` |
 | Git | `COMMIT_PARENT`, `COMMIT_TOUCHED_FILE`, `COMMIT_PRODUCED_BY_ARC` |
 | Format-specific | `LINKS_TO_FILE`, `LINKS_TO_SECTION`, `DESCRIBES`, `ON_PAGE`, `FIGURE_OF`, `TABLE_OF` |
 | Tool-call | `RAN_BASH` |
 
 `bbox_describe_schema`'s edge catalog is currently narrower than this
-table (Knowledge limited to `SUPERSEDES`,
-`DERIVED_FROM`, `Contradicts`, `KNOWLEDGE_FROM_SESSION`,
-`KNOWLEDGE_FROM_BOARD`), so its output can omit families listed here.
+table, so its output can omit edge kinds listed here.
 
 The EdgeIndex is built from per-project JSONL sidecars plus live
 knowledge, thread, and note stores, with virtual edges for

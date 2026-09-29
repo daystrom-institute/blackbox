@@ -35,9 +35,9 @@ returns a connection error:
 
 ## Hard Constraints
 
-- **Read-only.** Never call mutators: `bbox_learn`, `bbox_remember`, `bbox_decide`,
-  `bbox_forget`, `bbox_render`, `bbox_absorb`, `bbox_note`, `bbox_note_resolve`,
-  `bbox_thread` (open/continue/resolve/promote/rename/link), `bbox_review`, `bbox_reindex`,
+- **Read-only.** Never call mutators: `bbox_learn`, `bbox_forget`, `bbox_render`,
+  `bbox_note`, `bbox_note_resolve`,
+  `bbox_thread` (open/continue/resolve/promote/rename/link), `bbox_reindex`,
   or any `bro_*` dispatch. Readers only.
 - **Report gaps honestly.** Short sessions, missing messages, tool errors — say so. Never
   fabricate turn content.

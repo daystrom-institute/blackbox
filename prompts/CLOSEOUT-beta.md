@@ -43,6 +43,6 @@ without this?"). This is the per-session half of decision `0a8ffc5d`
   match. These are terse by design; earn every line.
 - **Honor the privacy rule** (knowledge `b2261ea4`): no private client
   identifiers in any committed artifact, AGENTS.md included — genericize.
-- New durable *cross-session* rules/decisions still go through
-  `bbox_learn`/`bbox_decide` (+ `bbox_render`); AGENTS.md here is the
+- New durable *cross-session* rules and commitments still go through
+  `bbox_learn` (+ `bbox_render`); AGENTS.md here is the
   code-local, hand-authored layer those don't cover.

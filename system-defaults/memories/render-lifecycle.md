@@ -1,24 +1,23 @@
 +++
-title = "Render lifecycle: render, review, lint"
-tags = ["render", "absorb", "review", "lint", "knowledge", "lifecycle", "runbook"]
+title = "Render lifecycle: learn, render"
+tags = ["render", "knowledge", "lifecycle", "runbook"]
 order = 20
 template = false
 +++
-# Render lifecycle: render, review, lint
+# Render lifecycle: learn, render
 
-The render path is easy to misuse because the verbs are adjacent in the UI but operate on different parts of the lifecycle.
+The render path is easy to misuse because the knowledge verbs are adjacent in the UI but operate on different parts of the lifecycle.
 
 This is the compact model:
 
-- `bbox_render` publishes approved knowledge into managed files.
-- Rendered files are unidirectional projections. `bbox_absorb` is a retired compatibility no-op and cannot import edits.
-- `bbox_review` accepts or rejects entries already awaiting approval in the store.
-- `bbox_lint` checks the store for contradictions, duplication, and stale structure.
+- `bbox_learn` creates or updates knowledge entries. It is the only write lane, and entries are approved with the operator before the write.
+- `bbox_render` publishes renderable knowledge (entries with `render=true`) into managed files.
+- Rendered files are unidirectional projections. Nothing imports edits from them.
 - `bbox_pin` is not part of this lifecycle. Pins stay out of rendered memory entirely.
 
 ## Normal forward path
 
-1. create or update entries with `bbox_learn` / `bbox_decide` / `bbox_remember`
+1. create or update entries with `bbox_learn`
 2. `bbox_render`
 3. agents consume the managed output
 
@@ -27,13 +26,13 @@ This is the default path when the source of truth is the knowledge store.
 ## Reverse path after manual edits
 
 Managed regions are regenerated from knowledge. To retain an intentional edit,
-update its source entry through the knowledge tools, then render again. Review
-controls unverified entries already present in the store; it does not import
-rendered files. `bbox_bootstrap` is retired and does not import instructions.
-Discover indexed instruction references with `bbox_hybrid_search`, then expand
-with `bbox_inspect_entity`, or read missing source through the checkout owner's
-file tools. Missing indexed references do not establish absence. Propose entries
-for operator approval before saving them; there is no automatic import lane.
+update its source entry with `bbox_learn`, then render again. Rendered files are
+never imported. To turn existing instructions into entries, discover indexed
+instruction references with `bbox_hybrid_search`, then expand with
+`bbox_inspect_entity`, or read missing source through the checkout owner's file
+tools. Missing indexed references do not establish absence. Propose entries for
+operator approval before saving them with `bbox_learn`; there is no automatic
+import lane.
 
 ## Scope thinking
 
@@ -54,30 +53,19 @@ not a different daemon path or hand-authored internal transport parameters.
 
 ## What each verb is not
 
-- `bbox_render` is not a review step. It publishes what is already approved/renderable.
+- `bbox_render` is not an approval step. It publishes what is already stored and renderable.
 - `bbox_render` is not a hot-context mechanism. If the goal is "keep this active-arc guidance visible across turns for one execution lane," use `bbox_pin`, not render.
-- `bbox_absorb` performs no import or publication.
-- `bbox_review` is not rendering. It changes whether pending entries are accepted.
-- `bbox_lint` is not a sync step. It is hygiene/diagnostics.
-
-## When to reach for lint
-
-Use `bbox_lint`:
-
-- before large knowledge-store refactors
-- after bulk knowledge imports or review
-- when the rendered output looks inconsistent with what you expected
+- `bbox_learn` with `render=false` is not a render input. Those entries are indexed for recall only.
 
 ## Keep hot vs cold
 
 Keep hot in tool docs:
 
+- learn writes
 - render publishes
-- review approves
-- lint diagnoses
 
 Keep cold here:
 
 - forward vs reverse lifecycle
 - scope thinking
-- owner-side application and review of pending entries
+- owner-side application of render plans

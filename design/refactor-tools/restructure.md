@@ -291,10 +291,8 @@ src/
     bbox_provenance.rs          # bbox_provenance_export/import
     bbox_embeddings.rs          # bbox_reembed, bbox_embed_status
     bbox_artifacts.rs           # bbox_artifact_install/list/supersede
-    bbox_knowledge.rs           # bbox_learn, bbox_remember, bbox_decide,
-                                # bbox_knowledge, bbox_review, bbox_render,
-                                # bbox_knowledge_link, bbox_forget,
-                                # bbox_lint
+    bbox_knowledge.rs           # bbox_learn, bbox_knowledge, bbox_render,
+                                # bbox_forget
     bbox_threads.rs             # bbox_thread, bbox_thread_list
     bbox_notes.rs               # bbox_note, bbox_notes, bbox_note_resolve
     bbox_packets.rs             # bbox_compile, bbox_apply, bbox_audit,
@@ -302,7 +300,7 @@ src/
                                 # bbox_packet_gap
     bbox_inbox.rs               # bbox_inbox
     bbox_pins.rs                # bbox_pin
-    bbox_bootstrap.rs           # bbox_bootstrap, bbox_absorb, bbox_reindex
+    bbox_bootstrap.rs           # bbox_reindex
     bro_exec.rs                 # bro_exec, bro_resume, bro_status, bro_wait,
                                 # bro_cancel, bro_when_all, bro_when_any
     badgey.rs                   # Badgey public tool facade. Child modules:

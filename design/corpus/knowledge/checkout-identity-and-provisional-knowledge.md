@@ -83,14 +83,13 @@ Also landed and full-profile verified: init/eject merge-preserve and record
 `repo_id`; the checkout registry uses the composite
 `(checkout_id, published_scope)` key; base and worktree writes resolve a
 concrete checkout id and monorepo project directory; publisher refs are pinned;
-and `learn`/`remember`/`decide` register before mutation and recompute an exact
-P/H/B overlay afterward. Session-authoritative `published|own|all` visibility
+and `learn` registers before mutation and recomputes an exact P/H/B overlay
+afterward. Session-authoritative `published|own|all` visibility
 now drives list, hybrid search, inspection, render, graph, and
 logical-ref-scoped index replacement.
 
-Mutation coverage and crash consistency are also landed. `forget`, `review`,
-`knowledge_link`, and both sides of a superseding `decide` resolve through the
-authoritative checkout. Repo-owned writes use an exclusive pending claim,
+Mutation coverage and crash consistency are also landed. `forget` resolves
+through the authoritative checkout. Repo-owned writes use an exclusive pending claim,
 staged old/new bytes, a recoverable manifest, loader/watcher exclusion, and
 startup plus abandoned-lane roll-forward. Fleet closeout takes the same claim and proves every
 completed manifest's terminal blobs against the locally folded candidate tree
@@ -173,9 +172,8 @@ committed-tree read (finding 4). Durable scope keys on `project:
 Option<String>` (path string) everywhere (:43+). The bridge is
 `write_redirects` (:952), central-store only; its load-time drop (:1163-1169)
 fires on mere ID existence at base (the promotion bug §4.4 fixes). Only
-`learn`/`remember`/`decide` receive a worktree `write_dir`; `forget`,
-`review`, `knowledge_link`, and the entry mutated by a superseding `decide` do
-not (:1296-1299, :1742-1752, :1770-1782, :2482-2496) and write into base
+`learn` receives a worktree `write_dir`; `forget` does not
+(:1296-1299, :1742-1752, :1770-1782, :2482-2496) and writes into base
 regardless. The gap store carries the identical host-only carrier
 (`crates/bbox-gaps/src/gaps.rs:175-187`) on the shared watcher/reload path.
 
@@ -682,10 +680,9 @@ Landed in slice 3.8 (finding 6, round 1; finding 8, round 2):
 ### 4.6 Mutation coverage with crash-consistent multi-file writes
 
 Every worktree-reachable durable mutation routes through the checkout-scoped
-write: `learn`/`remember`/`decide`, plus `forget`, `review`, `knowledge_link`,
-and the prior entry mutated by a superseding `decide` (finding 10, round 1). A
-supersession touches at least two files, which independent per-file atomic
-writes cannot make atomic together (finding 9, round 2).
+write: `learn` and `forget` (finding 10, round 1). A write that touches more
+than one file cannot be made atomic by independent per-file atomic writes
+(finding 9, round 2).
 
 **The traveling transaction is `git commit`, not a daemon marker (closes round
 3, finding 3).** The entry files are repo-committed and travel with the branch,
@@ -830,7 +827,7 @@ sequence begins with a repair gate:
 2. **3.3 dark overlay + register-on-write (landed).** Add `ResolvedCheckoutScope`,
    immutable overlay snapshots, exact merge-base working-tree diff with
    tombstones, validation, view stamps, and register-before-write ordering for
-   `learn`/`remember`/`decide`. Compute published maps from the pinned committed
+   `learn`. Compute published maps from the pinned committed
    ref, but keep both maps out of every live query/index/render consumer.
    Diagnostics prove recomputation without changing visible behavior.
 3. **3.4 committed view + session-authoritative visibility (landed).** Replace the
@@ -850,9 +847,8 @@ sequence begins with a repair gate:
    rows after registry loss, and dynamic watcher coverage rooted at
    `checkout_project_dir`. Complete the pure inventory runner, committed
    `.schema-epoch` markers, and local quarantine ledger.
-6. **Mutation coverage + crash-consistent writes (landed).** Route all mutation verbs;
-   in particular, a superseding `decide` applies the same checkout target to
-   both the new and old entry. Add host-local staging + recoverable manifest +
+6. **Mutation coverage + crash-consistent writes (landed).** Route all mutation verbs.
+   Add host-local staging + recoverable manifest +
    pending pointer for multi-file atomicity, with closeout proving same-commit
    membership.
 7. **Merge gate (landed).** `git merge-tree` candidate tree; shared-render

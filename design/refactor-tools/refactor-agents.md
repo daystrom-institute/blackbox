@@ -244,9 +244,7 @@ since atom filter overlays can only add denies.
     ],
     "disallow": [
       "mcp__blackbox__bbox_forget",
-      "mcp__blackbox__bbox_decide",
       "mcp__blackbox__bbox_learn",
-      "mcp__blackbox__bbox_remember",
       "mcp__blackbox__bbox_render",
       "mcp__blackbox__bro_*",
       "Bash",
@@ -266,10 +264,9 @@ Notes:
 - `Write` and `Edit` are disallowed. Refactor primitives do their own
   atomic writes. An atom that needs to edit a file outside the
   refactor surface is not atomic; it's a general executor.
-- `bbox_learn` / `bbox_remember` / `bbox_decide` / `bbox_forget` /
-  `bbox_render` are disallowed. Atoms emit findings via `bbox_note`,
+- `bbox_learn` / `bbox_forget` / `bbox_render` are disallowed. Atoms emit findings via `bbox_note`,
   not durable knowledge. Codex round-1 caught the missing `bbox_learn`
-  / `bbox_remember` in the rev-1 disallow list.
+  in the rev-1 disallow list.
 - `bro_*` is fully disallowed (recursion guard).
 
 ### `java-refactor-persona`

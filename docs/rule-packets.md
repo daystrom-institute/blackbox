@@ -182,4 +182,4 @@ gaps later with `bbox_packet_events(op = "gap")`.
 | "I need to classify 100+ entities against the same rubric" | `bbox_apply`: deterministic, no LLM drift |
 | "I want a durable decision function that survives system prompt changes" | `bbox_compile`: packets are stored, not inlined in prompts |
 | "I just need a one-off prose instruction" | Don't compile. Use prose in the prompt. |
-| "I need to remember a convention, not a classification" | `bbox_learn` or `bbox_remember` |
+| "I need to remember a convention, not a classification" | `bbox_learn` |

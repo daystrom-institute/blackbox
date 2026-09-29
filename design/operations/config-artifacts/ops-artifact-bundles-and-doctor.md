@@ -90,7 +90,7 @@ invisibility is historical, not principled.
 
 The current day-2 runbooks also scatter health and upgrade checks across
 `bbox_stats`, `bbox_embed_status`, `bbox_project_list`, `bbox_describe_schema`,
-`bbox_lint`, systemd journal inspection, and manual reindex or
+systemd journal inspection, and manual reindex or
 re-embed decisions. There is no single "what do I need to know about Blackbox
 right now?" tool, and no upgrade helper that mechanizes required post-upgrade
 actions.
@@ -986,7 +986,7 @@ Checks:
 - embedding queue health and route errors
 - project registry presence and stale project paths
 - EdgeIndex sidecar compaction pressure
-- knowledge/render hygiene via `bbox_lint` summary
+- rendered-file freshness
 - unresolved blocked/dispute/surprise note count (`bbox_notes`)
 - active/pending tasks that may conflict with upgrade operations
 
@@ -1086,8 +1086,7 @@ Sections:
   (referenced script/fixture paths that do not resolve)
 - `memories`: system-memory catalog loaded and `defaults_memories_dir` resolved
   (auto-loaded surface, not catalog-managed)
-- `knowledge`: `bbox_lint` severity summary and rendered-file freshness if
-  detectable
+- `knowledge`: rendered-file freshness if detectable
 - `attention`: unresolved note and gap counts by kind
 
 Doctor output must classify findings:

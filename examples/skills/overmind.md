@@ -1,6 +1,6 @@
 ---
 description: Meta-orchestration — strategic Advisor layer above crucible. Main-session Claude holds the arc's charter and spine; a dispatched orchestrator runs crucible internally; ensemble + implementer sit under the orchestrator. Survives orchestrator compaction by holding the strategic memory outside its boundary.
-allowed-tools: mcp__blackbox__bro_exec, mcp__blackbox__bro_resume, mcp__blackbox__bro_wait, mcp__blackbox__bro_status, mcp__blackbox__bro_cancel, mcp__blackbox__bro_dashboard, mcp__blackbox__bro_brofile, mcp__blackbox__bbox_thread, mcp__blackbox__bbox_thread_list, mcp__blackbox__bbox_notes, mcp__blackbox__bbox_knowledge, mcp__blackbox__bbox_decide, mcp__blackbox__bbox_hybrid_search, Read, Edit, Write, Glob, Grep, Bash, AskUserQuestion, TaskCreate, TaskUpdate
+allowed-tools: mcp__blackbox__bro_exec, mcp__blackbox__bro_resume, mcp__blackbox__bro_wait, mcp__blackbox__bro_status, mcp__blackbox__bro_cancel, mcp__blackbox__bro_dashboard, mcp__blackbox__bro_brofile, mcp__blackbox__bbox_thread, mcp__blackbox__bbox_thread_list, mcp__blackbox__bbox_notes, mcp__blackbox__bbox_knowledge, mcp__blackbox__bbox_learn, mcp__blackbox__bbox_hybrid_search, Read, Edit, Write, Glob, Grep, Bash, AskUserQuestion, TaskCreate, TaskUpdate
 argument-hint: <arc goal / task description>
 ---
 
@@ -46,7 +46,7 @@ User ↕ Advisor (main session)
 - **Spine doc is the load-bearing artifact.** Every strategic decision, every phase boundary, every escalation is appended to the spine doc *before* anything else happens. It is what a replacement advisor (or the user, or `/takeover`) reads to bootstrap. If it's not in the spine doc, it effectively doesn't exist.
 - **Phase boundaries only.** Orchestrator does not stream to Advisor; it reports at phase boundaries with structured summaries. Advisor does not poll; it waits. This rhythm keeps Advisor's context bounded.
 - **Charter is binding.** Once Phase 0 locks scope / halt / exit with the user, those conditions govern the arc. Advisor does not silently renegotiate — if a condition needs to change mid-arc, surface the delta to the user explicitly and update the spine doc.
-- **Advisor's tool surface is narrow and read-heavy.** `bbox_*` readers, `bbox_decide`, `bro_exec`/`bro_resume`/`bro_wait` on the orchestrator only, spine-doc Edit/Write. No `Bash` for build/test invocation. No `Read` into source files beyond scoping recon.
+- **Advisor's tool surface is narrow and read-heavy.** `bbox_*` readers, `bbox_learn` (recall-only, `render=false`), `bro_exec`/`bro_resume`/`bro_wait` on the orchestrator only, spine-doc Edit/Write. No `Bash` for build/test invocation. No `Read` into source files beyond scoping recon.
 - **Orchestrator is replaceable.** When it compacts badly, drifts, or corrupts, Advisor retires it (`bro_cancel`) and spins a fresh one bootstrapped from the spine doc. Same move as crucible's implementer retirement, one level up.
 
 ---
@@ -158,7 +158,7 @@ Spine doc structure:
 <phase>: <brief>
 
 ## Decisions
-(appended via bbox_decide and mirrored here with timestamps)
+(recorded via bbox_learn with render=false and mirrored here with timestamps)
 
 ## Risks
 (flagged as they surface)
@@ -320,13 +320,13 @@ Before responding, append to the spine doc:
 - Move the completed phase from Planned / Current → Completed
 - Record commits, ensemble verdict, any flagged risks, any new followups
 - Append strategic decisions to `## Decisions` (with timestamp)
-- Mirror each decision to `bbox_decide`:
+- Mirror each decision to a recall-only `bbox_learn` entry:
 
 ```
-bbox_decide(
-  content="<decision>",
-  rationale="<why — cite phase, ensemble convergence>",
-  category="decision",
+bbox_learn(
+  content="<decision>. Reason: <why; cite phase, ensemble convergence>",
+  category="memory",
+  render=false,
   scope="project",
   project=<cwd>
 )
@@ -481,7 +481,7 @@ Then stop. Do not start a next phase.
 - Move arc status to `resolved`
 - Record all commits in a summary block
 - Explicitly list all unresolved followups (these carry forward as stale-work signals)
-- Record the final `bbox_decide` entry for the arc's shipped outcome
+- Record the final recall-only `bbox_learn` entry for the arc's shipped outcome
 
 ### 5c. Resolve the arc thread
 
@@ -520,7 +520,7 @@ The spine doc was designed for this. A fresh advisor session (or the user via `/
 
 1. Finding the arc's `bbox_thread` via `bbox_thread_list`
 2. Reading the spine doc at the recorded path
-3. Reading recent `bbox_decide` entries for the arc
+3. Reading the arc's recall-only entries via `bbox_knowledge`
 4. Checking the orchestrator's current state (`bro_status`, `bro_dashboard`)
 5. Resuming the loop from Phase 3a (or restarting the orchestrator from Phase 4 if needed)
 

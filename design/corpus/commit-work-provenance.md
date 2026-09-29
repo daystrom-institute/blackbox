@@ -387,9 +387,9 @@ Phase 4: Git notes portability
   projected through the normal link projector. Do not write imported links
   directly to project edge JSONL.
 
-Phase 5: Cleanup and lint
+Phase 5: Cleanup and checks
 
-- Add `bbox_lint` checks for:
+- Add `bbox_doctor` checks for:
   - prose-only SHA mentions in threads/notes without structured links
   - schema edge kinds with no emitter
   - dangling imported thread/note refs

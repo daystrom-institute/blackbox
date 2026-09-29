@@ -125,8 +125,7 @@ on `published_ref`. Catalog admission, source publication, and index activation
 are separate steps; use `bbox_project_list()` and `bbox_doctor()` to inspect
 progress.
 
-`bbox_bootstrap` is retired. It does not import instructions or enroll remote
-checkouts. See [Projects And Code Indexing](projects-code-indexing.md) for local
+See [Projects And Code Indexing](projects-code-indexing.md) for local
 compatibility and catalog administration limits. Native session history has its
 own [transcript collector](native-transcript-collector.md); code collection does
 not collect Claude/Codex session files.

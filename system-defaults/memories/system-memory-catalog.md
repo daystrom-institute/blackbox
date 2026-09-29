@@ -21,10 +21,9 @@ Files in `system-defaults/memories/` use bare slugs such as
 
 ## Knowledge, Persistence, And Render Hygiene
 
-- [sm-persistence-taxonomy](persistence-taxonomy.md) - when to learn,
-  remember, decide, note, or pin.
-- [sm-render-lifecycle](render-lifecycle.md) - render, absorb, review, and
-  lint lifecycle.
+- [sm-persistence-taxonomy](persistence-taxonomy.md) - when to learn
+  (rendered or recall-only), note, or pin.
+- [sm-render-lifecycle](render-lifecycle.md) - learn and render lifecycle.
 - [sm-scoped-pins](scoped-pins.md) - hot context for one active execution lane.
 - [sm-side-channel-notes](side-channel-notes.md) - executor and orchestrator
   note emission.
