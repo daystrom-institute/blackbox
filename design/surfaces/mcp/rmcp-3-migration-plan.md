@@ -22,8 +22,8 @@ mechanics, and per-phase validation.
   `bro-harness`).
 - To: rmcp 3.x implementing MCP 2026-07-28. The title names the 3.0
   breaking-change migration, not an upper bound on the minor version.
-  Evaluate 3.4.1 as the concrete candidate: it is the latest published
-  version in the [SDK source audit](codex-0.156.1-mcp-audit.json), while
+  Evaluate 3.5.0 as the concrete candidate: it is the latest published
+  version in the [SDK source audit](codex-0.158.0-mcp-audit.json), while
   Codex release and upstream main still pin `=3.2.0`.
   Relevant to this plan: 3.3.0 adds
   `ServerHandler::negotiate_initialize` (#1247, reuse the SDK's version
@@ -40,8 +40,21 @@ mechanics, and per-phase validation.
   preserves a sessionless discover request's ID when forwarding a JSON-RPC
   rejection carried by HTTP 4xx (excluding 401/403), so clients receive
   the server's error. It also supports const-path and `concat!` macro
-  descriptions. The task subscription filter and notification rejection
-  paths remain unchanged; MSRV stays 1.88. The existing exemplar findings
+  descriptions. Version 3.5.0 moves `ProtocolVersion::LATEST` to
+  `V_2026_07_28` (#1105), so `ProtocolVersion::default()` and the default
+  `InitializeResult` / `InitializeRequestParams` name 2026-07-28. It adds
+  `LATEST_WITH_INITIALIZE` (2025-11-25, the newest version with a
+  handshake), `NO_INITIALIZE` and `ProtocolVersion::has_initialize()`. A
+  server asked to `initialize` at a version without a handshake answers
+  with the newest supported version that has one; a client answered with a
+  no-handshake version seeds per-request `_meta`. It also rejects a
+  supplied `Mcp-Method` that contradicts an `initialize` body and duplicate
+  SEP-2243 header values (#1274), matches explicit Origin ports exactly
+  with `:*` as the any-port form (a portless entry still matches any port
+  and is deprecated, #1270), tolerates an empty `cacheScope` (#1281) and
+  preserves an explicit `null` `structuredContent` (#1295). The task
+  subscription filter and notification rejection paths remain unchanged
+  through 3.5.0; MSRV stays 1.88. The existing exemplar findings
   are from 3.1; rerun them against the selected version before treating any SDK limitation as
   fixed or unchanged.
 - We skip the entire 2.x line. Most 2.x deprecations are removals in 3.0,
@@ -110,7 +123,12 @@ observable behavior change. Checklist:
 8. Result constructors now initialize `result_type: Some(COMPLETE)` and the
    server omits it for legacy peers; no action beyond snapshot updates.
 9. Client call sites keep `serve()` (legacy lifecycle) in both
-   `src/mcp_client.rs` and `crates/bro-harness/src/mcp.rs`.
+   `src/mcp_client.rs` and `crates/bro-harness/src/mcp.rs`. From rmcp
+   3.5.0 the default client info (including the `()` handler's) requests
+   `initialize` at 2026-07-28, so zero behavior change requires a client
+   info pinned to `ProtocolVersion::LATEST_WITH_INITIALIZE`. The daemon's
+   `get_info()` default likewise names 2026-07-28; legacy negotiation still
+   echoes the client's supported handshake version.
 10. Compiler-driven remainder: "the compiler is your friend" per the
     official guide. Deprecated-alias removals should not bite (we use
     modern names), but expect a tail of renames.
@@ -147,9 +165,12 @@ path for current clients. No tasks/resources yet.
    and per-method; keep the legacy initialize-time abort for legacy
    sessions.
 5. Override `supported_protocol_versions()`; advertise both
-   `V_2025_11_25` and `V_2026_07_28` behind a config gate (Q2). rmcp 3.0's
-   `ProtocolVersion::LATEST` still defaults to `V_2025_11_25`, so the modern
-   path is opt-in on both ends.
+   `V_2025_11_25` and `V_2026_07_28` behind a config gate (Q2). The SDK
+   default `supported_protocol_versions()` is `KNOWN_VERSIONS`, which
+   includes 2026-07-28, and from rmcp 3.5.0 `ProtocolVersion::LATEST` is
+   `V_2026_07_28`; the gate therefore lives in this override, not in SDK
+   defaults. Clients reach the modern lifecycle only through
+   `serve_with_lifecycle` (`Discover` or `Auto`).
 6. Deterministic `tools/list` ordering; set `ttl_ms` +
    `cache_scope: Private` on `ListToolsResult`.
 7. Upgrade both client paths to `serve_with_lifecycle`: `Auto` mode
@@ -210,8 +231,8 @@ negotiates modern discovery and opens listen for advertised tools/prompts/
 resources list changes. The isolated matrix validates tool catalog refetch
 on notification and after stream reopening, plus explicit legacy opt-outs
 and discover fallback. Tasks remain disabled; Codex still has no standard
-listen consumer. See the [Claude audit](claude-2.1.281-mcp-audit.json) and
-[Codex audit](codex-0.156.1-mcp-audit.json). This validates a catalog-change
+listen consumer. See the [Claude audit](claude-2.1.284-mcp-audit.json) and
+[Codex audit](codex-0.158.0-mcp-audit.json). This validates a catalog-change
 slice independently of Phase 2, not task notifications.
 
 - `ServerHandler::listen` + `SubscriptionSink`; emit
@@ -222,7 +243,7 @@ slice independently of Phase 2, not task notifications.
 - Harness children switch from bro_wait polling to listen + task handles;
   bro_wait remains the Tier 0 floor for all other clients.
 - SDK gap confirmed by the runtime spike (rmcp 3.1) and source inspection
-  of rmcp 3.4.1: `SubscriptionFilter` has no
+  of rmcp 3.5.0: `SubscriptionFilter` has no
   task category, `SubscriptionSink::send` rejects `notifications/tasks`,
   and the client `Subscription` rejects them too. Options: (a) custom glue
   sending task notifications on the active listen response stream, which
@@ -287,8 +308,8 @@ This plan interlocks at two points:
 
 Before flipping the prod version gate (Q2) or relying on any modern shape
 from Claude Code, re-probe the installed binary. Current evidence is in the
-[Claude audit](claude-2.1.281-mcp-audit.json) and
-[Codex audit](codex-0.156.1-mcp-audit.json); the entries below are prior
+[Claude audit](claude-2.1.284-mcp-audit.json) and
+[Codex audit](codex-0.158.0-mcp-audit.json); the entries below are prior
 snapshots, not the current compatibility verdict. The probe is structural,
 not single-literal: it enumerates vocabulary classes rather than grepping
 one string each, because (a) a constructed/concatenated key literal would

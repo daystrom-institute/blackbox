@@ -44,8 +44,8 @@ is the largest protocol break since Streamable HTTP:
 
 ### Current client compatibility
 
-The checked-in [Claude audit](claude-2.1.281-mcp-audit.json) and
-[Codex audit](codex-0.156.1-mcp-audit.json) pin binary hashes, release
+The checked-in [Claude audit](claude-2.1.284-mcp-audit.json) and
+[Codex audit](codex-0.158.0-mcp-audit.json) pin binary hashes, release
 versions, source snapshots, selectors, ordered wire observations and limits.
 Both matrices use isolated loopback MCP servers and deterministic local
 model responses. Wire findings are direct evidence; decoded Claude gates
@@ -84,8 +84,10 @@ stray GET, answered 405, before successful reopening. Empty prompt/resource
 catalogs do not establish their notification-driven refetch behavior, and
 per-URI subscriptions remain outside the matrix. Claude's model-facing
 resource catalog filters Apps UI resources identified by `ui://` or HTML
-with the `mcp-app` profile; direct URI reads remain available. The audit
-records that filtering as static evidence.
+with the `mcp-app` profile; direct URI reads remain available. With
+`CLAUDE_CODE_MCP_APPS_HOST` set, the legacy capability builder also
+declares the `io.modelcontextprotocol/ui` extension for that MIME type;
+no matrix case declares it. The audit records both as static evidence.
 
 Codex's ordinary-server and hosted-Apps modern flags are separate and
 remain default false in the inspected source. Modern stdio additionally
@@ -104,14 +106,18 @@ The stateless head must accept unknown request metadata. The audited
 release sends `callId`, `threadId`, `sessionId`, `windowId`, `itemId`
 and `x-codex-turn-metadata` beside the SEP-2575 triple. The session/window
 keys appear in both modern and legacy tool-call captures. Conditional
-`openai/readOnly` is present in release source; request-local W3C trace
-metadata is an upstream-main source finding. Neither path is exercised by
+`openai/readOnly` and request-local W3C trace metadata (`traceparent`,
+`tracestate`) are present in release source. Neither path is exercised by
 the matrix. Scope remains URL-owned, never inferred from client identifiers.
 
 Codex still pins rmcp 3.2.0; the published migration candidate is rmcp
-3.4.1. Source inspection of 3.4.1 confirms no task subscription filter and
+3.5.0. Source inspection of 3.5.0 confirms no task subscription filter and
 explicit rejection of task notifications by the server sink and client
-subscription. The standalone runtime exemplar still needs rerunning on the
+subscription. From 3.5.0 `ProtocolVersion::LATEST` is 2026-07-28 and
+`LATEST_WITH_INITIALIZE` names the newest handshake version (2025-11-25);
+SDK defaults no longer imply the legacy version, so the version gate is
+the server's `supported_protocol_versions()` override and the client's
+lifecycle mode. The standalone runtime exemplar still needs rerunning on the
 selected SDK version. Exact source anchors and package provenance are in
 the Codex audit record.
 

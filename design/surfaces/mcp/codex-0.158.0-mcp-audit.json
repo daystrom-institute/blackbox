@@ -1,0 +1,949 @@
+{
+  "audit_date": "2026-09-28",
+  "audit_timezone": "America/Edmonton",
+  "binary": {
+    "package": "@openai/codex",
+    "version": "0.158.0",
+    "platform": "macos-arm64",
+    "size_bytes": 239662592,
+    "sha256": "788a818fbb9596869c7a487554507cb8bdca17584b8671112b23f9e225ba35c8",
+    "latest_stable_verified": true,
+    "version_source": "https://registry.npmjs.org/@openai/codex/latest",
+    "registry_latest": "0.158.0",
+    "github_release_source": "https://github.com/openai/codex/releases/tag/rust-v0.158.0",
+    "github_published_at": "2026-09-28T05:07:23Z",
+    "launcher_sha256": "61b0194f3bb6534439c8d26a3ed57d0805f84b884588b761795323eeb92fcf70",
+    "native_version": "codex-cli 0.158.0",
+    "native_package": "@openai/codex-darwin-arm64"
+  },
+  "previous_audit": "codex-0.156.1-mcp-audit.json",
+  "verdict": {
+    "default": "legacy 2025-06-18",
+    "modern_opt_in": "features.mcp_2026_07_28=true: stateless discover, tools/list and tools/call pass",
+    "discover_fallback": "-32601 falls back to initialize with session id",
+    "client_capabilities": {
+      "elicitation": {
+        "form": {},
+        "url": {}
+      }
+    },
+    "standard_tasks": "not declared; no consumer in release/main source",
+    "standard_listen": "not observed despite tools.listChanged; no consumer in release/main source",
+    "protocol_delta_from_previous_audit": "none",
+    "request_metadata_delta": "none: tools/call _meta keys and x-codex-turn-metadata keys identical to 0.156.1. Released source now carries W3C traceparent propagation into request _meta; not observed because the matrix runs without an active trace."
+  },
+  "methodology": {
+    "runner": "fixtures/codex-audit-matrix.py",
+    "fixtures": [
+      "fixtures/codex-mcp-sink-legacy.py",
+      "fixtures/codex-mcp-sink-modern.py"
+    ],
+    "invocation": "codex exec --skip-git-repo-check --ignore-user-config --ignore-rules --ephemeral --json -s danger-full-access, temporary cwd, per-invocation configuration",
+    "model": "Deterministic local Responses SSE stub, custom unauthenticated provider, gpt-5.5 catalog selection to use named function tools. No real inference. Stub searches for sink_echo, calls the returned mcp__sink namespace, then returns done. Both wire tools/call and echo consumption in the next model request are asserted.",
+    "isolation": "Only loopback model/MCP endpoints configured; no installed settings, credentials or shared services changed. Existing CODEX_HOME retained; CLI ephemeral mode and config/rule ignores used.",
+    "sanitization": "Session/thread/window/item/turn/call ids and turn timestamps redacted from wire captures. Synthetic text and stub model selector retained. Raw model prompts and CLI output are not included.",
+    "limits": [
+      "No stdio or Hosted Apps live probe.",
+      "No task result, MRTR input_required or elicitation interaction presented.",
+      "Modern fixture advertises tools.listChanged only; absence of listen is bounded by this capability and exec lifetime, supplemented by source inspection.",
+      "Legacy fixture rejects tools/list with -32601 and GET with 405; case A/B verify lifecycle only.",
+      "Modern fixture includes resultType complete even when the client chooses legacy; case D proves acceptance of this fixture, not strict legacy server conformance.",
+      "Interactive/exec approval behavior was not tested; these cases use danger-full-access.",
+      "rmcp 3.5.0 checked by source inspection; runtime exemplar was not rerun."
+    ],
+    "raw_evidence_directory": "/var/folders/v5/v_5s6v8n025dpb_p098ysbhr0000gn/T/codex-mcp-audit-y0iu1lgq"
+  },
+  "cases": [
+    {
+      "case": "A-default-legacy",
+      "exit_code": 0,
+      "model_requests": 1,
+      "wire": [
+        {
+          "http": "POST",
+          "path": "/mcp",
+          "headers": {
+            "user-agent": "codex-mcp-client/0.158.0",
+            "accept": "text/event-stream, application/json",
+            "content-type": "application/json"
+          },
+          "body": {
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "initialize",
+            "params": {
+              "protocolVersion": "2025-06-18",
+              "capabilities": {
+                "elicitation": {
+                  "form": {},
+                  "url": {}
+                }
+              },
+              "clientInfo": {
+                "name": "codex-mcp-client",
+                "title": "Codex",
+                "version": "0.158.0"
+              }
+            }
+          }
+        },
+        {
+          "http": "POST",
+          "path": "/mcp",
+          "headers": {
+            "user-agent": "codex-mcp-client/0.158.0",
+            "mcp-protocol-version": "2025-06-18",
+            "accept": "text/event-stream, application/json",
+            "content-type": "application/json",
+            "mcp-session-id": "sink-session-1"
+          },
+          "body": {
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+          }
+        },
+        {
+          "http": "GET",
+          "path": "/mcp",
+          "headers": {
+            "user-agent": "codex-mcp-client/0.158.0",
+            "mcp-protocol-version": "2025-06-18",
+            "accept": "text/event-stream, application/json",
+            "mcp-session-id": "sink-session-1"
+          }
+        },
+        {
+          "http": "POST",
+          "path": "/mcp",
+          "headers": {
+            "user-agent": "codex-mcp-client/0.158.0",
+            "mcp-protocol-version": "2025-06-18",
+            "accept": "text/event-stream, application/json",
+            "content-type": "application/json",
+            "mcp-session-id": "sink-session-1"
+          },
+          "body": {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+            "params": {
+              "_meta": {
+                "progressToken": 0
+              }
+            }
+          }
+        },
+        {
+          "http": "DELETE",
+          "path": "/mcp",
+          "headers": {
+            "user-agent": "codex-mcp-client/0.158.0",
+            "mcp-protocol-version": "2025-06-18",
+            "mcp-session-id": "sink-session-1",
+            "accept": "*/*"
+          }
+        },
+        {
+          "http": "POST",
+          "path": "/mcp",
+          "headers": {
+            "user-agent": "codex-mcp-client/0.158.0",
+            "accept": "text/event-stream, application/json",
+            "content-type": "application/json"
+          },
+          "body": {
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "initialize",
+            "params": {
+              "protocolVersion": "2025-06-18",
+              "capabilities": {
+                "elicitation": {
+                  "form": {},
+                  "url": {}
+                }
+              },
+              "clientInfo": {
+                "name": "codex-mcp-client",
+                "title": "Codex",
+                "version": "0.158.0"
+              }
+            }
+          }
+        },
+        {
+          "http": "POST",
+          "path": "/mcp",
+          "headers": {
+            "user-agent": "codex-mcp-client/0.158.0",
+            "mcp-protocol-version": "2025-06-18",
+            "accept": "text/event-stream, application/json",
+            "content-type": "application/json",
+            "mcp-session-id": "sink-session-1"
+          },
+          "body": {
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+          }
+        },
+        {
+          "http": "GET",
+          "path": "/mcp",
+          "headers": {
+            "user-agent": "codex-mcp-client/0.158.0",
+            "mcp-protocol-version": "2025-06-18",
+            "accept": "text/event-stream, application/json",
+            "mcp-session-id": "sink-session-1"
+          }
+        },
+        {
+          "http": "POST",
+          "path": "/mcp",
+          "headers": {
+            "user-agent": "codex-mcp-client/0.158.0",
+            "mcp-protocol-version": "2025-06-18",
+            "accept": "text/event-stream, application/json",
+            "content-type": "application/json",
+            "mcp-session-id": "sink-session-1"
+          },
+          "body": {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+            "params": {
+              "_meta": {
+                "progressToken": 0
+              }
+            }
+          }
+        },
+        {
+          "http": "DELETE",
+          "path": "/mcp",
+          "headers": {
+            "user-agent": "codex-mcp-client/0.158.0",
+            "mcp-protocol-version": "2025-06-18",
+            "mcp-session-id": "sink-session-1",
+            "accept": "*/*"
+          }
+        }
+      ],
+      "checks": {
+        "cli_exit_zero": true,
+        "local_model_used": true,
+        "tools_list_observed": true,
+        "legacy_default": true
+      }
+    },
+    {
+      "case": "B-modern-fallback",
+      "exit_code": 0,
+      "model_requests": 1,
+      "wire": [
+        {
+          "http": "POST",
+          "path": "/mcp",
+          "headers": {
+            "user-agent": "codex-mcp-client/0.158.0",
+            "mcp-protocol-version": "2026-07-28",
+            "mcp-method": "server/discover",
+            "accept": "text/event-stream, application/json",
+            "content-type": "application/json"
+          },
+          "body": {
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "server/discover",
+            "params": {
+              "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientInfo": {
+                  "name": "codex-mcp-client",
+                  "title": "Codex",
+                  "version": "0.158.0"
+                },
+                "io.modelcontextprotocol/clientCapabilities": {
+                  "elicitation": {
+                    "form": {},
+                    "url": {}
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "http": "POST",
+          "path": "/mcp",
+          "headers": {
+            "user-agent": "codex-mcp-client/0.158.0",
+            "accept": "text/event-stream, application/json",
+            "content-type": "application/json"
+          },
+          "body": {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+              "protocolVersion": "2025-06-18",
+              "capabilities": {
+                "elicitation": {
+                  "form": {},
+                  "url": {}
+                }
+              },
+              "clientInfo": {
+                "name": "codex-mcp-client",
+                "title": "Codex",
+                "version": "0.158.0"
+              }
+            }
+          }
+        },
+        {
+          "http": "POST",
+          "path": "/mcp",
+          "headers": {
+            "user-agent": "codex-mcp-client/0.158.0",
+            "mcp-protocol-version": "2025-06-18",
+            "accept": "text/event-stream, application/json",
+            "content-type": "application/json",
+            "mcp-session-id": "sink-session-1"
+          },
+          "body": {
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+          }
+        },
+        {
+          "http": "GET",
+          "path": "/mcp",
+          "headers": {
+            "user-agent": "codex-mcp-client/0.158.0",
+            "mcp-protocol-version": "2025-06-18",
+            "accept": "text/event-stream, application/json",
+            "mcp-session-id": "sink-session-1"
+          }
+        },
+        {
+          "http": "POST",
+          "path": "/mcp",
+          "headers": {
+            "user-agent": "codex-mcp-client/0.158.0",
+            "mcp-protocol-version": "2025-06-18",
+            "accept": "text/event-stream, application/json",
+            "content-type": "application/json",
+            "mcp-session-id": "sink-session-1"
+          },
+          "body": {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": {
+              "_meta": {
+                "progressToken": 0
+              }
+            }
+          }
+        },
+        {
+          "http": "DELETE",
+          "path": "/mcp",
+          "headers": {
+            "user-agent": "codex-mcp-client/0.158.0",
+            "mcp-protocol-version": "2025-06-18",
+            "mcp-session-id": "sink-session-1",
+            "accept": "*/*"
+          }
+        },
+        {
+          "http": "POST",
+          "path": "/mcp",
+          "headers": {
+            "user-agent": "codex-mcp-client/0.158.0",
+            "mcp-method": "server/discover",
+            "mcp-protocol-version": "2026-07-28",
+            "accept": "text/event-stream, application/json",
+            "content-type": "application/json"
+          },
+          "body": {
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "server/discover",
+            "params": {
+              "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientInfo": {
+                  "name": "codex-mcp-client",
+                  "title": "Codex",
+                  "version": "0.158.0"
+                },
+                "io.modelcontextprotocol/clientCapabilities": {
+                  "elicitation": {
+                    "form": {},
+                    "url": {}
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "http": "POST",
+          "path": "/mcp",
+          "headers": {
+            "user-agent": "codex-mcp-client/0.158.0",
+            "accept": "text/event-stream, application/json",
+            "content-type": "application/json"
+          },
+          "body": {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+              "protocolVersion": "2025-06-18",
+              "capabilities": {
+                "elicitation": {
+                  "form": {},
+                  "url": {}
+                }
+              },
+              "clientInfo": {
+                "name": "codex-mcp-client",
+                "title": "Codex",
+                "version": "0.158.0"
+              }
+            }
+          }
+        },
+        {
+          "http": "POST",
+          "path": "/mcp",
+          "headers": {
+            "user-agent": "codex-mcp-client/0.158.0",
+            "mcp-protocol-version": "2025-06-18",
+            "accept": "text/event-stream, application/json",
+            "content-type": "application/json",
+            "mcp-session-id": "sink-session-1"
+          },
+          "body": {
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+          }
+        },
+        {
+          "http": "GET",
+          "path": "/mcp",
+          "headers": {
+            "user-agent": "codex-mcp-client/0.158.0",
+            "mcp-protocol-version": "2025-06-18",
+            "accept": "text/event-stream, application/json",
+            "mcp-session-id": "sink-session-1"
+          }
+        },
+        {
+          "http": "POST",
+          "path": "/mcp",
+          "headers": {
+            "user-agent": "codex-mcp-client/0.158.0",
+            "mcp-protocol-version": "2025-06-18",
+            "accept": "text/event-stream, application/json",
+            "content-type": "application/json",
+            "mcp-session-id": "sink-session-1"
+          },
+          "body": {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": {
+              "_meta": {
+                "progressToken": 0
+              }
+            }
+          }
+        },
+        {
+          "http": "DELETE",
+          "path": "/mcp",
+          "headers": {
+            "user-agent": "codex-mcp-client/0.158.0",
+            "mcp-protocol-version": "2025-06-18",
+            "mcp-session-id": "sink-session-1",
+            "accept": "*/*"
+          }
+        }
+      ],
+      "checks": {
+        "cli_exit_zero": true,
+        "local_model_used": true,
+        "tools_list_observed": true,
+        "discover_first": true,
+        "fallback": true
+      }
+    },
+    {
+      "case": "C-modern-tool-call",
+      "exit_code": 0,
+      "model_requests": 3,
+      "wire": [
+        {
+          "http": "POST",
+          "path": "/mcp",
+          "headers": {
+            "user-agent": "codex-mcp-client/0.158.0",
+            "mcp-method": "server/discover",
+            "mcp-protocol-version": "2026-07-28",
+            "accept": "text/event-stream, application/json",
+            "content-type": "application/json"
+          },
+          "body": {
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "server/discover",
+            "params": {
+              "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientInfo": {
+                  "name": "codex-mcp-client",
+                  "title": "Codex",
+                  "version": "0.158.0"
+                },
+                "io.modelcontextprotocol/clientCapabilities": {
+                  "elicitation": {
+                    "form": {},
+                    "url": {}
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "http": "POST",
+          "path": "/mcp",
+          "headers": {
+            "user-agent": "codex-mcp-client/0.158.0",
+            "mcp-method": "tools/list",
+            "mcp-protocol-version": "2026-07-28",
+            "accept": "text/event-stream, application/json",
+            "content-type": "application/json"
+          },
+          "body": {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+            "params": {
+              "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientInfo": {
+                  "name": "codex-mcp-client",
+                  "title": "Codex",
+                  "version": "0.158.0"
+                },
+                "io.modelcontextprotocol/clientCapabilities": {
+                  "elicitation": {
+                    "form": {},
+                    "url": {}
+                  }
+                },
+                "progressToken": 0
+              }
+            }
+          }
+        },
+        {
+          "http": "POST",
+          "path": "/mcp",
+          "headers": {
+            "user-agent": "codex-mcp-client/0.158.0",
+            "mcp-method": "tools/call",
+            "mcp-protocol-version": "2026-07-28",
+            "accept": "text/event-stream, application/json",
+            "content-type": "application/json"
+          },
+          "body": {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+              "_meta": {
+                "callId": "<redacted>",
+                "x-codex-turn-metadata": {
+                  "session_id": "<redacted>",
+                  "thread_id": "<redacted>",
+                  "reasoning_effort": "medium",
+                  "turn_id": "<redacted>",
+                  "model": "gpt-5.5",
+                  "thread_source": "user",
+                  "turn_trigger": "exec",
+                  "sandbox": "none",
+                  "sandbox_mode": "danger-full-access",
+                  "auto_review_enabled": false,
+                  "node_repl_auto_review_required": false,
+                  "node_repl_disabled": false,
+                  "turn_started_at_unix_ms": "<redacted>",
+                  "codex_version": "0.158.0"
+                },
+                "threadId": "<redacted>",
+                "sessionId": "<redacted>",
+                "windowId": "<redacted>",
+                "itemId": "<redacted>",
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientInfo": {
+                  "name": "codex-mcp-client",
+                  "title": "Codex",
+                  "version": "0.158.0"
+                },
+                "io.modelcontextprotocol/clientCapabilities": {
+                  "elicitation": {
+                    "form": {},
+                    "url": {}
+                  }
+                },
+                "progressToken": 1
+              },
+              "arguments": {
+                "text": "hello"
+              },
+              "name": "sink_echo"
+            }
+          }
+        }
+      ],
+      "checks": {
+        "cli_exit_zero": true,
+        "local_model_used": true,
+        "tools_list_observed": true,
+        "discover_first": true,
+        "stateless": true,
+        "modern_request_metadata": true,
+        "tools_call_observed": true,
+        "echo_consumed": true
+      }
+    },
+    {
+      "case": "D-default-modern-server",
+      "exit_code": 0,
+      "model_requests": 3,
+      "wire": [
+        {
+          "http": "POST",
+          "path": "/mcp",
+          "headers": {
+            "user-agent": "codex-mcp-client/0.158.0",
+            "accept": "text/event-stream, application/json",
+            "content-type": "application/json"
+          },
+          "body": {
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "initialize",
+            "params": {
+              "protocolVersion": "2025-06-18",
+              "capabilities": {
+                "elicitation": {
+                  "form": {},
+                  "url": {}
+                }
+              },
+              "clientInfo": {
+                "name": "codex-mcp-client",
+                "title": "Codex",
+                "version": "0.158.0"
+              }
+            }
+          }
+        },
+        {
+          "http": "POST",
+          "path": "/mcp",
+          "headers": {
+            "user-agent": "codex-mcp-client/0.158.0",
+            "mcp-protocol-version": "2025-06-18",
+            "accept": "text/event-stream, application/json",
+            "content-type": "application/json"
+          },
+          "body": {
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+          }
+        },
+        {
+          "http": "POST",
+          "path": "/mcp",
+          "headers": {
+            "user-agent": "codex-mcp-client/0.158.0",
+            "mcp-protocol-version": "2025-06-18",
+            "accept": "text/event-stream, application/json",
+            "content-type": "application/json"
+          },
+          "body": {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+            "params": {
+              "_meta": {
+                "progressToken": 0
+              }
+            }
+          }
+        },
+        {
+          "http": "POST",
+          "path": "/mcp",
+          "headers": {
+            "user-agent": "codex-mcp-client/0.158.0",
+            "mcp-protocol-version": "2025-06-18",
+            "accept": "text/event-stream, application/json",
+            "content-type": "application/json"
+          },
+          "body": {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+              "_meta": {
+                "callId": "<redacted>",
+                "x-codex-turn-metadata": {
+                  "session_id": "<redacted>",
+                  "thread_id": "<redacted>",
+                  "reasoning_effort": "medium",
+                  "turn_id": "<redacted>",
+                  "model": "gpt-5.5",
+                  "thread_source": "user",
+                  "turn_trigger": "exec",
+                  "sandbox": "none",
+                  "sandbox_mode": "danger-full-access",
+                  "auto_review_enabled": false,
+                  "node_repl_auto_review_required": false,
+                  "node_repl_disabled": false,
+                  "turn_started_at_unix_ms": "<redacted>",
+                  "codex_version": "0.158.0"
+                },
+                "threadId": "<redacted>",
+                "sessionId": "<redacted>",
+                "windowId": "<redacted>",
+                "itemId": "<redacted>",
+                "progressToken": 1
+              },
+              "name": "sink_echo",
+              "arguments": {
+                "text": "hello"
+              }
+            }
+          }
+        }
+      ],
+      "checks": {
+        "cli_exit_zero": true,
+        "local_model_used": true,
+        "tools_list_observed": true,
+        "legacy_default": true,
+        "tools_call_observed": true,
+        "echo_consumed": true
+      }
+    }
+  ],
+  "source_snapshot": {
+    "upstream_main_sha": "8bd5a136ffabf5cd4868f9eb8aff298d1f25d8ef",
+    "release_tag": "rust-v0.158.0",
+    "release_tag_object_sha": "54e1bd264b4122fe9471ee7d54c4d021a76bb8ff",
+    "release_commit_sha": "064c6b8c737f5b41d171fdda80bd9ef10ad06eb3",
+    "previous_doc_baseline_sha": "7e5054d32f1dae4f30136f078116100ee9722e5c",
+    "commits_since_baseline": 268,
+    "findings": [
+      {
+        "claim": "SDK pin remains =3.2.0",
+        "release_source": "https://github.com/openai/codex/blob/064c6b8c737f5b41d171fdda80bd9ef10ad06eb3/codex-rs/Cargo.toml#L444",
+        "main_source": "https://github.com/openai/codex/blob/8bd5a136ffabf5cd4868f9eb8aff298d1f25d8ef/codex-rs/Cargo.toml#L444"
+      },
+      {
+        "claim": "Both modern flags remain UnderDevelopment/default false",
+        "release_source": "https://github.com/openai/codex/blob/064c6b8c737f5b41d171fdda80bd9ef10ad06eb3/codex-rs/features/src/lib.rs#L1367",
+        "main_source": "https://github.com/openai/codex/blob/8bd5a136ffabf5cd4868f9eb8aff298d1f25d8ef/codex-rs/features/src/lib.rs#L1386"
+      },
+      {
+        "claim": "Legacy 2025-06-18; modern Auto 2026-07-28 with legacy fallback; modern stdio also requires CODEX_MCP_PROTOCOL_VERSION=2026-07-28",
+        "release_source": "https://github.com/openai/codex/blob/064c6b8c737f5b41d171fdda80bd9ef10ad06eb3/codex-rs/rmcp-client/src/protocol_mode.rs#L26",
+        "main_source": "https://github.com/openai/codex/blob/8bd5a136ffabf5cd4868f9eb8aff298d1f25d8ef/codex-rs/rmcp-client/src/protocol_mode.rs#L26"
+      },
+      {
+        "claim": "Known extension allowlist excludes tasks; native verification hosted-only",
+        "release_source": "https://github.com/openai/codex/blob/064c6b8c737f5b41d171fdda80bd9ef10ad06eb3/codex-rs/codex-mcp/src/client_capabilities.rs#L39",
+        "main_source": "https://github.com/openai/codex/blob/8bd5a136ffabf5cd4868f9eb8aff298d1f25d8ef/codex-rs/codex-mcp/src/client_capabilities.rs#L39"
+      },
+      {
+        "claim": "MRTR complete/input_required only, bounded retries return requestState/inputResponses",
+        "release_source": "https://github.com/openai/codex/blob/064c6b8c737f5b41d171fdda80bd9ef10ad06eb3/codex-rs/rmcp-client/src/tool_input.rs#L76",
+        "main_source": "https://github.com/openai/codex/blob/8bd5a136ffabf5cd4868f9eb8aff298d1f25d8ef/codex-rs/rmcp-client/src/tool_input.rs#L76"
+      },
+      {
+        "claim": "Separate Apps mode and HTTP registration override",
+        "release_source": "https://github.com/openai/codex/blob/064c6b8c737f5b41d171fdda80bd9ef10ad06eb3/codex-rs/codex-mcp/src/connection_manager.rs#L342",
+        "main_source": "https://github.com/openai/codex/blob/8bd5a136ffabf5cd4868f9eb8aff298d1f25d8ef/codex-rs/codex-mcp/src/connection_manager.rs#L342"
+      },
+      {
+        "claim": "Released source now supplies sessionId and optional windowId",
+        "release_source": "https://github.com/openai/codex/blob/064c6b8c737f5b41d171fdda80bd9ef10ad06eb3/codex-rs/core/src/mcp_tool_call.rs#L1399",
+        "main_source": "https://github.com/openai/codex/blob/8bd5a136ffabf5cd4868f9eb8aff298d1f25d8ef/codex-rs/core/src/mcp_tool_call.rs#L1403"
+      },
+      {
+        "claim": "Conditional openai/readOnly tools/list and tools/call metadata now released",
+        "release_source": "https://github.com/openai/codex/blob/064c6b8c737f5b41d171fdda80bd9ef10ad06eb3/codex-rs/rmcp-client/src/rmcp_client.rs#L418",
+        "main_source": "https://github.com/openai/codex/blob/8bd5a136ffabf5cd4868f9eb8aff298d1f25d8ef/codex-rs/rmcp-client/src/rmcp_client.rs#L418"
+      },
+      {
+        "claim": "Read-only policy separates connection/catalog identity",
+        "release_source": "https://github.com/openai/codex/blob/064c6b8c737f5b41d171fdda80bd9ef10ad06eb3/codex-rs/codex-mcp/src/server.rs#L289",
+        "main_source": "https://github.com/openai/codex/blob/8bd5a136ffabf5cd4868f9eb8aff298d1f25d8ef/codex-rs/codex-mcp/src/server.rs#L320"
+      },
+      {
+        "claim": "OAuth metadata 503 recovery tries same-issuer OIDC candidates, shares timeout and validation",
+        "release_source": "https://github.com/openai/codex/blob/064c6b8c737f5b41d171fdda80bd9ef10ad06eb3/codex-rs/rmcp-client/src/oauth_http_client.rs#L79",
+        "main_source": "https://github.com/openai/codex/blob/8bd5a136ffabf5cd4868f9eb8aff298d1f25d8ef/codex-rs/rmcp-client/src/oauth_http_client.rs#L79"
+      },
+      {
+        "claim": "Apps share live snapshots; ordinary clients own catalog; explicit refresh invalidates old bindings",
+        "release_source": "https://github.com/openai/codex/blob/064c6b8c737f5b41d171fdda80bd9ef10ad06eb3/codex-rs/codex-mcp/src/client_tool_catalog.rs#L46",
+        "main_source": "https://github.com/openai/codex/blob/8bd5a136ffabf5cd4868f9eb8aff298d1f25d8ef/codex-rs/codex-mcp/src/client_tool_catalog.rs#L46"
+      },
+      {
+        "claim": "Request-local W3C trace context propagation into MCP request _meta is now released (#47212)",
+        "release_source": "https://github.com/openai/codex/blob/064c6b8c737f5b41d171fdda80bd9ef10ad06eb3/codex-rs/rmcp-client/src/trace_context.rs#L18",
+        "main_source": "https://github.com/openai/codex/blob/8bd5a136ffabf5cd4868f9eb8aff298d1f25d8ef/codex-rs/rmcp-client/src/trace_context.rs#L18"
+      },
+      {
+        "claim": "Configurable startup_readiness lets a cached tool catalog satisfy MCP startup (#47935)",
+        "release_source": "https://github.com/openai/codex/blob/064c6b8c737f5b41d171fdda80bd9ef10ad06eb3/codex-rs/codex-mcp/src/connection_manager.rs#L173",
+        "main_source": "https://github.com/openai/codex/blob/8bd5a136ffabf5cd4868f9eb8aff298d1f25d8ef/codex-rs/codex-mcp/src/connection_manager.rs#L173"
+      }
+    ],
+    "main_only_findings": [],
+    "unchanged_files_previous_release_current_release_previous_main_current_main": [
+      "codex-rs/rmcp-client/src/protocol_mode.rs",
+      "codex-rs/codex-mcp/src/client_capabilities.rs",
+      "codex-rs/rmcp-client/src/tool_input.rs"
+    ],
+    "standard_tasks_or_listen_consumer": "No declaration or consumer found in rmcp-client/codex-mcp implementation, searching wire literals and typed task/subscription/listen names. Proprietary events/list and events/stream remain separate.",
+    "new_main_since_previous_audit": [
+      "single-server MCP status discovery with thread connection reuse (#48783)",
+      "executor MCP credential boundaries preserved across reconnects (#48143)"
+    ],
+    "cache_findings": {
+      "claim": "SDK 3.2 Peer::list_tools already honors ttlMs/cacheScope with default-enabled caching; Codex higher-level catalog snapshots are separate and drop hints in connector projection. SDK support is not evidence of automatic model catalog TTL refresh or standard listen.",
+      "sources": [
+        "https://github.com/openai/codex/blob/064c6b8c737f5b41d171fdda80bd9ef10ad06eb3/codex-rs/rmcp-client/src/rmcp_client.rs#L693",
+        "https://github.com/modelcontextprotocol/rust-sdk/blob/51ccb42993d6eb5075399672ce7a0c21a0e55eea/crates/rmcp/src/service/client.rs#L1668",
+        "https://github.com/modelcontextprotocol/rust-sdk/blob/51ccb42993d6eb5075399672ce7a0c21a0e55eea/crates/rmcp/src/service/client/cache.rs#L54"
+      ]
+    },
+    "new_main_delta_is_not_live_release_evidence": true,
+    "checkout_head_before": "25270df2615eb4da5b9d4a9a392226933fb096c5",
+    "checkout_head_after": "8bd5a136ffabf5cd4868f9eb8aff298d1f25d8ef",
+    "checkout_update": "git fetch origin --tags; clean detached HEAD switched to main, then git merge --ff-only origin/main",
+    "checkout_commits_fast_forwarded": 100,
+    "checkout_status_after": "?? 0.158.0\n?? HEAD",
+    "previously_main_only_now_released": [
+      {
+        "claim": "Request-local W3C trace propagation (#47212)",
+        "commit": "94174e44cb"
+      },
+      {
+        "claim": "Unix local MCP servers restricted to stdio descriptors (#47094)",
+        "commit": "afe4249cfe"
+      },
+      {
+        "claim": "OAuth authorization endpoints restricted to HTTP(S) (#47326)",
+        "commit": "2c2a42e65d"
+      },
+      {
+        "claim": "Confirmation-policy metadata for REPL-backed connector IDs (#47647)",
+        "commit": "e9b4c6967e"
+      }
+    ],
+    "new_release_vs_0_156_1": [
+      "W3C trace context captured in request _meta and restored around HTTP POSTs (#47212)",
+      "cached catalogs may satisfy MCP startup readiness (#47935)",
+      "MCP and Code Mode input schema budgets configurable (#47936)",
+      "MCP calls prepared from advertised tool identities; handlers reused across equivalent bindings (#47981, #47988)",
+      "client secrets for pre-registered MCP OAuth clients (#47891); OAuth authorization endpoints restricted to HTTP(S) (#47326)",
+      "explicit app and account targets for MCP resource reads (#47248); HTTP origins exposed in MCP server status (#47159)",
+      "Unix local MCP servers restricted to stdio descriptors (#47094)"
+    ]
+  },
+  "rmcp": {
+    "latest_published": "3.5.0",
+    "published_at": "2026-09-27",
+    "rust_version": "1.88",
+    "yanked": false,
+    "registry_source": "https://index.crates.io/rm/cp/rmcp",
+    "release_commit_sha": "0cde3c5cf3e6aff0cc852ce6045f107e95991f48",
+    "crate_sha256": "fae7019994ae0fe4ada40b732f798f3ff26f0f04facb1477f1bf37eb4f18a2d3",
+    "changes_from_3_4_1": [
+      {
+        "claim": "ProtocolVersion::LATEST is now V_2026_07_28 (was V_2025_11_25); ProtocolVersion::default(), default InitializeResult and default InitializeRequestParams therefore name 2026-07-28 (#1105)",
+        "source": "https://github.com/modelcontextprotocol/rust-sdk/blob/0cde3c5cf3e6aff0cc852ce6045f107e95991f48/crates/rmcp/src/model.rs#L177"
+      },
+      {
+        "claim": "New LATEST_WITH_INITIALIZE (= 2025-11-25), NO_INITIALIZE (= 2026-07-28) and has_initialize(); use LATEST_WITH_INITIALIZE for the handshake version",
+        "source": "https://github.com/modelcontextprotocol/rust-sdk/blob/0cde3c5cf3e6aff0cc852ce6045f107e95991f48/crates/rmcp/src/model.rs#L202"
+      },
+      {
+        "claim": "Server answers an initialize naming a version without a handshake with its preferred fallback when that has a handshake, else the newest supported version that does",
+        "source": "https://github.com/modelcontextprotocol/rust-sdk/blob/0cde3c5cf3e6aff0cc852ce6045f107e95991f48/crates/rmcp/src/service/server.rs#L486"
+      },
+      {
+        "claim": "Client seeds per-request _meta when a server answers initialize with a no-handshake version",
+        "source": "https://github.com/modelcontextprotocol/rust-sdk/blob/0cde3c5cf3e6aff0cc852ce6045f107e95991f48/crates/rmcp/src/service/client.rs#L928"
+      },
+      {
+        "claim": "Supplied Mcp-Method contradicting an initialize body, and duplicate SEP-2243 header values, are rejected (#1274)",
+        "source": "https://github.com/modelcontextprotocol/rust-sdk/blob/0cde3c5cf3e6aff0cc852ce6045f107e95991f48/crates/rmcp/src/transport/streamable_http_server/tower.rs#L834"
+      },
+      {
+        "claim": "Origin allowlist: explicit ports match exactly, :* matches any port, portless entries still match any port but are deprecated (#1270)",
+        "source": "https://github.com/modelcontextprotocol/rust-sdk/blob/0cde3c5cf3e6aff0cc852ce6045f107e95991f48/crates/rmcp/src/transport/streamable_http_server/tower.rs#L119"
+      },
+      {
+        "claim": "Empty cacheScope deserializes as absent instead of dropping the result into CustomResult (#1281)",
+        "source": "https://github.com/modelcontextprotocol/rust-sdk/blob/0cde3c5cf3e6aff0cc852ce6045f107e95991f48/crates/rmcp/src/model.rs#L1716"
+      },
+      {
+        "claim": "Explicit null structuredContent preserved as Some(Value::Null) (#1295); float fields decoded through serde_json::Number (#1300)",
+        "source": "https://github.com/modelcontextprotocol/rust-sdk/blob/0cde3c5cf3e6aff0cc852ce6045f107e95991f48/crates/rmcp/src/model.rs#L3958"
+      }
+    ],
+    "source_confirmations": [
+      {
+        "claim": "SubscriptionFilter has no tasks category",
+        "source": "https://github.com/modelcontextprotocol/rust-sdk/blob/0cde3c5cf3e6aff0cc852ce6045f107e95991f48/crates/rmcp/src/model.rs#L2080"
+      },
+      {
+        "claim": "Task-related lines in model.rs, service/server.rs and service/client.rs identical to 3.4.1 (server sink and client subscription still reject task notifications)",
+        "source": "https://github.com/modelcontextprotocol/rust-sdk/blob/0cde3c5cf3e6aff0cc852ce6045f107e95991f48/crates/rmcp/src/service/server.rs#L244"
+      },
+      {
+        "claim": "Default supported_protocol_versions remains KNOWN_VERSIONS",
+        "source": "https://github.com/modelcontextprotocol/rust-sdk/blob/0cde3c5cf3e6aff0cc852ce6045f107e95991f48/crates/rmcp/src/handler/server.rs#L390"
+      },
+      {
+        "claim": "ServiceExt::serve remains legacy initialization; ClientLifecycleMode unchanged",
+        "source": "https://github.com/modelcontextprotocol/rust-sdk/blob/0cde3c5cf3e6aff0cc852ce6045f107e95991f48/crates/rmcp/src/service/client.rs#L642"
+      }
+    ],
+    "changed_files_3_4_1_to_3_5_0": [
+      "src/model.rs",
+      "src/model/annotated.rs",
+      "src/model/elicitation_schema.rs",
+      "src/model/serde_impl.rs",
+      "src/service.rs",
+      "src/service/client.rs",
+      "src/service/server.rs",
+      "src/transport/common/mcp_headers.rs",
+      "src/transport/streamable_http_server/tower.rs"
+    ],
+    "migration_impact": "Latest candidate becomes 3.5.0. A client that keeps ServiceExt::serve with default client info now sends initialize at 2026-07-28; pin LATEST_WITH_INITIALIZE to keep the legacy handshake version unchanged. Server-side legacy negotiation still echoes a supported handshake version. No change to task-listen limitations, MRTR or MSRV. Runtime exemplar still requires rerun on the selected SDK.",
+    "runtime_spike_rerun": false,
+    "inspection_directory": "/private/tmp/claude-501/-Users-invidious-orca-workspaces-transcript-search-mcp-audit/eb86b927-f628-46fd-8484-94338da62afc/scratchpad"
+  }
+}
