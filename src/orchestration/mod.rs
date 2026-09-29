@@ -2168,10 +2168,9 @@ impl TaskStore {
 // ── Dispatch-context layer (typed ingredients, harness-composed) ────
 //
 // The daemon owns CONTENT SELECTION only (dispatch-prompt-slots.md §3):
-// which directives fire for a dispatch, each directive's empirically-
-// calibrated cadence, the persona resolved from the brofile, the
-// pre-bound scoping IDs (task, session, project, bro, thread,
-// work-item), and the resolved pin block. It does NOT compose prompt
+// the persona resolved from the brofile, the completion contract when the
+// dispatch carries one, and the pre-bound scoping IDs (task, session,
+// project, bro, thread, work-item). It does NOT compose prompt
 // text — `AmbientContext::dispatch_context` serializes the typed
 // payload and the harness routes each ingredient to its per-transport
 // slot (`--dispatch-context`, bro-protocol `DispatchContext`). The
@@ -2186,77 +2185,6 @@ impl TaskStore {
 //
 // If defense-in-depth text guards are wanted in the future, reintroduce
 // a prefix here and gate on `AmbientContext::provider`.
-
-/// Recall directive. The managed-region CORE RULE reliably triggers
-/// `bbox_knowledge` queries on cold-start but can attention-decay within long
-/// sessions on weaker providers. Keep this as a standing instruction, not a
-/// per-turn reminder: repeated developer-message injection made Codex/Brodex
-/// over-comply during procedural live-state work (especially gap-store work)
-/// where `bbox_gaps`/`bbox_gap` is already the authoritative surface.
-pub const RECALL_DIRECTIVE: &str = "\
-Use `bbox_knowledge` when durable knowledge, prior decisions, conventions, or \
-system runbooks could materially change the answer. It is not the surface for \
-procedural live-state work already using the authoritative store: scoped pins, \
-side-channel notes, active threads, transcripts, gap-store checks/writes \
-(`bbox_gaps`/`bbox_gap*`), or repo-owned state commits. If a recall check is \
-appropriate and the first result is empty or too broad, try one sharper phrase \
-before relying on live filesystem state or prior knowledge.";
-
-/// Ambient nudge for recursive orchestrators (allow_recursion=true).
-/// They're usually fan-out coordinators, and the most common silent
-/// failure mode is writing a prose rubric and pasting it into N
-/// identical sub-agent prompts instead of compiling a packet once and
-/// dispatching the packet_id. Fires in addition to RECALL_DIRECTIVE.
-pub const ORCHESTRATOR_HINT: &str = "\
-Orchestrator note: if your plan involves sending the same rubric / \
-ranking criteria / decision tree / access rules to multiple sub-agents, \
-compile it into a packet first via `bbox_compile` and dispatch the \
-`packet_id` — every sub-agent then produces bit-identical output via \
-`bbox_apply`, and a 4th agent can reproduce the results deterministically \
-without re-reading prose. See `sm-rule-packets` via `bbox_knowledge`.";
-
-/// Ambient task-shape nudge for every dispatch. Addresses a failure
-/// mode observed in E10/S11 where an agent bypassed packets entirely
-/// on a log-triage task ("the primitive was simply absent from my
-/// mental toolkit") because `bbox_compile` wasn't deferred-loaded and
-/// the task's shape read as regex-ish. Naming the packet tools in
-/// the ambient prefix pre-loads their schemas into the agent's option
-/// space and reframes "the AST can't do regex" as a gap-log rather
-/// than a bypass. Fires for every dispatch, orthogonal to
-/// ORCHESTRATOR_HINT.
-///
-/// **Calibration bound (E12 cross-provider data):** the current
-/// wording is at the "works across claude+codex+gemini" joint.
-/// Self-reported force varies by provider — Claude reads it as
-/// "nudge, not decider" ("I'd have compiled regardless"), Codex as
-/// "could have tipped fuzzier tasks", Gemini as "MANDATORY choice,
-/// not nudge". Escalating the language (e.g. imperative verbs,
-/// longer justification, explicit step-by-step) risks:
-///   (a) over-constraint on Claude — it becomes noise it ignores,
-///       or worse, makes the hint feel adversarial in tasks where
-///       packets are clearly wrong (prose/research/synthesis);
-///   (b) compliance theater on Gemini — Gemini already treats this
-///       as mandatory at current wording; turning the dial up could
-///       make it compile packets for tasks where the AST doesn't
-///       fit, defeating the gap-tool signal.
-///
-/// If you change this string, re-run E12 (cross-provider S11 sweep)
-/// to confirm all three providers still read it as intended.
-/// Don't add imperative verbs ("MUST compile", "ALWAYS use") without
-/// that verification.
-pub const TASK_SHAPE_HINT: &str = "\
-Task-shape check: if this task involves repeatedly classifying, \
-ranking, triaging, scoring, or judging entities against stated \
-criteria — try `bbox_compile` first (see `sm-rule-packets` via \
-`bbox_knowledge`). Packets force explicit rule ordering and buy a \
-free audit via `bbox_audit`. Log a gap via `bbox_packet_gap` when \
-the AST can't express what you need — whether mechanically (no \
-operator fires) or conceptually (a composition works but is \
-semantically blunt — e.g., keyword StringContains where you'd \
-have wanted regex or synonym matching, Any{} over a long needle \
-list where you wanted a generalizer). Fidelity 1.0 on training \
-alone doesn't rule out the gap; if the mechanism won't generalize \
-to unseen vocabulary, that's the signal the log wants.";
 
 /// Default per-dispatch contract. Deliberately quiet: `bbox_note` is a
 /// signal channel for *notable* observations, NOT a per-dispatch ritual, so
@@ -2310,8 +2238,7 @@ project path, not prose, not \"pending\">\n\
 ///
 /// Field names and the `gap_kind` enum are pinned to `gaps.rs` (`GapKind`);
 /// an unknown gap_kind or malformed dedupe_key would fail `bbox_gap`.
-/// Deliberately NOT routed through `apply_ambient` — its recall /
-/// task-shape nudges miscue a reflection turn (see `workload_retro_prompt`).
+/// Deliberately carries no dispatch context (see `workload_retro_prompt`).
 pub const WORKLOAD_RETRO_PROMPT: &str = "\
 Quick retrospective — the task itself is done, nothing more is needed on it.\n\
 \n\
@@ -2392,10 +2319,9 @@ Gaps filed: list dedupe keys, or `none`.";
 
 /// Build the workload-retro probe prompt with a minimal `[scope]` block so
 /// any gap note the bro files carries the session/project correlation keys
-/// and lands in `bbox_inbox` attributed correctly. Deliberately bypasses
-/// `apply_ambient`: the recall directive and task-shape (packet) nudge it
-/// injects would miscue a reflection turn, and the retro prompt already
-/// names the exact `bbox_note` call it wants.
+/// and lands in `bbox_inbox` attributed correctly. Deliberately carries no
+/// dispatch context: the retro prompt is self-contained and already names
+/// the exact `bbox_gap` call it wants.
 pub fn workload_retro_prompt(session_id: &str, project: Option<&str>) -> String {
     let mut scope = format!("[scope] session:{session_id}");
     if let Some(p) = project {
@@ -2569,18 +2495,16 @@ pub fn merge_tool_arg_defaults(
 }
 
 impl AmbientContext {
-    /// Serialize this dispatch's typed ingredients — persona (brofile lens),
-    /// the selected directive set with declared cadence, the scope fields,
-    /// and the pin block — into the `--dispatch-context` payload
-    /// (dispatch-prompt-slots.md §4/§6). The harness owns composition;
-    /// nothing here is prompt text.
+    /// Serialize this dispatch's typed ingredients (persona from the brofile
+    /// lens, the completion contract directive, and the scope fields) into
+    /// the `--dispatch-context` payload (dispatch-prompt-slots.md). The
+    /// harness owns composition; nothing here is prompt text.
     ///
     /// Recursion guarding (blocking sub-bro dispatch) stays mechanical via
     /// provider tool-filter args appended to argv outside this function; no
     /// text recursion guard is emitted.
     ///
-    /// Cadence declarations carry the empirical calibration the old glued
-    /// preamble encoded positionally. Directives are standing by default;
+    /// The completion contract is the only directive and is standing;
     /// recurring behavioral nudges belong in the harness HookEngine/NudgeLedger
     /// so they can be triggered and throttled by actual turn state. `contract`
     /// declares `needs_scope`: its text references the `bbox_scope`
@@ -2589,53 +2513,19 @@ impl AmbientContext {
     pub fn dispatch_context(&self, lens: Option<&str>) -> bro_protocol::DispatchContext {
         use bro_protocol::{DirectiveCadence, DispatchDirective, DispatchScope};
 
-        let directive = |id: &str, cadence: DirectiveCadence, needs_scope: bool, text: &str| {
-            DispatchDirective {
-                id: id.to_string(),
-                cadence,
-                needs_scope,
-                text: text.to_string(),
-            }
-        };
-        let mut directives = vec![
-            directive(
-                "recall",
-                DirectiveCadence::Standing,
-                false,
-                RECALL_DIRECTIVE,
-            ),
-            directive(
-                "task_shape",
-                DirectiveCadence::Standing,
-                false,
-                TASK_SHAPE_HINT,
-            ),
-        ];
-        // allow_recursion ⇒ this agent is a fan-out orchestrator. Surface the
-        // packet primitive — the most common silent miss for these agents is
-        // writing a prose rubric and pasting it into N identical sub-agent
-        // prompts.
-        if self.allow_recursion {
-            directives.push(directive(
-                "orchestrator",
-                DirectiveCadence::Standing,
-                false,
-                ORCHESTRATOR_HINT,
-            ));
-        }
-        if let Some(contract) = self
+        let directives: Vec<DispatchDirective> = self
             .completion_contract
             .as_deref()
             .map(str::trim_end)
             .filter(|c| !c.is_empty())
-        {
-            directives.push(directive(
-                "contract",
-                DirectiveCadence::Standing,
-                true,
-                contract,
-            ));
-        }
+            .map(|contract| DispatchDirective {
+                id: "contract".to_string(),
+                cadence: DirectiveCadence::Standing,
+                needs_scope: true,
+                text: contract.to_string(),
+            })
+            .into_iter()
+            .collect();
 
         let scope = DispatchScope {
             task: self.task_id.clone(),
@@ -9361,11 +9251,10 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_context_allow_recursion_keeps_scope_and_recall() {
-        // The payload carries scope + recall for every dispatch regardless of
-        // `allow_recursion`. Recursion guarding is mechanical (tool filter)
-        // not textual; fan-out orchestrators additionally get the packet
-        // nudge as a standing directive.
+    fn dispatch_context_allow_recursion_keeps_scope_without_directives() {
+        // The payload carries scope for every dispatch regardless of
+        // `allow_recursion`. Recursion guarding is mechanical (tool filter),
+        // not textual, and recursive dispatches carry no completion contract.
         let ctx = AmbientContext {
             session_id: Some("sess-orch".into()),
             allow_recursion: true,
@@ -9377,11 +9266,7 @@ mod tests {
             payload.scope.as_ref().unwrap().session.as_deref(),
             Some("sess-orch")
         );
-        let recall = directive(&payload, "recall");
-        assert!(recall.text.contains("bbox_knowledge"));
-        let orch = directive(&payload, "orchestrator");
-        assert!(orch.text.contains("bbox_compile"));
-        assert_eq!(orch.cadence, bro_protocol::DirectiveCadence::Standing);
+        assert!(payload.directives.is_empty());
     }
 
     #[test]
@@ -9413,54 +9298,31 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_context_recall_directive_is_standing_and_exempts_live_state_surfaces() {
-        let payload = AmbientContext::default().dispatch_context(None);
-        let recall = directive(&payload, "recall");
-        assert_eq!(recall.cadence, bro_protocol::DirectiveCadence::Standing);
-        assert!(!recall.needs_scope);
-        assert!(recall.text.contains("bbox_knowledge"));
-        assert!(recall.text.contains("procedural live-state work"));
-        assert!(recall.text.contains("bbox_gaps"));
-        assert!(recall.text.contains("bbox_gap*"));
-        assert!(recall.text.contains("repo-owned state commits"));
-        assert!(!recall.text.contains("FIRST tool call"));
-    }
-
-    #[test]
-    fn dispatch_context_directive_order_and_conditionals() {
-        // Solo executor: recall → task_shape → contract.
+    fn dispatch_context_contract_is_the_only_directive() {
         let solo = AmbientContext {
             allow_recursion: false,
             completion_contract: Some(DEFAULT_COMPLETION_CONTRACT.to_string()),
             ..Default::default()
         };
-        let payload = solo.dispatch_context(None);
         assert_eq!(
-            directive_ids(&payload),
-            vec!["recall", "task_shape", "contract"]
+            directive_ids(&solo.dispatch_context(None)),
+            vec!["contract"]
         );
-        let task_shape = directive(&payload, "task_shape");
-        assert!(task_shape.text.contains("bbox_compile"));
-        assert!(task_shape.text.contains("bbox_packet_gap"));
-        assert_eq!(task_shape.cadence, bro_protocol::DirectiveCadence::Standing);
 
-        // A legacy workspace flag must not restore a retired tool directive.
+        // No contract, recursion allowed, legacy workspace flag: no directives.
         let orch = AmbientContext {
             allow_recursion: true,
             coerce_workspace: true,
             ..Default::default()
         };
-        let payload = orch.dispatch_context(None);
-        assert_eq!(
-            directive_ids(&payload),
-            vec!["recall", "task_shape", "orchestrator"]
-        );
-    }
+        assert!(directive_ids(&orch.dispatch_context(None)).is_empty());
 
-    #[test]
-    fn dispatch_context_orchestrator_absent_without_recursion() {
-        let payload = AmbientContext::default().dispatch_context(None);
-        assert!(!directive_ids(&payload).contains(&"orchestrator"));
+        // A blank contract carries nothing.
+        let blank = AmbientContext {
+            completion_contract: Some("  \n".into()),
+            ..Default::default()
+        };
+        assert!(directive_ids(&blank.dispatch_context(None)).is_empty());
     }
 
     #[test]

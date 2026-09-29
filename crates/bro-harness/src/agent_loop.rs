@@ -1873,19 +1873,6 @@ impl Session {
                     }
                     v.push_str(t);
                 }
-                // Per-turn directives ride the volatile lane AFTER the existing
-                // channels (structured-output reminder, tail nudges), design §8.
-                // On openai-chat after-tool turns the transport folds the volatile
-                // tail into the leading system block (Mistral forbids
-                // system-after-tool); everywhere else this is the uncached
-                // trailing slot, late relative to the task.
-                if let Some(per_turn) = self.dispatch.per_turn_text() {
-                    let v = sys.volatile.get_or_insert_with(String::new);
-                    if !v.is_empty() {
-                        v.push('\n');
-                    }
-                    v.push_str(&per_turn);
-                }
                 let opts = TurnOpts {
                     system: sys,
                     ..self.base_opts.clone()
@@ -5952,20 +5939,12 @@ mod tests {
         let ctx = DispatchContext {
             v: 1,
             persona: Some("PERSONA_UNIQUE reviewer".into()),
-            directives: vec![
-                DispatchDirective {
-                    id: "task_shape".into(),
-                    cadence: DirectiveCadence::Standing,
-                    needs_scope: false,
-                    text: "STANDING_UNIQUE task-shape check".into(),
-                },
-                DispatchDirective {
-                    id: "recall".into(),
-                    cadence: DirectiveCadence::PerTurn,
-                    needs_scope: false,
-                    text: "PER_TURN_UNIQUE recall".into(),
-                },
-            ],
+            directives: vec![DispatchDirective {
+                id: "standing".into(),
+                cadence: DirectiveCadence::Standing,
+                needs_scope: false,
+                text: "STANDING_UNIQUE directive".into(),
+            }],
             scope,
         };
         DispatchState::from_arg(DispatchContextArg::Provided(Box::new(ctx)), &Value::Null)
@@ -6000,7 +5979,6 @@ mod tests {
         let stable = systems[0].stable_text().unwrap();
         ordered(stable, &["PERSONA_UNIQUE", "STANDING_UNIQUE"]);
         for absent in [
-            "PER_TURN_UNIQUE",
             "AGENTS_UNIQUE_RULE",
             "<bbox_scope>",
             "<environment_context>",
@@ -6042,7 +6020,6 @@ mod tests {
                 "<bbox_scope>",
             ],
         );
-        assert!(!stable.contains("PER_TURN_UNIQUE"));
         assert_eq!(shared.seen_users.lock().unwrap()[0], vec!["one-line task"]);
     }
 
@@ -6366,25 +6343,6 @@ mod tests {
         assert!(stable.contains("PERSONA_UNIQUE"));
         assert!(stable.contains("STANDING_UNIQUE"));
         assert!(!stable.contains("# AGENTS.md instructions"));
-    }
-
-    #[tokio::test]
-    async fn per_turn_directives_ride_volatile_after_nudge() {
-        let (mut session, shared) = mk_session(vec![MockTurn::Text("done".into())]);
-        session.dispatch = test_dispatch_state(Some(test_scope("task-1")));
-        session.tail_nudge = Some("NUDGE_UNIQUE".into());
-        run_user_turn(&mut session, "go").await;
-
-        let systems = shared.seen_systems.lock().unwrap();
-        let volatile = systems
-            .last()
-            .and_then(|s| s.volatile_text())
-            .expect("volatile tail present");
-        // Per-turn directives share the volatile lane with the existing
-        // channels, AFTER them (design §8).
-        ordered(volatile, &["NUDGE_UNIQUE", "PER_TURN_UNIQUE"]);
-        let stable = systems.last().and_then(|s| s.stable_text()).unwrap();
-        assert!(!stable.contains("PER_TURN_UNIQUE"));
     }
 
     #[tokio::test]

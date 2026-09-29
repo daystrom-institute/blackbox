@@ -1307,7 +1307,7 @@ fn focused_transcript_items(app: &App, idx: usize) -> Vec<TranscriptItem> {
     {
         let mut items = tail.items().to_vec();
         // The logged first user turn is the AMBIENT-WRAPPED prompt (scope
-        // block, recall directive, … with the operator's text last). When
+        // block, … with the operator's text last). When
         // this cockpit launched the dispatch it knows the operator's own
         // text — render that instead of the preamble blob. The full wrapped
         // turn stays in the event log for forensics; this is display only.

@@ -16,10 +16,9 @@ brief: "Designs template-based context assembly for brofiles, turns, dispatch de
 
 Blackbox currently assembles prompt context in several ad hoc places:
 
-- `apply_ambient` prepends scope, scoped pins, an unconditional recall
-  directive, an unconditional task-shape hint, an orchestrator hint when
-  `allow_recursion` is set, an optional completion contract, and an optional
-  workspace-tools appendix when the brofile coerces workspace tools.
+- the typed dispatch context carries scope, the brofile persona, and an
+  optional completion contract; the harness composes them
+  (`design/bro-harness/dispatch-prompt-slots.md`).
 - `apply_brofile_lens` prepends brofile persona text.
 - profile-backed atoms expand `inputs.prompt_template` and then dispatch via a
   brofile.
@@ -207,10 +206,6 @@ struct PromptRenderContext {
     model: Option<String>,
     effort: Option<String>,
     lens: Option<String>,
-    pins: Option<String>,
-    recall_directive: Option<String>,
-    task_shape_hint: Option<String>,
-    orchestrator_hint: Option<String>,
     completion_contract: Option<String>,
     workspace_tools_appendix: Option<String>,
     atom: Option<AtomRenderContext>,
@@ -222,7 +217,7 @@ struct PromptRenderContext {
 
 The base render context is built by the bro dispatch assembler from existing
 inputs: current prompt, brofile, provider/model/effort, task/session IDs,
-project scope, pins, and the same ingredients `apply_ambient` currently uses.
+project scope, and the same ingredients the dispatch context carries.
 Fields are optional so minimal templates can ignore them, but they are ordinary
 bounded strings, not hidden search results.
 
@@ -553,10 +548,6 @@ provider, not a phase gate.
 Current ambient sections become template variables or built-in partials:
 
 - `scope`
-- `pins`
-- `recall_directive`
-- `task_shape_hint`
-- `orchestrator_hint` (currently emitted only when `allow_recursion` is set)
 - `completion_contract`
 - `workspace_tools_appendix`
 - `lens`
@@ -664,7 +655,7 @@ Atom `inputs.prompt_template` keeps its existing simple-placeholder grammar:
 validated by `validate_prompt_template` in `src/orchestration/atoms/validate.rs`.
 That grammar is intentionally distinct from the Tera grammar used by brofile
 turn templates — atom inputs render to a `prompt` string, and the brofile
-template then composes that string with scope, pins, lens, and template inputs.
+template then composes that string with scope, lens, and template inputs.
 
 Workflow actor nodes already render `NodeSpec.prompt` from `ArcContext`. That
 rendered node prompt becomes the `prompt` input to the actor brofile's first or
@@ -719,7 +710,7 @@ Dry-run is non-dispatching and non-mutating end-to-end under
 `producers: "run"`:
 
 - The producer **must not** emit system events, write to the task store,
-  the resume-lease table, the knowledge store, threads, notes, pins,
+  the resume-lease table, the knowledge store, threads, notes,
   roadmap, or whiteboards, and **must not** call agent-dispatching tools.
   System events are durable in current code (`EventHub::emit` at
   `src/system_events/hub.rs:319` appends to the journal,
@@ -849,8 +840,7 @@ byte-equivalent (Phase 1 regression). Phase 4 then:
   `src/orchestration/mod.rs` and removes their last call sites in
   `src/tools/dispatch.rs` (`build_exec_prompt` and the `bro_resume` wrap
   call).
-- Removes the constants the helpers fed on (`RECALL_DIRECTIVE`,
-  `TASK_SHAPE_HINT`, `ORCHESTRATOR_HINT`, `WORKSPACE_TOOLS_APPENDIX`,
+- Removes the constants the helpers fed on (`WORKSPACE_TOOLS_APPENDIX`,
   `DEFAULT_COMPLETION_CONTRACT`) or moves them into the builtin template
   body where they belong.
 - Adds the remaining regression suite: minimal drone rendering, resume

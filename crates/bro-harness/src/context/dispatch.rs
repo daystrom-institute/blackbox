@@ -13,19 +13,18 @@ use crate::transport::TransportKind;
 /// Per-transport composition strategy — the harness analog of opencode's
 /// `provider(model)` + delivery branch and codex's PromptSlot router. One
 /// routing point decides which slot each semantic class (persona, standing
-/// directives, per-turn directives, memory, scope, environment, task)
+/// directives, memory, scope, environment, task)
 /// lands in; a per-provider fix becomes a strategy-arm change, not preamble
 /// surgery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompositionStrategy {
     /// anthropic + openai-responses: persona/standing directives in the
-    /// stable system slot; per-turn directives in the volatile tail;
-    /// memory/scope/environment as marker-demarcated contextual USER
-    /// fragments with change/compaction re-emit; the task is its own user
-    /// item, verbatim, last.
+    /// stable system slot; memory/scope/environment as marker-demarcated
+    /// contextual USER fragments with change/compaction re-emit; the task is
+    /// its own user item, verbatim, last.
     CodexShaped,
-    /// openai-chat (the Mistral lane): everything — persona, standing
-    /// directives, memory (AGENTS.md), environment, scope — folds into
+    /// openai-chat (the Mistral lane): everything (persona, standing
+    /// directives, AGENTS.md memory, environment, scope) folds into
     /// the leading system message, rebuilt in place per request (vibe's
     /// `update_system_prompt` shape); the task is the only initial user
     /// message. The observed failure mode this fixes: policy and memory text
@@ -157,11 +156,11 @@ impl DispatchState {
         self.context.as_ref().and_then(|c| c.persona.as_deref())
     }
 
-    fn directive_text(&self, cadence: DirectiveCadence) -> Option<String> {
+    /// Joined standing directives (system authority, once per request).
+    pub fn standing_text(&self) -> Option<String> {
         let ctx = self.context.as_ref()?;
         let parts: Vec<&str> = ctx
             .effective_directives()
-            .filter(|d| d.cadence == cadence)
             .map(|d| d.text.as_str())
             .collect();
         if parts.is_empty() {
@@ -169,16 +168,6 @@ impl DispatchState {
         } else {
             Some(parts.join("\n\n"))
         }
-    }
-
-    /// Joined standing directives (system authority, once per request).
-    pub fn standing_text(&self) -> Option<String> {
-        self.directive_text(DirectiveCadence::Standing)
-    }
-
-    /// Joined per-turn directives (uncached volatile-lane reinforcement).
-    pub fn per_turn_text(&self) -> Option<String> {
-        self.directive_text(DirectiveCadence::PerTurn)
     }
 
     /// Rendered `<bbox_scope>` fragment for the current scope, if any.
@@ -228,28 +217,16 @@ mod tests {
             persona: Some("You are a reviewer".into()),
             directives: vec![
                 DispatchDirective {
-                    id: "recall".into(),
-                    cadence: DirectiveCadence::PerTurn,
-                    needs_scope: false,
-                    text: "Recall directive".into(),
-                },
-                DispatchDirective {
-                    id: "task_shape".into(),
+                    id: "standing".into(),
                     cadence: DirectiveCadence::Standing,
                     needs_scope: false,
-                    text: "Task-shape check".into(),
+                    text: "Standing guidance".into(),
                 },
                 DispatchDirective {
                     id: "contract".into(),
                     cadence: DirectiveCadence::Standing,
                     needs_scope: true,
                     text: "Completion contract".into(),
-                },
-                DispatchDirective {
-                    id: "milestone".into(),
-                    cadence: DirectiveCadence::PerTurn,
-                    needs_scope: true,
-                    text: "Milestone reporting".into(),
                 },
             ],
             scope,
@@ -318,14 +295,10 @@ mod tests {
         );
         assert!(state.scope_render().is_some());
         assert_eq!(state.persona(), Some("You are a reviewer"));
-        // All four directives effective with scope present.
+        // Both directives effective with scope present.
         assert_eq!(
             state.standing_text().unwrap(),
-            "Task-shape check\n\nCompletion contract"
-        );
-        assert_eq!(
-            state.per_turn_text().unwrap(),
-            "Recall directive\n\nMilestone reporting"
+            "Standing guidance\n\nCompletion contract"
         );
     }
 
@@ -344,8 +317,7 @@ mod tests {
         assert_eq!(ctx.scope, None, "scope must NEVER be restored");
         assert_eq!(restored.persona(), Some("You are a reviewer"));
         // needs_scope directives drop without a current scope.
-        assert_eq!(restored.standing_text().unwrap(), "Task-shape check");
-        assert_eq!(restored.per_turn_text().unwrap(), "Recall directive");
+        assert_eq!(restored.standing_text().unwrap(), "Standing guidance");
         assert_eq!(restored.scope_render(), None);
     }
 
@@ -400,6 +372,35 @@ mod tests {
                 ]
             })
         );
+    }
+
+    /// Side-state persisted with per-turn directives restores without them:
+    /// per-turn cadence is dropped, while standing directives restore
+    /// whatever their id (ids are opaque to the harness).
+    #[test]
+    fn legacy_side_state_drops_per_turn_directives() {
+        let side = json!({
+            "dispatch_context": {
+                "v": 1,
+                "persona": "You are a reviewer",
+                "directives": [
+                    {"id": "recall", "cadence": "per_turn", "text": "Recall directive"},
+                    {"id": "task_shape", "cadence": "standing", "text": "Task-shape check"},
+                    {"id": "contract", "cadence": "standing", "needs_scope": true, "text": "c"}
+                ]
+            },
+        });
+        let restored = DispatchState::from_arg(DispatchContextArg::Absent, &side);
+        let ids: Vec<_> = restored
+            .context
+            .as_ref()
+            .expect("legacy context restored")
+            .directives
+            .iter()
+            .map(|d| d.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["task_shape", "contract"]);
+        assert_eq!(restored.standing_text().unwrap(), "Task-shape check");
     }
 
     #[test]

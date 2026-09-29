@@ -884,8 +884,8 @@ impl BlackboxServer {
         };
 
         // Re-pass the full dispatch context on resume: each resume is its own
-        // dispatch with a fresh task_id, and the per-turn recall directive +
-        // completion contract need to ride with every follow-up. Persona is
+        // dispatch with a fresh task_id, and the scope and completion contract
+        // need to ride with every follow-up. Persona is
         // included — the harness places it idempotently in the system slot
         // (the old resume branches dropped the lens; dispatch-prompt-slots.md
         // §6 classifies that as a bug, not behavior to preserve).
@@ -2095,9 +2095,7 @@ impl BlackboxServer {
         )?;
         let prompt = orch::workload_retro_prompt(session_id, cwd.as_deref());
         // Deliberately NO dispatch context: the retro prompt is self-contained
-        // (inline scope, names the exact bbox_gap call it wants) and the
-        // recall/task-shape directives would miscue a reflection turn
-        // (dispatch-prompt-slots.md §8).
+        // (inline scope, names the exact bbox_gap call it wants).
         let mut args = provider.build_resume_args(session_id, &prompt, None, exec_opts.as_ref());
         // Retro probes never orchestrate — keep the mechanical recursion
         // guard on so a probe can't fan out (or re-trigger prune-retro).
