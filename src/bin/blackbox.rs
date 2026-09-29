@@ -453,7 +453,8 @@ struct RenderLocalityCutoverArgs {
     /// Reviewable preflight report, required by preflight and apply.
     #[arg(long, value_name = "PATH")]
     report: Option<PathBuf>,
-    /// Exact catalog project id to cut over. Repeatable; preflight only.
+    /// Exact catalog project id to prove. Repeatable; preflight only. May be
+    /// omitted when a marker is installed, to carry and drop its rows only.
     #[arg(long = "project-id", value_name = "PROJECT_ID")]
     project_ids: Vec<String>,
     /// Mandatory no-daemon-render-access observation window.
@@ -486,7 +487,8 @@ struct CodeSourceLocalityCutoverArgs {
     /// Reviewable preflight report, required by preflight and apply.
     #[arg(long, value_name = "PATH")]
     report: Option<PathBuf>,
-    /// Exact catalog project id to cut over. Repeatable; preflight only.
+    /// Exact catalog project id to prove. Repeatable; preflight only. May be
+    /// omitted when a marker is installed, to carry and drop its rows only.
     #[arg(long = "project-id", value_name = "PROJECT_ID")]
     project_ids: Vec<String>,
     /// Mandatory no-local-walk observation window.
@@ -1470,11 +1472,6 @@ fn execute_render_locality_cutover(
                     "render-locality-cutover --preflight requires --report",
                 ));
             };
-            if args.project_ids.is_empty() {
-                return Err(cli_arguments(
-                    "render-locality-cutover --preflight requires at least one --project-id",
-                ));
-            }
             let project_ids = args
                 .project_ids
                 .into_iter()
@@ -1583,11 +1580,6 @@ fn execute_code_source_locality_cutover(
                     "code-source-locality-cutover --preflight requires --report",
                 ));
             };
-            if args.project_ids.is_empty() {
-                return Err(cli_arguments(
-                    "code-source-locality-cutover --preflight requires at least one --project-id",
-                ));
-            }
             let project_ids = args
                 .project_ids
                 .into_iter()

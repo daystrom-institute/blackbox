@@ -1,4 +1,12 @@
 //! Offline collected-source cutover and runtime LocalProjectWalk refusal.
+//!
+//! The ceremony is re-runnable. With a marker installed, preflight carries
+//! every row whose project is still in the catalog and still passes the
+//! governed-row checks daemon startup applies, drops rows whose project left
+//! the catalog, and proves only the explicitly selected projects. Apply
+//! supersedes the reviewed predecessor with the union of carried and proved
+//! rows, or removes the marker when no row remains, because the marker format
+//! the daemon loads admits no empty row set.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -11,8 +19,12 @@ use bbox_code_source_store::{
 };
 use bbox_config::config::Config;
 use bbox_corpus_core::identity::PublishedScope;
-use bbox_corpus_core::json_store::{atomic_write_json_locked, with_store_lock};
-use bbox_corpus_core::project_catalog::{ProjectId, ProjectScope};
+use bbox_corpus_core::json_store::{
+    acquire_store_lock_nofollow, atomic_write_json_locked, with_store_lock,
+};
+use bbox_corpus_core::project_catalog::{
+    CatalogSnapshotV2, CorpusProject, ProjectId, ProjectScope,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -62,6 +74,29 @@ pub struct CodeSourceLocalityCutoverRowV1 {
     pub checkout_baselines: Vec<CheckoutAccessTargetCounter>,
 }
 
+/// Why a predecessor marker row is not carried into the next marker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeSourceLocalityDroppedRowReasonV1 {
+    /// The row's project no longer exists in the catalog, so no source plan
+    /// can resolve it and no re-cutover can ever make it current.
+    ProjectAbsentFromCatalog,
+}
+
+/// One predecessor marker row the next marker omits.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CodeSourceLocalityDroppedRowV1 {
+    pub project_id: ProjectId,
+    pub scope: PublishedScope,
+    pub producer_id: String,
+    pub reason: CodeSourceLocalityDroppedRowReasonV1,
+}
+
+/// A reviewed preflight. `rows` holds the projects this run proves; with a
+/// predecessor marker, `carried_forward_rows` and `dropped_rows` partition
+/// the predecessor's remaining rows, and the next marker covers `rows` plus
+/// `carried_forward_rows`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CodeSourceLocalityCutoverReportV1 {
@@ -74,6 +109,15 @@ pub struct CodeSourceLocalityCutoverReportV1 {
     pub checkout_observation_sequence: u64,
     pub source_observation_sequence: u64,
     pub rows: Vec<CodeSourceLocalityCutoverRowV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predecessor_marker_checksum: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub carried_forward_rows: Vec<CodeSourceLocalityCutoverRowV1>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dropped_rows: Vec<CodeSourceLocalityDroppedRowV1>,
+    /// Published catalog projects the next marker would still not cover.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub uncovered_projects: Vec<ProjectId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,6 +141,14 @@ pub struct CodeSourceLocalityCutoverReceiptV1 {
     pub project_count: u64,
     pub checkout_observation_sequence: u64,
     pub source_observation_sequence: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predecessor_marker_checksum_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub carried_forward_row_count: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub dropped_row_count: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub uncovered_project_count: u64,
 }
 
 pub struct CodeSourceLocalityCutoverPreflightRequestV1 {
@@ -216,39 +268,7 @@ impl CodeSourceLocalityCutoverRuntimeV1 {
                 );
                 continue;
             };
-            if project.scope != ProjectScope::Published(row.scope.clone()) {
-                bail!("governed code-source project scope changed");
-            }
-            if assigned_producer(config, &row.scope)? != row.producer_id {
-                bail!("governed code-source producer assignment changed");
-            }
-            // Boot-time verification tolerates an activation still in flight:
-            // the manifest is correctly serving the predecessor generation and
-            // the startup reducer sweep converges the journal record. Refusing
-            // here would crash-loop the daemon before the reducer that fixes
-            // it ever runs. Everything else about the governed row (catalog
-            // scope and producer assignment, checked above) is still enforced.
-            let current = match current_generation_outcome(store, projects_path, &row.project_id)? {
-                CurrentGenerationV1::Evidence(evidence) => evidence,
-                CurrentGenerationV1::ActivationInFlight { journal_generation } => {
-                    tracing::warn!(
-                        project_id = %row.project_id,
-                        journal_generation = %journal_generation,
-                        "governed code-source project has an activation in flight; deferring \
-                         generation verification to the startup reducer sweep"
-                    );
-                    continue;
-                }
-            };
-            if current.project_id != row.project_id
-                || current.scope != row.scope
-                || current.producer_id != row.producer_id
-            {
-                bail!(
-                    "error.code_source_locality_generation: governed project {} no longer has a current generation from its cutover authority",
-                    row.project_id
-                );
-            }
+            verify_governed_row(row, project, config, store, projects_path)?;
         }
         Ok(())
     }
@@ -299,7 +319,8 @@ impl ProjectCatalogCodeSourceLocalityCutoverFacadeV1 {
                 "code-source locality quiet window must be at least {MIN_CODE_SOURCE_LOCALITY_QUIET_SECS} seconds"
             );
         }
-        if request.project_ids.is_empty() {
+        let predecessor = load_marker(&request.layout.state_dir)?;
+        if request.project_ids.is_empty() && predecessor.is_none() {
             bail!("code-source locality cutover requires at least one explicit project id");
         }
         let selected = request.project_ids.into_iter().collect::<BTreeSet<_>>();
@@ -309,6 +330,15 @@ impl ProjectCatalogCodeSourceLocalityCutoverFacadeV1 {
         let store = open_code_store(&request.config)?;
         let observations = open_observations(&store)?.snapshot();
         let checkout = open_checkout_observations(&request.layout)?.health();
+        let (carried_forward_rows, dropped_rows) =
+            partition_predecessor_rows(predecessor.as_ref(), &catalog, &selected);
+        verify_carried_rows(
+            &carried_forward_rows,
+            &catalog,
+            &request.config,
+            &store,
+            request.layout.projects_path(),
+        )?;
         let mut rows = Vec::with_capacity(selected.len());
         for project_id in selected {
             let project = catalog
@@ -344,6 +374,7 @@ impl ProjectCatalogCodeSourceLocalityCutoverFacadeV1 {
                 checkout_baselines: local_walk_counters(&checkout, project.project_id.as_str()),
             });
         }
+        let uncovered_projects = uncovered_projects(&catalog, &rows, &carried_forward_rows);
         let report = CodeSourceLocalityCutoverReportV1 {
             version: REPORT_VERSION,
             generated_at: request.generated_at,
@@ -354,16 +385,26 @@ impl ProjectCatalogCodeSourceLocalityCutoverFacadeV1 {
             checkout_observation_sequence: checkout.sequence,
             source_observation_sequence: observations.sequence,
             rows,
+            predecessor_marker_checksum: predecessor.map(|marker| marker.checksum_sha256),
+            carried_forward_rows,
+            dropped_rows,
+            uncovered_projects,
         };
         validate_report(&report)?;
         write_json(&request.report_path, &report)?;
-        Ok(receipt(
-            "preflight_clean",
-            None,
-            report.rows.len(),
-            checkout.sequence,
-            observations.sequence,
-        ))
+        Ok(CodeSourceLocalityCutoverReceiptV1 {
+            predecessor_marker_checksum_sha256: report.predecessor_marker_checksum.clone(),
+            carried_forward_row_count: report.carried_forward_rows.len() as u64,
+            dropped_row_count: report.dropped_rows.len() as u64,
+            uncovered_project_count: report.uncovered_projects.len() as u64,
+            ..receipt(
+                "preflight_clean",
+                None,
+                report.rows.len() + report.carried_forward_rows.len(),
+                checkout.sequence,
+                observations.sequence,
+            )
+        })
     }
 
     pub fn apply(
@@ -371,20 +412,52 @@ impl ProjectCatalogCodeSourceLocalityCutoverFacadeV1 {
     ) -> Result<CodeSourceLocalityCutoverReceiptV1> {
         let report: CodeSourceLocalityCutoverReportV1 = read_json_required(&request.report_path)?;
         validate_report(&report)?;
+        // The quiet window measures the projects this run proves. Carried
+        // rows keep the evidence baseline their original apply accepted.
         let elapsed = now_unix_secs().saturating_sub(report.generated_at_unix_secs);
-        if elapsed < report.min_quiet_secs {
+        if !report.rows.is_empty() && elapsed < report.min_quiet_secs {
             bail!(
                 "code-source locality quiet window is incomplete: {elapsed}/{} seconds",
                 report.min_quiet_secs
             );
         }
         let catalog_store = ProjectCatalogStore::open_existing(request.layout.projects_path())?;
+        let _catalog_lock = acquire_store_lock_nofollow(request.layout.projects_path())?;
         let catalog = catalog_store.snapshot()?.catalog().as_ref().clone();
         if catalog.epoch != report.catalog_epoch || sha256_json(&catalog)? != report.catalog_sha256
         {
             bail!("code-source locality cutover report is stale against the current catalog");
         }
+        let predecessor = load_marker(&request.layout.state_dir)?;
+        if predecessor.as_ref().map(|marker| &marker.checksum_sha256)
+            != report.predecessor_marker_checksum.as_ref()
+        {
+            bail!(
+                "code-source locality cutover marker changed since preflight; run a new preflight"
+            );
+        }
+        let proved = report
+            .rows
+            .iter()
+            .map(|row| row.project_id.clone())
+            .collect::<BTreeSet<_>>();
+        let (carried_forward_rows, dropped_rows) =
+            partition_predecessor_rows(predecessor.as_ref(), &catalog, &proved);
+        if carried_forward_rows != report.carried_forward_rows
+            || dropped_rows != report.dropped_rows
+        {
+            bail!(
+                "reviewed carry-forward or dropped code-source locality rows do not match the current predecessor"
+            );
+        }
         let store = open_code_store(&request.config)?;
+        verify_carried_rows(
+            &report.carried_forward_rows,
+            &catalog,
+            &request.config,
+            &store,
+            request.layout.projects_path(),
+        )?;
         let observations = open_observations(&store)?.snapshot();
         let checkout = open_checkout_observations(&request.layout)?.health();
         for row in &report.rows {
@@ -422,27 +495,47 @@ impl ProjectCatalogCodeSourceLocalityCutoverFacadeV1 {
             .layout
             .state_dir
             .join(CODE_SOURCE_LOCALITY_CUTOVER_MARKER_FILE);
-        if marker_path.exists() {
-            bail!("code-source locality cutover marker already exists; verify it instead");
-        }
-        let mut marker = CodeSourceLocalityCutoverMarkerV1 {
-            version: MARKER_VERSION,
-            applied_at: request.applied_at,
-            report_sha256: sha256_json(&report)?,
-            catalog_epoch: report.catalog_epoch,
-            catalog_sha256: report.catalog_sha256,
-            rows: report.rows,
-            checksum_sha256: String::new(),
+        let report_sha256 = sha256_json(&report)?;
+        let rows = successor_rows(&report.rows, &report.carried_forward_rows);
+        let installed = if rows.is_empty() {
+            // Every predecessor row was dropped and nothing new is proved.
+            // The daemon refuses an empty marker, so the successor is the
+            // absent marker, which governs no project.
+            remove_marker(&marker_path)?;
+            None
+        } else {
+            let mut marker = CodeSourceLocalityCutoverMarkerV1 {
+                version: MARKER_VERSION,
+                applied_at: request.applied_at,
+                report_sha256,
+                catalog_epoch: report.catalog_epoch,
+                catalog_sha256: report.catalog_sha256.clone(),
+                rows,
+                checksum_sha256: String::new(),
+            };
+            marker.checksum_sha256 = marker_checksum(&marker)?;
+            validate_marker(&marker)?;
+            write_json(&marker_path, &marker)?;
+            Some(marker)
         };
-        marker.checksum_sha256 = marker_checksum(&marker)?;
-        write_json(&marker_path, &marker)?;
-        Ok(receipt(
-            "applied",
-            Some(marker.checksum_sha256),
-            marker.rows.len(),
-            checkout.sequence,
-            observations.sequence,
-        ))
+        let project_count = installed.as_ref().map_or(0, |marker| marker.rows.len());
+        Ok(CodeSourceLocalityCutoverReceiptV1 {
+            predecessor_marker_checksum_sha256: report.predecessor_marker_checksum,
+            carried_forward_row_count: report.carried_forward_rows.len() as u64,
+            dropped_row_count: report.dropped_rows.len() as u64,
+            uncovered_project_count: report.uncovered_projects.len() as u64,
+            ..receipt(
+                if installed.is_some() {
+                    "applied"
+                } else {
+                    "retired"
+                },
+                installed.map(|marker| marker.checksum_sha256),
+                project_count,
+                checkout.sequence,
+                observations.sequence,
+            )
+        })
     }
 
     pub fn verify(
@@ -481,6 +574,165 @@ impl ProjectCatalogCodeSourceLocalityCutoverFacadeV1 {
             observations.sequence,
         ))
     }
+}
+
+/// The checks daemon startup applies to a governed row whose project is in
+/// the catalog: the catalog scope and producer assignment are unchanged, and
+/// the current collected generation comes from the row's cutover authority.
+/// The recorded generation is an evidence baseline, not a content pin, so a
+/// later generation from the same authority passes.
+fn verify_governed_row(
+    row: &CodeSourceLocalityCutoverRowV1,
+    project: &CorpusProject,
+    config: &Config,
+    store: &CodeSourceStore,
+    projects_path: &Path,
+) -> Result<()> {
+    if project.scope != ProjectScope::Published(row.scope.clone()) {
+        bail!("governed code-source project scope changed");
+    }
+    if assigned_producer(config, &row.scope)? != row.producer_id {
+        bail!("governed code-source producer assignment changed");
+    }
+    // Boot-time verification tolerates an activation still in flight: the
+    // manifest is correctly serving the predecessor generation and the
+    // startup reducer sweep converges the journal record. Refusing here would
+    // crash-loop the daemon before the reducer that fixes it ever runs.
+    // Everything else about the governed row (catalog scope and producer
+    // assignment, checked above) is still enforced.
+    let current = match current_generation_outcome(store, projects_path, &row.project_id)? {
+        CurrentGenerationV1::Evidence(evidence) => evidence,
+        CurrentGenerationV1::ActivationInFlight { journal_generation } => {
+            tracing::warn!(
+                project_id = %row.project_id,
+                journal_generation = %journal_generation,
+                "governed code-source project has an activation in flight; deferring \
+                 generation verification to the startup reducer sweep"
+            );
+            return Ok(());
+        }
+    };
+    if current.project_id != row.project_id
+        || current.scope != row.scope
+        || current.producer_id != row.producer_id
+    {
+        bail!(
+            "error.code_source_locality_generation: governed project {} no longer has a current generation from its cutover authority",
+            row.project_id
+        );
+    }
+    Ok(())
+}
+
+/// A carried row must still pass the governed-row checks, so the successor
+/// marker never holds a row daemon startup would refuse.
+fn verify_carried_rows(
+    rows: &[CodeSourceLocalityCutoverRowV1],
+    catalog: &CatalogSnapshotV2,
+    config: &Config,
+    store: &CodeSourceStore,
+    projects_path: &Path,
+) -> Result<()> {
+    for row in rows {
+        let project = catalog.projects.get(&row.project_id).with_context(|| {
+            format!(
+                "carried cutover project {} left the catalog",
+                row.project_id
+            )
+        })?;
+        verify_governed_row(row, project, config, store, projects_path)
+            .with_context(|| format!("carried code-source locality row {}", row.project_id))?;
+    }
+    Ok(())
+}
+
+fn load_marker(state_dir: &Path) -> Result<Option<CodeSourceLocalityCutoverMarkerV1>> {
+    let path = state_dir.join(CODE_SOURCE_LOCALITY_CUTOVER_MARKER_FILE);
+    let Some(marker) = read_json_optional::<CodeSourceLocalityCutoverMarkerV1>(&path)? else {
+        return Ok(None);
+    };
+    validate_marker(&marker)?;
+    Ok(Some(marker))
+}
+
+/// Split the predecessor's rows that this run does not re-prove into rows
+/// carried forward unchanged and rows dropped because their project left the
+/// catalog. A carried row keeps the recovery evidence its original apply
+/// accepted: the recorded generation is the baseline that justified the
+/// authority boundary, not a content pin (CS-D3 in the code-source locality
+/// design). Its live validity is checked separately.
+fn partition_predecessor_rows(
+    predecessor: Option<&CodeSourceLocalityCutoverMarkerV1>,
+    catalog: &CatalogSnapshotV2,
+    proved: &BTreeSet<ProjectId>,
+) -> (
+    Vec<CodeSourceLocalityCutoverRowV1>,
+    Vec<CodeSourceLocalityDroppedRowV1>,
+) {
+    let mut carried = Vec::new();
+    let mut dropped = Vec::new();
+    for row in predecessor.into_iter().flat_map(|marker| &marker.rows) {
+        if proved.contains(&row.project_id) {
+            continue;
+        }
+        if catalog.projects.contains_key(&row.project_id) {
+            carried.push(row.clone());
+        } else {
+            dropped.push(CodeSourceLocalityDroppedRowV1 {
+                project_id: row.project_id.clone(),
+                scope: row.scope.clone(),
+                producer_id: row.producer_id.clone(),
+                reason: CodeSourceLocalityDroppedRowReasonV1::ProjectAbsentFromCatalog,
+            });
+        }
+    }
+    (carried, dropped)
+}
+
+fn uncovered_projects(
+    catalog: &CatalogSnapshotV2,
+    rows: &[CodeSourceLocalityCutoverRowV1],
+    carried: &[CodeSourceLocalityCutoverRowV1],
+) -> Vec<ProjectId> {
+    let covered = rows
+        .iter()
+        .chain(carried)
+        .map(|row| &row.project_id)
+        .collect::<BTreeSet<_>>();
+    catalog
+        .projects
+        .values()
+        .filter(|project| matches!(project.scope, ProjectScope::Published(_)))
+        .filter(|project| !covered.contains(&project.project_id))
+        .map(|project| project.project_id.clone())
+        .collect()
+}
+
+fn successor_rows(
+    proved: &[CodeSourceLocalityCutoverRowV1],
+    carried: &[CodeSourceLocalityCutoverRowV1],
+) -> Vec<CodeSourceLocalityCutoverRowV1> {
+    proved
+        .iter()
+        .chain(carried)
+        .map(|row| (row.project_id.clone(), row.clone()))
+        .collect::<BTreeMap<_, _>>()
+        .into_values()
+        .collect()
+}
+
+// Runs only in the offline cutover command, never on a tokio worker.
+#[allow(clippy::disallowed_methods)]
+fn remove_marker(path: &Path) -> Result<()> {
+    with_store_lock(path, || {
+        std::fs::remove_file(path)?;
+        std::fs::File::open(path.parent().context("marker path has no parent")?)?.sync_all()?;
+        Ok(())
+    })
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 /// What the journal and the derived manifest jointly say about a project's
@@ -674,17 +926,39 @@ fn open_checkout_observations(
 fn validate_report(report: &CodeSourceLocalityCutoverReportV1) -> Result<()> {
     if report.version != REPORT_VERSION
         || report.min_quiet_secs < MIN_CODE_SOURCE_LOCALITY_QUIET_SECS
-        || report.rows.is_empty()
     {
         bail!("invalid code-source locality cutover report");
     }
     validate_sha256(&report.catalog_sha256)?;
+    match &report.predecessor_marker_checksum {
+        // A first cutover proves at least one project and has no
+        // predecessor rows to carry or drop.
+        None => {
+            if report.rows.is_empty()
+                || !report.carried_forward_rows.is_empty()
+                || !report.dropped_rows.is_empty()
+            {
+                bail!("invalid code-source locality cutover report");
+            }
+        }
+        Some(checksum) => validate_sha256(checksum)?,
+    }
     let mut seen = BTreeSet::new();
-    for row in &report.rows {
+    for row in report.rows.iter().chain(&report.carried_forward_rows) {
         if !seen.insert(row.project_id.clone()) {
             bail!("duplicate code-source locality cutover project");
         }
         validate_row(row)?;
+    }
+    for dropped in &report.dropped_rows {
+        if !seen.insert(dropped.project_id.clone()) {
+            bail!("duplicate code-source locality cutover dropped row");
+        }
+    }
+    for project_id in &report.uncovered_projects {
+        if !seen.insert(project_id.clone()) {
+            bail!("duplicate code-source locality cutover uncovered project");
+        }
     }
     Ok(())
 }
@@ -756,6 +1030,10 @@ fn receipt(
         project_count: rows as u64,
         checkout_observation_sequence: checkout_sequence,
         source_observation_sequence: source_sequence,
+        predecessor_marker_checksum_sha256: None,
+        carried_forward_row_count: 0,
+        dropped_row_count: 0,
+        uncovered_project_count: 0,
     }
 }
 
@@ -821,8 +1099,21 @@ mod tests {
         ProjectId,
         PublishedScope,
     ) {
+        let project_id = ProjectId::parse(PROJECT).unwrap();
+        let scope = PublishedScope::try_new("fixture-repo", ".").unwrap();
+        let (config, layout) = fixture_config(root, std::slice::from_ref(&scope));
+        insert_catalog_projects(&layout, &[(project_id.clone(), scope.clone())]);
+        activate_generation(&config, &layout, &project_id, &scope, 'a', 'b', 1);
+        record_recovery_evidence(&config, &layout);
+        (config, layout, project_id, scope)
+    }
+
+    /// A catalog-mode configuration whose single producer owns `scopes`.
+    fn fixture_config(
+        root: &Path,
+        scopes: &[PublishedScope],
+    ) -> (Config, ProjectCatalogMigrationResolvedLayoutV1) {
         use bbox_config::config::{CodeCollectionProducerConfig, LoadOptions};
-        use bbox_corpus_core::project_catalog::{CatalogSnapshotV2, CorpusProject};
 
         let state_dir = root.join("state");
         std::fs::create_dir_all(&state_dir).unwrap();
@@ -846,14 +1137,12 @@ mod tests {
         config.paths.bro_home = state_dir.join("bro");
         config.paths.index_path = state_dir.join("index");
         config.paths.vectors_path = state_dir.join("vectors");
-        let project_id = ProjectId::parse(PROJECT).unwrap();
-        let scope = PublishedScope::try_new("fixture-repo", ".").unwrap();
         config.code_collection.enabled = true;
         config.code_collection.producers = vec![CodeCollectionProducerConfig {
             producer_id: "producer".into(),
             token_file: root.join("producer-token"),
             token_files: Vec::new(),
-            scopes: vec![scope.clone()],
+            scopes: scopes.to_vec(),
             claim_scopes: Default::default(),
             auto_publish: false,
         }];
@@ -865,153 +1154,56 @@ mod tests {
             },
         )
         .unwrap();
-        let catalog = ProjectCatalogStore::initialize_empty(layout.projects_path()).unwrap();
+        ProjectCatalogStore::initialize_empty(layout.projects_path()).unwrap();
+        (config, layout)
+    }
+
+    fn insert_catalog_projects(
+        layout: &ProjectCatalogMigrationResolvedLayoutV1,
+        projects: &[(ProjectId, PublishedScope)],
+    ) {
+        use bbox_corpus_core::project_catalog::CatalogSnapshotV2;
+
+        let catalog = ProjectCatalogStore::open_existing(layout.projects_path()).unwrap();
         let epoch = catalog.snapshot().unwrap().epoch();
-        let project_id_for_catalog = project_id.clone();
-        let scope_for_catalog = scope.clone();
         catalog
             .transact(
                 epoch,
                 move |catalog: &mut CatalogSnapshotV2, _attachments| {
-                    catalog.projects.insert(
-                        project_id_for_catalog.clone(),
-                        CorpusProject {
-                            project_id: project_id_for_catalog.clone(),
-                            scope: ProjectScope::Published(scope_for_catalog.clone()),
-                            operator_aliases: Default::default(),
-                            nominated_aliases: Default::default(),
-                            display_name: "fixture".into(),
-                            created_at: "2026-08-09T00:00:00Z".into(),
-                            registered_at_compat: None,
-                            repo_history: None,
-                            languages: Default::default(),
-                        },
-                    );
+                    for (project_id, scope) in projects {
+                        catalog.projects.insert(
+                            project_id.clone(),
+                            CorpusProject {
+                                project_id: project_id.clone(),
+                                scope: ProjectScope::Published(scope.clone()),
+                                operator_aliases: Default::default(),
+                                nominated_aliases: Default::default(),
+                                display_name: "fixture".into(),
+                                created_at: "2026-08-09T00:00:00Z".into(),
+                                registered_at_compat: None,
+                                repo_history: None,
+                                languages: Default::default(),
+                            },
+                        );
+                    }
                     Ok(())
                 },
             )
             .unwrap();
-
-        let store = CodeSourceStore::open_with_mode(
-            state_dir.join("code-sources"),
-            StoreLimits::default(),
-            RuntimeRecordMode::CatalogV2,
-        )
-        .unwrap();
-        let head_commit = "a".repeat(40);
-        let entries = Vec::new();
-        let descriptor = bbox_code_source::GenerationDescriptor {
-            schema_version: bbox_code_source::SCHEMA_VERSION,
-            walker_policy_version: bbox_code_source::WALKER_POLICY_VERSION.into(),
-            scope: scope.clone(),
-            head_commit: head_commit.clone(),
-            dirty_fingerprint: bbox_code_source::dirty_fingerprint(&head_commit, &entries),
-            manifest_sha256: bbox_code_source::manifest_sha256(&entries),
-            file_count: 0,
-            logical_bytes: 0,
-        };
-        let upload = store.begin_upload("producer", descriptor).unwrap();
-        store
-            .complete_manifest("producer", &upload.upload_id)
-            .unwrap();
-        let generation = store
-            .finalize_upload_mixed("producer", &upload.upload_id)
-            .unwrap();
-        let generation_id = generation.generation_id().to_string();
-        let inventory = "b".repeat(64);
-        store
-            .record_materialization_mixed(&scope, &generation_id, 0, inventory.clone())
-            .unwrap();
-        store
-            .mark_generation_state_mixed(&scope, &generation_id, GenerationState::Active, None)
-            .unwrap();
-        let selector = crate::index::project_files::collected_materialization_selector(
-            project_id.as_str(),
-            &generation_id,
-        );
-        let snapshot_id =
-            bbox_edge_sidecar::snapshot::collected_snapshot_id(project_id.as_str(), &generation_id);
-        store
-            .save_activation_v2(&bbox_code_source_store::ActivationRecordV2 {
-                version: bbox_code_source_store::MIGRATION_STORE_VERSION,
-                project_id: project_id.clone(),
-                published_scope: scope.clone(),
-                generation_id: generation_id.clone(),
-                selector: selector.clone(),
-                snapshot_id: snapshot_id.clone(),
-                document_count: 0,
-                entity_inventory_sha256: inventory,
-                current_chunk_targets: BTreeMap::new(),
-                activated_unix_secs: 1,
-                cutback_pending: false,
-                cutback: None,
-                diagnostic: None,
-            })
-            .unwrap();
-        let edges_dir =
-            bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(layout.projects_path());
-        std::fs::create_dir_all(bbox_edge_sidecar::snapshot::snapshot_dir(
-            &edges_dir,
-            project_id.as_str(),
-            &snapshot_id,
-        ))
-        .unwrap();
-        bbox_edge_sidecar::snapshot::activate_collected_snapshot(
-            &edges_dir,
-            project_id.as_str(),
-            scope.repo_id(),
-            &head_commit,
-            &generation_id,
-            &selector,
-            &snapshot_id,
-        )
-        .unwrap();
-        let observations = CodeSourceLocalityObservationsV1::open(
-            observation_path_from_code_source_root(store.root()).unwrap(),
-        )
-        .unwrap();
-        observations
-            .record_verified_activations(
-                &store,
-                layout.projects_path(),
-                CodeSourceLocalityEvidenceKindV1::StartupRecovery,
-            )
-            .unwrap();
-        observations
-            .record_verified_activations(
-                &store,
-                layout.projects_path(),
-                CodeSourceLocalityEvidenceKindV1::FullRebuild,
-            )
-            .unwrap();
-        (config, layout, project_id, scope)
     }
 
-    fn row() -> CodeSourceLocalityCutoverRowV1 {
-        let project_id = ProjectId::parse(PROJECT).unwrap();
-        let scope = PublishedScope::try_new("repo", ".").unwrap();
-        let observation = |kind, sequence| CodeSourceLocalityObservationV1 {
-            project_id: project_id.clone(),
-            scope: scope.clone(),
-            producer_id: "producer".into(),
-            generation_id: "a".repeat(64),
-            selector: "collected:fixture".into(),
-            snapshot_id: "collected-fixture".into(),
-            document_count: 3,
-            entity_inventory_sha256: "b".repeat(64),
-            evidence_kind: kind,
-            sequence,
-            observed_at_unix_secs: sequence,
-        };
-        let startup = observation(CodeSourceLocalityEvidenceKindV1::StartupRecovery, 1);
-        CodeSourceLocalityCutoverRowV1 {
-            project_id: project_id.clone(),
-            scope: scope.clone(),
-            producer_id: "producer".into(),
-            generation: generation_from_observation(&startup),
-            startup_recovery: startup,
-            full_rebuild: observation(CodeSourceLocalityEvidenceKindV1::FullRebuild, 2),
-            checkout_baselines: Vec::new(),
+    /// Record `StartupRecovery` and `FullRebuild` evidence for every healthy
+    /// current activation.
+    fn record_recovery_evidence(config: &Config, layout: &ProjectCatalogMigrationResolvedLayoutV1) {
+        let store = open_code_store(config).unwrap();
+        let observations = open_observations(&store).unwrap();
+        for kind in [
+            CodeSourceLocalityEvidenceKindV1::StartupRecovery,
+            CodeSourceLocalityEvidenceKindV1::FullRebuild,
+        ] {
+            observations
+                .record_verified_activations(&store, layout.projects_path(), kind)
+                .unwrap();
         }
     }
 
@@ -1021,13 +1213,22 @@ mod tests {
         project_id: &ProjectId,
         scope: &PublishedScope,
     ) -> String {
-        let store = CodeSourceStore::open_with_mode(
-            config.paths.state_dir.join("code-sources"),
-            StoreLimits::default(),
-            RuntimeRecordMode::CatalogV2,
-        )
-        .unwrap();
-        let head_commit = "c".repeat(40);
+        activate_generation(config, layout, project_id, scope, 'c', 'd', 2)
+    }
+
+    /// Finalize, materialize, and activate a collected generation for the
+    /// project, with the workspace manifest in agreement.
+    fn activate_generation(
+        config: &Config,
+        layout: &ProjectCatalogMigrationResolvedLayoutV1,
+        project_id: &ProjectId,
+        scope: &PublishedScope,
+        head: char,
+        inventory: char,
+        activated_unix_secs: u64,
+    ) -> String {
+        let store = open_code_store(config).unwrap();
+        let head_commit = head.to_string().repeat(40);
         let entries = Vec::new();
         let descriptor = bbox_code_source::GenerationDescriptor {
             schema_version: bbox_code_source::SCHEMA_VERSION,
@@ -1047,7 +1248,7 @@ mod tests {
             .finalize_upload_mixed("producer", &upload.upload_id)
             .unwrap();
         let generation_id = generation.generation_id().to_string();
-        let inventory = "d".repeat(64);
+        let inventory = inventory.to_string().repeat(64);
         store
             .record_materialization_mixed(scope, &generation_id, 0, inventory.clone())
             .unwrap();
@@ -1071,7 +1272,7 @@ mod tests {
                 document_count: 0,
                 entity_inventory_sha256: inventory,
                 current_chunk_targets: BTreeMap::new(),
-                activated_unix_secs: 2,
+                activated_unix_secs,
                 cutback_pending: false,
                 cutback: None,
                 diagnostic: None,
@@ -1096,6 +1297,38 @@ mod tests {
         )
         .unwrap();
         generation_id
+    }
+
+    fn row() -> CodeSourceLocalityCutoverRowV1 {
+        row_for(PROJECT)
+    }
+
+    fn row_for(project_id: &str) -> CodeSourceLocalityCutoverRowV1 {
+        let project_id = ProjectId::parse(project_id).unwrap();
+        let scope = PublishedScope::try_new("repo", ".").unwrap();
+        let observation = |kind, sequence| CodeSourceLocalityObservationV1 {
+            project_id: project_id.clone(),
+            scope: scope.clone(),
+            producer_id: "producer".into(),
+            generation_id: "a".repeat(64),
+            selector: "collected:fixture".into(),
+            snapshot_id: "collected-fixture".into(),
+            document_count: 3,
+            entity_inventory_sha256: "b".repeat(64),
+            evidence_kind: kind,
+            sequence,
+            observed_at_unix_secs: sequence,
+        };
+        let startup = observation(CodeSourceLocalityEvidenceKindV1::StartupRecovery, 1);
+        CodeSourceLocalityCutoverRowV1 {
+            project_id: project_id.clone(),
+            scope: scope.clone(),
+            producer_id: "producer".into(),
+            generation: generation_from_observation(&startup),
+            startup_recovery: startup,
+            full_rebuild: observation(CodeSourceLocalityEvidenceKindV1::FullRebuild, 2),
+            checkout_baselines: Vec::new(),
+        }
     }
 
     fn marker() -> CodeSourceLocalityCutoverMarkerV1 {
@@ -1639,5 +1872,350 @@ mod tests {
         )
         .unwrap();
         assert_eq!(verified.status, "verified");
+    }
+
+    const NEW_PROJECT: &str = "p_00000000000000000000000000000003";
+    const UNCOVERED_PROJECT: &str = "p_00000000000000000000000000000004";
+    const RETIRED_PROJECT_A: &str = "p_000000000000000000000000000000a1";
+    const RETIRED_PROJECT_B: &str = "p_000000000000000000000000000000a2";
+
+    /// The marker fields a daemon built before re-runnable cutovers accepts;
+    /// the marker denies unknown fields, so a successor must add none.
+    const DEPLOYED_MARKER_FIELDS: [&str; 7] = [
+        "applied_at",
+        "catalog_epoch",
+        "catalog_sha256",
+        "checksum_sha256",
+        "report_sha256",
+        "rows",
+        "version",
+    ];
+
+    fn preflight_projects(
+        config: &Config,
+        layout: &ProjectCatalogMigrationResolvedLayoutV1,
+        report_path: &Path,
+        project_ids: &[&str],
+    ) -> Result<CodeSourceLocalityCutoverReceiptV1> {
+        ProjectCatalogCodeSourceLocalityCutoverFacadeV1::preflight(
+            CodeSourceLocalityCutoverPreflightRequestV1 {
+                layout: layout.clone(),
+                config: config.clone(),
+                report_path: report_path.to_path_buf(),
+                project_ids: project_ids
+                    .iter()
+                    .map(|project_id| ProjectId::parse(*project_id).unwrap())
+                    .collect(),
+                min_quiet_secs: MIN_CODE_SOURCE_LOCALITY_QUIET_SECS,
+                generated_at: "2026-08-09T00:00:00Z".into(),
+            },
+        )
+    }
+
+    fn apply_report(
+        config: &Config,
+        layout: &ProjectCatalogMigrationResolvedLayoutV1,
+        report_path: &Path,
+    ) -> Result<CodeSourceLocalityCutoverReceiptV1> {
+        ProjectCatalogCodeSourceLocalityCutoverFacadeV1::apply(
+            CodeSourceLocalityCutoverApplyRequestV1 {
+                layout: layout.clone(),
+                config: config.clone(),
+                report_path: report_path.to_path_buf(),
+                applied_at: "2026-08-09T00:05:00Z".into(),
+            },
+        )
+    }
+
+    fn age_report(report_path: &Path) {
+        let mut report: CodeSourceLocalityCutoverReportV1 =
+            read_json_required(report_path).unwrap();
+        report.generated_at_unix_secs =
+            now_unix_secs().saturating_sub(MIN_CODE_SOURCE_LOCALITY_QUIET_SECS);
+        write_json(report_path, &report).unwrap();
+    }
+
+    fn installed_marker(
+        layout: &ProjectCatalogMigrationResolvedLayoutV1,
+    ) -> (serde_json::Value, CodeSourceLocalityCutoverMarkerV1) {
+        let bytes = std::fs::read(
+            layout
+                .state_dir
+                .join(CODE_SOURCE_LOCALITY_CUTOVER_MARKER_FILE),
+        )
+        .unwrap();
+        (
+            serde_json::from_slice(&bytes).unwrap(),
+            serde_json::from_slice(&bytes).unwrap(),
+        )
+    }
+
+    fn marker_field_names(json: &serde_json::Value) -> BTreeSet<&str> {
+        json.as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect()
+    }
+
+    /// Rewrite the installed marker with extra synthetic rows for projects
+    /// the catalog does not hold, as a retirement leaves it.
+    fn add_retired_rows(
+        layout: &ProjectCatalogMigrationResolvedLayoutV1,
+        base: Option<&CodeSourceLocalityCutoverMarkerV1>,
+    ) -> CodeSourceLocalityCutoverMarkerV1 {
+        let mut rows = base.map(|marker| marker.rows.clone()).unwrap_or_default();
+        rows.extend([row_for(RETIRED_PROJECT_A), row_for(RETIRED_PROJECT_B)]);
+        rows.sort_by(|left, right| left.project_id.cmp(&right.project_id));
+        let mut marker = CodeSourceLocalityCutoverMarkerV1 {
+            rows,
+            checksum_sha256: String::new(),
+            ..base.cloned().unwrap_or_else(marker)
+        };
+        marker.checksum_sha256 = marker_checksum(&marker).unwrap();
+        write_json(
+            &layout
+                .state_dir
+                .join(CODE_SOURCE_LOCALITY_CUTOVER_MARKER_FILE),
+            &marker,
+        )
+        .unwrap();
+        marker
+    }
+
+    fn ids(rows: &[CodeSourceLocalityCutoverRowV1]) -> Vec<&str> {
+        rows.iter().map(|row| row.project_id.as_str()).collect()
+    }
+
+    #[test]
+    fn recut_carries_governed_rows_drops_retired_rows_and_proves_selected_projects() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let carried = ProjectId::parse(PROJECT).unwrap();
+        let new = ProjectId::parse(NEW_PROJECT).unwrap();
+        let carried_scope = PublishedScope::try_new("repo-carried", ".").unwrap();
+        let new_scope = PublishedScope::try_new("repo-new", ".").unwrap();
+        let (config, layout) = fixture_config(&root, &[carried_scope.clone(), new_scope.clone()]);
+        insert_catalog_projects(
+            &layout,
+            &[
+                (carried.clone(), carried_scope.clone()),
+                (new.clone(), new_scope.clone()),
+                (
+                    ProjectId::parse(UNCOVERED_PROJECT).unwrap(),
+                    PublishedScope::try_new("repo-uncovered", ".").unwrap(),
+                ),
+            ],
+        );
+        activate_generation(&config, &layout, &carried, &carried_scope, 'a', 'b', 1);
+        activate_generation(&config, &layout, &new, &new_scope, 'e', 'f', 1);
+        record_recovery_evidence(&config, &layout);
+        let report_path = root.join("code-source-locality-report.json");
+
+        // First cutover: no marker, explicit selection, prior report shape.
+        let error = preflight_projects(&config, &layout, &report_path, &[]).unwrap_err();
+        assert!(format!("{error:#}").contains("at least one explicit project id"));
+        let first = preflight_projects(&config, &layout, &report_path, &[PROJECT]).unwrap();
+        assert_eq!(first.project_count, 1);
+        let first_json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&report_path).unwrap()).unwrap();
+        for absent in [
+            "predecessor_marker_checksum",
+            "carried_forward_rows",
+            "dropped_rows",
+        ] {
+            assert!(first_json.get(absent).is_none(), "{absent}");
+        }
+        let receipt_json = serde_json::to_value(&first).unwrap();
+        for absent in [
+            "predecessor_marker_checksum_sha256",
+            "carried_forward_row_count",
+            "dropped_row_count",
+        ] {
+            assert!(receipt_json.get(absent).is_none(), "{absent}");
+        }
+        age_report(&report_path);
+        apply_report(&config, &layout, &report_path).unwrap();
+        // The same first-cutover report no longer matches the installed
+        // marker.
+        let error = apply_report(&config, &layout, &report_path).unwrap_err();
+        assert!(format!("{error:#}").contains("changed since preflight"));
+        let (_, first_marker) = installed_marker(&layout);
+        let predecessor = add_retired_rows(&layout, Some(&first_marker));
+        assert!(
+            CodeSourceLocalityCutoverRuntimeV1::open(&layout.state_dir)
+                .unwrap()
+                .transport_governed(RETIRED_PROJECT_A)
+        );
+
+        // The carried project's collector advances. The row's generation is
+        // an evidence baseline, not a pin, so it still carries unchanged.
+        activate_successor_generation(&config, &layout, &carried, &carried_scope);
+
+        // A carried row must still pass the startup checks.
+        let mut lost_assignment = config.clone();
+        lost_assignment.code_collection.producers[0].scopes = vec![new_scope.clone()];
+        let error = preflight_projects(&lost_assignment, &layout, &report_path, &[NEW_PROJECT])
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("carried code-source locality row"),
+            "{error:#}"
+        );
+
+        let receipt = preflight_projects(&config, &layout, &report_path, &[NEW_PROJECT]).unwrap();
+        assert_eq!(receipt.status, "preflight_clean");
+        assert_eq!(receipt.project_count, 2);
+        assert_eq!(receipt.carried_forward_row_count, 1);
+        assert_eq!(receipt.dropped_row_count, 2);
+        assert_eq!(receipt.uncovered_project_count, 1);
+        assert_eq!(
+            receipt.predecessor_marker_checksum_sha256.as_ref(),
+            Some(&predecessor.checksum_sha256)
+        );
+        let report: CodeSourceLocalityCutoverReportV1 = read_json_required(&report_path).unwrap();
+        assert_eq!(ids(&report.rows), [NEW_PROJECT]);
+        assert_eq!(report.carried_forward_rows, first_marker.rows);
+        assert_eq!(
+            report
+                .dropped_rows
+                .iter()
+                .map(|row| (row.project_id.as_str(), row.reason))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    RETIRED_PROJECT_A,
+                    CodeSourceLocalityDroppedRowReasonV1::ProjectAbsentFromCatalog
+                ),
+                (
+                    RETIRED_PROJECT_B,
+                    CodeSourceLocalityDroppedRowReasonV1::ProjectAbsentFromCatalog
+                ),
+            ]
+        );
+        assert_eq!(
+            serde_json::to_value(&report.dropped_rows[0]).unwrap()["reason"],
+            "project_absent_from_catalog"
+        );
+        assert_eq!(
+            report
+                .uncovered_projects
+                .iter()
+                .map(ProjectId::as_str)
+                .collect::<Vec<_>>(),
+            [UNCOVERED_PROJECT]
+        );
+
+        let error = apply_report(&config, &layout, &report_path).unwrap_err();
+        assert!(format!("{error:#}").contains("quiet window is incomplete"));
+        age_report(&report_path);
+        let reviewed = std::fs::read(&report_path).unwrap();
+        let mut tampered: CodeSourceLocalityCutoverReportV1 =
+            read_json_required(&report_path).unwrap();
+        tampered.dropped_rows.clear();
+        write_json(&report_path, &tampered).unwrap();
+        let error = apply_report(&config, &layout, &report_path).unwrap_err();
+        assert!(format!("{error:#}").contains("do not match the current predecessor"));
+        std::fs::write(&report_path, &reviewed).unwrap();
+
+        let applied = apply_report(&config, &layout, &report_path).unwrap();
+        assert_eq!(applied.status, "applied");
+        let (json, marker) = installed_marker(&layout);
+        assert_eq!(
+            marker_field_names(&json),
+            BTreeSet::from(DEPLOYED_MARKER_FIELDS)
+        );
+        assert_eq!(ids(&marker.rows), [PROJECT, NEW_PROJECT]);
+        assert_eq!(marker.rows[0], first_marker.rows[0]);
+        assert_eq!(marker.rows[1], report.rows[0]);
+        assert_eq!(marker.checksum_sha256, marker_checksum(&marker).unwrap());
+        assert_eq!(
+            marker.report_sha256,
+            sha256_json(
+                &read_json_required::<CodeSourceLocalityCutoverReportV1>(&report_path).unwrap()
+            )
+            .unwrap()
+        );
+        assert_eq!(applied.marker_checksum_sha256, Some(marker.checksum_sha256));
+        assert_eq!(applied.project_count, 2);
+        assert_eq!(
+            applied.predecessor_marker_checksum_sha256,
+            Some(predecessor.checksum_sha256)
+        );
+        assert_eq!(applied.carried_forward_row_count, 1);
+        assert_eq!(applied.dropped_row_count, 2);
+
+        // Daemon startup opens the marker and checks every governed row.
+        let runtime = CodeSourceLocalityCutoverRuntimeV1::open(&layout.state_dir).unwrap();
+        assert!(runtime.transport_governed(PROJECT));
+        assert!(runtime.transport_governed(NEW_PROJECT));
+        for ungoverned in [UNCOVERED_PROJECT, RETIRED_PROJECT_A, RETIRED_PROJECT_B] {
+            assert!(!runtime.transport_governed(ungoverned));
+        }
+        runtime
+            .verify_live(
+                &ProjectCatalogStore::open_existing(layout.projects_path()).unwrap(),
+                &config,
+                &open_code_store(&config).unwrap(),
+                layout.projects_path(),
+            )
+            .unwrap();
+        let verified = ProjectCatalogCodeSourceLocalityCutoverFacadeV1::verify(
+            CodeSourceLocalityCutoverVerifyRequestV1 {
+                layout: layout.clone(),
+                config: config.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(verified.status, "verified");
+        assert_eq!(verified.project_count, 2);
+    }
+
+    #[test]
+    fn recut_whose_every_predecessor_row_is_retired_removes_the_marker() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let (config, layout) = fixture_config(&root, &[]);
+        insert_catalog_projects(
+            &layout,
+            &[(
+                ProjectId::parse(UNCOVERED_PROJECT).unwrap(),
+                PublishedScope::try_new("repo-uncovered", ".").unwrap(),
+            )],
+        );
+        let predecessor = add_retired_rows(&layout, None);
+        let report_path = root.join("code-source-locality-report.json");
+
+        let receipt = preflight_projects(&config, &layout, &report_path, &[]).unwrap();
+        assert_eq!(receipt.status, "preflight_clean");
+        assert_eq!(receipt.project_count, 0);
+        assert_eq!(receipt.dropped_row_count, 2);
+        assert_eq!(receipt.uncovered_project_count, 1);
+
+        // Nothing is proved, so no quiet window applies.
+        let applied = apply_report(&config, &layout, &report_path).unwrap();
+        assert_eq!(applied.status, "retired");
+        assert_eq!(applied.marker_checksum_sha256, None);
+        assert_eq!(applied.project_count, 0);
+        assert_eq!(
+            applied.predecessor_marker_checksum_sha256,
+            Some(predecessor.checksum_sha256)
+        );
+        assert!(
+            !layout
+                .state_dir
+                .join(CODE_SOURCE_LOCALITY_CUTOVER_MARKER_FILE)
+                .exists()
+        );
+        assert!(
+            CodeSourceLocalityCutoverRuntimeV1::open(&layout.state_dir)
+                .unwrap()
+                .project_ids()
+                .is_empty()
+        );
+        let error = ProjectCatalogCodeSourceLocalityCutoverFacadeV1::verify(
+            CodeSourceLocalityCutoverVerifyRequestV1 { layout, config },
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("does not exist"), "{error:#}");
     }
 }

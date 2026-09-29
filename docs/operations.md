@@ -290,6 +290,21 @@ never reopens fallback. Bridge, uncovered, and `LegacyLocal` project renders
 remain explicit compatibility lanes. A code deployment alone does not apply a
 production marker.
 
+The ceremony is re-runnable against an installed marker. Preflight then
+accepts an empty `--project-id` set, carries every predecessor row whose
+project is still in the catalog under `carried_forward_rows` with the
+evidence its original apply accepted, lists rows whose project left the
+catalog under `dropped_rows` with reason `project_absent_from_catalog`, and
+proves only the selected projects. `uncovered_projects` names the Published
+catalog projects the next marker would still not cover. The report binds the
+predecessor checksum as `predecessor_marker_checksum`; apply refuses when the
+installed marker or its carried and dropped rows changed after preflight,
+waits out the quiet window only when the report proves a project, and
+supersedes the marker with the carried and proved rows. When no row remains,
+apply removes the marker, the receipt status is `retired`, and verify refuses
+because no marker exists. The marker format is unchanged, so a daemon without
+re-run support loads the successor.
+
 ### Collected code-source locality cutover
 
 This cutover makes one current collected generation authoritative and closes
@@ -352,6 +367,25 @@ search, graph, embeddings, and code-source health. This post-marker rebuild must
 leave every selected project's `LocalProjectWalk` target counters unchanged.
 Stop and investigate if offline verify then reports `changed after cutover`.
 A code deployment alone does not apply a production marker.
+
+The ceremony is re-runnable against an installed marker. Preflight then
+accepts an empty `--project-id` set, carries every predecessor row whose
+project is still in the catalog under `carried_forward_rows` with the
+recovery evidence its original apply accepted, lists rows whose project left
+the catalog under `dropped_rows` with reason `project_absent_from_catalog`,
+and proves only the selected projects. A carried row must still pass the
+governed-row checks daemon startup applies (catalog scope, producer
+assignment, current generation from the same authority), or preflight and
+apply refuse. `uncovered_projects` names the Published catalog projects the
+next marker would still not cover. The report binds the predecessor checksum
+as `predecessor_marker_checksum`; apply refuses when the installed marker or
+its carried and dropped rows changed after preflight, waits out the quiet
+window only when the report proves a project, and supersedes the marker with
+the carried and proved rows. When no row remains, apply removes the marker,
+the receipt status is `retired`, and verify refuses because no marker exists.
+The marker format is unchanged, so a daemon without re-run support loads the
+successor. No component reads or writes `blame-locality-cutover-marker.json`;
+the ceremony leaves that file untouched.
 
 ### After a daemon upgrade (no schema change)
 
