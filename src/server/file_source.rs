@@ -586,7 +586,7 @@ async fn catalog_onboard(
             );
         }
     }
-    state.nudge_edge_index_rebuild();
+    state.nudge_code_read_view_refresh();
     Ok((StatusCode::CREATED, Json(receipt)))
 }
 

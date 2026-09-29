@@ -88,7 +88,8 @@ impl OverlayManifest {
 // Active path loader view
 // ---------------------------------------------------------------------------
 
-/// Describes how to load a sidecar path during EdgeIndex rebuild.
+/// Describes how a selected sidecar path is read: in full, or filtered by
+/// the path hashes a per-file dirty overlay covers.
 #[derive(Debug)]
 pub enum PathLoadMode {
     /// Load all edges without filtering.

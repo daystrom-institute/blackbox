@@ -15,7 +15,6 @@ checkout_lifecycle_writer_wait_ms = 500
 
 [index]
 reindex_interval_secs = 120
-edge_index_boot_rebuild = false
 
 [provenance]
 git_notes_namespace = "bb"

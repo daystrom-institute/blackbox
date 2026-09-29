@@ -3,8 +3,7 @@ use std::collections::BTreeMap;
 use anyhow::Result;
 
 use super::{
-    EdgeFamilyExpectation, EntitySchemaView, EntityView, InspectableEntityProvider, Neighborhood,
-    NextHop, ProviderContext, empty_neighborhood_view, ensure_type, expected, next_hops, schema,
+    EntityView, InspectableEntityProvider, ProviderContext, empty_neighborhood_view, ensure_type,
     truncate_label,
 };
 use bbox_corpus_core::entity_ref::{EntityRef, EntityType};
@@ -46,27 +45,6 @@ impl InspectableEntityProvider for TranscriptProvider {
             properties.extend(indexed);
         }
         Ok(empty_neighborhood_view(r, properties))
-    }
-
-    fn schema(&self) -> EntitySchemaView {
-        schema(
-            self.entity_type(),
-            &["provider", "session_id", "line_offset", "event_idx", "role"],
-            &["IN_SESSION", "RAN_BASH"],
-            &["provider", "session_id", "role"],
-        )
-    }
-
-    fn expected_edge_families(&self, _r: &EntityRef) -> Vec<EdgeFamilyExpectation> {
-        vec![expected("IN_SESSION", true), expected("RAN_BASH", false)]
-    }
-
-    fn recommended_next_hops(
-        &self,
-        _entity: &EntityView,
-        full_neighborhood: &Neighborhood,
-    ) -> Vec<NextHop> {
-        next_hops(full_neighborhood, &["IN_SESSION", "RAN_BASH"])
     }
 
     fn compact_label(&self, ctx: &ProviderContext<'_>, r: &EntityRef) -> Option<String> {

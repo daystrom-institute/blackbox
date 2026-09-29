@@ -2,7 +2,6 @@ use super::startup::{configure_dispatch_mcp_env, discover_transcript_roots, reso
 use super::{SharedState, is_loopback_bind};
 use anyhow::Context;
 use parking_lot::RwLock;
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::broadcast;
@@ -17,8 +16,8 @@ use crate::projects::ProjectRegistry;
 use crate::store_persister::StorePersister;
 use crate::threads::Threads;
 use crate::{
-    artifacts, config, edge_index, index, orchestration, slack_channel_bindings,
-    slack_proposal_links, system_memory, tool_docs, vectors,
+    artifacts, config, index, orchestration, slack_channel_bindings, slack_proposal_links,
+    system_memory, tool_docs, vectors,
 };
 
 pub(super) struct OpenedServer {
@@ -773,8 +772,8 @@ pub(super) fn open_shared_state(
     // Legacy-lane migration commits retain their manifest and rollback
     // backup, but their extraction staging is disposable once the committed
     // status is durable. Recover crash-window transactions and reclaim any
-    // committed staging residue before graph authority is captured; older
-    // daemons left a second full copy of every migrated lane here.
+    // committed staging residue; older daemons left a second full copy of
+    // every migrated lane here.
     for message in crate::migration::recover_pending_migrations(&edges_dir)
         .context("pre-bind legacy edge migration recovery failed")?
     {
@@ -785,9 +784,8 @@ pub(super) fn open_shared_state(
         }
     }
 
-    // Retired transcript file-touch rows leave the durable lanes once, before
-    // graph authority is captured. The store-level marker makes every later
-    // start a single stat.
+    // Retired transcript file-touch rows leave the durable lanes once. The
+    // store-level marker makes every later start a single stat.
     purge_file_touch_edges_at_startup(&edges_dir)?;
 
     // Pre-bind catalog-mode recovery (P4-F section 10.1 steps 5-8):
@@ -796,7 +794,7 @@ pub(super) fn open_shared_state(
     // BEFORE the schema rebuild, reindex, and CodeReadView construction
     // so that a broken relationship chain fails closed before the daemon
     // builds any read view from corrupt state. Bridge mode is a no-op.
-    let pending_first_republish = super::code_source::pre_bind_catalog_recovery(
+    super::code_source::pre_bind_catalog_recovery(
         &project_authority,
         &code_sources,
         &checkout_access,
@@ -882,27 +880,15 @@ pub(super) fn open_shared_state(
 
     let bind_host = cfg.daemon.bind.clone();
     let bind_is_loopback = is_loopback_bind(&bind_host);
-    let edge_index = build_startup_edge_index(
-        &cfg,
-        &idx,
-        &threads_store.read(),
-        &task_store,
-        &records_provider.records_snapshot(),
-        &pending_first_republish,
-        &project_authority,
-        &git_transport_cutover,
-        &code_sources,
-    )?;
     let code_read_view = super::CodeReadView {
         active_selectors: idx.active_code_selectors(),
         searcher: idx.searcher(),
-        edge_index: Arc::new(edge_index),
-        // Seeded from the same boot snapshot that seeded the edge set above,
-        // so the startup view and the first runtime republish agree.
+        // Seeded from the boot catalog snapshot, so the startup view and the
+        // first runtime republish agree.
         catalog_epoch: records_provider.records_snapshot().authority_epoch,
         // Same boot snapshot, same rule: the startup view pins the durable
-        // overlay selection so the first request after open joins commit-file
-        // edges through exactly the overlays the manifest names.
+        // overlay selection the manifest names, which is also the Git GC
+        // root set the reference manifest below is built from.
         git_overlays: super::state::read_git_overlays_for_view(
             &project_authority,
             &bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(
@@ -918,7 +904,7 @@ pub(super) fn open_shared_state(
     // surfaces in doctor; it never blocks the open, because a stale
     // acceleration index must not cost history reads.
     refresh_history_reference_manifest(&cfg, &project_authority, &store_dir, &code_read_view);
-    let (edge_rebuild_nudge_tx, edge_rebuild_nudge_rx) = std::sync::mpsc::sync_channel(1);
+    let (code_view_refresh_nudge_tx, code_view_refresh_nudge_rx) = std::sync::mpsc::sync_channel(1);
     let shared = Arc::new(SharedState {
         idx: RwLock::new(idx),
         index_writer,
@@ -967,7 +953,6 @@ pub(super) fn open_shared_state(
         bbox_watcher: std::sync::Mutex::new(None),
         reindex_dirty,
         code_read_view: RwLock::new(Arc::new(code_read_view)),
-        edge_index_ready: std::sync::atomic::AtomicBool::new(cfg.index.edge_index_boot_rebuild),
         code_sources,
         file_sources,
         conversation_sources,
@@ -980,8 +965,8 @@ pub(super) fn open_shared_state(
         reconciler_shutdown: parking_lot::RwLock::new(Arc::new(
             std::sync::atomic::AtomicBool::new(false),
         )),
-        edge_rebuild_nudge_tx,
-        edge_rebuild_nudge_rx: std::sync::Mutex::new(Some(edge_rebuild_nudge_rx)),
+        code_view_refresh_nudge_tx,
+        code_view_refresh_nudge_rx: std::sync::Mutex::new(Some(code_view_refresh_nudge_rx)),
         task_store: Arc::new(RwLock::new(task_store)),
         tail_tx,
         roster_version: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -1166,54 +1151,6 @@ fn spawn_reindex_thread(
         std::time::Duration::from_secs(reindex_interval),
         reindex_dirty,
     );
-}
-
-#[allow(clippy::too_many_arguments)]
-fn build_startup_edge_index(
-    cfg: &config::Config,
-    idx: &TranscriptIndex,
-    th: &Threads,
-    task_store: &TaskStore,
-    records: &bbox_corpus_core::project_record::ProjectRecordsSnapshot,
-    pending_first_republish: &BTreeSet<String>,
-    project_authority: &super::state::ProjectAuthority,
-    git_transport_cutover: &bbox_indexing::git_transport_cutover::GitTransportCutoverRuntimeV1,
-    code_sources: &super::code_source::CodeSourceRuntime,
-) -> anyhow::Result<edge_index::EdgeIndex> {
-    if cfg.index.edge_index_boot_rebuild {
-        let edges_dir = bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(
-            &idx.reindex_config().projects_path,
-        );
-        // The startup edge set admits exactly the Git overlays the startup
-        // read view does.
-        let mut authority = edge_index::SidecarManifestAuthority::capture(&edges_dir)?;
-        if let edge_index::SidecarManifestAuthority::Manifest(index) = &mut authority {
-            super::state::hide_cutover_gated_git_overlays(
-                index,
-                project_authority,
-                git_transport_cutover,
-                code_sources,
-            );
-        }
-        edge_index::EdgeIndex::rebuild_from_authority_admitting_fully_absent(
-            &edge_index::EdgeStoreRefs {
-                index: idx,
-                threads: th,
-                session_brofile_rows: task_store.session_brofile_rows(),
-                edges_dir,
-                registered_project_ids: Some(records.registered_project_ids()),
-                include_tantivy_projection: false,
-                include_observed: true,
-            },
-            pending_first_republish,
-            &authority,
-        )
-    } else {
-        tracing::info!(
-            "startup EdgeIndex rebuild deferred (set BLACKBOX_EDGE_INDEX_BOOT_REBUILD=1 to restore eager rebuild)"
-        );
-        Ok(edge_index::EdgeIndex::default())
-    }
 }
 
 /// Rebuild and checksum the derived repo-history reference manifest from its

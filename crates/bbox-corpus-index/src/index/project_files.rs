@@ -3228,10 +3228,9 @@ fn snapshot_after_reindex(
     let worktree_dirty = bbox_corpus_core::git::is_worktree_dirty(root);
 
     // Writer-side materialization idempotency. Re-running `switch_to_*` rewrites
-    // the dirty overlay via temp-dir + atomic rename, which stamps fresh mtimes
-    // on `dirty-current/*.jsonl`. The edge-index rebuild watcher sums sidecar
-    // mtimes, so a byte-identical re-materialization still trips a full 18-21s
-    // EdgeIndex rebuild. When this pass changed nothing for the project and the
+    // the dirty overlay via temp-dir + atomic rename, which rewrites
+    // `dirty-current/*.jsonl` and the manifest for no semantic change. When
+    // this pass changed nothing for the project and the
     // on-disk materialization already matches the current head/version/worktree
     // state, skip it. Correctness rests on: derived overlay/snapshot edge content
     // is a deterministic function of (head_sha, changed-file set + contents). No
@@ -3852,8 +3851,8 @@ mod tests {
     //
     // These exercise `materialization_is_current`, the decision behind skipping a
     // no-op `snapshot_after_reindex`. Skipping when it returns true is what keeps
-    // a byte-identical re-materialization from re-stamping overlay mtimes and
-    // tripping the edge-index rebuild watcher; the "force" cases guard against
+    // a byte-identical re-materialization from rewriting the overlay and the
+    // manifest; the "force" cases guard against
     // skipping when the on-disk graph would actually go stale.
 
     const MAT_REPO: &str = "repo-mat";

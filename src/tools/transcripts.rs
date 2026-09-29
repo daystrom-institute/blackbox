@@ -97,7 +97,6 @@ mod tests {
             std::sync::Arc::new(crate::server::state::CodeReadView {
                 active_selectors: current.active_selectors.clone(),
                 searcher: server.state.idx.read().searcher(),
-                edge_index: current.edge_index.clone(),
                 catalog_epoch: current.catalog_epoch,
                 git_overlays: current.git_overlays.clone(),
             });

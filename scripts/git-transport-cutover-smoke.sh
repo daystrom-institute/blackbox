@@ -123,7 +123,6 @@ start_daemon() {
     XDG_DATA_HOME="$THROWAWAY/data" \
     XDG_STATE_HOME="$THROWAWAY/xdg-state" \
     BLACKBOX_REINDEX_INTERVAL_SECS=999999 \
-    BLACKBOX_EDGE_INDEX_BOOT_REBUILD=false \
     RUST_LOG=blackbox=info \
     "$BIN/blackboxd" >> "$DAEMON_LOG" 2>&1 &
   print $! > "$PID_FILE"

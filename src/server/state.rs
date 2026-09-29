@@ -16,7 +16,7 @@ use crate::orchestration::{self, TaskStore};
 use crate::projects::ProjectRegistry;
 use crate::store_persister::StorePersister;
 use crate::threads::Threads;
-use crate::{artifacts, edge_index, slack_channel_bindings, slack_proposal_links};
+use crate::{artifacts, slack_channel_bindings, slack_proposal_links};
 
 // ---------------------------------------------------------------------------
 // Shared state
@@ -208,10 +208,6 @@ pub(crate) struct SharedState {
     /// Shared with the reindex thread (same `Arc`).
     pub(crate) reindex_dirty: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) code_read_view: RwLock<Arc<CodeReadView>>,
-    /// True only after the process has published one complete EdgeIndex view.
-    /// Deferred startup must never make an empty placeholder look like a
-    /// valid graph to callers.
-    pub(crate) edge_index_ready: AtomicBool,
     pub(crate) code_sources: Arc<super::code_source::CodeSourceRuntime>,
     /// Connector generation store for the `/internal/file-source/v1/*` lane.
     /// Separate from `code_sources` because the generation model, the key,
@@ -245,15 +241,13 @@ pub(crate) struct SharedState {
     /// Shutdown flag for the cutback reconciler background task (P4-D).
     /// `None` in bridge mode (no reconciler spawned).
     pub(crate) reconciler_shutdown: parking_lot::RwLock<Arc<std::sync::atomic::AtomicBool>>,
-    /// Out-of-band wake for the edge-index rebuild watcher. Async tool
-    /// handlers whose store mutations change projected edges (bbox_thread
-    /// link, project unregister) nudge instead of rebuilding inline — a
-    /// rebuild parses the multi-GB sidecar lanes and must not run on a
-    /// tokio worker. 1-slot channel + try_send coalesces bursts; the
-    /// watcher rebuild picks up every store mutation made before it runs.
-    pub(crate) edge_rebuild_nudge_tx: std::sync::mpsc::SyncSender<()>,
-    /// Receiver half, taken once by `spawn_edge_index_rebuild_watcher`.
-    pub(crate) edge_rebuild_nudge_rx: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    /// Out-of-band wake for the code read view refresher. Handlers that
+    /// change the registered corpus project set or a derived manifest nudge
+    /// it so the pinned selector map follows promptly instead of on the next
+    /// interval. 1-slot channel + try_send coalesces bursts.
+    pub(crate) code_view_refresh_nudge_tx: std::sync::mpsc::SyncSender<()>,
+    /// Receiver half, taken once by `spawn_code_read_view_refresher`.
+    pub(crate) code_view_refresh_nudge_rx: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
     pub(crate) task_store: Arc<RwLock<TaskStore>>,
     pub(crate) tail_tx: broadcast::Sender<TailEvent>,
     pub(crate) roster_version: Arc<AtomicU64>,
@@ -292,7 +286,6 @@ pub(crate) struct SharedState {
 pub(crate) struct CodeReadView {
     pub(crate) active_selectors: BTreeMap<String, String>,
     pub(crate) searcher: tantivy::Searcher,
-    pub(crate) edge_index: Arc<edge_index::EdgeIndex>,
     /// Catalog authority epoch this view was derived from
     /// (`ProjectRecordsSnapshot.authority_epoch`; Phase 3 plan section 4.5).
     /// Pinning it is what makes the view a coherent read: without it two
@@ -310,11 +303,10 @@ pub(crate) struct CodeReadView {
     /// has no overlay identity to pin. An empty map therefore means "this
     /// deployment has no overlay lane", never "the overlays were dropped".
     ///
-    /// Pinned for the same reason `catalog_epoch` is: a request that reads
-    /// commit-file edges through one overlay and commit documents through a
-    /// generation the overlay no longer names is incoherent, and the only
-    /// way to rule that out is to freeze the overlay map beside the searcher
-    /// and selector map rather than re-reading the manifest mid-request.
+    /// Pinned for the same reason `catalog_epoch` is: the overlay map is the
+    /// Git source GC root set (maintenance protects exactly the sources it
+    /// names) and must agree with the searcher and selector map it was read
+    /// beside rather than with a manifest re-read mid-request.
     pub(crate) git_overlays: BTreeMap<String, bbox_corpus_core::git_overlay::GitOverlaySelector>,
 }
 
@@ -375,43 +367,6 @@ pub(crate) fn read_git_overlays_for_view(
                  publishing without overlays"
             );
             BTreeMap::new()
-        }
-    }
-}
-
-/// Narrow an edge rebuild's manifest to the Git overlays the read view
-/// admits. The edge loader admits a snapshot's `git-current` member through
-/// the raw selector, so a producer overlay the cutover hides (a non-current
-/// covered row, including one staging re-cutover evidence) is unset here
-/// exactly as `read_git_overlays_for_view` drops it. Bridge authority leaves
-/// the manifest unchanged.
-pub(crate) fn hide_cutover_gated_git_overlays(
-    manifest: &mut bbox_edge_sidecar::manifest::ManifestIndex,
-    authority: &ProjectAuthority,
-    cutover: &bbox_indexing::git_transport_cutover::GitTransportCutoverRuntimeV1,
-    code_sources: &super::code_source::CodeSourceRuntime,
-) {
-    let Some(store) = authority.catalog_store() else {
-        return;
-    };
-    let catalog = store.snapshot();
-    let assignments = code_sources.producer_auth().repo_assignment_producers();
-    for (project_id, entry) in &mut manifest.workspaces {
-        let Some(overlay) = entry.git_overlay.as_ref() else {
-            continue;
-        };
-        let visible = match &catalog {
-            Ok(catalog) => git_overlay_visible_under_cutover(
-                catalog.catalog(),
-                &assignments,
-                cutover,
-                project_id,
-                overlay,
-            ),
-            Err(_) => overlay.source.producer_transport().is_none(),
-        };
-        if !visible {
-            entry.git_overlay = None;
         }
     }
 }
@@ -555,7 +510,7 @@ impl SharedState {
     }
 
     /// Replace only the searcher component of the immutable read view. Holding
-    /// the view write lock while cloning selectors and edges prevents a commit
+    /// the view write lock while cloning selectors and overlays prevents a commit
     /// refresh from reverting a concurrent code-source activation swap.
     pub(crate) fn publish_code_read_searcher(&self, searcher: tantivy::Searcher) {
         let mut published = self.code_read_view.write();
@@ -563,10 +518,9 @@ impl SharedState {
         *published = Arc::new(CodeReadView {
             active_selectors: current.active_selectors.clone(),
             searcher,
-            edge_index: current.edge_index.clone(),
             catalog_epoch: current.catalog_epoch,
-            // Cloned through for exactly the reason `edge_index` and
-            // `catalog_epoch` are: this writer owns the searcher and nothing
+            // Cloned through for exactly the reason `catalog_epoch` is: this
+            // writer owns the searcher and nothing
             // else, so a field it drops is silently reset to "no overlay" on
             // the next commit. That is the drop-on-commit bug class the
             // preservation regression test pins.
@@ -596,34 +550,12 @@ impl SharedState {
         }
     }
 
-    /// Ask the edge-index rebuild watcher to run a rebuild soon (it wakes
+    /// Ask the code read view refresher to republish soon (it wakes
     /// immediately when parked on its interval). `try_send` failure means a
-    /// nudge is already pending — the queued rebuild will see this caller's
-    /// store mutation too, so dropping the second nudge is correct.
-    pub(crate) fn nudge_edge_index_rebuild(&self) {
-        let _ = self.edge_rebuild_nudge_tx.try_send(());
-    }
-
-    /// Clone one internally coherent code read view and reject the deferred
-    /// placeholder. Every publisher changes the fence and swaps the view under
-    /// the manifest coordinator: placeholder publishers lower the fence before
-    /// the swap, and the watcher raises it only after installing a complete
-    /// graph. Reading the fence while the view guard is held pairs it with the
-    /// view that guard shows, so a placeholder is never returned as complete,
-    /// even when a watcher publication lands right after the clone.
-    pub(crate) fn complete_code_read_view(&self) -> anyhow::Result<Arc<CodeReadView>> {
-        let guard = self.code_read_view.read();
-        let ready = self
-            .edge_index_ready
-            .load(std::sync::atomic::Ordering::Acquire);
-        let view = guard.clone();
-        drop(guard);
-        if !ready {
-            anyhow::bail!(
-                "error.edge_index_warming: the complete graph view is still rebuilding; retry this request"
-            );
-        }
-        Ok(view)
+    /// nudge is already pending, and the queued refresh reads this caller's
+    /// change too, so dropping the second nudge is correct.
+    pub(crate) fn nudge_code_read_view_refresh(&self) {
+        let _ = self.code_view_refresh_nudge_tx.try_send(());
     }
 
     pub(crate) fn roster_events(&self) -> orchestration::RosterEventSink {
@@ -789,7 +721,8 @@ impl SharedState {
             persister: projects_persister,
         };
 
-        let (edge_rebuild_nudge_tx, edge_rebuild_nudge_rx) = std::sync::mpsc::sync_channel(1);
+        let (code_view_refresh_nudge_tx, code_view_refresh_nudge_rx) =
+            std::sync::mpsc::sync_channel(1);
         let active_code_selectors = idx.active_code_selectors();
         let code_searcher = idx.searcher();
         SharedState {
@@ -854,11 +787,9 @@ impl SharedState {
             code_read_view: RwLock::new(Arc::new(CodeReadView {
                 active_selectors: active_code_selectors,
                 searcher: code_searcher,
-                edge_index: Arc::new(edge_index::EdgeIndex::default()),
                 catalog_epoch: 0,
                 git_overlays: BTreeMap::new(),
             })),
-            edge_index_ready: AtomicBool::new(true),
             code_sources: Arc::new(super::code_source::CodeSourceRuntime::for_test(store_dir)),
             file_sources: Arc::new(super::file_source::FileSourceRuntime::for_test(store_dir)),
             conversation_sources: Arc::new(
@@ -883,8 +814,8 @@ impl SharedState {
             reconciler_shutdown: parking_lot::RwLock::new(Arc::new(
                 std::sync::atomic::AtomicBool::new(false),
             )),
-            edge_rebuild_nudge_tx,
-            edge_rebuild_nudge_rx: std::sync::Mutex::new(Some(edge_rebuild_nudge_rx)),
+            code_view_refresh_nudge_tx,
+            code_view_refresh_nudge_rx: std::sync::Mutex::new(Some(code_view_refresh_nudge_rx)),
             task_store: Arc::new(RwLock::new(TaskStore::new())),
             tail_tx,
             roster_version: Arc::new(AtomicU64::new(0)),
@@ -1256,7 +1187,7 @@ mod clause_one_exit_proof {
         "hybrid search",
         "graph inspect",
         "storage GC",
-        "collected activation and rebuild",
+        "collected activation and view refresh",
         "published knowledge",
         "published gaps",
     ];
@@ -1464,101 +1395,42 @@ mod clause_one_exit_proof {
         );
         executed.push("storage GC");
 
-        // Collected activation and rebuild is not a tool call: it is the
-        // index-side pass that seeds corpus identity from
+        // Collected activation and view refresh is not a tool call: it is
+        // the index-side pass that seeds corpus identity from
         // `corpus_project_ids`, which is the field clause 1 keeps live.
         //
-        // Compared by rebuilt CONTENT, not by return status. A rebuild that
-        // consults `records`, emits different edges, and returns Ok on both
-        // twins is exactly the failure this row exists to catch, and
-        // is_ok()-equality cannot see it.
-        // ONE project-keyed sidecar file, named for the ATTACHED project so
-        // the loader's file-stem check admits it.
-        //
-        // The attached project, not the remote-only one, is what makes the
-        // mutation red on the COMPARISON rather than on the guard: it is
-        // present in the populated twin's records and absent from the
-        // recordless twin's, so a rebuild rewired to consult records makes
-        // the two projections DIVERGE. Keyed to the remote-only project both
-        // twins lose the edge together, which still reds but proves only
-        // that the seam was touched, not that the twins differ. This is the only lane the
-        // rebuild's registered-project set actually gates
-        // (project_sidecar_edges_in_dir -> sidecar_lane_is_admitted),
-        // and it is what makes this row seam-relative rather than merely
-        // populated: store-projected knowledge edges never pass through
-        // that filter, so comparing them proved nothing about records.
-        //
-        // The Edge is CONSTRUCTED and serialized rather than hand-written,
-        // so the fixture cannot drift from the type. That is not
-        // hypothetical: writing this by hand once already produced a file
-        // that never loaded, and the row went green having compared
-        // nothing. A constructor makes such a drift a compile error.
-        let sidecar_edge = bbox_edge_index::edge_index::Edge {
-            source: bbox_corpus_core::entity_ref::EntityRef::parse("knowledge:edge-seed-new")
-                .expect("edge source ref"),
-            kind: "DESCRIBES".to_string(),
-            target: bbox_corpus_core::entity_ref::EntityRef::parse("knowledge:edge-seed-old")
-                .expect("edge target ref"),
-            provenance: bbox_chunker::EdgeProvenance::Explicit,
-            confidence: bbox_chunker::EdgeConfidence::Exact,
-            metadata: Default::default(),
-            project_id: None,
-        };
-        let sidecar_key = format!(
-            "{}|{}|{}",
-            sidecar_edge.source, sidecar_edge.kind, sidecar_edge.target
-        );
-        let edges_dir = crate::server::edge_sidecar_dir(&populated.state);
-        std::fs::create_dir_all(&edges_dir).unwrap();
-        std::fs::write(
-            edges_dir.join(format!("{ATTACHED_PROJECT}.jsonl")),
-            format!(
-                "{}\n",
-                serde_json::to_string(&sidecar_edge).expect("edge serializes")
-            ),
-        )
-        .unwrap();
-
+        // Compared by republished CONTENT, not by return status. A refresh
+        // that consults `records`, derives a different selector map, and
+        // returns Ok on both twins is exactly the failure this row exists to
+        // catch, and is_ok()-equality cannot see it. The refresh authority
+        // (the registered corpus project set) must contain the ATTACHED
+        // project: it is present in the populated twin's records and absent
+        // from the recordless twin's, so an authority rewired to consult
+        // records makes the two twins diverge.
         for server in [&populated, &recordless] {
-            let base = knowledge_entry("edge-seed-old", "older seed");
-            let newer = knowledge_entry("edge-seed-new", "newer seed");
-            let mut kb = server.state.kb.write();
-            kb.upsert_generated(base).expect("seed entry");
-            kb.upsert_generated(newer).expect("seed entry");
-            drop(kb);
-            server
-                .rebuild_edge_index_from_stores()
-                .expect("rebuild succeeds on both twins");
+            crate::server::routes::refresh_code_read_view(&server.state)
+                .expect("view refresh succeeds on both twins");
         }
-        let edge_projection = |server: &BlackboxServer| {
-            let view = server.state.code_read_view.read().clone();
-            let mut edges = view
-                .edge_index
-                .all_edges()
-                .map(|edge| format!("{}|{}|{}", edge.source, edge.kind, edge.target))
-                .collect::<Vec<_>>();
-            edges.sort();
-            edges
-        };
-        let left = edge_projection(&populated);
-        let right = edge_projection(&recordless);
-        // Seam-relative non-triviality. "Populated" is not enough: the
-        // compared projection must CONTAIN the edge that travels through
-        // the filter under test, or a rebuild rewired to consult `records`
-        // changes nothing this row can see.
+        let selector_projection =
+            |server: &BlackboxServer| server.state.code_read_view.read().active_selectors.clone();
+        let left = selector_projection(&populated);
+        let right = selector_projection(&recordless);
+        let registered = |server: &BlackboxServer| server.state.corpus_registered_project_ids();
         assert!(
-            left.contains(&sidecar_key),
-            "the compared projection must contain the project-keyed sidecar \
-             edge, which is the one the registered-project filter gates: \
-             {left:?}"
+            registered(&populated).contains(ATTACHED_PROJECT),
+            "the refresh authority must contain the attached project"
         );
-
+        assert_eq!(
+            registered(&recordless),
+            registered(&populated),
+            "the refresh authority varied with the attached-row view"
+        );
         assert_eq!(
             right, left,
-            "collected activation and rebuild produced different edges with \
-             and without the attached-row view"
+            "collected activation and view refresh produced different selectors \
+             with and without the attached-row view"
         );
-        executed.push("collected activation and rebuild");
+        executed.push("collected activation and view refresh");
 
         // The two content-domain reads, compared as structured responses.
         let expected = populated.session_knowledge_view(None, None).unwrap();
@@ -1725,21 +1597,6 @@ mod committed_bytes_parity_tests {
 #[cfg(test)]
 mod code_read_view_tests {
     use super::*;
-
-    #[test]
-    fn selector_republish_lowers_edge_readiness_before_placeholder_is_readable() {
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path().canonicalize().unwrap();
-        let state = Arc::new(SharedState::for_test(&root));
-        assert!(state.complete_code_read_view().is_ok());
-
-        super::super::code_source::republish_code_read_view(&state).unwrap();
-
-        let Err(error) = state.complete_code_read_view() else {
-            panic!("selector republish exposed its placeholder as complete");
-        };
-        assert!(error.to_string().contains("error.edge_index_warming"));
-    }
 
     #[test]
     fn covered_noncurrent_repo_suppresses_only_the_producer_overlay() {
@@ -1949,7 +1806,6 @@ mod code_read_view_tests {
         let after = state.code_read_view.read().clone();
         assert!(!Arc::ptr_eq(&before, &after));
         assert_eq!(before.active_selectors, after.active_selectors);
-        assert!(Arc::ptr_eq(&before.edge_index, &after.edge_index));
         assert!(
             pinned_search(&state, &after, "pinnedrefreshsentinel")
                 .contains("pinnedrefreshsentinel")
@@ -1965,8 +1821,8 @@ mod code_read_view_tests {
     /// `publish_code_read_searcher` replaces ONLY the searcher and must
     /// carry every field it does not own through untouched. The
     /// drop-on-commit bug class is silent by construction: the view keeps
-    /// serving, it just reports an epoch (or a selector map, or an edge
-    /// index) that no longer matches what a concurrent activation
+    /// serving, it just reports an epoch (or a selector map, or an overlay
+    /// map) that no longer matches what a concurrent activation
     /// published. Every field added to `CodeReadView` must be asserted here.
     #[test]
     fn searcher_only_republish_preserves_the_catalog_epoch() {
@@ -1981,7 +1837,6 @@ mod code_read_view_tests {
                     "local:p_0000000000000000000000000000ep01".to_string(),
                 )]),
                 searcher: current.searcher.clone(),
-                edge_index: current.edge_index.clone(),
                 catalog_epoch: 42,
                 git_overlays: BTreeMap::from([(
                     "p_0000000000000000000000000000ep01".to_string(),
@@ -2019,7 +1874,6 @@ mod code_read_view_tests {
             "the searcher-only writer must carry the pinned catalog epoch through"
         );
         assert_eq!(before.active_selectors, after.active_selectors);
-        assert!(Arc::ptr_eq(&before.edge_index, &after.edge_index));
         // P3-F: the overlay map joins the same preservation contract. A
         // dropped overlay map is worse than a dropped epoch: the view keeps
         // serving code documents while silently reporting that no project

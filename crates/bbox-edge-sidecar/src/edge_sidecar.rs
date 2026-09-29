@@ -1,8 +1,8 @@
-//! Edge sidecar persistence layer: the on-disk JSONL edge lanes
-//! (observed / explicit / managed-derived), dir layout helpers, dedup
-//! append/replace/merge/purge primitives, and legacy-sidecar compaction.
-//! Store-agnostic by design — the store->edge emitters live in
-//! `edge_index`.
+//! Edge sidecar persistence layer: the managed-derived JSONL lanes that
+//! snapshots are built from, dir layout helpers, dedup
+//! append/replace/merge/purge primitives, legacy-sidecar compaction, and the
+//! catalog census of legacy transcript-edge lanes. Store-agnostic by design;
+//! no in-memory graph reads these lanes.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, OpenOptions};
@@ -1678,52 +1678,7 @@ pub fn line_provenance_is_derived(line: &str) -> bool {
 // Lifecycle API routing:
 //   project_files.rs  → replace_materialized_edges_incremental ("project")
 //   git_history.rs    → replace_materialized_edges (full) or merge_materialized_edges (incremental) ("git")
-//   tool_edges.rs     → append_observed_edges
-//   workflow/ops.rs   → append_explicit_edges
 // ---------------------------------------------------------------------------
-
-pub fn append_explicit_edges(edges_dir: &Path, project_id: &str, edges: &[Edge]) -> Result<usize> {
-    for e in edges {
-        debug_assert!(
-            e.provenance != EdgeProvenance::Derived,
-            "append_explicit_edges: rejected Derived edge kind={} source={:?}",
-            e.kind,
-            e.source,
-        );
-    }
-    let _mutation_lock = lock_project_edge_mutation(edges_dir, project_id)?;
-    append_edges_dedup(&edges_dir.join("explicit"), project_id, edges)
-}
-
-pub fn append_observed_edges(edges_dir: &Path, project_id: &str, edges: &[Edge]) -> Result<()> {
-    for e in edges {
-        debug_assert!(
-            e.provenance != EdgeProvenance::Derived,
-            "append_observed_edges: rejected Derived edge kind={} source={:?}",
-            e.kind,
-            e.source,
-        );
-    }
-    let _mutation_lock = lock_project_edge_mutation(edges_dir, project_id)?;
-    append_edges(&edges_dir.join("observed"), project_id, edges)
-}
-
-pub fn append_observed_edges_dedup(
-    edges_dir: &Path,
-    project_id: &str,
-    edges: &[Edge],
-) -> Result<usize> {
-    for e in edges {
-        debug_assert!(
-            e.provenance != EdgeProvenance::Derived,
-            "append_observed_edges_dedup: rejected Derived edge kind={} source={:?}",
-            e.kind,
-            e.source,
-        );
-    }
-    let _mutation_lock = lock_project_edge_mutation(edges_dir, project_id)?;
-    append_edges_dedup(&edges_dir.join("observed"), project_id, edges)
-}
 
 pub fn replace_materialized_edges(
     edges_dir: &Path,

@@ -251,7 +251,7 @@ async fn onboard(
             }
             return reply(result);
         }
-        state.nudge_edge_index_rebuild();
+        state.nudge_code_read_view_refresh();
     }
     reply(result)
 }

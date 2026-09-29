@@ -162,7 +162,7 @@ pub(crate) fn activate_generation(
         &staged.selector,
         &staged.snapshot_id,
     )?;
-    state.nudge_edge_index_rebuild();
+    state.nudge_code_read_view_refresh();
     // 4. The flip, last.
     store.mark_active(scope, generation_id)?;
     tracing::info!(
@@ -607,13 +607,9 @@ fn publish_derived_manifest(
             let mut selectors = index.active_code_selectors();
             selectors.insert(project_id.to_string(), selector.to_string());
             index.replace_active_code_selectors(selectors.clone());
-            state
-                .edge_index_ready
-                .store(false, std::sync::atomic::Ordering::Release);
             *state.code_read_view.write() = Arc::new(super::CodeReadView {
                 active_selectors: selectors,
                 searcher: index.searcher(),
-                edge_index: Arc::new(crate::edge_index::EdgeIndex::default()),
                 catalog_epoch: state.records_provider.records_snapshot().authority_epoch,
                 git_overlays: super::state::read_git_overlays_for_view(
                     &state.project_authority,
@@ -745,7 +741,7 @@ fn recover_one_scope(
                     generation_id,
                 ),
             )?;
-            state.nudge_edge_index_rebuild();
+            state.nudge_code_read_view_refresh();
             Ok(())
         }
         ActivationTear::RecoverBackwardToManifest => {

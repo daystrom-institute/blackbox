@@ -1796,8 +1796,8 @@ impl TranscriptIndex {
             project_access
                 .iter()
                 .filter_map(|access| {
-                    // Tool edges are a checkout-bound lane: a detached or
-                    // remote-only project has no local root and nothing to
+                    // Base-project attribution is checkout-bound: a detached
+                    // or remote-only project has no local root and nothing to
                     // attribute. Identity comes from the source-neutral
                     // `identity` field, never from a compatibility record.
                     let local_root = access.local_root?;
@@ -1807,10 +1807,6 @@ impl TranscriptIndex {
                     ))
                 })
                 .collect(),
-            bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(
-                &self.config.projects_path,
-            ),
-            !full,
         );
 
         index_transcripts_via_adapters(
@@ -1916,7 +1912,6 @@ impl TranscriptIndex {
             purged += 1;
         }
 
-        tool_edges.publish_pending_edges()?;
         writer.commit()?;
         if full {
             writer.wait_merging_threads()?;

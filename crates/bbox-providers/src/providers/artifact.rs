@@ -3,8 +3,7 @@ use std::collections::BTreeMap;
 use anyhow::{Result, bail};
 
 use super::{
-    EdgeFamilyExpectation, EntitySchemaView, EntityView, InspectableEntityProvider, Neighborhood,
-    NextHop, ProviderContext, empty_neighborhood_view, ensure_type, expected, next_hops, schema,
+    EntityView, InspectableEntityProvider, ProviderContext, empty_neighborhood_view, ensure_type,
     truncate_label,
 };
 use bbox_artifacts::artifacts::ArtifactKind;
@@ -71,41 +70,6 @@ impl InspectableEntityProvider for ArtifactProvider {
             }
         }
         Ok(empty_neighborhood_view(r, properties))
-    }
-
-    fn schema(&self) -> EntitySchemaView {
-        schema(
-            self.entity_type(),
-            &[
-                "kind",
-                "name",
-                "version",
-                "source",
-                "installed_at",
-                "active",
-                "content_sha256",
-                "project_id",
-                "project_path",
-                "superseded_by",
-            ],
-            &["DERIVED_FROM", "SUPERSEDES"],
-            &["kind", "name", "version", "active"],
-        )
-    }
-
-    fn expected_edge_families(&self, _r: &EntityRef) -> Vec<EdgeFamilyExpectation> {
-        vec![
-            expected("DERIVED_FROM", false),
-            expected("SUPERSEDES", false),
-        ]
-    }
-
-    fn recommended_next_hops(
-        &self,
-        _entity: &EntityView,
-        full_neighborhood: &Neighborhood,
-    ) -> Vec<NextHop> {
-        next_hops(full_neighborhood, &["DERIVED_FROM", "SUPERSEDES"])
     }
 
     fn compact_label(&self, _ctx: &ProviderContext<'_>, r: &EntityRef) -> Option<String> {

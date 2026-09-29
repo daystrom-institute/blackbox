@@ -65,7 +65,6 @@ bbox-knowledge-source-store = { path = "../bbox-knowledge-source-store" }
 bbox-project-graph = { path = "../bbox-project-graph" }
 bbox-config = { path = "../bbox-config" }
 bbox-threads = { path = "../bbox-threads" }
-bbox-edge-index = { path = "../bbox-edge-index" }
 bbox-vectors = { path = "../bbox-vectors" }
 
 [dev-dependencies]

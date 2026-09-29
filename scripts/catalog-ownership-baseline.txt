@@ -133,7 +133,7 @@ checkout_root_path	src/tools/project_catalog.rs	fn register_catalog_arm	5	collap
 checkout_root_path	src/tools/project_catalog.rs	fn rename_catalog_arm	5	collapse into the lease confined readers
 checkout_root_path	src/tools/projects.rs	fn bbox_project_eject	2	collapse into the lease confined readers
 checkout_root_path	src/tools/projects.rs	fn bbox_project_init	1	collapse into the lease confined readers
-checkout_root_path	src/tools/projects.rs	fn run_post_register_pipeline	5	collapse into the lease confined readers
+checkout_root_path	src/tools/projects.rs	fn run_post_register_pipeline	4	collapse into the lease confined readers
 checkout_root_path	src/tools/render.rs	fn bbox_render	3	collapse into the lease confined readers
 checkout_root_path	src/tools/scope.rs	fn resolve_project_write	3	collapse into the lease confined readers
 direct_git_process	crates/bbox-corpus-core/src/git.rs	fn git_output_strings	1	route through the verified-commit git wrapper

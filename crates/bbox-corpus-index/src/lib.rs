@@ -2,8 +2,9 @@
 //!
 //! Extracted from the root `blackbox` crate (root-crate-peels arc). Owns the
 //! tantivy schema and `TranscriptIndex`, search, the transcript adapter
-//! registry and projection, the project-file / git-history / tool-edge index
-//! passes, and the scan/meta utilities reindex orchestration is built from.
+//! registry and projection, the project-file / git-history index passes,
+//! transcript base-project attribution, and the scan/meta utilities reindex
+//! orchestration is built from.
 //!
 //! The daemon side (store->doc builders, the writer actor, reindex
 //! orchestration) lives above this crate and reaches in through public APIs;

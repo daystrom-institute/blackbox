@@ -32,6 +32,5 @@ pub use graph_docs::{
     is_meta_vertex, published_graph_vertex_documents,
 };
 pub use knowledge_docs::{KnowledgeIndexDocument, knowledge_chunk_hash, knowledge_entity_id};
-pub use reindex::backfill_tool_edges_for_project;
 pub use reindex::spawn_reindex_thread;
 pub use writer_actor::{IndexWriteOp, IndexWriterActor, ProducerAssignmentSource};

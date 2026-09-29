@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use bbox_corpus_core::entity_ref::EntityRef;
-use bbox_edge_index::edge_index::{Edge, EdgeIndex};
+use bbox_edge_sidecar::edge_sidecar::Edge;
 use bbox_project_graph::EvidenceEndpointStatus;
 use bbox_providers::entity_loader;
 use bbox_providers::providers::{self, EntityView, Neighborhood, NextHop, ProviderContext};
@@ -120,14 +120,6 @@ struct RenderedNextHop {
     label: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
-struct RenderedCoverage {
-    family: String,
-    count: usize,
-    expected: String,
-    status: String,
-}
-
 pub fn bad_input(entity_ref: &str, message: impl AsRef<str>) -> String {
     json!({
         "status": "error.bad_input",
@@ -155,37 +147,26 @@ pub fn bad_input_field(field: &str, message: impl AsRef<str>, suggested_fix: &st
     .to_string()
 }
 
-pub fn not_found(r: &EntityRef, similar_refs: Vec<String>) -> String {
+pub fn not_found(r: &EntityRef) -> String {
     json!({
         "status": "error.not_found",
         "error": {
             "code": "error.not_found",
             "message": format!("No entity found for {r}"),
             "ref": r.to_string(),
-            "similar_refs": similar_refs,
         }
     })
     .to_string()
 }
 
-pub fn similar_refs(edge_index: &EdgeIndex, r: &EntityRef) -> Vec<String> {
-    let needle = r.to_string();
-    let prefix = r.entity_type().as_str();
-    edge_index
-        .known_refs()
-        .into_iter()
-        .map(|known| known.to_string())
-        .filter(|known| known.starts_with(prefix))
-        .filter(|known| known != &needle)
-        .take(5)
-        .collect()
-}
-
+/// Read one entity's stored properties, plus the project-graph edges and
+/// evidence bindings that touch it. Corpus entities carry no edge
+/// neighborhood: the daemon keeps no edge graph, so a ref is found exactly
+/// when its provider's backing store holds it.
 pub fn inspect_entity(
     p: &InspectEntityParams,
     ctx: &ProviderContext<'_>,
     r: &EntityRef,
-    edge_index: &EdgeIndex,
 ) -> Result<String> {
     let direction = match InspectDirection::parse(p.direction.as_deref()) {
         Ok(direction) => direction,
@@ -244,7 +225,7 @@ pub fn inspect_entity(
         {
             return Err(error);
         }
-        Err(_) => return Ok(not_found(r, similar_refs(edge_index, r))),
+        Err(_) => return Ok(not_found(r)),
     };
     let canonical_ref = EntityRef::parse(&entity.ref_string).unwrap_or_else(|_| r.clone());
     if let Some(property) = p.property.as_deref() {
@@ -262,7 +243,7 @@ pub fn inspect_entity(
         // its neighborhood has to carry the bindings that point at it. Without
         // this the edge would exist only on the graph side and the reverse
         // traversal would lose it.
-        let mut neighborhood = full_neighborhood(edge_index, r);
+        let mut neighborhood = Neighborhood::default();
         for edge in ctx.evidence_edges(r) {
             if &edge.source == r {
                 neighborhood.forward.push(edge);
@@ -304,36 +285,7 @@ pub fn inspect_entity(
     let rendered_forward = render_edges(ctx, &entity.neighborhood.forward, "out");
     let rendered_reverse = render_edges(ctx, &entity.neighborhood.reverse, "in");
     let recommended = render_next_hops(provider.recommended_next_hops(&entity, &full_neighborhood));
-    let coverage = provider
-        .expected_edge_families(r)
-        .into_iter()
-        .map(|expectation| {
-            let count = full_neighborhood
-                .forward
-                .iter()
-                .chain(full_neighborhood.reverse.iter())
-                .filter(|edge| edge.kind == expectation.family_name)
-                .count();
-            RenderedCoverage {
-                family: expectation.family_name,
-                count,
-                expected: if expectation.required {
-                    "required"
-                } else {
-                    "optional"
-                }
-                .into(),
-                status: if count > 0 { "present" } else { "0 (expected)" }.into(),
-            }
-        })
-        .collect::<Vec<_>>();
     let properties = render_properties(&entity, property_mode);
-    // Keep required absences and observed relationships; generic optional
-    // zero-count families add no evidence. Authored absences remain in hops.
-    let coverage_json: Vec<&RenderedCoverage> = coverage
-        .iter()
-        .filter(|c| c.count > 0 || c.expected == "required")
-        .collect();
     let mut out = json!({
         "status": "ok",
         "entity_ref": canonical_ref.to_string(),
@@ -346,9 +298,6 @@ pub fn inspect_entity(
     });
     if !recommended.is_empty() {
         out["recommended_next_hops"] = json!(recommended);
-    }
-    if !coverage_json.is_empty() {
-        out["edge_family_coverage"] = json!(coverage_json);
     }
     if let Some(page) = edge_page {
         out["edge_page"] = page;
@@ -473,16 +422,6 @@ fn refined_endpoint_status(
         observation,
         has_expected_generation.then_some(0_u64),
     )
-}
-
-fn full_neighborhood(edge_index: &EdgeIndex, r: &EntityRef) -> Neighborhood {
-    Neighborhood {
-        // forward_edges_with_synthesis fills in the transcript -> session
-        // IN_SESSION edge at query time when it isn't materialized (see its
-        // doc comment). This is forward only; reverse has no counterpart.
-        forward: edge_index.forward_edges_with_synthesis(r),
-        reverse: edge_index.reverse_edges(r).into_iter().cloned().collect(),
-    }
 }
 
 const TOTAL_EDGE_CAP: usize = 100;
@@ -954,13 +893,7 @@ mod tests {
                 params.property_mode = Some("smrat".into());
             }
             let wire: serde_json::Value = serde_json::from_str(
-                &inspect_entity(
-                    &params,
-                    &ProviderContext::empty_for_tests(),
-                    &entity,
-                    &EdgeIndex::default(),
-                )
-                .unwrap(),
+                &inspect_entity(&params, &ProviderContext::empty_for_tests(), &entity).unwrap(),
             )
             .unwrap();
             assert_eq!(wire["status"], "error.bad_input");
@@ -1344,13 +1277,12 @@ mod tests {
     }
 
     #[test]
-    fn not_found_includes_similar_refs_field() {
+    fn not_found_names_the_ref() {
         let r = EntityRef::parse("knowledge:missing").unwrap();
-        let rendered = not_found(&r, vec!["knowledge:nearby".to_string()]);
-        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&not_found(&r)).unwrap();
         assert_eq!(value["status"], "error.not_found");
         assert_eq!(value["error"]["code"], "error.not_found");
-        assert_eq!(value["error"]["similar_refs"][0], "knowledge:nearby");
+        assert_eq!(value["error"]["ref"], "knowledge:missing");
     }
 
     #[test]
@@ -1372,13 +1304,7 @@ mod tests {
             property_mode: Some("summary".into()),
         };
         let r = EntityRef::parse(&params.entity_ref).unwrap();
-        let rendered = inspect_entity(
-            &params,
-            &ProviderContext::empty_for_tests(),
-            &r,
-            &EdgeIndex::default(),
-        )
-        .unwrap();
+        let rendered = inspect_entity(&params, &ProviderContext::empty_for_tests(), &r).unwrap();
         let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
 
         assert_eq!(value["status"], "ok");
@@ -1400,57 +1326,10 @@ mod tests {
         assert!(value["properties"].get("content").is_none());
     }
 
+    /// A corpus entity carries no edge neighborhood: inspection returns its
+    /// properties with empty edge lists and no family coverage scaffolding.
     #[test]
-    fn inspect_entity_synthesizes_transcript_in_session_edge() {
-        // gap-edc84378: a transcript ref with zero materialized edges must
-        // still surface an IN_SESSION out-edge via
-        // EdgeIndex::forward_edges_with_synthesis, and the (required) edge
-        // family coverage row must report it present.
-        let params = InspectEntityParams {
-            edge_cursor: None,
-            property: None,
-            property_cursor: None,
-            property_limit: None,
-            entity_ref: "transcript:claude:sess-1:42:0".into(),
-            provisional: None,
-            edge_types: None,
-            direction: None,
-            per_type_limit: None,
-            property_mode: Some("summary".into()),
-        };
-        let r = EntityRef::parse(&params.entity_ref).unwrap();
-        let rendered = inspect_entity(
-            &params,
-            &ProviderContext::empty_for_tests(),
-            &r,
-            &EdgeIndex::default(),
-        )
-        .unwrap();
-        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
-
-        assert_eq!(value["status"], "ok");
-        let out_edges = value["edges"]["out"].as_array().unwrap();
-        assert!(
-            out_edges
-                .iter()
-                .any(|edge| edge["kind"] == "IN_SESSION"
-                    && edge["target"] == "session:claude:sess-1"),
-            "expected synthesized IN_SESSION out-edge, got {out_edges:?}"
-        );
-        let coverage = value["edge_family_coverage"].as_array().unwrap();
-        assert!(
-            coverage
-                .iter()
-                .any(|row| row["family"] == "IN_SESSION" && row["count"] == 1),
-            "expected IN_SESSION coverage row with count=1, got {coverage:?}"
-        );
-    }
-
-    #[test]
-    fn edge_family_coverage_omits_optional_zero_count_rows() {
-        // An entity with no edges in the index: every optional expected family
-        // resolves to count 0. Those rows are padding and must not reach the
-        // structured payload; only present (count > 0) or required families do.
+    fn corpus_entities_inspect_as_properties_without_edges() {
         bbox_system_memory::init_for_tests_from(std::path::Path::new(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../system-defaults/memories"
@@ -1464,29 +1343,19 @@ mod tests {
             provisional: None,
             edge_types: None,
             direction: None,
-            per_type_limit: Some(0),
+            per_type_limit: None,
             property_mode: Some("summary".into()),
         };
         let r = EntityRef::parse(&params.entity_ref).unwrap();
-        let rendered = inspect_entity(
-            &params,
-            &ProviderContext::empty_for_tests(),
-            &r,
-            &EdgeIndex::default(),
+        let value: serde_json::Value = serde_json::from_str(
+            &inspect_entity(&params, &ProviderContext::empty_for_tests(), &r).unwrap(),
         )
         .unwrap();
-        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
-        let coverage = value["edge_family_coverage"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
-        for row in coverage {
-            let count = row["count"].as_u64().unwrap();
-            let expected = row["expected"].as_str().unwrap();
-            assert!(
-                count > 0 || expected == "required",
-                "optional zero-count family leaked into structured coverage: {row}"
-            );
-        }
+
+        assert_eq!(value["status"], "ok");
+        assert_eq!(value["edges"]["out"], json!([]));
+        assert_eq!(value["edges"]["in"], json!([]));
+        assert!(value.get("edge_family_coverage").is_none());
+        assert!(value.get("recommended_next_hops").is_none());
     }
 }

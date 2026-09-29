@@ -18,7 +18,6 @@ use crate::checkout_access::CheckoutAccessBroker;
 #[cfg(test)]
 use crate::projects::ProjectRegistry;
 use bbox_corpus_core::project_record::ProjectRecordsProvider;
-use bbox_corpus_index::transcripts::adapters::{TranscriptAdapterRegistry, TranscriptScanTarget};
 
 // At the default 120s interval this is one full refresh per day. Full
 // project refreshes rewrite managed derived sidecars and trigger legacy
@@ -526,16 +525,12 @@ pub(super) fn execute_reindex_pass(
             })
         })
         .collect();
-    let tool_edges = ToolEdgeContext::with_project_access(
-        tool_edge_project_access(
-            records_provider,
-            &plans,
-            &unavailable_record_project_paths,
-            local_tool_edge_access,
-        )?,
-        edges_dir.clone(),
-        !full,
-    );
+    let tool_edges = ToolEdgeContext::with_project_access(tool_edge_project_access(
+        records_provider,
+        &plans,
+        &unavailable_record_project_paths,
+        local_tool_edge_access,
+    )?);
 
     let transcript_phase = Instant::now();
     index_transcripts_via_adapters(
@@ -587,7 +582,8 @@ pub(super) fn execute_reindex_pass(
         // The pinned selector map was seeded from the pre-flip manifest, so a
         // reader would filter out the freshly staged documents until it is
         // refreshed. The boot path refreshes immediately after this pass; a
-        // background pass converges on the next edge-index rebuild.
+        // background pass converges when the code read view refresher next
+        // sees the manifest move.
         tracing::info!(
             migrated = ?project_stats.migrated_collected_selectors,
             "auto-reindex: migrated collected generations to the current materialization version"
@@ -797,12 +793,10 @@ pub(super) fn execute_reindex_pass(
         Some(checkout_access.publication_guard_for(lease_refs)?)
     };
     publisher_ref_publication.publish()?;
-    let tool_edge_publication = tool_edges.take_publish_bundle();
     let mut project_publication_result = project_stats.publication.publish()?;
     project_stats.pending_local_snapshots =
         project_publication_result.take_pending_local_snapshots();
     let commit_attempt = (|| -> Result<_> {
-        tool_edge_publication.publish()?;
         let pending_pins = if project_stats.pending_local_snapshots.is_empty() {
             Vec::new()
         } else {
@@ -1143,77 +1137,6 @@ pub fn spawn_reindex_thread(
         .expect("failed to spawn reindex thread");
 }
 
-/// Walk all indexed transcripts and retroactively emit observed tool-call edges
-/// (RAN_BASH) for a newly registered project.
-///
-/// Idempotent: uses `append_edges_dedup` so re-running produces no duplicates.
-/// Returns the number of new edges written.
-pub fn backfill_tool_edges_for_project<G>(
-    config: &ReindexConfig,
-    project_id: &str,
-    local_root: &std::path::Path,
-    publication_guard: impl FnOnce() -> Result<G>,
-) -> Result<usize> {
-    let edges_dir =
-        bbox_edge_index::edge_index::edges_dir_from_projects_path(&config.projects_path);
-    let ctx = ToolEdgeContext::for_project_access(
-        ToolEdgeProjectAccess::local(project_id, local_root.to_path_buf()),
-        edges_dir.clone(),
-    );
-    let registry = TranscriptAdapterRegistry::from_reindex_config(config);
-    let mut collected: Vec<bbox_edge_index::edge_index::Edge> = Vec::new();
-
-    for adapter in registry.adapters() {
-        for target in [
-            TranscriptScanTarget::Sessions,
-            TranscriptScanTarget::History,
-        ] {
-            let locations = match adapter.scan_locations(target) {
-                Ok(locs) => locs,
-                Err(err) => {
-                    tracing::warn!(
-                        error = %err,
-                        "backfill: adapter scan failed, skipping"
-                    );
-                    continue;
-                }
-            };
-            for location in locations {
-                let source_label = location.source.label();
-                let account = location.account.as_deref().unwrap_or(source_label);
-                let snapshot = match adapter.load_snapshot(&location) {
-                    Ok(s) => s,
-                    Err(_) => continue,
-                };
-                for event in &snapshot.events {
-                    let Some(parsed) = event.to_parsed_event() else {
-                        continue;
-                    };
-                    let line_offset = event.raw.byte_offset.unwrap_or(0);
-                    let event_idx = event.raw.event_idx.unwrap_or(0);
-                    match ctx.build_event_edges(&parsed, account, line_offset, event_idx) {
-                        Ok(Some(edge)) => collected.push(edge),
-                        Ok(None) => {}
-                        Err(err) => {
-                            tracing::debug!(
-                                error = %err,
-                                "backfill: skipping event edge build error"
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    let _publication_guard = publication_guard()?;
-    if collected.is_empty() {
-        return Ok(0);
-    }
-
-    bbox_edge_index::edge_index::append_observed_edges_dedup(&edges_dir, project_id, &collected)
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -1363,11 +1286,7 @@ mod tests {
         let mut writer = index.writer(50_000_000).unwrap();
         let mut meta = HashMap::new();
         let (mut files, mut docs, mut skipped) = (0u64, 0u64, 0u64);
-        let tool_edges = ToolEdgeContext::with_project_access(
-            Vec::new(),
-            bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(&config.projects_path),
-            false,
-        );
+        let tool_edges = ToolEdgeContext::with_project_access(Vec::new());
 
         index_transcripts_via_adapters(
             &config,

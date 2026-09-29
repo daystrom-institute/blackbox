@@ -59,7 +59,6 @@ ensure_layout() {
     "reindex_interval_secs = 3600" \
     "reindex_startup_delay_secs = 3600" \
     "background_full_reindex_ticks = 0" \
-    "edge_index_boot_rebuild = false" \
     "" \
     "[paths]" \
     "state_dir = \"$STATE_DIR\"" \
@@ -85,7 +84,6 @@ daemon_env() {
     BLACKBOX_PACKETS_DIR="$STATE_DIR/packets" \
     BLACKBOX_ARTIFACTS_DIR="$STATE_DIR/artifacts" \
     BLACKBOX_REINDEX_INTERVAL_SECS=3600 \
-    BLACKBOX_EDGE_INDEX_BOOT_REBUILD=false \
     "$@"
 }
 
@@ -415,7 +413,7 @@ Report concise findings under these headings:
 
 Use safe commands if shell is available. Prefer summaries over raw dumps. Never print full environment or provider credentials.
 
-Note: this debug daemon's agentic corpus is intentionally empty (no registered projects, delayed reindex, no boot edge-index rebuild). Skip bbox corpus grounding (an empty corpus is by design, not a defect); use filesystem/work tools directly for any source inspection. Do not file a substrate gap about the empty corpus.
+Note: this debug daemon's agentic corpus is intentionally empty (no registered projects, delayed reindex). Skip bbox corpus grounding (an empty corpus is by design, not a defect); use filesystem/work tools directly for any source inspection. Do not file a substrate gap about the empty corpus.
 PROMPT
 }
 

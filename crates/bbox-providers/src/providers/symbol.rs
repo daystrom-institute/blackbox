@@ -3,8 +3,7 @@ use std::collections::BTreeMap;
 use anyhow::Result;
 
 use super::{
-    EdgeFamilyExpectation, EntitySchemaView, EntityView, InspectableEntityProvider, Neighborhood,
-    NextHop, ProviderContext, empty_neighborhood_view, expected, next_hops, schema, truncate_label,
+    EntityView, InspectableEntityProvider, ProviderContext, empty_neighborhood_view, truncate_label,
 };
 use bbox_corpus_core::entity_ref::{EntityRef, EntityType};
 
@@ -24,45 +23,6 @@ impl InspectableEntityProvider for SymbolProvider {
         symbol_entity(ctx, r)
     }
 
-    fn schema(&self) -> EntitySchemaView {
-        schema(
-            self.entity_type(),
-            &["project_id", "qualified_name", "defn_hash", "language"],
-            &[
-                "CALLS",
-                "DEFINED_IN",
-                "IMPLEMENTS_TRAIT",
-                "EDITED_IN_COMMIT",
-            ],
-            &["project_id", "language", "qualified_name"],
-        )
-    }
-
-    fn expected_edge_families(&self, _r: &EntityRef) -> Vec<EdgeFamilyExpectation> {
-        vec![
-            expected("CALLS", false),
-            expected("DEFINED_IN", true),
-            expected("IMPLEMENTS_TRAIT", false),
-            expected("EDITED_IN_COMMIT", false),
-        ]
-    }
-
-    fn recommended_next_hops(
-        &self,
-        _entity: &EntityView,
-        full_neighborhood: &Neighborhood,
-    ) -> Vec<NextHop> {
-        next_hops(
-            full_neighborhood,
-            &[
-                "CALLS",
-                "DEFINED_IN",
-                "IMPLEMENTS_TRAIT",
-                "EDITED_IN_COMMIT",
-            ],
-        )
-    }
-
     fn compact_label(&self, _ctx: &ProviderContext<'_>, r: &EntityRef) -> Option<String> {
         let (_, _, qualified_name, _) = symbol_parts(r)?;
         Some(truncate_label(qualified_name))
@@ -80,26 +40,6 @@ impl InspectableEntityProvider for SymbolV2Provider {
 
     fn get_entity(&self, ctx: &ProviderContext<'_>, r: &EntityRef) -> Result<EntityView> {
         symbol_entity(ctx, r)
-    }
-
-    fn schema(&self) -> EntitySchemaView {
-        let mut view = SymbolProvider.schema();
-        view.entity_type = EntityType::SymbolV2;
-        view.properties.insert(1, "snapshot_id".into());
-        view.filterable_fields.insert(1, "snapshot_id".into());
-        view
-    }
-
-    fn expected_edge_families(&self, r: &EntityRef) -> Vec<EdgeFamilyExpectation> {
-        SymbolProvider.expected_edge_families(r)
-    }
-
-    fn recommended_next_hops(
-        &self,
-        entity: &EntityView,
-        full_neighborhood: &Neighborhood,
-    ) -> Vec<NextHop> {
-        SymbolProvider.recommended_next_hops(entity, full_neighborhood)
     }
 
     fn compact_label(&self, _ctx: &ProviderContext<'_>, r: &EntityRef) -> Option<String> {
@@ -143,18 +83,10 @@ fn symbol_entity(ctx: &ProviderContext<'_>, r: &EntityRef) -> Result<EntityView>
                 properties.extend(indexed);
             }
             None => {
-                // Symbols are edge-projected vertices: the indexer derives
-                // DEFINED_IN/CONTAINS_SYMBOL/CALLS edges but writes no
-                // entity doc (gap-496fe07f). When the call site supplied
-                // the edge sidecar, edge participation IS existence; a
-                // well-formed ref nothing points at stays not_found.
-                let edge_backed = ctx.edge_index().is_some_and(|edges| {
-                    !edges.forward_edges(r).is_empty() || !edges.reverse_edges(r).is_empty()
-                });
-                if !edge_backed {
-                    anyhow::bail!("symbol entity {r} not found");
-                }
-                properties.insert("source".into(), "edge_projection".into());
+                // Symbols have no entity doc of their own and the daemon keeps
+                // no edge graph, so a symbol ref has no existence proof: it
+                // resolves only where an indexed entity doc backs it.
+                anyhow::bail!("symbol entity {r} not found");
             }
         }
     }

@@ -1304,7 +1304,7 @@ async fn catalog_onboard(
             }
         }
     }
-    state.nudge_edge_index_rebuild();
+    state.nudge_code_read_view_refresh();
     Ok((StatusCode::CREATED, Json(receipt)))
 }
 
@@ -2671,12 +2671,22 @@ enum HealthSubject {
     /// A published-scope hash, owned and reconciled by the retained-blob
     /// scrub.
     Scope,
-    /// A daemon subsystem such as `_edge_index`.
+    /// A daemon subsystem, keyed by a `_`-prefixed name.
     System,
+    /// A retired daemon subsystem. No current writer records health under
+    /// it, so such a row is a leftover of an older build.
+    RetiredSystem,
 }
 
+/// Subsystem subjects no current build writes health rows for. The in-memory
+/// edge graph and its rebuild watcher are gone, so `_edge_index` rows
+/// (`rebuild_failed`, `store_refresh_deferred`) describe nothing live.
+const RETIRED_SYSTEM_HEALTH_SUBJECTS: &[&str] = &["_edge_index"];
+
 fn classify_health_subject(subject: &str) -> HealthSubject {
-    if subject.starts_with('_') {
+    if RETIRED_SYSTEM_HEALTH_SUBJECTS.contains(&subject) {
+        HealthSubject::RetiredSystem
+    } else if subject.starts_with('_') {
         HealthSubject::System
     } else if bbox_corpus_core::project_catalog::RepoHistoryId::parse(subject).is_ok() {
         HealthSubject::RepoHistory
@@ -2696,7 +2706,8 @@ fn classify_health_subject(subject: &str) -> HealthSubject {
 /// A project row survives while the catalog holds the project, a producer
 /// assignment or activation record still names it, or a retirement is
 /// queued for it (those rows describe work still in flight). Repository-
-/// history rows are always leftovers (see [`HealthSubject::RepoHistory`]).
+/// history rows and retired subsystem rows are always leftovers (see
+/// [`HealthSubject::RepoHistory`] and [`HealthSubject::RetiredSystem`]).
 /// Scope and system rows belong to their own reconcilers. Runs at startup,
 /// after every delivered catalog commit, and on the maintenance pass, so a
 /// retired project's rows clear without manual deletion.
@@ -2747,7 +2758,7 @@ pub(crate) fn clear_unbound_health_subjects(
                     )
                     .is_ok_and(|project_id| !catalog.projects.contains_key(&project_id))
             }
-            HealthSubject::RepoHistory => true,
+            HealthSubject::RepoHistory | HealthSubject::RetiredSystem => true,
             HealthSubject::Scope | HealthSubject::System => false,
         };
         if !stale {
@@ -3367,37 +3378,27 @@ pub(super) fn resolve_code_project_identity(
 
 /// Republish the pinned code read view after a post-activation overlay
 /// landed. The active selector map is already correct (the activation set
-/// it); only the edge index and searcher move.
-pub(super) fn republish_code_read_view(state: &Arc<SharedState>) -> Result<()> {
+/// it); only the Git overlay selection and searcher move.
+pub(crate) fn republish_code_read_view(state: &Arc<SharedState>) -> Result<()> {
     let edges_dir = bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(
         &state.idx.read().reindex_config().projects_path,
     );
-    // The fence store and the view swap run under the manifest coordinator,
-    // the same lock the watcher publishes under, and in the same order the
-    // activation callbacks use (coordinator, then `idx.write()`). Without it
-    // a watcher publication could land between the two steps and leave the
-    // fence raised over the placeholder graph. The coordinator is not
+    // The view swap runs under the manifest coordinator, the same lock the
+    // view refresher publishes under, and in the same order the activation
+    // callbacks use (coordinator, then `idx.write()`), so a concurrent
+    // publication cannot interleave with it. The coordinator is not
     // reentrant: no caller of this function may already hold it.
     bbox_edge_sidecar::snapshot::with_manifest_coordinator(|| {
         let index = state.idx.write();
         let selectors = index.active_code_selectors();
-        state
-            .edge_index_ready
-            .store(false, std::sync::atomic::Ordering::Release);
         *state.code_read_view.write() = Arc::new(super::CodeReadView {
             active_selectors: selectors,
             searcher: index.searcher(),
-            // Fail closed until the bounded watcher parses the newly selected
-            // sidecars. Keeping the outgoing graph here would expose edges
-            // from a selector this view no longer names; rebuilding inline
-            // made this post-activation path a multi-minute blocking
-            // operation.
-            edge_index: Arc::new(crate::edge_index::EdgeIndex::default()),
             catalog_epoch: state.records_provider.records_snapshot().authority_epoch,
             // Read AFTER the overlay selector landed in the manifest: this
             // republish is what makes the freshly staged overlay visible to
-            // readers, so pinning a pre-swap map here would publish edges the
-            // view claims not to have.
+            // readers and to the Git GC root set, so pinning a pre-swap map
+            // here would hide the overlay the manifest now names.
             git_overlays: super::state::read_git_overlays_for_view(
                 &state.project_authority,
                 &edges_dir,
@@ -3407,7 +3408,6 @@ pub(super) fn republish_code_read_view(state: &Arc<SharedState>) -> Result<()> {
         });
         Ok(())
     })?;
-    state.nudge_edge_index_rebuild();
     Ok(())
 }
 
@@ -5765,10 +5765,7 @@ fn classify_staging_error(error: &anyhow::Error) -> CutbackAttemptOutcome {
     }
     for cause in error.chain() {
         match cause.downcast_ref::<IndexWriterRetryableError>() {
-            Some(
-                IndexWriterRetryableError::ReindexPassInProgress
-                | IndexWriterRetryableError::EdgeIndexRebuildInProgress { .. },
-            ) => {
+            Some(IndexWriterRetryableError::ReindexPassInProgress) => {
                 return CutbackAttemptOutcome::ReadinessDeferred(CutbackReadiness::ReindexPass);
             }
             Some(IndexWriterRetryableError::VectorStoreWarming) => {
@@ -5933,17 +5930,9 @@ fn cutback_to_local_single_attempt(
             let mut selectors = index.active_code_selectors();
             selectors.insert(project_id.to_string(), staged.selector.clone());
             index.replace_active_code_selectors(selectors.clone());
-            state
-                .edge_index_ready
-                .store(false, std::sync::atomic::Ordering::Release);
             *state.code_read_view.write() = Arc::new(super::CodeReadView {
                 active_selectors: selectors,
                 searcher: index.searcher(),
-                // The callback executes under the manifest coordinator. A
-                // complete sidecar parse here starved every other manifest
-                // publisher in production. Publish no stale graph, release
-                // the coordinator, and let the bounded watcher fill it.
-                edge_index: Arc::new(crate::edge_index::EdgeIndex::default()),
                 catalog_epoch: state.records_provider.records_snapshot().authority_epoch,
                 git_overlays: super::state::read_git_overlays_for_view(
                     &state.project_authority,
@@ -5955,7 +5944,6 @@ fn cutback_to_local_single_attempt(
             Ok(())
         },
     )?;
-    state.nudge_edge_index_rebuild();
     if let Some(activation) = store.load_activation_mixed(project_id)? {
         if let Ok(generation) = store.find_generation_mixed(activation.generation_id()) {
             let gen_scope = generation.descriptor().scope.clone();
@@ -6284,13 +6272,9 @@ fn cutback_to_local(
             let mut selectors = index.active_code_selectors();
             selectors.insert(project_id.to_string(), staged.selector.clone());
             index.replace_active_code_selectors(selectors.clone());
-            state
-                .edge_index_ready
-                .store(false, std::sync::atomic::Ordering::Release);
             *state.code_read_view.write() = Arc::new(super::CodeReadView {
                 active_selectors: selectors,
                 searcher: index.searcher(),
-                edge_index: Arc::new(crate::edge_index::EdgeIndex::default()),
                 catalog_epoch: state.records_provider.records_snapshot().authority_epoch,
                 // Inside the manifest coordinator, so this reads the entry
                 // the activation just wrote: the atomic overlay clear.
@@ -6304,7 +6288,6 @@ fn cutback_to_local(
             Ok(())
         },
     )?;
-    state.nudge_edge_index_rebuild();
     if let Some(activation) = store.load_activation_mixed(project_id)? {
         if let Ok(generation) = store.find_generation_mixed(activation.generation_id()) {
             let scope = generation.descriptor().scope.clone();
@@ -6700,13 +6683,9 @@ fn activate_desired_loop(
                 let mut selectors = index.active_code_selectors();
                 selectors.insert(project_id.to_string(), staged.selector.clone());
                 index.replace_active_code_selectors(selectors.clone());
-                state
-                    .edge_index_ready
-                    .store(false, std::sync::atomic::Ordering::Release);
                 *state.code_read_view.write() = Arc::new(super::CodeReadView {
                     active_selectors: selectors,
                     searcher: index.searcher(),
-                    edge_index: Arc::new(crate::edge_index::EdgeIndex::default()),
                     catalog_epoch: state.records_provider.records_snapshot().authority_epoch,
                     // Inside the manifest coordinator, so this reads the
                     // entry the activation just wrote: activating a new code
@@ -6723,7 +6702,6 @@ fn activate_desired_loop(
                 Ok(())
             },
         )?;
-        state.nudge_edge_index_rebuild();
         tracing::info!(
             project_id,
             generation = %desired_generation_id,
@@ -8358,6 +8336,8 @@ mod tests {
             (orphan_history, "history_transport_activation_deadletter"),
             (scope_subject.as_str(), "missing_blob_data"),
             ("_edge_index", "store_refresh_deferred"),
+            ("_edge_index", "rebuild_failed"),
+            ("_subsystem", "still_owned"),
         ];
         for (subject, code) in rows {
             store
@@ -8374,10 +8354,7 @@ mod tests {
                 "retirement_deferred_active".to_string(),
             ),
             (scope_subject.clone(), "missing_blob_data".to_string()),
-            (
-                "_edge_index".to_string(),
-                "store_refresh_deferred".to_string(),
-            ),
+            ("_subsystem".to_string(), "still_owned".to_string()),
         ]);
         let remaining = || {
             store
@@ -13029,7 +13006,9 @@ mod tests {
             vec![],
         );
         let manifest = bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(
-            &crate::edge_index::edges_dir_from_projects_path(&root.join("projects.json")),
+            &bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(
+                &root.join("projects.json"),
+            ),
         )
         .unwrap();
         // No activation records in the store: chain must pass.
@@ -13097,7 +13076,9 @@ mod tests {
         // Catalog has a DIFFERENT scope than the activation.
         let snapshot = p4f_catalog_snapshot(project_id, catalog_scope, vec![]);
         let manifest = bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(
-            &crate::edge_index::edges_dir_from_projects_path(&root.join("projects.json")),
+            &bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(
+                &root.join("projects.json"),
+            ),
         )
         .unwrap();
 
@@ -13146,7 +13127,9 @@ mod tests {
         // Manifest is fresh/empty: no workspace entry for the project.
         // This is the migrated-root shape: chain must PASS.
         let manifest = bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(
-            &crate::edge_index::edges_dir_from_projects_path(&root.join("projects.json")),
+            &bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(
+                &root.join("projects.json"),
+            ),
         )
         .unwrap();
 
@@ -13181,8 +13164,9 @@ mod tests {
             false,
         );
         let catalog = p4f_catalog_snapshot(project_id, scope.clone(), vec![]);
-        let edges_dir =
-            crate::edge_index::edges_dir_from_projects_path(&root.join("projects.json"));
+        let edges_dir = bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(
+            &root.join("projects.json"),
+        );
         let initial = bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(&edges_dir).unwrap();
         validate_relationship_chain(&store, &catalog, &initial).unwrap();
 
@@ -13272,8 +13256,9 @@ mod tests {
     fn p4f_absent_local_materialization_remains_drift() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
-        let edges_dir =
-            crate::edge_index::edges_dir_from_projects_path(&root.join("projects.json"));
+        let edges_dir = bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(
+            &root.join("projects.json"),
+        );
         let project_id = "p_000000000000000000000000000004f5";
         let mut manifest = bbox_edge_sidecar::manifest::ManifestIndex::new();
         manifest.workspaces.insert(
@@ -13499,7 +13484,9 @@ mod tests {
         // pending-first-republish so the chain reaches link 6.
         let snapshot = p4f_catalog_snapshot(project_id, scope, vec![]);
         let manifest = bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(
-            &crate::edge_index::edges_dir_from_projects_path(&root.join("projects.json")),
+            &bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(
+                &root.join("projects.json"),
+            ),
         )
         .unwrap();
 

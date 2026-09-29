@@ -469,19 +469,8 @@ pub fn index_adapter_location(
         .flatten();
 
     for event in &snapshot.events {
-        let Some(parsed) = event.to_parsed_event() else {
+        if event.to_parsed_event().is_none() {
             continue;
-        };
-        let line_offset = event.raw.byte_offset.unwrap_or(0);
-        let event_idx = event.raw.event_idx.unwrap_or(0);
-        if !native_landed
-            && let Err(err) = tool_edges.emit_event_edges(&parsed, account, line_offset, event_idx)
-        {
-            tracing::debug!(
-                error = %err,
-                source = %location.source,
-                "failed to emit transcript tool-call edge"
-            );
         }
         let Some(doc) = normalized_to_doc(
             event,

@@ -1,9 +1,9 @@
 use anyhow::bail;
 
+use crate::entity_ref;
 use crate::mcp_tools;
 use crate::mcp_tools::inspect::InspectEntityParams;
 use crate::server::BlackboxServer;
-use crate::{edge_index, entity_ref};
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -24,11 +24,6 @@ pub(crate) struct EdgeCompactParams {
     pub project_id: String,
     /// Apply the compaction. Defaults to false, returning a dry-run summary.
     pub apply: Option<bool>,
-    /// Rebuild the in-memory EdgeIndex after applying. With apply=true, this
-    /// also works when compaction is already a no-op. Uses a sidecar-only
-    /// rebuild. Defaults to false because graph rebuilds can be expensive while
-    /// legacy sidecars are still large.
-    pub rebuild: Option<bool>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, schemars::JsonSchema)]
@@ -138,7 +133,7 @@ pub(crate) struct ProjectGraphValidateParams {
 impl BlackboxServer {
     #[tool(
         name = "bbox_inspect_entity",
-        description = "Inspect properties and targeted edges. Filter edge_types and direction; per_type_limit=0 reads properties only. property_mode selects summary, smart, or full. Follow edge_page.next_cursor for more edges; property retrieves exact text in pages."
+        description = "Inspect an entity's stored properties. Project graph vertices, and entities an evidence binding names, also carry their graph edges; filter those with edge_types and direction. property_mode selects summary, smart, or full; property retrieves exact text in pages."
     )]
     pub(crate) async fn bbox_inspect_entity(
         &self,
@@ -155,8 +150,7 @@ impl BlackboxServer {
                 }
             };
             let knowledge_view = server.session_knowledge_view(None, p.provisional.as_deref())?;
-            let read_view = server.state.complete_code_read_view()?;
-            let edge_index = read_view.edge_index.as_ref();
+            let read_view = server.state.code_read_view.read().clone();
             if matches!(
                 &entity_ref,
                 entity_ref::EntityRef::ProjectFile { .. }
@@ -171,20 +165,15 @@ impl BlackboxServer {
                     &read_view.searcher,
                 )
             {
-                let output = mcp_tools::inspect::not_found(
-                    &entity_ref,
-                    mcp_tools::inspect::similar_refs(edge_index, &entity_ref),
-                );
+                let output = mcp_tools::inspect::not_found(&entity_ref);
                 return knowledge_view.enrich_json_response(output);
             }
             let provider_ctx = server
                 .provider_context()
                 .with_knowledge_view(&knowledge_view.knowledge)
-                .with_edge_index(edge_index)
                 .with_searcher(&read_view.searcher)
                 .with_project_graph_resolver(&server, p.provisional.as_deref());
-            let output =
-                mcp_tools::inspect::inspect_entity(&p, &provider_ctx, &entity_ref, edge_index)?;
+            let output = mcp_tools::inspect::inspect_entity(&p, &provider_ctx, &entity_ref)?;
             knowledge_view.enrich_json_response(output)
         })
         .await
@@ -500,7 +489,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_edge_compact",
-        description = "Dry-run or apply legacy edge sidecar compaction for one project. Removes append-only derived edges from edges/<project_id>.jsonl while retaining explicit/provenance/malformed lines; apply defaults false and writes a backup before replacement. With apply=true, rebuild=true forces a sidecar-only in-memory EdgeIndex rebuild even when compaction is already complete."
+        description = "Dry-run or apply legacy edge sidecar compaction for one project. Removes append-only derived edges from edges/<project_id>.jsonl while retaining explicit/provenance/malformed lines; apply defaults false and writes a backup before replacement."
     )]
     pub(crate) async fn bbox_edge_compact(
         &self,
@@ -522,19 +511,12 @@ impl BlackboxServer {
             }
             let edges_dir = crate::server::edge_sidecar_dir(&server.state);
             let apply = p.apply.unwrap_or(false);
-            let stats = edge_index::compact_legacy_sidecar(&edges_dir, &p.project_id, apply)?;
-            let edge_index_rebuilt = apply && p.rebuild.unwrap_or(false);
-            let mut receipt = json!({"status":"ok", "stats":stats,
-                "compaction_completed":true, "edge_index_rebuilt":false});
-            if edge_index_rebuilt {
-                match crate::server::rebuild_edge_index_from_shared(&server.state, false) {
-                    Ok(()) => receipt["edge_index_rebuilt"] = json!(true),
-                    Err(_) => {
-                        receipt["status"] = json!("partial");
-                        receipt["error"] = json!("Compaction completed, but the in-memory edge index rebuild failed. Retry apply=true,rebuild=true to rebuild from the compacted sidecar.");
-                    }
-                }
-            }
+            let stats = bbox_edge_sidecar::edge_sidecar::compact_legacy_sidecar(
+                &edges_dir,
+                &p.project_id,
+                apply,
+            )?;
+            let receipt = json!({"status":"ok", "stats":stats, "compaction_completed":true});
             Ok(receipt.to_string())
         })
         .await
@@ -546,14 +528,13 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn compaction_receipt_survives_later_rebuild_failure() {
-        let mut env = crate::util::TestEnvGuard::new();
+    async fn compaction_receipt_reports_stats_and_backup() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
         let server = BlackboxServer::new(Arc::new(SharedState::for_test(&root.join("bro"))));
         let edges_dir = crate::server::edge_sidecar_dir(&server.state);
         std::fs::create_dir_all(&edges_dir).unwrap();
-        let edge = edge_index::Edge {
+        let edge = bbox_edge_sidecar::edge_sidecar::Edge {
             source: entity_ref::EntityRef::Knowledge { id: "first".into() },
             target: entity_ref::EntityRef::Knowledge {
                 id: "second".into(),
@@ -580,18 +561,16 @@ mod tests {
             vec![],
         )
         .unwrap();
-        env.set("BLACKBOX_EDGE_INDEX_REBUILD_MAX_INPUT_BYTES", "1");
         let result = server
             .bbox_edge_compact(Parameters(EdgeCompactParams {
                 project_id: "synthetic".into(),
                 apply: Some(true),
-                rebuild: Some(true),
             }))
             .await;
         assert_ne!(result.is_error, Some(true), "{result:?}");
         let value: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
-        assert_eq!(value["status"], "partial");
-        assert_eq!(value["edge_index_rebuilt"], false);
+        assert_eq!(value["status"], "ok");
+        assert!(value.get("edge_index_rebuilt").is_none());
         assert_eq!(value["stats"]["applied"], true);
         assert_eq!(
             std::fs::read_to_string(edges_dir.join("synthetic.jsonl")).unwrap(),
@@ -2775,73 +2754,36 @@ mod tests {
         );
     }
 
-    /// Symbols are edge-projected vertices: the indexer derives their edges
-    /// but writes no entity doc (gap-496fe07f). A symbol ref the edge
-    /// sidecar names must inspect OK (existence = edge participation); a
-    /// well-formed ref nothing points at must stay not_found.
+    /// Symbol refs have no entity doc and the daemon keeps no edge graph, so
+    /// nothing proves one exists: a well-formed symbol ref is not_found, and
+    /// the refusal carries no suggestion list drawn from a graph.
     #[tokio::test]
-    async fn inspect_resolves_edge_projected_symbol_without_entity_doc() {
-        use bbox_chunker::{EdgeConfidence, EdgeProvenance};
-        use bbox_edge_index::edge_index::{Edge, EdgeIndex};
-
+    async fn symbol_refs_without_an_entity_doc_are_not_found() {
         let tmp = tempfile::tempdir().unwrap();
         let server = test_server(&tmp);
-        let symbol = "symbol:d723917f:KnowledgeStore:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let file = "project_file:d723917f:31d088f0:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:163";
-        let selectors = server.state.idx.read().active_code_selectors();
-        let searcher = server.state.idx.read().searcher();
-        *server.state.code_read_view.write() = std::sync::Arc::new(crate::server::CodeReadView {
-            active_selectors: selectors,
-            searcher,
-            edge_index: std::sync::Arc::new(EdgeIndex::from_edges_for_tests(vec![Edge {
-                source: crate::entity_ref::EntityRef::parse(symbol).unwrap(),
-                kind: "DEFINED_IN".into(),
-                target: crate::entity_ref::EntityRef::parse(file).unwrap(),
-                provenance: EdgeProvenance::Derived,
-                confidence: EdgeConfidence::Exact,
-                metadata: Default::default(),
-                project_id: None,
-            }])),
-            catalog_epoch: 0,
-            git_overlays: std::collections::BTreeMap::new(),
-        });
-
-        let inspect = |entity_ref: String| {
-            let server = server.clone();
-            async move {
-                let result = server
-                    .bbox_inspect_entity(Parameters(InspectEntityParams {
-                        edge_cursor: None,
-                        property: None,
-                        property_cursor: None,
-                        property_limit: None,
-                        entity_ref,
-                        provisional: None,
-                        edge_types: None,
-                        direction: None,
-                        per_type_limit: Some(5),
-                        property_mode: Some("full".into()),
-                    }))
-                    .await;
-                serde_json::from_str::<serde_json::Value>(&extract_text(&result)).unwrap()
-            }
-        };
-
-        let found = inspect(symbol.to_string()).await;
-        assert_eq!(
-            found["status"], "ok",
-            "edge-backed symbol must inspect: {found}"
-        );
-        assert_eq!(found["properties"]["qualified_name"], "KnowledgeStore");
-        assert_eq!(found["properties"]["source"], "edge_projection");
-
-        let orphan =
-            inspect("symbol:d723917f:KnowledgeStore:cccccccccccccccccccccccccccccccc".to_string())
+        for entity_ref in [
+            "symbol:d723917f:KnowledgeStore:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "symbol_v2:d723917f:snap:KnowledgeStore:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ] {
+            let result = server
+                .bbox_inspect_entity(Parameters(InspectEntityParams {
+                    edge_cursor: None,
+                    property: None,
+                    property_cursor: None,
+                    property_limit: None,
+                    entity_ref: entity_ref.into(),
+                    provisional: None,
+                    edge_types: None,
+                    direction: None,
+                    per_type_limit: Some(5),
+                    property_mode: Some("full".into()),
+                }))
                 .await;
-        assert_eq!(
-            orphan["status"], "error.not_found",
-            "edge-less symbol ref must stay not_found: {orphan}"
-        );
+            let value: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+            assert_eq!(value["status"], "error.not_found", "{entity_ref}: {value}");
+            assert_eq!(value["error"]["ref"], entity_ref);
+            assert!(value["error"].get("similar_refs").is_none());
+        }
     }
 
     /// gap-edc84378 fold: bbox_inspect_entity used to 404 real transcript
@@ -2849,11 +2791,10 @@ mod tests {
     /// TranscriptIndex::transcript_properties capped its per-session doc
     /// scan at a fixed size (fixed in bbox-corpus-index, see its doc
     /// comment). A transcript ref with a matching tantivy doc must inspect
-    /// OK and carry the synthesized IN_SESSION out-edge; one with no
-    /// matching doc must still 404 -- the eval oracle depends on genuinely
-    /// dead refs staying dead.
+    /// OK; one with no matching doc must still 404 -- the eval oracle
+    /// depends on genuinely dead refs staying dead.
     #[tokio::test]
-    async fn bbox_inspect_entity_resolves_transcript_doc_and_synthesizes_in_session() {
+    async fn bbox_inspect_entity_resolves_transcript_doc() {
         let tmp = tempfile::tempdir().unwrap();
         let server = test_server(&tmp);
         {
@@ -2895,14 +2836,7 @@ mod tests {
         let found = inspect("transcript:claude:sess-1:42:0".to_string()).await;
         assert_eq!(found["status"], "ok", "expected ok, got {found}");
         assert_eq!(found["properties"]["role"], "assistant");
-        let out_edges = found["edges"]["out"].as_array().unwrap();
-        assert!(
-            out_edges
-                .iter()
-                .any(|edge| edge["kind"] == "IN_SESSION"
-                    && edge["target"] == "session:claude:sess-1"),
-            "expected synthesized IN_SESSION out-edge, got {out_edges:?}"
-        );
+        assert_eq!(found["edges"]["out"], json!([]), "{found}");
 
         // A ref whose (session, byte_offset) matches no doc must stay
         // not_found -- do not fabricate entities for arbitrary offsets.
@@ -2910,32 +2844,36 @@ mod tests {
         assert_eq!(missing["status"], "error.not_found");
     }
 
+    /// Inspection never waits on graph state: a property read answers
+    /// straight from the entity's store, including immediately after a code
+    /// read view republish, which once published a placeholder graph and
+    /// refused every inspect until a rebuild landed.
     #[tokio::test]
-    async fn deferred_edge_index_refuses_graph_reads_until_complete_view_is_published() {
+    async fn inspect_property_reads_answer_immediately_after_a_view_republish() {
+        crate::init_system_memory_for_tests();
         let tmp = tempfile::tempdir().unwrap();
         let server = test_server(&tmp);
-        server
-            .state
-            .edge_index_ready
-            .store(false, std::sync::atomic::Ordering::Release);
+        crate::server::code_source::republish_code_read_view(&server.state).unwrap();
 
         let result = server
             .bbox_inspect_entity(Parameters(InspectEntityParams {
                 edge_cursor: None,
-                property: None,
+                property: Some("id".into()),
                 property_cursor: None,
                 property_limit: None,
-                entity_ref: "thread:thread-00000000".into(),
+                entity_ref: "system_memory:sm-agentic-opening-sequence".into(),
                 provisional: None,
                 edge_types: None,
                 direction: None,
-                per_type_limit: Some(5),
-                property_mode: Some("summary".into()),
+                per_type_limit: Some(0),
+                property_mode: None,
             }))
             .await;
 
-        assert_eq!(result.is_error, Some(true));
-        assert!(extract_text(&result).contains("error.edge_index_warming"));
+        assert_ne!(result.is_error, Some(true), "{}", extract_text(&result));
+        let value: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(value["status"], "ok", "{value}");
+        assert_eq!(value["body"]["text"], "sm-agentic-opening-sequence");
     }
 }
 

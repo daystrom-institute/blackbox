@@ -43,7 +43,6 @@ mod restore;
 pub mod routes;
 mod run;
 mod runtime_metrics;
-pub mod schema;
 mod shutdown;
 mod startup;
 pub mod state;

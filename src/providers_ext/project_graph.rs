@@ -3,8 +3,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::{Result, anyhow};
 use bbox_corpus_core::entity_ref::{EntityRef, EntityType};
 use bbox_providers::providers::{
-    EdgeFamilyExpectation, EntitySchemaView, EntityView, InspectableEntityProvider, Neighborhood,
-    NextHop, NextHopDirection, ProviderContext, schema, truncate_label,
+    EntityView, InspectableEntityProvider, Neighborhood, NextHop, NextHopDirection,
+    ProviderContext, truncate_label,
 };
 
 pub(crate) struct ProjectGraphVertexProvider {
@@ -38,30 +38,6 @@ impl InspectableEntityProvider for ProjectGraphVertexProvider {
         ctx.project_graph_resolver()
             .ok_or_else(|| anyhow!("project graph provider requires a request resolver"))?
             .resolve_entity(r, ctx.provisional_mode())
-    }
-
-    fn schema(&self) -> EntitySchemaView {
-        schema(
-            self.entity_type(),
-            &[
-                "id",
-                "type",
-                "label",
-                "project_id",
-                "graph_id",
-                "logical_ref",
-                "content_hash",
-                "source",
-                "checkout_id",
-                "properties",
-            ],
-            &[],
-            &["project_id", "graph_id", "type", "source"],
-        )
-    }
-
-    fn expected_edge_families(&self, _r: &EntityRef) -> Vec<EdgeFamilyExpectation> {
-        Vec::new()
     }
 
     /// Three lanes, in priority order.
@@ -177,7 +153,7 @@ impl InspectableEntityProvider for ProjectGraphVertexProvider {
 mod tests {
     use super::*;
     use bbox_chunker::{EdgeConfidence, EdgeProvenance};
-    use bbox_edge_index::edge_index::Edge;
+    use bbox_edge_sidecar::edge_sidecar::Edge;
     use bbox_providers::providers::NextHopHint;
     use std::collections::BTreeMap;
 

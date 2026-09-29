@@ -175,7 +175,7 @@ impl BlackboxServer {
         // write guard, and the fsynced `.bbox/record/` snapshot) runs on the
         // blocking pool so a queued write guard or slow disk never parks a
         // tokio worker. The handler only awaits it, the durable persist, and
-        // the non-blocking index enqueue and rebuild nudge.
+        // the non-blocking index enqueue.
         let server = self.clone();
         let mut p = p.inner;
         let mutation_result = tokio::task::spawn_blocking(move || {
@@ -229,13 +229,6 @@ impl BlackboxServer {
                 .enqueue(crate::index::IndexWriteOp::UpsertThread(Box::new(
                     thread.clone(),
                 )));
-        }
-        if mutation.changed_edges {
-            // Nudge the watcher thread instead of rebuilding inline: a full
-            // rebuild parses the multi-GB sidecar lanes (13s+ in prod) and
-            // must not pin a tokio worker. The linked edge appears in the
-            // graph once the watcher's rebuild lands (typically seconds).
-            self.state.nudge_edge_index_rebuild();
         }
         let ms = start.elapsed().as_secs_f64() * 1000.0;
         tracing::info!(target: "blackbox::tool", tool = "bbox_thread", elapsed_ms = ms, bytes = mutation.message.len(), "ok");
@@ -779,15 +772,14 @@ mod tests {
         );
     }
 
-    /// A thread mutation never waits on an in-flight edge-index rebuild.
-    /// Holding a code read view reader parks the rebuild at publish under the
-    /// manifest coordinator (the `rebuild_releases_store_locks_before_taking_edge_index_write`
-    /// technique); open, link, and resolve must each complete within the
-    /// bound while it stays parked. Each call runs as its own task so the
+    /// A thread mutation never waits on an in-flight code read view refresh.
+    /// Holding a code read view reader parks the refresh at publish under the
+    /// manifest coordinator; open, link, and resolve must each complete
+    /// within the bound while it stays parked. Each call runs as its own task so the
     /// timeout fires even if the handler were to block its worker.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[allow(clippy::await_holding_lock)] // The test thread holds the view guard to park the rebuild; the calls run on worker tasks.
-    async fn thread_mutations_do_not_wait_on_parked_edge_index_rebuild() {
+    #[allow(clippy::await_holding_lock)] // The test thread holds the view guard to park the refresh; the calls run on worker tasks.
+    async fn thread_mutations_do_not_wait_on_a_parked_view_refresh() {
         use std::time::Duration;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -797,18 +789,18 @@ mod tests {
         let state = Arc::new(SharedState::for_test(&root.join("bro")));
         let server = BlackboxServer::new(state.clone());
 
+        use crate::server::routes::refresh_code_read_view;
+
         let held = state.code_read_view.read();
         let st = state.clone();
-        // lint-concurrency: allow(thread-spawn) - test harness stands in for the rebuild watcher's own std thread
-        let rebuild = std::thread::spawn(move || {
-            crate::server::routes::rebuild_edge_index_from_shared(&st, false)
-        });
-        // Let the rebuild finish its (trivial) projection and park on the
-        // view write; it cannot return while `held` is alive.
+        // lint-concurrency: allow(thread-spawn) - test harness stands in for the view refresher's own std thread
+        let refresh = std::thread::spawn(move || refresh_code_read_view(&st));
+        // Let the refresh read its selectors and park on the view write; it
+        // cannot return while `held` is alive.
         tokio::time::sleep(Duration::from_millis(400)).await;
         assert!(
-            !rebuild.is_finished(),
-            "precondition: rebuild should be parked at publish"
+            !refresh.is_finished(),
+            "precondition: refresh should be parked at publish"
         );
 
         let call = |params: ThreadParams| {
@@ -823,7 +815,7 @@ mod tests {
                 let result = tokio::time::timeout(Duration::from_secs(2), task)
                     .await
                     .unwrap_or_else(|_| {
-                        panic!("bbox_thread action={action} waited on the parked rebuild")
+                        panic!("bbox_thread action={action} waited on the parked refresh")
                     })
                     .unwrap();
                 assert_ne!(result.is_error, Some(true), "{}", text_of(&result));
@@ -832,7 +824,7 @@ mod tests {
         };
 
         let opened = call(ThreadParams {
-            topic: Some("parked rebuild".into()),
+            topic: Some("parked refresh".into()),
             project: Some(project.to_string_lossy().into_owned()),
             ..tp("open")
         })
@@ -853,14 +845,14 @@ mod tests {
         .await;
         call(ThreadParams {
             id: Some(id.clone()),
-            note: Some("resolved while the rebuild is parked".into()),
+            note: Some("resolved while the refresh is parked".into()),
             ..tp("resolve")
         })
         .await;
 
         assert!(
-            !rebuild.is_finished(),
-            "the rebuild must still be parked when every mutation has returned"
+            !refresh.is_finished(),
+            "the refresh must still be parked when every mutation has returned"
         );
         let status = state
             .threads
@@ -876,14 +868,14 @@ mod tests {
                 .join("record")
                 .join(format!("{id}.json"))
                 .is_file(),
-            "the record snapshot is written while the rebuild is parked"
+            "the record snapshot is written while the refresh is parked"
         );
 
         drop(held);
-        rebuild
+        refresh
             .join()
             .unwrap()
-            .expect("rebuild completes once the view guard is released");
+            .expect("refresh completes once the view guard is released");
     }
 }
 

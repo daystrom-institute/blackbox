@@ -1,7 +1,10 @@
-//! bbox-edge-index — extracted from the origin crate by `extract_rust_crate`.
-//! Modules move verbatim; the origin re-exports them under their original
-//! `crate::<module>` paths.
+//! bbox-edge-index: storage health, retention planning and garbage
+//! collection over the on-disk edge sidecar (snapshots, git overlays and
+//! lane files). The daemon keeps no in-memory edge graph; the sidecar
+//! remains the code-source activation and git-overlay authority.
 
-pub mod edge_index;
 pub mod migration;
 pub mod storage_health;
+
+#[cfg(test)]
+mod sidecar_tests;

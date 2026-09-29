@@ -1,5 +1,5 @@
 use super::restore::restore_runtime_state;
-use super::{SharedState, spawn_edge_index_rebuild_watcher};
+use super::{SharedState, spawn_code_read_view_refresher};
 use crate::server::runtime_metrics::{
     spawn_runtime_metrics_sampler, spawn_scheduler_latency_probe,
 };
@@ -20,7 +20,7 @@ pub(super) async fn start_background_tasks(shared: Arc<SharedState>) -> anyhow::
     super::knowledge_source::restore_operator_workspace_bindings(&shared);
     configure_dispatch_path_env();
     spawn_vector_warmup_thread(shared.clone())?;
-    spawn_edge_index_rebuild_watcher(shared.clone(), std::time::Duration::from_secs(60));
+    spawn_code_read_view_refresher(shared.clone(), std::time::Duration::from_secs(60));
     spawn_storage_gc(shared.clone());
     spawn_runtime_metrics_sampler();
     // Off-runtime companion to the sampler above: the sampler is a

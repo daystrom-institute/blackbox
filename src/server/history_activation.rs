@@ -2030,6 +2030,14 @@ mod tests {
         assert!(reconcile_transport_currency(&state, root_project).unwrap());
         assert!(reconcile_transport_currency(&state, member_project).unwrap());
         verify_committed_activation(&state, &journal).unwrap();
+        // The view refresher republishes the overlay selection, so the Git
+        // source GC roots derived from the pinned view survive a refresh.
+        crate::server::routes::refresh_code_read_view(&state).unwrap();
+        let pinned = state.code_read_view.read().git_overlays.clone();
+        assert_eq!(pinned, selected);
+        assert!(pinned.values().all(|overlay| {
+            overlay.source.producer_transport() == Some(("producer-a", source.as_str()))
+        }));
         state
             .git_sources
             .store()
@@ -2283,18 +2291,6 @@ mod tests {
         // fallback stays closed.
         assert!(state.git_transport_governs_project(root_project).unwrap());
         assert!(state.code_read_view.read().git_overlays.is_empty());
-        let mut manifest =
-            bbox_edge_sidecar::manifest::ManifestIndex::load(&edges_dir(&state)).unwrap();
-        crate::server::state::hide_cutover_gated_git_overlays(
-            &mut manifest,
-            &state.project_authority,
-            &state.git_transport_cutover,
-            &state.code_sources,
-        );
-        assert!(
-            manifest.workspaces[root_project].git_overlay.is_none(),
-            "the edge loader must not admit the staged git-current member"
-        );
 
         // Neither clear site discards the staged evidence, and neither
         // reports it as serving.

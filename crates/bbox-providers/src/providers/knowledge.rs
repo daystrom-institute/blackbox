@@ -3,8 +3,7 @@ use std::collections::BTreeMap;
 use anyhow::Result;
 
 use super::{
-    EdgeFamilyExpectation, EntitySchemaView, EntityView, InspectableEntityProvider, Neighborhood,
-    NextHop, ProviderContext, empty_neighborhood_view, ensure_type, expected, next_hops, schema,
+    EntityView, InspectableEntityProvider, ProviderContext, empty_neighborhood_view, ensure_type,
     truncate_label,
 };
 use bbox_corpus_core::entity_ref::{EntityRef, EntityType};
@@ -42,27 +41,6 @@ impl InspectableEntityProvider for KnowledgeProvider {
             insert_entry_properties(&mut properties, entry);
         }
         Ok(empty_neighborhood_view(r, properties))
-    }
-
-    fn schema(&self) -> EntitySchemaView {
-        schema(
-            self.entity_type(),
-            &["id", "title", "category", "scope"],
-            &[],
-            &["project", "category", "scope"],
-        )
-    }
-
-    fn expected_edge_families(&self, _r: &EntityRef) -> Vec<EdgeFamilyExpectation> {
-        Vec::new()
-    }
-
-    fn recommended_next_hops(
-        &self,
-        _entity: &EntityView,
-        full_neighborhood: &Neighborhood,
-    ) -> Vec<NextHop> {
-        next_hops(full_neighborhood, &[])
     }
 
     fn compact_label(&self, ctx: &ProviderContext<'_>, r: &EntityRef) -> Option<String> {
@@ -133,39 +111,6 @@ impl InspectableEntityProvider for ProvisionalKnowledgeProvider {
             }
         }
         Ok(empty_neighborhood_view(r, properties))
-    }
-
-    fn schema(&self) -> EntitySchemaView {
-        schema(
-            self.entity_type(),
-            &[
-                "id",
-                "logical_ref",
-                "scope_hash",
-                "checkout_id",
-                "content_hash",
-                "overlay_snapshot_id",
-                "title",
-                "category",
-                "scope",
-                "status",
-                "approval",
-            ],
-            &[],
-            &["project", "checkout_id", "status"],
-        )
-    }
-
-    fn expected_edge_families(&self, _r: &EntityRef) -> Vec<EdgeFamilyExpectation> {
-        Vec::new()
-    }
-
-    fn recommended_next_hops(
-        &self,
-        _entity: &EntityView,
-        _full_neighborhood: &Neighborhood,
-    ) -> Vec<NextHop> {
-        Vec::new()
     }
 
     fn compact_label(&self, ctx: &ProviderContext<'_>, r: &EntityRef) -> Option<String> {

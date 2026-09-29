@@ -223,7 +223,7 @@ pub(crate) fn run(server: &crate::server::BlackboxServer) -> anyhow::Result<Doct
         index_section(state),
         code_sources_section(state),
         vectors_section(state),
-        graph_section(server),
+        snapshots_section(state),
         projects_section(state),
     ];
     let checkout_access = state.checkout_access_observations.health();
@@ -281,7 +281,7 @@ pub(crate) fn section_names(state: &crate::server::state::SharedState) -> Vec<&'
         "index",
         "code_sources",
         "vectors",
-        "graph",
+        "snapshots",
         "projects",
         "checkout_access",
     ];
@@ -333,7 +333,7 @@ pub(crate) fn run_section(
         "index" => index_section(state),
         "code_sources" => code_sources_section(state),
         "vectors" => vectors_section(state),
-        "graph" => graph_section(server),
+        "snapshots" => snapshots_section(state),
         "projects" => projects_section(state),
         "locality_cutovers" => locality_cutovers_section(state),
         "resolver_compat" => resolver_compat_section(state),
@@ -1754,17 +1754,71 @@ fn vectors_section(_state: &crate::server::state::SharedState) -> SectionReport 
     }
 }
 
-fn graph_section(server: &crate::server::BlackboxServer) -> SectionReport {
-    let counts = server.describe_schema_counts();
-    let total: usize = counts.values().sum();
-    let finding = if counts.is_empty() || total == 0 {
-        Finding::info("agentic graph has no entities yet (populated by indexing)")
+/// Snapshot and Git overlay health. The edge sidecar manifest is the
+/// code-source activation authority and its Git overlay selectors are Git
+/// source GC roots, so a manifest that fails to load or selects a missing
+/// member is reported here. Read-only: one manifest read under the manifest
+/// coordinator and the pinned read view's overlay map.
+fn snapshots_section(state: &crate::server::state::SharedState) -> SectionReport {
+    use bbox_edge_sidecar::manifest::{ManifestFallbackReason, try_load_manifest_index};
+
+    let edges_dir = crate::server::edge_sidecar_dir(state);
+    let mut findings = Vec::new();
+    let manifest = bbox_edge_sidecar::snapshot::with_manifest_coordinator(|| {
+        Ok(match try_load_manifest_index(&edges_dir) {
+            Ok(index) => {
+                let validation = index
+                    .active_paths_for_loader(&edges_dir)
+                    .map(|paths| paths.len());
+                Some(Ok((index, validation)))
+            }
+            Err(ManifestFallbackReason::MissingNotMigrated) => None,
+            Err(reason) => Some(Err(reason)),
+        })
+    });
+    match manifest {
+        Err(error) => findings.push(Finding::warn(format!(
+            "snapshot manifest could not be read: {error:#}"
+        ))),
+        Ok(None) => findings.push(Finding::info(
+            "no snapshot manifest yet (written by the first code-source activation or reindex)",
+        )),
+        Ok(Some(Err(reason))) => findings.push(Finding::warn(format!(
+            "snapshot manifest is unavailable ({reason:?}); code-source activation and Git overlay selection cannot use it"
+        ))),
+        Ok(Some(Ok((index, validation)))) => {
+            let workspaces = index.workspaces.len();
+            let active = index
+                .workspaces
+                .values()
+                .filter(|entry| entry.active_snapshot.is_some())
+                .count();
+            let dirty = index
+                .workspaces
+                .values()
+                .filter(|entry| entry.dirty_overlay.is_some())
+                .count();
+            match validation {
+                Ok(members) => findings.push(Finding::ok(format!(
+                    "{workspaces} workspaces: {active} active snapshots, {dirty} dirty overlays, {members} selected members present"
+                ))),
+                Err(error) => findings.push(Finding::warn(format!(
+                    "snapshot manifest selects a missing or invalid member: {error:#}"
+                ))),
+            }
+        }
+    }
+    let overlays = state.code_read_view.read().git_overlays.len();
+    findings.push(if overlays == 0 {
+        Finding::info("no Git overlays pinned in the read view")
     } else {
-        Finding::ok(format!("{total} entities across {} types", counts.len()))
-    };
+        Finding::ok(format!(
+            "{overlays} Git overlays pinned in the read view (Git source GC roots)"
+        ))
+    });
     SectionReport {
-        section: "graph",
-        findings: vec![finding],
+        section: "snapshots",
+        findings,
     }
 }
 
@@ -2119,6 +2173,89 @@ mod tests {
         assert_eq!(finding.level, FindingLevel::Warn);
     }
 
+    /// The snapshots section reads the manifest and the pinned overlay map,
+    /// never an edge graph: an absent manifest is informational, a valid
+    /// one is counted, and a manifest selecting a missing snapshot warns.
+    #[test]
+    fn snapshots_section_reports_manifest_and_overlay_health() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let state = crate::server::state::SharedState::for_test(&root);
+        let levels = |report: &SectionReport| {
+            report
+                .findings
+                .iter()
+                .map(|finding| (finding.level, finding.message.clone()))
+                .collect::<Vec<_>>()
+        };
+
+        let absent = snapshots_section(&state);
+        assert_eq!(absent.section, "snapshots");
+        assert_eq!(absent.findings[0].level, FindingLevel::Info, "{absent:?}");
+        assert!(absent.findings[0].message.contains("no snapshot manifest"));
+
+        let edges_dir = crate::server::edge_sidecar_dir(&state);
+        std::fs::create_dir_all(&edges_dir).unwrap();
+        let edge = bbox_edge_sidecar::edge_sidecar::Edge {
+            source: crate::entity_ref::EntityRef::Knowledge { id: "a".into() },
+            kind: "DESCRIBES".into(),
+            target: crate::entity_ref::EntityRef::Knowledge { id: "b".into() },
+            provenance: bbox_chunker::EdgeProvenance::Derived,
+            confidence: bbox_chunker::EdgeConfidence::Exact,
+            metadata: Default::default(),
+            project_id: None,
+        };
+        bbox_edge_sidecar::snapshot::switch_to_clean_snapshot(
+            &edges_dir,
+            "p",
+            "repo",
+            Some("main"),
+            "head-a",
+            vec![edge],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        let healthy = snapshots_section(&state);
+        assert_eq!(
+            healthy.findings[0].level,
+            FindingLevel::Ok,
+            "{:?}",
+            levels(&healthy)
+        );
+        assert!(
+            healthy.findings[0]
+                .message
+                .starts_with("1 workspaces: 1 active snapshots, 0 dirty overlays"),
+            "{:?}",
+            levels(&healthy)
+        );
+        assert!(
+            healthy.findings[1]
+                .message
+                .contains("no Git overlays pinned")
+        );
+
+        let index = bbox_edge_sidecar::manifest::ManifestIndex::load(&edges_dir).unwrap();
+        let active = index.workspaces["p"].active_snapshot.clone().unwrap();
+        std::fs::remove_dir_all(
+            bbox_edge_sidecar::manifest::materialized_dir(&edges_dir).join(&active),
+        )
+        .unwrap();
+        let broken = snapshots_section(&state);
+        assert_eq!(
+            broken.findings[0].level,
+            FindingLevel::Warn,
+            "{:?}",
+            levels(&broken)
+        );
+        assert!(
+            broken.findings[0].message.contains("snapshot manifest"),
+            "{:?}",
+            levels(&broken)
+        );
+    }
+
     /// End-to-end over a per-test SharedState: every v0 section shows up,
     /// nothing panics on an empty daemon, and the report serializes.
     #[test]
@@ -2137,7 +2274,7 @@ mod tests {
                 "index",
                 "code_sources",
                 "vectors",
-                "graph",
+                "snapshots",
                 "projects",
                 "checkout_access",
                 "resolver_compat",

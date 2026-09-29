@@ -3,8 +3,7 @@ use std::collections::BTreeMap;
 use anyhow::Result;
 
 use super::{
-    EdgeFamilyExpectation, EntitySchemaView, EntityView, InspectableEntityProvider, Neighborhood,
-    NextHop, ProviderContext, empty_neighborhood_view, expected, next_hops, schema, truncate_label,
+    EntityView, InspectableEntityProvider, ProviderContext, empty_neighborhood_view, truncate_label,
 };
 use bbox_corpus_core::entity_ref::{EntityRef, EntityType};
 
@@ -24,87 +23,6 @@ impl InspectableEntityProvider for ProjectFileProvider {
         project_file_entity(ctx, r)
     }
 
-    fn schema(&self) -> EntitySchemaView {
-        schema(
-            self.entity_type(),
-            &[
-                "project_id",
-                "rel_path_hash",
-                "chunk_hash",
-                "occurrence_idx",
-                "chunk_kind",
-                "language",
-                "symbol",
-            ],
-            &[
-                "CALLS",
-                "CALLED_BY",
-                "CONTAINS_SYMBOL",
-                "IN_FILE",
-                "EDITED_IN_COMMIT",
-                "NEXT_SECTION",
-                "LINKS_TO_FILE",
-                "LINKS_TO_SECTION",
-                "DESCRIBES",
-            ],
-            &["project_id", "chunk_kind", "language"],
-        )
-    }
-
-    fn expected_edge_families(&self, _r: &EntityRef) -> Vec<EdgeFamilyExpectation> {
-        vec![
-            expected("CONTAINS_SYMBOL", false),
-            expected("DEFINED_IN", false),
-            expected("CALLS", false),
-            expected("CALLED_BY", false),
-            expected("EDITED_IN_COMMIT", false),
-            expected("COMMIT_TOUCHED_FILE", false),
-            expected("DESCRIBES", false),
-            expected("LINKS_TO_FILE", false),
-            expected("LINKS_TO_SECTION", false),
-            expected("IN_FILE", true),
-            expected("NEXT_SECTION", false),
-            expected("NEXT_CHUNK", false),
-            expected("PREV_CHUNK", false),
-        ]
-    }
-
-    fn recommended_next_hops(
-        &self,
-        _entity: &EntityView,
-        full_neighborhood: &Neighborhood,
-    ) -> Vec<NextHop> {
-        // Order matters — `select_notable_edges` walks this list and picks the
-        // first PER_DIRECTION_EDGE_LIMIT matches. Keep semantic edges
-        // (provenance, symbol/call relationships) ahead of structural noise
-        // (IN_FILE self-proxy, NEXT_SECTION/NEXT_CHUNK siblings) so the seed
-        // surface tells the agent something actionable instead of "this chunk
-        // is in a file with other chunks". The structural kinds stay in the
-        // list as fallback when nothing semantic exists.
-        next_hops(
-            full_neighborhood,
-            &[
-                // Symbol/call graph
-                "CONTAINS_SYMBOL",
-                "DEFINED_IN",
-                "CALLS",
-                "CALLED_BY",
-                // History: the commits that touched this chunk
-                "EDITED_IN_COMMIT",
-                "COMMIT_TOUCHED_FILE",
-                // Semantic linking
-                "DESCRIBES",
-                "LINKS_TO_FILE",
-                "LINKS_TO_SECTION",
-                // Structural fallback
-                "IN_FILE",
-                "NEXT_SECTION",
-                "NEXT_CHUNK",
-                "PREV_CHUNK",
-            ],
-        )
-    }
-
     fn compact_label(&self, ctx: &ProviderContext<'_>, r: &EntityRef) -> Option<String> {
         project_file_label(ctx, r)
     }
@@ -121,26 +39,6 @@ impl InspectableEntityProvider for ProjectFileV2Provider {
 
     fn get_entity(&self, ctx: &ProviderContext<'_>, r: &EntityRef) -> Result<EntityView> {
         project_file_entity(ctx, r)
-    }
-
-    fn schema(&self) -> EntitySchemaView {
-        let mut view = ProjectFileProvider.schema();
-        view.entity_type = EntityType::ProjectFileV2;
-        view.properties.insert(1, "snapshot_id".into());
-        view.filterable_fields.insert(1, "snapshot_id".into());
-        view
-    }
-
-    fn expected_edge_families(&self, r: &EntityRef) -> Vec<EdgeFamilyExpectation> {
-        ProjectFileProvider.expected_edge_families(r)
-    }
-
-    fn recommended_next_hops(
-        &self,
-        entity: &EntityView,
-        full_neighborhood: &Neighborhood,
-    ) -> Vec<NextHop> {
-        ProjectFileProvider.recommended_next_hops(entity, full_neighborhood)
     }
 
     fn compact_label(&self, ctx: &ProviderContext<'_>, r: &EntityRef) -> Option<String> {

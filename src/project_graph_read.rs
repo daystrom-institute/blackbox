@@ -4,7 +4,7 @@ use anyhow::{Result, anyhow, bail};
 use bbox_chunker::{EdgeConfidence, EdgeProvenance};
 use bbox_corpus_core::entity_ref::EntityRef;
 use bbox_corpus_core::project_catalog::ProjectId;
-use bbox_edge_index::edge_index::Edge;
+use bbox_edge_sidecar::edge_sidecar::Edge;
 use bbox_indexing::project_graph_view::{
     ProjectGraphRead, ProjectGraphValidity, ProjectGraphViewEntry,
 };

@@ -2,8 +2,6 @@ use anyhow::Context;
 
 use crate::embed_queue;
 use crate::server::BlackboxServer;
-#[cfg(test)]
-use crate::server::routes::rebuild_edge_index_from_shared;
 
 /// The view checkout-overlay index reconciliation reads: accepted content
 /// plus every checkout overlay the daemon itself observes.
@@ -193,14 +191,6 @@ impl BlackboxServer {
                 documents: Vec::new(),
             });
         Ok(())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn rebuild_edge_index_from_stores(&self) -> anyhow::Result<()> {
-        // Store mutations only affect structured edges. Re-projecting all
-        // Tantivy docs here is a multi-GB path and can stack under concurrent
-        // thread updates.
-        rebuild_edge_index_from_shared(&self.state, false)
     }
 }
 

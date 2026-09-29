@@ -68,7 +68,6 @@ pub struct IndexOverrides {
     pub reindex_interval_secs: Option<u64>,
     pub reindex_startup_delay_secs: Option<Option<u64>>,
     pub background_full_reindex_ticks: Option<Option<u64>>,
-    pub edge_index_boot_rebuild: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -417,15 +416,10 @@ struct RawIndexConfig {
     pub reindex_startup_delay_secs: Option<u64>,
     #[serde(default)]
     pub background_full_reindex_ticks: Option<u64>,
-    #[serde(default = "default_index_edge_index_boot_rebuild")]
-    pub edge_index_boot_rebuild: bool,
 }
 
 fn default_index_reindex_interval_secs() -> u64 {
     120
-}
-fn default_index_edge_index_boot_rebuild() -> bool {
-    false
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -620,7 +614,6 @@ pub struct IndexConfig {
     pub reindex_interval_secs: u64,
     pub reindex_startup_delay_secs: Option<u64>,
     pub background_full_reindex_ticks: Option<u64>,
-    pub edge_index_boot_rebuild: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1120,7 +1113,6 @@ impl Config {
                 reindex_interval_secs: default_index_reindex_interval_secs(),
                 reindex_startup_delay_secs: None,
                 background_full_reindex_ticks: None,
-                edge_index_boot_rebuild: default_index_edge_index_boot_rebuild(),
             },
             code_collection: RawCodeCollectionConfig::default(),
             source_connectors: RawSourceConnectorsConfig::default(),
@@ -1280,13 +1272,6 @@ fn apply_explicit_env(raw: RawConfig) -> RawConfig {
         && let Ok(r) = reindex.parse()
     {
         raw.index.reindex_interval_secs = r;
-    }
-
-    // edge_index_boot_rebuild
-    if let Ok(val) = std::env::var("BLACKBOX_EDGE_INDEX_BOOT_REBUILD")
-        && !val.trim().is_empty()
-    {
-        raw.index.edge_index_boot_rebuild = val == "1" || val.eq_ignore_ascii_case("true");
     }
 
     // Provenance settings
@@ -1504,7 +1489,6 @@ pub fn load_with(options: LoadOptions) -> Result<Config> {
             reindex_interval_secs: raw.index.reindex_interval_secs,
             reindex_startup_delay_secs: raw.index.reindex_startup_delay_secs,
             background_full_reindex_ticks: raw.index.background_full_reindex_ticks,
-            edge_index_boot_rebuild: raw.index.edge_index_boot_rebuild,
         },
         code_collection: CodeCollectionConfig {
             enabled: raw.code_collection.enabled,
@@ -1857,9 +1841,6 @@ fn apply_flag_overrides(mut raw: RawConfig, overrides: ConfigOverrides) -> RawCo
     }
     if let Some(background_full_reindex_ticks) = overrides.index.background_full_reindex_ticks {
         raw.index.background_full_reindex_ticks = background_full_reindex_ticks;
-    }
-    if let Some(edge_index_boot_rebuild) = overrides.index.edge_index_boot_rebuild {
-        raw.index.edge_index_boot_rebuild = edge_index_boot_rebuild;
     }
 
     // Apply provider overrides
@@ -2280,7 +2261,6 @@ mod tests {
         assert_eq!(config.daemon.fleetd_worker_bro_home, None);
 
         assert_eq!(config.index.reindex_interval_secs, 120);
-        assert!(!config.index.edge_index_boot_rebuild);
 
         assert_eq!(config.lsp.idle_timeout_secs, 600);
         assert_eq!(config.lsp.request_timeout_secs, 30);
@@ -2304,6 +2284,19 @@ mod tests {
             validate_mcp_allowed_hosts(&["example.test:7264".into(), "10.43.0.10:7264".into(),])
                 .is_ok()
         );
+    }
+
+    /// The retired `edge_index_boot_rebuild` key (the daemon keeps no
+    /// in-memory edge graph to rebuild) must not make an existing config
+    /// file unloadable.
+    #[test]
+    fn retired_edge_index_boot_rebuild_key_is_ignored() {
+        let raw: RawIndexConfig = Figment::from(Toml::string(
+            "reindex_interval_secs = 90\nedge_index_boot_rebuild = true\n",
+        ))
+        .extract()
+        .unwrap();
+        assert_eq!(raw.reindex_interval_secs, 90);
     }
 
     #[test]

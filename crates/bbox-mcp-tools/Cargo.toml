@@ -39,7 +39,7 @@ rmcp = { version = "1.4", features = [
 ] }
 tempfile = "3"
 bbox-knowledge = { path = "../bbox-knowledge" }
-bbox-edge-index = { path = "../bbox-edge-index" }
+bbox-edge-sidecar = { path = "../bbox-edge-sidecar" }
 bbox-indexing = { path = "../bbox-indexing" }
 # For the evidence edge metadata keys and endpoint-status vocabulary the read
 # surfaces label steps and edges with.

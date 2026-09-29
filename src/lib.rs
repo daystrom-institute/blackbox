@@ -27,7 +27,6 @@ use bbox_artifacts::artifacts;
 pub use bbox_config::config;
 pub mod dispatch_mcp;
 mod doctor;
-use bbox_edge_index::edge_index;
 use bbox_embed::embed;
 use bbox_embed::embed_queue;
 mod embed_runtime;

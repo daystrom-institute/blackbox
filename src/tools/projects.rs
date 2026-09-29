@@ -6,7 +6,6 @@ use std::time::Duration;
 
 use crate::artifacts;
 use crate::config;
-use crate::index;
 use crate::orchestration;
 use crate::projects::{
     ProjectEjectParams, ProjectInitParams, ProjectListResponse, ProjectRegisterParams,
@@ -360,7 +359,7 @@ impl BlackboxServer {
             let server = self.clone();
             let result: anyhow::Result<String> = tokio::task::spawn_blocking(move || {
                 let (record, catalog_summary) = server.register_catalog_arm(&store, &p.path)?;
-                server.state.nudge_edge_index_rebuild();
+                server.state.nudge_code_read_view_refresh();
                 let mut response = server.run_post_register_pipeline(record)?;
                 if let Some(map) = response.as_object_mut() {
                     map.insert("catalog".into(), catalog_summary);
@@ -424,7 +423,7 @@ impl BlackboxServer {
             tracing::warn!(target: "blackbox::tool", tool = "bbox_project_register", elapsed_ms = ms, error = %e, "err");
             return Self::err_text(&format!("Error: {e:#}"));
         }
-        self.state.nudge_edge_index_rebuild();
+        self.state.nudge_code_read_view_refresh();
         // Phase 2: heavy fs work (MCP migration, config load, artifact discovery,
         // watcher, kb sync) on the blocking pool.
         let server = self.clone();
@@ -675,49 +674,6 @@ impl BlackboxServer {
                 &server.state,
                 &record.canonical_path,
             );
-            // P1 backfill: retroactively emit observed tool-call edges for the
-            // newly registered project by walking all prior transcripts. Runs
-            // in a background thread so the registration response is immediate.
-            // Uses append_edges_dedup so re-running is safe.
-            {
-                let reindex_cfg = server.state.idx.read().reindex_config();
-                let project_for_backfill = record.clone();
-                let checkout_access = server.state.checkout_access.clone();
-                // lint-concurrency: allow(thread-spawn) — one-shot registration backfill; relocation to an owner module tracked in thread-935b467d
-                std::thread::spawn(move || {
-                    let result = (|| {
-                        let local = crate::server::checkout_access::acquire_selected_project_access(
-                        &checkout_access,
-                        &project_for_backfill.project_id,
-                        bbox_indexing::checkout_access::CheckoutAccessKind::LocalProjectWalk,
-                        bbox_indexing::checkout_access::CheckoutAccessIntent::Read,
-                        )?;
-                        index::backfill_tool_edges_for_project(
-                            &reindex_cfg,
-                            &project_for_backfill.project_id,
-                            local.project_root(),
-                            || {
-                                checkout_access
-                                    .publication_guard_for(std::iter::once(&local))
-                                    .map_err(anyhow::Error::new)
-                            },
-                        )
-                    })();
-                    match result {
-                        Ok(written) => tracing::info!(
-                            project_id = %project_for_backfill.project_id,
-                            edges_written = written,
-                            "P1 backfill complete"
-                        ),
-                        Err(err) => tracing::warn!(
-                            project_id = %project_for_backfill.project_id,
-                            error = %err,
-                            "P1 backfill failed"
-                        ),
-                    }
-                });
-            }
-
             let response = json!({
                 "record": record,
                 "project_config_loaded": project_config_loaded,
@@ -963,7 +919,7 @@ impl BlackboxServer {
                 None
             } else {
                 let result = server.state.index_writer.run_reindex_pass(false, true)?;
-                server.state.nudge_edge_index_rebuild();
+                server.state.nudge_code_read_view_refresh();
                 Some(result)
             };
 
@@ -1132,11 +1088,10 @@ impl BlackboxServer {
             // `.bbox/knowledge/` stays on disk and reloads on re-register.
             crate::server::routes::sync_kb_project_roots(&self.state);
 
-            // Nudge the watcher to rebuild EdgeIndex so edges keyed on the
-            // removed project stop surfacing. Async handler — the rebuild's
-            // multi-GB sidecar parse must not run inline on a tokio worker;
-            // stale edges for a few seconds after unregister are acceptable.
-            self.state.nudge_edge_index_rebuild();
+            // The removed project leaves the corpus project set, so the pinned
+            // selector map must follow; the refresher republishes it off the
+            // tokio worker.
+            self.state.nudge_code_read_view_refresh();
 
             Ok(serde_json::to_string_pretty(&json!({
                 "status": "ok",

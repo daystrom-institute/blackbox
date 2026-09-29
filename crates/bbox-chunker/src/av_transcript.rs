@@ -31,8 +31,7 @@ const TARGET_CHUNK_BYTES: usize = 1024;
 /// Per the X-AV spec, `AT_TIMESTAMP`/`IN_RECORDING` edges are deferred: this
 /// pass emits zero edges, matching every other chunker in this crate's
 /// registry (`SourceFormatChunker::chunk` always returns an empty edge
-/// vec here). Wiring those edge families into the live EdgeIndex channel is
-/// out of scope until that channel is confirmed live for this chunker.
+/// vec here).
 ///
 /// Degradation posture matches `pdf::PdfChunker`: malformed input (invalid
 /// UTF-8, missing `WEBVTT` header, unparseable cue timing, empty/garbage

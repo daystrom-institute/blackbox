@@ -12,7 +12,6 @@ use super::state::SharedState;
 use crate::artifacts::{
     self, ArtifactInstallParams, ArtifactListParams, ArtifactRemoveParams, ArtifactSupersedeParams,
 };
-use crate::edge_index;
 use crate::index;
 use crate::orchestration;
 use crate::orchestration::providers::Provider;
@@ -593,64 +592,26 @@ pub(crate) fn edge_sidecar_dir(state: &SharedState) -> std::path::PathBuf {
     )
 }
 
-pub(crate) fn rebuild_edge_index_from_shared(
-    state: &SharedState,
-    include_tantivy_projection: bool,
-) -> anyhow::Result<()> {
+/// Republish the pinned code read view from current authority: the active
+/// selector map (manifest plus registered corpus projects), the searcher,
+/// the catalog epoch and the Git overlay selection. Nothing here parses edge
+/// rows; the view carries selectors and overlays, not a graph.
+///
+/// The selectors are read and the view swapped under the manifest
+/// coordinator, in the order every activation publisher uses (coordinator,
+/// then the index lock), so a concurrent activation can neither interleave
+/// nor be reverted by a stale selector map. The coordinator is not
+/// reentrant: no caller may already hold it.
+pub(crate) fn refresh_code_read_view(state: &SharedState) -> anyhow::Result<()> {
     let edges_dir = edge_sidecar_dir(state);
-    rebuild_edge_index_from_shared_at(state, include_tantivy_projection, &edges_dir)
-}
-
-pub(crate) fn rebuild_edge_index_from_shared_at(
-    state: &SharedState,
-    include_tantivy_projection: bool,
-    edges_dir: &std::path::Path,
-) -> anyhow::Result<()> {
-    let registered_project_ids = state.corpus_registered_project_ids();
-    let prepared = (|| -> anyhow::Result<_> {
-        let authority = capture_edge_rebuild_authority(&edges_dir, Some(&registered_project_ids))?;
-        let max_bytes = edge_index_rebuild_max_input_bytes();
-        if authority.signature.bytes > max_bytes {
-            anyhow::bail!(
-                "edge-index rebuild refused: active sidecar input is {} bytes (limit {}); compact/rematerialize the active edge set before retrying",
-                authority.signature.bytes,
-                max_bytes
-            );
-        }
-        let rebuilt = build_edge_index_from_shared_at_authority(
-            state,
-            include_tantivy_projection,
-            edges_dir,
-            &authority.manifest,
-        )?;
+    bbox_edge_sidecar::snapshot::with_manifest_coordinator(|| {
         let (selectors, searcher) = {
             let index = state.idx.read();
             (index.refresh_active_code_selectors()?, index.searcher())
         };
-        Ok((authority, rebuilt, selectors, searcher))
-    })();
-    let (authority, rebuilt, selectors, searcher) = match prepared {
-        Ok(prepared) => prepared,
-        Err(error) => {
-            let _ = state.code_sources.store().record_health_failure(
-                "_edge_index",
-                "rebuild_failed",
-                &error.to_string(),
-            );
-            return Err(error);
-        }
-    };
-    if let Err(error) = bbox_edge_sidecar::snapshot::with_manifest_coordinator(|| {
-        let current = capture_edge_rebuild_authority(&edges_dir, Some(&registered_project_ids))?;
-        if current != authority {
-            anyhow::bail!(
-                "edge-index rebuild input changed while it was being parsed; refusing stale publication"
-            );
-        }
         *state.code_read_view.write() = std::sync::Arc::new(super::CodeReadView {
             active_selectors: selectors,
             searcher,
-            edge_index: std::sync::Arc::new(rebuilt),
             catalog_epoch: state.records_provider.records_snapshot().authority_epoch,
             git_overlays: super::state::read_git_overlays_for_view(
                 &state.project_authority,
@@ -659,625 +620,153 @@ pub(crate) fn rebuild_edge_index_from_shared_at(
                 &state.code_sources,
             ),
         });
-        state
-            .edge_index_ready
-            .store(true, std::sync::atomic::Ordering::Release);
         Ok(())
-    }) {
-        let _ = state.code_sources.store().record_health_failure(
-            "_edge_index",
-            "rebuild_failed",
-            &error.to_string(),
-        );
-        tracing::error!(%error, "edge-index rebuild manifest coordination failed");
-        return Err(error);
-    }
-    state
-        .code_sources
-        .store()
-        .clear_health_failure("_edge_index", "rebuild_failed")?;
-    Ok(())
-}
-
-fn build_edge_index_from_shared_at_authority(
-    state: &SharedState,
-    include_tantivy_projection: bool,
-    edges_dir: &std::path::Path,
-    authority: &edge_index::SidecarManifestAuthority,
-) -> anyhow::Result<edge_index::EdgeIndex> {
-    let started = std::time::Instant::now();
-    // F3: the COMPLETE catalog id set, through the one shared accessor that
-    // also seeds startup, the storage tools, and the background GC pass.
-    let registered_project_ids = state.corpus_registered_project_ids();
-    // The store read-locks cover ONLY the in-memory store projections (fast).
-    // The sidecar load below is a multi-GB disk parse and must run with NO
-    // store guards held: parking_lot is fair, so a writer queued behind these
-    // guards blocks every new reader for the scan duration (measured 13-100s+
-    // in prod), stalling tokio workers that touch any store.
-    //
-    // All guards must also drop before acquiring `edge_index.write()`.
-    // Holding idx.read()/kb.read()/etc. across that acquisition is a deadlock
-    // hazard:
-    //   A (this rebuild)        holds idx.read, wants edge_index.write
-    //   R (auto-reindex commit) wants idx.write -> queues behind A; a queued
-    //                           writer then blocks new idx *readers* (parking_lot
-    //                           is fair, so readers don't starve the writer)
-    //   D (a graph tool, e.g.   holds edge_index.read (live arg), wants idx.read
-    //      bbox_inspect_entity) -> blocked behind R
-    // => A waits on D's edge_index.read, D waits on R's queued idx.write, R waits
-    //    on A's idx.read. Cycle. Acquiring edge_index.write() with no store locks
-    //    held removes A from the cycle entirely.
-    let (mut rebuilt, mut seen) = {
-        let idx = state.idx.read();
-        let threads = state.threads.read();
-        let task_store = state.task_store.read();
-        edge_index::EdgeIndex::project_store_edges(&edge_index::EdgeStoreRefs {
-            index: &idx,
-            threads: &threads,
-            session_brofile_rows: task_store.session_brofile_rows(),
-            edges_dir: edges_dir.to_path_buf(),
-            registered_project_ids: Some(registered_project_ids.clone()),
-            include_tantivy_projection,
-            include_observed: true,
-        })
-        // all store read-guards drop here
-    };
-    let mut authority = authority.clone();
-    if let edge_index::SidecarManifestAuthority::Manifest(index) = &mut authority {
-        super::state::hide_cutover_gated_git_overlays(
-            index,
-            &state.project_authority,
-            &state.git_transport_cutover,
-            &state.code_sources,
-        );
-    }
-    rebuilt.load_sidecar_edges_from_authority(
-        &edges_dir,
-        Some(&registered_project_ids),
-        &mut seen,
-        true,
-        &authority,
-    )?;
-    rebuilt.log_rebuilt(include_tantivy_projection, started);
-    Ok(rebuilt)
-}
-
-const DEFAULT_EDGE_INDEX_REBUILD_MAX_INPUT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
-const DEFAULT_EDGE_INDEX_NUDGE_MAX_CURRENT_EDGES: usize = 250_000;
-
-fn edge_index_rebuild_max_input_bytes() -> u64 {
-    std::env::var("BLACKBOX_EDGE_INDEX_REBUILD_MAX_INPUT_BYTES")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_EDGE_INDEX_REBUILD_MAX_INPUT_BYTES)
-}
-
-fn edge_index_nudge_max_current_edges() -> usize {
-    std::env::var("BLACKBOX_EDGE_INDEX_NUDGE_MAX_CURRENT_EDGES")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(DEFAULT_EDGE_INDEX_NUDGE_MAX_CURRENT_EDGES)
-}
-
-fn should_rebuild_edge_index(
-    nudged: bool,
-    sidecars_changed: bool,
-    published_edge_count: usize,
-    nudge_limit: usize,
-) -> bool {
-    sidecars_changed || nudged && published_edge_count <= nudge_limit
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct EdgeSidecarSignature {
-    files: u64,
-    bytes: u64,
-    modified_nanos: u128,
-    path_identity: u64,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-struct EdgeRebuildAuthority {
-    manifest: edge_index::SidecarManifestAuthority,
-    signature: EdgeSidecarSignature,
-}
-
-fn fold_sidecar_path(
-    signature: &mut EdgeSidecarSignature,
-    seen: &mut std::collections::HashSet<std::path::PathBuf>,
-    path: &std::path::Path,
-) {
-    use std::hash::{Hash, Hasher};
-
-    if !seen.insert(path.to_path_buf()) {
-        return;
-    }
-    let Ok(meta) = std::fs::metadata(path) else {
-        return;
-    };
-    if !meta.is_file() {
-        return;
-    }
-    signature.files += 1;
-    signature.bytes = signature.bytes.saturating_add(meta.len());
-    let modified = meta
-        .modified()
-        .ok()
-        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    signature.modified_nanos = signature.modified_nanos.wrapping_add(modified);
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    path.hash(&mut hasher);
-    meta.len().hash(&mut hasher);
-    modified.hash(&mut hasher);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        meta.dev().hash(&mut hasher);
-        meta.ino().hash(&mut hasher);
-    }
-    signature.path_identity ^= hasher.finish();
-}
-
-fn fold_jsonl_dir(
-    signature: &mut EdgeSidecarSignature,
-    seen: &mut std::collections::HashSet<std::path::PathBuf>,
-    dir: &std::path::Path,
-    registered_project_ids: Option<&std::collections::HashSet<String>>,
-) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.filter_map(Result::ok) {
-        let path = entry.path();
-        if path.extension().and_then(|extension| extension.to_str()) == Some("jsonl")
-            && bbox_edge_sidecar::edge_sidecar::sidecar_lane_is_admitted(
-                &path,
-                registered_project_ids,
-            )
-        {
-            fold_sidecar_path(signature, seen, &path);
-        }
-    }
-}
-
-fn capture_edge_rebuild_authority(
-    edges_dir: &std::path::Path,
-    registered_project_ids: Option<&std::collections::HashSet<String>>,
-) -> anyhow::Result<EdgeRebuildAuthority> {
-    let mut manifest = edge_index::SidecarManifestAuthority::capture(edges_dir)?;
-    // `updated_at` is operational metadata, not loader authority. Reindex can
-    // refresh it while leaving every selected path and selector unchanged;
-    // including it in the before/after equality made a semantic no-op look
-    // like an input mutation.
-    if let edge_index::SidecarManifestAuthority::Manifest(index) = &mut manifest {
-        index.updated_at = None;
-    }
-    let mut sig = EdgeSidecarSignature {
-        files: 0,
-        bytes: 0,
-        modified_nanos: 0,
-        path_identity: 0,
-    };
-    let mut seen = std::collections::HashSet::new();
-
-    match &manifest {
-        edge_index::SidecarManifestAuthority::Manifest(index) => {
-            for loadable in index.active_paths_for_loader(edges_dir)? {
-                fold_sidecar_path(&mut sig, &mut seen, &loadable.path);
-            }
-            // Manifest mode still unions post-migration explicit/observed and
-            // top-level compatibility lanes. No inactive materialized tree is
-            // an input and therefore none belongs in the watcher signature.
-            fold_jsonl_dir(&mut sig, &mut seen, edges_dir, registered_project_ids);
-            fold_jsonl_dir(
-                &mut sig,
-                &mut seen,
-                &edges_dir.join("explicit"),
-                registered_project_ids,
-            );
-            fold_jsonl_dir(
-                &mut sig,
-                &mut seen,
-                &edges_dir.join("observed"),
-                registered_project_ids,
-            );
-        }
-        edge_index::SidecarManifestAuthority::LegacyMissing => {
-            fold_jsonl_dir(&mut sig, &mut seen, edges_dir, registered_project_ids);
-            for lane in ["derived", "explicit", "observed"] {
-                let lane_dir = edges_dir.join(lane);
-                fold_jsonl_dir(&mut sig, &mut seen, &lane_dir, registered_project_ids);
-                if let Ok(entries) = std::fs::read_dir(&lane_dir) {
-                    for entry in entries.filter_map(Result::ok) {
-                        if entry.path().is_dir() {
-                            fold_jsonl_dir(
-                                &mut sig,
-                                &mut seen,
-                                &entry.path(),
-                                registered_project_ids,
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
-    // Fold the semantic manifest authority, not manifest-index.json's inode
-    // and mtime. The reindexer can rewrite a byte-equivalent authority file;
-    // file metadata is not a graph input and must not launch a 1+ GiB parse.
-    // Active-pointer and selector changes remain visible through the stable
-    // serialized authority, even when already-materialized JSONL metadata is
-    // unchanged (for example, a branch switch back to a retained snapshot).
-    let mut manifest_hasher = std::collections::hash_map::DefaultHasher::new();
-    match &manifest {
-        edge_index::SidecarManifestAuthority::Manifest(index) => {
-            std::hash::Hash::hash(&1_u8, &mut manifest_hasher);
-            std::hash::Hash::hash(&serde_json::to_vec(index)?, &mut manifest_hasher);
-        }
-        edge_index::SidecarManifestAuthority::LegacyMissing => {
-            std::hash::Hash::hash(&0_u8, &mut manifest_hasher);
-        }
-    }
-    sig.path_identity ^= std::hash::Hasher::finish(&manifest_hasher);
-    Ok(EdgeRebuildAuthority {
-        manifest,
-        signature: sig,
     })
 }
 
-#[cfg(test)]
-fn edge_sidecar_signature(edges_dir: &std::path::Path) -> anyhow::Result<EdgeSidecarSignature> {
-    capture_edge_rebuild_authority(edges_dir, None).map(|authority| authority.signature)
+/// Hash of the manifest authority the code read view derives from. The
+/// volatile `updated_at` stamp is excluded: reindex refreshes it while every
+/// selected path and selector stays the same. Snapshot member bytes are not
+/// view inputs, so neither inactive snapshots nor in-progress write
+/// directories move this value.
+fn manifest_view_signature(edges_dir: &std::path::Path) -> anyhow::Result<u64> {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    match bbox_edge_sidecar::manifest::try_load_manifest_index(edges_dir) {
+        Ok(mut index) => {
+            index.updated_at = None;
+            1_u8.hash(&mut hasher);
+            serde_json::to_vec(&index)?.hash(&mut hasher);
+        }
+        Err(bbox_edge_sidecar::manifest::ManifestFallbackReason::MissingNotMigrated) => {
+            0_u8.hash(&mut hasher);
+        }
+        Err(reason) => anyhow::bail!("active edge manifest is unavailable: {reason:?}"),
+    }
+    Ok(hasher.finish())
 }
 
-/// Watcher thread that rebuilds the EdgeIndex when edge sidecars change.
-/// The auto-reindex thread writes new docs + edge sidecars every interval,
-/// but it can't trigger a rebuild itself (it spawns before SharedState exists).
-/// The watcher uses sidecar-only rebuilds so background maintenance does not
-/// materialize every stored Tantivy document.
-pub(crate) fn spawn_edge_index_rebuild_watcher(
+/// Everything the published view derives from besides the searcher: the
+/// manifest authority, the registered corpus project set and the catalog
+/// epoch.
+fn code_view_authority(state: &SharedState, edges_dir: &std::path::Path) -> anyhow::Result<u64> {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    manifest_view_signature(edges_dir)?.hash(&mut hasher);
+    let mut registered = state
+        .corpus_registered_project_ids()
+        .into_iter()
+        .collect::<Vec<_>>();
+    registered.sort();
+    registered.hash(&mut hasher);
+    state
+        .records_provider
+        .records_snapshot()
+        .authority_epoch
+        .hash(&mut hasher);
+    Ok(hasher.finish())
+}
+
+/// Background thread that keeps the pinned code read view current. The
+/// reindex thread writes snapshots and manifest entries without a handle on
+/// `SharedState`, and registration changes the corpus project set, so this
+/// thread republishes the view when its authority changes or a caller nudges
+/// it, and otherwise refreshes only the searcher when the corpus moved. Every
+/// pass is a manifest read, never an edge parse.
+pub(crate) fn spawn_code_read_view_refresher(
     state: Arc<SharedState>,
     interval: std::time::Duration,
 ) {
     std::thread::Builder::new()
-        .name("blackbox-edge-rebuild".into())
+        .name("blackbox-code-view".into())
         .spawn(move || {
             let _scope = crate::util::BlockingScope::enter();
-            // Nudge channel: async tool handlers whose store mutations change
-            // projected edges wake this thread instead of rebuilding inline.
-            let nudge_rx = state.edge_rebuild_nudge_rx.lock().unwrap().take();
-            run_edge_index_rebuild_watcher(&state, interval, nudge_rx, run_edge_index_watcher_pass);
+            let nudge_rx = state.code_view_refresh_nudge_rx.lock().unwrap().take();
+            run_code_read_view_refresher(&state, interval, nudge_rx);
         })
-        .expect("failed to spawn edge index rebuild watcher");
+        .expect("failed to spawn code read view refresher");
 }
 
-/// Delay before retrying a rebuild while no complete graph is published:
-/// 1 second after the first consecutive failure, doubling per further
-/// failure, capped at the watcher interval.
-fn rebuild_retry_delay(
-    consecutive_failures: u32,
-    interval: std::time::Duration,
-) -> std::time::Duration {
-    let doublings = consecutive_failures.saturating_sub(1).min(31);
-    std::time::Duration::from_secs(1u64 << doublings).min(interval)
-}
-
-/// Consecutive failed watcher passes while no complete graph is published.
-#[derive(Debug, Default)]
-struct RebuildRetryBackoff {
-    consecutive_failures: u32,
-}
-
-impl RebuildRetryBackoff {
-    /// Records a pass outcome and returns how long to wait before retrying,
-    /// or `None` when the pass needs no retry. A publication or a raised
-    /// fence resets the count; failures only count while the fence is down,
-    /// since a failed rebuild behind a raised fence keeps the prior graph.
-    fn after_pass(
-        &mut self,
-        outcome: EdgeIndexWatcherPass,
-        ready: bool,
-        interval: std::time::Duration,
-    ) -> Option<std::time::Duration> {
-        if ready || outcome == EdgeIndexWatcherPass::Rebuilt {
-            self.consecutive_failures = 0;
-            return None;
-        }
-        match outcome {
-            EdgeIndexWatcherPass::AuthorityUnavailable | EdgeIndexWatcherPass::RebuildFailed => {
-                self.consecutive_failures = self.consecutive_failures.saturating_add(1);
-                Some(rebuild_retry_delay(self.consecutive_failures, interval))
-            }
-            EdgeIndexWatcherPass::PublicationBusy
-            | EdgeIndexWatcherPass::Rebuilt
-            | EdgeIndexWatcherPass::StoreRefreshDeferred
-            | EdgeIndexWatcherPass::SearcherRefreshed
-            | EdgeIndexWatcherPass::Unchanged => None,
-        }
-    }
-}
-
-/// Watcher loop body. `pass` runs one watcher pass and releases the sidecar
-/// publication guard before it returns, so no retry sleep holds the guard.
-/// Returns when every nudge sender is gone.
-fn run_edge_index_rebuild_watcher(
+fn run_code_read_view_refresher(
     state: &SharedState,
     interval: std::time::Duration,
     nudge_rx: Option<std::sync::mpsc::Receiver<()>>,
-    mut pass: impl FnMut(
-        &SharedState,
-        &std::path::Path,
-        &mut EdgeIndexWatcherCursor,
-        bool,
-        usize,
-    ) -> EdgeIndexWatcherPass,
 ) {
-    // Eager startup already published a graph. Deferred startup did
-    // not: rebuild immediately in the background, and keep graph
-    // consumers fail-closed until this publication succeeds.
-    let mut pending_nudge = !state
-        .edge_index_ready
-        .load(std::sync::atomic::Ordering::Acquire);
-    if !pending_nudge {
-        std::thread::sleep(std::time::Duration::from_secs(20));
-    }
     let edges_dir = edge_sidecar_dir(state);
-    let mut cursor = EdgeIndexWatcherCursor::capture(state, &edges_dir);
-    let mut backoff = RebuildRetryBackoff::default();
+    let mut cursor = CodeViewCursor {
+        last_docs: state.idx.read().num_docs(),
+        last_authority: code_view_authority(state, &edges_dir).ok(),
+    };
     loop {
-        if !pending_nudge {
-            pending_nudge = match &nudge_rx {
-                Some(rx) => match rx.recv_timeout(interval) {
-                    Ok(()) => true,
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => false,
-                    // All senders dropped — SharedState is gone; exit.
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
-                },
-                None => {
-                    std::thread::sleep(interval);
-                    false
-                }
-            };
-        }
-        let nudged = std::mem::take(&mut pending_nudge);
-        let outcome = pass(
-            state,
-            &edges_dir,
-            &mut cursor,
-            nudged,
-            edge_index_nudge_max_current_edges(),
-        );
-        let ready = state
-            .edge_index_ready
-            .load(std::sync::atomic::Ordering::Acquire);
-        if let Some(delay) = backoff.after_pass(outcome, ready, interval) {
-            pending_nudge = true;
-            std::thread::sleep(delay);
-            continue;
-        }
-        if outcome == EdgeIndexWatcherPass::PublicationBusy {
-            tracing::debug!(
-                nudged,
-                "edge-index watcher deferred while a reindex publication is active"
-            );
-            pending_nudge = nudged;
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
+        let nudged = match &nudge_rx {
+            Some(rx) => match rx.recv_timeout(interval) {
+                Ok(()) => true,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => false,
+                // All senders dropped: SharedState is gone.
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+            },
+            None => {
+                std::thread::sleep(interval);
+                false
+            }
+        };
+        run_code_read_view_pass(state, &edges_dir, &mut cursor, nudged);
     }
 }
 
-/// What the watcher last observed: the corpus document count and the sidecar
-/// authority signature of the last published graph.
-struct EdgeIndexWatcherCursor {
-    last_seen: u64,
-    last_signature: Option<EdgeSidecarSignature>,
-}
-
-impl EdgeIndexWatcherCursor {
-    fn capture(state: &SharedState, edges_dir: &std::path::Path) -> Self {
-        Self {
-            last_seen: state.idx.read().num_docs(),
-            last_signature: capture_edge_rebuild_authority(
-                edges_dir,
-                Some(&state.corpus_registered_project_ids()),
-            )
-            .ok()
-            .map(|authority| authority.signature),
-        }
-    }
+/// What the refresher last published: the corpus document count and the view
+/// authority hash.
+struct CodeViewCursor {
+    last_docs: u64,
+    last_authority: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EdgeIndexWatcherPass {
-    /// Sidecar authority could not be captured; the last published graph stays.
+enum CodeViewPass {
+    /// Authority could not be read; the published view stays.
     AuthorityUnavailable,
-    /// A rebuild is due but another publication holds the sidecar guard.
-    PublicationBusy,
-    Rebuilt,
-    RebuildFailed,
-    /// A store-only nudge against a published graph above the nudge limit.
-    StoreRefreshDeferred,
+    Republished,
+    RepublishFailed,
     SearcherRefreshed,
     Unchanged,
 }
 
-struct EdgeIndexWatcherDecision {
-    signature: EdgeSidecarSignature,
-    sidecars_changed: bool,
-    published_edge_count: usize,
-    rebuild: bool,
-}
-
-fn decide_edge_index_watcher_pass(
+fn run_code_read_view_pass(
     state: &SharedState,
     edges_dir: &std::path::Path,
-    cursor: &EdgeIndexWatcherCursor,
+    cursor: &mut CodeViewCursor,
     nudged: bool,
-    nudge_limit: usize,
-) -> anyhow::Result<EdgeIndexWatcherDecision> {
-    let registered_project_ids = state.corpus_registered_project_ids();
-    let signature =
-        capture_edge_rebuild_authority(edges_dir, Some(&registered_project_ids))?.signature;
-    let sidecars_changed = Some(signature) != cursor.last_signature;
-    let published_edge_count = state.code_read_view.read().edge_index.edge_count();
-    Ok(EdgeIndexWatcherDecision {
-        signature,
-        sidecars_changed,
-        published_edge_count,
-        rebuild: should_rebuild_edge_index(
-            nudged,
-            sidecars_changed,
-            published_edge_count,
-            nudge_limit,
-        ),
-    })
-}
-
-/// One watcher pass. The rebuild decision is made without the sidecar
-/// publication guard; only a pass that will rebuild takes it, then decides
-/// again against the authority it is about to parse. Passes that defer a
-/// store-only nudge or refresh the pinned searcher never hold the guard, so
-/// they cannot refuse a concurrent reindex admission.
-fn run_edge_index_watcher_pass(
-    state: &SharedState,
-    edges_dir: &std::path::Path,
-    cursor: &mut EdgeIndexWatcherCursor,
-    nudged: bool,
-    nudge_limit: usize,
-) -> EdgeIndexWatcherPass {
-    let current = state.idx.read().num_docs();
-    let authority_unavailable = |cursor: &mut EdgeIndexWatcherCursor, error: anyhow::Error| {
-        tracing::warn!(
-            %error,
-            nudged,
-            "edge-index watcher authority capture failed; keeping the last published graph"
-        );
-        cursor.last_seen = current;
-        EdgeIndexWatcherPass::AuthorityUnavailable
-    };
-    let mut decision =
-        match decide_edge_index_watcher_pass(state, edges_dir, cursor, nudged, nudge_limit) {
-            Ok(decision) => decision,
-            Err(error) => return authority_unavailable(cursor, error),
-        };
-    if decision.rebuild {
-        let Some(publication_guard) = state.index_writer.try_begin_edge_index_rebuild() else {
-            return EdgeIndexWatcherPass::PublicationBusy;
-        };
-        decision =
-            match decide_edge_index_watcher_pass(state, edges_dir, cursor, nudged, nudge_limit) {
-                Ok(decision) => decision,
-                Err(error) => return authority_unavailable(cursor, error),
-            };
-        if decision.rebuild {
-            let outcome = rebuild_edge_index_for_watcher(
-                state, edges_dir, cursor, current, nudged, &decision,
-            );
-            drop(publication_guard);
-            cursor.last_seen = current;
-            return outcome;
+) -> CodeViewPass {
+    let docs = state.idx.read().num_docs();
+    let authority = match code_view_authority(state, edges_dir) {
+        Ok(authority) => authority,
+        Err(error) => {
+            tracing::warn!(%error, nudged, "code view authority unavailable; keeping the published view");
+            return CodeViewPass::AuthorityUnavailable;
         }
-    }
-    let EdgeIndexWatcherDecision {
-        signature,
-        published_edge_count,
-        ..
-    } = decision;
-    let outcome = if nudged {
-        let detail = format!(
-            "structured-edge refresh deferred: the published graph has {published_edge_count} edges (nudge rebuild limit {nudge_limit}) and sidecar authority did not change"
-        );
-        let _ = state.code_sources.store().record_health_failure(
-            "_edge_index",
-            "store_refresh_deferred",
-            &detail,
-        );
-        tracing::warn!(
-            published_edge_count,
-            limit = nudge_limit,
-            "edge-index watcher deferred a store-only nudge to avoid rebuilding a large unchanged sidecar graph"
-        );
-        EdgeIndexWatcherPass::StoreRefreshDeferred
-    } else if current != cursor.last_seen {
+    };
+    let outcome = if nudged || cursor.last_authority != Some(authority) {
+        match refresh_code_read_view(state) {
+            Ok(()) => {
+                cursor.last_authority = Some(authority);
+                CodeViewPass::Republished
+            }
+            Err(error) => {
+                tracing::warn!(%error, nudged, "code view republish failed; retrying on the next pass");
+                return CodeViewPass::RepublishFailed;
+            }
+        }
+    } else if docs != cursor.last_docs {
         let searcher = { state.idx.read().searcher() };
         state.publish_code_read_searcher(searcher);
-        tracing::debug!(
-            prev_docs = cursor.last_seen,
-            new_docs = current,
-            sidecar_files = signature.files,
-            sidecar_bytes = signature.bytes,
-            "edge-index watcher: corpus changed without sidecar changes; pinned searcher refreshed"
-        );
-        EdgeIndexWatcherPass::SearcherRefreshed
+        CodeViewPass::SearcherRefreshed
     } else {
-        EdgeIndexWatcherPass::Unchanged
+        CodeViewPass::Unchanged
     };
-    cursor.last_seen = current;
+    cursor.last_docs = docs;
     outcome
-}
-
-/// Rebuild step of a watcher pass. The caller holds the sidecar publication
-/// guard for the whole call.
-fn rebuild_edge_index_for_watcher(
-    state: &SharedState,
-    edges_dir: &std::path::Path,
-    cursor: &mut EdgeIndexWatcherCursor,
-    current: u64,
-    nudged: bool,
-    decision: &EdgeIndexWatcherDecision,
-) -> EdgeIndexWatcherPass {
-    let EdgeIndexWatcherDecision {
-        signature,
-        sidecars_changed,
-        ..
-    } = *decision;
-    let started = std::time::Instant::now();
-    tracing::info!(
-        current_docs = current,
-        sidecar_files = signature.files,
-        sidecar_bytes = signature.bytes,
-        nudged,
-        sidecars_changed,
-        "edge-index watcher rebuild started"
-    );
-    match rebuild_edge_index_from_shared(state, false) {
-        Ok(()) => {
-            tracing::info!(
-                prev_docs = cursor.last_seen,
-                new_docs = current,
-                sidecar_files = signature.files,
-                sidecar_bytes = signature.bytes,
-                nudged,
-                sidecars_changed,
-                elapsed_ms = started.elapsed().as_millis(),
-                "edge-index watcher: sidecars changed or store nudge, EdgeIndex rebuilt"
-            );
-            cursor.last_signature = capture_edge_rebuild_authority(
-                edges_dir,
-                Some(&state.corpus_registered_project_ids()),
-            )
-            .ok()
-            .map(|authority| authority.signature)
-            .or(Some(signature));
-            let _ = state
-                .code_sources
-                .store()
-                .clear_health_failure("_edge_index", "store_refresh_deferred");
-            EdgeIndexWatcherPass::Rebuilt
-        }
-        Err(error) => {
-            tracing::warn!(
-                %error,
-                nudged,
-                elapsed_ms = started.elapsed().as_millis(),
-                "edge-index watcher rebuild failed; retaining prior signature for retry"
-            );
-            EdgeIndexWatcherPass::RebuildFailed
-        }
-    }
 }
 
 pub(crate) fn project_ref_counts(state: &Arc<SharedState>, project: &str) -> anyhow::Result<Value> {
@@ -2117,59 +1606,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn rebuild_releases_store_locks_before_taking_edge_index_write() {
-        // Regression for the rebuild/reindex/blame deadlock: rebuild must not
-        // hold idx.read()/kb.read() while acquiring edge_index.write(). We hold
-        // edge_index.read() to force the rebuild to park on edge_index.write(),
-        // then prove idx and kb are still acquirable during that wait. Pre-fix
-        // the rebuild held idx.read across the write acquisition, so idx.write()
-        // would never succeed here (the deadlock window).
-        use std::sync::Arc;
-        use std::time::Duration;
-
-        let tmp = tempfile::tempdir().unwrap();
-        let state = Arc::new(SharedState::for_test(&tmp.path().join("bro")));
-
-        // Hold a reader on the combined view so the rebuild's final write blocks.
-        let held = state.code_read_view.read();
-
-        let st = state.clone();
-        let handle = std::thread::spawn(move || {
-            rebuild_edge_index_from_shared(&st, false).unwrap();
-        });
-
-        // Let the rebuild acquire its store read-locks, finish computing
-        // (trivial on an empty test corpus), and PARK on edge_index.write()
-        // (blocked because `held` is alive). It cannot return until we drop
-        // `held`, so after this settle it is definitively waiting on the write.
-        // No early break — we must observe the steady state, not the
-        // pre-acquisition race (an early break is what made the first cut of
-        // this test pass against the buggy code).
-        std::thread::sleep(Duration::from_millis(400));
-
-        // The rebuild must still be parked (it can't complete until we release).
-        assert!(
-            !handle.is_finished(),
-            "precondition: rebuild should be blocked on edge_index.write()"
-        );
-        // Fixed code dropped the store read-guards before acquiring the write,
-        // so idx/kb are free now. Buggy code holds idx.read()/kb.read() while
-        // parked here, so these would be None.
-        assert!(
-            state.idx.try_write().is_some(),
-            "idx.write() must be free while rebuild waits on edge_index.write()"
-        );
-        assert!(
-            state.kb.try_write().is_some(),
-            "kb.write() must be free while rebuild waits on edge_index.write()"
-        );
-
-        // Let the rebuild finish.
-        drop(held);
-        handle.join().unwrap();
-    }
-
     /// Regression for the 2026-08-25 cage index-plane deadlock:
     /// `bbox_hybrid_search` holds
     /// `state.idx.read()` across the whole search call, and provider
@@ -2217,97 +1653,8 @@ mod tests {
         writer.join().unwrap();
     }
 
-    /// A watcher publication parked on the view write lock holds the
-    /// manifest coordinator. A concurrent selector republish must serialize
-    /// behind it: lowering the fence first and swapping the view after the
-    /// watcher lets the watcher raise the fence and the republish then
-    /// overwrite the complete graph with the placeholder, which a reader
-    /// would take as complete.
-    #[test]
-    fn republish_interleaved_with_watcher_publish_never_exposes_placeholder_as_complete() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::time::Duration;
-
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        let state = Arc::new(SharedState::for_test(&root.join("bro")));
-        let edges_dir = edge_sidecar_dir(&state);
-        let (_cursor, published) = published_watcher_graph(&state);
-
-        // A reader polls the complete view for the whole interleaving. The
-        // fixture's rebuilt graph is non-empty, so an empty edge index can
-        // only be the placeholder.
-        let stop = Arc::new(AtomicBool::new(false));
-        let reader = {
-            let state = state.clone();
-            let stop = stop.clone();
-            std::thread::spawn(move || {
-                while !stop.load(Ordering::Acquire) {
-                    if let Ok(view) = state.complete_code_read_view() {
-                        assert!(
-                            view.edge_index.edge_count() > 0,
-                            "complete_code_read_view returned the placeholder as complete"
-                        );
-                    }
-                    std::thread::yield_now();
-                }
-            })
-        };
-
-        // Park the watcher's publish on the view write lock, inside the
-        // manifest coordinator.
-        let held = state.code_read_view.read();
-        let barrier = Arc::new(std::sync::Barrier::new(2));
-        let watcher = {
-            let state = state.clone();
-            let edges_dir = edges_dir.clone();
-            let barrier = barrier.clone();
-            std::thread::spawn(move || {
-                barrier.wait();
-                rebuild_edge_index_from_shared_at(&state, false, &edges_dir).unwrap();
-            })
-        };
-        barrier.wait();
-        std::thread::sleep(Duration::from_millis(400));
-        assert!(
-            !watcher.is_finished(),
-            "precondition: the watcher publish must be parked on the view write lock"
-        );
-
-        // The republish starts while the watcher holds the coordinator.
-        let republish = {
-            let state = state.clone();
-            std::thread::spawn(move || {
-                super::super::code_source::republish_code_read_view(&state).unwrap();
-            })
-        };
-        std::thread::sleep(Duration::from_millis(400));
-        assert!(
-            !republish.is_finished(),
-            "precondition: the republish must wait behind the watcher publish"
-        );
-
-        drop(held);
-        watcher.join().unwrap();
-        republish.join().unwrap();
-        stop.store(true, Ordering::Release);
-        reader.join().unwrap();
-
-        // The republish ran last, so its lowered fence is what remains.
-        let Err(error) = state.complete_code_read_view() else {
-            panic!("the republish placeholder is readable as complete");
-        };
-        assert!(error.to_string().contains("error.edge_index_warming"));
-
-        // The next watcher publication restores the complete graph.
-        rebuild_edge_index_from_shared_at(&state, false, &edges_dir).unwrap();
-        let view = state.complete_code_read_view().unwrap();
-        assert_eq!(view.edge_index.edge_count(), published);
-    }
-
-    fn signature_test_edge(kind: &str) -> edge_index::Edge {
-        edge_index::Edge {
+    fn signature_test_edge(kind: &str) -> bbox_edge_sidecar::edge_sidecar::Edge {
+        bbox_edge_sidecar::edge_sidecar::Edge {
             source: entity_ref::EntityRef::Knowledge {
                 id: "source".into(),
             },
@@ -2323,7 +1670,7 @@ mod tests {
     }
 
     #[test]
-    fn edge_sidecar_signature_ignores_inactive_snapshots_and_write_tmp_dirs() {
+    fn manifest_view_signature_ignores_inactive_snapshots_and_write_tmp_dirs() {
         let dir = tempfile::tempdir().unwrap();
         let edges_dir = dir.path();
         bbox_edge_sidecar::snapshot::switch_to_clean_snapshot(
@@ -2337,7 +1684,7 @@ mod tests {
             vec![],
         )
         .unwrap();
-        let base = edge_sidecar_signature(edges_dir).unwrap();
+        let base = manifest_view_signature(edges_dir).unwrap();
 
         bbox_edge_sidecar::snapshot::write_snapshot_files(
             edges_dir,
@@ -2348,8 +1695,8 @@ mod tests {
         .unwrap();
         assert_eq!(
             base,
-            edge_sidecar_signature(edges_dir).unwrap(),
-            "inactive snapshot bytes are not rebuild inputs"
+            manifest_view_signature(edges_dir).unwrap(),
+            "inactive snapshot bytes are not view inputs"
         );
 
         let mat = edges_dir.join("materialized/workspace/p");
@@ -2362,17 +1709,17 @@ mod tests {
         .unwrap();
         assert_eq!(
             base,
-            edge_sidecar_signature(edges_dir).unwrap(),
+            manifest_view_signature(edges_dir).unwrap(),
             "*.write-tmp jsonl must not affect the signature"
         );
     }
 
     #[test]
-    fn edge_sidecar_signature_tracks_manifest_index_active_pointers() {
+    fn manifest_view_signature_tracks_manifest_index_active_pointers() {
         let dir = tempfile::tempdir().unwrap();
         let edges_dir = dir.path();
         // Baseline: no manifest-index present.
-        let sig0 = edge_sidecar_signature(edges_dir).unwrap();
+        let sig0 = manifest_view_signature(edges_dir).unwrap();
         bbox_edge_sidecar::snapshot::switch_to_clean_snapshot(
             edges_dir,
             "p",
@@ -2384,12 +1731,12 @@ mod tests {
             vec![],
         )
         .unwrap();
-        let sig1 = edge_sidecar_signature(edges_dir).unwrap();
+        let sig1 = manifest_view_signature(edges_dir).unwrap();
         assert_ne!(sig0, sig1);
 
-        // A different active-pointer set — e.g. a branch switch flipping
-        // active_snapshot between two already-materialized snapshots — changes
-        // no `.jsonl` mtime, so only the manifest-index fold catches it.
+        // A different active-pointer set, such as a branch switch flipping
+        // active_snapshot between two materialized snapshots, must move the
+        // signature.
         bbox_edge_sidecar::snapshot::switch_to_clean_snapshot(
             edges_dir,
             "p",
@@ -2401,7 +1748,7 @@ mod tests {
             vec![],
         )
         .unwrap();
-        let sig2 = edge_sidecar_signature(edges_dir).unwrap();
+        let sig2 = manifest_view_signature(edges_dir).unwrap();
         assert_ne!(
             sig1, sig2,
             "active-pointer change must change the signature even with no .jsonl change"
@@ -2409,7 +1756,7 @@ mod tests {
     }
 
     #[test]
-    fn edge_sidecar_signature_ignores_manifest_timestamp_only_rewrites() {
+    fn manifest_view_signature_ignores_manifest_timestamp_only_rewrites() {
         let dir = tempfile::tempdir().unwrap();
         let edges_dir = dir.path();
         bbox_edge_sidecar::snapshot::switch_to_clean_snapshot(
@@ -2423,7 +1770,7 @@ mod tests {
             vec![],
         )
         .unwrap();
-        let base = edge_sidecar_signature(edges_dir).unwrap();
+        let base = manifest_view_signature(edges_dir).unwrap();
 
         let mut index = bbox_edge_sidecar::manifest::ManifestIndex::load(edges_dir).unwrap();
         index.updated_at = Some("timestamp-only-rewrite".into());
@@ -2431,19 +1778,46 @@ mod tests {
 
         assert_eq!(
             base,
-            edge_sidecar_signature(edges_dir).unwrap(),
-            "volatile manifest timestamps are not graph inputs"
+            manifest_view_signature(edges_dir).unwrap(),
+            "volatile manifest timestamps are not view inputs"
         );
     }
 
+    /// A pass republishes the view when a nudge arrives or the manifest
+    /// authority moves, refreshes only the searcher when the corpus moved,
+    /// and otherwise leaves the published view alone. No pass reads an edge
+    /// row, so an oversized or malformed lane file cannot fail one.
     #[test]
-    fn edge_rebuild_refuses_oversized_active_input_before_parsing() {
-        let mut env = crate::util::TestEnvGuard::new();
+    fn view_refresher_republishes_on_authority_change_and_nudge_only() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
-        let state = SharedState::for_test(&root.join("bro"));
+        let state = Arc::new(SharedState::for_test(&root.join("bro")));
         let edges_dir = edge_sidecar_dir(&state);
-        std::fs::create_dir_all(&edges_dir).unwrap();
+        std::fs::create_dir_all(edges_dir.join("observed")).unwrap();
+        std::fs::write(
+            edges_dir.join("observed/p.jsonl"),
+            "not an edge row\n".repeat(64),
+        )
+        .unwrap();
+        let mut cursor = CodeViewCursor {
+            last_docs: state.idx.read().num_docs(),
+            last_authority: code_view_authority(&state, &edges_dir).ok(),
+        };
+        let published = || state.code_read_view.read().clone();
+
+        let before = published();
+        assert_eq!(
+            run_code_read_view_pass(&state, &edges_dir, &mut cursor, false),
+            CodeViewPass::Unchanged
+        );
+        assert!(Arc::ptr_eq(&before, &published()));
+
+        assert_eq!(
+            run_code_read_view_pass(&state, &edges_dir, &mut cursor, true),
+            CodeViewPass::Republished
+        );
+        assert!(!Arc::ptr_eq(&before, &published()));
+
         bbox_edge_sidecar::snapshot::switch_to_clean_snapshot(
             &edges_dir,
             "p",
@@ -2455,296 +1829,16 @@ mod tests {
             vec![],
         )
         .unwrap();
-        env.set("BLACKBOX_EDGE_INDEX_REBUILD_MAX_INPUT_BYTES", "1");
-        let error = rebuild_edge_index_from_shared(&state, false).unwrap_err();
-        assert!(
-            error.to_string().contains("active sidecar input"),
-            "unexpected refusal: {error:#}"
-        );
-    }
-
-    #[test]
-    fn store_only_nudge_does_not_rebuild_a_large_unchanged_graph() {
-        assert!(!should_rebuild_edge_index(true, false, 250_001, 250_000));
-        assert!(should_rebuild_edge_index(true, false, 250_000, 250_000));
-        assert!(
-            should_rebuild_edge_index(false, true, usize::MAX, 0),
-            "authority changes still require a rebuild regardless of current graph size"
-        );
-    }
-
-    /// Register a project beside the state directory and return its id, the
-    /// lane stem its edge sidecar is admitted under.
-    fn registered_watcher_lane(state: &SharedState) -> String {
-        let store_dir = state.store_dir.canonicalize().unwrap();
-        let project = store_dir.parent().unwrap().join("watcher-project");
-        std::fs::create_dir_all(&project).unwrap();
-        state
-            .project_authority
-            .bridge_registry()
-            .unwrap()
-            .write()
-            .register_path(&project)
-            .unwrap()
-            .project_id
-    }
-
-    /// Publish a sidecar graph and return the watcher cursor over it plus the
-    /// published edge count.
-    fn published_watcher_graph(state: &SharedState) -> (EdgeIndexWatcherCursor, usize) {
-        let edges_dir = edge_sidecar_dir(state);
-        std::fs::create_dir_all(&edges_dir).unwrap();
-        let lane = registered_watcher_lane(state);
-        bbox_edge_sidecar::edge_sidecar::append_edges(
-            &edges_dir,
-            &lane,
-            &[signature_test_edge("A"), signature_test_edge("B")],
-        )
-        .unwrap();
-        rebuild_edge_index_from_shared(state, false).unwrap();
-        let published = state.code_read_view.read().edge_index.edge_count();
-        assert!(published > 0, "the fixture must publish a non-empty graph");
-        (
-            EdgeIndexWatcherCursor::capture(state, &edges_dir),
-            published,
-        )
-    }
-
-    #[test]
-    fn store_only_nudges_above_the_limit_never_hold_the_reindex_publication_guard() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        let state = SharedState::for_test(&root.join("bro"));
-        let edges_dir = edge_sidecar_dir(&state);
-        let (mut cursor, published) = published_watcher_graph(&state);
-        let nudge_limit = published - 1;
-        let nudge_rx = state.edge_rebuild_nudge_rx.lock().unwrap().take().unwrap();
-
-        for _ in 0..3 {
-            state.nudge_edge_index_rebuild();
-            let nudged = nudge_rx.try_recv().is_ok();
-            assert!(nudged);
-            assert_eq!(
-                run_edge_index_watcher_pass(&state, &edges_dir, &mut cursor, nudged, nudge_limit),
-                EdgeIndexWatcherPass::StoreRefreshDeferred
-            );
-            state
-                .index_writer
-                .run_reindex_pass(false, true)
-                .expect("reindex admission succeeds between watcher passes");
-        }
-
-        // A deferral pass never takes the guard: it settles even while another
-        // publication holds it, and leaves that holder's reservation intact.
-        let held = state
-            .index_writer
-            .try_begin_edge_index_rebuild()
-            .expect("idle publication admits an edge rebuild");
-        state.nudge_edge_index_rebuild();
-        assert!(nudge_rx.try_recv().is_ok());
+        let before = published();
         assert_eq!(
-            run_edge_index_watcher_pass(&state, &edges_dir, &mut cursor, true, nudge_limit),
-            EdgeIndexWatcherPass::StoreRefreshDeferred
+            run_code_read_view_pass(&state, &edges_dir, &mut cursor, false),
+            CodeViewPass::Republished
         );
-        assert!(state.index_writer.try_begin_edge_index_rebuild().is_none());
-        drop(held);
-        state
-            .index_writer
-            .run_reindex_pass(false, true)
-            .expect("reindex admission succeeds once the other holder releases");
+        assert!(!Arc::ptr_eq(&before, &published()));
         assert_eq!(
-            state.code_read_view.read().edge_index.edge_count(),
-            published,
-            "deferral passes must not republish the graph"
+            run_code_read_view_pass(&state, &edges_dir, &mut cursor, false),
+            CodeViewPass::Unchanged
         );
-    }
-
-    #[test]
-    fn watcher_rebuild_waits_for_the_publication_guard_and_rechecks_under_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        let state = SharedState::for_test(&root.join("bro"));
-        let edges_dir = edge_sidecar_dir(&state);
-        let (mut cursor, published) = published_watcher_graph(&state);
-        let published_signature = cursor.last_signature;
-
-        let lane = registered_watcher_lane(&state);
-        bbox_edge_sidecar::edge_sidecar::append_edges(
-            &edges_dir,
-            &lane,
-            &[signature_test_edge("C")],
-        )
-        .unwrap();
-        let held = state
-            .index_writer
-            .try_begin_edge_index_rebuild()
-            .expect("idle publication admits an edge rebuild");
-        assert_eq!(
-            run_edge_index_watcher_pass(&state, &edges_dir, &mut cursor, false, usize::MAX),
-            EdgeIndexWatcherPass::PublicationBusy
-        );
-        assert_eq!(cursor.last_signature, published_signature);
-        drop(held);
-
-        assert_eq!(
-            run_edge_index_watcher_pass(&state, &edges_dir, &mut cursor, false, usize::MAX),
-            EdgeIndexWatcherPass::Rebuilt
-        );
-        assert_ne!(cursor.last_signature, published_signature);
-        assert!(state.code_read_view.read().edge_index.edge_count() > published);
-        assert!(
-            state.index_writer.try_begin_edge_index_rebuild().is_some(),
-            "the rebuild releases the guard when the pass ends"
-        );
-    }
-
-    #[test]
-    fn rebuild_retry_delay_doubles_from_one_second_up_to_the_interval() {
-        use std::time::Duration;
-
-        let interval = Duration::from_secs(60);
-        assert_eq!(rebuild_retry_delay(1, interval), Duration::from_secs(1));
-        assert_eq!(rebuild_retry_delay(2, interval), Duration::from_secs(2));
-        assert_eq!(rebuild_retry_delay(3, interval), Duration::from_secs(4));
-        assert_eq!(rebuild_retry_delay(6, interval), Duration::from_secs(32));
-        assert_eq!(rebuild_retry_delay(7, interval), interval);
-        assert_eq!(rebuild_retry_delay(u32::MAX, interval), interval);
-        assert_eq!(
-            rebuild_retry_delay(1, Duration::from_millis(500)),
-            Duration::from_millis(500)
-        );
-
-        let failed = EdgeIndexWatcherPass::RebuildFailed;
-        let mut backoff = RebuildRetryBackoff::default();
-        let delays: Vec<_> = [failed, EdgeIndexWatcherPass::AuthorityUnavailable, failed]
-            .into_iter()
-            .map(|outcome| backoff.after_pass(outcome, false, interval))
-            .collect();
-        assert_eq!(
-            delays,
-            [1, 2, 4].map(|secs| Some(Duration::from_secs(secs))),
-            "both fence-down failure outcomes back off"
-        );
-        assert_eq!(
-            backoff.after_pass(EdgeIndexWatcherPass::PublicationBusy, false, interval),
-            None
-        );
-        assert_eq!(
-            backoff.after_pass(failed, false, interval),
-            Some(Duration::from_secs(8)),
-            "a busy pass neither retries on backoff nor resets the count"
-        );
-
-        assert_eq!(
-            backoff.after_pass(EdgeIndexWatcherPass::Rebuilt, true, interval),
-            None
-        );
-        assert_eq!(
-            backoff.after_pass(failed, false, interval),
-            Some(Duration::from_secs(1)),
-            "a publication resets the count"
-        );
-
-        assert_eq!(
-            backoff.after_pass(failed, false, interval),
-            Some(Duration::from_secs(2))
-        );
-        assert_eq!(
-            backoff.after_pass(failed, true, interval),
-            None,
-            "a failed rebuild behind a raised fence keeps the prior graph and waits for the next nudge or interval"
-        );
-        assert_eq!(
-            backoff.after_pass(failed, false, interval),
-            Some(Duration::from_secs(1)),
-            "a raised fence resets the count"
-        );
-    }
-
-    #[test]
-    fn watcher_retries_a_failed_rebuild_on_backoff_while_the_fence_is_down() {
-        use std::sync::Arc;
-        use std::time::{Duration, Instant};
-
-        const FAILURES: usize = 3;
-        let interval = Duration::from_secs(60);
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        let state = Arc::new(SharedState::for_test(&root.join("bro")));
-        let (_cursor, published) = published_watcher_graph(&state);
-        super::super::code_source::republish_code_read_view(&state).unwrap();
-        assert!(
-            state.complete_code_read_view().is_err(),
-            "precondition: the placeholder republish lowers the fence"
-        );
-
-        let (nudge_tx, nudge_rx) = std::sync::mpsc::channel();
-        let (pass_tx, pass_rx) = std::sync::mpsc::channel();
-        let started = Instant::now();
-        let watcher = {
-            let state = state.clone();
-            std::thread::spawn(move || {
-                let mut calls = 0;
-                run_edge_index_rebuild_watcher(
-                    &state,
-                    interval,
-                    Some(nudge_rx),
-                    |state, edges_dir, cursor, nudged, nudge_limit| {
-                        calls += 1;
-                        let outcome = if calls <= FAILURES {
-                            EdgeIndexWatcherPass::RebuildFailed
-                        } else {
-                            run_edge_index_watcher_pass(
-                                state,
-                                edges_dir,
-                                cursor,
-                                nudged,
-                                nudge_limit,
-                            )
-                        };
-                        pass_tx.send((Instant::now(), nudged, outcome)).unwrap();
-                        outcome
-                    },
-                );
-            })
-        };
-
-        let mut passes = Vec::new();
-        loop {
-            let pass = pass_rx
-                .recv_timeout(interval)
-                .expect("the watcher retries before a full interval elapses");
-            passes.push(pass);
-            if pass.2 != EdgeIndexWatcherPass::RebuildFailed {
-                break;
-            }
-        }
-        let elapsed = started.elapsed();
-
-        assert_eq!(passes.len(), FAILURES + 1);
-        assert_eq!(passes[FAILURES].2, EdgeIndexWatcherPass::Rebuilt);
-        assert!(
-            passes.iter().all(|pass| pass.1),
-            "every pass while the fence is down is a nudged retry"
-        );
-        for (failures, pair) in passes.windows(2).enumerate() {
-            let expected = rebuild_retry_delay(failures as u32 + 1, interval);
-            assert!(
-                pair[1].0 - pair[0].0 >= expected,
-                "retry {failures} waited less than {expected:?}"
-            );
-        }
-        let view = state
-            .complete_code_read_view()
-            .expect("the retried rebuild raises the fence");
-        assert_eq!(view.edge_index.edge_count(), published);
-        assert!(
-            elapsed < interval / 4,
-            "the fence rose after {elapsed:?}, not well before the {interval:?} interval"
-        );
-
-        drop(nudge_tx);
-        watcher.join().unwrap();
     }
 
     #[tokio::test]

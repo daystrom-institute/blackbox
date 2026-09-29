@@ -206,10 +206,10 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_inspect_entity",
         category: ToolCategory::Graph,
-        summary: "Inspect properties and targeted edges. Filter edge_types and direction; per_type_limit=0 reads properties only. property_mode selects summary, smart, or full. Follow edge_page.next_cursor for more edges; property retrieves exact text in pages.",
-        when_to_use: "Use after search to verify a ref and inspect relevant relations. Select edge_types and direction (out, in, both). property_mode is summary, smart (default, 300-character text previews), or full; invalid values fail. Edges page at 100 maximum; follow edge_page.next_cursor as edge_cursor with the same selection. Read a property key from properties or property_projection.omitted_keys with property=<key>; body.next_cursor continues via property_cursor. property_limit is 4..4096 UTF-8 bytes, default 4096. Cursors reject changed selections or source revisions. Full/property reads recover stored provider values; *_preview fields do not expand upstream content. Commit content is the indexed message; evidence.content_completeness marks ingestion truncation. Schema-authored absent relations remain explicit; generic empty scaffolding is omitted. Evidence properties retain assertion authority, source generation, endpoint freshness, and unresolved states. No embedded rendered text mirror is returned.",
+        summary: "Inspect an entity's stored properties. Project graph vertices, and entities an evidence binding names, also carry their graph edges; filter those with edge_types and direction. property_mode selects summary, smart, or full; property retrieves exact text in pages.",
+        when_to_use: "Use after search to verify a ref and read its stored properties. A ref resolves only when its provider's store holds it; symbol refs never resolve. Project graph vertices carry their graph edges and evidence bindings: select edge_types and direction (out, in, both). property_mode is summary, smart (default, 300-character text previews), or full; invalid values fail. Edges page at 100 maximum; follow edge_page.next_cursor as edge_cursor with the same selection. Read a property key from properties or property_projection.omitted_keys with property=<key>; body.next_cursor continues via property_cursor. property_limit is 4..4096 UTF-8 bytes, default 4096. Cursors reject changed selections or source revisions. Full/property reads recover stored provider values; *_preview fields do not expand upstream content. Commit content is the indexed message; evidence.content_completeness marks ingestion truncation. Schema-authored absent relations remain explicit; generic empty scaffolding is omitted. Evidence properties retain assertion authority, source generation, endpoint freshness, and unresolved states. No embedded rendered text mirror is returned.",
         example: Some(
-            r#"bbox_inspect_entity(entity_ref="thread:thread-abc12345", edge_types="THREAD_SPAWNED_FROM,THREAD_BLOCKED_BY", direction="both")"#,
+            r#"bbox_inspect_entity(entity_ref="knowledge:abc12345", property="content")"#,
         ),
     },
     ToolDoc {
@@ -236,8 +236,8 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_edge_compact",
         category: ToolCategory::Graph,
-        summary: "Dry-run or apply legacy edge sidecar compaction for one project. Removes append-only derived edges from edges/<project_id>.jsonl while retaining explicit/provenance/malformed lines; apply defaults false and writes a backup before replacement. With apply=true, rebuild=true forces a sidecar-only in-memory EdgeIndex rebuild even when compaction is already complete.",
-        when_to_use: "Use when legacy edge sidecars have grown from repeated full reindex replay. Call first with `apply=false` (default) for exactly one project_id, inspect removed/retained counts, then call with `apply=true` for that same project if the dry-run scope is acceptable. Leave `rebuild=false` while compacting multiple projects; after the last project, call with `apply=true,rebuild=true` once to reload graph state. If a requested rebuild fails after compaction, status=partial preserves the compaction stats and backup receipt. Retry apply=true,rebuild=true to rebuild the current compacted sidecar.",
+        summary: "Dry-run or apply legacy edge sidecar compaction for one project. Removes append-only derived edges from edges/<project_id>.jsonl while retaining explicit/provenance/malformed lines; apply defaults false and writes a backup before replacement.",
+        when_to_use: "Use when a legacy top-level edge sidecar has grown from repeated full reindex replay and its disk footprint matters. Call first with `apply=false` (default) for exactly one project_id, inspect removed/retained counts, then call with `apply=true` for that same project if the dry-run scope is acceptable.",
         example: Some(r#"bbox_edge_compact(project_id="d723917f", apply=false)"#),
     },
     // ── Projects ─────────────────────────────────────────────────────
@@ -803,7 +803,7 @@ fn render_retrieval_workflow(out: &mut String) {
     out.push_str("## Retrieval workflow\n\n");
     out.push_str("Use Blackbox retrieval when stored decisions, conversation history, or indexed code evidence can change the answer. A direct local edit or an already-authoritative live result does not require a graph walk.\n\n");
     out.push_str("Use a short phrase from the task, not a single generic keyword. Query `bbox_knowledge` for durable rules and decisions, and `bbox_hybrid_search` for conversation history, indexed code or mixed evidence. Inspect relevant hits before relying on them.\n\n");
-    out.push_str("Use tool-returned canonical entity refs and suggested fixes. Scope edge types and direction to the question. Retrieve `sm-agentic-opening-sequence` only for a graph investigation that needs its detailed recipes.\n\n");
+    out.push_str("Use tool-returned canonical entity refs and suggested fixes. Retrieve `sm-agentic-opening-sequence` when the question needs its answer protocol or recipes.\n\n");
 }
 
 fn render_persistence_workflow(out: &mut String) {

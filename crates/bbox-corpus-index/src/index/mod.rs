@@ -901,7 +901,7 @@ impl TranscriptIndex {
     }
 
     /// Current document count from a fresh searcher snapshot. Used by the
-    /// edge-index rebuild watcher to detect when the corpus has grown.
+    /// code read view refresher to detect when the corpus has grown.
     pub fn num_docs(&self) -> u64 {
         self.reader.searcher().num_docs()
     }
@@ -921,12 +921,7 @@ impl TranscriptIndex {
     }
 
     /// Cheap count of docs matching a single `doc_type` term, via a
-    /// `TermQuery` + `Count` collector -- no stored-doc streaming. Used by
-    /// `bbox_describe_schema`'s transcript vertex count: transcript entities
-    /// are deliberately excluded from `EdgeIndex::entity_type_counts_active`
-    /// (they're an observed history lane, not part of the active knowledge
-    /// graph), so describe_schema needs a tantivy-backed count instead of an
-    /// edge-index one.
+    /// `TermQuery` + `Count` collector, with no stored-doc streaming.
     pub fn doc_type_count(&self, doc_type: &str) -> Result<usize> {
         if doc_type == "roadmap" {
             return Ok(0);
@@ -2316,9 +2311,6 @@ mod tests {
 
     #[test]
     fn doc_type_count_counts_only_the_requested_doc_type() {
-        // gap-edc84378: bbox_describe_schema's transcript count comes from
-        // this cheap TermQuery + Count collector, not from EdgeIndex (which
-        // deliberately excludes transcript from its active counts).
         let dir = tempfile::tempdir().unwrap();
         let index = TranscriptIndex::open_or_create_with_records(
             &dir.path().join("index"),

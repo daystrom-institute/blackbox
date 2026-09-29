@@ -171,9 +171,9 @@ pub fn recover_pending_migrations(edges_dir: &Path) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::edge_index::Edge;
     use bbox_chunker::{EdgeConfidence, EdgeProvenance};
     use bbox_corpus_core::entity_ref::EntityRef;
+    use bbox_edge_sidecar::edge_sidecar::Edge;
     use std::collections::BTreeMap;
     use std::io::Write;
 
@@ -293,28 +293,6 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(migration_dir.join("manifest.json")).unwrap())
                 .unwrap();
         assert_eq!(reloaded, committed);
-    }
-
-    #[test]
-    fn active_loader_reads_installed_explicit_lane() {
-        use crate::edge_index::EdgeIndex;
-
-        let dir = tempfile::tempdir().unwrap();
-        let edges_dir = dir.path();
-        write_explicit_lane(edges_dir, "p1");
-
-        let mut index = EdgeIndex::default();
-        let mut seen = std::collections::HashSet::new();
-        index
-            .load_sidecar_edges(edges_dir, None, &mut seen, true)
-            .unwrap();
-
-        let source = EntityRef::Knowledge { id: "k1".into() };
-        assert_eq!(
-            index.forward_edges(&source).len(),
-            1,
-            "an installed explicit lane loads"
-        );
     }
 
     #[test]

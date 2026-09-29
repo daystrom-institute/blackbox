@@ -4,9 +4,8 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::{Result, anyhow, bail};
 
 use super::{
-    EdgeFamilyExpectation, EntitySchemaView, EntityView, InspectableEntityProvider, Neighborhood,
-    NextHop, ProviderCheckoutSelection, ProviderContext, ProviderProjectAuthority,
-    empty_neighborhood_view, ensure_type, schema, truncate_label,
+    EntityView, InspectableEntityProvider, ProviderCheckoutSelection, ProviderContext,
+    ProviderProjectAuthority, empty_neighborhood_view, ensure_type, truncate_label,
 };
 use bbox_corpus_core::entity_ref::{EntityRef, EntityType};
 use bbox_corpus_core::identity::PublishedScope;
@@ -69,35 +68,6 @@ impl InspectableEntityProvider for FileProvider {
             properties.insert("content_preview".into(), preview(&resolved.content));
         }
         Ok(empty_neighborhood_view(r, properties))
-    }
-
-    fn schema(&self) -> EntitySchemaView {
-        schema(
-            self.entity_type(),
-            &[
-                "path",
-                "project_id",
-                "project_root",
-                "file_path",
-                "relative_path",
-                "bytes",
-                "content_preview",
-            ],
-            &["IN_PROJECT"],
-            &["path", "project_id", "relative_path"],
-        )
-    }
-
-    fn expected_edge_families(&self, _r: &EntityRef) -> Vec<EdgeFamilyExpectation> {
-        Vec::new()
-    }
-
-    fn recommended_next_hops(
-        &self,
-        _entity: &EntityView,
-        _full_neighborhood: &Neighborhood,
-    ) -> Vec<NextHop> {
-        Vec::new()
     }
 
     fn compact_label(&self, _ctx: &ProviderContext<'_>, r: &EntityRef) -> Option<String> {

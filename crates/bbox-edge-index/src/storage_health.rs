@@ -1187,12 +1187,12 @@ fn extract_project_id_from_base(file_name: &str) -> Option<String> {
 }
 
 pub fn find_edges_dir(store_dir: &Path, projects_path: Option<&Path>) -> PathBuf {
-    let from_store = crate::edge_index::edges_dir_from_bro_store(store_dir);
+    let from_store = bbox_edge_sidecar::edge_sidecar::edges_dir_from_bro_store(store_dir);
     if from_store.is_dir() {
         return from_store;
     }
     if let Some(pp) = projects_path {
-        let from_projects = crate::edge_index::edges_dir_from_projects_path(pp);
+        let from_projects = bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(pp);
         if from_projects.is_dir() {
             return from_projects;
         }

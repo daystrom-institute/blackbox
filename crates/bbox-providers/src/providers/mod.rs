@@ -20,7 +20,7 @@ use anyhow::{Result, bail};
 use bbox_artifacts::artifacts::ArtifactCatalog;
 use bbox_corpus_core::entity_ref::{EntityRef, EntityType};
 use bbox_corpus_index::index::TranscriptIndex;
-use bbox_edge_index::edge_index::Edge;
+use bbox_edge_sidecar::edge_sidecar::Edge;
 use bbox_knowledge::knowledge::Knowledge;
 use bbox_threads::threads::Threads;
 use parking_lot::RwLock;
@@ -36,14 +36,6 @@ pub struct EntityView {
     /// them from (today: project graph vertices). Empty everywhere else, so a
     /// provider that only counts edge families keeps its existing behavior.
     pub next_hop_hints: Vec<NextHopHint>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EntitySchemaView {
-    pub entity_type: EntityType,
-    pub properties: Vec<String>,
-    pub edge_families: Vec<String>,
-    pub filterable_fields: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -97,14 +89,6 @@ pub struct NextHopHint {
     pub direction: NextHopDirection,
     pub label: Option<String>,
     pub authored: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EdgeFamilyExpectation {
-    pub family_name: String,
-    pub min_count: Option<usize>,
-    pub max_count: Option<usize>,
-    pub required: bool,
 }
 
 /// Borrowed view over the corpus stores the entity providers read.
@@ -178,15 +162,8 @@ pub struct ProviderContext<'a> {
     /// daemon state type they were registered with. Keeps per-call state
     /// without this crate naming the daemon's types.
     ext: Option<&'a (dyn std::any::Any + Send + Sync)>,
-    /// Edge sidecar, when the call site already holds a read guard.
-    /// Edge-projected vertex types (symbol, symbol_v2) have no entity doc
-    /// of their own — the indexer derives only their edges (gap-496fe07f)
-    /// — so their existence check falls back to edge participation when
-    /// this is present. Absent → those providers keep the strict
-    /// indexed-doc requirement.
-    edges: Option<&'a bbox_edge_index::edge_index::EdgeIndex>,
     /// Request-pinned Tantivy searcher. Code-source reads pair this with the
-    /// pinned selector map and edge sidecar so provider properties and labels
+    /// pinned selector map so provider properties and labels
     /// cannot reopen a newer reader mid-request.
     searcher: Option<&'a tantivy::Searcher>,
     project_graph_resolver: Option<&'a dyn ProjectGraphEntityResolver>,
@@ -221,7 +198,6 @@ impl<'a> ProviderContext<'a> {
             checkout_selection: None,
             knowledge_view: None,
             ext: None,
-            edges: None,
             searcher: None,
             project_graph_resolver: None,
             provisional: None,
@@ -237,16 +213,10 @@ impl<'a> ProviderContext<'a> {
             checkout_selection: None,
             knowledge_view: None,
             ext: Some(ext),
-            edges: None,
             searcher: None,
             project_graph_resolver: None,
             provisional: None,
         }
-    }
-
-    pub fn with_edge_index(mut self, edges: &'a bbox_edge_index::edge_index::EdgeIndex) -> Self {
-        self.edges = Some(edges);
-        self
     }
 
     pub fn with_knowledge_view(mut self, knowledge: &'a Knowledge) -> Self {
@@ -280,7 +250,6 @@ impl<'a> ProviderContext<'a> {
             checkout_selection: None,
             knowledge_view: None,
             ext: None,
-            edges: None,
             searcher: None,
             project_graph_resolver: None,
             provisional: None,
@@ -301,10 +270,6 @@ impl<'a> ProviderContext<'a> {
 
     pub fn ext(&self) -> Option<&'a (dyn std::any::Any + Send + Sync)> {
         self.ext
-    }
-
-    pub fn edge_index(&self) -> Option<&'a bbox_edge_index::edge_index::EdgeIndex> {
-        self.edges
     }
 
     pub fn project_graph_resolver(&self) -> Option<&'a dyn ProjectGraphEntityResolver> {
@@ -364,18 +329,19 @@ pub trait InspectableEntityProvider: Send + Sync {
     }
 
     /// Load scalar/entity-specific properties from the provider's backing
-    /// store. The returned `EntityView.neighborhood` is intentionally empty;
-    /// callers populate it from `EdgeIndex` before rendering or calling
-    /// `recommended_next_hops`.
+    /// store. Only project graph vertices carry a neighborhood (their graph
+    /// edges and evidence bindings); every other provider returns it empty.
     fn get_entity(&self, ctx: &ProviderContext<'_>, r: &EntityRef) -> Result<EntityView>;
-    fn schema(&self) -> EntitySchemaView;
-    fn expected_edge_families(&self, r: &EntityRef) -> Vec<EdgeFamilyExpectation>;
 
+    /// Recommended hops over the entity's neighborhood. Empty for providers
+    /// whose entities carry no neighborhood.
     fn recommended_next_hops(
         &self,
-        entity: &EntityView,
-        full_neighborhood: &Neighborhood,
-    ) -> Vec<NextHop>;
+        _entity: &EntityView,
+        _full_neighborhood: &Neighborhood,
+    ) -> Vec<NextHop> {
+        Vec::new()
+    }
 
     fn compact_label(&self, ctx: &ProviderContext<'_>, r: &EntityRef) -> Option<String>;
 }
@@ -456,59 +422,6 @@ pub fn empty_neighborhood_view(r: &EntityRef, properties: BTreeMap<String, Strin
         neighborhood: Neighborhood::default(),
         next_hop_hints: Vec::new(),
     }
-}
-
-pub fn schema(
-    entity_type: EntityType,
-    properties: &[&str],
-    edge_families: &[&str],
-    filterable_fields: &[&str],
-) -> EntitySchemaView {
-    EntitySchemaView {
-        entity_type,
-        properties: properties
-            .iter()
-            .map(|value| (*value).to_string())
-            .collect(),
-        edge_families: edge_families
-            .iter()
-            .map(|value| (*value).to_string())
-            .collect(),
-        filterable_fields: filterable_fields
-            .iter()
-            .map(|value| (*value).to_string())
-            .collect(),
-    }
-}
-
-pub fn expected(family_name: &str, required: bool) -> EdgeFamilyExpectation {
-    EdgeFamilyExpectation {
-        family_name: family_name.to_string(),
-        min_count: required.then_some(1),
-        max_count: None,
-        required,
-    }
-}
-
-pub fn next_hops(neighborhood: &Neighborhood, families: &[&str]) -> Vec<NextHop> {
-    families
-        .iter()
-        .map(|family| {
-            let count = neighborhood
-                .forward
-                .iter()
-                .chain(neighborhood.reverse.iter())
-                .filter(|edge| edge.kind == *family)
-                .count();
-            NextHop {
-                edge_family_name: (*family).to_string(),
-                count,
-                direction: None,
-                label: None,
-                authored: false,
-            }
-        })
-        .collect()
 }
 
 pub fn truncate_label(value: impl AsRef<str>) -> String {
