@@ -103,6 +103,16 @@ rolling log directory. A second daemon shares it unless it isolates `HOME`
 that. The vector store is the config-resolved `paths.vectors_path`, claimed
 like every other root; its default is the platform directory.
 
+### Booting on a copy of real state
+
+A daemon booted on a copy of a real state directory still owns every checkout
+that copy's project catalog registers: at startup it reconciles and rewrites
+those checkouts' `.bbox/` files in place, exactly as the original daemon would.
+State isolation does not extend to registered checkouts. Before booting a
+copy, remove its catalog registrations (`projects.json`, `project-attachments.json`
+and the `project-catalog-*` siblings together) so it starts in bridge mode with
+no checkouts, or point it only at throwaway clones of the registered repos.
+
 ### Skipping heavy startup work
 
 | Env var | Default | Dev value | Effect |
