@@ -138,7 +138,7 @@ pub struct NoteListParams {
 pub struct NoteResolveParams {
     /// Note ID for the single-note path. Canonical form is `note-<8 hex>` (e.g.
     /// `note-a1b2c3d4`) — the exact string returned by `bbox_note` and listed
-    /// by `bbox_notes` / `bbox_inbox`. The bare 8-hex suffix (`a1b2c3d4`) is
+    /// by `bbox_notes`. The bare 8-hex suffix (`a1b2c3d4`) is
     /// accepted as a fallback for ergonomics, but prefer the canonical form.
     #[serde(default)]
     #[schemars(regex(pattern = r"^(note-)?[0-9a-f]{8}$"))]
@@ -428,8 +428,8 @@ impl Notes {
         format!("note-{:08x}", hash as u32)
     }
 
-    /// Immutable slice of all stored notes — used by cross-store
-    /// aggregators (inbox) that can't go through the MCP layer.
+    /// Immutable slice of all stored notes, for in-process readers that
+    /// can't go through the MCP layer.
     pub fn all(&self) -> &[Note] {
         &self.store.notes
     }

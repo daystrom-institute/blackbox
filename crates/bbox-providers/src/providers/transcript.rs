@@ -52,18 +52,13 @@ impl InspectableEntityProvider for TranscriptProvider {
         schema(
             self.entity_type(),
             &["provider", "session_id", "line_offset", "event_idx", "role"],
-            &["IN_SESSION", "EDITED_FILE", "READ_FILE", "RAN_BASH"],
+            &["IN_SESSION", "RAN_BASH"],
             &["provider", "session_id", "role"],
         )
     }
 
     fn expected_edge_families(&self, _r: &EntityRef) -> Vec<EdgeFamilyExpectation> {
-        vec![
-            expected("IN_SESSION", true),
-            expected("EDITED_FILE", false),
-            expected("READ_FILE", false),
-            expected("RAN_BASH", false),
-        ]
+        vec![expected("IN_SESSION", true), expected("RAN_BASH", false)]
     }
 
     fn recommended_next_hops(
@@ -71,10 +66,7 @@ impl InspectableEntityProvider for TranscriptProvider {
         _entity: &EntityView,
         full_neighborhood: &Neighborhood,
     ) -> Vec<NextHop> {
-        next_hops(
-            full_neighborhood,
-            &["IN_SESSION", "EDITED_FILE", "READ_FILE", "RAN_BASH"],
-        )
+        next_hops(full_neighborhood, &["IN_SESSION", "RAN_BASH"])
     }
 
     fn compact_label(&self, ctx: &ProviderContext<'_>, r: &EntityRef) -> Option<String> {

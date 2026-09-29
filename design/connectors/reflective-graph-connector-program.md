@@ -32,10 +32,7 @@ status refreshed 2026-08-16. Landed on `beta/blackbox-v2`:
   `bbox_project_graph_list/describe/validate`, provisional visibility -
   proven live by `examples/graph-live-exercise.sh` and a real external
   authoring exercise (findings on thread-a2062843).
-- **M2-M3 (2026-08-13)**: source projections in
-  `crates/bbox-source-graph` (dedicated connector source-projection
-  store, atomic snapshot acceptance, `SourceProjectionStatus`) and
-  cross-entity evidence bindings in
+- **M3 (2026-08-13)**: cross-entity evidence bindings in
   `crates/bbox-project-graph/src/evidence.rs` with the
   `.bbox/evidence/bindings.json` checkout lane.
 - **Connector identity (phase 0, 2026-08-12/13)**: operator-minted
@@ -478,7 +475,7 @@ traversed with no new Rust domain variants.
 
 ## 8. Milestone 2: source-managed graph projections
 
-Status: LANDED 2026-08-13 in `crates/bbox-source-graph`.
+Status: not built.
 
 Add connector authority without weakening project ownership:
 
@@ -497,8 +494,7 @@ stale or unresolved and remain diagnosable.
 Exit gate: a synthetic API-dataset connector advances a source graph through
 create, update, delete, checkpoint resume, and schema reprojection.
 
-Accepted implementation contract (first proven on the pre-locality
-branch, landed in `bbox-source-graph`):
+Implementation contract:
 
 - connector-managed generations live in a dedicated source projection store,
   not under either project-authored graph root;

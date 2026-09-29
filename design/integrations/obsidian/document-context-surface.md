@@ -102,9 +102,9 @@ blackbox, Obsidian, or MCP tooling might expect them:
   deterministic — templates, classifiers, and lookup tables. The `why` field in
   `potential_related` items uses a fixed template, not an LLM summary. The plugin
   never prompts an LLM.
-- **No live git fallback.** Git-note provenance appears only after normal
-  blackbox import/indexing has promoted it to graph state. The endpoint does not
-  shell out to `git notes` or read `.git/` directly.
+- **No live git fallback.** Git context appears only after normal blackbox
+  indexing has promoted it to graph state. The endpoint does not shell out to
+  `git` or read `.git/` directly.
 - **No vector similarity as a durable edge.** `potential_related` items carry
   `confidence="suggested"` and are never persisted as graph edges without
   explicit operator acceptance through the write-capable phase.
@@ -129,9 +129,8 @@ Keep the first pass intentionally narrow:
    when Codex or another tool creates adjacent worktree directories and the
    active note should be resolved against that project instead of the vault's
    default root.
-3. **BBox graph state is the source of truth.** Git notes are not read live as a
-   fallback. If provenance matters, import/export keeps it in bbox first; the
-   document context route renders what bbox knows.
+3. **BBox graph state is the source of truth.** Git is not read live as a
+   fallback; the document context route renders what bbox knows.
 4. **No markdown mutation.** The plugin does not insert links, frontmatter,
    evidence blocks, or provenance stanzas into the existing document in v1.
 5. **Accepted relations go to `.bbox/`.** If the operator accepts a suggested
@@ -159,8 +158,7 @@ Relevant existing capabilities:
 | Entity inspection | `bbox_inspect_entity` returns properties and targeted edges for one entity ref. |
 | Path finding | `bbox_find_paths` returns direction-preserving graph paths for multi-hop explanations. |
 | Evidence bundles | `bbox_bundle_evidence` packages entity refs and path ids into a bounded evidence object. |
-| Provenance | Tool-call, transcript, thread, note, commit, and git-note provenance are already modeled in the graph and docs. |
-| Git notes | `bbox_provenance_export` / `bbox_provenance_import` round-trip provenance through `refs/notes/bbox/provenance`. |
+| Provenance | Tool-call, transcript, thread, note, and commit provenance are already modeled in the graph and docs. |
 | Edge vocabulary | `SUPERSEDES` and `DERIVED_FROM` are existing knowledge/agent edge kinds; roadmap supersession is separately projected as `ROADMAP_SUPERSEDES`. |
 | HTTP daemon | `blackboxd` already serves non-MCP routes beside `/mcp`. |
 
@@ -193,7 +191,7 @@ For a `design/*.md` document, useful sections are:
 | Section | Meaning |
 |---|---|
 | `provenance` | Sessions, tasks, brofiles, agents, notes, or threads that created, edited, reviewed, or discussed the document. |
-| `git` | Commits touching the document, commit subjects, git-note provenance, and linked work objects when available. |
+| `git` | Commits touching the document, commit subjects, and linked work objects when available. |
 | `lifecycle` | `DERIVED_FROM`, `SUPERSEDES`, superseded-by, archived-by, replacement, and design lineage relationships. |
 | `knowledge` | Decisions, conventions, memories, and runbooks derived from, cited by, or topically tied to the document. |
 | `threads` | Active or historical work threads related to the document. |
@@ -422,8 +420,7 @@ The default recipe for markdown design documents:
      not expected by default.
 3. **Git context**
    - recent commits touching the file;
-   - commit subjects, authors, dates, and linked work provenance;
-   - imported/exported git-note provenance when present.
+   - commit subjects, authors, dates, and linked work provenance.
 4. **Threads and notes**
    - notes whose entity refs, body, or thread links mention the document;
    - unresolved `dispute`, `assumption`, `followup`, and `blocked` first;

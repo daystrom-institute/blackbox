@@ -36,9 +36,9 @@ The main operator binaries are:
 | [Atoms](atoms.md) | Retired atom execution and replacements |
 | [Refactor Tools And Atoms](refactor.md) | Harness-native structural refactor tooling |
 | [Bro Runtime](bro-runtime.md) | Direct dispatch, resume, wait, teams, brofiles, and provider runtime controls |
-| [Knowledge Store](knowledge-store.md) | Learn, decide, remember, pin, render, review, notes, and inbox |
+| [Knowledge Store](knowledge-store.md) | Learn, decide, remember, pin, render, review, and notes |
 | [Design Graph](design-graph.md) | Operate this repo's `design` project graph: verbs, authority, reads, state blocks |
-| [Transcript Retrieval](transcript-retrieval.md) | Search, cite, context, sessions, messages, topics, and freshness checks |
+| [Transcript Retrieval](transcript-retrieval.md) | Search, context, sessions, messages, and freshness checks |
 | [Projects And Code Indexing](projects-code-indexing.md) | Project registration, `.bbox`, code navigation, reindex, and reembed |
 | [Code Source Collector](code-source-collector.md) | Publish checkout-owned current files to a corpus daemon and operate source transitions |
 | [Artifact Catalog](artifact-catalog.md) | Install, list, supersede, and reason about `system-defaults/` |
@@ -46,9 +46,7 @@ The main operator binaries are:
 | [Badgey](badgey.md) | Retired integration and retained evidence |
 | [Consultant Runtime](consultant-runtime.md) | Retired consultant runtime |
 | [Ingress Paths](ingress-paths.md) | Bro control and collector transport boundaries |
-| [System Events](system-events.md) | Observation journal without reaction execution |
 | [Slack Bridge](slack-bridge.md) | Retired bridge and retained conversation evidence |
-| [Whiteboards](whiteboards.md) | Historical evidence with preserved visibility |
 | [Convergence Drain Gate](converge-gate.md) | Probe live orchestration state and drain admission before converging or cycling the daemon |
 
 ## Quick links

@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+#[cfg(test)]
 use std::path::Path;
 
 use anyhow::Result;
@@ -10,17 +11,11 @@ use tantivy::schema::*;
 use tantivy::snippet::SnippetGenerator;
 use tantivy::{IndexWriter, TantivyDocument, Term};
 
-use super::helpers::*;
+use super::conversation_lane::{ConversationCoordinates, CorpusDocumentFilter, LexicalQueryMode};
 use super::passes::*;
 use super::project_files;
 use super::{FieldHandles, FileMeta, TranscriptIndex, first_u64};
-use bbox_corpus_core::entity_ref::EntityRef;
 use bbox_corpus_core::query::smart_query_to_tantivy;
-
-/// Reply to a transcript read against an empty index. Reindexing is an
-/// operator tool, so the reply names the operator CLI form.
-pub const EMPTY_INDEX_MESSAGE: &str =
-    "Index is empty. Ask the operator to run `bro mcp call bbox_reindex '{}' --surface ops`.";
 
 #[derive(Debug)]
 struct IndexedTranscriptMessage {
@@ -33,212 +28,6 @@ struct IndexedTranscriptMessage {
     role: String,
     timestamp: String,
     content: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum SearchRecovery {
-    NativeTranscript {
-        locator: Option<String>,
-        byte_offset: Option<u64>,
-        session_id: Option<String>,
-    },
-    SlackTranscript {
-        locator: Option<String>,
-        byte_offset: Option<u64>,
-        session_id: Option<String>,
-        has_permalink: bool,
-    },
-    Thread {
-        thread_id: String,
-    },
-    Entity {
-        entity_ref: String,
-    },
-    Unavailable {
-        doc_type: String,
-    },
-}
-
-fn non_blank(value: &str) -> Option<String> {
-    (!value.trim().is_empty()).then(|| value.to_string())
-}
-
-fn canonical_entity_ref(value: &str) -> Option<String> {
-    EntityRef::parse(value)
-        .ok()
-        .map(|entity_ref| entity_ref.to_string())
-}
-
-fn json_string(value: &str) -> String {
-    serde_json::to_string(value).expect("UTF-8 string serialization cannot fail")
-}
-
-fn display_fragment(value: &str, max_bytes: usize) -> String {
-    let mut end = value.len().min(max_bytes);
-    while !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    if end < value.len() {
-        format!("{} [preview; use exact reader]", &value[..end])
-    } else {
-        value.to_owned()
-    }
-}
-
-impl SearchRecovery {
-    fn new(
-        doc_type: &str,
-        entity_id: &str,
-        locator: &str,
-        session_id: &str,
-        raw_byte_offset: Option<u64>,
-        message_ts: &str,
-        source: &str,
-        has_permalink: bool,
-    ) -> Self {
-        let locator = non_blank(locator);
-        let session_id = non_blank(session_id);
-        if matches!(doc_type, "transcript" | "tool_call") {
-            if locator
-                .as_deref()
-                .is_some_and(|value| value.starts_with("slack:"))
-            {
-                let byte_offset = crate::transcripts::conversation::message_ts_digits(message_ts);
-                let has_context = locator.is_some() && byte_offset.is_some();
-                let has_messages = session_id.is_some() || locator.is_some();
-                if !has_context && !has_messages {
-                    return Self::Unavailable {
-                        doc_type: doc_type.to_string(),
-                    };
-                }
-                return Self::SlackTranscript {
-                    locator,
-                    byte_offset,
-                    session_id,
-                    has_permalink,
-                };
-            }
-            if source == "slack" {
-                // Retained conversation rows need a landing-store selector;
-                // a native-looking locator never changes that authority.
-                return Self::Unavailable {
-                    doc_type: "retained conversation".into(),
-                };
-            }
-            let has_context = locator.is_some() && raw_byte_offset.is_some();
-            let has_messages = session_id.is_some() || locator.is_some();
-            if !has_context && !has_messages {
-                return Self::Unavailable {
-                    doc_type: doc_type.to_string(),
-                };
-            }
-            return Self::NativeTranscript {
-                locator,
-                byte_offset: raw_byte_offset,
-                session_id,
-            };
-        }
-
-        let entity_ref = match EntityRef::parse(entity_id) {
-            Ok(entity_ref) => entity_ref,
-            Err(_) => {
-                return Self::Unavailable {
-                    doc_type: doc_type.to_string(),
-                };
-            }
-        };
-        if let EntityRef::Thread { thread_id } = entity_ref {
-            return Self::Thread { thread_id };
-        }
-        Self::Entity {
-            entity_ref: entity_ref.to_string(),
-        }
-    }
-
-    fn append_next_steps(&self, out: &mut String) {
-        match self {
-            Self::NativeTranscript {
-                locator,
-                byte_offset,
-                session_id,
-            } => {
-                if let (Some(locator), Some(byte_offset)) = (locator, byte_offset) {
-                    out.push_str(&format!(
-                        "  → Surrounding conversation: bbox_context(file_path={}, byte_offset={byte_offset})\n",
-                        json_string(locator)
-                    ));
-                }
-                if let Some(session_id) = session_id {
-                    out.push_str(&format!(
-                        "  → Read the whole session: bbox_messages(session_id={})\n",
-                        json_string(session_id)
-                    ));
-                } else if let Some(locator) = locator {
-                    out.push_str(&format!(
-                        "  → Read the indexed transcript: bbox_messages(file_path={})\n",
-                        json_string(locator)
-                    ));
-                }
-            }
-            Self::SlackTranscript {
-                locator,
-                byte_offset,
-                session_id,
-                has_permalink,
-            } => {
-                if let (Some(locator), Some(byte_offset)) = (locator, byte_offset) {
-                    out.push_str(&format!(
-                        "  → Surrounding conversation: bbox_context(file_path={}, byte_offset={byte_offset})\n",
-                        json_string(locator)
-                    ));
-                }
-                if let Some(session_id) = session_id {
-                    out.push_str(&format!(
-                        "  → Read the day's messages: bbox_messages(session_id={})\n",
-                        json_string(session_id)
-                    ));
-                    let channel_id = session_id.split('/').next().unwrap_or(session_id);
-                    out.push_str(&format!(
-                        "  → The whole channel's messages: bbox_search(query={}, channel={})\n",
-                        json_string("..."),
-                        json_string(channel_id)
-                    ));
-                } else if let Some(locator) = locator {
-                    out.push_str(&format!(
-                        "  → The whole channel's messages: bbox_messages(file_path={})\n",
-                        json_string(locator)
-                    ));
-                }
-                if *has_permalink {
-                    out.push_str(
-                        "  → Open a specific message in Slack: follow its Permalink line above\n",
-                    );
-                }
-            }
-            Self::Thread { thread_id } => {
-                let thread_ref = json_string(&format!("thread:{thread_id}"));
-                out.push_str(&format!(
-                    "  → Read the thread summary and detail entry point: bbox_thread(action={}, id={})\n",
-                    json_string("get"),
-                    json_string(thread_id)
-                ));
-                out.push_str(&format!(
-                    "  → Inspect thread relations: bbox_inspect_entity(entity_ref={thread_ref})\n"
-                ));
-            }
-            Self::Entity { entity_ref } => {
-                out.push_str(&format!(
-                    "  → Inspect the exact entity: bbox_inspect_entity(entity_ref={})\n",
-                    json_string(entity_ref)
-                ));
-            }
-            Self::Unavailable { doc_type } => {
-                out.push_str(&format!(
-                    "  → No exact follow-up reader is available for this {doc_type} hit\n"
-                ));
-            }
-        }
-    }
 }
 
 impl IndexedTranscriptMessage {
@@ -596,59 +385,6 @@ pub fn graph_lane_boolean_query(
     BooleanQuery::new(clauses)
 }
 
-#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct SearchParams {
-    /// Search query. In smart mode, adjacent terms broaden recall (`OR`);
-    /// use `mode=fulltext` for raw Tantivy/Lucene-style boolean syntax.
-    pub query: String,
-    /// Search mode: smart (default) or fulltext
-    #[serde(default)]
-    pub mode: Option<String>,
-    /// Exact source account label, as shown in search results (for example
-    /// default). Account labels are configured by the source owner; use source
-    /// to select a provider lane.
-    #[serde(default)]
-    pub account: Option<String>,
-    /// Filter by project path keywords
-    #[serde(default)]
-    pub project: Option<String>,
-    /// Filter by message role/type
-    #[serde(default)]
-    pub role: Option<String>,
-    /// Filter by source lane: `glm`, `claude`, `codex`, `gemini`, `slack`, ...
-    /// Comma-separated for several, and a `-` prefix EXCLUDES a lane
-    /// (`source="-slack"` searches everything except Slack). Slack
-    /// conversations are searchable by default; this is the one filter that
-    /// includes or excludes them.
-    #[serde(default)]
-    pub source: Option<String>,
-    /// Filter by author identity on conversation documents (a provider user
-    /// id). Authorship is identity, not turn kind, so it is its own filter
-    /// rather than a `role` value.
-    #[serde(default)]
-    pub author: Option<String>,
-    /// Filter to one conversation channel (Slack lane): a channel name
-    /// (leading `#` accepted) or a channel id. A name resolves against the
-    /// current roster to the stable channel id, so a renamed channel still
-    /// matches its whole history; documents stamped with the queried name
-    /// match directly even when the roster has moved on.
-    #[serde(default)]
-    pub channel: Option<String>,
-    /// Include subagent transcripts (default: true)
-    #[serde(default)]
-    pub include_subagents: Option<bool>,
-    /// Max results (default: 20, max: 100)
-    #[serde(default)]
-    pub limit: Option<u64>,
-    /// Auto-exclude the caller's own session by detecting which active
-    /// transcript contains this query as a recent user message
-    /// (self-reference suppression). Defaults to false — opt-in. Enable
-    /// when an interactive agent is searching for context derived from
-    /// its own current turn and would otherwise see itself in results.
-    #[serde(default)]
-    pub exclude_self: Option<bool>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HybridBm25Hit {
     pub entity_id: String,
@@ -673,25 +409,22 @@ pub struct HybridBm25Hit {
     /// The pasteable logical ref; equals the entity id on the published plane
     /// and carries the project form for provisional hits in later milestones.
     pub logical_ref: Option<String>,
+    /// Read coordinates, present only on conversation documents.
+    #[serde(default)]
+    pub conversation: Option<ConversationCoordinates>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TranscriptSearchMode {
-    Smart,
-    Fulltext,
-}
-
-impl TranscriptSearchMode {
-    fn parse_optional(s: Option<&str>) -> Result<Self> {
-        match s {
-            None => Ok(Self::Smart),
-            Some("smart" | "natural") => Ok(Self::Smart),
-            Some("fulltext" | "lucene" | "literal") => Ok(Self::Fulltext),
-            Some(raw) => anyhow::bail!(
-                "invalid mode: {raw:?} (expected \"smart\"/\"natural\" or \"fulltext\"/\"lucene\"/\"literal\")"
-            ),
-        }
-    }
+/// One word-lane request. `Default` is an unfiltered smart-mode lane with a
+/// zero limit, so callers name every field they rely on.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HybridWordLane<'a> {
+    pub query: &'a str,
+    pub limit: usize,
+    pub doc_type: Option<&'a str>,
+    pub exclude_knowledge: bool,
+    pub mode: LexicalQueryMode,
+    pub filter: Option<&'a CorpusDocumentFilter>,
+    pub graph_authority: Option<&'a GraphWordAuthority>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -709,7 +442,8 @@ pub struct ContextParams {
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SessionParams {
-    /// Exact indexed session id returned by bbox_search or bbox_sessions_list.
+    /// Exact indexed session id from a bbox_hybrid_search conversation hit or
+    /// bbox_sessions_list.
     pub session_id: String,
 }
 
@@ -718,7 +452,8 @@ pub struct MessagesParams {
     /// Exact indexed session id. Provide exactly one of session_id or file_path.
     #[serde(default)]
     pub session_id: Option<String>,
-    /// Opaque stored transcript locator from bbox_search.file_path, never a
+    /// Opaque stored transcript locator from a bbox_hybrid_search conversation
+    /// hit's file_path, never a
     /// daemon filesystem path. Native messages are stored projections and may
     /// already be parser-truncated. Slack reads its authoritative landing store.
     #[serde(default)]
@@ -761,38 +496,6 @@ pub struct ReindexParams {
     /// must not populate it on the operator's behalf after seeing a refusal.
     #[serde(default)]
     pub accept_empty_projects: Option<Vec<String>>,
-}
-
-#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct TopicsParams {
-    /// Exact indexed session id. Provide exactly one selector.
-    #[serde(default)]
-    pub session_id: Option<String>,
-    /// Opaque stored locator from bbox_search, never opened as a file.
-    #[serde(default)]
-    pub file_path: Option<String>,
-    #[serde(default)]
-    pub role: Option<String>,
-    #[serde(default)]
-    pub limit: Option<u64>,
-}
-
-#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct CiteParams {
-    /// The claim, rule, or phrase to trace back to its origin
-    pub claim: String,
-    /// Filter to account
-    #[serde(default)]
-    pub account: Option<String>,
-    /// Filter by project path keywords
-    #[serde(default)]
-    pub project: Option<String>,
-    /// Role to cite (default: "user" — who said it originally)
-    #[serde(default)]
-    pub role: Option<String>,
-    /// Max citations (default: 5, max: 20)
-    #[serde(default)]
-    pub limit: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -861,14 +564,13 @@ pub(super) fn effective_project_filter(
 }
 
 impl TranscriptIndex {
-    /// Project filter as an OR of three lanes: the permanent legacy
-    /// substring lane (literal cwd in the `project` field), an exact term on
-    /// the stamped `base_project_id` so a base-project selector matches
-    /// sessions from every checkout/worktree (gap-72fd5932), and an exact
-    /// term on `project_id` so it also reaches project-file documents (F7).
-    /// Every lane comes from the caller-supplied filter: the two id lanes
-    /// fire only when the caller resolved an id.
-    fn push_project_filter_clause(
+    /// Conversation project filter as an OR of two lanes: the literal
+    /// substring lane (recorded cwd in the `project` field) and an exact term
+    /// on the stamped `base_project_id`, so a base-project selector matches
+    /// sessions from every checkout and worktree. Both come from the
+    /// caller-supplied filter: the id lane fires only when the caller
+    /// resolved an id.
+    pub(super) fn push_project_filter_clause(
         &self,
         clauses: &mut Vec<(Occur, Box<dyn tantivy::query::Query>)>,
         filter: &ProjectFilterInput,
@@ -884,22 +586,6 @@ impl TranscriptIndex {
                 Occur::Should,
                 Box::new(TermQuery::new(
                     Term::from_field_text(self.fields.base_project_id, base_id),
-                    IndexRecordOption::Basic,
-                )),
-            ));
-            // F7: project-file documents never carry `base_project_id`, so
-            // before this lane a resolved selector could reach them only
-            // through the literal substring hitting their absolute `project`
-            // value. `project_id` is already stamped and indexed on them, so
-            // this is a pure clause addition: no schema change, no new
-            // identity authority, and the permanent literal lane above is
-            // untouched. Without it the P3-E schema cut (which removes the
-            // absolute value from `project`) would silently return empty
-            // results for every resolved project filter over code.
-            lanes.push((
-                Occur::Should,
-                Box::new(TermQuery::new(
-                    Term::from_field_text(self.fields.project_id, base_id),
                     IndexRecordOption::Basic,
                 )),
             ));
@@ -920,7 +606,7 @@ impl TranscriptIndex {
     /// Documents with no source field (knowledge, project files, commits) are
     /// matched by an exclusion and dropped by an inclusion, which is the
     /// correct reading both times: they are not in any transcript lane.
-    fn push_source_filter_clauses(
+    pub(super) fn push_source_filter_clauses(
         &self,
         clauses: &mut Vec<(Occur, Box<dyn tantivy::query::Query>)>,
         spec: &str,
@@ -952,355 +638,6 @@ impl TranscriptIndex {
         }
     }
 
-    // ── Search ──────────────────────────────────────────────────────
-
-    pub fn search(&self, p: &SearchParams) -> Result<String> {
-        let selectors = self.active_code_selectors();
-        self.search_with_active_selectors(p, &selectors)
-    }
-
-    pub fn search_with_active_selectors(
-        &self,
-        p: &SearchParams,
-        active_selectors: &BTreeMap<String, String>,
-    ) -> Result<String> {
-        let searcher = self.reader.searcher();
-        self.search_with_active_selectors_and_searcher(p, active_selectors, &searcher)
-    }
-
-    /// Literal-lane entry point for callers with no project resolver
-    /// (index-side probes and tests). Daemon surfaces resolve the raw
-    /// `project` selector first and call
-    /// [`Self::search_with_project_filter`]: the `base_project_id` term
-    /// lane only fires for a caller-resolved id.
-    pub fn search_with_active_selectors_and_searcher(
-        &self,
-        p: &SearchParams,
-        active_selectors: &BTreeMap<String, String>,
-        searcher: &tantivy::Searcher,
-    ) -> Result<String> {
-        self.search_with_project_filter(p, None, active_selectors, searcher)
-    }
-
-    pub fn search_with_project_filter(
-        &self,
-        p: &SearchParams,
-        project_filter: Option<&ProjectFilterInput>,
-        active_selectors: &BTreeMap<String, String>,
-        searcher: &tantivy::Searcher,
-    ) -> Result<String> {
-        let project_filter = effective_project_filter(project_filter, p.project.as_deref());
-        let raw_query = p.query.as_str();
-        let mode = TranscriptSearchMode::parse_optional(p.mode.as_deref())?;
-        let query_str = match mode {
-            TranscriptSearchMode::Smart => {
-                smart_query_to_tantivy(raw_query).unwrap_or_else(|| raw_query.to_string())
-            }
-            TranscriptSearchMode::Fulltext => raw_query.to_string(),
-        };
-        let limit = p.limit.unwrap_or(20).min(100) as usize;
-        let include_subagents = p.include_subagents.unwrap_or(true);
-
-        if searcher.num_docs() == 0 {
-            return Ok(EMPTY_INDEX_MESSAGE.to_string());
-        }
-
-        // Parse the user's text query against content + project fields. The
-        // conversation channel name rides along so "what's in pg-p1-4565"
-        // works as a plain query: only conversation documents carry the
-        // field, so the other lanes are unaffected.
-        let mut qp = QueryParser::for_index(
-            &self.index,
-            vec![
-                self.fields.content,
-                self.fields.project,
-                self.fields.code_content,
-                self.fields.symbol,
-                self.fields.conversation_channel_name,
-            ],
-        );
-        if matches!(mode, TranscriptSearchMode::Fulltext) {
-            qp.set_conjunction_by_default();
-        }
-        let text_query = qp.parse_query(&query_str)?;
-
-        // Build filter clauses
-        let mut clauses: Vec<(Occur, Box<dyn tantivy::query::Query>)> =
-            vec![(Occur::Must, text_query.box_clone())];
-        if let Some(active) = self.active_code_source_query_for(active_selectors) {
-            clauses.push((Occur::Must, active));
-        }
-
-        if !include_subagents {
-            clauses.push((
-                Occur::Must,
-                Box::new(TermQuery::new(
-                    Term::from_field_u64(self.fields.is_subagent, 0),
-                    IndexRecordOption::Basic,
-                )),
-            ));
-        }
-
-        if let Some(account) = p.account.as_deref() {
-            clauses.push((
-                Occur::Must,
-                Box::new(TermQuery::new(
-                    Term::from_field_text(self.fields.account, account),
-                    IndexRecordOption::Basic,
-                )),
-            ));
-        }
-
-        if let Some(role) = p.role.as_deref() {
-            clauses.push((
-                Occur::Must,
-                Box::new(TermQuery::new(
-                    Term::from_field_text(self.fields.role, role),
-                    IndexRecordOption::Basic,
-                )),
-            ));
-        }
-
-        if let Some(spec) = p.source.as_deref() {
-            self.push_source_filter_clauses(&mut clauses, spec);
-        }
-
-        if let Some(author) = p.author.as_deref().map(str::trim).filter(|a| !a.is_empty()) {
-            clauses.push((
-                Occur::Must,
-                Box::new(TermQuery::new(
-                    Term::from_field_text(self.fields.author_id, author),
-                    IndexRecordOption::Basic,
-                )),
-            ));
-        }
-
-        if let Some(channel) = p.channel.as_deref() {
-            clauses.push((Occur::Must, self.conversation_channel_query(channel)?));
-        }
-
-        if let Some(filter) = project_filter.as_ref() {
-            self.push_project_filter_clause(&mut clauses, filter);
-        }
-
-        // Transcript search is a static corpus surface and carries no
-        // checkout authority. Published knowledge may remain searchable for
-        // compatibility, but provisional variants are session-only.
-        clauses.push((
-            Occur::MustNot,
-            Box::new(TermQuery::new(
-                Term::from_field_text(self.fields.knowledge_visibility, "provisional"),
-                IndexRecordOption::Basic,
-            )),
-        ));
-
-        // Caller-session auto-exclude. Disabled by default — the heuristic
-        // (find an active transcript whose tail contains this query as a
-        // recent user message) is best-effort and can mis-attribute when
-        // multiple agents share the host or when the same query phrase
-        // legitimately appears in unrelated sessions. Opt in via
-        // `exclude_self=true` from interactive callers that genuinely
-        // need to suppress self-reference.
-        if p.exclude_self.unwrap_or(false) {
-            if let Some(caller_sid) = detect_caller_session(&self.config, raw_query) {
-                clauses.push((
-                    Occur::MustNot,
-                    Box::new(TermQuery::new(
-                        Term::from_field_text(self.fields.session_id, &caller_sid),
-                        IndexRecordOption::Basic,
-                    )),
-                ));
-            }
-        }
-
-        let query = self.live_documents_query(Box::new(BooleanQuery::new(clauses)));
-        let top_docs = searcher.search(&query, &TopDocs::with_limit(limit))?;
-
-        if top_docs.is_empty() {
-            return Ok("No results found.".to_string());
-        }
-
-        // Snippet generator for excerpt highlighting
-        let snippet_gen = SnippetGenerator::create(&searcher, &*text_query, self.fields.content)?;
-
-        let mut results = Vec::new();
-        // The top hit's kind and canonical identity drive the follow-up hints.
-        // Transcript hints are selected only from the indexed reader coordinates
-        // that actually survive the read tools' validation.
-        let mut top_recovery: Option<SearchRecovery> = None;
-        let mut rendered_bytes = 0;
-        for (score, addr) in &top_docs {
-            let doc: TantivyDocument = searcher.doc(*addr)?;
-            let snippet = snippet_gen.snippet_from_doc(&doc);
-
-            let doc_type = self.doc_text(&doc, self.fields.doc_type);
-            let entity_id = self.doc_text(&doc, self.fields.entity_id);
-            let file_path = self.doc_text(&doc, self.fields.file_path);
-            let session_id = self.doc_text(&doc, self.fields.session_id);
-            let role = self.doc_text(&doc, self.fields.role);
-            let ts = self.doc_text(&doc, self.fields.timestamp);
-            let project = self.doc_text(&doc, self.fields.project);
-            let account = self.doc_text(&doc, self.fields.account);
-            let byte_offset =
-                doc.get_first(self.fields.byte_offset)
-                    .and_then(|value| match value {
-                        tantivy::schema::OwnedValue::U64(value) => Some(*value),
-                        _ => None,
-                    });
-            let reader_handle = self.native_reader_handle(&searcher, *addr, &doc);
-            let file_path = if !super::native_reader::compact_locator(&file_path) {
-                reader_handle.as_deref().unwrap_or(&file_path).to_owned()
-            } else {
-                file_path
-            };
-            let source = self.doc_text(&doc, self.fields.source);
-            let recovery_session = if serde_json::to_vec(&session_id)?.len() <= 1024
-                && (source == "slack"
-                    || file_path.starts_with("slack:")
-                    || crate::transcripts::conversation::parse_session_bucket(&session_id)
-                        .is_none())
-            {
-                session_id.as_str()
-            } else {
-                ""
-            };
-            if top_recovery.is_none() {
-                let message_ts = self.doc_text(&doc, self.fields.conversation_message_ts);
-                top_recovery = Some(SearchRecovery::new(
-                    &doc_type,
-                    &entity_id,
-                    &file_path,
-                    recovery_session,
-                    byte_offset,
-                    &message_ts,
-                    &source,
-                    {
-                        let permalink = self.doc_text(&doc, self.fields.permalink);
-                        !permalink.is_empty() && permalink.len() <= 1024
-                    },
-                ));
-            }
-
-            let excerpt = snippet.to_html().replace("<b>", "**").replace("</b>", "**");
-            // A query that matched only metadata fields (channel name, source
-            // lane, file path, author) produces no content fragments, and an
-            // empty excerpt reads as an empty message. Fall back to the start
-            // of the document so metadata-scoped hits stay legible.
-            let excerpt = if excerpt.trim().is_empty() {
-                let content = self.doc_text(&doc, self.fields.content);
-                let prefix: String = content.chars().take(150).collect();
-                if prefix.chars().count() < content.chars().count() {
-                    format!("{prefix}...")
-                } else {
-                    prefix
-                }
-            } else {
-                excerpt
-            };
-
-            // Preserve external conversation provenance alongside the opaque
-            // locator used by context/messages. Neither native nor Slack
-            // locators authorize opening a caller file on the daemon.
-            let mut provenance = String::new();
-            let permalink = self.doc_text(&doc, self.fields.permalink);
-            let author = self.doc_text(&doc, self.fields.author_id);
-            let channel = self.doc_text(&doc, self.fields.conversation_channel_name);
-            let channel = if channel.is_empty() {
-                self.doc_text(&doc, self.fields.conversation_channel_id)
-            } else {
-                channel
-            };
-            if !author.is_empty() {
-                provenance.push_str(&format!("\nAuthor: {}", display_fragment(&author, 256)));
-            }
-            if !channel.is_empty() {
-                provenance.push_str(&format!("\nChannel: {}", display_fragment(&channel, 256)));
-            }
-            if !permalink.is_empty() {
-                provenance.push_str(&format!(
-                    "\nPermalink: {}",
-                    display_fragment(&permalink, 1024)
-                ));
-            }
-
-            let identity = if matches!(
-                doc_type.as_str(),
-                "transcript" | "tool_call" | "project_file"
-            ) && !file_path.trim().is_empty()
-            {
-                format!("Locator: {file_path}")
-            } else if let Some(entity_ref) = canonical_entity_ref(&entity_id) {
-                format!("Entity ref: {entity_ref}")
-            } else {
-                format!("Entity type: {doc_type}")
-            };
-
-            let mut rendered = format!(
-                "Score: {score:.2} | mode={} | {account} | {role}\n\
-                 Session: {session_id}\n\
-                 Project: {project}\n\
-                 Time: {ts}\n\
-                 {identity}{provenance}\n\
-                 Excerpt: {excerpt}",
-                match mode {
-                    TranscriptSearchMode::Smart => "smart",
-                    TranscriptSearchMode::Fulltext => "fulltext",
-                },
-                account = display_fragment(&account, 128),
-                role = display_fragment(&role, 128),
-                session_id = if session_id.len() <= 256 {
-                    session_id.clone()
-                } else {
-                    "[omitted; use exact reader]".into()
-                },
-                project = display_fragment(&project, 256),
-                ts = display_fragment(&ts, 128),
-                excerpt = display_fragment(&excerpt, 600),
-            );
-            if let (Some(handle), Some(offset)) = (&reader_handle, byte_offset) {
-                rendered.push_str(&format!(
-                    "\nExact read: {}",
-                    serde_json::json!({"tool":"bbox_context","arguments":{
-                        "file_path":handle,"byte_offset":offset,"body_limit":4096
-                    }})
-                ));
-            }
-            let bytes = serde_json::to_vec(&rendered)?.len();
-            if rendered_bytes + bytes > 32_000 {
-                anyhow::ensure!(
-                    !results.is_empty(),
-                    "search hit identity exceeds the response budget"
-                );
-                break;
-            }
-            rendered_bytes += bytes;
-            results.push(rendered);
-        }
-
-        let mut out = format!(
-            "{} results:\n\n{}",
-            results.len(),
-            results.join("\n\n---\n\n")
-        );
-        if results.len() < top_docs.len() {
-            out.push_str(&format!("\n\nResponse byte limit: showing {} of {} ranked hits; narrow query or filters to inspect remaining hits.\n", results.len(), top_docs.len()));
-        }
-        if let Some(recovery) = top_recovery {
-            let transcript_hit = matches!(
-                recovery,
-                SearchRecovery::NativeTranscript { .. } | SearchRecovery::SlackTranscript { .. }
-            );
-            out.push_str("\n\nNext steps:\n");
-            recovery.append_next_steps(&mut out);
-            if transcript_hit {
-                out.push_str(
-                    "  → Trace a specific claim to its origin: bbox_cite(claim=\"<exact phrase>\")\n",
-                );
-            }
-        }
-        Ok(out)
-    }
-
     /// The filter for one conversation channel, matched on TWO lanes at once:
     ///
     /// 1. **Stable id.** The spec itself, plus every channel id whose CURRENT
@@ -1316,7 +653,10 @@ impl TranscriptIndex {
     /// A name never collides with an id: ids are opaque provider tokens that
     /// appear only in the raw `conversation_channel_id` field, so ORing the
     /// spec into the id lane unconditionally is safe.
-    fn conversation_channel_query(&self, spec: &str) -> Result<Box<dyn tantivy::query::Query>> {
+    pub(super) fn conversation_channel_query(
+        &self,
+        spec: &str,
+    ) -> Result<Box<dyn tantivy::query::Query>> {
         let spec = spec.trim().trim_start_matches('#').trim();
         if spec.is_empty() {
             anyhow::bail!("channel filter is empty (pass a channel name or id)");
@@ -1427,6 +767,7 @@ impl TranscriptIndex {
     /// Everything else about the pipeline is unchanged; the authority clause
     /// is composed into the same `BooleanQuery` that carries the `doc_type`
     /// term and the active-code-selector clause, before `TopDocs`.
+    #[allow(clippy::too_many_arguments)]
     pub fn hybrid_bm25_hits_with_graph_authority_and_searcher(
         &self,
         query: &str,
@@ -1437,11 +778,60 @@ impl TranscriptIndex {
         searcher: &tantivy::Searcher,
         graph_authority: Option<&GraphWordAuthority>,
     ) -> Result<Vec<HybridBm25Hit>> {
+        self.hybrid_word_lane_hits(
+            &HybridWordLane {
+                query,
+                limit,
+                doc_type,
+                exclude_knowledge,
+                graph_authority,
+                ..HybridWordLane::default()
+            },
+            active_selectors,
+            searcher,
+        )
+    }
+
+    /// [`Self::hybrid_word_lane_hits`] over the live code selectors and a
+    /// fresh searcher, for callers without a pinned read view.
+    pub fn word_lane_hits(&self, lane: &HybridWordLane<'_>) -> Result<Vec<HybridBm25Hit>> {
+        let selectors = self.active_code_selectors();
+        let searcher = self.reader.searcher();
+        self.hybrid_word_lane_hits(lane, &selectors, &searcher)
+    }
+
+    /// The hybrid word lane: BM25 over every indexed document type, with the
+    /// lane's narrowing (doc_type, knowledge exclusion, graph authority and
+    /// document filter) composed into one `BooleanQuery` before `TopDocs`, so
+    /// excluded documents never consume rank positions.
+    pub fn hybrid_word_lane_hits(
+        &self,
+        lane: &HybridWordLane<'_>,
+        active_selectors: &BTreeMap<String, String>,
+        searcher: &tantivy::Searcher,
+    ) -> Result<Vec<HybridBm25Hit>> {
+        let HybridWordLane {
+            query,
+            limit,
+            doc_type,
+            exclude_knowledge,
+            mode,
+            filter,
+            graph_authority,
+        } = *lane;
         if searcher.num_docs() == 0 || query.trim().is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
 
-        let query_str = smart_query_to_tantivy(query).unwrap_or_else(|| query.to_string());
+        let query_str = match mode {
+            LexicalQueryMode::Smart => {
+                smart_query_to_tantivy(query).unwrap_or_else(|| query.to_string())
+            }
+            LexicalQueryMode::Fulltext => query.to_string(),
+        };
+        // The conversation channel name rides along so "what's in
+        // ops-incident-4565" works as a plain query: only conversation
+        // documents carry the field, so no other ranking moves.
         let mut qp = QueryParser::for_index(
             &self.index,
             vec![
@@ -1451,8 +841,12 @@ impl TranscriptIndex {
                 self.fields.symbol,
                 self.fields.commit_author_name,
                 self.fields.path_tokens,
+                self.fields.conversation_channel_name,
             ],
         );
+        if mode == LexicalQueryMode::Fulltext {
+            qp.set_conjunction_by_default();
+        }
         // Modest boost for path/symbol matches: a query mentioning `voyage`
         // should preferentially surface files literally named voyage.rs over
         // arbitrary text mentions of "voyage", but not so aggressively that
@@ -1512,6 +906,9 @@ impl TranscriptIndex {
         if let Some(authority) = graph_authority.filter(|authority| !authority.is_empty()) {
             clauses.push((Occur::Must, self.graph_authority_clause(authority)));
         }
+        if let Some(filter) = filter.filter(|filter| !filter.is_empty()) {
+            clauses.push((Occur::Must, self.document_filter_query(filter)?));
+        }
         let query = self.live_documents_query(Box::new(BooleanQuery::new(clauses)));
         let top_docs = searcher.search(&query, &TopDocs::with_limit(limit))?;
         if top_docs.is_empty() {
@@ -1528,6 +925,21 @@ impl TranscriptIndex {
             }
             let snippet = snippet_gen.snippet_from_doc(&doc);
             let excerpt = snippet.to_html().replace("<b>", "**").replace("</b>", "**");
+            let conversation = self.conversation_coordinates_at(searcher, addr, &doc);
+            // A conversation hit that matched only metadata (channel name,
+            // lane, author) has no content fragment, and an empty excerpt
+            // reads as an empty message: show the start of the message.
+            let excerpt = if excerpt.trim().is_empty() && conversation.is_some() {
+                let content = self.doc_text(&doc, self.fields.content);
+                let prefix: String = content.chars().take(150).collect();
+                if prefix.chars().count() < content.chars().count() {
+                    format!("{prefix}...")
+                } else {
+                    prefix
+                }
+            } else {
+                excerpt
+            };
             hits.push(HybridBm25Hit {
                 entity_id,
                 score,
@@ -1547,6 +959,7 @@ impl TranscriptIndex {
                 graph_vertex_type: super::optional_text(&doc, self.fields.graph_vertex_type),
                 graph_generation: super::optional_text(&doc, self.fields.graph_generation),
                 logical_ref: super::optional_text(&doc, self.fields.logical_ref),
+                conversation,
             });
         }
         Ok(hits)
@@ -1789,6 +1202,10 @@ impl TranscriptIndex {
         // explicitly the relative path rather than whatever the compat field
         // happens to hold. Both carry the same value after the bump; the order
         // makes the intent non-accidental and survives a later `file_path` cut.
+        // A conversation document's locator is an opaque read selector that
+        // may be a host path; only the compact form is fit for a title.
+        let conversation = super::conversation_lane::CONVERSATION_DOC_TYPES
+            .contains(&self.doc_text(doc, self.fields.doc_type).as_str());
         for field in [
             self.fields.symbol,
             self.fields.symbol_exact,
@@ -1798,175 +1215,17 @@ impl TranscriptIndex {
             self.fields.session_id,
         ] {
             let value = self.doc_text(doc, field);
+            if conversation
+                && field == self.fields.file_path
+                && !super::native_reader::compact_locator(&value)
+            {
+                continue;
+            }
             if !value.is_empty() {
                 return Some(value.chars().take(80).collect());
             }
         }
         None
-    }
-
-    // ── Cite ────────────────────────────────────────────────────────
-
-    /// Trace a claim back to the transcript turn where it was established.
-    /// Defaults to role=user (the origin of most rules/preferences),
-    /// auto-wraps the claim in quotes for phrase matching unless it
-    /// already contains quoted segments, and returns citation-shaped
-    /// output sorted oldest-first so the earliest mention surfaces first.
-    ///
-    /// `project_filter` carries the caller-resolved project selector;
-    /// `None` keeps the raw selector on the literal substring lane.
-    pub fn cite(
-        &self,
-        p: &CiteParams,
-        project_filter: Option<&ProjectFilterInput>,
-    ) -> Result<String> {
-        let project_filter = effective_project_filter(project_filter, p.project.as_deref());
-        let limit = p.limit.unwrap_or(5).min(20) as usize;
-        let role = p.role.as_deref().unwrap_or("user");
-
-        if self.is_empty() {
-            return Ok(EMPTY_INDEX_MESSAGE.to_string());
-        }
-
-        let claim = p.claim.trim();
-        if claim.is_empty() {
-            anyhow::bail!("'claim' is required");
-        }
-        let query_str = if claim.contains('"') {
-            claim.to_string()
-        } else {
-            format!("\"{claim}\"")
-        };
-
-        let searcher = self.reader.searcher();
-        let mut qp = QueryParser::for_index(&self.index, vec![self.fields.content]);
-        qp.set_conjunction_by_default();
-        let text_query = qp.parse_query(&query_str)?;
-
-        let mut clauses: Vec<(Occur, Box<dyn tantivy::query::Query>)> = vec![
-            (Occur::Must, text_query.box_clone()),
-            (
-                Occur::Must,
-                Box::new(TermQuery::new(
-                    Term::from_field_text(self.fields.role, role),
-                    IndexRecordOption::Basic,
-                )),
-            ),
-        ];
-
-        if let Some(account) = p.account.as_deref() {
-            clauses.push((
-                Occur::Must,
-                Box::new(TermQuery::new(
-                    Term::from_field_text(self.fields.account, account),
-                    IndexRecordOption::Basic,
-                )),
-            ));
-        }
-
-        if let Some(filter) = project_filter.as_ref() {
-            self.push_project_filter_clause(&mut clauses, filter);
-        }
-
-        let query = self.live_documents_query(Box::new(BooleanQuery::new(clauses)));
-        // Pull a generous top-N by score, then resort by timestamp ascending
-        // so the oldest citation (most likely the origin) shows first.
-        let fetch = (limit * 4).max(20);
-        let top_docs = searcher.search(&query, &TopDocs::with_limit(fetch))?;
-
-        if top_docs.is_empty() {
-            return Ok(format!(
-                "No citations found for: {}",
-                display_fragment(claim, 256)
-            ));
-        }
-
-        let snippet_gen = SnippetGenerator::create(&searcher, &*text_query, self.fields.content)?;
-
-        let mut rows: Vec<(
-            String,
-            String,
-            String,
-            String,
-            String,
-            String,
-            u64,
-            String,
-            Option<String>,
-        )> = Vec::new();
-        for (_score, addr) in &top_docs {
-            let doc: TantivyDocument = searcher.doc(*addr)?;
-            let snippet = snippet_gen.snippet_from_doc(&doc);
-            let excerpt = snippet.to_html().replace("<b>", "**").replace("</b>", "**");
-            let handle = self.native_reader_handle(&searcher, *addr, &doc);
-            let locator = self.doc_text(&doc, self.fields.file_path);
-            let locator = if super::native_reader::compact_locator(&locator) {
-                locator
-            } else {
-                handle.clone().unwrap_or(locator)
-            };
-            rows.push((
-                self.doc_text(&doc, self.fields.timestamp),
-                self.doc_text(&doc, self.fields.account),
-                self.doc_text(&doc, self.fields.project),
-                self.doc_text(&doc, self.fields.session_id),
-                self.doc_text(&doc, self.fields.role),
-                locator,
-                first_u64(&doc, self.fields.byte_offset),
-                excerpt,
-                handle,
-            ));
-        }
-
-        // Oldest first — origin of the claim
-        rows.sort_by(|a, b| a.0.cmp(&b.0));
-        rows.truncate(limit);
-
-        let mut rendered = Vec::new();
-        let mut bytes = 0;
-        for (ts, account, project, sid, r, locator, offset, excerpt, handle) in &rows {
-            let mut row = format!(
-                "[{}] {}/{}: {}\n  session: {}\n  locator: {locator}\n  byte_offset: {offset}\n  > {}\n",
-                display_fragment(ts, 128),
-                display_fragment(account, 128),
-                display_fragment(r, 128),
-                display_fragment(project, 256),
-                if sid.len() <= 256 {
-                    sid.as_str()
-                } else {
-                    "[omitted; use exact reader]"
-                },
-                display_fragment(excerpt, 600),
-            );
-            if let Some(handle) = handle {
-                row.push_str(&format!(
-                    "  Exact read: {}\n",
-                    serde_json::json!({"tool":"bbox_context","arguments":{
-                        "file_path":handle,"byte_offset":offset,"body_limit":4096
-                    }})
-                ));
-            }
-            let size = serde_json::to_vec(&row)?.len();
-            if bytes + size > 32_000 {
-                anyhow::ensure!(
-                    !rendered.is_empty(),
-                    "citation identity exceeds the response budget"
-                );
-                break;
-            }
-            bytes += size;
-            rendered.push(row);
-        }
-        let mut out = format!(
-            "{} citation(s) for: {}\n\n{}",
-            rendered.len(),
-            display_fragment(claim, 256),
-            rendered.join("\n")
-        );
-        if rendered.len() < rows.len() {
-            out.push_str(&format!("\nResponse byte limit: omitted {} of {} ranked citations; narrow the claim or filters to inspect the remaining hits.\n", rows.len()-rendered.len(),rows.len()));
-        }
-        Ok(out)
     }
 
     // ── Context ─────────────────────────────────────────────────────
@@ -1995,7 +1254,7 @@ impl TranscriptIndex {
         let messages = self.indexed_transcript_messages(Some(file_path), None, None, true)?;
         let target = messages.iter().position(|message| message.byte_offset == p.byte_offset)
             .ok_or_else(|| anyhow::anyhow!(
-                "error.transcript_not_indexed: no indexed message at this locator and offset; use bbox_search for retained source coordinates. Reindex cannot recover a source the producer has not delivered."
+                "error.transcript_not_indexed: no indexed message at this locator and offset; use bbox_hybrid_search for retained source coordinates. Reindex cannot recover a source the producer has not delivered."
             ))?;
         let context = ctx_lines.min(25);
         let mut start = target.saturating_sub(context);
@@ -2043,7 +1302,7 @@ impl TranscriptIndex {
         let messages = self.indexed_transcript_messages(None, Some(&p.session_id), None, true)?;
         if messages.is_empty() {
             anyhow::bail!(
-                "error.transcript_not_indexed: session has no indexed messages; use bbox_search or bbox_sessions_list for retained sessions. Native producer ingestion is required for absent source history."
+                "error.transcript_not_indexed: session has no indexed messages; use bbox_hybrid_search or bbox_sessions_list for retained sessions. Native producer ingestion is required for absent source history."
             );
         }
         let sources = messages
@@ -2138,7 +1397,7 @@ impl TranscriptIndex {
                 .is_empty()
         {
             anyhow::bail!(
-                "error.transcript_not_indexed: no indexed messages match this locator/session; use bbox_search for retained source coordinates. Native producer ingestion is required for absent source history."
+                "error.transcript_not_indexed: no indexed messages match this locator/session; use bbox_hybrid_search for retained source coordinates. Native producer ingestion is required for absent source history."
             );
         }
         let total = messages.len();
@@ -2428,64 +1687,6 @@ impl TranscriptIndex {
         Ok(messages)
     }
 
-    // ── Topics ──────────────────────────────────────────────────────
-
-    pub fn topics(&self, p: &TopicsParams) -> Result<String> {
-        let top_n = p.limit.unwrap_or(25).clamp(1, 100) as usize;
-        let role_filter = p.role.as_deref();
-        let session_id = p.session_id.as_deref();
-        let file_path = p.file_path.as_deref();
-
-        if session_id.is_none() && file_path.is_none() {
-            anyhow::bail!("Either 'session_id' or 'file_path' is required");
-        }
-
-        let messages =
-            self.indexed_transcript_messages(file_path, session_id, role_filter, true)?;
-        if messages.is_empty() {
-            anyhow::bail!(
-                "error.transcript_not_indexed: no indexed messages match this selector; use bbox_search for retained source coordinates."
-            );
-        }
-        let mut all_content = String::new();
-        for message in messages {
-            if role_filter.is_none() && message.role == "tool_result" {
-                continue;
-            }
-            all_content.push(' ');
-            all_content.push_str(&message.content);
-        }
-
-        if all_content.is_empty() {
-            return Ok("No content found for this session.".to_string());
-        }
-
-        // Tokenize and count
-        let mut counts: HashMap<String, u32> = HashMap::new();
-        for word in all_content.split(|c: char| !c.is_alphanumeric() && c != '_') {
-            let w = word.to_lowercase();
-            if w.len() < 3 || is_stop_word(&w) {
-                continue;
-            }
-            *counts.entry(w).or_insert(0) += 1;
-        }
-
-        let mut sorted: Vec<(String, u32)> = counts.into_iter().collect();
-        sorted.sort_by_key(|b| std::cmp::Reverse(b.1));
-        sorted.truncate(top_n);
-
-        let lines: Vec<String> = sorted
-            .iter()
-            .map(|(word, count)| format!("{:>4}  {}", count, word))
-            .collect();
-
-        Ok(format!(
-            "Top {} terms from indexed projections (source completeness and freshness not established):\n{}",
-            sorted.len(),
-            lines.join("\n")
-        ))
-    }
-
     // ── Stats ───────────────────────────────────────────────────────
 
     pub fn stats(&self) -> Result<String> {
@@ -2603,7 +1804,6 @@ impl TranscriptIndex {
                     Some(crate::index::tool_edges::ToolEdgeProjectAccess::local(
                         access.project_id(),
                         local_root.to_path_buf(),
-                        access.git_root.map(Path::to_path_buf),
                     ))
                 })
                 .collect(),
@@ -2896,6 +2096,28 @@ mod agentic_project_file_tests {
         assert_markdown_and_rust_project_searchable(&work, repo_root);
     }
 
+    /// Relative paths of the project files the word lane ranks for `query`.
+    fn hit_paths(index: &TranscriptIndex, query: &str, mode: LexicalQueryMode) -> String {
+        let searcher = index.searcher();
+        index
+            .word_lane_hits(&HybridWordLane {
+                query,
+                limit: 100,
+                mode,
+                ..HybridWordLane::default()
+            })
+            .unwrap()
+            .iter()
+            .filter_map(|hit| {
+                index
+                    .entity_properties_with_searcher(&hit.entity_id, &searcher)
+                    .unwrap()
+                    .and_then(|properties| properties.get("relative_path").cloned())
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     fn assert_markdown_and_rust_project_searchable(work: &Path, repo_root: &Path) {
         let projects_path = work.join("projects.json");
         let project = register_test_project(&projects_path, repo_root);
@@ -2931,61 +2153,23 @@ mod agentic_project_file_tests {
             .unwrap();
         assert!(msg.contains("Indexed"));
 
-        let design_hits = index
-            .search(&SearchParams {
-                query: "agentic-corpus".into(),
-                mode: None,
-                account: None,
-                project: None,
-                role: None,
-                include_subagents: None,
-                limit: Some(100),
-                source: None,
-                author: None,
-                channel: None,
-                exclude_self: None,
-            })
-            .unwrap();
+        let design_hits = hit_paths(&index, "agentic-corpus", LexicalQueryMode::Smart);
         assert!(
             design_hits.contains("design/corpus/agentic-corpus/agentic-corpus.md"),
             "{design_hits}"
         );
 
-        let trait_hits = index
-            .search(&SearchParams {
-                query: "trait StoreSnapshot".into(),
-                mode: None,
-                account: None,
-                project: None,
-                role: None,
-                include_subagents: None,
-                limit: Some(100),
-                source: None,
-                author: None,
-                channel: None,
-                exclude_self: None,
-            })
-            .unwrap();
+        let trait_hits = hit_paths(&index, "trait StoreSnapshot", LexicalQueryMode::Smart);
         assert!(
             trait_hits.contains("src/store_persister.rs"),
             "{trait_hits}"
         );
 
-        let display_hits = index
-            .search(&SearchParams {
-                query: "impl Display for EntityRef".into(),
-                mode: Some("fulltext".into()),
-                account: None,
-                project: None,
-                role: None,
-                include_subagents: None,
-                limit: Some(100),
-                source: None,
-                author: None,
-                channel: None,
-                exclude_self: None,
-            })
-            .unwrap();
+        let display_hits = hit_paths(
+            &index,
+            "impl Display for EntityRef",
+            LexicalQueryMode::Fulltext,
+        );
         assert!(display_hits.contains("src/entity_ref.rs"), "{display_hits}");
 
         let rerun = index
@@ -3050,21 +2234,17 @@ mod agentic_project_file_tests {
             )
             .unwrap();
 
-        let hits = index
-            .search(&SearchParams {
-                query: "\"second git message searchable\"".into(),
-                mode: Some("fulltext".into()),
-                account: None,
-                project: None,
-                role: None,
-                include_subagents: None,
-                limit: Some(5),
-                source: None,
-                author: None,
-                channel: None,
-                exclude_self: None,
-            })
-            .unwrap();
+        let hits = format!(
+            "{:?}",
+            index
+                .word_lane_hits(&HybridWordLane {
+                    query: "\"second git message searchable\"",
+                    limit: 5,
+                    mode: LexicalQueryMode::Fulltext,
+                    ..HybridWordLane::default()
+                })
+                .unwrap()
+        );
         assert!(hits.contains("**second**"), "{hits}");
         assert!(hits.contains("**git**"), "{hits}");
         assert!(hits.contains("**message**"), "{hits}");
@@ -3123,206 +2303,6 @@ mod source_filter_tests {
     }
 }
 
-#[cfg(test)]
-mod project_filter_lane_tests {
-    use super::*;
-    use crate::index::TranscriptIndex;
-
-    const PROJECT: &str = "p_00000000000000000000000000000f71";
-
-    fn index_with_project_file_document(root: &std::path::Path) -> TranscriptIndex {
-        let index = TranscriptIndex::open_or_create_with_records(
-            &root.join("idx"),
-            Vec::new(),
-            None,
-            root.join("projects.json"),
-            root.join("kb.json"),
-            root.join("threads.json"),
-            std::sync::Arc::new(crate::index::StaticProjectRecordsProvider::empty()),
-        )
-        .unwrap();
-        let fields = index.field_handles();
-        let handle = index.index_handle();
-        let mut writer: IndexWriter = handle.writer(50_000_000).unwrap();
-        let mut document = TantivyDocument::new();
-        document.add_text(fields.doc_type, "project_file");
-        document.add_text(fields.project_id, PROJECT);
-        document.add_text(fields.entity_id, "project_file:lane:fixture");
-        document.add_text(
-            fields.code_source_selector,
-            &bbox_code_source::local_selector(PROJECT),
-        );
-        document.add_text(fields.content, "phase three filter lane fixture");
-        // The literal lane is deliberately unusable in this fixture: the
-        // `project` field carries a value no selector could ever match, so a
-        // hit can only arrive through the id lane under test.
-        document.add_text(fields.project, "unmatchable-literal-value");
-        document.add_text(fields.file_path, "src/lane.rs");
-        writer.add_document(document).unwrap();
-        writer.commit().unwrap();
-        index.reader_reload_for_test();
-        index
-    }
-
-    fn search(index: &TranscriptIndex, filter: Option<&ProjectFilterInput>) -> String {
-        let selectors = std::collections::BTreeMap::from([(
-            PROJECT.to_string(),
-            bbox_code_source::local_selector(PROJECT),
-        )]);
-        let searcher = index.searcher();
-        index
-            .search_with_project_filter(
-                &SearchParams {
-                    query: "filter lane fixture".into(),
-                    mode: Some("fulltext".into()),
-                    account: None,
-                    project: None,
-                    role: None,
-                    include_subagents: None,
-                    limit: Some(10),
-                    source: None,
-                    author: None,
-                    channel: None,
-                    exclude_self: None,
-                },
-                filter,
-                &selectors,
-                &searcher,
-            )
-            .unwrap()
-    }
-
-    #[test]
-    fn a_resolved_project_id_reaches_project_file_documents() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        let index = index_with_project_file_document(&root);
-
-        assert!(
-            search(&index, None).contains("src/lane.rs"),
-            "the unfiltered query must find the fixture at all"
-        );
-        assert!(
-            search(
-                &index,
-                Some(&ProjectFilterInput {
-                    project_id: Some(PROJECT.to_string()),
-                    // A literal that cannot match the fixture: without the
-                    // `project_id` lane this filter returns silently empty,
-                    // which is exactly the F7 failure mode.
-                    literal: "no-such-literal".into(),
-                })
-            )
-            .contains("src/lane.rs"),
-            "a resolved id must reach project-file documents through the id lane"
-        );
-    }
-
-    #[test]
-    fn an_unresolved_literal_filter_still_narrows_to_nothing() {
-        // The id lane must not widen an UNRESOLVED filter: a selector that
-        // resolved to no project still gets literal-only semantics.
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        let index = index_with_project_file_document(&root);
-        let output = search(
-            &index,
-            Some(&ProjectFilterInput::unresolved("no-such-literal")),
-        );
-        assert!(!output.contains("src/lane.rs"), "{output}");
-    }
-
-    #[test]
-    fn a_foreign_resolved_id_does_not_match() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        let index = index_with_project_file_document(&root);
-        let output = search(
-            &index,
-            Some(&ProjectFilterInput {
-                project_id: Some("p_0000000000000000000000000000ffff".into()),
-                literal: "no-such-literal".into(),
-            }),
-        );
-        assert!(!output.contains("src/lane.rs"), "{output}");
-    }
-
-    /// P3-E enumerated search consequence (plan section 4.3 item 2): the
-    /// permanent literal substring lane stops matching project-file documents
-    /// by an unregistered absolute-path fragment, because `project` now carries
-    /// the display name. The id lane is what reaches them instead, so the
-    /// narrowing is a lane change and not a loss of reachability.
-    #[test]
-    fn a_host_path_fragment_no_longer_reaches_project_file_documents() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        let index = TranscriptIndex::open_or_create_with_records(
-            &root.join("idx"),
-            Vec::new(),
-            None,
-            root.join("projects.json"),
-            root.join("kb.json"),
-            root.join("threads.json"),
-            std::sync::Arc::new(crate::index::StaticProjectRecordsProvider::empty()),
-        )
-        .unwrap();
-        let fields = index.field_handles();
-        let handle = index.index_handle();
-        let mut writer: IndexWriter = handle.writer(50_000_000).unwrap();
-        let mut document = TantivyDocument::new();
-        document.add_text(fields.doc_type, "project_file");
-        document.add_text(fields.project_id, PROJECT);
-        document.add_text(fields.entity_id, "project_file:lane:display");
-        document.add_text(
-            fields.code_source_selector,
-            &bbox_code_source::local_selector(PROJECT),
-        );
-        document.add_text(fields.content, "phase three filter lane fixture");
-        // Exactly what the P3-E doc builder emits now.
-        document.add_text(fields.project, "acme-service");
-        document.add_text(fields.file_path, "src/lane.rs");
-        document.add_text(fields.relative_path, "src/lane.rs");
-        writer.add_document(document).unwrap();
-        writer.commit().unwrap();
-        index.reader_reload_for_test();
-
-        let by_host_fragment = search(
-            &index,
-            Some(&ProjectFilterInput::unresolved(
-                "/host-checkouts/acme-service",
-            )),
-        );
-        assert!(
-            !by_host_fragment.contains("src/lane.rs"),
-            "a host-path fragment must no longer match a project-file document: \
-             {by_host_fragment}"
-        );
-        let by_resolved_id = search(
-            &index,
-            Some(&ProjectFilterInput {
-                project_id: Some(PROJECT.to_string()),
-                literal: "/host-checkouts/acme-service".into(),
-            }),
-        );
-        assert!(
-            by_resolved_id.contains("src/lane.rs"),
-            "the id lane must still reach it: {by_resolved_id}"
-        );
-        let by_display_name = search(
-            &index,
-            Some(&ProjectFilterInput::unresolved("acme-service")),
-        );
-        assert!(
-            by_display_name.contains("src/lane.rs"),
-            "the literal lane still works against the display value: {by_display_name}"
-        );
-    }
-}
-
-/// Phase 3 P3-C purge exemption on the LEGACY `build_index` loop (plan
-/// section 7 item 2, F2). The reindex pass's loop is covered by
-/// `project_files::purge_exemption_tests`; both loops route through the same
-/// `classify_stale_meta_row`, and this is the second loop's end-to-end row.
 #[cfg(test)]
 mod legacy_purge_exemption_tests {
     use super::*;
@@ -3543,22 +2523,26 @@ mod conversation_channel_search_tests {
         (index, store)
     }
 
+    /// The hits, followed by the top conversation hit's follow-up readers.
     fn search(index: &TranscriptIndex, query: &str, channel: Option<&str>) -> String {
-        index
-            .search(&SearchParams {
-                query: query.into(),
-                mode: None,
-                account: None,
-                project: None,
-                role: None,
-                include_subagents: None,
-                limit: Some(20),
-                source: None,
-                author: None,
-                channel: channel.map(str::to_string),
-                exclude_self: None,
+        let filter = CorpusDocumentFilter {
+            channel: channel.map(str::to_string),
+            ..CorpusDocumentFilter::default()
+        };
+        let hits = index
+            .word_lane_hits(&HybridWordLane {
+                query,
+                limit: 20,
+                filter: Some(&filter),
+                ..HybridWordLane::default()
             })
-            .unwrap()
+            .unwrap();
+        let steps = hits
+            .first()
+            .and_then(|hit| hit.conversation.as_ref())
+            .map(|conversation| conversation.next_steps().join("\n"))
+            .unwrap_or_default();
+        format!("{hits:#?}\n{steps}")
     }
 
     #[test]
@@ -3921,7 +2905,7 @@ mod conversation_read_plane_tests {
             "{context_out}"
         );
         assert!(context_out.contains("not indexed"), "{context_out}");
-        assert!(context_out.contains("bbox_search"), "{context_out}");
+        assert!(context_out.contains("bbox_hybrid_search"), "{context_out}");
 
         let messages_out = index
             .messages(&MessagesParams {
@@ -3940,7 +2924,10 @@ mod conversation_read_plane_tests {
             "{messages_out}"
         );
         assert!(messages_out.contains("not indexed"), "{messages_out}");
-        assert!(messages_out.contains("bbox_search"), "{messages_out}");
+        assert!(
+            messages_out.contains("bbox_hybrid_search"),
+            "{messages_out}"
+        );
     }
 
     #[test]
@@ -3978,17 +2965,14 @@ mod conversation_read_plane_tests {
             })
             .unwrap_err();
         assert!(out.to_string().contains("error.transcript_not_indexed"));
-        assert!(out.to_string().contains("bbox_search"));
+        assert!(out.to_string().contains("bbox_hybrid_search"));
     }
 }
 
 #[cfg(test)]
-mod search_recovery_hint_tests {
+mod conversation_coordinate_tests {
     use super::*;
     use crate::index::TranscriptIndex;
-    use std::collections::BTreeMap;
-
-    const PROJECT: &str = "p_00000000000000000000000000000f71";
 
     fn open_index(root: &Path) -> TranscriptIndex {
         TranscriptIndex::open_or_create_with_records(
@@ -4005,77 +2989,66 @@ mod search_recovery_hint_tests {
 
     fn document(
         fields: &crate::index::FieldHandles,
-        doc_type: &str,
         entity_id: &str,
         marker: &str,
     ) -> TantivyDocument {
         let mut document = TantivyDocument::new();
-        document.add_text(fields.doc_type, doc_type);
+        document.add_text(fields.doc_type, "transcript");
         document.add_text(fields.entity_id, entity_id);
         document.add_text(fields.content, marker);
         document
     }
 
-    fn search(index: &TranscriptIndex, marker: &str, active_project: Option<&str>) -> String {
-        let selectors = active_project
-            .map(|project| {
-                (
-                    project.to_string(),
-                    bbox_code_source::local_selector(project),
-                )
+    fn write(index: &TranscriptIndex, documents: Vec<TantivyDocument>) {
+        let mut writer: IndexWriter = index.index_handle().writer(50_000_000).unwrap();
+        for document in documents {
+            writer.add_document(document).unwrap();
+        }
+        writer.commit().unwrap();
+        index.reader_reload_for_test();
+    }
+
+    fn top_steps(index: &TranscriptIndex, marker: &str) -> (ConversationCoordinates, String) {
+        let hits = index
+            .word_lane_hits(&HybridWordLane {
+                query: marker,
+                limit: 1,
+                mode: LexicalQueryMode::Fulltext,
+                ..HybridWordLane::default()
             })
-            .into_iter()
-            .collect::<BTreeMap<_, _>>();
-        index
-            .search_with_active_selectors(
-                &SearchParams {
-                    query: marker.to_string(),
-                    mode: Some("fulltext".into()),
-                    account: None,
-                    project: None,
-                    role: None,
-                    include_subagents: None,
-                    limit: Some(1),
-                    source: None,
-                    author: None,
-                    channel: None,
-                    exclude_self: None,
-                },
-                &selectors,
-            )
-            .unwrap()
+            .unwrap();
+        let coordinates = hits[0].conversation.clone().expect("conversation hit");
+        let steps = coordinates.next_steps().join("\n");
+        (coordinates, steps)
     }
 
     #[test]
-    fn a_native_transcript_top_hit_gets_working_reader_selectors() {
+    fn a_native_transcript_hit_carries_working_reader_selectors() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let index = open_index(&root);
         let fields = index.field_handles();
         let mut transcript = document(
             &fields,
-            "transcript",
             "transcript:codex:session-fixture:0:0",
             "native-recovery-positive",
         );
         transcript.add_text(fields.file_path, "native:producer/session-fixture");
         transcript.add_text(fields.session_id, "session-fixture");
         transcript.add_u64(fields.byte_offset, 123);
-        let mut writer: IndexWriter = index.index_handle().writer(50_000_000).unwrap();
-        writer.add_document(transcript).unwrap();
-        writer.commit().unwrap();
-        index.reader_reload_for_test();
+        write(&index, vec![transcript]);
 
-        let hits = search(&index, "native-recovery-positive", None);
+        let (coordinates, steps) = top_steps(&index, "native-recovery-positive");
+        assert_eq!(coordinates.byte_offset, Some(123));
         assert!(
-            hits.contains(
+            steps.contains(
                 "bbox_context(file_path=\"native:producer/session-fixture\", byte_offset=123)"
             ),
-            "{hits}"
+            "{steps}"
         );
         assert!(
-            hits.contains("bbox_messages(session_id=\"session-fixture\")"),
-            "{hits}"
+            steps.contains("bbox_messages(session_id=\"session-fixture\")"),
+            "{steps}"
         );
     }
 
@@ -4087,200 +3060,93 @@ mod search_recovery_hint_tests {
         let fields = index.field_handles();
         let mut transcript = document(
             &fields,
-            "transcript",
             "transcript:codex:anonymous:0:0",
             "native-recovery-blank-session",
         );
         transcript.add_text(fields.file_path, "native:producer/anonymous");
         transcript.add_u64(fields.byte_offset, 77);
-        let mut writer: IndexWriter = index.index_handle().writer(50_000_000).unwrap();
-        writer.add_document(transcript).unwrap();
-        writer.commit().unwrap();
-        index.reader_reload_for_test();
+        write(&index, vec![transcript]);
 
-        let hits = search(&index, "native-recovery-blank-session", None);
+        let (coordinates, steps) = top_steps(&index, "native-recovery-blank-session");
+        assert_eq!(coordinates.session_id, None);
         assert!(
-            hits.contains("bbox_context(file_path=\"native:producer/anonymous\", byte_offset=77)"),
-            "{hits}"
+            steps.contains("bbox_context(file_path=\"native:producer/anonymous\", byte_offset=77)"),
+            "{steps}"
         );
         assert!(
-            hits.contains("bbox_messages(file_path=\"native:producer/anonymous\")"),
-            "{hits}"
+            steps.contains("bbox_messages(file_path=\"native:producer/anonymous\")"),
+            "{steps}"
         );
-        assert!(!hits.contains("bbox_messages(session_id=\"\""), "{hits}");
+        assert!(!steps.contains("session_id="), "{steps}");
     }
 
     #[test]
-    fn a_native_hit_without_indexed_coordinates_states_recovery_is_unavailable() {
+    fn a_hit_without_indexed_coordinates_states_recovery_is_unavailable() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let index = open_index(&root);
         let fields = index.field_handles();
-        let transcript = document(
-            &fields,
-            "transcript",
-            "",
-            "native-recovery-missing-coordinates",
+        write(
+            &index,
+            vec![document(
+                &fields,
+                "transcript:codex:missing:0:0",
+                "native-recovery-missing-coordinates",
+            )],
         );
-        let mut writer: IndexWriter = index.index_handle().writer(50_000_000).unwrap();
-        writer.add_document(transcript).unwrap();
-        writer.commit().unwrap();
-        index.reader_reload_for_test();
 
-        let hits = search(&index, "native-recovery-missing-coordinates", None);
-        assert!(!hits.contains("bbox_context("), "{hits}");
-        assert!(!hits.contains("bbox_messages("), "{hits}");
+        let (_, steps) = top_steps(&index, "native-recovery-missing-coordinates");
+        assert!(!steps.contains("bbox_context("), "{steps}");
         assert!(
-            hits.contains("No exact follow-up reader is available for this transcript hit"),
-            "{hits}"
+            steps.contains("No exact follow-up reader is available for this conversation hit"),
+            "{steps}"
         );
     }
 
     #[test]
-    fn a_thread_hit_recommends_exact_thread_readers_not_store_coordinates() {
+    fn slack_hits_get_landing_store_selectors_and_their_permalink() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let index = open_index(&root);
         let fields = index.field_handles();
-        let mut thread = document(
-            &fields,
-            "thread",
-            "thread:thread-12345678",
-            "thread-recovery-fixture",
-        );
-        thread.add_text(
-            fields.file_path,
-            root.join("threads.json").to_string_lossy(),
-        );
-        let mut writer: IndexWriter = index.index_handle().writer(50_000_000).unwrap();
-        writer.add_document(thread).unwrap();
-        writer.commit().unwrap();
-        index.reader_reload_for_test();
-
-        let hits = search(&index, "thread-recovery-fixture", None);
-        assert!(
-            hits.contains("bbox_thread(action=\"get\", id=\"thread-12345678\")"),
-            "{hits}"
-        );
-        assert!(
-            hits.contains("bbox_inspect_entity(entity_ref=\"thread:thread-12345678\")"),
-            "{hits}"
-        );
-        assert!(!hits.contains("threads.json"), "{hits}");
-    }
-
-    #[test]
-    fn knowledge_and_code_hits_use_canonical_entity_inspection() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        let index = open_index(&root);
-        let fields = index.field_handles();
-        let mut knowledge = document(
-            &fields,
-            "knowledge",
-            "knowledge:abc12345",
-            "knowledge-recovery-fixture",
-        );
-        knowledge.add_text(fields.file_path, root.join("kb.json").to_string_lossy());
-        let mut project_file = document(
-            &fields,
-            "project_file",
-            "project_file_v2:p_00000000000000000000000000000f71:collected-snapshot:12345678:deadbeef:0",
-            "code-recovery-fixture",
-        );
-        project_file.add_text(fields.project_id, PROJECT);
-        project_file.add_text(
-            fields.code_source_selector,
-            &bbox_code_source::local_selector(PROJECT),
-        );
-        project_file.add_text(fields.file_path, "src/recovery.rs");
-        let mut writer: IndexWriter = index.index_handle().writer(50_000_000).unwrap();
-        writer.add_document(knowledge).unwrap();
-        writer.add_document(project_file).unwrap();
-        writer.commit().unwrap();
-        index.reader_reload_for_test();
-
-        let knowledge_hits = search(&index, "knowledge-recovery-fixture", None);
-        assert!(
-            knowledge_hits.contains("bbox_inspect_entity(entity_ref=\"knowledge:abc12345\")"),
-            "{knowledge_hits}"
-        );
-        assert!(!knowledge_hits.contains("kb.json"), "{knowledge_hits}");
-
-        let code_hits = search(&index, "code-recovery-fixture", Some(PROJECT));
-        assert!(
-            code_hits.contains(
-                "bbox_inspect_entity(entity_ref=\"project_file_v2:p_00000000000000000000000000000f71:collected-snapshot:12345678:deadbeef:0\")"
-            ),
-            "{code_hits}"
-        );
-        assert!(!code_hits.contains("bbox_context("), "{code_hits}");
-        assert!(!code_hits.contains("bbox_messages("), "{code_hits}");
-    }
-
-    #[test]
-    fn slack_and_generic_entity_hits_get_matching_recovery_selectors() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        let index = open_index(&root);
-        let fields = index.field_handles();
-        let mut slack = document(&fields, "transcript", "", "slack-recovery-fixture");
-        slack.add_text(fields.file_path, "slack:T0RECOVERY/C0RECOVERY");
-        slack.add_text(fields.session_id, "C0RECOVERY/2026-08-10");
-        slack.add_text(fields.conversation_message_ts, "1786390478.000100");
-        slack.add_text(
+        let slack_document = |marker: &str| {
+            let mut slack = document(&fields, "", marker);
+            slack.add_text(fields.account, "slack");
+            slack.add_text(fields.source, "slack");
+            slack.add_text(fields.file_path, "slack:T0RECOVERY/C0RECOVERY");
+            slack.add_text(fields.session_id, "C0RECOVERY/2026-08-10");
+            slack.add_text(fields.conversation_message_ts, "1786390478.000100");
+            slack
+        };
+        let mut linked = slack_document("slack-recovery-fixture");
+        linked.add_text(
             fields.permalink,
             "https://synthetic.slack.com/archives/C0RECOVERY/p1786390478000100",
         );
-        let mut without_permalink = document(&fields, "transcript", "", "noexternallinkfixture");
-        without_permalink.add_text(fields.file_path, "slack:T0RECOVERY/C0RECOVERY");
-        without_permalink.add_text(fields.session_id, "C0RECOVERY/2026-08-10");
-        without_permalink.add_text(fields.conversation_message_ts, "1786390478.000100");
-        let generic = document(
-            &fields,
-            "project_graph_vertex",
-            "project_graph_vertex:p_00000000000000000000000000000f71:graph-a:vertex/service",
-            "generic-entity-recovery-fixture",
+        write(
+            &index,
+            vec![linked, slack_document("noexternallinkfixture")],
         );
-        let mut writer: IndexWriter = index.index_handle().writer(50_000_000).unwrap();
-        writer.add_document(slack).unwrap();
-        writer.add_document(without_permalink).unwrap();
-        writer.add_document(generic).unwrap();
-        writer.commit().unwrap();
-        index.reader_reload_for_test();
 
-        let slack_hits = search(&index, "slack-recovery-fixture", None);
+        let (coordinates, steps) = top_steps(&index, "slack-recovery-fixture");
         assert!(
-            slack_hits.contains(
+            steps.contains(
                 "bbox_context(file_path=\"slack:T0RECOVERY/C0RECOVERY\", byte_offset=1786390478000100)"
             ),
-            "{slack_hits}"
+            "{steps}"
         );
         assert!(
-            slack_hits.contains("bbox_messages(session_id=\"C0RECOVERY/2026-08-10\")"),
-            "{slack_hits}"
+            steps.contains("bbox_messages(session_id=\"C0RECOVERY/2026-08-10\")"),
+            "{steps}"
         );
-        assert!(
-            slack_hits.contains("channel=\"C0RECOVERY\""),
-            "{slack_hits}"
+        assert!(steps.contains("channel=\"C0RECOVERY\""), "{steps}");
+        assert_eq!(
+            coordinates.permalink.as_deref(),
+            Some("https://synthetic.slack.com/archives/C0RECOVERY/p1786390478000100")
         );
-        assert!(slack_hits.contains(
-            "Permalink: https://synthetic.slack.com/archives/C0RECOVERY/p1786390478000100"
-        ));
-        assert!(slack_hits.contains("follow its Permalink line above"));
-        let without_permalink = search(&index, "noexternallinkfixture", None);
-        assert!(
-            !without_permalink.contains("follow its Permalink line above"),
-            "{without_permalink}"
-        );
-
-        let generic_hits = search(&index, "generic-entity-recovery-fixture", None);
-        assert!(
-            generic_hits.contains(
-                "bbox_inspect_entity(entity_ref=\"project_graph_vertex:p_00000000000000000000000000000f71:graph-a:vertex/service\")"
-            ),
-            "{generic_hits}"
-        );
+        assert!(steps.contains("through its permalink"), "{steps}");
+        let (_, unlinked) = top_steps(&index, "noexternallinkfixture");
+        assert!(!unlinked.contains("through its permalink"), "{unlinked}");
     }
 }
 
@@ -4342,19 +3208,6 @@ mod native_drilldown_tests {
         serde_json::from_value(serde_json::json!({"session_id": "session-fixture"})).unwrap()
     }
 
-    fn generated_selector_arg(output: &str, tool: &str, argument: &str) -> String {
-        let line = output
-            .lines()
-            .find(|line| line.contains(&format!("{tool}(")))
-            .unwrap_or_else(|| panic!("missing {tool} selector in:\n{output}"));
-        let start = line
-            .find(&format!("{argument}="))
-            .expect("selector argument");
-        let encoded = line[start + argument.len() + 1..].trim_start();
-        let mut deserializer = serde_json::Deserializer::from_str(encoded);
-        <String as serde::Deserialize>::deserialize(&mut deserializer).unwrap()
-    }
-
     #[test]
     fn generated_native_selectors_round_trip_through_the_readers() {
         let dir = tempfile::tempdir().unwrap();
@@ -4362,37 +3215,16 @@ mod native_drilldown_tests {
         let locator = r#"native:producer/quote"back\slash"#;
         let index = fixture(&root, locator, 5, 30);
         let hits = index
-            .search_with_active_selectors(
-                &SearchParams {
-                    query: "stored2".into(),
-                    mode: Some("fulltext".into()),
-                    account: None,
-                    project: None,
-                    role: None,
-                    include_subagents: None,
-                    limit: Some(1),
-                    source: None,
-                    author: None,
-                    channel: None,
-                    exclude_self: None,
-                },
-                &BTreeMap::new(),
-            )
+            .word_lane_hits(&HybridWordLane {
+                query: "stored2",
+                limit: 1,
+                mode: LexicalQueryMode::Fulltext,
+                ..HybridWordLane::default()
+            })
             .unwrap();
-        assert_eq!(
-            generated_selector_arg(&hits, "bbox_context", "file_path"),
-            locator
-        );
-        let context_line = hits
-            .lines()
-            .find(|line| line.contains("bbox_context("))
-            .unwrap();
-        let byte_offset = context_line
-            .split("byte_offset=")
-            .nth(1)
-            .and_then(|rest| rest.split(')').next())
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap();
+        let coordinates = hits[0].conversation.clone().expect("conversation hit");
+        assert_eq!(coordinates.file_path.as_deref(), Some(locator));
+        let byte_offset = coordinates.byte_offset.unwrap();
         assert_eq!(byte_offset, 200);
         let context: Value = serde_json::from_str(
             &index
@@ -4406,7 +3238,7 @@ mod native_drilldown_tests {
         .unwrap();
         assert_eq!(context["messages"][1]["byte_offset"], 200);
         assert_eq!(context["messages"][1]["target"], true);
-        let session_id = generated_selector_arg(&hits, "bbox_messages", "session_id");
+        let session_id = coordinates.session_id.clone().unwrap();
         assert_eq!(session_id, "session-fixture");
         let messages: Value = serde_json::from_str(
             &index
@@ -4457,15 +3289,6 @@ mod native_drilldown_tests {
         )
         .unwrap();
         assert_eq!(session["indexed_message_count"], 5);
-        let topics = index
-            .topics(&TopicsParams {
-                session_id: None,
-                file_path: Some(locator.to_string()),
-                role: None,
-                limit: Some(5),
-            })
-            .unwrap();
-        assert!(topics.contains("indexed projections"));
     }
 
     #[test]

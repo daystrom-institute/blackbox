@@ -731,18 +731,11 @@ Producer section depends on the `producers` argument on `bro_context`:
 Dry-run is non-dispatching and non-mutating end-to-end under
 `producers: "run"`:
 
-- The producer **must not** emit system events, write to the task store,
-  the resume-lease table, the knowledge store, threads, notes, pins,
-  roadmap, or whiteboards, and **must not** call agent-dispatching tools.
-  System events are durable in current code (`EventHub::emit` at
-  `src/system_events/hub.rs:319` appends to the journal,
-  `src/system_events/store.rs:74` writes and `sync_all`s it, and
-  `src/system_events/hub.rs:324,359` enqueues matching reactions). The
-  producer effect model already forbids agent-dispatching tools and all
-  durable-write tools at registry time; the dry-run runtime adds a
-  blanket "suppress system event emission for this producer invocation"
-  guard at the dispatch layer so even legitimate read-only event reads
-  do not turn into writes through reaction side effects.
+- The producer **must not** write to the task store, the resume-lease
+  table, the knowledge store, threads, notes, pins, or roadmap, and
+  **must not** call agent-dispatching tools. The producer effect model
+  already forbids agent-dispatching tools and all durable-write tools at
+  registry time.
 - The producer input carries `dry_run: true` so atoms with optional
   internal bookkeeping (telemetry counters, etc.) can branch if they
   choose. v1 producers are expected to behave identically in either

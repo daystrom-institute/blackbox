@@ -2964,7 +2964,7 @@ fn create_writer(index: &Index, heap: usize) -> Result<IndexWriter> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::{SearchParams, TranscriptIndex};
+    use crate::index::{HybridWordLane, TranscriptIndex};
     use std::process::Command;
 
     fn graph_lane_test_doc(
@@ -4186,21 +4186,16 @@ mod tests {
     }
 
     fn search(index: &TranscriptIndex, q: &str) -> String {
-        index
-            .search(&SearchParams {
-                query: q.into(),
-                mode: None,
-                account: None,
-                project: None,
-                role: None,
-                include_subagents: None,
-                limit: Some(5),
-                source: None,
-                author: None,
-                channel: None,
-                exclude_self: None,
-            })
-            .unwrap()
+        format!(
+            "{:?}",
+            index
+                .word_lane_hits(&HybridWordLane {
+                    query: q,
+                    limit: 5,
+                    ..HybridWordLane::default()
+                })
+                .unwrap()
+        )
     }
 
     fn visibility_count(index: &TranscriptIndex, visibility: &str) -> usize {

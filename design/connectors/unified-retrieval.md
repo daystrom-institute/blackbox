@@ -430,7 +430,7 @@ different trust:
   default for labels and annotated properties, but a connector graph is a
   projection of a third-party system and its policy should be reviewed at
   enablement rather than assumed. The operator-facing status surface reports
-  retrieval participation per graph (section 6.5) so this is visible without
+  retrieval participation per graph (section 6.4) so this is visible without
   reading the schema artifact.
 
 Local scratch graphs (`GraphSource::LocalScratch`,
@@ -867,17 +867,7 @@ provisional hit pasteable: the compound ref is a correct identity and a
 poor handle, and `resolve_published_form_vertex` already accepts the logical
 form.
 
-### 6.2 `bbox_discover_seed_entities`
-
-Inherits everything. It reuses `hybrid_search_typed` verbatim and differs
-only in post-processing, and the crate note is explicit that ranking changes
-land in one place. `notable_edges` derives its priority order from the
-provider's `recommended_next_hops`, so making evidence edges and
-schema-declared graph edges outrank structural ones for a graph seed is a
-change to `ProjectGraphVertexProvider::recommended_next_hops` (currently a
-bare edge-kind count) and not a ranking fork.
-
-### 6.3 `bbox_inspect_entity`
+### 6.2 `bbox_inspect_entity`
 
 No argument change. Graph vertices are already inspectable by exact ref,
 which is the v1 capability. Two additions:
@@ -889,7 +879,7 @@ which is the v1 capability. Two additions:
   schema edges ahead of structural ones, matching the semantic-first
   ordering that `project_file.rs` already documents as load-bearing.
 
-### 6.4 `bbox_find_paths` and `bbox_bundle_evidence`
+### 6.3 `bbox_find_paths` and `bbox_bundle_evidence`
 
 `find_paths` gains the graph-selection gate and the per-hop fan-out cap
 (section 5.2), plus per-hop source labeling. `bundle_evidence` already
@@ -897,7 +887,7 @@ accepts graph vertex refs from M3; M9's change is that bundled graph
 vertices render through the annotation lens and carry plane identity, so a
 bundle a caller re-reads later still says which authority asserted what.
 
-### 6.5 Operator surfaces
+### 6.4 Operator surfaces
 
 `bbox_project_graph_describe` reports retrieval participation per graph:
 policy flags, excluded types, indexed vertex count, embedded vertex count,
@@ -957,10 +947,8 @@ Scope: connector-managed source graphs in the index, the `graph_source`
 filter, the collision rule (`visible_connector`) honored at query time, and
 the operator review surface for connector retrieval policy.
 
-Separated from M9a for a sequencing reason rather than a design one:
-`crates/bbox-source-graph` is a workspace member but is **not** a dependency
-of the `blackbox` crate or of `bbox-indexing`, and no daemon path
-constructs a `SourceProjectionStore` today. The connector read lane exists
+Separated from M9a for a sequencing reason rather than a design one: no
+daemon path constructs a source projection store. The connector read lane exists
 in `ProjectGraphViewCatalog` and is exercised only by its own tests. The
 transport that feeds it is M4. M9b is therefore gated on M4 landing, and
 carving it out keeps M9a shippable in the meantime.
@@ -1091,9 +1079,7 @@ Layered, extending the campaign's matrix rather than replacing it:
   the real index or the prod daemon.
 
 Public-safe fixtures only. No live tenant data in fixtures, snapshots, or
-examples. `crates/bbox-source-graph/tests/synthetic_api_dataset.rs` is the
-existing synthetic API-dataset connector and is the natural fixture source
-for the connector-plane slices.
+examples.
 
 **Documentation debt this milestone should clear.**
 `docs/graph-retrieval-internals.md` currently describes three ranked lanes
@@ -1195,7 +1181,7 @@ diagnostic.
 
 **Q10. Does the `visibility` / `provisional` parameter split get fixed
 here?**
-Section 6.5. *Recommendation: align on `provisional` and accept `visibility`
+Section 6.4. *Recommendation: align on `provisional` and accept `visibility`
 as a deprecated alias on the `bbox_project_graph_*` family.* It is a small
 correction, it is cheapest while that family is being touched for
 participation reporting, and a third spelling arriving with M9 would make it
@@ -1213,8 +1199,7 @@ permanent.
   [Reflective Project Graph](../corpus/agentic-corpus/reflective-project-graph.md),
   which deferred full-text and vector indexing of graph vertices out of v1
   and points at the connector program for the follow-on.
-- **Builds on:** the M2 source projection contracts
-  (`crates/bbox-source-graph`) and the M3 evidence binding lane
+- **Builds on:** the M2 source projection contracts and the M3 evidence binding lane
   (`crates/bbox-project-graph/src/evidence.rs`), both landed on
   `beta/blackbox-v2`; the existing hybrid retrieval pipeline described in
   [`docs/graph-retrieval-internals.md`](../../docs/graph-retrieval-internals.md)

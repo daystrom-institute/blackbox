@@ -87,7 +87,6 @@ pub async fn run() -> anyhow::Result<()> {
         cfg.daemon.fleetd_worker_bro_home.as_deref(),
         shared.task_store.clone(),
         shared.tail_tx.clone(),
-        Some(shared.system_events.clone()),
         Some(std::sync::Arc::new(
             crate::server::knowledge_source::DaemonWorkspaceBindingAuthority::new(shared.clone()),
         )),

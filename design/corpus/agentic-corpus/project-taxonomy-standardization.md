@@ -169,10 +169,7 @@ consolidation, not greenfield:
   confinement and fills `default:mcp.*.project` from the canonical dispatch
   cwd.
 - Durable entities already key on `project_id + rel_path_hash`
-  (`EntityRef::ProjectFile`), and provenance git notes store relative paths
-  plus `project_id` — both are already container-portable.
-- `bbox_blame` already renders audience-aware dual paths
-  (`BlameTarget { file_path, display_path }`).
+  (`EntityRef::ProjectFile`), which is already container-portable.
 
 The genuinely new slices are: aliases, the structured `ProjectContext` return
 type, and the session workspace map. The workspace layer (`/work`, mount
@@ -243,12 +240,10 @@ HEAD SHA, behind `BBOX_PROJECT_REFS_V2`), which already exists in the ref
 schema. A `snapshot=`/`rev=` query selector should be specified only when
 multi-checkout indexing lands, and must key on that dimension.
 
-**Dual path fields: yes — standardize the blame pattern.** `bbox_blame`
-already ships `BlameTarget { file_path, display_path }`. New and migrating
-tools adopt the same shape: an audience-rendered `display_path` alongside the
-canonical form whenever the two differ (today, project-relative vs
-host-absolute; later, workspace-mapped vs host). Lossless during migration
-and precedented in code.
+**Dual path fields: yes.** New and migrating tools adopt one shape: an
+audience-rendered `display_path` alongside the canonical form whenever the two
+differ (today, project-relative vs host-absolute; later, workspace-mapped vs
+host). Lossless during migration.
 
 ## Open Questions
 

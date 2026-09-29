@@ -19,14 +19,13 @@ edges, path IDs, and evidence bundles forward.
 
 Each graph tool is shaped to feed the next.
 
-### `bbox_hybrid_search` and `bbox_discover_seed_entities`
+### `bbox_hybrid_search`
 
-Output: ranked entity refs, each with a `notable_edges` preview.
+Output: ranked entity refs.
 
 `bbox_hybrid_search` is the default search call. It fuses four lane
 families: lexical chunk, file-level lexical, knowledge, and per-route
-vector lanes. `bbox_discover_seed_entities` is the same orientation
-pattern with notable edges rendered inline for each seed.
+vector lanes.
 
 The important behavior is that search returns graph refs, not just text.
 The next call can inspect those refs without reconstructing paths or
@@ -107,7 +106,7 @@ questions. Step 5 is the evidence close.
 
 Data flows forward:
 
-- Step 2 returns `notable_edges`, so the agent has a next-hop menu.
+- Step 2 returns canonical entity refs, so step 3 inspects them directly.
 - Step 3 returns `recommended_next_hops`, so traversal is ranked by the index.
 - Step 4 returns `path_ids`, so evidence does not depend on model memory.
 - Step 5 packages the refs and paths into a reviewable answer kit.
@@ -129,7 +128,6 @@ types are:
 | `symbol` | Named code symbols | "what calls or defines this?" |
 | `symbol_v2` | Snapshot-scoped code symbols | "which definition is live?" |
 | `brofile` | Persona/model/lens triple | "which agent produced this?" |
-| `whiteboard` | Multi-agent deliberation state | "what is on the board?" |
 | `commit` | Git commit metadata and touched files | "when did this change?" |
 | `task` | A dispatched bro unit | "what produced this artifact?" |
 | `bash_call` | One shell invocation in a transcript | "what did this command emit?" |
@@ -151,7 +149,7 @@ Edges are directional and typed.
 | Provenance | `SESSION_USED_BROFILE`, `ARC_USED_BROFILE`, `ARC_OPENED_BOARD`, `NOTE_FROM_SESSION`, `NOTE_IN_THREAD`, `NOTE_FROM_TASK`, `TASK_PRODUCED_NOTE` |
 | Git | `COMMIT_PARENT`, `COMMIT_TOUCHED_FILE`, `COMMIT_PRODUCED_BY_ARC` |
 | Format-specific | `LINKS_TO_FILE`, `LINKS_TO_SECTION`, `DESCRIBES`, `ON_PAGE`, `FIGURE_OF`, `TABLE_OF` |
-| Tool-call | `EDITED_FILE`, `EDITED_BY_SESSION`, `READ_FILE`, `RAN_BASH` |
+| Tool-call | `RAN_BASH` |
 
 `bbox_describe_schema`'s edge catalog is currently narrower than this
 table (Knowledge limited to `SUPERSEDES`,
@@ -276,9 +274,7 @@ whatever families no hint covers; each direction-aware hop prints its
 label and the literal `edge_types` / `direction` arguments to pass into
 the next call, and an authored hop with zero edges prints `(none)` so an
 absent answer stays visible instead of vanishing. The five-hop display
-cap bounds only the unauthored tail. `bbox_discover_seed_entities`
-reuses the same list as its notable-edge priorities and previews a
-directional hop in that direction only. Shape, validation codes, and the
+cap bounds only the unauthored tail. Shape, validation codes, and the
 ordering rule live in
 `design/corpus/agentic-corpus/reflective-project-graph.md`.
 

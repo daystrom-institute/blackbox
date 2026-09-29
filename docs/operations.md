@@ -39,7 +39,6 @@ The `bro/` subtree in detail:
 | `webhooks/` | Installed webhook extractors + routing refs |
 | `crons/` | Installed cron specs |
 | `councils/` | Council transcripts |
-| `whiteboards/` | Whiteboard state |
 | `slack-channel-bindings.json` | Slack channel → project bindings for Badgey |
 | `slack-proposal-links.json` | Posted Slack message → proposal mappings |
 | `slack-threads.json` | Slack thread metadata |
@@ -202,7 +201,6 @@ old inode until systemd restarts it.
     │   ├── webhooks/
     │   ├── crons/
     │   ├── councils/
-    │   ├── whiteboards/
     │   ├── slack-channel-bindings.json
     │   ├── slack-proposal-links.json
     │   └── tasks.json
@@ -233,12 +231,12 @@ old inode until systemd restarts it.
 
 `bbox_doctor(format="summary")` is the first call for "what needs attention
 right now": it aggregates the old manual smoke checks (`bbox_stats`,
-`bbox_embed_status`, `bbox_project_list`, `bbox_lint`, `bbox_inbox`) into one
+`bbox_embed_status`, `bbox_project_list`, `bbox_lint`) into one
 classified report (ok/info/warn/action/blocked) with suggested next commands.
 
 ```bash
 bbox_doctor(format="summary")            # aggregate health + attention report
-bbox_inbox(project="/your/repo")         # attention sweep
+bbox_notes(project="/your/repo")         # unresolved executor notes
 bbox_thread_list(status="open")          # investigation continuity
 bbox_embed_status()                      # confirm no embedding errors
 ```
@@ -274,63 +272,6 @@ degrades/refuses and requires a new reviewed cutover; it never reopens the
 local adapter. Bridge, uncovered, and `LegacyLocal` rows remain outside this
 marker. Back up the state directory's cutover marker and receipt with the
 catalog authority.
-
-### Blame locality overlap and cutover
-
-Run overlap while the selected daemon is live. For every project selected for
-cutover, exercise at least one representative path and one corpus entity
-through the scope-bound operator route. `--verify-overlap` executes the legacy
-adapter once in a separate session and persists only identity and canonical
-response checksums; any mismatch fails the command. The producer token must be
-the single configured owner of the checkout's committed published scope.
-
-```bash
-bro blame --project-root /absolute/path/to/project \
-  --token-file /absolute/path/to/producer.token \
-  --file src/lib.rs --line 1 --verify-overlap
-
-bro blame --project-root /absolute/path/to/project \
-  --token-file /absolute/path/to/producer.token \
-  --entity-ref "$BBOX_PROJECT_FILE_REF" --verify-overlap
-```
-
-Preflight is read-only with respect to daemon state and may run while the daemon
-is live. It requires explicit catalog project IDs, both operator positive
-controls, equal path/entity comparisons, and one unique configured producer per
-scope. It captures the exact catalog, assignment, comparisons, and per-project
-`Blame` checkout counters. The quiet window has a hard minimum of 300 seconds.
-
-```bash
-blackbox project-catalog blame-locality-cutover --preflight --configured \
-  --report /absolute/path/blame-locality-report.json \
-  --project-id p_00000000000000000000000000000001
-```
-
-Leave normal traffic running for the declared quiet window. If any selected
-project records a daemon-side `Blame` checkout attempt, or its comparison,
-producer assignment, or catalog authority changes, apply refuses and a new
-preflight/window is required.
-
-Apply and verify are offline catalog operations. Obtain explicit operator
-authorization and stop only the named daemon before running them. Apply takes
-its exact project set from the reviewed report; it does not accept new project
-IDs at the mutation boundary.
-
-```bash
-blackbox project-catalog blame-locality-cutover --apply --configured \
-  --report /absolute/path/blame-locality-report.json
-
-blackbox project-catalog blame-locality-cutover --verify --configured
-```
-
-The installed `blame-locality-cutover-marker.json` is checksummed and loaded
-before the listener binds; corrupt marker bytes fail startup. For a covered
-Published project, corpus-entity blame and path blame carrying a stable session
-project refuse before the legacy checkout broker and must use managed harness
-or `bro blame` locality transport. Authority loss never reopens fallback.
-Bridge calls and raw path calls with no stable project context remain explicit
-compatibility lanes and require their own later retirement decision. A code
-deployment alone does not apply a production marker.
 
 ### Project render locality overlap and cutover
 
@@ -563,7 +504,7 @@ vectors, run `bbox_reembed(route="<route>")` for each configured route.
 3. Copy systemd units and drop-ins (including secrets).
 4. Start the daemon - index rebuilds automatically.
 5. Run `bbox_reembed(route="<route>")` for each embedding route.
-6. Verify: `bbox_describe_schema`, `bbox_embed_status`, `bbox_inbox`.
+6. Verify: `bbox_describe_schema`, `bbox_embed_status`, `bbox_doctor`.
 
 Multi-machine active setups: the JSON stores are not concurrency-safe
 across machines. Use one canonical host and treat others as read-only

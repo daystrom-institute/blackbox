@@ -282,7 +282,7 @@ second projection path that will drift. The alternative, keeping Slack outside
 the registry and driving the normalized-event projection directly, buys nothing
 except that drift.
 
-Slack messages index with their own source label so `bbox_search` can include
+Slack messages index with their own source label so `bbox_hybrid_search` can include
 or exclude them with one filter. Authorship does not fit the transcript role
 vocabulary, which describes turn kind rather than identity, so the author id
 rides a dedicated indexed field and the role lane collapses to human-versus-app
@@ -404,7 +404,7 @@ bound in globs. The first deployment runs membership mode.
 
 ## 7. Retrieval
 
-Messages surface through `bbox_search` and hybrid search as conversation
+Messages surface through `bbox_hybrid_search` as conversation
 documents carrying indexed provenance: workspace id, channel id, observed
 channel name, thread parent ts, author id, observed display name, message ts,
 and permalink.
@@ -469,7 +469,7 @@ startup; a non-loopback plain-HTTP corpus URL is refused; a scope outside the
 grant is rejected before any durable write.
 
 **S2. Corpus projection and search.** Landed records project into conversation
-documents; `bbox_search` returns them with full provenance and a source filter.
+documents; `bbox_hybrid_search` returns them with full provenance and a source filter.
 *Gate:* a known message is findable by text and returns a correct permalink;
 unenrolling a channel purges its documents; a full reindex from landed records
 is deterministic and duplicate-free.

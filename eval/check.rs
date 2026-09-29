@@ -58,28 +58,12 @@ pub const MANIFEST_SOURCES: &[(&str, &str)] = &[
         include_str!("queries/conceptual-workflow-foreach.json"),
     ),
     (
-        "decision-rule-packet-primitive",
-        include_str!("queries/decision-rule-packet-primitive.json"),
-    ),
-    (
         "decision-deep-docs-system-memory",
         include_str!("queries/decision-deep-docs-system-memory.json"),
     ),
     (
-        "decision-distinct-daemon-paths",
-        include_str!("queries/decision-distinct-daemon-paths.json"),
-    ),
-    (
-        "decision-bro-account-env",
-        include_str!("queries/decision-bro-account-env.json"),
-    ),
-    (
         "decision-render-pipeline-unidirectional",
         include_str!("queries/decision-render-pipeline-unidirectional.json"),
-    ),
-    (
-        "decision-rule-packet-validation",
-        include_str!("queries/decision-rule-packet-validation.json"),
     ),
     (
         "transcript-nextest-workspace-adoption",
@@ -116,10 +100,6 @@ pub const MANIFEST_SOURCES: &[(&str, &str)] = &[
     (
         "cross-modal-workflow-engine",
         include_str!("queries/cross-modal-workflow-engine.json"),
-    ),
-    (
-        "cross-modal-rule-packets",
-        include_str!("queries/cross-modal-rule-packets.json"),
     ),
     (
         "cross-modal-entity-ref-parser",
@@ -216,14 +196,10 @@ pub fn checker_by_name(name: &str) -> Option<CheckPassFn> {
         "check_conceptual_edge_index_authored" => check_conceptual_edge_index_authored,
         "check_conceptual_no_sync_llm" => check_conceptual_no_sync_llm,
         "check_conceptual_workflow_foreach" => check_conceptual_workflow_foreach,
-        "check_decision_rule_packet_primitive" => check_decision_rule_packet_primitive,
         "check_decision_deep_docs_system_memory" => check_decision_deep_docs_system_memory,
-        "check_decision_distinct_daemon_paths" => check_decision_distinct_daemon_paths,
-        "check_decision_bro_account_env" => check_decision_bro_account_env,
         "check_decision_render_pipeline_unidirectional" => {
             check_decision_render_pipeline_unidirectional
         }
-        "check_decision_rule_packet_validation" => check_decision_rule_packet_validation,
         "check_transcript_nextest_workspace_adoption" => {
             check_transcript_nextest_workspace_adoption
         }
@@ -241,7 +217,6 @@ pub fn checker_by_name(name: &str) -> Option<CheckPassFn> {
         "check_cross_modal_knowledge_store" => check_cross_modal_knowledge_store,
         "check_cross_modal_recursion_guard" => check_cross_modal_recursion_guard,
         "check_cross_modal_workflow_engine" => check_cross_modal_workflow_engine,
-        "check_cross_modal_rule_packets" => check_cross_modal_rule_packets,
         "check_cross_modal_entity_ref_parser" => check_cross_modal_entity_ref_parser,
         "check_cross_modal_notes_side_channel" => check_cross_modal_notes_side_channel,
         _ => return None,
@@ -376,12 +351,8 @@ stub_checker!(check_conceptual_embedding_routing);
 stub_checker!(check_conceptual_edge_index_authored);
 stub_checker!(check_conceptual_no_sync_llm);
 stub_checker!(check_conceptual_workflow_foreach);
-stub_checker!(check_decision_rule_packet_primitive);
 stub_checker!(check_decision_deep_docs_system_memory);
-stub_checker!(check_decision_distinct_daemon_paths);
-stub_checker!(check_decision_bro_account_env);
 stub_checker!(check_decision_render_pipeline_unidirectional);
-stub_checker!(check_decision_rule_packet_validation);
 stub_checker!(check_transcript_nextest_workspace_adoption);
 stub_checker!(check_transcript_mechanical_recursion_guard);
 stub_checker!(check_transcript_clippy_disallowed_methods);
@@ -391,7 +362,6 @@ stub_checker!(check_transcript_harness_in_process_provider);
 stub_checker!(check_cross_modal_knowledge_store);
 stub_checker!(check_cross_modal_recursion_guard);
 stub_checker!(check_cross_modal_workflow_engine);
-stub_checker!(check_cross_modal_rule_packets);
 stub_checker!(check_cross_modal_entity_ref_parser);
 stub_checker!(check_cross_modal_notes_side_channel);
 
@@ -403,9 +373,9 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     #[test]
-    fn all_30_manifests_parse_and_round_trip() {
+    fn all_25_manifests_parse_and_round_trip() {
         let manifests = load_manifests().expect("all eval manifests parse");
-        assert_eq!(manifests.len(), 30);
+        assert_eq!(manifests.len(), 25);
 
         let mut ids = BTreeSet::new();
         let mut class_counts = BTreeMap::<QueryClass, usize>::new();
@@ -444,14 +414,14 @@ mod tests {
             assert_eq!(&decoded, manifest);
         }
 
-        for class in [
-            QueryClass::ExactSymbol,
-            QueryClass::ConceptualDesignDoc,
-            QueryClass::StaleDecisionLookup,
-            QueryClass::TranscriptProvenance,
-            QueryClass::CrossModalCodeProse,
+        for (class, count) in [
+            (QueryClass::ExactSymbol, 6),
+            (QueryClass::ConceptualDesignDoc, 6),
+            (QueryClass::StaleDecisionLookup, 2),
+            (QueryClass::TranscriptProvenance, 6),
+            (QueryClass::CrossModalCodeProse, 5),
         ] {
-            assert_eq!(class_counts.get(&class).copied(), Some(6), "{class:?}");
+            assert_eq!(class_counts.get(&class).copied(), Some(count), "{class:?}");
         }
     }
 
@@ -459,7 +429,7 @@ mod tests {
     #[ignore = "data-dependent: resolves transcript:* expected refs against a populated \
                 transcript corpus on disk, which is absent in a fresh checkout. Run with \
                 `cargo test -- --ignored` against a real corpus."]
-    fn all_30_manifests_have_resolvable_expected_refs() {
+    fn all_25_manifests_have_resolvable_expected_refs() {
         let manifests = load_manifests().expect("all eval manifests parse");
         for manifest in &manifests {
             for raw in &manifest.expected_entity_refs {

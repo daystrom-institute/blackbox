@@ -7,7 +7,6 @@ use std::time::Duration;
 use crate::artifacts;
 use crate::config;
 use crate::index;
-use crate::mcp_tools;
 use crate::orchestration;
 use crate::projects::{
     ProjectEjectParams, ProjectInitParams, ProjectListResponse, ProjectRegisterParams,
@@ -427,7 +426,7 @@ impl BlackboxServer {
         }
         self.state.nudge_edge_index_rebuild();
         // Phase 2: heavy fs work (MCP migration, config load, artifact discovery,
-        // provenance import, watcher, kb sync) on the blocking pool.
+        // watcher, kb sync) on the blocking pool.
         let server = self.clone();
         let result: anyhow::Result<String> = tokio::task::spawn_blocking(move || {
             let response = server.run_post_register_pipeline(record)?;
@@ -559,10 +558,9 @@ impl BlackboxServer {
     }
 
     /// The post-register enrichment pipeline (plan §9.1): MCP migration,
-    /// project config + artifact discovery, provenance import, watcher and
-    /// kb registration, and the transcript-edge backfill, all behind the
-    /// same capability leases in both authority modes. Blocking work: call
-    /// from the blocking pool only.
+    /// project config + artifact discovery, watcher and kb registration, and
+    /// the transcript-edge backfill, all behind the same capability leases in
+    /// both authority modes. Blocking work: call from the blocking pool only.
     ///
     /// Capability semantics: a catalog attachment records what its checkout
     /// shape supports; a step whose capability is not recorded is skipped
@@ -648,58 +646,6 @@ impl BlackboxServer {
                 }
                 Err(error) => return Err(error),
             }
-            let edges_dir = crate::server::edge_sidecar_dir(&server.state);
-            let provenance_lease =
-                match crate::server::checkout_access::acquire_selected_project_access(
-                    &server.state.checkout_access,
-                    &record.project_id,
-                    CheckoutAccessKind::ProvenanceNoteIo,
-                    CheckoutAccessIntent::Read,
-                ) {
-                    Ok(lease) => Some(lease),
-                    Err(error) if capability_denied(&error) => {
-                        skipped_enrichment.push("provenance_import");
-                        None
-                    }
-                    Err(error) => return Err(error),
-                };
-            if let Some(provenance_lease) = provenance_lease {
-                let provenance_project = mcp_tools::provenance::ProvenanceProject {
-                    project_id: record.project_id.clone(),
-                    project_root: provenance_lease.project_root().to_path_buf(),
-                };
-                let resolve_legacy_target =
-                    |project_id: &str,
-                     root: &Path,
-                     absolute_path: &Path,
-                     byte_range: Option<(u64, u64)>| {
-                        if project_id != record.project_id {
-                            anyhow::bail!(
-                                "error.project_mismatch: provenance target belongs to another project"
-                            );
-                        }
-                        bbox_indexing::index::resolve_current_project_chunk_entity(
-                            &record.project_id,
-                            root,
-                            absolute_path,
-                            byte_range,
-                        )
-                    };
-                let prepared_provenance = mcp_tools::provenance::prepare_provenance_import(
-                    std::slice::from_ref(&provenance_project),
-                    &resolve_legacy_target,
-                )?;
-                let provenance_publication = server
-                    .state
-                    .checkout_access
-                    .publication_guard(&provenance_lease)
-                    .map_err(anyhow::Error::new)?;
-                mcp_tools::provenance::publish_prepared_provenance_import(
-                    prepared_provenance,
-                    &edges_dir,
-                )?;
-                drop(provenance_publication);
-            }
             // Register with the live .bbox/ watcher so future file changes
             // are picked up without a daemon restart.
             if let Ok(mut guard) = server.state.bbox_watcher.lock() {
@@ -746,27 +692,13 @@ impl BlackboxServer {
                         bbox_indexing::checkout_access::CheckoutAccessKind::LocalProjectWalk,
                         bbox_indexing::checkout_access::CheckoutAccessIntent::Read,
                         )?;
-                        let git = project_for_backfill
-                            .is_git_repo
-                            .then(|| {
-                                crate::server::checkout_access::acquire_selected_project_access(
-                                    &checkout_access,
-                                    &project_for_backfill.project_id,
-                                    bbox_indexing::checkout_access::CheckoutAccessKind::GitHistory,
-                                    bbox_indexing::checkout_access::CheckoutAccessIntent::Read,
-                                )
-                            })
-                            .transpose()?;
                         index::backfill_tool_edges_for_project(
                             &reindex_cfg,
                             &project_for_backfill.project_id,
                             local.project_root(),
-                            git.as_ref().map(|lease| lease.checkout_root()),
                             || {
                                 checkout_access
-                                    .publication_guard_for(
-                                        std::iter::once(&local).chain(git.iter()),
-                                    )
+                                    .publication_guard_for(std::iter::once(&local))
                                     .map_err(anyhow::Error::new)
                             },
                         )
@@ -911,7 +843,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_project_rename",
-        description = "Local administrator operation; transport-owned catalog projects refuse with error.project_admin_locality_required because no remote relocation lane is implemented. A bridge failure after registry admission reports error.project_rename_partial with completed effects and old/new recovery coordinates. Rename a registered bbox project root while preserving its project_id and migrating project-scoped bbox state. Accepts project (project_id, registered canonical_path, or absolute path), new_path (absolute directory path), optional move_on_disk (default false), and optional dry_run. Updates project registry, knowledge, threads, notes, pins, Slack channel bindings, live teams, whiteboards, pollers, and crons, then reindexes project files. In catalog mode rename is attachment relocation: the moved checkout must carry the same checkout-id marker and resolve the same scope, the ledger records the historical path, owner-store rows are never rewritten, and move_on_disk is refused (move first, then rename)."
+        description = "Local administrator operation; transport-owned catalog projects refuse with error.project_admin_locality_required because no remote relocation lane is implemented. A bridge failure after registry admission reports error.project_rename_partial with completed effects and old/new recovery coordinates. Rename a registered bbox project root while preserving its project_id and migrating project-scoped bbox state. Accepts project (project_id, registered canonical_path, or absolute path), new_path (absolute directory path), optional move_on_disk (default false), and optional dry_run. Updates project registry, knowledge, threads, notes, pins, Slack channel bindings, live teams, pollers, and crons, then reindexes project files. In catalog mode rename is attachment relocation: the moved checkout must carry the same checkout-id marker and resolve the same scope, the ledger records the historical path, owner-store rows are never rewritten, and move_on_disk is refused (move first, then rename)."
     )]
     pub(crate) async fn bbox_project_rename(
         &self,
@@ -1074,7 +1006,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_project_unregister",
-        description = "Unregister a project root from the bbox project registry. Accepts project (project_id, registered canonical_path, or absolute path). Removes the registry entry only; does NOT delete project-scoped state (knowledge, threads, notes, pins, Slack bindings, teams, whiteboards, pollers, crons) keyed on the project_id, which is derived from the canonical realpath and is stable across unregister+re-register. By default refuses when refs still exist and returns the counts; pass force=true to orphan them, or bbox_project_rename to migrate first. dry_run=true previews counts without mutating the registry. In catalog mode unregister is detach: the attachment is marked detached with census deregistration scoped to its checkout and scope pair, every logical store keeps its rows, and catalog deletion is the offline project-catalog retire surface."
+        description = "Unregister a project root from the bbox project registry. Accepts project (project_id, registered canonical_path, or absolute path). Removes the registry entry only; does NOT delete project-scoped state (knowledge, threads, notes, pins, Slack bindings, teams, pollers, crons) keyed on the project_id, which is derived from the canonical realpath and is stable across unregister+re-register. By default refuses when refs still exist and returns the counts; pass force=true to orphan them, or bbox_project_rename to migrate first. dry_run=true previews counts without mutating the registry. In catalog mode unregister is detach: the attachment is marked detached with census deregistration scoped to its checkout and scope pair, every logical store keeps its rows, and catalog deletion is the offline project-catalog retire surface."
     )]
     pub(crate) async fn bbox_project_unregister(
         &self,
@@ -1988,20 +1920,22 @@ mod tests {
             .register_path(&old)
             .unwrap();
         server.state.persist_projects_durable().await.unwrap();
-        let boards = root.join("board-storage");
-        std::fs::create_dir_all(&boards).unwrap();
-        std::fs::write(boards.join("fixture-board.json"), serde_json::to_vec(&serde_json::json!({
-            "id":"fixture-board", "topic":"fixture", "project":old.to_str().unwrap(),
-            "project_id":record.project_id, "created_at":"2026-01-01T00:00:00Z",
-            "phase":"blind", "phase_history":[], "agents":{}, "posts":[], "annotations":[], "votes":[]
-        })).unwrap()).unwrap();
         server
             .state
-            .whiteboards
-            .set_storage_dir(boards.clone())
+            .slack_proposal_links
+            .record(
+                serde_json::from_value(serde_json::json!({
+                    "team_id": "T0", "channel_id": "C0", "msg_ts": "1.0",
+                    "proposal_id": "fixture-proposal", "version": 1,
+                    "project_dir": old.to_str().unwrap(), "posted_at": "2026-01-01T00:00:00Z",
+                }))
+                .unwrap(),
+            )
             .unwrap();
-        std::fs::remove_dir_all(&boards).unwrap();
-        std::fs::write(&boards, b"not a directory").unwrap();
+        // The proposal-link save stages through this sibling; a directory in
+        // its place makes the owner-store rewrite fail after the registry
+        // move is durable.
+        std::fs::create_dir_all(root.join("bro").join("slack-proposal-links.json.tmp")).unwrap();
         let result = server
             .bbox_project_rename(Parameters(ProjectRenameParams {
                 project: record.project_id.clone(),

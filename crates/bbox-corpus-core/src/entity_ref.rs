@@ -28,7 +28,6 @@ pub enum EntityType {
     Symbol,
     SymbolV2,
     Brofile,
-    Whiteboard,
     Commit,
     Task,
     BashCall,
@@ -37,7 +36,7 @@ pub enum EntityType {
 }
 
 impl EntityType {
-    pub const ALL: [EntityType; 21] = [
+    pub const ALL: [EntityType; 20] = [
         EntityType::Knowledge,
         EntityType::ProvisionalKnowledge,
         EntityType::SystemMemory,
@@ -53,7 +52,6 @@ impl EntityType {
         EntityType::Symbol,
         EntityType::SymbolV2,
         EntityType::Brofile,
-        EntityType::Whiteboard,
         EntityType::Commit,
         EntityType::Task,
         EntityType::BashCall,
@@ -78,7 +76,6 @@ impl EntityType {
             EntityType::Symbol => "symbol",
             EntityType::SymbolV2 => "symbol_v2",
             EntityType::Brofile => "brofile",
-            EntityType::Whiteboard => "whiteboard",
             EntityType::Commit => "commit",
             EntityType::Task => "task",
             EntityType::BashCall => "bash_call",
@@ -118,7 +115,6 @@ impl EntityType {
                 "symbol_v2:<project_id>:<snapshot_id>:<qualified_name>:<defn_hash>"
             }
             EntityType::Brofile => "brofile:<name>",
-            EntityType::Whiteboard => "whiteboard:<board_id>",
             EntityType::Commit => "commit:<repo_id>:<sha>",
             EntityType::Task => "task:<task_id>",
             EntityType::BashCall => "bash_call:<session>:<turn>",
@@ -220,9 +216,6 @@ pub enum EntityRef {
     Brofile {
         name: String,
     },
-    Whiteboard {
-        board_id: String,
-    },
     Commit {
         repo_id: String,
         sha: String,
@@ -308,11 +301,6 @@ impl EntityRef {
             EntityType::Brofile => parse_single(input, rest, EntityType::Brofile, |name| {
                 EntityRef::Brofile { name }
             }),
-            EntityType::Whiteboard => {
-                parse_single(input, rest, EntityType::Whiteboard, |board_id| {
-                    EntityRef::Whiteboard { board_id }
-                })
-            }
             EntityType::Commit => parse_commit(input, rest),
             EntityType::Task => parse_single(input, rest, EntityType::Task, |task_id| {
                 EntityRef::Task { task_id }
@@ -435,7 +423,6 @@ impl EntityRef {
                 "symbol_v2:{project_id}:{snapshot_id}:{qualified_name}:{defn_hash}"
             )),
             EntityRef::Brofile { name } => Ok(format!("brofile:{name}")),
-            EntityRef::Whiteboard { board_id } => Ok(format!("whiteboard:{board_id}")),
             EntityRef::Commit { repo_id, sha } => Ok(format!("commit:{repo_id}:{sha}")),
             EntityRef::Task { task_id } => Ok(format!("task:{task_id}")),
             EntityRef::BashCall { session, turn } => Ok(format!("bash_call:{session}:{turn}")),
@@ -481,7 +468,6 @@ impl EntityRef {
             EntityRef::Symbol { .. } => EntityType::Symbol,
             EntityRef::SymbolV2 { .. } => EntityType::SymbolV2,
             EntityRef::Brofile { .. } => EntityType::Brofile,
-            EntityRef::Whiteboard { .. } => EntityType::Whiteboard,
             EntityRef::Commit { .. } => EntityType::Commit,
             EntityRef::Task { .. } => EntityType::Task,
             EntityRef::BashCall { .. } => EntityType::BashCall,
@@ -1060,6 +1046,8 @@ mod tests {
     fn retired_entity_refs_are_not_supported() {
         assert!(super::EntityRef::parse("roadmap_item:legacy").is_err());
         assert!(super::EntityType::from_prefix("roadmap_item").is_none());
+        assert!(super::EntityRef::parse("whiteboard:board-legacy").is_err());
+        assert!(super::EntityType::from_prefix("whiteboard").is_none());
     }
 
     use super::*;
@@ -1519,25 +1507,22 @@ mod tests {
             14 => EntityRef::Brofile {
                 name: rng.token("bro-"),
             },
-            15 => EntityRef::Whiteboard {
-                board_id: rng.token("board-"),
-            },
-            16 => EntityRef::Commit {
+            15 => EntityRef::Commit {
                 repo_id: rng.hex(8),
                 sha: rng.hex(40),
             },
-            17 => EntityRef::Task {
+            16 => EntityRef::Task {
                 task_id: rng.token("task-"),
             },
-            18 => EntityRef::BashCall {
+            17 => EntityRef::BashCall {
                 session: format!("{}:{}", rng.token("sess-"), rng.token("tool-")),
                 turn: rng.next() as u32,
             },
-            19 => EntityRef::Agent {
+            18 => EntityRef::Agent {
                 name: rng.token("agent-"),
                 version: 1 + (rng.next() as u32) % 10,
             },
-            20 => EntityRef::Artifact {
+            19 => EntityRef::Artifact {
                 kind: "workflow".into(),
                 name: rng.token("workflow-"),
                 version: Some("1".into()),

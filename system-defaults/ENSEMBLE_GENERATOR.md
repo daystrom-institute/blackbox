@@ -106,7 +106,7 @@ Survey the target repo. Run these checks before asking the operator anything:
    - Any existing teams or teamplates?
 
 7. Transcript history
-   - bbox_search for recent review/design/architecture discussions
+   - bbox_hybrid_search (doc_type=transcript) for recent review/design/architecture discussions
    - bbox_knowledge for settled decisions and conventions
 ```
 
@@ -249,15 +249,15 @@ Generate the full artifact set:
    - `name`: `<name>-<dim-code>` (e.g., `security-review-snd`)
    - `provider` / `model` / `effort`: as proposed
    - `lens`: full prompt owning exactly one question
-   - `filters.allow`: read-only tools + whiteboard post/annotate/vote
-   - `filters.disallow`: all mutation tools, `bro_*`, `whiteboard_open/register/transition`
+   - `filters.allow`: read-only tools
+   - `filters.disallow`: all mutation tools, `bro_*`
 
 3. **Validator brofile** — read-only, evidence-prover:
-   - `filters.allow`: read-only tools + `whiteboard_annotate` (no `whiteboard_post`)
+   - `filters.allow`: read-only tools
    - `lens`: audit-first, escalate-only-where-weakness-meets-consequence, post-per-finding
 
 4. **Facilitator brofile** — orchestrator:
-   - `filters.allow`: read-only + `whiteboard_state/summarize/transition`
+   - `filters.allow`: read-only tools
    - `lens`: distribute context, synthesize review, write output
 
 5. **Panel teamplate** — 5 members:
@@ -305,8 +305,6 @@ mechanics this generator uses. Fetch them via `bbox_knowledge` when needed:
 
 - **Workflow primitives:** `bbox_knowledge(query="sm-workflow-orchestration")`
   — actor kinds, transition types, hooks, vars_schema, subworkflows, wait nodes.
-- **Whiteboard API:** `bbox_knowledge(query="sm-whiteboards")`
-  — phases, posts, annotations, votes, transitions, conflict detection.
 - **Pathology ensemble (reference):** `design/refactor-tools/pathology-ensemble-review.md`
   — the original projection of these 5 dimensions into architecture pathology.
 - **Pathology dispatch (operator guide):** `docs/pathology-dispatch.md`

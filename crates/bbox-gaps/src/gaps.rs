@@ -1452,8 +1452,8 @@ impl GapStore {
         Ok(updated)
     }
 
-    /// Immutable slice of all stored gaps — used by cross-store aggregators
-    /// (inbox) that can't go through the MCP layer.
+    /// Immutable slice of all stored gaps, for in-process readers that
+    /// can't go through the MCP layer.
     pub fn all(&self) -> &[GapNote] {
         &self.data.gaps
     }

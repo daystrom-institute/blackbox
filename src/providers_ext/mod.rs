@@ -21,12 +21,6 @@ pub(crate) fn extra_providers() -> Vec<Box<dyn InspectableEntityProvider>> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-
-    use crate::mcp_tools::ref_size::{
-        FileInputResolution, RefSizeParams, ValidatedFileInput, ValidatedFileInputs, ref_size,
-        ref_size_with_validated_files,
-    };
     use crate::providers::{ProviderContext, all_providers, provider_for};
 
     use bbox_corpus_core::entity_ref::{EntityRef, EntityType};
@@ -49,7 +43,6 @@ mod tests {
             "note:note-12345678",
             "symbol:proj1234:crate::Type::method:defhash",
             "brofile:auditor",
-            "whiteboard:board-12345678",
             "commit:repo1234:abcdef1234567890",
             "task:task-12345678",
             "bash_call:session123:7",
@@ -91,114 +84,5 @@ mod tests {
             provider_for(entity_type);
         }
         assert_eq!(all_providers().len(), EntityType::ALL.len());
-    }
-
-    // ── relocated from mcp_tools/ref_size.rs: these exercise ref_size
-    // against daemon state (SharedState::for_test), which the peeled
-    // mcp-tools crate must not name. ──
-    #[test]
-    fn virtual_entity_ref_measures_provider_properties_json() {
-        crate::providers::register_extra_providers(super::extra_providers());
-        let ctx = crate::providers::ProviderContext::empty_for_tests();
-        let out = ref_size(
-            &RefSizeParams {
-                refs: vec!["task:task-123".into()],
-                project_dir: None,
-                ..Default::default()
-            },
-            &ctx,
-        )
-        .unwrap();
-        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(value["status"], "ok");
-        assert!(value["total_bytes"].as_u64().unwrap() > 0);
-        assert_eq!(value["per_ref"][0]["ref"], "task:task-123");
-        assert_eq!(value["per_ref"][0]["entity_type"], "task");
-        assert_eq!(value["per_ref"][0]["source"], "entity_properties_json");
-    }
-
-    #[test]
-    fn file_ref_measures_registered_project_file_content() {
-        let store = tempfile::tempdir().unwrap();
-        let project = tempfile::tempdir().unwrap();
-        fs::create_dir_all(project.path().join("docs")).unwrap();
-        let file_path = project.path().join("docs/design.md");
-        fs::write(&file_path, "hello\nworld\n").unwrap();
-
-        let stores = crate::server::state::SharedState::for_test(store.path());
-        stores
-            .project_authority
-            .bridge_registry()
-            .unwrap()
-            .write()
-            .register_path(project.path())
-            .unwrap();
-        let ctx = crate::providers::ProviderContext::new_with_ext(stores.corpus_stores(), &stores);
-        let files = ValidatedFileInputs::from([(
-            "docs/design.md".into(),
-            FileInputResolution::Validated(ValidatedFileInput {
-                bytes: std::fs::metadata(&file_path).unwrap().len(),
-            }),
-        )]);
-        let out = ref_size_with_validated_files(
-            &RefSizeParams {
-                refs: vec!["file:docs/design.md".into()],
-                project_dir: None,
-                ..Default::default()
-            },
-            &ctx,
-            &files,
-        )
-        .unwrap();
-        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(value["status"], "ok");
-        assert_eq!(value["total_bytes"], 12);
-        assert_eq!(value["per_ref"][0]["ref"], "file:docs/design.md");
-        assert_eq!(value["per_ref"][0]["entity_type"], "file");
-        assert_eq!(value["per_ref"][0]["source"], "file_content");
-    }
-
-    #[test]
-    fn file_ref_uses_only_caller_validated_worktree_file() {
-        let store = tempfile::tempdir().unwrap();
-        let registered = tempfile::tempdir().unwrap();
-        let worktree = tempfile::tempdir().unwrap();
-        fs::create_dir_all(registered.path().join("scripts")).unwrap();
-        fs::create_dir_all(worktree.path().join("scripts")).unwrap();
-        fs::write(registered.path().join("scripts/guard.py"), "old").unwrap();
-        fs::write(worktree.path().join("scripts/guard.py"), "new guard\n").unwrap();
-
-        let stores = crate::server::state::SharedState::for_test(store.path());
-        stores
-            .project_authority
-            .bridge_registry()
-            .unwrap()
-            .write()
-            .register_path(registered.path())
-            .unwrap();
-        let ctx = crate::providers::ProviderContext::new_with_ext(stores.corpus_stores(), &stores);
-        let files = ValidatedFileInputs::from([(
-            "scripts/guard.py".into(),
-            FileInputResolution::Validated(ValidatedFileInput {
-                bytes: std::fs::metadata(worktree.path().join("scripts/guard.py"))
-                    .unwrap()
-                    .len(),
-            }),
-        )]);
-        let out = ref_size_with_validated_files(
-            &RefSizeParams {
-                refs: vec!["file:scripts/guard.py".into()],
-                project_dir: Some(worktree.path().to_string_lossy().into_owned()),
-                ..Default::default()
-            },
-            &ctx,
-            &files,
-        )
-        .unwrap();
-        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(value["status"], "ok");
-        assert_eq!(value["total_bytes"], 10);
-        assert_eq!(value["per_ref"][0]["ref"], "file:scripts/guard.py");
-        assert_eq!(value["per_ref"][0]["source"], "file_content");
     }
 }

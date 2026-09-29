@@ -16,7 +16,6 @@ pub(super) async fn start_background_tasks(shared: Arc<SharedState>) -> anyhow::
     super::code_source::spawn_commit_observer(&shared);
     super::code_source::spawn_store_maintenance(&shared)?;
     super::history_activation::spawn_worker(&shared)?;
-    super::provenance_import::spawn_worker(&shared)?;
     // Operator-minted workspace bindings are durable: re-arm the ones
     // persisted under the knowledge-source store before anything can capture.
     super::knowledge_source::restore_operator_workspace_bindings(&shared);
@@ -44,7 +43,6 @@ pub(super) async fn start_background_tasks(shared: Arc<SharedState>) -> anyhow::
     start_bbox_watcher(&shared);
     spawn_knowledge_lifecycle_reconciler(shared.clone());
     restore_runtime_state(&shared).await;
-    spawn_event_journal_maintenance(shared.clone());
     spawn_account_probe_refresh(shared.clone());
     crate::embed_runtime::spawn_embed_residue_sweeper(shared);
     Ok(())
@@ -253,7 +251,7 @@ fn start_bbox_watcher(shared: &Arc<SharedState>) {
 
     // On a committed `.bbox/knowledge/` or top-level `.bbox/gaps/` change (e.g.
     // `git pull`, manual edit): reload the in-memory store(s) so
-    // `bbox_knowledge`/`bbox_gaps`/`render`/`bbox_inbox` see it immediately, and
+    // `bbox_knowledge`/`bbox_gaps`/`render` see it immediately, and
     // flag the reindex thread to refresh search on its next tick. A `Weak` ref
     // avoids a cycle — `SharedState` owns the watcher. The callback deliberately
     // does NOT touch the search index directly: the reindex thread is the single
@@ -388,23 +386,6 @@ fn start_bbox_watcher(shared: &Arc<SharedState>) {
 /// allocator's `quota_capacity` consumer was always missing). Seeds immediately
 /// at startup, then every `BBOX_ACCOUNT_PROBE_INTERVAL_SECS` (default 900;
 /// 0 disables). v1 probes GLM/Z.AI; the prober suite extends to other providers.
-fn spawn_event_journal_maintenance(shared: Arc<SharedState>) {
-    tokio::spawn(async move {
-        loop {
-            let hub = shared.system_events.clone();
-            let result =
-                tokio::task::spawn_blocking(move || hub.compact_with_now(&crate::util::now_iso()))
-                    .await;
-            match result {
-                Ok(Ok(_)) => {}
-                Ok(Err(error)) => tracing::warn!(%error, "event journal maintenance failed"),
-                Err(error) => tracing::warn!(%error, "event journal maintenance task failed"),
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(6 * 60 * 60)).await;
-        }
-    });
-}
-
 fn spawn_account_probe_refresh(shared: Arc<SharedState>) {
     let interval_secs = std::env::var("BBOX_ACCOUNT_PROBE_INTERVAL_SECS")
         .ok()

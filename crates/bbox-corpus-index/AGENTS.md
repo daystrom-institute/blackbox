@@ -19,8 +19,8 @@
 - The project filter is OR(legacy substring lane over `project`, exact term
   on `base_project_id`). **Never drop the substring lane** — unregistered
   projects and ad hoc path filters have nothing else.
-- Selector resolution does NOT live in this crate: callers hand search,
-  cite, and sessions_list a `ProjectFilterInput { project_id, literal }`
+- Selector resolution does NOT live in this crate: callers hand search
+  and sessions_list a `ProjectFilterInput { project_id, literal }`
   resolved at the daemon tool boundary, and the id lane fires only when
   the caller resolved one. Never read project records off disk here to
   interpret a filter: the dependency direction forbids reaching the
@@ -38,19 +38,6 @@
   — the worktree case made history lanes invisible for weeks. When touching
   filter resolution, keep "registry first, hash fallback last" and test the
   out-of-tree worktree path explicitly.
-
-## Pinned provenance target resolution
-
-- Authenticated provenance import resolves legacy V1 path/range targets only
-  against the journal-pinned collected selector and a pinned Tantivy searcher.
-  The resolver is exact on project id, selector, and repository-relative path;
-  it never consults the live checkout or silently crosses into another active
-  code generation while an import is being prepared.
-- V2 target membership accepts either an entity in that exact active selector
-  or an exact historical target still backed by a matching observed
-  `READ_FILE`/`EDITED_FILE` edge in the pinned edge view. The historical arm is
-  required across collected-snapshot and ProjectFileV2 migrations; imported
-  provenance edges cannot authorize it recursively.
 
 ## Graph vertex documents (M9, design/connectors/unified-retrieval.md)
 
@@ -96,7 +83,7 @@
 
 ## Transcript read authority
 
-- Native context/messages/session/topics reads use exact stored transcript
+- Native context/messages/session reads use exact stored transcript
   locators or session ids. A locator may resemble a host path, but read APIs
   never open it or reconstruct source files from it. Source discovery and
   ingestion belong to adapters with explicit roots or enrolled transport.

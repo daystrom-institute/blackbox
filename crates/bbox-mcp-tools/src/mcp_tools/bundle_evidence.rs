@@ -348,8 +348,6 @@ fn intra_bundle_edges(
 
 /// Surfaces 2-hop convergences: pairs of bundled entities (A, B) that share
 /// a common neighbor C via outgoing or incoming edges. Examples:
-/// - two project_files both EDITED_BY_SESSION the same session ("touched in
-///   the same conversation")
 /// - two project_files both COMMIT_TOUCHED_FILE the same commit ("changed
 ///   together")
 /// - a knowledge entry and a session it was KNOWLEDGE_FROM_SESSION'd from

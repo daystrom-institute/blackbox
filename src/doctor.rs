@@ -1,8 +1,7 @@
 //! `bbox_doctor` v0: one read-only "what do I need to know right now?"
 //! surface (design/operations/config-artifacts/ops-artifact-bundles-and-doctor.md,
 //! Phase 5 pulled forward). Aggregates existing health signals in-process
-//! and classifies findings; it never mutates stores, enqueues notes, or
-//! emits inbox items.
+//! and classifies findings; it never mutates stores or enqueues notes.
 //!
 //! v0 ships the substrate-independent sections only: daemon, index,
 //! code sources, vectors, graph, projects, checkout access, memories,
@@ -1226,33 +1225,6 @@ fn code_sources_section(state: &crate::server::state::SharedState) -> SectionRep
         ))),
     }
     findings.extend(repo_history_findings(state));
-    match state.git_sources.store().provenance_export_receipts() {
-        Ok(receipts) => {
-            for stored in receipts {
-                findings.push(Finding::ok(format!(
-                    "project `{}` provenance export receipted ({} documents, generation {})",
-                    stored.project_id,
-                    stored.receipt.document_count,
-                    &stored.receipt.generation[..12],
-                )));
-            }
-        }
-        Err(error) => findings.push(Finding::blocked(format!(
-            "provenance export receipts are unreadable: {error:#}"
-        ))),
-    }
-    let provenance = state.git_sources.provenance_export_metrics();
-    if provenance.pages_served > 0
-        || provenance.stale_restarts > 0
-        || provenance.receipts_accepted > 0
-    {
-        findings.push(Finding::info(format!(
-            "provenance transport served {} page(s), accepted {} receipt(s), and requested {} stale restart(s) since daemon start",
-            provenance.pages_served,
-            provenance.receipts_accepted,
-            provenance.stale_restarts,
-        )));
-    }
     if findings.is_empty() {
         findings.push(if state.config.read().code_collection.enabled {
             Finding::info("code collection enabled with no active collected generations")
@@ -1704,7 +1676,7 @@ fn attention_section(state: &crate::server::state::SharedState) -> SectionReport
         } else {
             Finding::info(format!("unresolved notes: {summary}"))
         };
-        findings.push(finding.with_next("bbox_inbox() to triage".to_string()));
+        findings.push(finding.with_next("bbox_notes() to triage".to_string()));
     }
 
     let failed_tasks = {

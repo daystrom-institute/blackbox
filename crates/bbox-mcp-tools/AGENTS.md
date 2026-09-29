@@ -1,12 +1,4 @@
-# bbox-mcp-tools — graph retrieval pipeline (hybrid search, discover, paths)
-
-- Authenticated provenance import prepares corpus `Edge` values only after the
-  caller has pinned a selector/searcher. V2 target errors fail closed and never
-  fall back to V1 path resolution; V1 receives only a relative-path resolver.
-  Publication sends the complete bounded project inventory through the atomic
-  explicit-sidecar merge, preserving the legacy edge kinds and
-  metadata-independent import key while adding the authenticated import
-  generation and document SHA-256 as audit metadata.
+# bbox-mcp-tools - graph retrieval pipeline (hybrid search, inspect, paths)
 
 - Hybrid pipeline order: BM25 field boosts → RRF fusion (k=60, vector weight
   0.6 default) → model rerank (DEFAULT since the measured 2026-07-11
@@ -37,9 +29,6 @@
   nonblocking partition metrics so compaction cannot stall retrieval. Queue
   and indexing telemetry belongs on bbox_embed_status; search returns only
   concise retrieval status and result-affecting degradation by default.
-- `discover_seed` reuses `hybrid_search_typed` verbatim and differs only in
-  post-processing (notable edges). Ranking changes land in one place and
-  affect both; do not fork the ranking for one surface.
 - `vector_ranked_lists` searches TWO route families against the same
   `partitions` map from `vectors::metrics_nonblocking()`: `Bucket`-keyed text routes
   (`route_buckets`) and chunk-kind-keyed visual routes

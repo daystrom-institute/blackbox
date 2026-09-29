@@ -971,7 +971,7 @@ impl VectorStore {
 
     /// Like `metrics()` but skips partitions whose lock is held (e.g. a
     /// long write-lock rebuild). For surfaces that must never block behind
-    /// compaction — the inbox attention layer reads through this.
+    /// compaction, such as the search and doctor health reads.
     pub fn metrics_nonblocking(&self) -> BTreeMap<String, PartitionMetrics> {
         self.partitions
             .read()
@@ -1360,7 +1360,7 @@ const COMPACT_MIN_WAL_SURPLUS_RECORDS: usize = 100_000;
 
 /// Connectivity thresholds (gap-1168b0bd). These gate the WORKFLOW
 /// compaction lane (embed-compaction-arc: quiesce → rebuild → swap) and the
-/// inbox attention layer — deliberately NOT the in-process periodic
+/// doctor health report, deliberately NOT the in-process periodic
 /// compactor above, because a connectivity-triggered rebuild holds the
 /// partition write lock for the full rebuild (~25 min at 399k×1024d) and
 /// must not fire unquiesced on a 5-minute tick.

@@ -682,7 +682,7 @@ mod filter_merge_tests {
             &["mcp__blackbox__bbox_*".into()],
             &["mcp__blackbox__bro_*".into()],
             Some(&AgentFilterOverlay {
-                allow: vec!["mcp__blackbox__bbox_search".into()],
+                allow: vec!["mcp__blackbox__bbox_context".into()],
                 disallow: vec!["mcp__blackbox__bbox_forget".into()],
             }),
         );
@@ -690,7 +690,7 @@ mod filter_merge_tests {
             merged.allow,
             vec![
                 "mcp__blackbox__bbox_*".to_string(),
-                "mcp__blackbox__bbox_search".to_string(),
+                "mcp__blackbox__bbox_context".to_string(),
             ]
         );
         assert_eq!(

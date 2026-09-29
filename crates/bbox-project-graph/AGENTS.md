@@ -19,10 +19,8 @@
   is deliberately rootless (`relative_root() == None`), so checkout discovery
   cannot reach it however it is asked.
 - Connector projection mechanics (deltas, named checkpoints, retained
-  observations, the atomic snapshot) live in `bbox-source-graph`, which
-  consumes this crate's descriptor, schema, validation, and `build_generation`.
-  Evidence endpoints, text/vector retrieval, and hosted auth remain outside
-  both crates.
+  observations, the atomic snapshot), evidence endpoints, text/vector
+  retrieval, and hosted auth live outside this crate.
 - Schema property terms may carry retrieval annotations
   (`{"type": <term>, "index": "none|word|text", "embed": <bool>}`) under a
   per-graph `index_policy`. They are structural here: validated, preserved,

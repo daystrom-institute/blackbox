@@ -161,8 +161,8 @@ borrow/conversion outcome that is the compiler's call (recorded as uncertainty).
 
 **`PRD-COR-J` — Java Transcript-Anchored Pressure.** Confirm/down-rank against
 operator/agent history + churn/fix-revert; merge overlapping atom signals.
-Authorities: `bbox_search`/`bbox_notes`/`bbox_thread_list`/`bbox_hybrid_search`,
-git log, `bbox_blame`. Reject: history alone, unconfirmed by current code.
+Authorities: `bbox_hybrid_search`/`bbox_notes`/`bbox_thread_list`,
+git log. Reject: history alone, unconfirmed by current code.
 
 **`PRD-COR-R` — Rust Transcript-Anchored Pressure.** Same, with Rust signals:
 public-API opt-out debates, compile-fix churn, abandoned module-split/bin-to-lib
@@ -337,7 +337,7 @@ gate). The ensemble is adversarial review of the atom outputs across the five
 orthogonal axes, and the validator is the independent critic that gives refutation
 teeth.
 
-## Workflow gate (whiteboard participation)
+## Gate rules (v2)
 
 Shared by all four flows. Lattice `["ready_debate","ready_skip","ready","invalid"]`;
 first-match evaluation; reads `vars.board_check.*` (the `whiteboard_summarize`

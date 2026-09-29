@@ -19,8 +19,10 @@ pub(super) fn compact_locator(locator: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::{ContextParams, MessagesParams, SearchParams, StaticProjectRecordsProvider};
-    use std::collections::BTreeMap;
+    use crate::index::{
+        ContextParams, HybridWordLane, LexicalQueryMode, MessagesParams,
+        StaticProjectRecordsProvider,
+    };
     use tantivy::{Term, collector::DocSetCollector, query::AllQuery};
 
     fn fixture(root: &std::path::Path) -> TranscriptIndex {
@@ -68,22 +70,28 @@ mod tests {
         writer.commit().unwrap();
         index.reader.reload().unwrap();
         let hits = index
-            .search_with_active_selectors(
-                &serde_json::from_value::<SearchParams>(json!({
-                    "query":"oversizedrecoveryneedle", "mode":"fulltext"
-                }))
-                .unwrap(),
-                &BTreeMap::new(),
-            )
+            .word_lane_hits(&HybridWordLane {
+                query: "oversizedrecoveryneedle",
+                limit: 20,
+                mode: LexicalQueryMode::Fulltext,
+                ..HybridWordLane::default()
+            })
             .unwrap();
-        assert!(serde_json::to_vec(&hits).unwrap().len() < 40_000);
-        assert!(!hits.contains("/private/synthetic-source/"));
-        let recovery: Value = serde_json::from_str(
-            hits.lines()
-                .find_map(|line| line.strip_prefix("Exact read: "))
-                .unwrap(),
-        )
-        .unwrap();
+        let rendered = serde_json::to_string(&hits).unwrap();
+        assert!(rendered.len() < 40_000);
+        assert!(!rendered.contains("/private/synthetic-source/"));
+        let coordinates = hits[0].conversation.clone().unwrap();
+        assert_eq!(
+            coordinates.session_id, None,
+            "oversized session ids are omitted"
+        );
+        let recovery = coordinates.exact_read.unwrap();
+        assert_eq!(
+            coordinates.file_path,
+            recovery["arguments"]["file_path"]
+                .as_str()
+                .map(str::to_owned)
+        );
         let handle = recovery["arguments"]["file_path"]
             .as_str()
             .unwrap()

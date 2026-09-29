@@ -25,7 +25,7 @@ source material:
 | Vector store | Per-route embedding partitions for semantic retrieval |
 | EdgeIndex | Graph projection over indexed docs plus live knowledge/thread/note stores |
 | Knowledge store | Durable rules, decisions, memories, pins, notes, and render targets |
-| Orchestration runtime | `bro` tasks, teams, workflows, waits, signals, whiteboards, and councils |
+| Orchestration runtime | `bro` tasks, teams, workflows, waits, signals, and councils |
 | Artifact catalog | Installed workflows, atoms, packets, agents, and brofiles from `system-defaults/` |
 
 The important boundary: operators maintain the daemon and its stores;

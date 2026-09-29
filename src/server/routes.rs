@@ -897,7 +897,7 @@ fn build_edge_index_from_shared_at_authority(
     //                           writer then blocks new idx *readers* (parking_lot
     //                           is fair, so readers don't starve the writer)
     //   D (a graph tool, e.g.   holds edge_index.read (live arg), wants idx.read
-    //      bbox_blame)          -> blocked behind R
+    //      bbox_inspect_entity) -> blocked behind R
     // => A waits on D's edge_index.read, D waits on R's queued idx.write, R waits
     //    on A's idx.read. Cycle. Acquiring edge_index.write() with no store locks
     //    held removes A from the cycle entirely.
@@ -940,25 +940,6 @@ fn edge_index_rebuild_max_input_bytes() -> u64 {
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_EDGE_INDEX_REBUILD_MAX_INPUT_BYTES)
-}
-
-pub(crate) fn ensure_edge_index_rebuild_admitted_at(
-    state: &SharedState,
-    edges_dir: &std::path::Path,
-    additional_bytes: u64,
-) -> anyhow::Result<u64> {
-    let registered_project_ids = state.corpus_registered_project_ids();
-    let authority = capture_edge_rebuild_authority(edges_dir, Some(&registered_project_ids))?;
-    let max_bytes = edge_index_rebuild_max_input_bytes();
-    let projected_bytes = authority.signature.bytes.saturating_add(additional_bytes);
-    if projected_bytes > max_bytes {
-        anyhow::bail!(
-            "edge-index rebuild refused: projected active sidecar input is {} bytes (limit {}); compact/rematerialize the active edge set before retrying",
-            projected_bytes,
-            max_bytes
-        );
-    }
-    Ok(max_bytes)
 }
 
 fn edge_index_nudge_max_current_edges() -> usize {
@@ -1517,17 +1498,6 @@ pub(crate) fn project_ref_counts(state: &Arc<SharedState>, project: &str) -> any
         .iter()
         .filter(|team| team.project_dir.as_deref() == Some(project))
         .count();
-    let whiteboards = state
-        .whiteboards
-        .list_ids()
-        .iter()
-        .filter(|id| {
-            state
-                .whiteboards
-                .get(id)
-                .is_some_and(|board| board.read().project == project)
-        })
-        .count();
     let gaps = state
         .gaps
         .read()
@@ -1543,7 +1513,6 @@ pub(crate) fn project_ref_counts(state: &Arc<SharedState>, project: &str) -> any
         "slack_channel_bindings": slack_channel_bindings,
         "slack_proposal_links": slack_proposal_links,
         "teams": teams,
-        "whiteboards": whiteboards,
         "gaps": gaps,
     }))
 }
@@ -1797,9 +1766,6 @@ pub(crate) fn migrate_project_refs(
         .rename_project_refs(old_project, new_project)?;
     let teams =
         orchestration::team::rename_project_refs(&state.store_dir, old_project, new_project);
-    let whiteboards = state
-        .whiteboards
-        .rename_project_refs(old_project, new_project)?;
 
     let gaps = state
         .gaps
@@ -1813,7 +1779,6 @@ pub(crate) fn migrate_project_refs(
         "slack_channel_bindings": slack_channel_bindings,
         "slack_proposal_links": slack_proposal_links,
         "teams": teams,
-        "whiteboards": whiteboards,
         "gaps": gaps,
     }))
 }
@@ -2435,7 +2400,7 @@ mod tests {
     }
 
     /// Regression for the 2026-08-25 cage index-plane deadlock:
-    /// `bbox_hybrid_search` / `bbox_discover_seed_entities` hold
+    /// `bbox_hybrid_search` holds
     /// `state.idx.read()` across the whole search call, and provider
     /// property/label lookups re-acquire the same lock on the same thread.
     /// A writer queued between the two acquisitions (history activation's

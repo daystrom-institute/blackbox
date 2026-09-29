@@ -52,8 +52,7 @@ if ((failures > 0)); then
     cat >&2 <<'EOF'
 
 bbox-code-collector walks, hashes, and uploads raw bounded files plus typed
-Git-history and committed knowledge-source facts, and applies bounded
-provenance pages through the leaf local writer. Stores, chunking, indexing,
+Git-history and committed knowledge-source facts. Stores, chunking, indexing,
 vectors, edge materialization, model runtimes, and daemon behavior belong on
 the corpus side of the boundary.
 EOF

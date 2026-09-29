@@ -15,7 +15,6 @@
       "mcp__blackbox__bbox_find_paths",
       "mcp__blackbox__bbox_bundle_evidence",
       "mcp__blackbox__bbox_knowledge",
-      "mcp__blackbox__bbox_search",
       "mcp__blackbox__bbox_notes",
       "mcp__blackbox__bbox_thread_list",
       "mcp__blackbox__bbox_note",

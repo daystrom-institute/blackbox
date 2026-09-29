@@ -19,23 +19,15 @@ and edge families.
 
 ```
 1. bbox_describe_schema           # orient — entity types + edge families
-2. bbox_hybrid_search(query, k=5) # seeds — mixed-modal results with notable_edges
+2. bbox_hybrid_search(query, k=5) # seeds - mixed-modal ranked entity refs
 3. bbox_inspect_entity(ref)       # confirm — properties + edges in one call
 4. bbox_find_paths(from, to_*)    # traverse — direction-preserving BFS chains
 5. bbox_bundle_evidence(...)      # answer — package refs + path_ids
 ```
 
-`bbox_blame(file, line)` is the line-level provenance escape hatch — use
-when the question is "who/why does this line exist?" rather than a
-graph walk.
-
-`bbox_discover_seed_entities` is `bbox_hybrid_search` plus emphasis on
-notable_edges for orientation; either tool returns seeds you can hand
-to step 3.
-
 ## Domain orientation (memorize once per session)
 
-**12 entity types** the graph contains:
+**11 entity types** the graph contains:
 
 | Type | Population | Use it for |
 |---|---|---|
@@ -47,7 +39,6 @@ to step 3.
 | `note` | structured side-channel records (dispute/done/etc) | "what's pending review?" |
 | `symbol` | named code symbols (functions, types, modules) | "what calls X?" |
 | `brofile` | persona+model+lens triple | "what brofile dispatched this?" |
-| `whiteboard` | multi-agent deliberation surface | "what did the contradiction-review board decide?" |
 | `commit` | git commits with parent + touched-file edges | "what changed in commit X?" |
 | `task` (virtual) | bro_exec dispatch unit | "what produced this artifact?" |
 | `bash_call` (virtual) | one shell invocation in a transcript | "what did this command emit?" |
@@ -60,7 +51,7 @@ to step 3.
 - **Provenance** (`SESSION_USED_BROFILE`, `ARC_USED_BROFILE`, `ARC_OPENED_BOARD`, `NOTE_FROM_SESSION`, `NOTE_IN_THREAD`, `NOTE_FROM_TASK`, `TASK_PRODUCED_NOTE`) — origin trails
 - **Git** (`COMMIT_PARENT`, `COMMIT_TOUCHED_FILE`, `COMMIT_PRODUCED_BY_ARC`) — version control history
 - **Format-specific** (`LINKS_TO_FILE`, `LINKS_TO_SECTION`, `DESCRIBES`, `ON_PAGE`, `FIGURE_OF`, `TABLE_OF`) — cross-reference within docs
-- **Tool-call** (`EDITED_FILE`, `EDITED_BY_SESSION`, `READ_FILE`, `RAN_BASH`) — agent activity provenance
+- **Tool-call** (`RAN_BASH`): shell commands agents ran
 
 `bbox_describe_schema` returns the live counts and the schema-aware tip
 for each family.
@@ -99,9 +90,8 @@ for each family.
 
 6. **Per-file collapse is on by default.** Search and find_paths return
    ONE entity per file by default (the highest-scoring or shortest-
-   path chunk). If you need multiple chunks of the same file, the
-   chunk's notable_edges already point you to siblings via
-   `NEXT_SECTION`.
+   path chunk). If you need multiple chunks of the same file, inspect
+   the chunk: its `NEXT_SECTION` edges point to siblings.
 
 ## Final-answer protocol — verify by question type
 
@@ -116,9 +106,8 @@ Before sending your answer, walk this checklist for the question shape:
 cite the `knowledge` entity directly.
 
 **WHO/WHEN** ("who wrote X?", "when did this change?"): cite the
-`commit` entity (`COMMIT_TOUCHED_FILE` traversal) AND the
-`session` (`EDITED_BY_SESSION`) when one exists. `bbox_blame` gives
-both in one call for a known file/line.
+`commit` entity (`COMMIT_TOUCHED_FILE` traversal). Search transcripts for
+the file path to find the sessions that touched it.
 
 **WHY** ("why does X exist?", "what was the rationale?"): trace
 `KNOWLEDGE_FROM_SESSION` from a knowledge entry to the originating
@@ -138,8 +127,8 @@ between cited entities (when implemented).
 **HISTORICAL** ("trace the chain"): every step in your narrative MUST
 be grounded in a validated `path_id` from `bbox_find_paths`. State
 edge directions as the path returned them — do not invert from
-memory ("X reads Y" stays as `READ_FILE` from X to Y; do not flip it
-to "Y was read by X" without re-querying).
+memory ("X calls Y" stays as `CALLS` from X to Y; do not flip it
+to "Y is called by X" without re-querying).
 
 **IMPACT** ("what gets affected if X changes?"): traverse outward
 from X via `CALLS`, `IMPLEMENTS_TRAIT`, `EDITED_IN_COMMIT` →
@@ -158,15 +147,6 @@ edge-confidence drops to `Heuristic` and surface that as a caveat.
 4. Answer with the file_path + symbol name from properties.
 ```
 
-### "Who/when last edited file X line N?"
-
-```
-1. bbox_blame(file="absolute/path", line=N)
-2. The response includes git_blame.{commit_sha, author, author_time}
-   AND, if a bbox-tracked tool call matches the commit, the full
-   anchor chain (session, brofile, threads).
-```
-
 ### "What's our policy on X?"
 
 ```
@@ -179,10 +159,7 @@ edge-confidence drops to `Heuristic` and surface that as a caveat.
 
 ```
 1. bbox_session(session_id="S")               # metadata + first prompt
-2. bbox_inspect_entity("session:provider:S",
-       edge_types="EDITED_BY_SESSION,READ_FILE",
-       direction="in")
-3. bbox_find_paths(from="session:provider:S", to_type="commit",
+2. bbox_find_paths(from="session:provider:S", to_type="commit",
        max_depth=2)                            # commits this session produced
 ```
 
@@ -198,10 +175,10 @@ edge-confidence drops to `Heuristic` and surface that as a caveat.
 
 - **Single bbox_knowledge call as the entire grounding step.** Knowledge
   is rendered RULES, not corpus. Most questions need search-or-graph too.
-- **Iterating bbox_search 5 different ways.** If 2-3 reformulations
-  don't surface the answer, switch to `bbox_hybrid_search` (vector lane
-  catches paraphrases) or `bbox_describe_schema` (you may be looking at
-  the wrong entity type).
+- **Iterating keyword queries 5 different ways.** If 2-3 reformulations
+  don't surface the answer, drop the narrowing filters on
+  `bbox_hybrid_search` (vector lane catches paraphrases) or switch to
+  `bbox_describe_schema` (you may be looking at the wrong entity type).
 - **Inventing entity refs.** If you didn't read it from a tool response
   this turn, query for it. The bad_input error returns a `suggested_fix`.
 - **Truncating paths in the answer.** When the user asks

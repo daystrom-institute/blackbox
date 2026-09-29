@@ -43,7 +43,7 @@ ALLOWLIST = {
     "bro_interrupt", "bro_mcp", "bro_providers", "bro_prune",
     "bro_retro",
     "bro_status", "bro_steer", "tool_identity_get",
-    "tool_identity_list", "tool_system_event_list", "tool_system_event_open",
+    "tool_identity_list",
 }
 
 fail = False
