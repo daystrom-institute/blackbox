@@ -304,6 +304,18 @@ apply removes the marker, the receipt status is `retired`, and verify refuses
 because no marker exists. The marker format is unchanged, so a daemon without
 re-run support loads the successor.
 
+`bbox_doctor(section="locality_cutovers")` reports both locality cutovers from
+the markers the daemon loaded at startup. A daemon with no marker reports the
+cutover as not run with its uncovered Published project count. A loaded marker
+reports its checksum (the receipt's `marker_checksum_sha256`), apply time,
+catalog epoch, and governed and current row counts, and names each Published
+project it leaves uncovered. A governed row whose live catalog scope or
+producer assignment no longer matches the marker is an `action` finding that
+points at a fresh `--preflight`; a row whose project was retired is informational
+and the next re-run drops it.
+An invalid marker never reaches doctor because it refuses startup. The section
+is catalog-only and absent in bridge mode.
+
 ### Collected code-source locality cutover
 
 This cutover makes one current collected generation authoritative and closes
@@ -366,6 +378,9 @@ search, graph, embeddings, and code-source health. This post-marker rebuild must
 leave every selected project's `LocalProjectWalk` target counters unchanged.
 Stop and investigate if offline verify then reports `changed after cutover`.
 A code deployment alone does not apply a production marker.
+The daemon's completion state for this marker appears in
+`bbox_doctor(section="locality_cutovers")`, described under the render
+locality cutover above.
 
 The ceremony is re-runnable against an installed marker. Preflight then
 accepts an empty `--project-id` set, carries every predecessor row whose

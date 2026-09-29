@@ -149,9 +149,23 @@ pub struct RenderLocalityCutoverVerifyRequestV1 {
     pub layout: ProjectCatalogMigrationResolvedLayoutV1,
 }
 
+/// Path-free identity of the validated marker a runtime was opened from.
+/// `checksum_sha256` is the value the apply and verify receipts report as
+/// `marker_checksum_sha256`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RenderLocalityCutoverMarkerIdentityV1 {
+    pub applied_at: String,
+    pub report_sha256: String,
+    pub catalog_epoch: u64,
+    pub catalog_sha256: String,
+    pub checksum_sha256: String,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct RenderLocalityCutoverRuntimeV1 {
     rows: BTreeMap<ProjectId, RenderLocalityCutoverRowV1>,
+    /// `Some` exactly when a validated marker was loaded.
+    marker: Option<RenderLocalityCutoverMarkerIdentityV1>,
 }
 
 impl RenderLocalityCutoverRuntimeV1 {
@@ -160,14 +174,35 @@ impl RenderLocalityCutoverRuntimeV1 {
         let Some(marker) = read_json_optional::<RenderLocalityCutoverMarkerV1>(&path)? else {
             return Ok(Self::default());
         };
+        Self::from_marker(marker)
+    }
+
+    fn from_marker(marker: RenderLocalityCutoverMarkerV1) -> Result<Self> {
         validate_marker(&marker)?;
         Ok(Self {
+            marker: Some(RenderLocalityCutoverMarkerIdentityV1 {
+                applied_at: marker.applied_at,
+                report_sha256: marker.report_sha256,
+                catalog_epoch: marker.catalog_epoch,
+                catalog_sha256: marker.catalog_sha256,
+                checksum_sha256: marker.checksum_sha256,
+            }),
             rows: marker
                 .rows
                 .into_iter()
                 .map(|row| (row.project_id.clone(), row))
                 .collect(),
         })
+    }
+
+    /// Identity of the loaded marker; `None` when no marker was installed.
+    pub fn marker_identity(&self) -> Option<&RenderLocalityCutoverMarkerIdentityV1> {
+        self.marker.as_ref()
+    }
+
+    /// Governed rows in project-id order.
+    pub fn rows(&self) -> impl Iterator<Item = &RenderLocalityCutoverRowV1> {
+        self.rows.values()
     }
 
     pub fn transport_governed(&self, project_id: &str) -> bool {
@@ -182,38 +217,63 @@ impl RenderLocalityCutoverRuntimeV1 {
 
     #[cfg(feature = "test-support")]
     pub fn governed_for_test(project_id: &str) -> Self {
-        let project_id = ProjectId::parse(project_id).expect("valid test project id");
-        let completions = [
-            ProjectRenderViewV1::Published,
-            ProjectRenderViewV1::Own,
-            ProjectRenderViewV1::All,
-        ]
-        .into_iter()
-        .enumerate()
-        .map(|(index, view)| RenderLocalityCompletionV1 {
-            project_id: project_id.as_str().to_string(),
-            view,
-            receipt_sha256: "a".repeat(64),
-            all_providers: true,
-            dry_run: false,
-            provider_count: 3,
-            written_count: 3,
-            refused_count: 0,
-            sequence: index as u64 + 1,
-            observed_at_unix_secs: 1,
-            issued_at_ms: None,
-        })
-        .collect();
-        let row = RenderLocalityCutoverRowV1 {
-            project_id: project_id.clone(),
-            scope: PublishedScope::try_new("test", ".").unwrap(),
-            producer_id: "test".into(),
-            completions,
-            checkout_baselines: vec![],
+        Self::governed_rows_for_test(&[(
+            project_id,
+            PublishedScope::try_new("test", ".").unwrap(),
+            "test",
+        )])
+    }
+
+    /// A runtime loaded from a checksummed marker governing exactly these
+    /// `(project_id, scope, producer_id)` rows, through the same validation
+    /// startup applies.
+    #[cfg(feature = "test-support")]
+    pub fn governed_rows_for_test(rows: &[(&str, PublishedScope, &str)]) -> Self {
+        let rows = rows
+            .iter()
+            .map(|(project_id, scope, producer_id)| {
+                let project_id = ProjectId::parse(*project_id).expect("valid test project id");
+                let completions = [
+                    ProjectRenderViewV1::Published,
+                    ProjectRenderViewV1::Own,
+                    ProjectRenderViewV1::All,
+                ]
+                .into_iter()
+                .enumerate()
+                .map(|(index, view)| RenderLocalityCompletionV1 {
+                    project_id: project_id.as_str().to_string(),
+                    view,
+                    receipt_sha256: "a".repeat(64),
+                    all_providers: true,
+                    dry_run: false,
+                    provider_count: 3,
+                    written_count: 3,
+                    refused_count: 0,
+                    sequence: index as u64 + 1,
+                    observed_at_unix_secs: 1,
+                    issued_at_ms: None,
+                })
+                .collect();
+                RenderLocalityCutoverRowV1 {
+                    project_id,
+                    scope: scope.clone(),
+                    producer_id: (*producer_id).into(),
+                    completions,
+                    checkout_baselines: vec![],
+                }
+            })
+            .collect();
+        let mut marker = RenderLocalityCutoverMarkerV1 {
+            version: MARKER_VERSION,
+            applied_at: "2026-01-01T00:00:00Z".into(),
+            report_sha256: "c".repeat(64),
+            catalog_epoch: 1,
+            catalog_sha256: "d".repeat(64),
+            rows,
+            checksum_sha256: String::new(),
         };
-        Self {
-            rows: BTreeMap::from([(project_id, row)]),
-        }
+        marker.checksum_sha256 = marker_checksum(&marker).expect("test marker checksum");
+        Self::from_marker(marker).expect("valid test marker")
     }
 }
 
@@ -1111,11 +1171,15 @@ mod tests {
             .status,
             "verified"
         );
-        assert!(
-            RenderLocalityCutoverRuntimeV1::open(&layout.state_dir)
-                .unwrap()
-                .transport_governed(PROJECT)
+        let runtime = RenderLocalityCutoverRuntimeV1::open(&layout.state_dir).unwrap();
+        assert!(runtime.transport_governed(PROJECT));
+        let identity = runtime.marker_identity().expect("loaded marker identity");
+        assert_eq!(
+            Some(&identity.checksum_sha256),
+            receipt.marker_checksum_sha256.as_ref()
         );
+        assert_eq!(identity.applied_at, "unix:3");
+        assert_eq!(runtime.rows().count() as u64, receipt.project_count);
     }
 
     const CARRIED_PROJECT: &str = "p_00000000000000000000000000000002";

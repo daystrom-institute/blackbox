@@ -172,9 +172,23 @@ pub struct CodeSourceLocalityCutoverVerifyRequestV1 {
     pub config: Config,
 }
 
+/// Path-free identity of the validated marker a runtime was opened from.
+/// `checksum_sha256` is the value the apply and verify receipts report as
+/// `marker_checksum_sha256`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CodeSourceLocalityCutoverMarkerIdentityV1 {
+    pub applied_at: String,
+    pub report_sha256: String,
+    pub catalog_epoch: u64,
+    pub catalog_sha256: String,
+    pub checksum_sha256: String,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct CodeSourceLocalityCutoverRuntimeV1 {
     rows: BTreeMap<ProjectId, CodeSourceLocalityCutoverRowV1>,
+    /// `Some` exactly when a validated marker was loaded.
+    marker: Option<CodeSourceLocalityCutoverMarkerIdentityV1>,
 }
 
 impl CodeSourceLocalityCutoverRuntimeV1 {
@@ -183,14 +197,35 @@ impl CodeSourceLocalityCutoverRuntimeV1 {
         let Some(marker) = read_json_optional::<CodeSourceLocalityCutoverMarkerV1>(&path)? else {
             return Ok(Self::default());
         };
+        Self::from_marker(marker)
+    }
+
+    fn from_marker(marker: CodeSourceLocalityCutoverMarkerV1) -> Result<Self> {
         validate_marker(&marker)?;
         Ok(Self {
+            marker: Some(CodeSourceLocalityCutoverMarkerIdentityV1 {
+                applied_at: marker.applied_at,
+                report_sha256: marker.report_sha256,
+                catalog_epoch: marker.catalog_epoch,
+                catalog_sha256: marker.catalog_sha256,
+                checksum_sha256: marker.checksum_sha256,
+            }),
             rows: marker
                 .rows
                 .into_iter()
                 .map(|row| (row.project_id.clone(), row))
                 .collect(),
         })
+    }
+
+    /// Identity of the loaded marker; `None` when no marker was installed.
+    pub fn marker_identity(&self) -> Option<&CodeSourceLocalityCutoverMarkerIdentityV1> {
+        self.marker.as_ref()
+    }
+
+    /// Governed rows in project-id order.
+    pub fn rows(&self) -> impl Iterator<Item = &CodeSourceLocalityCutoverRowV1> {
+        self.rows.values()
     }
 
     pub fn transport_governed(&self, project_id: &str) -> bool {
@@ -275,36 +310,61 @@ impl CodeSourceLocalityCutoverRuntimeV1 {
 
     #[cfg(feature = "test-support")]
     pub fn governed_for_test(project_id: &str) -> Self {
-        let project_id = ProjectId::parse(project_id).expect("valid test project id");
-        let scope = PublishedScope::try_new("test", ".").unwrap();
-        let observation = |kind| CodeSourceLocalityObservationV1 {
-            project_id: project_id.clone(),
-            scope: scope.clone(),
-            producer_id: "producer".into(),
-            generation_id: "a".repeat(64),
-            selector: "collected:test".into(),
-            snapshot_id: "snapshot".into(),
-            document_count: 1,
-            entity_inventory_sha256: "b".repeat(64),
-            evidence_kind: kind,
-            sequence: 1,
-            observed_at_unix_secs: 1,
+        Self::governed_rows_for_test(&[(
+            project_id,
+            PublishedScope::try_new("test", ".").unwrap(),
+            "producer",
+        )])
+    }
+
+    /// A runtime loaded from a checksummed marker governing exactly these
+    /// `(project_id, scope, producer_id)` rows, through the same validation
+    /// startup applies.
+    #[cfg(feature = "test-support")]
+    pub fn governed_rows_for_test(rows: &[(&str, PublishedScope, &str)]) -> Self {
+        let rows = rows
+            .iter()
+            .map(|(project_id, scope, producer_id)| {
+                let project_id = ProjectId::parse(*project_id).expect("valid test project id");
+                let observation = |kind| CodeSourceLocalityObservationV1 {
+                    project_id: project_id.clone(),
+                    scope: scope.clone(),
+                    producer_id: (*producer_id).into(),
+                    generation_id: "a".repeat(64),
+                    selector: "collected:test".into(),
+                    snapshot_id: "snapshot".into(),
+                    document_count: 1,
+                    entity_inventory_sha256: "b".repeat(64),
+                    evidence_kind: kind,
+                    sequence: 1,
+                    observed_at_unix_secs: 1,
+                };
+                CodeSourceLocalityCutoverRowV1 {
+                    project_id: project_id.clone(),
+                    scope: scope.clone(),
+                    producer_id: (*producer_id).into(),
+                    generation: generation_from_observation(&observation(
+                        CodeSourceLocalityEvidenceKindV1::StartupRecovery,
+                    )),
+                    startup_recovery: observation(
+                        CodeSourceLocalityEvidenceKindV1::StartupRecovery,
+                    ),
+                    full_rebuild: observation(CodeSourceLocalityEvidenceKindV1::FullRebuild),
+                    checkout_baselines: Vec::new(),
+                }
+            })
+            .collect();
+        let mut marker = CodeSourceLocalityCutoverMarkerV1 {
+            version: MARKER_VERSION,
+            applied_at: "2026-01-01T00:00:00Z".into(),
+            report_sha256: "c".repeat(64),
+            catalog_epoch: 1,
+            catalog_sha256: "d".repeat(64),
+            rows,
+            checksum_sha256: String::new(),
         };
-        let generation = generation_from_observation(&observation(
-            CodeSourceLocalityEvidenceKindV1::StartupRecovery,
-        ));
-        let row = CodeSourceLocalityCutoverRowV1 {
-            project_id: project_id.clone(),
-            scope: scope.clone(),
-            producer_id: "producer".into(),
-            generation,
-            startup_recovery: observation(CodeSourceLocalityEvidenceKindV1::StartupRecovery),
-            full_rebuild: observation(CodeSourceLocalityEvidenceKindV1::FullRebuild),
-            checkout_baselines: Vec::new(),
-        };
-        Self {
-            rows: BTreeMap::from([(project_id, row)]),
-        }
+        marker.checksum_sha256 = marker_checksum(&marker).expect("test marker checksum");
+        Self::from_marker(marker).expect("valid test marker")
     }
 }
 
@@ -1380,6 +1440,16 @@ mod tests {
     }
 
     #[test]
+    fn absent_marker_opens_an_ungoverned_runtime_without_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let runtime = CodeSourceLocalityCutoverRuntimeV1::open(&root).unwrap();
+        assert!(runtime.marker_identity().is_none());
+        assert_eq!(runtime.rows().count(), 0);
+        assert!(!runtime.transport_governed(PROJECT));
+    }
+
+    #[test]
     fn current_v2_preflight_apply_verify_closes_post_cutover_local_walk() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
@@ -1414,11 +1484,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(applied.status, "applied");
-        assert!(
-            CodeSourceLocalityCutoverRuntimeV1::open(&layout.state_dir)
-                .unwrap()
-                .transport_governed(project_id.as_str())
+        let runtime = CodeSourceLocalityCutoverRuntimeV1::open(&layout.state_dir).unwrap();
+        assert!(runtime.transport_governed(project_id.as_str()));
+        let identity = runtime.marker_identity().expect("loaded marker identity");
+        assert_eq!(
+            Some(&identity.checksum_sha256),
+            applied.marker_checksum_sha256.as_ref()
         );
+        assert_eq!(identity.applied_at, "2026-08-09T00:05:00Z");
+        assert_eq!(runtime.rows().count() as u64, applied.project_count);
         let verified = ProjectCatalogCodeSourceLocalityCutoverFacadeV1::verify(
             CodeSourceLocalityCutoverVerifyRequestV1 {
                 layout: layout.clone(),
