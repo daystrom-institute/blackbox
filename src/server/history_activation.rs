@@ -189,35 +189,188 @@ pub(crate) fn spawn_worker(state: &Arc<SharedState>) -> Result<()> {
                 let Some(state) = weak.upgrade() else {
                     break;
                 };
-                let store = state.git_sources.store();
-                match store.current_ready_source_ids() {
-                    Ok(ids) => pending.extend(ids),
-                    Err(error) => tracing::warn!(%error, "enumerating ready Git-history sources failed"),
-                }
-                match store.list_activation_journals() {
-                    Ok(journals) => pending.extend(
-                        journals
-                            .into_iter()
-                            .filter(|journal| !journal.stage.terminal())
-                            .map(|journal| journal.source_generation_id),
-                    ),
-                    Err(error) => tracing::warn!(%error, "enumerating Git-history activation journals failed"),
-                }
-                let batch = std::mem::take(&mut pending);
-                for source in batch {
-                    if let Err(error) = activate_source(&state, &source) {
-                        record_activation_failure(&state, &source, &error);
-                        tracing::warn!(
-                            source_generation = %source,
-                            error = %error,
-                            "typed Git-history activation did not converge; background redrive will retry"
-                        );
-                    }
-                }
+                run_activation_tick(&state, &mut pending);
             }
         })
         .context("spawning Git-history activation worker")?;
     Ok(())
+}
+
+/// One worker tick: seed the work set from durable store state, then
+/// redrive each source. A current ready source whose repository history the
+/// producer grant table refuses (no catalog project binds it, its members
+/// split across producers, or the producer lost the scope) cannot converge
+/// by retrying, so it is dead-lettered: one durable record and one WARN,
+/// then quiet skips. The grant is re-derived every tick, so a catalog or
+/// grant change resumes the redrive without operator action. A dead letter
+/// whose source is no longer a redrive candidate is dropped.
+fn run_activation_tick(state: &Arc<SharedState>, pending: &mut BTreeSet<String>) {
+    let store = state.git_sources.store();
+    let mut seeded = true;
+    match store.current_ready_source_ids() {
+        Ok(ids) => pending.extend(ids),
+        Err(error) => {
+            seeded = false;
+            tracing::warn!(%error, "enumerating ready Git-history sources failed");
+        }
+    }
+    match store.list_activation_journals() {
+        Ok(journals) => pending.extend(
+            journals
+                .into_iter()
+                .filter(|journal| !journal.stage.terminal())
+                .map(|journal| journal.source_generation_id),
+        ),
+        Err(error) => {
+            seeded = false;
+            tracing::warn!(%error, "enumerating Git-history activation journals failed");
+        }
+    }
+    let deadletters = match store.list_activation_deadletters() {
+        Ok(deadletters) => deadletters
+            .into_iter()
+            .map(|deadletter| (deadletter.repo_history_id.clone(), deadletter))
+            .collect::<BTreeMap<_, _>>(),
+        Err(error) => {
+            seeded = false;
+            tracing::warn!(%error, "enumerating Git-history activation dead letters failed");
+            BTreeMap::new()
+        }
+    };
+    let batch = std::mem::take(pending);
+    for source in &batch {
+        if deadletter_source(state, &store, source, &deadletters) {
+            continue;
+        }
+        if let Err(error) = activate_source(state, source) {
+            record_activation_failure(state, source, &error);
+            tracing::warn!(
+                source_generation = %source,
+                error = %error,
+                "typed Git-history activation did not converge; background redrive will retry"
+            );
+        }
+    }
+    if seeded {
+        for deadletter in deadletters.values() {
+            if !batch.contains(&deadletter.source_generation_id) {
+                drop_deadletter(
+                    &store,
+                    deadletter,
+                    "its source is no longer a redrive candidate",
+                );
+            }
+        }
+    }
+}
+
+/// Dead-letter `source` when it is its repository's current ready source
+/// and the grant table refuses the repository. Returns whether the source
+/// was dead-lettered; otherwise any stale dead letter for the repository is
+/// dropped so the redrive proceeds.
+fn deadletter_source(
+    state: &Arc<SharedState>,
+    store: &bbox_git_source_store::GitSourceStore,
+    source: &str,
+    deadletters: &BTreeMap<RepoHistoryId, bbox_git_source_store::ActivationDeadletterV1>,
+) -> bool {
+    let Ok(authority) = store.generation_authority_for_any_producer(source) else {
+        return false;
+    };
+    let prior = deadletters.get(&authority.repo_history_id);
+    let current = store
+        .current_ready_source_id(&authority.repo_history_id)
+        .ok()
+        .flatten()
+        .as_deref()
+        == Some(source);
+    let refusal = current
+        .then(|| {
+            state
+                .code_sources
+                .producer_auth()
+                .repo_transport_grant_for_id(&authority.producer_id, &authority.repo_history_id)
+                .err()
+                .map(|error| error.code())
+        })
+        .flatten();
+    let Some(code) = refusal else {
+        if let Some(prior) = prior
+            && prior.source_generation_id == source
+        {
+            drop_deadletter(store, prior, "its producer grant now resolves");
+        }
+        return false;
+    };
+    if prior.is_some_and(|prior| prior.source_generation_id == source && prior.error_code == code) {
+        tracing::debug!(
+            repo_history = %authority.repo_history_id,
+            source_generation = %source,
+            error_code = code,
+            "Git-history activation remains dead-lettered"
+        );
+        return true;
+    }
+    let diagnostic = deadletter_diagnostic(code);
+    match store.record_activation_deadletter(
+        &authority.repo_history_id,
+        &authority.producer_id,
+        source,
+        code,
+        Some(diagnostic.to_string()),
+    ) {
+        Ok(deadletter) => {
+            record_activation_failure(state, source, &anyhow!("{code}"));
+            tracing::warn!(
+                repo_history = %authority.repo_history_id,
+                source_generation = %source,
+                error_code = code,
+                attempts = deadletter.attempts,
+                "typed Git-history activation dead-lettered: {diagnostic}; redrive resumes when the catalog or producer grant changes"
+            );
+        }
+        Err(error) => tracing::warn!(
+            repo_history = %authority.repo_history_id,
+            source_generation = %source,
+            error_code = code,
+            %error,
+            "recording the Git-history activation dead letter failed"
+        ),
+    }
+    true
+}
+
+fn drop_deadletter(
+    store: &bbox_git_source_store::GitSourceStore,
+    deadletter: &bbox_git_source_store::ActivationDeadletterV1,
+    reason: &str,
+) {
+    match store.drop_activation_deadletter(&deadletter.repo_history_id) {
+        Ok(true) => tracing::info!(
+            repo_history = %deadletter.repo_history_id,
+            source_generation = %deadletter.source_generation_id,
+            error_code = %deadletter.error_code,
+            "Git-history activation dead letter dropped: {reason}"
+        ),
+        Ok(false) => {}
+        Err(error) => tracing::warn!(
+            repo_history = %deadletter.repo_history_id,
+            %error,
+            "dropping the Git-history activation dead letter failed"
+        ),
+    }
+}
+
+/// Operator-facing meaning of a dead-lettered grant refusal.
+pub(crate) fn deadletter_diagnostic(code: &str) -> &'static str {
+    match code {
+        "repo_history_not_found" => "no catalog project binds this repository history",
+        "repo_history_scope_split" => {
+            "the repository's catalog members are assigned to more than one producer"
+        }
+        "scope_forbidden" => "the recorded producer no longer holds a grant for this repository",
+        _ => "the producer grant table refuses this repository",
+    }
 }
 
 pub(crate) fn activate_source(state: &Arc<SharedState>, source_generation_id: &str) -> Result<()> {
@@ -2202,5 +2355,208 @@ mod tests {
             .unwrap();
         }
         assert!(staged_overlays().is_empty());
+    }
+
+    const ORPHAN_PROJECT: &str = "p_orphan_root";
+
+    /// The production redrive shape: an accepted source whose repository
+    /// history has a catalog record but no catalog project binding it, so the
+    /// producer grant table refuses it with `repo_history_not_found`.
+    fn orphaned_history_fixture() -> (CatalogFixture, Arc<SharedState>, RepoHistoryId, String) {
+        let fixture = CatalogFixture::new();
+        let root_scope = CatalogFixture::scope(".");
+        fixture.add_published_project(ORPHAN_PROJECT, &root_scope);
+        let history = RepoHistoryId::parse("rh_0000000000000000000000000000000d").unwrap();
+        let namespace = CommitNamespace::parse("repo_example").unwrap();
+        let epoch = fixture.epoch();
+        fixture
+            .store()
+            .transact(epoch, |catalog, _| {
+                catalog.repo_histories.insert(
+                    history.clone(),
+                    RepoHistoryRecord {
+                        repo_history_id: history.clone(),
+                        membership_generation: 0,
+                        authority: RepoHistoryAuthority::Recorded(
+                            RecordedRepoAuthority::parse("repo_example").unwrap(),
+                        ),
+                        primary_namespace: namespace.clone(),
+                        compatibility_namespaces: Default::default(),
+                        materialization: RepoHistoryMaterialization::NotBuilt,
+                    },
+                );
+                Ok(())
+            })
+            .unwrap();
+        let state = fixture.server().state;
+        install_catalog_auth(&state);
+        let head = "1".repeat(40);
+        install_empty_code_generation(&state, ORPHAN_PROJECT, root_scope.clone(), &head);
+        let source = install_history_source(&state, &history, &namespace, root_scope, &head);
+        (fixture, state, history, source)
+    }
+
+    fn install_catalog_auth(state: &Arc<SharedState>) {
+        let token = bro_rpc::ServiceToken::parse("d".repeat(64)).unwrap();
+        let catalog = state
+            .project_authority
+            .catalog_store()
+            .unwrap()
+            .snapshot()
+            .unwrap();
+        state
+            .code_sources
+            .install_auth_for_test(Arc::new(ProducerAuthRuntime::for_test_catalog(
+                vec![(
+                    token,
+                    ProducerGrant {
+                        producer_id: "producer-a".into(),
+                        projects: BTreeMap::from([(
+                            CatalogFixture::scope("."),
+                            ORPHAN_PROJECT.to_string(),
+                        )]),
+                    },
+                )],
+                catalog.catalog(),
+            )));
+    }
+
+    fn deadletter(
+        state: &Arc<SharedState>,
+        history: &RepoHistoryId,
+    ) -> Option<bbox_git_source_store::ActivationDeadletterV1> {
+        state
+            .git_sources
+            .store()
+            .read_activation_deadletter(history)
+            .unwrap()
+    }
+
+    #[test]
+    fn orphaned_ready_source_is_deadlettered_once_and_resumes_when_bound() {
+        let (_fixture, state, history, source) = orphaned_history_fixture();
+        let mut pending = BTreeSet::new();
+
+        run_activation_tick(&state, &mut pending);
+        let recorded = deadletter(&state, &history).expect("orphan source is dead-lettered");
+        assert_eq!(recorded.error_code, "repo_history_not_found");
+        assert_eq!(recorded.source_generation_id, source);
+        assert_eq!(recorded.attempts, 1);
+        assert!(
+            state
+                .git_sources
+                .store()
+                .read_activation_journal(&history)
+                .unwrap()
+                .is_none(),
+            "a dead-lettered source never starts an activation"
+        );
+        // No health row is keyed by the repository history, and no bound
+        // project exists to carry one.
+        assert!(
+            state
+                .code_sources
+                .store()
+                .health_records()
+                .unwrap()
+                .is_empty()
+        );
+
+        // Later ticks skip without rewriting the durable record.
+        for _ in 0..3 {
+            run_activation_tick(&state, &mut pending);
+        }
+        assert_eq!(deadletter(&state, &history), Some(recorded));
+
+        // Binding a catalog project resolves the grant: the dead letter is
+        // dropped and the same source activates without operator action.
+        let catalog_store = state.project_authority.catalog_store().unwrap();
+        let epoch = catalog_store.snapshot().unwrap().epoch();
+        catalog_store
+            .transact(epoch, |catalog, _| {
+                catalog
+                    .projects
+                    .get_mut(&ProjectId::parse(ORPHAN_PROJECT).unwrap())
+                    .unwrap()
+                    .repo_history = Some(history.clone());
+                Ok(())
+            })
+            .unwrap();
+        install_catalog_auth(&state);
+        run_activation_tick(&state, &mut pending);
+        assert!(deadletter(&state, &history).is_none());
+        assert_eq!(
+            state
+                .git_sources
+                .store()
+                .read_activation_journal(&history)
+                .unwrap()
+                .unwrap()
+                .stage,
+            HistoryActivationStageV1::Committed
+        );
+    }
+
+    #[test]
+    fn deadletter_is_dropped_once_its_ready_pointer_is_retired() {
+        let (_fixture, state, history, source) = orphaned_history_fixture();
+        let mut pending = BTreeSet::new();
+        run_activation_tick(&state, &mut pending);
+        assert!(deadletter(&state, &history).is_some());
+
+        let store = state.git_sources.store();
+        assert_eq!(
+            store.retire_current_ready_pointer(&history).unwrap(),
+            Some(source.clone())
+        );
+        assert_eq!(
+            store.history_status("producer-a", &source).unwrap().state,
+            GitHistorySourceStateV1::Superseded
+        );
+        run_activation_tick(&state, &mut pending);
+        assert!(deadletter(&state, &history).is_none());
+        assert!(store.current_ready_source_ids().unwrap().is_empty());
+    }
+
+    #[test]
+    fn legacy_deadletter_for_the_current_source_is_kept_without_a_redrive() {
+        let (_fixture, state, history, source) = orphaned_history_fixture();
+        let store = state.git_sources.store();
+        // A record an older build accumulated over many redrives.
+        for _ in 0..6 {
+            store
+                .record_activation_deadletter(
+                    &history,
+                    "producer-a",
+                    &source,
+                    "repo_history_not_found",
+                    Some("no published project binds this repo history".to_string()),
+                )
+                .unwrap();
+        }
+        let legacy = deadletter(&state, &history).unwrap();
+        assert_eq!(legacy.attempts, 6);
+
+        let mut pending = BTreeSet::new();
+        run_activation_tick(&state, &mut pending);
+        assert_eq!(deadletter(&state, &history), Some(legacy));
+        assert!(store.read_activation_journal(&history).unwrap().is_none());
+    }
+
+    #[test]
+    fn missing_deadletter_area_is_created_on_first_deadletter() {
+        let (_fixture, state, history, _source) = orphaned_history_fixture();
+        let area = state
+            .git_sources
+            .store()
+            .root()
+            .join("activation-deadletter");
+        std::fs::remove_dir(&area).unwrap();
+        assert!(!area.exists());
+
+        let mut pending = BTreeSet::new();
+        run_activation_tick(&state, &mut pending);
+        assert!(area.is_dir());
+        assert!(deadletter(&state, &history).is_some());
     }
 }

@@ -1132,6 +1132,43 @@ fn resolver_compat_section(state: &crate::server::state::SharedState) -> Section
     }
 }
 
+/// Git-history activations the background lane dead-lettered because the
+/// producer grant table refuses their repository. The dead letter is the
+/// durable record; it disappears when the grant resolves, the source stops
+/// being a redrive candidate, or an operator drops it.
+fn history_activation_deadletter_findings(
+    state: &crate::server::state::SharedState,
+) -> Vec<Finding> {
+    let deadletters = match state.git_sources.store().list_activation_deadletters() {
+        Ok(deadletters) => deadletters,
+        Err(error) => {
+            return vec![Finding::warn(format!(
+                "Git-history activation dead letters are unreadable: {error:#}"
+            ))];
+        }
+    };
+    deadletters
+        .into_iter()
+        .map(|deadletter| {
+            let repo_history = deadletter.repo_history_id.as_str();
+            let message = format!(
+                "repository history `{repo_history}` typed activation is dead-lettered ({}): {}; source generation `{}` is not redriven until the catalog or producer grant changes",
+                deadletter.error_code,
+                crate::server::history_activation::deadletter_diagnostic(&deadletter.error_code),
+                deadletter.source_generation_id,
+            );
+            let next = if deadletter.error_code == "repo_history_not_found" {
+                format!(
+                    "bind a catalog project to this repository history, or retire its ready pointer with `blackbox git-history activations-drop --repo-history {repo_history} --retire-ready-pointer`"
+                )
+            } else {
+                "repair the producer grant for this repository; the activation lane resumes automatically once the grant resolves".to_string()
+            };
+            Finding::action(message, next)
+        })
+        .collect()
+}
+
 fn code_sources_section(state: &crate::server::state::SharedState) -> SectionReport {
     let store = state.code_sources.store();
     let mut findings = Vec::new();
@@ -1240,6 +1277,7 @@ fn code_sources_section(state: &crate::server::state::SharedState) -> SectionRep
             "code-source health records are unreadable: {error:#}"
         ))),
     }
+    findings.extend(history_activation_deadletter_findings(state));
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3039,5 +3077,68 @@ mod catalog_health_tests {
             )),
             "{text}"
         );
+    }
+}
+
+#[cfg(test)]
+mod history_activation_deadletter_tests {
+    use super::*;
+
+    #[test]
+    fn deadlettered_activation_surfaces_with_the_retirement_remedy() {
+        crate::init_system_memory_for_tests();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let state = std::sync::Arc::new(crate::server::state::SharedState::for_test(&root));
+        assert!(
+            history_activation_deadletter_findings(&state).is_empty(),
+            "a never-provisioned dead-letter area reports nothing"
+        );
+
+        let repo_history = bbox_corpus_core::project_catalog::RepoHistoryId::parse(
+            "rh_00000000000000000000000000000042",
+        )
+        .unwrap();
+        let source = format!("ghs_{}", "a".repeat(64));
+        state
+            .git_sources
+            .store()
+            .record_activation_deadletter(
+                &repo_history,
+                "producer-a",
+                &source,
+                "repo_history_not_found",
+                None,
+            )
+            .unwrap();
+
+        let section = code_sources_section(&state);
+        let finding = section
+            .findings
+            .iter()
+            .find(|finding| finding.message.contains(repo_history.as_str()))
+            .expect("the dead letter surfaces in the code_sources section");
+        assert_eq!(finding.level, FindingLevel::Action);
+        assert!(
+            finding.message.contains("dead-lettered"),
+            "{}",
+            finding.message
+        );
+        assert!(finding.message.contains(&source), "{}", finding.message);
+        let next = finding.next.as_deref().unwrap_or_default();
+        assert!(
+            next.contains(&format!(
+                "blackbox git-history activations-drop --repo-history {}",
+                repo_history.as_str()
+            )) && next.contains("--retire-ready-pointer"),
+            "{next}"
+        );
+
+        state
+            .git_sources
+            .store()
+            .drop_activation_deadletter(&repo_history)
+            .unwrap();
+        assert!(history_activation_deadletter_findings(&state).is_empty());
     }
 }
