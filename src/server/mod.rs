@@ -92,7 +92,6 @@ impl BlackboxServer {
                 + crate::tools::doctor::router()
                 + crate::tools::storage_health::router()
                 + crate::tools::storage_gc::router()
-                + crate::tools::storage_migration::router()
                 + crate::tools::tool_calls::router(),
             embed_status_snapshots: Default::default(),
             surface: std::sync::OnceLock::new(),

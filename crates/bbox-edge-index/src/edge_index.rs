@@ -963,8 +963,6 @@ fn thread_edge_kind_name(kind: &EdgeKind) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::fs::OpenOptions;
-    use std::io::Write;
 
     use super::*;
 
@@ -2296,72 +2294,6 @@ mod tests {
             !dir.path().join("p1.jsonl").exists(),
             "lifecycle writes must not regrow the legacy compatibility lane"
         );
-    }
-
-    #[test]
-    fn plan_legacy_extraction_classifies_lines() {
-        let dir = tempfile::tempdir().unwrap();
-
-        let derived = derived_chunker_edge("NEXT_SECTION");
-        let tool = observed_tool_edge("RAN_BASH");
-        let explicit = explicit_edge("SUPERSEDES");
-
-        append_project_edges(dir.path(), "p1", &[derived]).unwrap();
-        append_edges(dir.path(), "p1", &[tool]).unwrap();
-        append_edges(dir.path(), "p1", &[explicit]).unwrap();
-        {
-            let mut f = OpenOptions::new()
-                .append(true)
-                .open(dir.path().join("p1.jsonl"))
-                .unwrap();
-            f.write_all(b"\n").unwrap();
-            f.write_all(b"not json\n").unwrap();
-        }
-
-        let plan = plan_legacy_edge_extraction(dir.path(), "p1").unwrap();
-        assert_eq!(plan.total_lines, 5);
-        assert_eq!(plan.derived_lines, 1);
-        assert_eq!(plan.tool_lines, 1);
-        assert_eq!(plan.explicit_lines, 1);
-        assert_eq!(plan.blank_lines, 1);
-        assert_eq!(plan.malformed_lines, 1);
-        assert!(!plan.managed_replacement_exists);
-        assert!(!plan.extractable);
-    }
-
-    #[test]
-    fn plan_legacy_extraction_detects_managed_replacement() {
-        let dir = tempfile::tempdir().unwrap();
-        let derived = derived_chunker_edge("NEXT_SECTION");
-        append_project_edges(dir.path(), "p1", std::slice::from_ref(&derived)).unwrap();
-
-        let plan_before = plan_legacy_edge_extraction(dir.path(), "p1").unwrap();
-        assert!(!plan_before.managed_replacement_exists);
-
-        replace_materialized_edges(dir.path(), "project", "p1", &[derived]).unwrap();
-
-        let plan_after = plan_legacy_edge_extraction(dir.path(), "p1").unwrap();
-        assert!(plan_after.managed_replacement_exists);
-        assert!(plan_after.extractable);
-    }
-
-    #[test]
-    fn plan_tool_only_legacy_lane_is_extractable_with_managed_replacement() {
-        let dir = tempfile::tempdir().unwrap();
-        append_edges(dir.path(), "p1", &[observed_tool_edge("RAN_BASH")]).unwrap();
-        replace_materialized_edges(
-            dir.path(),
-            "project",
-            "p1",
-            &[derived_chunker_edge("NEXT_SECTION")],
-        )
-        .unwrap();
-
-        let plan = plan_legacy_edge_extraction(dir.path(), "p1").unwrap();
-        assert_eq!(plan.derived_lines, 0);
-        assert_eq!(plan.tool_lines, 1);
-        assert!(plan.managed_replacement_exists);
-        assert!(plan.extractable);
     }
 
     #[test]

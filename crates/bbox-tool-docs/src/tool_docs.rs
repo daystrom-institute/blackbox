@@ -828,13 +828,6 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
             r#"bbox_storage_gc(detail="candidates"); bbox_storage_gc(receipt_id="<returned id>", detail="candidates", cursor="<body.next_cursor>")"#,
         ),
     },
-    ToolDoc {
-        name: "bbox_storage_migrate_legacy_edges",
-        category: ToolCategory::StorageHealth,
-        summary: "Dry-run or apply daemon-local legacy edge sidecar migration into lifecycle-owned explicit/observed lanes. Selectors (project_id, operator alias, registered path) resolve through one authority in both modes; unknown selectors fail both. Dry-run plans are paged; only selected page targets are planned after sidecar discovery.",
-        when_to_use: "Migrating pre-Phase-2 legacy sidecars into lane-split storage. The project selector resolves project_id, operator alias, and registered path through the SAME authority for dry-run and apply; an unknown selector refuses identically in both modes instead of returning an empty plan set. Dry-run without a filter plans every registered project with a sidecar, paged in project order (limit default 20, max 100; follow next_offset, restart at 0 after lifecycle actions) and reports unregistered sidecars it skipped. apply requires exactly one registered project; limit/offset are refused there before any scan. Operates on daemon-local edge storage; drops derived only when managed replacement exists; quarantines malformed lines.",
-        example: None,
-    },
     // ── Reactions ──────────────────────────────────────────────────
 
     // ── Identity ─────────────────────────────────────────────────────

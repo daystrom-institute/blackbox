@@ -32,7 +32,6 @@ pub mod scope;
 pub mod sessions;
 pub mod storage_gc;
 pub mod storage_health;
-pub mod storage_migration;
 pub mod threads;
 pub mod tool_calls;
 pub mod transcripts;
