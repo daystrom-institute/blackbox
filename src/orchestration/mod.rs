@@ -3887,13 +3887,7 @@ fn spawn_harness_ingest_loop(
             // below this has been applied", so advancing early would let a
             // replay skip an event this daemon never actually ingested.
             let seq = evt.get("seq").and_then(Value::as_u64);
-            ingest_harness_event(
-                &task,
-                provider,
-                evt,
-                &tail_tx,
-                &task_id,
-            );
+            ingest_harness_event(&task, provider, evt, &tail_tx, &task_id);
             if let Some(seq) = seq {
                 let mut inner = task.inner.lock();
                 inner.harness_ingest_seq = inner.harness_ingest_seq.max(seq);
@@ -8388,13 +8382,7 @@ mod tests {
         evt["seq"] = json!(7);
         let task = mk_ingest_task("instruction-timeout", "fixture-session");
         let (tx, _) = tokio::sync::broadcast::channel(16);
-        ingest_harness_event(
-            &task,
-            Provider::Brodex,
-            evt,
-            &tx,
-            "instruction-timeout",
-        );
+        ingest_harness_event(&task, Provider::Brodex, evt, &tx, "instruction-timeout");
         assert_eq!(task.inner.lock().status, TaskStatus::Running);
         let status = mcp_task_status_json(&task, "summary", None, None, 5, false).unwrap();
         let recent = status["recentEvents"].as_array().unwrap();
@@ -8563,32 +8551,14 @@ mod tests {
                 "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": text}},
             })
         };
-        ingest_harness_event(
-            &task,
-            Provider::Minimax,
-            delta("hel"),
-            &tx,
-            "task-deltas",
-        );
-        ingest_harness_event(
-            &task,
-            Provider::Minimax,
-            delta("lo"),
-            &tx,
-            "task-deltas",
-        );
+        ingest_harness_event(&task, Provider::Minimax, delta("hel"), &tx, "task-deltas");
+        ingest_harness_event(&task, Provider::Minimax, delta("lo"), &tx, "task-deltas");
         let assistant = serde_json::json!({
             "type": "assistant",
             "session_id": "sess-d",
             "message": {"role": "assistant", "content": [{"type": "text", "text": "hello"}]},
         });
-        ingest_harness_event(
-            &task,
-            Provider::Minimax,
-            assistant,
-            &tx,
-            "task-deltas",
-        );
+        ingest_harness_event(&task, Provider::Minimax, assistant, &tx, "task-deltas");
 
         let inner = task.inner.lock();
         assert_eq!(inner.last_assistant_message.as_deref(), Some("hello"));

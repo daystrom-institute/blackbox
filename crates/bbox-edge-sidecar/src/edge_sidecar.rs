@@ -86,7 +86,8 @@ pub struct Edge {
 
 /// Endpoint types with no surviving entity family, each with the field that
 /// carries its identity. Rows naming one stay inert on disk.
-const RETIRED_ENDPOINT_TYPES: [(&str, &str); 2] = [("roadmap_item", "id"), ("whiteboard", "board_id")];
+const RETIRED_ENDPOINT_TYPES: [(&str, &str); 2] =
+    [("roadmap_item", "id"), ("whiteboard", "board_id")];
 
 fn retired_endpoint_id_field(endpoint: &serde_json::Value) -> Option<&'static str> {
     RETIRED_ENDPOINT_TYPES
