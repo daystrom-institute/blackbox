@@ -259,11 +259,6 @@ pub(super) fn open_shared_state(
     // open the platform default while the migration inventory and the
     // retirement discharge read the configured root.
     vectors::install_global_root(cfg.paths.vectors_path.clone());
-    // Push the config-resolved git-notes namespace into the corpus-core
-    // foundation crate (dependency inversion: corpus-core must not reach up into
-    // blackbox::config). Absent this, git::notes_namespace falls back to the
-    // BBOX_GIT_NOTES_NAMESPACE env var, then "bbox".
-    crate::git::set_notes_namespace(cfg.provenance.git_notes_namespace.clone())?;
     let cfg_arc = Arc::new(RwLock::new(cfg.clone()));
 
     let roots = discover_transcript_roots(&cfg, home);
@@ -301,10 +296,6 @@ pub(super) fn open_shared_state(
     let knowledge_transport_observations =
         bbox_indexing::knowledge_transport_observations::KnowledgeTransportObservationsV1::open(
             store_dir.join("knowledge-transport-observations.json"),
-        )?;
-    let blame_locality_observations =
-        bbox_indexing::blame_locality_observations::BlameLocalityObservationsV1::open(
-            store_dir.join("blame-locality-observations.json"),
         )?;
     let render_locality_observations =
         bbox_indexing::render_locality_observations::RenderLocalityObservationsV1::open(
@@ -344,19 +335,6 @@ pub(super) fn open_shared_state(
         } else {
             bbox_indexing::knowledge_transport_cutover::KnowledgeTransportCutoverRuntimeV1::default(
             )
-        },
-    );
-    let blame_locality_cutover = Arc::new(
-        if matches!(
-            store_probe,
-            bbox_indexing::project_catalog_store::ProjectStoreProbe::CatalogV2
-        ) {
-            bbox_indexing::blame_locality_cutover::BlameLocalityCutoverRuntimeV1::open(
-                &cfg.paths.state_dir,
-            )
-            .map_err(|error| anyhow::anyhow!("blame locality cutover startup gate: {error}"))?
-        } else {
-            bbox_indexing::blame_locality_cutover::BlameLocalityCutoverRuntimeV1::default()
         },
     );
     let render_locality_cutover = Arc::new(
@@ -983,7 +961,6 @@ pub(super) fn open_shared_state(
         ),
         checkout_access,
         knowledge_transport_observations,
-        blame_locality_observations,
         render_locality_observations,
         // Publisher refs define authority and cannot be reconstructed from
         // checkout discovery without silently moving published truth. Keep
@@ -1017,7 +994,6 @@ pub(super) fn open_shared_state(
         knowledge_sources,
         git_transport_cutover,
         knowledge_transport_cutover,
-        blame_locality_cutover,
         render_locality_cutover,
         code_source_locality_cutover,
         reconciler_shutdown: parking_lot::RwLock::new(Arc::new(

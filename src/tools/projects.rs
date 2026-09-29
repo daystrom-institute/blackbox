@@ -7,7 +7,6 @@ use std::time::Duration;
 use crate::artifacts;
 use crate::config;
 use crate::index;
-use crate::mcp_tools;
 use crate::orchestration;
 use crate::projects::{
     ProjectEjectParams, ProjectInitParams, ProjectListResponse, ProjectRegisterParams,
@@ -648,58 +647,6 @@ impl BlackboxServer {
                     skipped_enrichment.push("artifact_discovery");
                 }
                 Err(error) => return Err(error),
-            }
-            let edges_dir = crate::server::edge_sidecar_dir(&server.state);
-            let provenance_lease =
-                match crate::server::checkout_access::acquire_selected_project_access(
-                    &server.state.checkout_access,
-                    &record.project_id,
-                    CheckoutAccessKind::ProvenanceNoteIo,
-                    CheckoutAccessIntent::Read,
-                ) {
-                    Ok(lease) => Some(lease),
-                    Err(error) if capability_denied(&error) => {
-                        skipped_enrichment.push("provenance_import");
-                        None
-                    }
-                    Err(error) => return Err(error),
-                };
-            if let Some(provenance_lease) = provenance_lease {
-                let provenance_project = mcp_tools::provenance::ProvenanceProject {
-                    project_id: record.project_id.clone(),
-                    project_root: provenance_lease.project_root().to_path_buf(),
-                };
-                let resolve_legacy_target =
-                    |project_id: &str,
-                     root: &Path,
-                     absolute_path: &Path,
-                     byte_range: Option<(u64, u64)>| {
-                        if project_id != record.project_id {
-                            anyhow::bail!(
-                                "error.project_mismatch: provenance target belongs to another project"
-                            );
-                        }
-                        bbox_indexing::index::resolve_current_project_chunk_entity(
-                            &record.project_id,
-                            root,
-                            absolute_path,
-                            byte_range,
-                        )
-                    };
-                let prepared_provenance = mcp_tools::provenance::prepare_provenance_import(
-                    std::slice::from_ref(&provenance_project),
-                    &resolve_legacy_target,
-                )?;
-                let provenance_publication = server
-                    .state
-                    .checkout_access
-                    .publication_guard(&provenance_lease)
-                    .map_err(anyhow::Error::new)?;
-                mcp_tools::provenance::publish_prepared_provenance_import(
-                    prepared_provenance,
-                    &edges_dir,
-                )?;
-                drop(provenance_publication);
             }
             // Register with the live .bbox/ watcher so future file changes
             // are picked up without a daemon restart.

@@ -7,8 +7,6 @@
 //! (`register_embed_hooks`); when nothing is registered — engine-only
 //! tests, standalone use — emits are silently dropped, matching the
 //! best-effort semantics embed enqueue already has.
-//!
-//! Same startup-injection pattern as `bbox_corpus_core::git::set_notes_namespace`.
 
 use std::collections::HashMap;
 use std::sync::OnceLock;

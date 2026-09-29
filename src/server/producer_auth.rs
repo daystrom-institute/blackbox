@@ -210,9 +210,7 @@ impl ProducerAuthRuntime {
         }
         if config.code_collection.git_transport_enabled
             && (config.code_collection.max_git_history_commits == 0
-                || config.code_collection.max_git_history_logical_bytes == 0
-                || config.code_collection.max_provenance_documents == 0
-                || config.code_collection.max_provenance_logical_bytes == 0)
+                || config.code_collection.max_git_history_logical_bytes == 0)
         {
             bail!("Git transport limits must be nonzero");
         }
