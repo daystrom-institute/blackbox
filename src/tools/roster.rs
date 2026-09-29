@@ -782,10 +782,26 @@ impl BlackboxServer {
         description = "Manage teamplates and teams without automatic advisor execution. list/list_templates/roster return bounded summaries; get/get_template return exact JSON body pages."
     )]
     pub(crate) async fn bro_team(&self, Parameters(p): Parameters<TeamParams>) -> CallToolResult {
-        if let Err(error) =
-            validate_team_params(&p).and_then(|()| require_team_template_locality(self, &p))
-        {
+        if let Err(error) = validate_team_params(&p) {
             return Self::err_text(&error.to_string());
+        }
+        if is_project_template_action(&p) && !self.state.project_authority.is_bridge() {
+            let mutation = matches!(p.action.as_str(), "save_template" | "delete_template");
+            let server = self.clone();
+            let result = Self::run_blocking_with_structured("bro_team", move || {
+                let value = catalog_project_template_action(&server, &p)?;
+                Ok((serde_json::to_string(&value)?, value))
+            })
+            .await;
+            if mutation
+                && result.is_error != Some(true)
+                && let Err(error) = self.state.persist_checkout_mutations_durable().await
+            {
+                return Self::err_text(&format!(
+                    "Error: the template edit was queued, but checkout-queue durability failed: {error:#}"
+                ));
+            }
+            return result;
         }
         if matches!(
             p.action.as_str(),
@@ -808,8 +824,10 @@ impl BlackboxServer {
                     Some(n) => n,
                     None => return Self::err_text("name is required"),
                 };
-                if scope == "project" && p.project_dir.is_none() {
-                    return Self::err_text("project_dir required for project scope");
+                if scope == "project" && !p.project_dir.as_deref().is_some_and(is_absolute_dir) {
+                    return Self::err_text(
+                        "project template directory must be absolute for scope=project",
+                    );
                 }
                 let members = match &p.members {
                     Some(m) if !m.is_empty() => m,
@@ -1133,18 +1151,202 @@ fn brofile_selection(
     format!("brofile:{scope}:{store}:{name}")
 }
 
-fn require_team_template_locality(server: &BlackboxServer, p: &TeamParams) -> anyhow::Result<()> {
-    if matches!(
+fn is_project_template_action(p: &TeamParams) -> bool {
+    matches!(
         p.action.as_str(),
         "save_template" | "delete_template" | "list_templates" | "get_template"
     ) && p.scope.as_deref() == Some("project")
-        && !server.state.project_authority.is_bridge()
-    {
-        anyhow::bail!(
-            "error.team_template_locality_required: project .bro/teamplates have no remote source lane; inspect or edit them with the checkout owner's file tools, or use daemon-owned templates with scope=global and no project_dir. No project template was read or changed; passing a caller path cannot grant daemon checkout access"
-        );
+}
+
+fn is_absolute_dir(path: &str) -> bool {
+    Path::new(path).is_absolute()
+}
+
+const PROJECT_TEMPLATE_PUBLICATION: &str = "Project templates are read from the project's accepted publication; a template queued through save_template or delete_template takes effect only after the checkout owner commits and publishes it";
+
+/// Catalog-mode project template actions. `project_dir` only selects a
+/// catalog project; reads come from its accepted configuration and edits are
+/// guarded mutations for its checkout owner. Exact project scope never
+/// includes global templates.
+fn catalog_project_template_action(
+    server: &BlackboxServer,
+    p: &TeamParams,
+) -> anyhow::Result<Value> {
+    catalog_project_template_action_with_hook(server, p, || {})
+}
+
+/// `after_snapshot` runs between the edit preparation's first read of the
+/// accepted configuration and its revalidation under the queue lock.
+fn catalog_project_template_action_with_hook(
+    server: &BlackboxServer,
+    p: &TeamParams,
+    after_snapshot: impl FnMut(),
+) -> anyhow::Result<Value> {
+    use orchestration::team;
+    let selector = p
+        .project_dir
+        .as_deref()
+        .expect("validated project template selector");
+    let accepted = server.state.select_project_config_scope(selector)?;
+    let snapshot = &accepted.snapshot;
+    let project_id = accepted.project_id.as_str();
+    let source = json!(snapshot.provenance());
+    match p.action.as_str() {
+        "get_template" => {
+            let name = p.name.as_deref().expect("validated template name");
+            let template = snapshot.teamplate(name).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Teamplate not found in project {project_id}; use list_templates in the same scope. {PROJECT_TEMPLATE_PUBLICATION}"
+                )
+            })?;
+            let selection = json!(["teamplate", "project", project_id, name]).to_string();
+            Ok(
+                json!({"name": name, "scope": "project", "projectId": project_id, "source": source,
+                "body": super::body_page::json_body_page(&selection, &serde_json::to_value(template)?, p.cursor.as_deref(), p.body_limit)?}),
+            )
+        }
+        "list_templates" => {
+            let mut templates = match p.name.as_deref() {
+                Some(name) => snapshot.teamplate(name).into_iter().collect::<Vec<_>>(),
+                None => snapshot
+                    .teamplates()
+                    .map(|(_, template)| template)
+                    .collect(),
+            };
+            templates.sort_by(|a, b| a.name.cmp(&b.name));
+            team_summary_page(
+                templates.into_iter().map(team_template_summary).collect(),
+                "templates",
+                p,
+                json!({"scope": "project", "projectId": project_id, "source": source,
+                    "detail_hint": "bro_team(action=get_template, name=<name>, same scope/project_dir); follow body.next_cursor",
+                    "publication": PROJECT_TEMPLATE_PUBLICATION}),
+            )
+        }
+        "save_template" => {
+            let name = p
+                .name
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("name is required"))?;
+            let members = p
+                .members
+                .as_ref()
+                .filter(|members| !members.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("members is required"))?;
+            let target = project_template_target(name)?;
+            let template = team::Teamplate {
+                name: name.to_string(),
+                members: members
+                    .iter()
+                    .map(|m| team::TeamplateMember {
+                        brofile: m.brofile.clone(),
+                        alias: m.alias.clone(),
+                        count: m.count.unwrap_or(1),
+                    })
+                    .collect(),
+                advisor: None,
+                diversity_floor: None,
+            };
+            team::validate_teamplate_member_count(&template)
+                .map_err(|error| anyhow::anyhow!("Teamplate was not saved: {error}"))?;
+            let content = String::from_utf8(crate::json_store::to_vec_pretty_newline(&template)?)?;
+            let store_dir = &server.state.store_dir;
+            let receipt = server.state.prepare_project_config_mutation_in_view(
+                project_id,
+                &target,
+                "bro_team(action=save_template, scope=project)",
+                after_snapshot,
+                |view, _| {
+                    // Members resolve against the accepted generation this
+                    // edit is prepared, preconditioned and reported against:
+                    // its project brofiles, then global ones. A queued,
+                    // unpublished brofile does not count.
+                    for member in &template.members {
+                        anyhow::ensure!(
+                            orchestration::project_config::resolve_brofile(
+                                Some(&view.snapshot),
+                                &member.brofile,
+                                store_dir,
+                            )
+                            .is_some(),
+                            "Brofile not found: {}. Members resolve from project {}'s accepted brofiles, then global ones; a brofile queued through the checkout-owner lane counts only after it is committed and published. Nothing was queued",
+                            member.brofile,
+                            view.project_id
+                        );
+                    }
+                    Ok(Some(
+                        crate::tools::project_config::ProjectConfigEdit::Write(content),
+                    ))
+                },
+            )?;
+            Ok(project_template_receipt(
+                json!({"saved": name}),
+                project_id,
+                receipt,
+                "The project's accepted template, with its queued edits applied, already has these exact bytes; nothing was queued",
+            ))
+        }
+        "delete_template" => {
+            let name = p
+                .name
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("name is required"))?;
+            let target = project_template_target(name)?;
+            let mut present = false;
+            let receipt = server.state.prepare_project_config_mutation(
+                project_id,
+                &target,
+                "bro_team(action=delete_template, scope=project)",
+                |base| {
+                    present = base.is_some();
+                    Ok(Some(
+                        crate::tools::project_config::ProjectConfigEdit::Delete,
+                    ))
+                },
+            )?;
+            anyhow::ensure!(
+                present,
+                "Teamplate not found: {name}. Neither project {project_id}'s accepted templates nor its queued edits hold it; nothing was queued"
+            );
+            Ok(project_template_receipt(
+                json!({"deleted": name}),
+                project_id,
+                receipt,
+                "",
+            ))
+        }
+        _ => unreachable!("only project template actions reach the catalog lane"),
     }
-    Ok(())
+}
+
+fn project_template_target(name: &str) -> anyhow::Result<bbox_code_source::ProjectConfigTargetV1> {
+    bbox_code_source::validate_project_config_name(name).map_err(|error| {
+        anyhow::anyhow!("project template name cannot be a project configuration file: {error}")
+    })?;
+    Ok(bbox_code_source::ProjectConfigTargetV1::Teamplate(
+        name.to_string(),
+    ))
+}
+
+fn project_template_receipt(
+    mut receipt: Value,
+    project_id: &str,
+    mutation: Option<crate::tools::project_config::ProjectConfigMutationReceipt>,
+    unchanged: &str,
+) -> Value {
+    receipt["scope"] = json!("project");
+    receipt["projectId"] = json!(project_id);
+    match mutation {
+        Some(mutation) => {
+            receipt["state"] = json!(mutation.state);
+            receipt["mutation"] = json!(mutation);
+        }
+        None => {
+            receipt["state"] = json!("unchanged");
+            receipt["detail"] = json!(unchanged);
+        }
+    }
+    receipt
 }
 
 fn validate_team_object_name(name: &str) -> anyhow::Result<()> {
@@ -1224,10 +1426,11 @@ fn validate_team_params(p: &TeamParams) -> anyhow::Result<()> {
             }
             "global" => {}
             "project" => {
-                let path = p.project_dir.as_deref().ok_or_else(|| anyhow::anyhow!("project_dir is required for scope=project; no daemon current-directory fallback"))?;
                 anyhow::ensure!(
-                    Path::new(path).is_absolute(),
-                    "project template directory must be absolute"
+                    p.project_dir
+                        .as_deref()
+                        .is_some_and(|path| !path.trim().is_empty()),
+                    "project_dir is required for scope=project; no daemon current-directory fallback"
                 );
             }
             _ => anyhow::bail!("scope must be global or project"),
@@ -1326,7 +1529,6 @@ fn team_discovery(server: &BlackboxServer, p: &TeamParams) -> anyhow::Result<Val
     let store = &server.state.store_dir;
     if matches!(p.action.as_str(), "list_templates" | "get_template") {
         let scope = p.scope.as_deref().unwrap_or("global");
-        require_team_template_locality(server, p)?;
         if p.action == "get_template" {
             let name = p.name.as_deref().expect("validated template name");
             let template =
@@ -1443,6 +1645,10 @@ fn bro_report_v1_to_dashboard_json(report: &bro_protocol::BroReportV1) -> Value 
         report.reported_at,
     )
 }
+
+#[cfg(test)]
+#[path = "roster_team_template_tests.rs"]
+mod team_template_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1641,7 +1847,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn catalog_team_mutations_refuse_project_sources_and_keep_global_worker_context() {
+    async fn catalog_team_templates_refuse_unregistered_paths_and_keep_worker_context() {
         use orchestration::{brofile, team};
         let fixture = crate::server::state::catalog_fixture::CatalogFixture::new();
         let server = fixture.server();
@@ -1678,9 +1884,21 @@ mod tests {
             }
             let result = server.bro_team(Parameters(team_params(request))).await;
             assert_eq!(result.is_error, Some(true));
-            assert!(extract_text(&result).contains("error.team_template_locality_required"));
+            // A path that names no catalog project has no project template
+            // scope; the daemon never reads or writes the local directory.
+            assert!(extract_text(&result).contains("error.project_config_project_unknown"));
             assert_eq!(std::fs::read(&path).unwrap(), before);
         }
+        for action in ["list_templates", "get_template"] {
+            let result = server
+                .bro_team(Parameters(team_params(
+                    json!({"action":action,"name":"panel","scope":"project","project_dir":project}),
+                )))
+                .await;
+            assert_eq!(result.is_error, Some(true));
+            assert!(extract_text(&result).contains("error.project_config_project_unknown"));
+        }
+        assert_eq!(server.state.checkout_mutations.read().pending_count(), 0);
         let created=server.bro_team(Parameters(team_params(json!({"action":"create","template":"panel","name":"global-team","project_dir":project})))).await;
         assert_ne!(created.is_error, Some(true), "{}", extract_text(&created));
         let receipt: Value = serde_json::from_str(&extract_text(&created)).unwrap();
@@ -1914,7 +2132,7 @@ mod tests {
         let catalog_server = fixture.server();
         let result=catalog_server.bro_team(Parameters(team_params(json!({"action":"list_templates","scope":"project","project_dir":"/nonexistent-owner-checkout"})))).await;
         assert_eq!(result.is_error, Some(true));
-        assert!(extract_text(&result).contains("error.team_template_locality_required"));
+        assert!(extract_text(&result).contains("error.project_config_project_unknown"));
         let dir = server.state.store_dir.join("teamplates");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("broken.json"), "{").unwrap();
