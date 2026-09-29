@@ -4,8 +4,7 @@ use anyhow::Result;
 
 use crate::providers::{
     EdgeFamilyExpectation, EntitySchemaView, EntityView, InspectableEntityProvider, Neighborhood,
-    NextHop, ProviderContext, empty_neighborhood_view, ensure_type, expected, next_hops, schema,
-    truncate_label,
+    NextHop, ProviderContext, empty_neighborhood_view, ensure_type, schema, truncate_label,
 };
 use bbox_corpus_core::entity_ref::{EntityRef, EntityType};
 
@@ -56,24 +55,21 @@ impl InspectableEntityProvider for TaskProvider {
         schema(
             self.entity_type(),
             &["task_id", "virtual"],
-            &["TASK_PRODUCED_NOTE", "NOTE_FROM_TASK"],
+            &[],
             &["task_id"],
         )
     }
 
     fn expected_edge_families(&self, _r: &EntityRef) -> Vec<EdgeFamilyExpectation> {
-        vec![
-            expected("TASK_PRODUCED_NOTE", false),
-            expected("NOTE_FROM_TASK", false),
-        ]
+        Vec::new()
     }
 
     fn recommended_next_hops(
         &self,
         _entity: &EntityView,
-        full_neighborhood: &Neighborhood,
+        _full_neighborhood: &Neighborhood,
     ) -> Vec<NextHop> {
-        next_hops(full_neighborhood, &["TASK_PRODUCED_NOTE", "NOTE_FROM_TASK"])
+        Vec::new()
     }
 
     fn compact_label(&self, ctx: &ProviderContext<'_>, r: &EntityRef) -> Option<String> {

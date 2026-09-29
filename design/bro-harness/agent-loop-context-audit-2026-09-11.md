@@ -49,7 +49,7 @@ provider capacity measurement.
 
 | Boundary | Current bro-harness behavior | Current Codex behavior |
 | --- | --- | --- |
-| Stable instructions | Capability-derived base; explicit text, persona and standing directives; pinned-tool descriptions. Vibe also puts environment/scope/pins here. | Base instructions plus typed developer/context sections; request representation can depend on model metadata. |
+| Stable instructions | Capability-derived base; explicit text and persona; pinned-tool descriptions. Vibe also puts environment/scope/pins here. | Base instructions plus typed developer/context sections; request representation can depend on model metadata. |
 | First user turn | CodexShaped emits scope/pins/environment, then task. Discovered filesystem instructions arrive afterward through the separate instruction ledger. | Full typed context is assembled before recording the real user input. |
 | Later user turn | Environment and dispatch deltas, then raw task; pending changed filesystem instructions are appended at the model boundary. | Context state and durable baseline produce typed changes; removed sections can emit explicit revocation. |
 | Later model step | Instruction graphs refresh every request; environment/dispatch user-context preparation is tied primarily to user-turn entry. Tool observations, hooks and the transport manifest have separate delivery paths. | A captured step supplies tools/settings and world state; changes are recorded before sampling. |
@@ -167,8 +167,8 @@ emitted after explicit clear.
 **Counterexample:** resume a CodexShaped session containing scope and pins with
 `--dispatch-context '{}'`. The model still sees the old fragments, with no
 revocation. Runtime dispatch state is cleared; this does not mechanically
-rebind a task. Persona and standing directives are correctly removed from the
-recomposed system block. Vibe's normal system-carried scope/pins have a different
+rebind a task. Persona is correctly removed from the recomposed system
+block. Vibe's normal system-carried scope/pins have a different
 replacement behavior.
 
 **Reference:** typed removal in

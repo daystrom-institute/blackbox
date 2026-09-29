@@ -40,8 +40,8 @@ path). Keys form a small grammar:
 ```
 <flavor>:<tool-pattern>.<param> = <value>
 
-default:mcp.bbox_note.project = /repo/x      # fill if absent
-pin:*.project_dir             = /repo/wt-7   # enforce; mismatch is an error
+default:mcp.bbox_hybrid_search.project = /repo/x   # fill if absent
+pin:*.project_dir                       = /repo/wt-7 # enforce; mismatch is an error
 ```
 
 - **`default`** — applied only when the model elides the param. Model-supplied
@@ -61,7 +61,7 @@ daemon-supplied trust model, never inherited by shell children).
 ## 3. Safety requirements (each is load-bearing)
 
 1. **Per-(tool, param) opt-in; no blanket name matching.** Absence is
-   sometimes semantics: `project: None` on `bbox_note`/`bbox_learn` means
+   sometimes semantics: `project: None` on `bbox_learn` means
    *global scope*. A flat `project=foo` applied everywhere silently converts
    intended-global writes to project-scoped. Glob keys are allowed but the
    *host* writes them deliberately; the harness never infers.
@@ -148,7 +148,6 @@ previously routed through the legacy `spawn_task` wrapper and silently
 dropped the table), fleet cockpit via the control plane — now emits, from
 `AmbientContext::tool_arg_defaults()` (src/orchestration/mod.rs):
 
-- `default:mcp.bbox_note.session_id=<session>` (pre-existing), and
 - `pin:*.cwd=<canonical worktree root>` **and**
   `pin:*.project_dir=<canonical worktree root>` when the dispatch cwd is a
   daemon-managed worktree. Both spellings are pinned (gap-6366c92d): the pin
@@ -172,7 +171,7 @@ checkout (`.git` *directory*) never pins. Operator-created linked worktrees
 also match; accepted deliberately — a dispatch confined to a worktree wants
 the same confinement semantics regardless of who ran `git worktree add`.
 The `pin:*.cwd` / `pin:*.project_dir` globs are safe per §3.1: the
-project-scoped coordination tools (notes/knowledge) take `project`, not
+project-scoped knowledge tools take `project`, not
 `cwd`/`project_dir`; a schema-drift tripwire test pins that assumption.
 Session-start schema validation treats glob rules as "wherever the param
 exists" — a glob matching tools without the param is the expected steady
@@ -207,7 +206,7 @@ and live. The approved expansion, emitted from the same
   `id` would shadow name-based continue/resolve and convert missing-id errors
   on resolve/promote/rename into silent mutations of the ambient thread.
 
-The knowledge/note/learn `project` exclusion is **permanent**, not pending:
+The knowledge/learn `project` exclusion is **permanent**, not pending:
 absence there means *global write scope* (§3.1) and is never mechanically
 filled. An exclusion test (`ambient_tool_defaults_never_default_write_scope_params`)
 plus the schema-drift tripwire pin both halves. Session-start schema

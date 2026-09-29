@@ -583,18 +583,6 @@ pub struct EmbedStatusResponse {
     pub routes: BTreeMap<String, RouteStatus>,
 }
 
-/// Post-upsert contradiction hook: the daemon registers its
-/// knowledge-contradiction detector here at boot (dependency inversion —
-/// detection needs daemon state this layer must not name). Unregistered
-/// means no detection, matching a daemon that never installed state.
-static CONTRADICTION_HOOK: std::sync::OnceLock<fn(&EmbedRequest, &str, &[f32])> =
-    std::sync::OnceLock::new();
-
-/// Register the contradiction detector. Idempotent; first registration wins.
-pub fn register_contradiction_hook(hook: fn(&EmbedRequest, &str, &[f32])) {
-    let _ = CONTRADICTION_HOOK.set(hook);
-}
-
 /// Fired when a route's pending depth returns to zero, i.e. a wave finished
 /// draining. The daemon registers a hook here at boot that wakes the residue
 /// sweeper so an across-wave refill happens promptly instead of waiting for
@@ -1723,34 +1711,19 @@ fn persist_vectors(
             batch.len()
         ));
     }
-    let mut contradiction_checks = Vec::new();
     let records = batch
         .iter()
         .zip(vectors)
-        .map(|(request, vector)| {
-            // `bucket` is an ignored placeholder on visual requests
-            // (routing goes through `visual_kind` instead), so gate on it
-            // explicitly rather than relying on the placeholder value never
-            // colliding with `Bucket::Knowledge`.
-            if request.visual_kind.is_none() && request.bucket == Bucket::Knowledge {
-                contradiction_checks.push((request.clone(), vector.clone()));
-            }
-            bbox_vectors::VectorUpsert {
-                entity_id: request.entity_id.clone(),
-                content_hash: request.chunk_hash.clone(),
-                vector,
-            }
+        .map(|(request, vector)| bbox_vectors::VectorUpsert {
+            entity_id: request.entity_id.clone(),
+            content_hash: request.chunk_hash.clone(),
+            vector,
         })
         .collect();
     let Some(store) = &spec.vector_store else {
         return Ok(());
     };
     store.upsert_batch(&spec.vector_route, records)?;
-    for (request, vector) in contradiction_checks {
-        if let Some(hook) = CONTRADICTION_HOOK.get() {
-            hook(&request, &spec.vector_route, &vector);
-        }
-    }
     Ok(())
 }
 
@@ -2837,7 +2810,7 @@ mod tests {
                     },
                 ),
                 (
-                    "notes".to_string(),
+                    "threads".to_string(),
                     RouteStatus {
                         available: false,
                         last_error: Some(
@@ -2856,9 +2829,9 @@ mod tests {
             response.routes["code"].health_reason.as_deref(),
             Some("queue_full")
         );
-        assert_eq!(response.routes["notes"].health, "unavailable");
+        assert_eq!(response.routes["threads"].health, "unavailable");
         assert_eq!(
-            response.routes["notes"].health_reason.as_deref(),
+            response.routes["threads"].health_reason.as_deref(),
             Some("credential_missing")
         );
     }

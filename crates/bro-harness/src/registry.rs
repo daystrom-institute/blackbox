@@ -1018,7 +1018,7 @@ mod tests {
         #[async_trait]
         impl Tool for Echo {
             fn name(&self) -> &str {
-                "mcp__blackbox__bbox_note"
+                "mcp__blackbox__bbox_gap"
             }
             fn description(&self) -> &str {
                 "echo"
@@ -1027,7 +1027,7 @@ mod tests {
                 json!({
                     "type": "object",
                     "properties": {
-                        "kind": {"type": "string"},
+                        "title": {"type": "string"},
                         "session_id": {"type": "string"}
                     }
                 })
@@ -1038,7 +1038,7 @@ mod tests {
         }
 
         let defaults = bro_tools::ToolArgDefaults::parse_map(std::collections::BTreeMap::from([(
-            "default:mcp.bbox_note.session_id".to_string(),
+            "default:mcp.bbox_gap.session_id".to_string(),
             "host-session".to_string(),
         )]))
         .unwrap();
@@ -1051,7 +1051,7 @@ mod tests {
         .unwrap();
         let cx = test_cx(defaults);
         let result = reg
-            .dispatch("mcp__blackbox__bbox_note", json!({"kind": "done"}), &cx)
+            .dispatch("mcp__blackbox__bbox_gap", json!({"title": "t"}), &cx)
             .await;
         let ToolResult::Json(v) = result else {
             panic!("expected json result");
@@ -1067,20 +1067,20 @@ mod tests {
     #[tokio::test]
     async fn dispatch_returns_pin_conflict_error_with_separate_observation() {
         let defaults = bro_tools::ToolArgDefaults::parse_map(std::collections::BTreeMap::from([(
-            "pin:mcp.bbox_note.session_id".to_string(),
+            "pin:mcp.bbox_gap.session_id".to_string(),
             "host-session".to_string(),
         )]))
         .unwrap();
         let reg = Registry::new(
             vec![],
-            vec![mk("mcp__blackbox__bbox_note", "note")],
+            vec![mk("mcp__blackbox__bbox_gap", "gap")],
             &PinPolicy { patterns: vec![] },
             &ToolFilter::default(),
         )
         .unwrap();
         let result = reg
             .dispatch(
-                "mcp__blackbox__bbox_note",
+                "mcp__blackbox__bbox_gap",
                 json!({"session_id": "model-session"}),
                 &test_cx(defaults),
             )

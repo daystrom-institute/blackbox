@@ -840,7 +840,6 @@ mod tests {
             /*deferred_tools_available*/ false,
         );
         // Local addition (not vendored): no absent host service is suggested.
-        assert!(!description.contains("bbox_note"));
         assert!(!description.contains("exec_command"));
         // Long-running cells: raise yield_time_ms via the pragma.
         assert!(description.contains(r#"// @exec: {"yield_time_ms": 60000}"#));

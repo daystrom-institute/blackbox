@@ -2,9 +2,7 @@
 //! surface. The contract (Bucket, EmbeddingRouter, the queue handle and
 //! enqueue helpers) lives in `crate::embed` / `crate::embed_queue`; this
 //! module owns everything that needs `SharedState` or routing-verdict
-//! dispatch: reembed orchestration, embedding route coverage, and the
-//! knowledge contradiction detector (registered into the queue worker's hook at
-//! SharedState construction).
+//! dispatch: reembed orchestration and embedding route coverage.
 
 pub(crate) mod status_snapshot;
 
@@ -13,13 +11,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use parking_lot::RwLock;
 use rmcp::schemars;
 use serde::Deserialize;
 use serde_json::json;
 use std::sync::OnceLock;
 
-use crate::embed::queue::{EmbedRequest, EmbedStatusResponse};
+use crate::embed::queue::EmbedStatusResponse;
 use crate::embed::{Bucket, EmbeddingRouter};
 use crate::embed_queue::status_response;
 use crate::server::state::SharedState;
@@ -29,13 +26,6 @@ use crate::embed::queue;
 use bbox_chunker::Chunk;
 use bbox_corpus_core::entity_ref::EntityRef;
 use bbox_corpus_index::index::EmbeddingSourceDoc;
-use bbox_threads::notes::NoteParams;
-
-/// Adapter with the queue worker's hook signature; registered via
-/// `embed::queue::register_contradiction_hook` at SharedState construction.
-pub(crate) fn contradiction_hook(request: &EmbedRequest, vector_route: &str, vector: &[f32]) {
-    maybe_detect_knowledge_contradiction(request, vector_route, vector);
-}
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ReembedParams {
@@ -644,22 +634,6 @@ pub(crate) fn route_coverage(
             )?;
         }
     }
-    if buckets.contains(&Bucket::Notes) {
-        for note in stores.notes.read().all() {
-            record_coverage(
-                &router,
-                &mut coverage,
-                &mut active_by_route,
-                Bucket::Notes,
-                None,
-                &EntityRef::Note {
-                    note_id: note.id.clone(),
-                }
-                .to_string(),
-                &crate::embed_queue::note_chunk_hash(note),
-            )?;
-        }
-    }
     if buckets.contains(&Bucket::Threads) {
         for thread in stores.threads.read().all() {
             record_coverage(
@@ -828,7 +802,7 @@ fn record_index_doc_coverage(
                 chunk_hash,
             )
         }
-        Bucket::Knowledge | Bucket::Notes | Bucket::Threads | Bucket::Graph => Ok(()),
+        Bucket::Knowledge | Bucket::Threads | Bucket::Graph => Ok(()),
     }
 }
 
@@ -921,16 +895,6 @@ fn enqueue_reembed_routes(
             let entity_id = crate::index::knowledge_entity_id(&entry.id);
             let chunk_hash = crate::index::knowledge_chunk_hash(entry);
             if crate::embed_queue::enqueue_knowledge(entry, &entity_id, &chunk_hash) {
-                enqueued += 1;
-            }
-        }
-    }
-    if buckets.contains(&Bucket::Notes) {
-        for note in state.notes.read().all() {
-            if limit_reached(max_entities, enqueued) {
-                return Ok(enqueued);
-            }
-            if crate::embed_queue::enqueue_note(note) {
                 enqueued += 1;
             }
         }
@@ -1342,7 +1306,7 @@ fn enqueue_reembed_index_doc(buckets: &[Bucket], doc: &EmbeddingSourceDoc) -> bo
             };
             crate::embed_queue::enqueue_git_message(entity_id, chunk_hash, &doc.content)
         }
-        Bucket::Knowledge | Bucket::Notes | Bucket::Threads | Bucket::Graph => false,
+        Bucket::Knowledge | Bucket::Threads | Bucket::Graph => false,
     }
 }
 
@@ -1537,28 +1501,6 @@ fn chunk_from_embedding_doc(doc: &EmbeddingSourceDoc) -> Option<Chunk> {
     })
 }
 
-static CONTRADICTION_STATE: OnceLock<RwLock<Option<std::sync::Arc<SharedState>>>> = OnceLock::new();
-static CONTRADICTION_THRESHOLD: OnceLock<RwLock<f32>> = OnceLock::new();
-const DEFAULT_TIER0_COSINE_THRESHOLD: f32 = 0.85;
-
-pub(crate) fn install_contradiction_state(state: std::sync::Arc<SharedState>) {
-    *CONTRADICTION_STATE
-        .get_or_init(|| RwLock::new(None))
-        .write() = Some(state);
-}
-
-pub(crate) fn install_contradiction_threshold(threshold: f32) {
-    *CONTRADICTION_THRESHOLD
-        .get_or_init(|| RwLock::new(DEFAULT_TIER0_COSINE_THRESHOLD))
-        .write() = threshold.clamp(0.0, 1.0);
-}
-
-fn contradiction_threshold() -> f32 {
-    *CONTRADICTION_THRESHOLD
-        .get_or_init(|| RwLock::new(DEFAULT_TIER0_COSINE_THRESHOLD))
-        .read()
-}
-
 /// Coverage below this with an idle queue marks a route `stalled`: the
 /// residue exists but nothing is enqueueing it, so it will never converge
 /// without an explicit backfill (gap-b9d39c10 — git_message sat at 0%
@@ -1684,7 +1626,6 @@ pub(crate) fn status_response_for_state(
         Bucket::Code,
         Bucket::Docs,
         Bucket::GitMessage,
-        Bucket::Notes,
         Bucket::Threads,
         Bucket::Graph,
     ];
@@ -1817,69 +1758,6 @@ fn project_status_response(
         });
     }
     Ok(value)
-}
-
-pub(crate) fn maybe_detect_knowledge_contradiction(
-    request: &EmbedRequest,
-    vector_route: &str,
-    vector: &[f32],
-) {
-    if request.bucket != Bucket::Knowledge {
-        return;
-    }
-    let Some(state) = CONTRADICTION_STATE
-        .get_or_init(|| RwLock::new(None))
-        .read()
-        .clone()
-    else {
-        return;
-    };
-    let Some(entry_a) = request.entity_id.strip_prefix("knowledge:") else {
-        return;
-    };
-    let hits = match crate::vectors::search(vector_route, vector, 5) {
-        Ok(hits) => hits,
-        Err(err) => {
-            tracing::debug!(error = %err, "knowledge contradiction nearest-neighbor scan failed");
-            return;
-        }
-    };
-    let kb = state.kb.read();
-    let Some(source) = kb.entry(entry_a).cloned() else {
-        return;
-    };
-    let threshold = contradiction_threshold();
-    let Some((entry_b, cosine)) = hits.into_iter().find_map(|hit| {
-        let cosine = 1.0 - hit.distance;
-        if hit.id == request.entity_id || cosine < threshold {
-            return None;
-        }
-        let id = hit.id.strip_prefix("knowledge:")?;
-        let target = kb.entry(id)?.clone();
-        Some((target, cosine))
-    }) else {
-        return;
-    };
-    drop(kb);
-
-    let project = source.project.clone().or(entry_b.project.clone());
-    let body = format!(
-        "Tier-0 contradiction detected between knowledge:{} and knowledge:{} (cosine {:.3}); review the linked evidence.",
-        source.id, entry_b.id, cosine
-    );
-    if let Err(err) = state.notes.write().create(&NoteParams {
-        project_id: None,
-        kind: "surprise".into(),
-        body,
-        task_id: None,
-        session_id: None,
-        project,
-        thread_id: None,
-        provider: None,
-        bro: None,
-    }) {
-        tracing::warn!(error = %err, "failed to surface contradiction fallback note");
-    }
 }
 
 #[cfg(test)]
@@ -2472,7 +2350,7 @@ pdf_figure = "voyage_visual"
             },
         );
         response.routes.insert(
-            "notes".into(),
+            "threads".into(),
             RouteStatus {
                 coverage_ratio: Some(0.684),
                 queue_depth: 120,
@@ -2514,7 +2392,7 @@ pdf_figure = "voyage_visual"
             "misleading nightly-backfill phrasing removed: {git_reason}"
         );
         assert_eq!(
-            response.routes["notes"].health, "ok",
+            response.routes["threads"].health, "ok",
             "busy queue means residue is draining"
         );
         assert_eq!(response.routes["code"].health, "ok");
@@ -3226,7 +3104,7 @@ pdf_figure = "voyage_visual"
             .insert("code".into(), route_status(true, 100, 90, 0, 0)); // 10 residue
         response
             .routes
-            .insert("notes".into(), route_status(true, 50, 50, 0, 3)); // busy
+            .insert("threads".into(), route_status(true, 50, 50, 0, 3)); // busy
         // A transcript route with residue AND a draining queue must be
         // ignored on both axes (guarded corpus).
         response
@@ -3238,7 +3116,7 @@ pdf_figure = "voyage_visual"
             snap.residue, 10,
             "only code's residue; transcripts excluded"
         );
-        assert!(snap.busy, "notes is draining");
+        assert!(snap.busy, "threads is draining");
     }
 
     /// Termination / no-hot-loop: the wake decision. A stuck pass (residue

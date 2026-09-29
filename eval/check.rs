@@ -105,10 +105,6 @@ pub const MANIFEST_SOURCES: &[(&str, &str)] = &[
         "cross-modal-entity-ref-parser",
         include_str!("queries/cross-modal-entity-ref-parser.json"),
     ),
-    (
-        "cross-modal-notes-side-channel",
-        include_str!("queries/cross-modal-notes-side-channel.json"),
-    ),
 ];
 
 static CHECKER_MANIFESTS: OnceLock<Result<Vec<EvalQueryManifest>, String>> = OnceLock::new();
@@ -218,7 +214,6 @@ pub fn checker_by_name(name: &str) -> Option<CheckPassFn> {
         "check_cross_modal_recursion_guard" => check_cross_modal_recursion_guard,
         "check_cross_modal_workflow_engine" => check_cross_modal_workflow_engine,
         "check_cross_modal_entity_ref_parser" => check_cross_modal_entity_ref_parser,
-        "check_cross_modal_notes_side_channel" => check_cross_modal_notes_side_channel,
         _ => return None,
     })
 }
@@ -363,7 +358,6 @@ stub_checker!(check_cross_modal_knowledge_store);
 stub_checker!(check_cross_modal_recursion_guard);
 stub_checker!(check_cross_modal_workflow_engine);
 stub_checker!(check_cross_modal_entity_ref_parser);
-stub_checker!(check_cross_modal_notes_side_channel);
 
 #[cfg(test)]
 mod tests {
@@ -373,9 +367,9 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     #[test]
-    fn all_25_manifests_parse_and_round_trip() {
+    fn all_24_manifests_parse_and_round_trip() {
         let manifests = load_manifests().expect("all eval manifests parse");
-        assert_eq!(manifests.len(), 25);
+        assert_eq!(manifests.len(), 24);
 
         let mut ids = BTreeSet::new();
         let mut class_counts = BTreeMap::<QueryClass, usize>::new();
@@ -419,7 +413,7 @@ mod tests {
             (QueryClass::ConceptualDesignDoc, 6),
             (QueryClass::StaleDecisionLookup, 2),
             (QueryClass::TranscriptProvenance, 6),
-            (QueryClass::CrossModalCodeProse, 5),
+            (QueryClass::CrossModalCodeProse, 4),
         ] {
             assert_eq!(class_counts.get(&class).copied(), Some(count), "{class:?}");
         }
@@ -429,7 +423,7 @@ mod tests {
     #[ignore = "data-dependent: resolves transcript:* expected refs against a populated \
                 transcript corpus on disk, which is absent in a fresh checkout. Run with \
                 `cargo test -- --ignored` against a real corpus."]
-    fn all_25_manifests_have_resolvable_expected_refs() {
+    fn all_24_manifests_have_resolvable_expected_refs() {
         let manifests = load_manifests().expect("all eval manifests parse");
         for manifest in &manifests {
             for raw in &manifest.expected_entity_refs {

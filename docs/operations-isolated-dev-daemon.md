@@ -49,7 +49,7 @@ cannot resolve auxiliary state outside the throwaway root:
 | `BLACKBOX_STATE_DIR` | `~/.local/state/blackbox` | Root for all below |
 | `BLACKBOX_KNOWLEDGE_PATH` | `<state_dir>/blackbox-knowledge.json` | Knowledge store |
 | `BLACKBOX_THREADS_PATH` | `<state_dir>/blackbox-threads.json` | Thread store |
-| `BLACKBOX_NOTES_PATH` | `<state_dir>/blackbox-notes.json` | Notes store |
+| `BLACKBOX_NOTES_PATH` | `<state_dir>/blackbox-notes.json` | Note records the project catalog inventories as owner rows; nothing else reads them |
 | `BLACKBOX_PINS_PATH` | `<state_dir>/blackbox-pins.json` | Pin records the project catalog inventories as owner rows; nothing else reads them |
 | `BLACKBOX_PROJECTS_PATH` | `<state_dir>/projects.json` | Project registry |
 | `BLACKBOX_GAPS_PATH` | `<state_dir>/blackbox-gaps.json` | Gap notes store |

@@ -86,8 +86,11 @@ pub struct Edge {
 
 /// Endpoint types with no surviving entity family, each with the field that
 /// carries its identity. Rows naming one stay inert on disk.
-const RETIRED_ENDPOINT_TYPES: [(&str, &str); 2] =
-    [("roadmap_item", "id"), ("whiteboard", "board_id")];
+const RETIRED_ENDPOINT_TYPES: [(&str, &str); 3] = [
+    ("roadmap_item", "id"),
+    ("whiteboard", "board_id"),
+    ("note", "note_id"),
+];
 
 fn retired_endpoint_id_field(endpoint: &serde_json::Value) -> Option<&'static str> {
     RETIRED_ENDPOINT_TYPES
@@ -2023,6 +2026,12 @@ mod project_catalog_snapshot_tests {
         let (edge, _) = decode_live_edge_row(board.to_string().as_bytes()).unwrap();
         assert!(edge.is_none());
         assert!(walk.accept(&board.to_string()).unwrap().is_none());
+        let mut note = serde_json::to_value(&live).unwrap();
+        note["source"] = serde_json::json!({"type": "note", "note_id": "note-stale"});
+        note["kind"] = serde_json::json!("NOTE_IN_THREAD");
+        let (edge, _) = decode_live_edge_row(note.to_string().as_bytes()).unwrap();
+        assert!(edge.is_none());
+        assert!(walk.accept(&note.to_string()).unwrap().is_none());
         retired["provenance"] = serde_json::json!("invalid");
         assert!(decode_live_edge_row(retired.to_string().as_bytes()).is_err());
         assert!(decode_live_edge_row(b"{broken").is_err());

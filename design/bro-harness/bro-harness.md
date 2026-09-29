@@ -136,5 +136,5 @@ points to a backlog doc.
 - Privilege lives in `SafetyPolicy` + the brofile allow/deny layer. Nudges steer,
   they never gate; neuralyze rewinds, it never escalates privilege.
 - Session-scoped state only — no cross-session / cross-bro sharing.
-- Provider-agnostic ambient text uses **bare** tool names (`bbox_note`, not
-  `mcp__blackbox__bbox_note`); FQDN surfacing is a per-CLI concern.
+- Provider-agnostic ambient text uses **bare** tool names (`bbox_thread`, not
+  `mcp__blackbox__bbox_thread`); FQDN surfacing is a per-CLI concern.

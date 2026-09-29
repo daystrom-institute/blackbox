@@ -5,10 +5,10 @@
 //! See design/bro-harness/bro-harness-hooks.md: the scaffold + gating ledger
 //! + the two delivery mechanisms + the shipped rule set.
 //!
-//! Adoption is deliberately *not* tracked here. Whether a nudge was adopted (or
-//! declined, with or without a gap note) is a retrospective query over the
-//! indexed tool-call transcript corpus — which already logs every call and
-//! contains the `<harness-note>` rider itself. See bro-harness-hooks.md §6.
+//! Adoption is deliberately *not* tracked here. Whether a nudge was adopted or
+//! declined is a retrospective query over the indexed tool-call transcript
+//! corpus, which already logs every call and contains the `<harness-note>`
+//! rider itself. See bro-harness-hooks.md §6.
 //!
 //! Shape (separation of concerns):
 //! - A [`Hook`] is a pure matcher: given turn state it returns [`Candidate`]s.
@@ -30,19 +30,6 @@ use crate::transport::{ToolCall, ToolResult};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-
-/// Appended at most once per session — the adopt-or-explain half of the
-/// feedback loop. An agent that declines the steer should say *why* via a gap
-/// note, turning a silent fallback into actionable signal for refining the tool
-/// surface. Cross-cutting policy, so it's added at delivery (not per rule), but
-/// session-deduped so periodic nudges cannot repeatedly compel notes.
-const GAP_NOTE_DIRECTIVE: &str = " If this suggestion is wrong for the task, ignore it; \
-    if the tool surface is actually missing or wrong-shaped, file `bbox_note(kind=\"followup\")`.";
-
-/// Focused kill switch for the gap-note rider. `BRO_HARNESS_NUDGES=0` disables
-/// the whole hook subsystem; this leaves nudges on while making "quiet down"
-/// satisfiable for note-storm mitigation.
-const GAP_NOTE_DIRECTIVE_ENV: &str = "BRO_HARNESS_NUDGE_GAP_NOTES";
 
 /// Where a nudge is delivered. The choice follows its lifetime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,8 +84,7 @@ impl Nudge {
 /// persist across `exec → resume`.
 ///
 /// Note: there is deliberately **no** adoption/telemetry record here. Whether a
-/// nudge was adopted — or declined, with or without a gap note — is a
-/// retrospective query over the indexed tool-call transcript corpus (which
+/// nudge was adopted or declined is a retrospective query over the indexed tool-call transcript corpus (which
 /// already logs every call and contains the `<harness-note>` rider itself), not
 /// per-session state the harness duplicates. See bro-harness-hooks.md §6.
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -107,10 +93,6 @@ pub struct NudgeLedger {
     fired: HashSet<String>,
     /// Periodic rule_id -> turns remaining before it may fire again.
     cooldown: HashMap<String, u64>,
-    /// Whether the cross-cutting gap-note rider has already been delivered.
-    /// Default false for older persisted side blobs.
-    #[serde(default)]
-    gap_note_directive_delivered: bool,
 }
 
 impl NudgeLedger {
@@ -143,16 +125,6 @@ impl NudgeLedger {
             *v = v.saturating_sub(1);
         }
     }
-
-    /// True once per session, used to prevent periodic nudges from repeatedly
-    /// reintroducing a note-filing instruction.
-    fn try_deliver_gap_note_directive(&mut self) -> bool {
-        if self.gap_note_directive_delivered {
-            return false;
-        }
-        self.gap_note_directive_delivered = true;
-        true
-    }
 }
 
 /// A pure trigger matcher. Each method defaults to "no candidates" so a hook
@@ -173,24 +145,11 @@ pub trait Hook: Send + Sync {
 pub struct HookEngine {
     hooks: Vec<Box<dyn Hook>>,
     ledger: NudgeLedger,
-    gap_note_directive_enabled: bool,
 }
 
 impl HookEngine {
     pub fn new(hooks: Vec<Box<dyn Hook>>, ledger: NudgeLedger) -> Self {
-        Self::with_gap_note_directive(hooks, ledger, true)
-    }
-
-    fn with_gap_note_directive(
-        hooks: Vec<Box<dyn Hook>>,
-        ledger: NudgeLedger,
-        gap_note_directive_enabled: bool,
-    ) -> Self {
-        Self {
-            hooks,
-            ledger,
-            gap_note_directive_enabled,
-        }
+        Self { hooks, ledger }
     }
 
     /// The default rule set shipped with the harness (§2: one trivial rule).
@@ -200,7 +159,6 @@ impl HookEngine {
     /// sessions can override it without mutating global env.
     pub fn from_env(ledger: NudgeLedger) -> Self {
         let enabled = session_flag_enabled("BRO_HARNESS_NUDGES", false);
-        let gap_note_directive_enabled = session_flag_enabled(GAP_NOTE_DIRECTIVE_ENV, true);
         let hooks: Vec<Box<dyn Hook>> = if enabled {
             vec![
                 Box::new(TodoAllDoneHook),
@@ -211,7 +169,7 @@ impl HookEngine {
         } else {
             Vec::new()
         };
-        Self::with_gap_note_directive(hooks, ledger, gap_note_directive_enabled)
+        Self::new(hooks, ledger)
     }
 
     pub fn to_side(&self) -> Value {
@@ -268,13 +226,9 @@ impl HookEngine {
                 }
             };
             if pass {
-                let mut message = c.message;
-                if self.gap_note_directive_enabled && self.ledger.try_deliver_gap_note_directive() {
-                    message.push_str(GAP_NOTE_DIRECTIVE);
-                }
                 let n = Nudge {
                     rule_id: c.rule_id,
-                    message,
+                    message: c.message,
                     delivery: c.delivery,
                 };
                 tracing::info!(rule = %n.rule_id, ?n.delivery, "nudge fired");
@@ -738,94 +692,33 @@ mod tests {
     }
 
     #[test]
-    fn delivered_nudges_carry_quiet_gap_followup_escape_hatch() {
-        // The first delivered nudge gets the gap-note directive appended at the
-        // engine choke point.
+    fn delivered_nudges_carry_only_the_rule_body() {
         let mut eng = HookEngine::new(vec![Box::new(ShellGrepHook)], NudgeLedger::default());
         let out = eng.on_tool_result(&shell_call("grep -r x ."), &ok_result());
         assert_eq!(out.len(), 1);
         let msg = &out[0].message;
-        assert!(
-            msg.contains("bbox_note"),
-            "directive names the followup-note tool"
-        );
-        assert!(
-            msg.contains("If this suggestion is wrong"),
-            "directive frames non-applicable suggestions as ignorable"
-        );
-        // The rule's own body is still there ahead of the directive.
         assert!(msg.contains("indexed"));
-        // And it's inside the rider envelope when delivered as a rider.
+        assert!(
+            !msg.contains("bbox_note"),
+            "nudges carry no filing instruction"
+        );
         assert!(out[0].rider_block().contains("<harness-note>"));
     }
 
     #[test]
-    fn gap_note_directive_is_session_deduped() {
-        struct TwoSignposts;
-        impl Hook for TwoSignposts {
-            fn on_user_turn(&self, _: &str) -> Vec<Candidate> {
-                vec![
-                    Candidate {
-                        rule_id: "first".into(),
-                        message: "first nudge".into(),
-                        delivery: Delivery::SystemTail,
-                        kind: NudgeKind::Signpost,
-                        priority: 2,
-                    },
-                    Candidate {
-                        rule_id: "second".into(),
-                        message: "second nudge".into(),
-                        delivery: Delivery::SystemTail,
-                        kind: NudgeKind::Signpost,
-                        priority: 1,
-                    },
-                ]
-            }
-        }
-
-        let mut eng = HookEngine::new(vec![Box::new(TwoSignposts)], NudgeLedger::default());
-        let first = eng.on_user_turn("x");
-        assert_eq!(first[0].rule_id, "first");
-        assert!(first[0].message.contains("bbox_note"));
-
-        let second = eng.on_user_turn("x");
-        assert_eq!(second[0].rule_id, "second");
-        assert!(second[0].message.contains("second nudge"));
+    fn ledger_restores_older_side_blobs_with_retired_fields() {
+        let ledger = NudgeLedger::from_side(&serde_json::json!({
+            "fired": ["shell-grep"],
+            "cooldown": {},
+            "gap_note_directive_delivered": true,
+        }));
+        assert!(ledger.fired.contains("shell-grep"));
         assert!(
-            !second[0].message.contains("bbox_note"),
-            "gap-note rider must not repeat on later nudges"
+            ledger
+                .to_side()
+                .get("gap_note_directive_delivered")
+                .is_none()
         );
-    }
-
-    #[test]
-    fn gap_note_directive_can_be_disabled_without_disabling_nudges() {
-        let mut eng = HookEngine::with_gap_note_directive(
-            vec![Box::new(ShellGrepHook)],
-            NudgeLedger::default(),
-            false,
-        );
-        let out = eng.on_tool_result(&shell_call("grep -r x ."), &ok_result());
-        assert_eq!(out.len(), 1);
-        assert!(out[0].message.contains("indexed"));
-        assert!(!out[0].message.contains("bbox_note"));
-    }
-
-    #[tokio::test]
-    async fn from_env_reads_session_env_for_gap_note_directive() {
-        crate::transport::with_session_env(
-            std::collections::BTreeMap::from([
-                ("BRO_HARNESS_NUDGES".to_string(), "1".to_string()),
-                (GAP_NOTE_DIRECTIVE_ENV.to_string(), "0".to_string()),
-            ]),
-            async {
-                let mut eng = HookEngine::from_env(NudgeLedger::default());
-                let out = eng.on_tool_result(&shell_call("grep -r x ."), &ok_result());
-                assert_eq!(out.len(), 1);
-                assert!(out[0].message.contains("indexed"));
-                assert!(!out[0].message.contains("bbox_note"));
-            },
-        )
-        .await;
     }
 
     #[tokio::test]

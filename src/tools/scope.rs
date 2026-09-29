@@ -1,8 +1,7 @@
 //! Shared project write-scope resolution for store tool adapters.
 //!
-//! Stores that key durable state by project path (knowledge, gaps, pins,
-//! and notes) must agree on what a
-//! caller-supplied `project` value means when the caller works inside a
+//! Stores that key durable state by project path (knowledge, gaps, and
+//! pins) must agree on what a caller-supplied `project` value means when the caller works inside a
 //! worktree: the durable scope is the registered BASE project, while
 //! repo-owned committed files belong in the WORKTREE checkout so they travel
 //! with the agent's branch. Centralizing the resolution here keeps every
@@ -360,7 +359,6 @@ impl BlackboxServer {
 mod tests {
     use crate::server::BlackboxServer;
     use crate::server::state::SharedState;
-    use rmcp::handler::server::wrapper::Parameters;
     use std::path::Path;
     use std::sync::Arc;
 
@@ -709,89 +707,6 @@ mod tests {
             out.status.success(),
             "git {args:?} failed: {}",
             String::from_utf8_lossy(&out.stderr)
-        );
-    }
-
-    /// Notes authored from an in-tree linked worktree key to the registered
-    /// BASE project, and the notes list
-    /// filter maps a worktree path back to that scope.
-    #[tokio::test]
-    async fn worktree_callers_key_notes_to_base() {
-        let tmp = tempfile::tempdir().unwrap();
-        let base = tmp.path().join("repo");
-        std::fs::create_dir_all(&base).unwrap();
-        run_git(&base, &["init", "-b", "main"]);
-        run_git(&base, &["config", "user.email", "t@example.com"]);
-        run_git(&base, &["config", "user.name", "T"]);
-        std::fs::write(base.join("README.md"), "base").unwrap();
-        run_git(&base, &["add", "."]);
-        run_git(&base, &["commit", "-m", "init"]);
-        let base_canon = base.canonicalize().unwrap();
-        let base_str = base_canon.to_string_lossy().into_owned();
-
-        let worktree = base.join(".claude").join("worktrees").join("wt");
-        std::fs::create_dir_all(worktree.parent().unwrap()).unwrap();
-        run_git(
-            &base,
-            &[
-                "worktree",
-                "add",
-                "-b",
-                "arc/scope",
-                worktree.to_str().unwrap(),
-                "HEAD",
-            ],
-        );
-        let wt = worktree
-            .canonicalize()
-            .unwrap()
-            .to_string_lossy()
-            .into_owned();
-
-        let server = BlackboxServer::new(Arc::new(SharedState::for_test(tmp.path())));
-        server
-            .state
-            .project_authority
-            .bridge_registry()
-            .unwrap()
-            .write()
-            .register_path(&base_canon)
-            .unwrap();
-
-        // Notes: write keys base; a worktree-path list filter still finds it.
-        let note = server
-            .bbox_note(Parameters(crate::notes::NoteParams {
-                kind: "learned".into(),
-                body: "WORKTREE_NOTE_MARKER observation".into(),
-                task_id: None,
-                session_id: None,
-                project: Some(wt.clone()),
-                project_id: None,
-                thread_id: None,
-                provider: None,
-                bro: None,
-            }))
-            .await;
-        assert_ne!(note.is_error, Some(true), "note failed: {note:?}");
-        {
-            let notes = server.state.notes.read();
-            let stored = notes
-                .all()
-                .iter()
-                .find(|n| n.body.contains("WORKTREE_NOTE_MARKER"))
-                .expect("note stored");
-            assert_eq!(stored.project.as_deref(), Some(base_str.as_str()));
-        }
-        let listed = server.bbox_notes(Parameters(
-            crate::notes::NoteListParams {
-                project: Some(wt.clone()),
-                ..Default::default()
-            }
-            .into(),
-        ));
-        assert!(
-            format!("{:?}", listed.content).contains("WORKTREE_NOTE_MARKER"),
-            "worktree-path note filter should map to the base scope: {listed:?}"
         );
     }
 }

@@ -2,7 +2,7 @@
 
 Converging or cycling a blackbox daemon while operator sessions are mid
 bro-wave sandbags live orchestration state: running bro tasks, `bro_wait` /
-`bro_when_all` / `bro_when_any` long-polls, and sessions still writing threads, notes, and knowledge. The protected resource
+`bro_when_all` / `bro_when_any` long-polls, and sessions still writing threads and knowledge. The protected resource
 is that live state, not build capacity. This page describes the daemon-side
 probe and drain mode, and the wrapper script an external converge path calls.
 
@@ -45,11 +45,11 @@ Payload shape:
 |---|---|
 | `quiescent` | `true` iff no running tasks and no long-poll waiters |
 | `quiescent_scope` | Always `"tasks,waiters"`; states what `quiescent` covers |
-| `recent_writes_total` | Thread/note/knowledge writes inside the window (same level as `quiescent`, deliberately not folded into it) |
+| `recent_writes_total` | Thread and knowledge writes inside the window (same level as `quiescent`, deliberately not folded into it) |
 | `drain` | `{draining, set_at, reason, set_by, marker_path}` |
 | `running_tasks` | `count` + `tasks[]` (`task_id`, `session_id`, `provider`, `origin`, `bro`, `name`, `cwd`, `started_at_ms`, `age_secs`) |
 | `long_poll_waiters` | `count` + `waiters[]` (`id`, `tool`, `task_ids`, `age_secs`) |
-| `recent_writes` | `window_minutes`, `total`, `threads[]`, `notes[]`, `knowledge[]` |
+| `recent_writes` | `window_minutes`, `total`, `threads[]`, `knowledge[]` |
 
 Write recency is DELIBERATELY excluded from `quiescent`. A chatty operator
 session cannot be drained, only observed, so the daemon reports it and the

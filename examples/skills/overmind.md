@@ -1,6 +1,6 @@
 ---
 description: Meta-orchestration — strategic Advisor layer above crucible. Main-session Claude holds the arc's charter and spine; a dispatched orchestrator runs crucible internally; ensemble + implementer sit under the orchestrator. Survives orchestrator compaction by holding the strategic memory outside its boundary.
-allowed-tools: mcp__blackbox__bro_exec, mcp__blackbox__bro_resume, mcp__blackbox__bro_wait, mcp__blackbox__bro_status, mcp__blackbox__bro_cancel, mcp__blackbox__bro_dashboard, mcp__blackbox__bro_brofile, mcp__blackbox__bbox_thread, mcp__blackbox__bbox_thread_list, mcp__blackbox__bbox_notes, mcp__blackbox__bbox_knowledge, mcp__blackbox__bbox_learn, mcp__blackbox__bbox_hybrid_search, Read, Edit, Write, Glob, Grep, Bash, AskUserQuestion, TaskCreate, TaskUpdate
+allowed-tools: mcp__blackbox__bro_exec, mcp__blackbox__bro_resume, mcp__blackbox__bro_wait, mcp__blackbox__bro_status, mcp__blackbox__bro_cancel, mcp__blackbox__bro_dashboard, mcp__blackbox__bro_brofile, mcp__blackbox__bbox_thread, mcp__blackbox__bbox_thread_list, mcp__blackbox__bbox_knowledge, mcp__blackbox__bbox_learn, mcp__blackbox__bbox_hybrid_search, Read, Edit, Write, Glob, Grep, Bash, AskUserQuestion, TaskCreate, TaskUpdate
 argument-hint: <arc goal / task description>
 ---
 
@@ -179,7 +179,7 @@ bbox_thread(
 )
 ```
 
-Record `arc_thread_id`. This is the arc-level spine in bbox state. Individual crucibles inside the arc will open their own per-phase work-item threads and link to this one via notes or `bbox_thread`'s graph edges.
+Record `arc_thread_id`. This is the arc-level spine in bbox state. Individual crucibles inside the arc will open their own per-phase work-item threads, and Advisor links each one to this thread (`bbox_thread(action="link")`).
 
 Write `arc_thread_id` back into the spine doc.
 
@@ -226,8 +226,8 @@ Self-contained. Orchestrator needs:
 
 Advisor (main-session Claude) holds the strategic spine. You run crucible
 internally — ensemble review, durable implementer, per-phase work-item threads,
-structured bbox_note signals. Advisor does not see your work stream; you
-report at phase boundaries.
+and the thread notes you keep on them. Advisor does not see your work stream;
+you report at phase boundaries.
 
 ### Phase-boundary reports
 
@@ -243,7 +243,7 @@ Acceptance criteria:
 Commits: <SHA1 (title)>, <SHA2 (title)>
 Ensemble final verdict: APPROVE | REVISE | REJECT
 Ensemble dissent: <if any, both sides stated>
-Implementer notes of interest:
+Implementer signals of interest:
   - dispute (unresolved): <body>
   - surprise: <body>
   - followup (deferred): <body>
@@ -257,9 +257,6 @@ Drift signals (things outside the phase brief that surfaced):
 Strategic decisions needing Advisor input:
 1. <question>
 2. <question>
-
-Also emit bbox_note(kind="done", task_id=<from [scope]>, thread_id=<arc_thread_id>,
-body="<one-line phase summary>") before returning.
 
 ### Between phases
 
@@ -302,14 +299,14 @@ bro_wait(task_id=<current_orchestrator_task>, timeout_seconds=10800)
 
 Maximum timeout — phases can run long. Advisor does not poll. When `bro_wait` returns, the report is the assistant message; the structured fields are parseable by format.
 
-### 3b. Read the signal trail (narrow)
+### 3b. Record the phase on the arc thread (narrow)
 
 ```
-bbox_notes(thread_id=<arc_thread_id>, kind="done")
-bbox_notes(project=<cwd>, limit=5)   // project-scoped: surfaces anything unresolved
+bbox_thread(action="continue", id=<arc_thread_id>, note="Phase <N> <status>: <one-line summary>")
+bbox_thread(action="link", id=<arc_thread_id>, target=<phase work-item thread_id>)
 ```
 
-**Do NOT** read full phase notes, full diffs, or individual implementer notes. Orchestrator summarized them in the report. Trust the summary.
+**Do NOT** read full phase threads, full diffs, or individual implementer signals. Orchestrator summarized them in the report. Trust the summary.
 
 If a specific signal is unclear, Advisor may ask a pointed question in the next steering turn — not investigate directly.
 
@@ -611,7 +608,7 @@ No special handling needed in overmind itself — the spine doc + arc thread are
 
 ### Deferred Followups
 
-<explicit list — remaining kind=followup notes the user should know about>
+<explicit list: deferred followups the user should know about>
 
 ### Protocol Observations
 

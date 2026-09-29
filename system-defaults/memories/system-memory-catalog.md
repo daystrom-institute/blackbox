@@ -22,10 +22,8 @@ Files in `system-defaults/memories/` use bare slugs such as
 ## Knowledge, Persistence, And Render Hygiene
 
 - [sm-persistence-taxonomy](persistence-taxonomy.md) - when to learn
-  (rendered or recall-only) or note.
+  (rendered or recall-only) or keep context in a thread.
 - [sm-render-lifecycle](render-lifecycle.md) - learn and render lifecycle.
-- [sm-side-channel-notes](side-channel-notes.md) - executor and orchestrator
-  note emission.
 - [sm-create-etiquette](create-etiquette.md) - list-before-create dedupe
   discipline.
 - [sm-gap-notes](gap-notes.md) - reporting missing substrate capabilities.

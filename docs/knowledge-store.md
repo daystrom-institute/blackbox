@@ -15,7 +15,6 @@ from the store into `CLAUDE.md`, `AGENTS.md`, and `GEMINI.md`.
 | Searchable fact that should not live in every prompt | `bbox_learn` (`category="memory"`, `render=false`) |
 | Retire an entry | `bbox_forget` |
 | Active-arc guidance that should disappear when the work ends | the dispatch brief or `bbox_thread` |
-| Side-channel executor signal | `bbox_note` |
 | Multi-session investigation state | `bbox_thread` |
 
 `bbox_learn` is the only knowledge write lane. `bbox_knowledge` reads entries,
@@ -25,7 +24,7 @@ the write; every stored entry is active and there is no review queue.
 
 The test for a rendered `bbox_learn` entry is simple: would this still be
 correct a year from now after the current migration or work item is over? If
-no, it belongs in the dispatch brief, a note, or a thread entry.
+no, it belongs in the dispatch brief or a thread note.
 
 ## Learn
 
@@ -115,8 +114,8 @@ bbox_knowledge(query="retry policy", project="/repo/x")
 bbox_knowledge(query="sm-persistence-taxonomy")
 ```
 
-It also surfaces system memories (`sm-*`). For notes, use `bbox_notes`; for
-active threads, use `bbox_thread_list`.
+It also surfaces system memories (`sm-*`). For active threads and their notes,
+use `bbox_thread_list` and `bbox_thread`.
 
 ## Render
 
@@ -156,31 +155,34 @@ coverage is missing. Propose the resulting knowledge entries for operator
 approval before saving them through `bbox_learn`. There is no automatic
 instruction-file import lane.
 
-## Notes
+## Thread Notes
 
-Executor observations belong in notes:
+A note is an entry inside a thread. `bbox_thread` with `action="continue"`
+appends one:
 
 ```text
-bbox_note(kind="done", body="Implemented X; tests Y pass.")
-bbox_note(kind="blocked", body="Cannot proceed until schema Z is clarified.")
+bbox_thread(action="continue", id="thread-abc", note="Implemented X; tests Y pass.")
 ```
 
 Read them through:
 
 ```text
-bbox_notes(thread_id="thread-abc", full=true)
-bbox_notes(project="/repo/x")
+bbox_thread(action="get", id="thread-abc", detail="notes")
 ```
 
-At a round boundary, sweep project notes, `bbox_gaps` and `bro_dashboard` for
-unresolved notes, open gaps, and failed bro tasks.
+Dispatched agents file nothing: their final answer is their report. When
+dispatched work needs a durable record, the orchestrating agent opens a thread
+(`bbox_thread` `open`) and links it (`link`).
+
+At a round boundary, sweep `bbox_thread_list`, `bbox_gaps` and `bro_dashboard`
+for active threads, open gaps, and failed bro tasks.
 
 ## Common Mistakes
 
 - Storing phase-specific guidance with `bbox_learn`.
 - Writing rendered markdown by hand and expecting it to be the durable source.
 - Learning a replacement without forgetting the entry it replaces.
-- Using `bbox_note(kind="learned")` for a user-stated rule. User rules belong in
+- Recording a user-stated rule as a thread note. User rules belong in
   `bbox_learn`.
 - Rendering just to influence one active dispatch. Put it in the dispatch brief
   or the work-item thread.

@@ -43,7 +43,7 @@ Major code ownership boundaries:
   `find_paths`, evidence bundling).
 - `knowledge.rs`, `render.rs`, `system_memory/` - durable knowledge, rendered
   provider memory, and runtime-loaded system memories.
-- `threads.rs`, `notes.rs` - coordination stores.
+- `threads.rs` - thread store (threads and their notes).
 - `orchestration/` - providers, brofiles, teams, agent dispatch/resume, MCP
   injection and recursion guard.
 - `config.rs` - config loader and env override allowlist.

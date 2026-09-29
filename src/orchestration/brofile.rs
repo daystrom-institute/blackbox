@@ -1362,7 +1362,6 @@ mod tests {
         let f = bf.filters.expect("filters present");
 
         let expected_allow: Vec<&str> = vec![
-            "mcp__blackbox__bbox_note",
             "mcp__blackbox__bbox_thread",
             "mcp__blackbox__bbox_inspect_entity",
             "mcp__blackbox__bbox_hybrid_search",
@@ -1430,7 +1429,6 @@ mod tests {
         let f = bf.filters.expect("filters present");
 
         let expected_allow: Vec<&str> = vec![
-            "mcp__blackbox__bbox_note",
             "mcp__blackbox__bbox_thread",
             "mcp__blackbox__bbox_inspect_entity",
             "mcp__blackbox__bbox_hybrid_search",
@@ -1570,6 +1568,9 @@ mod tests {
             "macro_plan",
             "macro_apply",
             "macro_run",
+            "bbox_note",
+            "bbox_notes",
+            "bbox_note_resolve",
         ];
         let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut offenders = Vec::new();

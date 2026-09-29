@@ -4,7 +4,6 @@ pub mod artifact;
 pub mod commit;
 pub mod file;
 pub mod knowledge;
-pub mod note;
 pub mod project_file;
 pub mod session;
 pub mod symbol;
@@ -23,7 +22,6 @@ use bbox_corpus_core::entity_ref::{EntityRef, EntityType};
 use bbox_corpus_index::index::TranscriptIndex;
 use bbox_edge_index::edge_index::Edge;
 use bbox_knowledge::knowledge::Knowledge;
-use bbox_threads::notes::Notes;
 use bbox_threads::threads::Threads;
 use parking_lot::RwLock;
 
@@ -130,7 +128,6 @@ pub struct CorpusStores<'a> {
     pub idx: &'a RwLock<TranscriptIndex>,
     pub kb: &'a RwLock<Knowledge>,
     pub threads: &'a RwLock<Threads>,
-    pub notes: &'a RwLock<Notes>,
     /// Injected project authority. Providers enumerate records through it
     /// rather than reading the registry (or `projects.json`) directly.
     pub projects: &'a dyn bbox_corpus_core::project_record::ProjectRecordsProvider,
@@ -451,7 +448,6 @@ fn registry() -> &'static Vec<Box<dyn InspectableEntityProvider>> {
             Box::new(transcript::TranscriptProvider),
             Box::new(session::SessionProvider),
             Box::new(thread::ThreadProvider),
-            Box::new(note::NoteProvider),
             Box::new(symbol::SymbolProvider),
             Box::new(symbol::SymbolV2Provider),
             Box::new(commit::CommitProvider),

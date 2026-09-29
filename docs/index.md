@@ -34,7 +34,7 @@ The main operator binaries are:
 | [Index And Embedding Internals](index-embedding-internals.md) | Tantivy indexing, embedding queues, schema migration, vector and edge compaction |
 | [Refactor Tools](refactor.md) | Harness-native structural refactor tooling |
 | [Bro Runtime](bro-runtime.md) | Direct dispatch, resume, wait, teams, brofiles, and provider runtime controls |
-| [Knowledge Store](knowledge-store.md) | Learn, forget, render, and notes |
+| [Knowledge Store](knowledge-store.md) | Learn, forget, render, and thread notes |
 | [Design Graph](design-graph.md) | Operate this repo's `design` project graph: verbs, authority, reads, state blocks |
 | [Transcript Retrieval](transcript-retrieval.md) | Search, context, sessions, messages, and freshness checks |
 | [Projects And Code Indexing](projects-code-indexing.md) | Project registration, `.bbox`, code navigation, reindex, and reembed |
@@ -47,5 +47,5 @@ The main operator binaries are:
 ## Quick links
 
 - **Source**: [github.com/invidious9000/transcript-search](https://github.com/invidious9000/transcript-search)
-- **Key paths**: `~/.local/state/blackbox/` (index, knowledge, threads, notes), `~/.local/state/blackbox/bro/` (tasks, teams, MCP config)
+- **Key paths**: `~/.local/state/blackbox/` (index, knowledge, threads), `~/.local/state/blackbox/bro/` (tasks, teams, MCP config)
 - **Env vars**: `BBOX_PORT` (default 7264), `TRANSCRIPT_SEARCH_ROOTS`, `TRANSCRIPT_SEARCH_INDEX_PATH`

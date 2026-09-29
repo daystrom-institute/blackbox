@@ -516,11 +516,6 @@ impl BlackboxServer {
             bro_name: request.ambient_bro_name.clone(),
             thread_id: None,
             work_item_id: None,
-            completion_contract: if request.allow_recursion {
-                None
-            } else {
-                Some(orch::DEFAULT_COMPLETION_CONTRACT.to_string())
-            },
             provider: Some(request.provider),
             coerce_workspace: request.coerce_workspace,
         };
@@ -879,8 +874,8 @@ impl BlackboxServer {
         };
 
         // Re-pass the full dispatch context on resume: each resume is its own
-        // dispatch with a fresh task_id, and the scope and completion contract
-        // need to ride with every follow-up. Persona is
+        // dispatch with a fresh task_id, and the scope needs to ride with
+        // every follow-up. Persona is
         // included — the harness places it idempotently in the system slot
         // (the old resume branches dropped the lens; dispatch-prompt-slots.md
         // §6 classifies that as a bug, not behavior to preserve).
@@ -892,11 +887,6 @@ impl BlackboxServer {
             bro_name: p.bro.clone(),
             thread_id: None,
             work_item_id: None,
-            completion_contract: if allow_recursion {
-                None
-            } else {
-                Some(orch::DEFAULT_COMPLETION_CONTRACT.to_string())
-            },
             provider: Some(provider),
             coerce_workspace,
         };

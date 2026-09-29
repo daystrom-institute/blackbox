@@ -27,7 +27,7 @@ and edge families.
 
 ## Domain orientation (memorize once per session)
 
-**11 entity types** the graph contains:
+**10 entity types** the graph contains:
 
 | Type | Population | Use it for |
 |---|---|---|
@@ -36,7 +36,6 @@ and edge families.
 | `transcript` | one block of one Claude/Codex/Gemini session | "what did this turn say?" |
 | `session` | a full agent conversation | "what was that session about?" |
 | `thread` | persistent investigation across sessions | "what's the deferred-items work?" |
-| `note` | structured side-channel records (dispute/done/etc) | "what's pending review?" |
 | `symbol` | named code symbols (functions, types, modules) | "what calls X?" |
 | `brofile` | persona+model+lens triple | "what brofile dispatched this?" |
 | `commit` | git commits with parent + touched-file edges | "what changed in commit X?" |

@@ -11,7 +11,6 @@ use tokio::sync::broadcast;
 use crate::gaps::GapStore;
 use crate::index::TranscriptIndex;
 use crate::knowledge::Knowledge;
-use crate::notes::Notes;
 use crate::orchestration::tail::TailEvent;
 use crate::orchestration::{self, TaskStore};
 use crate::projects::ProjectRegistry;
@@ -90,8 +89,6 @@ pub(crate) struct SharedState {
     pub(crate) gaps: RwLock<GapStore>,
     pub(crate) threads: Arc<RwLock<Threads>>,
     pub(crate) threads_persister: StorePersister<Threads>,
-    pub(crate) notes: Arc<RwLock<Notes>>,
-    pub(crate) notes_persister: StorePersister<Notes>,
     /// Durable pending checkout mutations (repo-owned file writes the
     /// daemon validated but cannot apply; the checkout-owner collector
     /// polls and acks them over the producer channel).
@@ -578,10 +575,6 @@ impl SharedState {
         });
     }
 
-    pub(crate) async fn persist_notes_durable(&self) -> anyhow::Result<()> {
-        self.notes_persister.request_durable().await
-    }
-
     pub(crate) async fn persist_threads_durable(&self) -> anyhow::Result<()> {
         self.threads_persister.request_durable().await
     }
@@ -654,7 +647,6 @@ impl SharedState {
             idx: &self.idx,
             kb: self.kb.as_ref(),
             threads: self.threads.as_ref(),
-            notes: self.notes.as_ref(),
             projects: self.records_provider.as_ref(),
             checkout_registry: self.checkout_registry.as_ref(),
             checkout_access: self.checkout_access.as_ref(),
@@ -762,15 +754,10 @@ impl SharedState {
         )
         .unwrap();
         crate::threads::register_thread_embed_hook(crate::embed_queue::enqueue_thread_hook);
-        crate::notes::register_note_embed_hook(crate::embed_queue::enqueue_note_hook);
         crate::index::writer_actor::register_embed_bootstrap(
             crate::embed_queue::register_index_embed_hooks,
         );
         crate::providers::register_extra_providers(crate::providers_ext::extra_providers());
-        crate::embed::queue::register_contradiction_hook(crate::embed_runtime::contradiction_hook);
-        let notes_path = store_dir.join("notes.json");
-        let notes_store = Arc::new(RwLock::new(Notes::open(&notes_path).unwrap()));
-        let notes_persister = StorePersister::spawn("notes-test", notes_store.clone(), notes_path);
         let threads_path = store_dir.join("threads.json");
         let threads_store = Arc::new(RwLock::new(Threads::open(&threads_path).unwrap()));
         let threads_persister =
@@ -814,8 +801,6 @@ impl SharedState {
             gaps: RwLock::new(gaps),
             threads: threads_store,
             threads_persister,
-            notes: notes_store,
-            notes_persister,
             checkout_mutations: checkout_mutations_store,
             checkout_mutations_persister,
             producer_claims: producer_claims_store,

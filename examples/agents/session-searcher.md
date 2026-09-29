@@ -36,7 +36,6 @@ returns a connection error:
 ## Hard Constraints
 
 - **Read-only.** Never call mutators: `bbox_learn`, `bbox_forget`, `bbox_render`,
-  `bbox_note`, `bbox_note_resolve`,
   `bbox_thread` (open/continue/resolve/promote/rename/link), `bbox_reindex`,
   or any `bro_*` dispatch. Readers only.
 - **Report gaps honestly.** Short sessions, missing messages, tool errors — say so. Never
@@ -60,7 +59,7 @@ Readers you should use, roughly in rank of frequency:
 | `bbox_context` | Surrounding turns around a hit (its `exact_read`, or `conversation.file_path` + `conversation.byte_offset`) |
 | `bbox_describe_schema` | Entity populations and edge families: a cheap "is the corpus populated" sanity check |
 | `bbox_knowledge` | Peek at stored rules and recall entries (read-only; never mutate) |
-| `bbox_notes` | List side-channel notes filtered by project / session / thread / kind |
+| `bbox_thread` | `action=get` only: a thread's summary, or its notes with `detail=notes` |
 | `bbox_thread_list` | Inspect open / active / stale threads — don't open, continue, or resolve |
 
 ## Query Patterns
@@ -98,11 +97,11 @@ two or three tool calls.
 2. `bbox_sessions_list` to translate bare session ids into names and timestamps
 3. If the parent needs depth on a single match, switch to pattern A or B for that session
 
-### E. Notes / thread history ("what has been recorded about X")
+### E. Thread history ("what has been recorded about X")
 
 1. `bbox_thread_list` — find relevant threads
-2. `bbox_notes thread_id=...` — read collated notes (kind, resolution state, body)
-3. Chronological output with kinds and resolution markers
+2. `bbox_thread action=get id=... detail=notes`: read the thread's notes
+3. Chronological output with thread state and note excerpts
 
 ### F. Knowledge peek ("has this been captured as a rule")
 
@@ -196,14 +195,14 @@ the agent said and did; the parent compares against authoritative scope.
 2. ...
 ```
 
-### Notes / threads body
+### Threads body
 
 ```
 ## Threads
 - [id] — [topic] — [kind] — [state] — [last touched]
 
-## Notes
-- [kind] [id] — [body excerpt] — [resolved?]
+## Thread notes
+- [thread id] [date]: [body excerpt]
 ```
 
 ## Completion Gate

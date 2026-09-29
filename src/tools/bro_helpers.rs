@@ -77,28 +77,3 @@ pub(crate) fn roster_entry_key(entry: &BroRosterEntry) -> String {
         format!("member::{}", entry.bro_selector)
     }
 }
-
-pub(crate) fn tier0_cosine_threshold_from_env() -> f32 {
-    const DEFAULT: f32 = 0.85;
-    match std::env::var("BBOX_TIER0_COSINE_THRESHOLD") {
-        Ok(raw) => match raw.parse::<f32>() {
-            Ok(value) if (0.0..=1.0).contains(&value) => value,
-            Ok(value) => {
-                tracing::warn!(
-                    value,
-                    "BBOX_TIER0_COSINE_THRESHOLD outside [0.0, 1.0]; using default"
-                );
-                DEFAULT
-            }
-            Err(err) => {
-                tracing::warn!(
-                    value = raw,
-                    error = %err,
-                    "invalid BBOX_TIER0_COSINE_THRESHOLD; using default"
-                );
-                DEFAULT
-            }
-        },
-        Err(_) => DEFAULT,
-    }
-}

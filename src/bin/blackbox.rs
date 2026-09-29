@@ -2070,7 +2070,6 @@ mod tests {
             ("knowledge.json", "entries"),
             ("gaps.json", "gaps"),
             ("threads.json", "threads"),
-            ("notes.json", "notes"),
             ("pins.json", "pins"),
         ] {
             let path = root.join(name);
@@ -3287,7 +3286,7 @@ impl<'a> project_catalog_admin::RetirementDischargeWorkers for CliRetirementDisc
 
     /// Stage CollectedGenerationsDischarged: clear the activation record,
     /// delete source-owned generation records, and clear project-scoped
-    /// coordination rows (knowledge, gaps, threads, notes, pins, etc.).
+    /// coordination rows (knowledge, gaps, threads, pins, etc.).
     fn discharge_collected_generations(
         &mut self,
         project_id: &ProjectId,
@@ -3913,7 +3912,7 @@ fn validate_retirement_targets_absent(
 /// audit history. Slack rows are the opposite case and are included: both
 /// slack stores key their rows to a project by id and by project directory,
 /// so they are logical-identity references like any other coordination row.
-const RETIRE_REFERENCE_CLASSES: [&str; 18] = [
+const RETIRE_REFERENCE_CLASSES: [&str; 17] = [
     "code_source_activation",
     "code_source_generations",
     "producer_assignments",
@@ -3921,7 +3920,6 @@ const RETIRE_REFERENCE_CLASSES: [&str; 18] = [
     "knowledge_rows",
     "gap_rows",
     "thread_rows",
-    "note_rows",
     "pin_rows",
     "artifact_rows",
     "packet_rows",
@@ -4155,7 +4153,6 @@ fn probe_retire_evidence(
         ("knowledge_rows", &config.paths.knowledge_path),
         ("gap_rows", &config.paths.gaps_path),
         ("thread_rows", &config.paths.threads_path),
-        ("note_rows", &config.paths.notes_path),
         ("pin_rows", &config.paths.pins_path),
     ] {
         probe.record(
@@ -5037,11 +5034,6 @@ fn coordination_row_paths(
         (
             config.paths.threads_path.clone(),
             &["threads"],
-            &PROJECT_ROW_KEYS,
-        ),
-        (
-            config.paths.notes_path.clone(),
-            &["notes"],
             &PROJECT_ROW_KEYS,
         ),
         (config.paths.pins_path.clone(), &["pins"], &PROJECT_ROW_KEYS),

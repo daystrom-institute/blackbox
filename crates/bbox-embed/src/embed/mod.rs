@@ -233,7 +233,6 @@ pub enum Bucket {
     Docs,
     Transcripts,
     GitMessage,
-    Notes,
     Threads,
     /// Project-graph vertices whose schema opts them into embedding
     /// (unified-retrieval design 4.4; one route for every graph, Q3). The
@@ -243,13 +242,12 @@ pub enum Bucket {
 }
 
 impl Bucket {
-    pub const ALL: [Bucket; 8] = [
+    pub const ALL: [Bucket; 7] = [
         Bucket::Knowledge,
         Bucket::Code,
         Bucket::Docs,
         Bucket::Transcripts,
         Bucket::GitMessage,
-        Bucket::Notes,
         Bucket::Threads,
         Bucket::Graph,
     ];
@@ -261,7 +259,6 @@ impl Bucket {
             Self::Docs => "docs",
             Self::Transcripts => "transcripts",
             Self::GitMessage => "git_message",
-            Self::Notes => "notes",
             Self::Threads => "threads",
             Self::Graph => "graph",
         }
@@ -492,7 +489,6 @@ pub struct RoutesConfig {
     pub docs: Option<String>,
     pub transcripts: Option<String>,
     pub git_message: Option<String>,
-    pub notes: Option<String>,
     pub threads: Option<String>,
     pub graph: Option<String>,
     #[serde(default)]
@@ -512,7 +508,6 @@ pub struct BucketRoutes {
     pub docs: Option<String>,
     pub transcripts: Option<String>,
     pub git_message: Option<String>,
-    pub notes: Option<String>,
     pub threads: Option<String>,
     pub graph: Option<String>,
 }
@@ -525,7 +520,6 @@ impl BucketRoutes {
             Bucket::Docs => self.docs.as_deref(),
             Bucket::Transcripts => self.transcripts.as_deref(),
             Bucket::GitMessage => self.git_message.as_deref(),
-            Bucket::Notes => self.notes.as_deref(),
             Bucket::Threads => self.threads.as_deref(),
             Bucket::Graph => self.graph.as_deref(),
         }
@@ -540,7 +534,6 @@ impl RoutesConfig {
             Bucket::Docs => self.docs.as_deref(),
             Bucket::Transcripts => self.transcripts.as_deref(),
             Bucket::GitMessage => self.git_message.as_deref(),
-            Bucket::Notes => self.notes.as_deref(),
             Bucket::Threads => self.threads.as_deref(),
             Bucket::Graph => self.graph.as_deref(),
         }
@@ -1074,7 +1067,7 @@ rate_limit_per_min = 500
 model = "custom-local"
 
 [embed.routes]
-notes = "ollama"
+threads = "ollama"
 "#,
         )
         .unwrap();
@@ -1082,10 +1075,13 @@ notes = "ollama"
         assert_eq!(route.provider_id, VOYAGE_PROVIDER_ID);
         assert_eq!(route.document_model, "voyage-code-2");
         assert_eq!(router.rate_limit_per_min(VOYAGE_PROVIDER_ID), Some(500));
-        let notes = router.route(Bucket::Notes, None).unwrap();
-        assert_eq!(notes.document_model, "custom-local");
-        assert_eq!(notes.endpoint_kind, EmbedEndpointKind::Ollama);
-        assert_eq!(notes.compatibility_family, "ollama:custom-local:768:float");
+        let threads = router.route(Bucket::Threads, None).unwrap();
+        assert_eq!(threads.document_model, "custom-local");
+        assert_eq!(threads.endpoint_kind, EmbedEndpointKind::Ollama);
+        assert_eq!(
+            threads.compatibility_family,
+            "ollama:custom-local:768:float"
+        );
     }
 
     /// Two Voyage-backed aliases with different models — the core Layer 0
@@ -1204,8 +1200,8 @@ threads = "ollama"
         )
         .unwrap();
         let routes = router.configured_routes();
-        // 8 global buckets + 8 per-project rows for proj1234.
-        assert_eq!(routes.len(), 16);
+        // 7 global buckets + 7 per-project rows for proj1234.
+        assert_eq!(routes.len(), 14);
         assert!(routes.iter().any(|route| {
             route.bucket == Bucket::Threads
                 && route.project_id.as_deref() == Some("proj1234")
@@ -1492,25 +1488,28 @@ threads = "ollama"
     /// Embed configs written with a route for the removed agent manifest
     /// bucket still load; the key is ignored.
     #[test]
-    fn legacy_agent_manifest_route_key_is_ignored() {
+    fn legacy_route_keys_are_ignored() {
         let router = EmbeddingRouter::from_toml_str(
             r#"
 [embed.providers.ollama]
 model = "custom-local"
 
 [embed.routes]
+threads = "ollama"
 notes = "ollama"
 agent_manifest = "ollama"
 
 [embed.routes.per_project.p1]
+notes = "ollama"
 agent_manifest = "ollama"
 "#,
         )
         .unwrap();
         assert_eq!(
-            router.route(Bucket::Notes, None).unwrap().document_model,
+            router.route(Bucket::Threads, None).unwrap().document_model,
             "custom-local"
         );
         assert!(bucket_from_str("agent_manifest").is_err());
+        assert!(bucket_from_str("notes").is_err());
     }
 }

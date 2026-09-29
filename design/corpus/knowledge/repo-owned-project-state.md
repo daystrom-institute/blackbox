@@ -195,7 +195,7 @@ layer and wrong for the activity layer — different natures want different home
 | knowledge (conventions, rules) | durable, reviewable, branch-aligned | **committed** `.bbox/` | config-like; git is ideal; PR review *is* the approval workflow |
 | accepted roadmap items | durable intent | **committed** `.bbox/` | but see roadmap caveat below |
 | promoted/resolved thread snapshots | durable record of past activity | **committed** `.bbox/record/` | the *record* belongs with the code it explains |
-| live threads, side-channel notes | high-churn activity, often session/bro/task-bound | **local** `.bbox/local/` (gitignored) | committing churns merges and *leaks per-host identity* (session UUIDs, bro IDs, absolute paths) |
+| live threads and their notes | high-churn activity, often session/bro/task-bound | **local** `.bbox/local/` (gitignored) | committing churns merges and *leaks per-host identity* (session UUIDs, bro IDs, absolute paths) |
 | index, embeddings, edge sidecars | derived cache | **host** (`~/.local/state`) | reproducible from source; never authoritative |
 
 **Roadmap caveat (from review):** accepted roadmap *items* are durable and can be

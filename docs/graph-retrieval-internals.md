@@ -124,7 +124,6 @@ types are:
 | `transcript` | One content block from a session | "what did this turn say?" |
 | `session` | A full agent conversation | "what was this session about?" |
 | `thread` | Persistent work across sessions | "what is still active?" |
-| `note` | Structured side-channel records | "what did the executor flag?" |
 | `symbol` | Named code symbols | "what calls or defines this?" |
 | `symbol_v2` | Snapshot-scoped code symbols | "which definition is live?" |
 | `brofile` | Persona/model/lens triple | "which agent produced this?" |
@@ -155,7 +154,7 @@ Edges are directional and typed.
 table, so its output can omit edge kinds listed here.
 
 The EdgeIndex is built from per-project JSONL sidecars plus live
-knowledge, thread, and note stores, with virtual edges for
+knowledge and thread stores, with virtual edges for
 tasks and tool calls.
 
 ## Hybrid search mechanics
@@ -190,7 +189,7 @@ session before fusion.
 Vector lanes are per route: hybrid search iterates on-disk vector
 partitions with a nonzero active count and maps each back to a
 configured text bucket (`code`, `docs`, `knowledge`, `transcripts`,
-`git_message`, `notes`, `threads`, `graph`) or visual
+`git_message`, `threads`, `graph`) or visual
 route, and each contributing partition becomes its own ranked list.
 Unmapped partitions are skipped and reported in
 `degraded.skipped_partitions`.

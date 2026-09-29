@@ -28,7 +28,6 @@ pub enum ToolCategory {
     ProjectCatalog,
     Knowledge,
     Threads,
-    Notes,
     Gaps,
     Artifacts,
     Orchestration,
@@ -47,7 +46,6 @@ impl ToolCategory {
             Self::ProjectCatalog => "Project catalog administration",
             Self::Knowledge => "Knowledge",
             Self::Threads => "Threads",
-            Self::Notes => "Side-channel notes",
             Self::Gaps => "Gap notes",
             Self::Artifacts => "Artifact catalog",
             Self::Orchestration => "Bro orchestration",
@@ -77,9 +75,6 @@ impl ToolCategory {
             }
             Self::Threads => {
                 "Track non-dispatchable work that spans sessions (investigations, QC walks, debugging, refinement loops). Lighter than the full dispatch pipeline, heavier than memory. Use `kind=work_item` for orchestrator-led propose→execute→review→refine loops."
-            }
-            Self::Notes => {
-                "Structured side channel for *notable* observations surfaced during delegated work; orchestrators query `bbox_notes` at round boundaries. Seven kinds: `dispute`, `assumption`, `surprise`, `followup`, `blocked`, `learned`, `done`. Emit one only when you have something genuinely worth flagging; this is a signal channel, not a progress log, and silence is the right default when nothing is notable. A `done` note with a one-line acceptance summary is useful when an explicit caller contract asks for a structured sign-off; it is not required on every dispatch."
             }
             Self::Gaps => {
                 "First-class substrate gap-note store. File a gap when the blocker is in the blackbox substrate or shared agent workflow — a missing tool primitive, MCP surface, refactor atom, workflow shape, ontology edge, or runbook that agents in other projects could plausibly hit too — not in the current product codebase. Project-scoped gaps are repo-owned (committed under `<project>/.bbox/gaps/`, travel with the checkout); cross-project substrate gaps go to the central host store with `scope=\"global\"`. `bbox_gap` files (typed, validated, deduped by `dedupe_key`), `bbox_gaps` filters by typed fields, `bbox_gap_resolve` closes out (with structured supersession), `bbox_gap_update` edits in place. See `sm-gap-notes` via `bbox_knowledge` for the full envelope, vocabularies, and lifecycle."
@@ -118,7 +113,6 @@ const HOT_RENDER_CATEGORIES: &[ToolCategory] = &[
     ToolCategory::Projects,
     ToolCategory::Knowledge,
     ToolCategory::Threads,
-    ToolCategory::Notes,
     ToolCategory::Artifacts,
     ToolCategory::Orchestration,
 ];
@@ -175,7 +169,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_reembed",
         category: ToolCategory::Transcripts,
         summary: "Request an embedding rebuild for a configured route.",
-        when_to_use: "Use after changing embedding routes or provider dimensions to kick convergence immediately; a background residue sweeper otherwise drives every non-transcript route to full coverage on its own, including residue past the per-route queue cap, so a `stalled` route converges without repeated manual calls. E3 performs the rebuild. Routes include knowledge, code, docs, git_message, notes, threads, graph (project-graph vertices whose schema opts them into embedding; rebuilt from the installed published views, and the one route that also tombstones vectors of vertices no longer embed-eligible), and guarded transcripts; `backfill` sweeps every route except transcripts (idempotent: already-embedded items dedupe at enqueue). Use max_entities for progressive refills. Transcript rebuilds require include_transcripts=true because they read the transcript corpus.",
+        when_to_use: "Use after changing embedding routes or provider dimensions to kick convergence immediately; a background residue sweeper otherwise drives every non-transcript route to full coverage on its own, including residue past the per-route queue cap, so a `stalled` route converges without repeated manual calls. E3 performs the rebuild. Routes include knowledge, code, docs, git_message, threads, graph (project-graph vertices whose schema opts them into embedding; rebuilt from the installed published views, and the one route that also tombstones vectors of vertices no longer embed-eligible), and guarded transcripts; `backfill` sweeps every route except transcripts (idempotent: already-embedded items dedupe at enqueue). Use max_entities for progressive refills. Transcript rebuilds require include_transcripts=true because they read the transcript corpus.",
         example: None,
     },
     ToolDoc {
@@ -289,7 +283,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_project_rename",
         category: ToolCategory::Projects,
-        summary: "Local administrator operation; transport-owned catalog projects refuse with error.project_admin_locality_required because no remote relocation lane is implemented. A bridge failure after registry admission reports error.project_rename_partial with completed effects and old/new recovery coordinates. Rename a registered bbox project root while preserving its project_id and migrating project-scoped bbox state. Accepts project (project_id, registered canonical_path, or absolute path), new_path (absolute directory path), optional move_on_disk (default false), and optional dry_run. Updates project registry, knowledge, threads, notes, Slack channel bindings, live teams, pollers, and crons, then reindexes project files. In catalog mode rename is attachment relocation: the moved checkout must carry the same checkout-id marker and resolve the same scope, the ledger records the historical path, owner-store rows are never rewritten, and move_on_disk is refused (move first, then rename).",
+        summary: "Local administrator operation; transport-owned catalog projects refuse with error.project_admin_locality_required because no remote relocation lane is implemented. A bridge failure after registry admission reports error.project_rename_partial with completed effects and old/new recovery coordinates. Rename a registered bbox project root while preserving its project_id and migrating project-scoped bbox state. Accepts project (project_id, registered canonical_path, or absolute path), new_path (absolute directory path), optional move_on_disk (default false), and optional dry_run. Updates project registry, knowledge, threads, Slack channel bindings, live teams, pollers, and crons, then reindexes project files. In catalog mode rename is attachment relocation: the moved checkout must carry the same checkout-id marker and resolve the same scope, the ledger records the historical path, owner-store rows are never rewritten, and move_on_disk is refused (move first, then rename).",
         when_to_use: "Use after renaming a repo directory, or with `move_on_disk=true` to let bbox move the directory first. Prefer `dry_run=true` before changing several project names so the affected state counts are visible.",
         example: Some(
             r#"bbox_project_rename(project="d723917f", new_path="/home/me/repos/blackbox", dry_run=true)"#,
@@ -312,7 +306,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_project_unregister",
         category: ToolCategory::Projects,
-        summary: "Unregister a project root from the bbox project registry. Accepts project (project_id, registered canonical_path, or absolute path). Removes the registry entry only; does NOT delete project-scoped state (knowledge, threads, notes, Slack bindings, teams, pollers, crons) keyed on the project_id, which is derived from the canonical realpath and is stable across unregister+re-register. By default refuses when refs still exist and returns the counts; pass force=true to orphan them, or bbox_project_rename to migrate first. dry_run=true previews counts without mutating the registry. In catalog mode unregister is detach: the attachment is marked detached with census deregistration scoped to its checkout and scope pair, every logical store keeps its rows, and catalog deletion is the offline project-catalog retire surface.",
+        summary: "Unregister a project root from the bbox project registry. Accepts project (project_id, registered canonical_path, or absolute path). Removes the registry entry only; does NOT delete project-scoped state (knowledge, threads, Slack bindings, teams, pollers, crons) keyed on the project_id, which is derived from the canonical realpath and is stable across unregister+re-register. By default refuses when refs still exist and returns the counts; pass force=true to orphan them, or bbox_project_rename to migrate first. dry_run=true previews counts without mutating the registry. In catalog mode unregister is detach: the attachment is marked detached with census deregistration scoped to its checkout and scope pair, every logical store keeps its rows, and catalog deletion is the offline project-catalog retire surface.",
         when_to_use: "Use to drop a stale or accidentally-registered project root without hand-editing projects.json. Prefer `dry_run=true` first to see what is still attached, then `bbox_project_rename` to migrate or `force=true` to accept orphaning. Compatibility unregistration can complete before auxiliary watcher cleanup fails; status=partial preserves the committed registry change.",
         example: Some(
             r#"bbox_project_unregister(project="/home/me/repos/dead-project", dry_run=true)"#,
@@ -400,7 +394,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_learn",
         category: ToolCategory::Knowledge,
         summary: "Persist an operator-approved rule or convention that should bind future sessions; rendered into provider markdown files. Pass render=false for an indexed-only recall entry that search finds but no rendered file carries. Use for narrative rules (\"we always X\", \"never Y\") only after the operator has approved the exact content and scope.",
-        when_to_use: "Use only after the operator has approved the exact text and scope for a standing user rule that must outlive the current edit AND would still be correct a year from now with all current arcs complete. Anti-trigger: content naming a specific migration, phase, active arc, current initiative, or \"finish X before Y\" sequencing is arc-bound; it belongs in the dispatch brief or the work-item thread. Not for one-off task constraints, not for facts you discovered yourself (that's `bbox_note(kind=\"learned\")`). Query `bbox_knowledge` first to avoid duplicate entries. On a transport-governed estate, project-scoped writes ride the checkout-owner backchannel: the daemon enqueues the committed `.bbox/knowledge/` bytes and the collector applies them within one cycle; commit the file to publish. See `sm-persistence-taxonomy` via `bbox_knowledge` for the deeper split.",
+        when_to_use: "Use only after the operator has approved the exact text and scope for a standing user rule that must outlive the current edit AND would still be correct a year from now with all current arcs complete. Anti-trigger: content naming a specific migration, phase, active arc, current initiative, or \"finish X before Y\" sequencing is arc-bound; it belongs in the dispatch brief or the work-item thread. Not for one-off task constraints, not for facts you discovered yourself (those belong in a thread note or your final report). Query `bbox_knowledge` first to avoid duplicate entries. On a transport-governed estate, project-scoped writes ride the checkout-owner backchannel: the daemon enqueues the committed `.bbox/knowledge/` bytes and the collector applies them within one cycle; commit the file to publish. See `sm-persistence-taxonomy` via `bbox_knowledge` for the deeper split.",
         example: Some(
             r#"bbox_learn(content="use rustls, not openssl", category="convention", scope="project", project="/repo/x")"#,
         ),
@@ -409,7 +403,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_knowledge",
         category: ToolCategory::Knowledge,
         summary: "Query durable knowledge entries by free-text or filters. Use early when prior decisions, conventions, remembered facts, or system runbooks could change the answer. Also surfaces a bounded system-memory sidecar; system memories include system_memory:<id> refs usable with bbox_inspect_entity or bbox_bundle_evidence. Pass category=\"system_memory\" to list memory metadata.",
-        when_to_use: "Use near the start of tasks where durable knowledge-store context could matter: prior decisions, project conventions, rendered rules, remembered facts, or system runbooks. This is not the surface for side-channel notes (`bbox_notes`), active threads (`bbox_thread_list`), or transcript history (`bbox_hybrid_search`). Prefer a short phrase from the user's request over a single generic keyword; adjacent terms broaden recall, quoted phrases stay exact, `AND` / `OR` work explicitly, and `-term` excludes. If the first query is empty or too broad, try one sharper phrase. Use `mode=substring` for literal whole-query matching. Add `project=<cwd>` when looking for an entry to update or replace; `project` also accepts a project_id or a registered operator alias and matches entries by project identity, and a value that resolves to no registered project keeps literal substring matching and says so in the response diagnostics. System memories can also be paged by canonical `sm-*` ID. Oversized structured entry content or metadata becomes a bounded preview whose detail recovery arguments carry the canonical entity_ref and the same filters; pass entry_detail=<entity_ref>, then concatenate body.text pages from detail_cursor through next_cursor and parse the complete JSON. Pass diagnostics_detail=true with the same filters to page exact omitted diagnostics. Content changes invalidate cursors; restart the same read without detail_cursor. offset continues the selected ranked knowledge page or system-memory catalog. Requests cap at 100 rows and 16 KiB selectors; complete-envelope budgeting can return fewer. Follow structuredContent.page.next_offset for knowledge. The selection is live, so concurrent changes can move rows.",
+        when_to_use: "Use near the start of tasks where durable knowledge-store context could matter: prior decisions, project conventions, rendered rules, remembered facts, or system runbooks. This is not the surface for active threads (`bbox_thread_list`) or transcript history (`bbox_hybrid_search`). Prefer a short phrase from the user's request over a single generic keyword; adjacent terms broaden recall, quoted phrases stay exact, `AND` / `OR` work explicitly, and `-term` excludes. If the first query is empty or too broad, try one sharper phrase. Use `mode=substring` for literal whole-query matching. Add `project=<cwd>` when looking for an entry to update or replace; `project` also accepts a project_id or a registered operator alias and matches entries by project identity, and a value that resolves to no registered project keeps literal substring matching and says so in the response diagnostics. System memories can also be paged by canonical `sm-*` ID. Oversized structured entry content or metadata becomes a bounded preview whose detail recovery arguments carry the canonical entity_ref and the same filters; pass entry_detail=<entity_ref>, then concatenate body.text pages from detail_cursor through next_cursor and parse the complete JSON. Pass diagnostics_detail=true with the same filters to page exact omitted diagnostics. Content changes invalidate cursors; restart the same read without detail_cursor. offset continues the selected ranked knowledge page or system-memory catalog. Requests cap at 100 rows and 16 KiB selectors; complete-envelope budgeting can return fewer. Follow structuredContent.page.next_offset for knowledge. The selection is live, so concurrent changes can move rows.",
         example: Some(r#"bbox_knowledge(query="retry policy")"#),
     },
     ToolDoc {
@@ -440,32 +434,6 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         summary: "List thread summary pages (default 20, maximum 100), ordered by last activity then id. Continue with next_offset; use bbox_thread(action=get,id=...) for a bounded summary, then detail pages.",
         when_to_use: "Before starting work on a topic (continuity check). Use `status` for lifecycle (`open`, `active`, `resolved`, `promoted`) and `min_idle_days` to return only threads idle for at least N days. Filter by `kind=work_item`. Workflow-origin arc threads are hidden by default; pass `include_workflows=true` when you need historical workflow records.",
         example: None,
-    },
-    // ── Notes ────────────────────────────────────────────────────────
-    ToolDoc {
-        name: "bbox_note",
-        category: ToolCategory::Notes,
-        summary: "Record a structured side-channel note while working.",
-        when_to_use: "Emit a note only when you have a *notable* signal worth surfacing to an orchestrator — a `dispute`, `surprise`, `blocked`, `learned` fact, or actionable `followup`. Silence is the correct default: this is a side channel, not a per-call progress log, so most dispatches should emit nothing. A `kind=done` sign-off is opt-in — emit it when an explicit caller contract asks for one, not on every dispatch. Use `learned` for agent-discovered facts, not user-stated rules. See `sm-side-channel-notes` via `bbox_knowledge` for the full note taxonomy. Substrate gaps that other projects could plausibly hit too are NOT side-channel notes — file them with `bbox_gap` (see `sm-gap-notes` via `bbox_knowledge`), not here.",
-        example: Some(
-            r#"bbox_note(kind="dispute", body="brief assumes schema is additive — migration 0042 makes it subtractive")"#,
-        ),
-    },
-    ToolDoc {
-        name: "bbox_notes",
-        category: ToolCategory::Notes,
-        summary: "List note summary pages (default 20, maximum 100), newest first then id. Continue with next_offset; use id and full=true for complete bodies through a content-bound cursor. Filter by kind, project, session, thread, or resolution.",
-        when_to_use: "Orchestrators reading what executors emitted this round, auditing past dispatch for a work-item thread, or retrieving a known note by `id=\"note-<8hex>\"`. The `query` filter searches note bodies, not IDs. Bodies are previewed at 200 chars by default; pass `full=true` with `id` to page the complete stored row through a content-bound cursor (useful for `done` summaries and structured `dispute` rationales); a cursor from one note is rejected on another or after the row changes. Addressed notes are hidden by default for list views but included by default for exact `id` lookups. Exact note reads honor the same resolved project/ledger filters as lists; offset/limit are invalid for exact reads.",
-        example: Some(r#"bbox_notes(id="note-a1b2c3d4", full=true)"#),
-    },
-    ToolDoc {
-        name: "bbox_note_resolve",
-        category: ToolCategory::Notes,
-        summary: "Mark one note, or a batch of notes, acknowledged or addressed.",
-        when_to_use: "Orchestrator close-the-loop move. Pass the full `note-<8hex>` ID verbatim as `id` for one note, pass `ids=[...]` to close multiple notes with a shared `note`, or pass `notes={\"note-<8hex>\":\"detail\"}` for per-note resolution details. The batch forms use one mutation and one durable persist. `addressed` removes notes from the default `bbox_notes` view; `acknowledged` keeps them visible as deferred. See `sm-side-channel-notes` via `bbox_knowledge` for the full loop. Resolution batches accept at most 100 IDs and 64 KiB of serialized input, checked before mutation.",
-        example: Some(
-            r#"bbox_note_resolve(notes={"note-a1b2c3d4":"fixed parser","note-deadbeef":"deferred to thread-12345678"}, resolution="addressed")"#,
-        ),
     },
     // ── Gap notes ────────────────────────────────────────────────────
     ToolDoc {
@@ -725,16 +693,10 @@ broader recall.
 
 ## Roles and the core loop
 
-- **Orchestrator**: dispatches, reviews, reads `bbox_notes`, resolves notes, \
-and records durable commitments.
-- **Executor** — when running as a dispatched bro/task actor, \
-does the work and returns its result. `bbox_note` is available for *notable* \
-observations worth surfacing to the orchestrator (`dispute`, `surprise`, \
-`blocked`, `learned`, actionable `followup`) — it is not a per-dispatch ritual, \
-so stay silent when nothing is notable. A caller that needs a structured \
-sign-off contract may require a \
-`kind=done` note on top of this default; absent that instruction, a done note \
-is optional.
+- **Orchestrator**: dispatches, reviews, creates and links a `bbox_thread` \
+when a dispatch needs a durable record, and records durable commitments.
+- **Executor**: when running as a dispatched bro/task actor, does the work and \
+returns its result. The final answer is the report; nothing else needs filing.
 
 ## Ambient scope block
 
@@ -769,8 +731,8 @@ work-item thread. The one-year test decides: would it still be correct a year \
 from now with current arcs done?
 - Compose gates, retries, schedules and review protocols in your caller. Blackbox \
 executes and resumes bro turns; it does not choose the next application step.
-- `bbox_learn` is for operator-approved, user-stated rules; `bbox_note(kind=learned)` is for \
-agent-discovered facts.
+- `bbox_learn` is for operator-approved, user-stated rules; agent-discovered facts \
+belong in a thread note or the final report.
 ";
 
 fn system_memory_hint(doc: &ToolDoc) -> Option<String> {
@@ -925,10 +887,9 @@ fn topic_for_category(category: ToolCategory) -> GuidanceTopic {
             GuidanceTopic::Retrieval
         }
         ToolCategory::Knowledge => GuidanceTopic::Persistence,
-        ToolCategory::Threads
-        | ToolCategory::Notes
-        | ToolCategory::Artifacts
-        | ToolCategory::Orchestration => GuidanceTopic::Orchestration,
+        ToolCategory::Threads | ToolCategory::Artifacts | ToolCategory::Orchestration => {
+            GuidanceTopic::Orchestration
+        }
         _ => GuidanceTopic::Operations,
     }
 }

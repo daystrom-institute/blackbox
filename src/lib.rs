@@ -49,7 +49,6 @@ use bbox_knowledge::knowledge;
 mod managed_worktrees;
 use bbox_edge_index::migration;
 use bbox_mcp_tools::mcp_tools;
-use bbox_threads::notes;
 mod orchestration;
 use bbox_mcp_tools::path_cache;
 use bbox_stores::checkout_mutations;

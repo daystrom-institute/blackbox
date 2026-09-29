@@ -8,7 +8,7 @@
 //! 1. A cheap, machine-readable **activity probe** (`GET
 //!    /admin/orchestration-activity`) that reports running bro tasks,
 //!    in-flight workflow arcs, active long-poll waiters, and recent
-//!    orchestration writes (threads / notes / knowledge).
+//!    orchestration writes (threads / knowledge).
 //! 2. An operator-togglable **admission drain** (`GET|POST /admin/drain`).
 //!    While draining, fresh dispatches (`bro_exec` and every path that funnels
 //!    through `dispatch_fresh_bro_task`, plus top-level workflow arc starts)
@@ -337,7 +337,7 @@ fn rfc3339_age_secs(ts: &str, now: chrono::DateTime<chrono::Utc>) -> Option<i64>
 ///
 /// Cheap by construction: one read of the task store (per-task inner lock
 /// only for running tasks), the arc token map, the waiter registry, and a
-/// linear pass over the threads / notes / knowledge stores. No I/O.
+/// linear pass over the threads / knowledge stores. No I/O.
 ///
 /// `quiescent` is the gate's verdict input and its scope is stated in the
 /// payload (`quiescent_scope: "tasks,waiters"`): no running tasks, no
@@ -414,16 +414,6 @@ pub(crate) fn orchestration_activity_snapshot(
             }));
         }
     }
-    let mut note_rows: Vec<Value> = Vec::new();
-    for n in state.notes.read().all() {
-        if within(&n.updated_at) {
-            note_rows.push(json!({
-                "id": n.id,
-                "kind": n.kind,
-                "updated_at": n.updated_at,
-            }));
-        }
-    }
     let mut knowledge_rows: Vec<Value> = Vec::new();
     for e in state.kb.read().all_entries() {
         if within(&e.updated_at) {
@@ -434,7 +424,7 @@ pub(crate) fn orchestration_activity_snapshot(
             }));
         }
     }
-    let recent_total = thread_rows.len() + note_rows.len() + knowledge_rows.len();
+    let recent_total = thread_rows.len() + knowledge_rows.len();
 
     let quiescent = running_tasks.is_empty() && waiters.is_empty();
 
@@ -457,7 +447,6 @@ pub(crate) fn orchestration_activity_snapshot(
             "window_minutes": writes_window_minutes,
             "total": recent_total,
             "threads": thread_rows,
-            "notes": note_rows,
             "knowledge": knowledge_rows,
         },
     })

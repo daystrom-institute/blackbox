@@ -517,8 +517,8 @@ fn harness_control_input(subtype: &str, request_id: String, fields: Value) -> Va
 // `tasks.json` writes used to run as a synchronous `std::fs::write` of the WHOLE
 // store directly on a tokio worker thread, while holding the store read guard
 // (`task_store.read().persist(dir)`). Under fleet load that blocked async
-// workers — starving unrelated control/knowledge-plane handlers (`bbox_note`,
-// MCP `bro_status`) — and blocked store writers for the whole write.
+// workers, starving unrelated control/knowledge-plane handlers (`bbox_thread`,
+// MCP `bro_status`), and blocked store writers for the whole write.
 //
 // The actor owns a dedicated OS thread (NOT a tokio task, so it never consumes
 // the async worker pool). Hot paths call `request_persist` — a non-blocking
@@ -2132,9 +2132,8 @@ impl TaskStore {
 // ── Dispatch-context layer (typed ingredients, harness-composed) ────
 //
 // The daemon owns CONTENT SELECTION only (dispatch-prompt-slots.md §3):
-// the persona resolved from the brofile, the completion contract when the
-// dispatch carries one, and the pre-bound scoping IDs (task, session,
-// project, bro, thread, work-item). It does NOT compose prompt
+// the persona resolved from the brofile and the pre-bound scoping IDs
+// (task, session, project, bro, thread, work-item). It does NOT compose prompt
 // text — `AmbientContext::dispatch_context` serializes the typed
 // payload and the harness routes each ingredient to its per-transport
 // slot (`--dispatch-context`, bro-protocol `DispatchContext`). The
@@ -2149,37 +2148,6 @@ impl TaskStore {
 //
 // If defense-in-depth text guards are wanted in the future, reintroduce
 // a prefix here and gate on `AmbientContext::provider`.
-
-/// Default per-dispatch contract. Deliberately quiet: `bbox_note` is a
-/// signal channel for *notable* observations, NOT a per-dispatch ritual, so
-/// the baseline neither requires a `done` note nor demands a note per finding.
-/// Callers that genuinely need a guaranteed structured sign-off (atoms,
-/// workflows, badgey, review arcs) layer a stricter contract on top of this.
-/// The only hard part retained is the task_id/scope correlation guidance —
-/// when a note *is* emitted it must carry the right keys to land.
-pub const DEFAULT_COMPLETION_CONTRACT: &str = "\
-If something genuinely notable came up during the work, surface it with a \
-`bbox_note` call so the orchestrator doesn't have to re-read \
-your transcript. This is a signal channel, not a progress log — if nothing was \
-notable, emit nothing. Use the kind that fits:\n\
-   • `surprise` — you expected X and found Y.\n\
-   • `dispute` — the brief is wrong or contradicts what you found.\n\
-   • `blocked` — you could not proceed and why.\n\
-   • `followup` — concrete out-of-scope work you noticed (record only; do not \
-do it).\n\
-   • `assumption` — an ambiguity-resolving judgment a reviewer should know about.\n\
-   • `learned` — a reusable project-local fact worth keeping.\n\
-A `kind=done` note with a specific one-line acceptance summary (\"verified X \
-already handles Y\"; not \"task complete\") is worth emitting when a concise \
-result would help the orchestrator act — but it is optional unless this \
-dispatch's instructions require one.\n\
-\n\
-When you do emit a note, include the correlation keys so it lands:\n\
-  task_id=<copy `task:` from the `bbox_scope` context block EXACTLY — not the \
-project path, not prose, not \"pending\">\n\
-  project=<`project` from the `bbox_scope` block, if present>\n\
-  bro=<`bro` from the `bbox_scope` block, if present>\n\
-  session_id=<`session` from the `bbox_scope` block, if present>";
 
 /// The workload-retrospective probe prompt, injected as a fake user turn
 /// when a bro's own session is resumed by `bro_prune(retro=true)`. It
@@ -2224,7 +2192,7 @@ did not need provenance or because the path was awkward?\n\
   • Could an outside observer reconstruct the important file reads/writes, \
 shell commands, denials, cwd changes, env overrides, and tool calls from the \
 available output?\n\
-  • Did the sandbox encourage native idioms such as `note()`/`hybrid_search()`/\
+  • Did the sandbox encourage native idioms such as `hybrid_search()`/\
 `smart_read()`/`work_bash()`, or did you have to translate through awkward \
 outside-daemon forms?\n\
 \n\
@@ -2235,7 +2203,7 @@ existed but fought you — missing parameter, awkward output, wrong shape;\n\
 worktree, writable roots, durable project scope, provider/session env, MCP \
 surface, denied paths, file writes, or shell commands weren't visible enough;\n\
   • a sandbox-native idiom that would have been clearer than the outside-daemon \
-form you had to use, e.g. `note()`/`hybrid_search()`/`smart_read()`/`work_bash()` \
+form you had to use, e.g. `hybrid_search()`/`smart_read()`/`work_bash()` \
 instead of a fully-qualified MCP/tool spelling;\n\
   • an evidence-bundling or blackbox-opening-sequence step that was unclear, \
 too easy to skip, or awkward to complete before making a provenance-sensitive \
@@ -2297,22 +2265,20 @@ pub fn workload_retro_prompt(session_id: &str, project: Option<&str>) -> String 
 
 /// Pre-bound context the daemon has at dispatch time but the executor
 /// would otherwise have to infer by reaching back through the prompt.
-/// Emitting these into the prefix lets notes, thread links, and work-
-/// item attribution land correctly on the first attempt.
+/// Emitting these into the prefix lets thread, gap, and work-item
+/// attribution land correctly on the first attempt.
 #[derive(Debug, Clone, Default)]
 pub struct AmbientContext {
     /// Daemon-generated dispatch task ID. Stable pre-spawn and across
     /// all providers, regardless of when each provider emits its own
-    /// session ID. Used as the primary correlation key for notes:
-    /// agents copy the `task:` scope value into `bbox_note.task_id`.
+    /// session ID. The primary correlation key rendered as the `task:`
+    /// scope value.
     pub task_id: Option<String>,
     pub session_id: Option<String>,
     pub project_dir: Option<String>,
     pub bro_name: Option<String>,
     pub thread_id: Option<String>,
     pub work_item_id: Option<String>,
-    /// Per-dispatch expectation, e.g. "call bbox_note(kind='done', body='…') before returning".
-    pub completion_contract: Option<String>,
     /// Target provider. When set and the provider supports dispatch-time
     /// tool filtering (Claude/Copilot), the text recursion guard is
     /// omitted in favor of the mechanical filter applied at the CLI arg
@@ -2361,12 +2327,6 @@ impl AmbientContext {
 
     pub fn tool_arg_defaults(&self) -> Option<BTreeMap<String, String>> {
         let mut defaults = BTreeMap::new();
-        if let Some(session_id) = self.session_field() {
-            defaults.insert(
-                "default:mcp.bbox_note.session_id".to_string(),
-                session_id.to_string(),
-            );
-        }
         // bbox_thread ids are deliberately NOT defaulted: the table is
         // per-(tool,param), not per-action, and `resolve_thread_id` prefers
         // `id` over `name` — a filled `id` would shadow name-based
@@ -2391,7 +2351,7 @@ impl AmbientContext {
         // (canonical, gap-6366c92d) but still accept `project_dir` as a
         // deprecated alias, so a single-name pin would let the other
         // spelling sail past. Safe as globs because the project-scoped
-        // coordination tools (notes/knowledge) take `project`, not
+        // coordination tools (threads/knowledge) take `project`, not
         // `cwd`/`project_dir` — see the schema-drift tripwire test. Plain
         // repo dispatches (`.git` directory) never pin.
         let worktree = cwd.and_then(worktree_pin_target);
@@ -2405,8 +2365,8 @@ impl AmbientContext {
         // operator-approved). Read-scoped params only: eliding `project` on
         // a retrieval search merely means "unscoped", and the model can
         // still request an unscoped search explicitly — `resolve_project_filter`
-        // treats an empty/whitespace `project` as None. The knowledge/note/
-        // learn `project` params stay excluded PERMANENTLY (§3.1: absence
+        // treats an empty/whitespace `project` as None. The knowledge/learn/
+        // thread `project` params stay excluded PERMANENTLY (§3.1: absence
         // there means *global write scope*); see the exclusion test.
         if let Some(cwd) = cwd {
             // Raw dispatch cwd, canonicalized. Worktree paths are correct
@@ -2458,36 +2418,16 @@ pub fn merge_tool_arg_defaults(
 
 impl AmbientContext {
     /// Serialize this dispatch's typed ingredients (persona from the brofile
-    /// lens, the completion contract directive, and the scope fields) into
-    /// the `--dispatch-context` payload (dispatch-prompt-slots.md). The
+    /// lens and the scope fields) into the `--dispatch-context` payload (dispatch-prompt-slots.md). The
     /// harness owns composition; nothing here is prompt text.
     ///
     /// Recursion guarding (blocking sub-bro dispatch) stays mechanical via
     /// provider tool-filter args appended to argv outside this function; no
-    /// text recursion guard is emitted.
-    ///
-    /// The completion contract is the only directive and is standing;
-    /// recurring behavioral nudges belong in the harness HookEngine/NudgeLedger
-    /// so they can be triggered and throttled by actual turn state. `contract`
-    /// declares `needs_scope`: its text references the `bbox_scope`
-    /// correlation keys, so the harness drops it whenever no current scope
-    /// exists.
+    /// text recursion guard is emitted. Recurring behavioral nudges belong in
+    /// the harness HookEngine/NudgeLedger so they can be triggered and
+    /// throttled by actual turn state.
     pub fn dispatch_context(&self, lens: Option<&str>) -> bro_protocol::DispatchContext {
-        use bro_protocol::{DirectiveCadence, DispatchDirective, DispatchScope};
-
-        let directives: Vec<DispatchDirective> = self
-            .completion_contract
-            .as_deref()
-            .map(str::trim_end)
-            .filter(|c| !c.is_empty())
-            .map(|contract| DispatchDirective {
-                id: "contract".to_string(),
-                cadence: DirectiveCadence::Standing,
-                needs_scope: true,
-                text: contract.to_string(),
-            })
-            .into_iter()
-            .collect();
+        use bro_protocol::DispatchScope;
 
         let scope = DispatchScope {
             task: self.task_id.clone(),
@@ -2504,7 +2444,6 @@ impl AmbientContext {
                 .map(str::trim)
                 .filter(|l| !l.is_empty())
                 .map(str::to_string),
-            directives,
             scope: (!scope.is_empty()).then_some(scope),
         }
     }
@@ -2841,9 +2780,9 @@ pub fn finish_in_process_task(
 /// Spawn a provider CLI process and return a tracked Task.
 ///
 /// `task_id` is pre-generated by the caller so it can be threaded into
-/// the ambient `[scope]` block before the subprocess launches. That lets
-/// agents emit `bbox_note(task_id=...)` records correlated back to the
-/// dispatch regardless of when the provider emits its own session ID.
+/// the ambient `[scope]` block before the subprocess launches. That keeps
+/// the dispatch correlation key stable regardless of when the provider
+/// emits its own session ID.
 ///
 /// `origin` (Slice 1b) labels the spawn site so the fleet roster can
 /// tab tasks by source — see `bro_core::Origin` for the taxonomy.
@@ -8432,18 +8371,12 @@ mod tests {
                 ("bro", "executor"),
             ]
         );
-        // Text recursion guard retired: no directive carries it for any
-        // provider — guarding is mechanical via dispatch tool filters.
-        assert!(
-            payload
-                .directives
-                .iter()
-                .all(|d| !d.text.contains("IMPORTANT:")),
-            "text recursion guard leaked into a directive"
-        );
-        // The payload is ingredients only — never the operator's prompt.
+        // The payload is ingredients only: never the operator's prompt and
+        // never a text recursion guard (guarding is mechanical via dispatch
+        // tool filters).
         let raw = serde_json::to_string(&payload).unwrap();
         assert!(!raw.contains("do stuff"));
+        assert!(!raw.contains("IMPORTANT:"), "{raw}");
         // And it round-trips through the harness's strict parser.
         assert_eq!(bro_protocol::DispatchContext::parse(&raw).unwrap(), payload);
     }
@@ -8476,37 +8409,15 @@ mod tests {
     }
 
     #[test]
-    fn ambient_tool_defaults_track_session_id() {
-        // Session only: exactly the bbox_note.session_id default.
-        let ctx = AmbientContext {
-            session_id: Some("sess-abc".into()),
-            bro_name: Some("executor".into()),
-            ..Default::default()
-        };
-        let defaults = ctx.tool_arg_defaults().expect("session default");
-        assert_eq!(defaults.len(), 1);
-        assert_eq!(
-            defaults
-                .get("default:mcp.bbox_note.session_id")
-                .map(String::as_str),
-            Some("sess-abc")
-        );
-
-        // A task id carries no tool default of its own.
+    fn ambient_tool_defaults_need_a_dispatch_cwd() {
+        // Session, task and bro ids carry no tool default of their own.
         let ctx = AmbientContext {
             session_id: Some("sess-abc".into()),
             task_id: Some("task-abc".into()),
+            bro_name: Some("executor".into()),
             ..Default::default()
         };
-        let defaults = ctx.tool_arg_defaults().expect("session default");
-        assert_eq!(defaults.len(), 1);
-
-        // Pending session, no task, no cwd: nothing to emit.
-        let pending = AmbientContext {
-            session_id: Some("pending".into()),
-            ..Default::default()
-        };
-        assert!(pending.tool_arg_defaults().is_none());
+        assert!(ctx.tool_arg_defaults().is_none());
 
         // Blank ids are withheld, not emitted as empty defaults.
         let blank = AmbientContext {
@@ -8536,8 +8447,7 @@ mod tests {
 
     #[test]
     fn tool_arg_defaults_merge_ambient_only() {
-        let ambient =
-            BTreeMap::from([("default:mcp.bbox_note.session_id".into(), "sess-1".into())]);
+        let ambient = BTreeMap::from([("default:fixture.session_id".into(), "sess-1".into())]);
         assert_eq!(
             merge_tool_arg_defaults(Some(ambient.clone()), None, None),
             Some(
@@ -8552,7 +8462,7 @@ mod tests {
     #[test]
     fn tool_arg_defaults_merge_brofile_overlay() {
         let ambient = BTreeMap::from([
-            ("default:mcp.bbox_note.session_id".into(), "sess-1".into()),
+            ("default:fixture.session_id".into(), "sess-1".into()),
             (
                 "default:rust.moveStructFields.acknowledge_repr".into(),
                 "false".into(),
@@ -8577,7 +8487,7 @@ mod tests {
         );
         assert_eq!(
             merged
-                .get("default:mcp.bbox_note.session_id")
+                .get("default:fixture.session_id")
                 .and_then(serde_json::Value::as_str),
             Some("sess-1")
         );
@@ -8703,7 +8613,7 @@ mod tests {
     #[test]
     fn ambient_tool_defaults_never_default_write_scope_params() {
         // §3.1 permanent exclusion (gap-ae22a6b2): `project` on the
-        // knowledge/note/learn write tools means *global scope* when absent
+        // knowledge/learn write tools means *global scope* when absent
         // and must never be mechanically filled. bbox_thread ids are also
         // excluded: the table is per-(tool,param), not per-action, and a
         // filled `id` would shadow name-based lookups and silently mutate
@@ -8723,7 +8633,6 @@ mod tests {
         let defaults = ctx.tool_arg_defaults().expect("maximal ambient defaults");
         for key in defaults.keys() {
             for excluded in [
-                "bbox_note.project",
                 "bbox_knowledge",
                 "bbox_learn",
                 // bbox_gaps (list): `project` is a result filter, None = all.
@@ -8781,9 +8690,8 @@ mod tests {
             session_id: Some("sess-1".into()),
             ..Default::default()
         };
-        let defaults = no_cwd.tool_arg_defaults().expect("session default only");
         assert!(
-            !defaults.keys().any(|k| k.contains("bbox_gap")),
+            no_cwd.tool_arg_defaults().is_none(),
             "gap defaults must be gated on project_dir presence"
         );
     }
@@ -8810,19 +8718,13 @@ mod tests {
         let (_base, wt) = fake_linked_worktree(&root);
 
         // Dispatch cwd is a subdir of the worktree: the pin resolves to the
-        // canonical worktree root, and the session default rides along.
+        // canonical worktree root.
         let ctx = AmbientContext {
             session_id: Some("sess-wt".into()),
             project_dir: Some(wt.join("src").to_string_lossy().into_owned()),
             ..Default::default()
         };
-        let defaults = ctx.tool_arg_defaults().expect("session default + pin");
-        assert_eq!(
-            defaults
-                .get("default:mcp.bbox_note.session_id")
-                .map(String::as_str),
-            Some("sess-wt")
-        );
+        let defaults = ctx.tool_arg_defaults().expect("worktree pin");
         for key in ["pin:*.project_dir", "pin:*.cwd"] {
             assert_eq!(
                 defaults.get(key).map(String::as_str),
@@ -8831,14 +8733,13 @@ mod tests {
             );
         }
 
-        // A pending session still carries the worktree pin (no session entry).
+        // A pending session still carries the worktree pin.
         let pending = AmbientContext {
             session_id: Some("pending".into()),
             project_dir: Some(wt.to_string_lossy().into_owned()),
             ..Default::default()
         };
-        let defaults = pending.tool_arg_defaults().expect("pin only");
-        assert!(!defaults.contains_key("default:mcp.bbox_note.session_id"));
+        let defaults = pending.tool_arg_defaults().expect("pin");
         for key in ["pin:*.project_dir", "pin:*.cwd"] {
             assert_eq!(
                 defaults.get(key).map(String::as_str),
@@ -8850,8 +8751,8 @@ mod tests {
 
     #[test]
     fn ambient_tool_defaults_no_pin_for_plain_repo_cwd() {
-        // Plain repo (.git directory): session default only — a primary
-        // checkout dispatch must never get a project_dir pin.
+        // Plain repo (.git directory): a primary checkout dispatch must never
+        // get a project_dir pin.
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().canonicalize().unwrap().join("repo");
         std::fs::create_dir_all(repo.join(".git")).unwrap();
@@ -8862,7 +8763,7 @@ mod tests {
             project_dir: Some(repo.join("src").to_string_lossy().into_owned()),
             ..Default::default()
         };
-        let defaults = ctx.tool_arg_defaults().expect("session default");
+        let defaults = ctx.tool_arg_defaults().expect("retrieval default");
         assert!(!defaults.contains_key("pin:*.project_dir"));
         assert!(!defaults.contains_key("pin:*.cwd"));
     }
@@ -8906,7 +8807,6 @@ mod tests {
         // stay free. Tripwire: if these adapters ever grow a `cwd` or
         // `project_dir` param, re-check the globs before shipping.
         for (name, src) in [
-            ("notes", include_str!("../tools/notes.rs")),
             ("knowledge", include_str!("../tools/knowledge.rs")),
             ("threads", include_str!("../tools/threads.rs")),
         ] {
@@ -8924,21 +8824,6 @@ mod tests {
         }
     }
 
-    fn directive_ids(payload: &bro_protocol::DispatchContext) -> Vec<&str> {
-        payload.directives.iter().map(|d| d.id.as_str()).collect()
-    }
-
-    fn directive<'a>(
-        payload: &'a bro_protocol::DispatchContext,
-        id: &str,
-    ) -> &'a bro_protocol::DispatchDirective {
-        payload
-            .directives
-            .iter()
-            .find(|d| d.id == id)
-            .unwrap_or_else(|| panic!("directive {id} missing"))
-    }
-
     #[test]
     fn dispatch_context_skips_pending_session() {
         let ctx = AmbientContext {
@@ -8952,88 +8837,20 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_context_without_contract_keeps_scope_and_no_directives() {
-        // The payload carries scope for every dispatch. Recursion guarding is
-        // mechanical (tool filter), not textual, and recursive dispatches
-        // carry no completion contract.
+    fn dispatch_context_carries_only_persona_and_scope() {
+        // Recursion guarding is mechanical (tool filter), not textual, and the
+        // legacy workspace flag injects nothing.
         let ctx = AmbientContext {
             session_id: Some("sess-orch".into()),
             provider: Some(providers::Provider::Glm),
-            ..Default::default()
-        };
-        let payload = ctx.dispatch_context(None);
-        assert_eq!(
-            payload.scope.as_ref().unwrap().session.as_deref(),
-            Some("sess-orch")
-        );
-        assert!(payload.directives.is_empty());
-    }
-
-    #[test]
-    fn dispatch_context_contract_is_standing_and_needs_scope() {
-        let ctx = AmbientContext {
-            completion_contract: Some(
-                "call bbox_note(kind=\"done\", body=\"summary\") before returning".into(),
-            ),
-            ..Default::default()
-        };
-        let payload = ctx.dispatch_context(None);
-        let contract = directive(&payload, "contract");
-        assert!(contract.text.contains("bbox_note"));
-        assert_eq!(contract.cadence, bro_protocol::DirectiveCadence::Standing);
-        assert!(
-            contract.needs_scope,
-            "contract references bbox_scope keys, so it must drop without scope"
-        );
-    }
-
-    #[test]
-    fn default_contract_references_bbox_scope_block() {
-        // Wording follow-through (dispatch-prompt-slots.md §6): the contract's
-        // correlation-key guidance is placement-neutral — it names the
-        // `bbox_scope` context block, valid for both the contextual-user and
-        // system-section renderings, never "[scope] above".
-        assert!(DEFAULT_COMPLETION_CONTRACT.contains("`bbox_scope` context block"));
-        assert!(!DEFAULT_COMPLETION_CONTRACT.contains("[scope]"));
-    }
-
-    #[test]
-    fn dispatch_context_contract_is_the_only_directive() {
-        let solo = AmbientContext {
-            completion_contract: Some(DEFAULT_COMPLETION_CONTRACT.to_string()),
-            ..Default::default()
-        };
-        assert_eq!(
-            directive_ids(&solo.dispatch_context(None)),
-            vec!["contract"]
-        );
-
-        // No contract and the legacy workspace flag: no directives.
-        let orch = AmbientContext {
             coerce_workspace: true,
             ..Default::default()
         };
-        assert!(directive_ids(&orch.dispatch_context(None)).is_empty());
-
-        // A blank contract carries nothing.
-        let blank = AmbientContext {
-            completion_contract: Some("  \n".into()),
-            ..Default::default()
-        };
-        assert!(directive_ids(&blank.dispatch_context(None)).is_empty());
-    }
-
-    #[test]
-    fn legacy_workspace_flag_does_not_inject_retired_tools() {
-        let payload = AmbientContext {
-            coerce_workspace: true,
-            ..Default::default()
-        }
-        .dispatch_context(None);
-        assert!(!directive_ids(&payload).contains(&"workspace"));
-        for directive in payload.directives {
-            assert!(!directive.text.contains("work_smart_read"));
-        }
+        let payload = ctx.dispatch_context(Some("lens"));
+        assert_eq!(
+            serde_json::to_value(&payload).unwrap(),
+            serde_json::json!({"v": 1, "persona": "lens", "scope": {"session": "sess-orch"}})
+        );
     }
 
     #[test]

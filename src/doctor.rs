@@ -1,7 +1,7 @@
 //! `bbox_doctor` v0: one read-only "what do I need to know right now?"
 //! surface (design/operations/config-artifacts/ops-artifact-bundles-and-doctor.md,
 //! Phase 5 pulled forward). Aggregates existing health signals in-process
-//! and classifies findings; it never mutates stores or enqueues notes.
+//! and classifies findings; it never mutates stores.
 //!
 //! v0 ships the substrate-independent sections only: daemon, index,
 //! code sources, vectors, graph, projects, checkout access, memories,
@@ -1623,37 +1623,7 @@ fn memories_section(state: &crate::server::state::SharedState) -> SectionReport 
 }
 
 fn attention_section(state: &crate::server::state::SharedState) -> SectionReport {
-    use bbox_threads::notes::{NoteKind, NoteResolution};
     let mut findings = Vec::new();
-
-    let notes = state.notes.read();
-    let mut by_kind: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
-    for note in notes.all() {
-        if note.resolution == NoteResolution::Unresolved {
-            let kind: &str = note.kind.as_ref();
-            *by_kind.entry(kind.to_string()).or_default() += 1;
-        }
-    }
-    drop(notes);
-    if !by_kind.is_empty() {
-        let summary = by_kind
-            .iter()
-            .map(|(kind, count)| format!("{kind}={count}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let urgent: usize = [NoteKind::Blocked, NoteKind::Dispute]
-            .iter()
-            .filter_map(|k| by_kind.get(k.as_ref() as &str))
-            .sum();
-        let finding = if urgent > 0 {
-            Finding::warn(format!(
-                "{urgent} unresolved blocked/dispute note(s) (all unresolved: {summary})"
-            ))
-        } else {
-            Finding::info(format!("unresolved notes: {summary}"))
-        };
-        findings.push(finding.with_next("bbox_notes() to triage".to_string()));
-    }
 
     let failed_tasks = {
         let task_store = state.task_store.read();

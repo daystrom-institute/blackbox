@@ -174,7 +174,7 @@ throw away incremental assumptions.
 Use [Internals](internals.md) and the agentic opening sequence when the question
 needs relationships across entities:
 
-- what thread/session/note produced a commit
+- what thread or session produced a commit
 - which docs and symbols relate to an artifact
 
 Transcript search finds text. The graph finds paths.

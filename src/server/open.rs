@@ -10,7 +10,6 @@ use tokio::sync::broadcast;
 use crate::checkout_mutations::CheckoutMutations;
 use crate::index::TranscriptIndex;
 use crate::knowledge::Knowledge;
-use crate::notes::Notes;
 use crate::orchestration::TaskStore;
 use crate::orchestration::tail::TailEvent;
 use crate::producer_claims::ProducerClaims;
@@ -645,12 +644,10 @@ pub(super) fn open_shared_state(
     // Wire the store-side embed sinks to the embedding queue (dependency
     // inversion: the stores live below the embed pipeline in the crate DAG).
     crate::threads::register_thread_embed_hook(crate::embed_queue::enqueue_thread_hook);
-    crate::notes::register_note_embed_hook(crate::embed_queue::enqueue_note_hook);
     crate::index::writer_actor::register_embed_bootstrap(
         crate::embed_queue::register_index_embed_hooks,
     );
     crate::providers::register_extra_providers(crate::providers_ext::extra_providers());
-    crate::embed::queue::register_contradiction_hook(crate::embed_runtime::contradiction_hook);
     tracing::info!("Thread store: {}", th_path.display());
     // Queued on the writer actor: boot no longer races the reindex thread
     // (or a winding-down previous daemon) for tantivy's single-writer lock.
@@ -658,11 +655,6 @@ pub(super) fn open_shared_state(
     let threads_store = Arc::new(RwLock::new(th));
     let threads_persister =
         StorePersister::spawn("threads", threads_store.clone(), th_path.clone());
-
-    let notes_path = cfg.paths.notes_path.clone();
-    let notes_store = Arc::new(RwLock::new(Notes::open(&notes_path)?));
-    let notes_persister = StorePersister::spawn("notes", notes_store.clone(), notes_path.clone());
-    tracing::info!("Notes store: {}", notes_path.display());
 
     let checkout_mutations_path = cfg.paths.checkout_mutations_path.clone();
     let checkout_mutations_store = Arc::new(RwLock::new(CheckoutMutations::open(
@@ -894,7 +886,6 @@ pub(super) fn open_shared_state(
         &cfg,
         &idx,
         &threads_store.read(),
-        &notes_store.read(),
         &task_store,
         &records_provider.records_snapshot(),
         &pending_first_republish,
@@ -936,8 +927,6 @@ pub(super) fn open_shared_state(
         gaps: RwLock::new(gaps_store),
         threads: threads_store,
         threads_persister,
-        notes: notes_store,
-        notes_persister,
         checkout_mutations: checkout_mutations_store,
         checkout_mutations_persister,
         producer_claims: producer_claims_store,
@@ -1185,7 +1174,6 @@ fn build_startup_edge_index(
     cfg: &config::Config,
     idx: &TranscriptIndex,
     th: &Threads,
-    notes_store: &Notes,
     task_store: &TaskStore,
     records: &bbox_corpus_core::project_record::ProjectRecordsSnapshot,
     pending_first_republish: &BTreeSet<String>,
@@ -1212,7 +1200,6 @@ fn build_startup_edge_index(
             &edge_index::EdgeStoreRefs {
                 index: idx,
                 threads: th,
-                notes: notes_store,
                 session_brofile_rows: task_store.session_brofile_rows(),
                 edges_dir,
                 registered_project_ids: Some(records.registered_project_ids()),

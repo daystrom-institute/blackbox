@@ -673,8 +673,7 @@ impl Threads {
     }
 
     /// The id/name finder shared by the get paths. Accepts bare `<8hex>` as
-    /// a fallback for canonical `thread-<8hex>` — matches the schema regex
-    /// and the NoteResolveParams policy.
+    /// a fallback for canonical `thread-<8hex>`, matching the schema regex.
     fn find_thread<'a>(&'a self, p: &ThreadParams) -> Result<&'a Thread> {
         let thread = if let Some(id) = p.id.as_deref() {
             self.store

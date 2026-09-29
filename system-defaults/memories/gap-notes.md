@@ -8,7 +8,7 @@ template = false
 
 When the blocker is in the blackbox substrate or shared agent workflow — not in the current product codebase — file a gap note.
 
-Gap notes are first-class: a dedicated, typed, repo-owned store with its own `bbox_gap*` tool family. They are NOT side-channel notes — do not file them through `bbox_note`.
+Gap notes are first-class: a dedicated, typed, repo-owned store with its own `bbox_gap*` tool family. They are not thread notes; file them only through `bbox_gap`.
 
 ## When to file
 
@@ -31,7 +31,7 @@ Not a gap note:
 - user-stated standing rules (those go to `bbox_learn`)
 - active-arc instructions (those go to the dispatch brief or a work-item thread)
 
-The test: would agents in unrelated projects plausibly hit the same missing blackbox capability? If yes, gap note. If no, a normal `bbox_note(kind="followup")`.
+The test: would agents in unrelated projects plausibly hit the same missing blackbox capability? If yes, gap note. If no, a follow-up in the current work-item thread or your final report.
 
 ## How to file
 

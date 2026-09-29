@@ -40,7 +40,6 @@ mod tests {
             "transcript:claude:session123:42:0",
             "session:claude:session123",
             "thread:thread-12345678",
-            "note:note-12345678",
             "symbol:proj1234:crate::Type::method:defhash",
             "brofile:auditor",
             "commit:repo1234:abcdef1234567890",

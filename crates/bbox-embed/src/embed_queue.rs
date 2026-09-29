@@ -8,7 +8,6 @@ use crate::embed::{Bucket, queue};
 use bbox_chunker::Chunk;
 use bbox_corpus_core::entity_ref::EntityRef;
 use bbox_knowledge::knowledge::KnowledgeEntry;
-use bbox_threads::notes::Note;
 use bbox_threads::threads::Thread;
 
 static GLOBAL_QUEUE: OnceLock<RwLock<Option<EmbedQueueHandle>>> = OnceLock::new();
@@ -246,26 +245,6 @@ pub fn enqueue_git_message(entity_id: &str, chunk_hash: &str, message: &str) -> 
     })
 }
 
-pub fn enqueue_note(note: &Note) -> bool {
-    let entity_id = EntityRef::Note {
-        note_id: note.id.clone(),
-    }
-    .to_string();
-    enqueue(EmbedRequest {
-        bucket: Bucket::Notes,
-        project_id: None,
-        entity_id,
-        chunk_hash: note_chunk_hash(note),
-        text: note_text(note),
-        visual_kind: None,
-        visual_payload: None,
-    })
-}
-
-pub fn enqueue_note_hook(note: &Note) {
-    let _ = enqueue_note(note);
-}
-
 pub fn enqueue_thread(thread: &Thread) -> bool {
     let entity_id = EntityRef::Thread {
         thread_id: thread.id.clone(),
@@ -379,35 +358,6 @@ pub fn content_hash(content: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(content.as_bytes());
     format!("{:x}", hasher.finalize())
-}
-
-pub fn note_chunk_hash(note: &Note) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(note.id.as_bytes());
-    hasher.update([0]);
-    hasher.update(note.kind.as_ref().as_bytes());
-    hasher.update([0]);
-    hasher.update(note.body.as_bytes());
-    hasher.update([0]);
-    hasher.update(note.updated_at.as_bytes());
-    format!("{:x}", hasher.finalize())
-}
-
-fn note_text(note: &Note) -> String {
-    let mut fields = vec![format!("kind: {}", note.kind.as_ref()), note.body.clone()];
-    if let Some(project) = &note.project {
-        fields.push(format!("project: {project}"));
-    }
-    if let Some(task_id) = &note.task_id {
-        fields.push(format!("task: {task_id}"));
-    }
-    if let Some(thread_id) = &note.thread_id {
-        fields.push(format!("thread: {thread_id}"));
-    }
-    if let Some(bro) = &note.bro {
-        fields.push(format!("bro: {bro}"));
-    }
-    fields.join("\n")
 }
 
 pub fn thread_chunk_hash(thread: &Thread) -> String {

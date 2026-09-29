@@ -963,7 +963,6 @@ dependencies = [
  "bbox-stores",
  "bbox-util",
  "dirs",
- "fs2",
  "parking_lot",
  "rmcp",
  "schemars 0.8.22",

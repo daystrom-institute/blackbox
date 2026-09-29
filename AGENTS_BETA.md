@@ -38,7 +38,7 @@ Use this sequence before codebase, design, history, or coordination claims:
    `sm-agentic-opening-sequence`; pull it only when the injected tool guidance is
    insufficient for the question shape. For fresh probe/retro evidence, if
    hybrid search returns only generic seeds, no results, or a degraded
-   BM25-only/vector-warming notice, pivot to `bbox_notes`/`bbox_gaps` with exact
+   BM25-only/vector-warming notice, pivot to `bbox_gaps` with exact
    task, project, bro, or short substrings before broadening to git/filesystem
    evidence. If `bbox_describe_schema` reports `project_file` /
    `project_file_v2` population `0`, do not investigate or patch indexing as
@@ -78,7 +78,7 @@ Prefer sandbox-scoped tools and idioms over host/outside-daemon assumptions:
   shell probes; prefer `sandbox_status` for follow-up spot checks.
 - After `enter_worktree`, prefer `work_*` tools or absolute paths under the
   returned worktree; generic file tools may still target the original checkout.
-- Prefer direct in-sandbox knowledge/search/note affordances when present. If
+- Prefer direct in-sandbox knowledge/search affordances when present. If
   only MCP names are available, use the MCP tool and note the alias gap only when
   the extra ceremony materially affects the work.
 - Keep tool outputs scoped and diagnostic. If a command or tool result is too
@@ -119,5 +119,6 @@ For sandbox probes, make the boundary observable as part of the work:
   were visible enough to debug after the fact.
 - In the retrospective, distinguish task difficulty from sandbox friction.
 
-Use durable project knowledge only for settled invariants. Use notes/gaps for
-probe findings, missing surfaces, and retrospective feedback.
+Use durable project knowledge only for settled invariants. Use gaps for
+missing surfaces and Blackbox defects; report probe findings and retrospective
+feedback in your final answer.

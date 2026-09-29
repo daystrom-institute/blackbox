@@ -513,7 +513,7 @@ mod tests {
     #[test]
     fn parses_flavors_globs_and_rejects_malformed_keys() {
         let defaults = table(&[
-            ("default:mcp.bbox_note.session_id", "s1"),
+            ("default:mcp.bbox_gap.session_id", "s1"),
             ("pin:*.cwd", "/tmp/wt"),
         ]);
         assert!(!defaults.is_empty());
@@ -539,10 +539,10 @@ mod tests {
     fn exact_rules_beat_globs_for_the_same_param() {
         let defaults = table(&[
             ("default:*.session_id", "glob"),
-            ("default:mcp.bbox_note.session_id", "exact"),
+            ("default:mcp.bbox_gap.session_id", "exact"),
         ]);
         let (input, rider) = defaults
-            .apply("mcp__blackbox__bbox_note", json!({}))
+            .apply("mcp__blackbox__bbox_gap", json!({}))
             .unwrap();
         assert_eq!(input["session_id"], "exact");
         assert_eq!(rider.defaults_applied["session_id"], "exact");
@@ -550,15 +550,15 @@ mod tests {
 
     #[test]
     fn default_fills_only_when_model_omits_param() {
-        let defaults = table(&[("default:mcp.bbox_note.session_id", "host")]);
+        let defaults = table(&[("default:mcp.bbox_gap.session_id", "host")]);
         let (input, rider) = defaults
-            .apply("mcp__blackbox__bbox_note", json!({"kind": "done"}))
+            .apply("mcp__blackbox__bbox_gap", json!({"title": "t"}))
             .unwrap();
         assert_eq!(input["session_id"], "host");
         assert_eq!(rider.defaults_applied["session_id"], "host");
 
         let (input, rider) = defaults
-            .apply("mcp__blackbox__bbox_note", json!({"session_id": "model"}))
+            .apply("mcp__blackbox__bbox_gap", json!({"session_id": "model"}))
             .unwrap();
         assert_eq!(input["session_id"], "model");
         assert!(rider.is_empty());
@@ -566,9 +566,9 @@ mod tests {
 
     #[test]
     fn pin_conflict_errors_without_overriding() {
-        let defaults = table(&[("pin:mcp.bbox_note.session_id", "host")]);
+        let defaults = table(&[("pin:mcp.bbox_gap.session_id", "host")]);
         let err = defaults
-            .apply("mcp__blackbox__bbox_note", json!({"session_id": "model"}))
+            .apply("mcp__blackbox__bbox_gap", json!({"session_id": "model"}))
             .unwrap_err();
         assert_eq!(err.param, "session_id");
         assert_eq!(err.expected, "host");
@@ -669,26 +669,26 @@ mod tests {
             "type": "object",
             "properties": {"query": {"type": "string"}, "project": {"type": "string"}}
         });
-        let note_schema = json!({
+        let gap_schema = json!({
             "type": "object",
-            "properties": {"kind": {"type": "string"}, "session_id": {"type": "string"}}
+            "properties": {"title": {"type": "string"}, "session_id": {"type": "string"}}
         });
         let warnings = defaults.validation_warnings([
             ("mcp__blackbox__bro_exec", &dispatch_schema),
             ("mcp__blackbox__bbox_hybrid_search", &retrieval_schema),
-            ("mcp__blackbox__bbox_note", &note_schema),
+            ("mcp__blackbox__bbox_gap", &gap_schema),
         ]);
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
 
         // Exact rules still warn on a missing param (rot detection).
-        let stale = table(&[("default:mcp.bbox_note.nope", "x")]);
-        let warnings = stale.validation_warnings([("mcp__blackbox__bbox_note", &note_schema)]);
+        let stale = table(&[("default:mcp.bbox_gap.nope", "x")]);
+        let warnings = stale.validation_warnings([("mcp__blackbox__bbox_gap", &gap_schema)]);
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("unknown param 'nope'"));
 
         // Glob rules that match no loaded tool at all still warn.
         let dead = table(&[("pin:mcp.bbox_zzz_*.cwd", "/repo/wt")]);
-        let warnings = dead.validation_warnings([("mcp__blackbox__bbox_note", &note_schema)]);
+        let warnings = dead.validation_warnings([("mcp__blackbox__bbox_gap", &gap_schema)]);
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("matched no loaded tool"));
     }
@@ -696,8 +696,8 @@ mod tests {
     #[test]
     fn validation_warns_for_unknown_tool_or_param() {
         let defaults = table(&[
-            ("default:mcp.bbox_note.session_id", "host"),
-            ("default:mcp.bbox_note.nope", "host"),
+            ("default:mcp.bbox_gap.session_id", "host"),
+            ("default:mcp.bbox_gap.nope", "host"),
             ("pin:mcp.unknown.session_id", "host"),
         ]);
         let schema = json!({
@@ -706,8 +706,7 @@ mod tests {
                 "session_id": {"type": "string"}
             }
         });
-        let warnings =
-            defaults.validation_warnings([("mcp__blackbox__bbox_note", &schema)].into_iter());
+        let warnings = defaults.validation_warnings([("mcp__blackbox__bbox_gap", &schema)]);
         assert_eq!(warnings.len(), 2);
         assert!(warnings.iter().any(|w| w.contains("unknown param 'nope'")));
         assert!(

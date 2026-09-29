@@ -613,7 +613,7 @@ fn parse_copilot_mcp_pattern(pattern: &str) -> Option<(&str, &str)> {
 /// matcher that recurses per `*` split point: that is exponential, and
 /// because it runs while the per-dispatch tool-surface lock is held, a
 /// pathological multi-`*` pattern wedges the WHOLE daemon (every
-/// notes/thread/knowledge op stalls for minutes). Surfaced by the
+/// thread/knowledge op stalls for minutes). Surfaced by the
 /// closeout dogfooding run — see
 /// design/fleet-tui/closeout-command.md §6 and thread-de03a2c5 Note 5.
 pub fn glob_match(pattern: &str, text: &str) -> bool {
@@ -2443,7 +2443,7 @@ mod tests {
         let universe = [
             "mcp__blackbox__bro_exec",
             "mcp__blackbox__bro_resume",
-            "mcp__blackbox__bbox_note",
+            "mcp__blackbox__bbox_gap",
             "Bash",
         ];
         let out = expand_pattern("mcp__blackbox__bro_*", &universe);
@@ -2502,8 +2502,8 @@ mod tests {
             "bro_exec",
             "bro_resume",
             "bro_status",
-            "bbox_note",
-            "bbox_notes",
+            "bbox_gap",
+            "bbox_gaps",
         ];
         // Trailing `*`
         assert_eq!(expand_pattern("bro_*", &universe).len(), 3);
@@ -2511,11 +2511,11 @@ mod tests {
         let leading = expand_pattern("*_exec", &universe);
         assert_eq!(leading, vec!["bro_exec"]);
         // Mid-string `*`
-        let mid = expand_pattern("b*_note*", &universe);
-        assert_eq!(mid, vec!["bbox_note", "bbox_notes"]);
+        let mid = expand_pattern("b*_gap*", &universe);
+        assert_eq!(mid, vec!["bbox_gap", "bbox_gaps"]);
         // `?` single-char wildcard
-        let single = expand_pattern("bbox_note?", &universe);
-        assert_eq!(single, vec!["bbox_notes"]);
+        let single = expand_pattern("bbox_gap?", &universe);
+        assert_eq!(single, vec!["bbox_gaps"]);
         // Pure literal still works
         assert_eq!(expand_pattern("bro_exec", &universe), vec!["bro_exec"]);
         // No match returns empty (not panic)

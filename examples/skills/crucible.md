@@ -1,6 +1,6 @@
 ---
-description: Orchestrator-led implementation workflow — durable pair-programmer implementer, continuous red-team ensemble, coordinated through bbox work-item threads with structured notes as the signal channel
-allowed-tools: mcp__blackbox__bro_exec, mcp__blackbox__bro_resume, mcp__blackbox__bro_wait, mcp__blackbox__bro_when_all, mcp__blackbox__bro_when_any, mcp__blackbox__bro_team, mcp__blackbox__bro_brofile, mcp__blackbox__bro_providers, mcp__blackbox__bro_status, mcp__blackbox__bro_cancel, mcp__blackbox__bro_dashboard, mcp__blackbox__bbox_thread, mcp__blackbox__bbox_thread_list, mcp__blackbox__bbox_notes, mcp__blackbox__bbox_note_resolve, mcp__blackbox__bbox_knowledge, mcp__blackbox__bbox_learn, Read, Edit, Write, Bash, Glob, Grep, AskUserQuestion, TaskCreate, TaskUpdate
+description: Orchestrator-led implementation workflow: durable pair-programmer implementer, continuous red-team ensemble, coordinated through a bbox work-item thread the orchestrator keeps
+allowed-tools: mcp__blackbox__bro_exec, mcp__blackbox__bro_resume, mcp__blackbox__bro_wait, mcp__blackbox__bro_when_all, mcp__blackbox__bro_when_any, mcp__blackbox__bro_team, mcp__blackbox__bro_brofile, mcp__blackbox__bro_providers, mcp__blackbox__bro_status, mcp__blackbox__bro_cancel, mcp__blackbox__bro_dashboard, mcp__blackbox__bbox_thread, mcp__blackbox__bbox_thread_list, mcp__blackbox__bbox_knowledge, mcp__blackbox__bbox_learn, Read, Edit, Write, Bash, Glob, Grep, AskUserQuestion, TaskCreate, TaskUpdate
 argument-hint: <task description>
 ---
 
@@ -30,8 +30,7 @@ Substantial implementation work, coordinated by the main-session orchestrator th
 - **Implementer is durable.** One `bro_exec` at start, then only `bro_resume`. A fresh `bro_exec` on a follow-up destroys the compartmentalized context that is crucible's whole point.
 - **Ensemble continuity comes from team member sessions.** Round 1 dispatches each member with `bro_exec(bro="<team>::<member>")`; every later round is `bro_resume(bro="<team>::<member>")` per member, so each reviewer keeps its own session across rounds. Resume a single member only for bilateral recovery (one reviewer died, one needs a correction).
 - **Reviewers are blind to each other within a round.** Orchestrator is the synthesizer — quote each side back to the others in next-round prompts. Cross-pollination is deliberate when orchestrator chooses it, not a default.
-- **`thread_id` threads every dispatch.** Implementer and reviewers both copy it into `bbox_note(thread_id=...)` so the orchestrator reads the full signal trail with one `bbox_notes(thread_id=...)` call instead of parsing prose.
-- **`task_id` from the `[scope]` block is the per-dispatch correlation key.** Implementer and reviewers copy it verbatim into every `bbox_note(task_id=...)`.
+- **The orchestrator keeps the work-item thread.** Implementer and reviewers file nothing: each final answer is its report. The orchestrator appends the verdicts, disputes and decisions it acts on as thread notes (`bbox_thread(action="continue", id=<thread_id>, note=...)`), so the signal trail survives orchestrator compaction.
 - **Mechanical recursion guard stays on.** Implementer and reviewers cannot call `bro_*` — do NOT set `allow_recursion=true`. They are executors.
 - **Named-bro routing is unsafe across sibling sessions.** If a brofile has multiple recent task histories, `bro_resume(bro="...")` can pick the wrong session. Record the `taskId`/`sessionId` returned by your most recent `bro_exec` or `bro_resume` and pass it explicitly when resuming if there's any chance of ambiguity.
 - **Turn discipline.** Ensemble rounds stop when a voice re-raises a prior concern: either produce concrete evidence to refute or concede. Never retreat on pressure alone, never rubber-stamp. Cap at 8 ensemble rounds per work-item before halting and escalating to the user.
@@ -140,14 +139,8 @@ Output format:
   Findings: <numbered, terse, cite specifics>
   Under 200 words.
 
-Before returning, emit:
-  bbox_note(
-    task_id=<copy from [scope] block>,
-    thread_id=<thread_id>,
-    kind="done",
-    body="<verdict + one-line summary>"
-  )
-Also emit kind=dispute for any position you want escalated.
+Your final answer is your report. Start it with the Verdict line; mark any
+position you want escalated as DISPUTE.
 ```
 
 ### 2d. Join
@@ -158,11 +151,10 @@ bro_when_all(team="<topic>-review", timeout_seconds=600)
 
 ### 2e. Synthesize
 
-Read verdicts:
+Read each member's final answer from the join (`bro_status(task_id, tail=N)` if one is truncated), then record the round on the thread:
 
 ```
-bbox_notes(thread_id=<thread_id>, kind="done")
-bbox_notes(thread_id=<thread_id>, kind="dispute")
+bbox_thread(action="continue", id=<thread_id>, note="Plan round 1: codex <verdict>, gemini <verdict>; disputes: <...>")
 ```
 
 Classify findings: agreed / majority / minority / contradictory. Revise plan incorporating agreed+majority concerns. Reject minorities only with concrete evidence — cite it. When two reviewers contradict, pick the side with stronger evidence and note the dissent for the round-2 prompt.
@@ -228,7 +220,7 @@ Self-contained brief. Include everything the implementer needs — orchestrator'
 - **Out-of-scope list**: explicit, so the implementer doesn't drift
 - **Known gotchas**: anything the ensemble surfaced
 - **Ensemble convergence notes**: *"ensemble converged on Option B2 because…"* — grounds, not just instructions
-- **Work-item thread_id**: for every `bbox_note` emission
+- **Work-item thread_id**: context for continuity; the orchestrator records to it
 - **Expectations contract** (next section, verbatim)
 
 ### 3c. Expectations contract (append to work packet)
@@ -249,7 +241,7 @@ Before first commit on any slice, run verification in parallel:
 - check adjacent tests aren't depending on current shape
 
 Report what you found before cutting. If ground-truth diverges from the brief,
-emit a surprise or dispute note and wait for steering.
+say so in your answer (SURPRISE or DISPUTE) and stop for steering.
 
 ### Proposals before cutting (when warranted)
 
@@ -259,34 +251,29 @@ pressure at decision points, not just mechanical edits.
 
 ### Pushback
 
-Emit bbox_note with the right kind AS SOON AS you notice:
-- kind="dispute"    — brief is wrong, or a premise is contradicted by code
-- kind="assumption" — you resolved an ambiguity by judgment; state what you chose
-- kind="surprise"   — expected X, found Y (code differs from plan's assumptions)
-- kind="blocked"    — you cannot proceed; include the specific reason
-- kind="followup"   — spotted out-of-scope work; defer, do NOT widen scope
+Raise pushback in your answer AS SOON AS you notice, with the right label:
+- DISPUTE: brief is wrong, or a premise is contradicted by code
+- ASSUMPTION: you resolved an ambiguity by judgment; state what you chose
+- SURPRISE: expected X, found Y (code differs from plan's assumptions)
+- BLOCKED: you cannot proceed; include the specific reason
+- FOLLOWUP: spotted out-of-scope work; defer, do NOT widen scope
 
-Every note MUST include task_id (copy from [scope] block verbatim) and
-thread_id=<thread_id from packet>. Also project and bro fields if your ambient
-scope doesn't auto-fill them.
+You file nothing. Your answer at each pause is your report; the orchestrator
+records what it acts on.
 
 ### Completion
 
-Before returning the final turn of any packet, always emit:
-  bbox_note(
-    kind="done",
-    body="<concrete one-line acceptance summary>",
-    task_id=..., thread_id=...
-  )
+End the final turn of any packet with a DONE line: a concrete one-line
+acceptance summary.
 
-If you stop short of acceptance criteria, still emit done and list what's
+If you stop short of acceptance criteria, still end with DONE and list what's
 incomplete.
 
 ### Never
 
 - Never commit without an explicit gate from the orchestrator on slices the
   brief didn't pre-authorize
-- Never silently widen or narrow scope — emit dispute or followup instead
+- Never silently widen or narrow scope; raise DISPUTE or FOLLOWUP instead
 - Never skip the grounding checks even when the brief looks obvious
 ```
 
@@ -309,11 +296,11 @@ bro_exec(
 
 Expect 2–4 pauses per packet. The typical shape:
 
-1. Implementer runs grounding checks → pauses with findings (may include dispute/surprise notes)
+1. Implementer runs grounding checks → pauses with findings (may include DISPUTE/SURPRISE items)
 2. Orchestrator steers (accept, redirect, or approve Approach A vs B) → `bro_resume` with decision
 3. Implementer cuts first slice, verifies, commits → pauses with result
-4. Orchestrator reviews diff + notes → `bro_resume` with next slice instruction or "proceed to next"
-5. Repeat until packet acceptance criteria hit, implementer emits `kind="done"`
+4. Orchestrator reviews diff + answer → `bro_resume` with next slice instruction or "proceed to next"
+5. Repeat until packet acceptance criteria hit, implementer reports DONE
 
 ### 4a. Awaiting a pause
 
@@ -338,7 +325,7 @@ This is the **info-asymmetry protocol** — exec can't see ensemble threads, so 
 
 ### 4c. Dispute-driven phase spawn
 
-If an implementer `kind="dispute"` reveals a materially different alternate path that the ensemble agrees with, either:
+If an implementer DISPUTE reveals a materially different alternate path that the ensemble agrees with, either:
 
 - **Steer within the current work-item** (most cases): resume the implementer with the new direction, continue.
 - **Open a new sub-phase work-item** (when the dispute opens a distinct body of work): open another `bbox_thread(kind="work_item")` for the new phase and resume the implementer with the new thread_id in the brief. Keep the original thread open if work there is still ongoing, or resolve it if the dispute has entirely superseded the original plan.
@@ -349,13 +336,13 @@ If an implementer `kind="dispute"` reveals a materially different alternate path
 - Resume prompts are **deltas** — the implementer remembers. Include only: what the last pause returned, what you decided, what's next.
 - If the implementer is unresponsive or the session is clearly polluted, retire it: `bro_cancel`, then a FRESH `bro_exec` with a recovery brief carrying forward the critical prior-session context (see Phase 7 recovery pattern).
 
-### 4e. After `kind="done"`
+### 4e. After DONE
 
-Read the full signal trail:
+Read the implementer's final answer and the diff, then record the packet on the thread:
 
 ```
-bbox_notes(thread_id=<thread_id>, task_id=<current_task_id>)
 git diff <rollback_ref>...HEAD -- <relevant paths>
+bbox_thread(action="continue", id=<thread_id>, note="Packet <X> DONE: <summary>; disputes, surprises, followups: <...>")
 ```
 
 **Commit your own orchestrator assessment before Phase 5** — what's right, what's missing, what's risky, whether it matches the converged plan. Write it down explicitly. This is the anti-anchoring move: you do not want the ensemble's post-work verdicts reshaping your own read.
@@ -388,7 +375,7 @@ Work product:
   Commits: <SHA1 (title)>, <SHA2 (title)>, ...
   Diff summary: <git diff --stat output>
   Targeted hunks / full diff: <inline, or per-file>
-  Implementer notes of interest:
+  Implementer signals of interest:
     - dispute: <body>
     - surprise: <body>
     - followup (deferred): <body>
@@ -405,16 +392,15 @@ Format:
   Findings: <numbered, cite file:line>
   Under 200 words.
 
-Emit bbox_note(kind="done", body="<verdict + summary>", task_id=..., thread_id=<thread_id>)
-Emit kind=dispute for positions you want escalated.
+Your final answer is your report. Start it with the Verdict line; mark
+positions you want escalated as DISPUTE.
 ```
 
 ### 5b. Join + synthesize
 
 ```
 bro_when_all(team="<topic>-review", timeout_seconds=600)
-bbox_notes(thread_id=<thread_id>, kind="done")      // this round's verdicts
-bbox_notes(thread_id=<thread_id>, kind="dispute")
+bbox_thread(action="continue", id=<thread_id>, note="Audit round <N>: <per-member verdicts>; disputes: <...>")
 ```
 
 ### 5c. Three-way convergence
@@ -426,10 +412,10 @@ Now you have: orchestrator's committed assessment (4e) + ensemble verdicts. For 
 - **Single reviewer raises** → judgment call, default to including unless contradicted.
 - **Orchestrator-only concern** → fix; the ensemble didn't catch it but you did.
 
-Produce a concrete **fixup list** scoped to one implementer round. Larger rewrites → multiple rounds. Mark addressed notes:
+Produce a concrete **fixup list** scoped to one implementer round. Larger rewrites → multiple rounds. Record it on the thread:
 
 ```
-bbox_note_resolve(id=<note_id>, resolution="addressed", note="<brief>")
+bbox_thread(action="continue", id=<thread_id>, note="Fixup list round <N>: <items>; addressed: <prior items>")
 ```
 
 ### 5d. Calibration check
@@ -481,7 +467,7 @@ Then choose:
 
 Round exits when:
 - Orchestrator + ensemble agree no material issues remain, OR
-- Remaining issues are explicitly deferred as followups (captured as `bbox_note(kind="followup")`, noted in Phase 7 output).
+- Remaining issues are explicitly deferred as followups (recorded as thread notes, listed in Phase 7 output).
 
 Cap hit without convergence → halt, surface to user with both positions.
 
@@ -491,13 +477,13 @@ Cap hit without convergence → halt, surface to user with both positions.
 
 ### 7a. Protocol-violation sweep
 
-Before resolving the thread, scan for protocol issues that went unaddressed during the run (exec committed without gate, silent scope widening the orchestrator noticed but didn't raise live, ensemble anomalies, etc.). Park them as separate notes for later user conversation — don't derail close-out:
+Before resolving the thread, scan for protocol issues that went unaddressed during the run (exec committed without gate, silent scope widening the orchestrator noticed but didn't raise live, ensemble anomalies, etc.). Park them as thread notes for later user conversation; don't derail close-out:
 
 ```
-bbox_note(
-  kind="followup",
-  body="Protocol: exec committed <commit_SHA> without gate during Packet B. Not corrective now, raise in next standup.",
-  thread_id=<thread_id>
+bbox_thread(
+  action="continue",
+  id=<thread_id>,
+  note="Protocol: exec committed <commit_SHA> without gate during Packet B. Not corrective now, raise in next standup."
 )
 ```
 
@@ -529,7 +515,7 @@ bbox_thread(
 - **Converged findings** — ensemble + orchestrator agreement
 - **Changes applied** — file-level summary with commit SHAs
 - **Ensemble dissent** — non-converged positions with both sides stated
-- **Deferred follow-ups** — explicit (remaining `kind="followup"` notes)
+- **Deferred follow-ups**: explicit (followups recorded on the thread)
 - **Protocol-violation parks** — anything raised in 7a
 - **Rollback reference** — still valid
 - **Work-item thread_id** — for future continuity
@@ -614,7 +600,7 @@ Response: for that member alone, `bro_resume(bro="<alias>", prompt="Your prior t
 
 ### Deferred Follow-ups
 
-<explicit list — remaining kind=followup notes>
+<explicit list: followups recorded on the thread>
 
 ### Protocol Parks
 

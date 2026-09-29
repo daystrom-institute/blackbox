@@ -115,7 +115,6 @@ impl InspectableEntityProvider for ThreadProvider {
                 "THREAD_BLOCKED_BY",
                 "THREAD_RELATES_TO",
                 "THREAD_SUBSUMES",
-                "NOTE_IN_THREAD",
             ],
             &["kind", "status", "project"],
         )
@@ -128,7 +127,6 @@ impl InspectableEntityProvider for ThreadProvider {
             expected("THREAD_BLOCKED_BY", false),
             expected("THREAD_RELATES_TO", false),
             expected("THREAD_SUBSUMES", false),
-            expected("NOTE_IN_THREAD", false),
         ]
     }
 
@@ -145,7 +143,6 @@ impl InspectableEntityProvider for ThreadProvider {
                 "THREAD_BLOCKED_BY",
                 "THREAD_RELATES_TO",
                 "THREAD_SUBSUMES",
-                "NOTE_IN_THREAD",
             ],
         )
     }

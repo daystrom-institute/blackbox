@@ -710,12 +710,10 @@ fn build_edge_index_from_shared_at_authority(
     let (mut rebuilt, mut seen) = {
         let idx = state.idx.read();
         let threads = state.threads.read();
-        let notes = state.notes.read();
         let task_store = state.task_store.read();
         edge_index::EdgeIndex::project_store_edges(&edge_index::EdgeStoreRefs {
             index: &idx,
             threads: &threads,
-            notes: &notes,
             session_brofile_rows: task_store.session_brofile_rows(),
             edges_dir: edges_dir.to_path_buf(),
             registered_project_ids: Some(registered_project_ids.clone()),
@@ -1297,13 +1295,6 @@ pub(crate) fn project_ref_counts(state: &Arc<SharedState>, project: &str) -> any
         .iter()
         .filter(|thread| thread.project == project)
         .count();
-    let notes = state
-        .notes
-        .read()
-        .all()
-        .iter()
-        .filter(|note| note.project.as_deref() == Some(project))
-        .count();
     let slack_channel_bindings = state.slack_channel_bindings.list(None, Some(project)).len();
     let slack_proposal_links = state.slack_proposal_links.project_ref_count(project);
     let teams = orchestration::team::load_all_teams(&state.store_dir)
@@ -1320,7 +1311,6 @@ pub(crate) fn project_ref_counts(state: &Arc<SharedState>, project: &str) -> any
     Ok(json!({
         "knowledge": knowledge,
         "threads": threads,
-        "notes": notes,
         "slack_channel_bindings": slack_channel_bindings,
         "slack_proposal_links": slack_proposal_links,
         "teams": teams,
@@ -1548,14 +1538,6 @@ pub(crate) fn migrate_project_refs(
         // This sync migration helper cannot await; threads persistence is write-behind here.
         state.threads_persister.request();
     }
-    let notes = state
-        .notes
-        .write()
-        .rename_project_refs(old_project, new_project)?;
-    if notes > 0 {
-        // This sync migration helper cannot await; notes persistence is write-behind here.
-        state.notes_persister.request();
-    }
     let slack_channel_bindings = state.slack_channel_bindings.rename_project_refs(
         old_project,
         new_project,
@@ -1574,7 +1556,6 @@ pub(crate) fn migrate_project_refs(
     Ok(json!({
         "knowledge": knowledge,
         "threads": threads,
-        "notes": notes,
         "slack_channel_bindings": slack_channel_bindings,
         "slack_proposal_links": slack_proposal_links,
         "teams": teams,

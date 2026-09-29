@@ -59,7 +59,6 @@ impl BlackboxServer {
         }
         counts.insert("knowledge".into(), self.state.kb.read().all_entries().len());
         counts.insert("thread".into(), self.state.threads.read().all().len());
-        counts.insert("note".into(), self.state.notes.read().all().len());
         // Brofile vertices live in the artifact catalog and do not appear in
         // EdgeIndex entity counts until an edge points at them, so seed the
         // count directly from the catalog.

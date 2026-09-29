@@ -5,26 +5,24 @@
 
 use serde_json::{Value, json};
 
-pub use bro_protocol::{DirectiveCadence, DispatchContext, DispatchDirective, DispatchScope};
+pub use bro_protocol::{DispatchContext, DispatchScope};
 
 use super::{ContextualUserFragment, FragmentRole};
 use crate::transport::TransportKind;
 
 /// Per-transport composition strategy — the harness analog of opencode's
 /// `provider(model)` + delivery branch and codex's PromptSlot router. One
-/// routing point decides which slot each semantic class (persona, standing
-/// directives, memory, scope, environment, task)
-/// lands in; a per-provider fix becomes a strategy-arm change, not preamble
+/// routing point decides which slot each semantic class (persona, memory,
+/// scope, environment, task) lands in; a per-provider fix becomes a strategy-arm change, not preamble
 /// surgery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompositionStrategy {
-    /// anthropic + openai-responses: persona/standing directives in the
-    /// stable system slot; memory/scope/environment as marker-demarcated
+    /// anthropic + openai-responses: persona in the stable system slot; memory/scope/environment as marker-demarcated
     /// contextual USER fragments with change/compaction re-emit; the task is
     /// its own user item, verbatim, last.
     CodexShaped,
-    /// openai-chat (the Mistral lane): everything (persona, standing
-    /// directives, AGENTS.md memory, environment, scope) folds into
+    /// openai-chat (the Mistral lane): everything (persona, AGENTS.md
+    /// memory, environment, scope) folds into
     /// the leading system message, rebuilt in place per request (vibe's
     /// `update_system_prompt` shape); the task is the only initial user
     /// message. The observed failure mode this fixes: policy and memory text
@@ -52,14 +50,14 @@ impl CompositionStrategy {
 /// How the `--dispatch-context` flag resolved for this session run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DispatchContextArg {
-    /// Flag present, non-empty: the payload replaces persisted
-    /// persona/directives wholesale and sets the current scope.
+    /// Flag present, non-empty: the payload replaces the persisted persona
+    /// wholesale and sets the current scope.
     /// Boxed: the payload dwarfs the unit variants.
     Provided(Box<DispatchContext>),
     /// Flag present but empty (`""`/`{}`): explicit clear.
     Clear,
-    /// Flag absent: restore persona/directives from session side-state;
-    /// scope is NEVER restored (per-dispatch correlation data).
+    /// Flag absent: restore the persona from session side-state; scope is
+    /// NEVER restored (per-dispatch correlation data).
     Absent,
 }
 
@@ -156,20 +154,6 @@ impl DispatchState {
         self.context.as_ref().and_then(|c| c.persona.as_deref())
     }
 
-    /// Joined standing directives (system authority, once per request).
-    pub fn standing_text(&self) -> Option<String> {
-        let ctx = self.context.as_ref()?;
-        let parts: Vec<&str> = ctx
-            .effective_directives()
-            .map(|d| d.text.as_str())
-            .collect();
-        if parts.is_empty() {
-            None
-        } else {
-            Some(parts.join("\n\n"))
-        }
-    }
-
     /// Rendered `<bbox_scope>` fragment for the current scope, if any.
     pub fn scope_render(&self) -> Option<String> {
         let scope = self.context.as_ref()?.scope.as_ref()?;
@@ -180,9 +164,8 @@ impl DispatchState {
     }
 }
 
-/// Pre-bound scoping IDs, demarcated so the completion contract's "copy
-/// `task:` from the `bbox_scope` context block" reference resolves under both
-/// the contextual-user and system-section renderings.
+/// Pre-bound scoping IDs, demarcated identically under both the
+/// contextual-user and system-section renderings.
 struct ScopeFragment<'a> {
     scope: &'a DispatchScope,
 }
@@ -215,20 +198,6 @@ mod tests {
         DispatchContext {
             v: 1,
             persona: Some("You are a reviewer".into()),
-            directives: vec![
-                DispatchDirective {
-                    id: "standing".into(),
-                    cadence: DirectiveCadence::Standing,
-                    needs_scope: false,
-                    text: "Standing guidance".into(),
-                },
-                DispatchDirective {
-                    id: "contract".into(),
-                    cadence: DirectiveCadence::Standing,
-                    needs_scope: true,
-                    text: "Completion contract".into(),
-                },
-            ],
             scope,
         }
     }
@@ -295,15 +264,10 @@ mod tests {
         );
         assert!(state.scope_render().is_some());
         assert_eq!(state.persona(), Some("You are a reviewer"));
-        // Both directives effective with scope present.
-        assert_eq!(
-            state.standing_text().unwrap(),
-            "Standing guidance\n\nCompletion contract"
-        );
     }
 
     #[test]
-    fn restore_round_trip_excludes_scope_and_drops_needs_scope() {
+    fn restore_round_trip_excludes_scope() {
         let provided = DispatchState::from_arg(
             DispatchContextArg::Provided(Box::new(ctx_with(Some(full_scope())))),
             &Value::Null,
@@ -316,8 +280,6 @@ mod tests {
         let ctx = restored.context.as_ref().expect("context restored");
         assert_eq!(ctx.scope, None, "scope must NEVER be restored");
         assert_eq!(restored.persona(), Some("You are a reviewer"));
-        // needs_scope directives drop without a current scope.
-        assert_eq!(restored.standing_text().unwrap(), "Standing guidance");
         assert_eq!(restored.scope_render(), None);
     }
 
@@ -364,21 +326,14 @@ mod tests {
         assert_eq!(restored.emitted_to_side(), json!({"scope": "s"}));
         assert_eq!(
             restored.context_to_side(),
-            json!({
-                "v": 1,
-                "persona": "You are a reviewer",
-                "directives": [
-                    {"id": "contract", "cadence": "standing", "needs_scope": true, "text": "c"}
-                ]
-            })
+            json!({"v": 1, "persona": "You are a reviewer"})
         );
     }
 
-    /// Side-state persisted with per-turn directives restores without them:
-    /// per-turn cadence is dropped, while standing directives restore
-    /// whatever their id (ids are opaque to the harness).
+    /// Side-state persisted with directives of any cadence restores the
+    /// persona and drops every directive.
     #[test]
-    fn legacy_side_state_drops_per_turn_directives() {
+    fn legacy_side_state_drops_directives() {
         let side = json!({
             "dispatch_context": {
                 "v": 1,
@@ -391,16 +346,11 @@ mod tests {
             },
         });
         let restored = DispatchState::from_arg(DispatchContextArg::Absent, &side);
-        let ids: Vec<_> = restored
-            .context
-            .as_ref()
-            .expect("legacy context restored")
-            .directives
-            .iter()
-            .map(|d| d.id.as_str())
-            .collect();
-        assert_eq!(ids, vec!["task_shape", "contract"]);
-        assert_eq!(restored.standing_text().unwrap(), "Task-shape check");
+        assert_eq!(restored.persona(), Some("You are a reviewer"));
+        assert_eq!(
+            restored.context_to_side(),
+            json!({"v": 1, "persona": "You are a reviewer"})
+        );
     }
 
     #[test]

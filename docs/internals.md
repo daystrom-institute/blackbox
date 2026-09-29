@@ -21,9 +21,9 @@ source material:
 | Layer | Purpose |
 |---|---|
 | Transcript adapters | Read Claude, Codex, Gemini, and other provider session formats |
-| Tantivy index | Fast BM25 search over transcript blocks, project files, git messages, knowledge, notes, and threads |
+| Tantivy index | Fast BM25 search over transcript blocks, project files, git messages, knowledge, and threads |
 | Vector store | Per-route embedding partitions for semantic retrieval |
-| EdgeIndex | Graph projection over indexed docs plus live knowledge/thread/note stores |
+| EdgeIndex | Graph projection over indexed docs plus live knowledge and thread stores |
 | Knowledge store | Durable rules, conventions, memories, and render targets |
 | Orchestration runtime | `bro` tasks, teams, waits, and cancellation |
 | Artifact catalog | Installed brofiles and teams; retired workflow, agent, atom, cron and packet receipts stay readable |
@@ -40,7 +40,7 @@ agents consume the graph/search/tool surfaces through MCP.
   ref, use it verbatim.
 - Rebuildable projections are not durable state. The index, vectors,
   edges, and git metadata can be regenerated.
-- Durable JSON stores are the source of truth for knowledge, notes,
+- Durable JSON stores are the source of truth for knowledge,
   threads, projects, artifacts, and bro runtime state.
 - Embedding routes are independent. A provider/model change on one route
   does not invalidate the other routes.

@@ -4,7 +4,6 @@ use crate::server::runtime_metrics::{
     spawn_runtime_metrics_sampler, spawn_scheduler_latency_probe,
 };
 use crate::server::storage_gc::{spawn_storage_gc_thread, storage_gc_interval_from_env};
-use crate::tools::bro_helpers::tier0_cosine_threshold_from_env;
 use crate::{embed, embed_queue, orchestration, vectors, watcher};
 use std::sync::Arc;
 
@@ -20,7 +19,6 @@ pub(super) async fn start_background_tasks(shared: Arc<SharedState>) -> anyhow::
     // persisted under the knowledge-source store before anything can capture.
     super::knowledge_source::restore_operator_workspace_bindings(&shared);
     configure_dispatch_path_env();
-    configure_embed_runtime(&shared);
     spawn_vector_warmup_thread(shared.clone())?;
     spawn_edge_index_rebuild_watcher(shared.clone(), std::time::Duration::from_secs(60));
     spawn_storage_gc(shared.clone());
@@ -168,11 +166,6 @@ fn configure_dispatch_path_env() {
     unsafe {
         std::env::set_var("PATH", augmented);
     }
-}
-
-fn configure_embed_runtime(shared: &Arc<SharedState>) {
-    crate::embed_runtime::install_contradiction_threshold(tier0_cosine_threshold_from_env());
-    crate::embed_runtime::install_contradiction_state(shared.clone());
 }
 
 fn spawn_vector_warmup_thread(shared: Arc<SharedState>) -> anyhow::Result<()> {

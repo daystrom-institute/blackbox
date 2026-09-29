@@ -10,7 +10,7 @@ daemon's state root; apply them relative to that volume. Checkout hosts run
 only satellites: `fleetd`, `bro-harness`, `bro`, `bbox-code-collector` and
 `bbox-transcript-collector`.
 
-Maintenance tools named here other than `bbox_notes`, `bbox_thread_list`,
+Maintenance tools named here other than `bbox_thread_list`,
 `bbox_describe_schema`, `bbox_hybrid_search`, `bbox_project_list` and
 `bbox_render` are on the `ops` surface: run them from an `ops` MCP session or
 with `bro mcp call <tool> '<json>' --surface ops`.
@@ -30,7 +30,7 @@ will run.
 | Path | Contents | Size (typical) |
 |---|---|---|
 | `~/.local/state/blackbox/blackbox-knowledge.json` | Knowledge entries not owned by a repo's `.bbox/knowledge/` | ~500KB |
-| `~/.local/state/blackbox/blackbox-notes.json` | All side-channel notes (done/dispute/blocked/etc) | ~6MB |
+| `~/.local/state/blackbox/blackbox-notes.json` | Note records the project catalog inventories as owner rows; nothing else reads them | varies |
 | `~/.local/state/blackbox/blackbox-threads.json` | Work threads and their session/edge linkage | ~500KB |
 | `~/.local/state/blackbox/projects.json` | Registered project roots and their IDs | small |
 | `~/.local/state/blackbox/packets/` | Packet records the project catalog inventories as owner rows; nothing else reads them | varies |
@@ -192,7 +192,6 @@ classified report (ok/info/warn/action/blocked) with suggested next commands.
 
 ```bash
 bbox_doctor(format="summary")            # aggregate health + attention report
-bbox_notes(project="/your/repo")         # unresolved executor notes
 bbox_thread_list(status="open")          # investigation continuity
 bbox_embed_status()                      # confirm no embedding errors
 ```

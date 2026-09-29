@@ -110,7 +110,6 @@ allow = [
     "bbox_bundle_evidence",
     "bbox_knowledge",
     "bbox_thread_list",
-    "bbox_notes",
     "bbox_project_list",
     "bro_status",
     "bro_dashboard",

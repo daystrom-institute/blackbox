@@ -725,7 +725,7 @@ impl BlackboxServer {
                 "indexing": {
                     "status": "scheduled",
                     "mode": "background",
-                    "detail": "project registration is durable; project-file indexing and edge projection are picked up by the background reindexer after this response, and embeddings across all routes (docs/code/notes/visual:*) then converge automatically via the background residue sweeper — no manual bbox_reembed is required"
+                    "detail": "project registration is durable; project-file indexing and edge projection are picked up by the background reindexer after this response, and embeddings across all routes (docs/code/visual:*) then converge automatically via the background residue sweeper; no manual bbox_reembed is required"
                 },
             });
             Ok(response)
@@ -843,7 +843,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_project_rename",
-        description = "Local administrator operation; transport-owned catalog projects refuse with error.project_admin_locality_required because no remote relocation lane is implemented. A bridge failure after registry admission reports error.project_rename_partial with completed effects and old/new recovery coordinates. Rename a registered bbox project root while preserving its project_id and migrating project-scoped bbox state. Accepts project (project_id, registered canonical_path, or absolute path), new_path (absolute directory path), optional move_on_disk (default false), and optional dry_run. Updates project registry, knowledge, threads, notes, Slack channel bindings, live teams, pollers, and crons, then reindexes project files. In catalog mode rename is attachment relocation: the moved checkout must carry the same checkout-id marker and resolve the same scope, the ledger records the historical path, owner-store rows are never rewritten, and move_on_disk is refused (move first, then rename)."
+        description = "Local administrator operation; transport-owned catalog projects refuse with error.project_admin_locality_required because no remote relocation lane is implemented. A bridge failure after registry admission reports error.project_rename_partial with completed effects and old/new recovery coordinates. Rename a registered bbox project root while preserving its project_id and migrating project-scoped bbox state. Accepts project (project_id, registered canonical_path, or absolute path), new_path (absolute directory path), optional move_on_disk (default false), and optional dry_run. Updates project registry, knowledge, threads, Slack channel bindings, live teams, pollers, and crons, then reindexes project files. In catalog mode rename is attachment relocation: the moved checkout must carry the same checkout-id marker and resolve the same scope, the ledger records the historical path, owner-store rows are never rewritten, and move_on_disk is refused (move first, then rename)."
     )]
     pub(crate) async fn bbox_project_rename(
         &self,
@@ -1006,7 +1006,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_project_unregister",
-        description = "Unregister a project root from the bbox project registry. Accepts project (project_id, registered canonical_path, or absolute path). Removes the registry entry only; does NOT delete project-scoped state (knowledge, threads, notes, Slack bindings, teams, pollers, crons) keyed on the project_id, which is derived from the canonical realpath and is stable across unregister+re-register. By default refuses when refs still exist and returns the counts; pass force=true to orphan them, or bbox_project_rename to migrate first. dry_run=true previews counts without mutating the registry. In catalog mode unregister is detach: the attachment is marked detached with census deregistration scoped to its checkout and scope pair, every logical store keeps its rows, and catalog deletion is the offline project-catalog retire surface."
+        description = "Unregister a project root from the bbox project registry. Accepts project (project_id, registered canonical_path, or absolute path). Removes the registry entry only; does NOT delete project-scoped state (knowledge, threads, Slack bindings, teams, pollers, crons) keyed on the project_id, which is derived from the canonical realpath and is stable across unregister+re-register. By default refuses when refs still exist and returns the counts; pass force=true to orphan them, or bbox_project_rename to migrate first. dry_run=true previews counts without mutating the registry. In catalog mode unregister is detach: the attachment is marked detached with census deregistration scoped to its checkout and scope pair, every logical store keeps its rows, and catalog deletion is the offline project-catalog retire surface."
     )]
     pub(crate) async fn bbox_project_unregister(
         &self,
@@ -1378,7 +1378,7 @@ mod tests {
     use crate::projects::ProjectRecord;
     use crate::server::producer_commands::{ProducerCommandResult, ProducerCommandRuntime};
     use crate::server::state::{BlackboxServer, SharedState};
-    use crate::{entity_ref, knowledge, notes, threads};
+    use crate::{entity_ref, knowledge, threads};
     use bbox_code_source::{
         EnrollReceiptV1, PRODUCER_COMMAND_SCHEMA_VERSION, ProducerCommandPollRequestV1,
         ProducerPresenceV1,
@@ -2028,22 +2028,6 @@ mod tests {
             .unwrap();
         // Test setup is sync-only; thread persistence is write-behind here.
         server.state.threads_persister.request();
-        server
-            .state
-            .notes
-            .write()
-            .create(&notes::NoteParams {
-                kind: "learned".into(),
-                body: "project note".into(),
-                task_id: None,
-                session_id: None,
-                project: Some(old_project.clone()),
-                project_id: None,
-                thread_id: None,
-                provider: None,
-                bro: None,
-            })
-            .unwrap();
 
         server
             .state
@@ -2098,7 +2082,7 @@ mod tests {
         );
         assert_eq!(payload["migrated_refs"]["knowledge"], 1);
         assert_eq!(payload["migrated_refs"]["threads"], 1);
-        assert_eq!(payload["migrated_refs"]["notes"], 1);
+        assert!(payload["migrated_refs"].get("notes").is_none());
         assert!(payload["migrated_refs"].get("pins").is_none());
         assert_eq!(payload["migrated_refs"]["gaps"], 1);
         assert!(payload["migrated_refs"].get("webhooks").is_none());
@@ -2111,10 +2095,6 @@ mod tests {
         assert_eq!(
             server.state.threads.read().all()[0].project.as_str(),
             new_project.as_str()
-        );
-        assert_eq!(
-            server.state.notes.read().all()[0].project.as_deref(),
-            Some(new_project.as_str())
         );
         assert_eq!(
             server.state.gaps.read().all()[0].project.as_deref(),

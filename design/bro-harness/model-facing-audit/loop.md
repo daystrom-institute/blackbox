@@ -140,7 +140,7 @@ Recommendation: admit exactly one terminal call with schema-valid args and no si
 
 Counterexample: previous scope task A or pin 'work only on module A'; resume with context explicitly cleared or pin removed. Runtime no longer has it, model still sees it as its last scoped instruction. Resume in cwd B sends an environment delta but can retain cwd A's AGENTS content with no fresh B instructions.
 
-Coverage: dispatch tests assert Rust state clears and effective directives disappear; baseline tests assert identical context is not repeated. They do not inspect provider-visible removal or changed AGENTS content after actual resume.
+Coverage: dispatch tests assert Rust state clears; baseline tests assert identical context is not repeated. They do not inspect provider-visible removal or changed AGENTS content after actual resume.
 
 Recommendation: a versioned context snapshot/delta model must represent removal as well as addition, including document identities/hashes. Model-visible revocation or replacement should be recorded. Do not silently infer fresh authority from old user text.
 

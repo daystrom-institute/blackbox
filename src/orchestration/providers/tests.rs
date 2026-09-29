@@ -190,7 +190,6 @@ fn dispatch_context_rides_its_own_flag_with_verbatim_prompt() {
         task_id: Some("task-9".into()),
         session_id: Some("sid-9".into()),
         project_dir: Some("/repo/x".into()),
-        completion_contract: Some(crate::orchestration::DEFAULT_COMPLETION_CONTRACT.to_string()),
         ..Default::default()
     };
     let payload = ambient.dispatch_context(Some("You are a reviewer"));

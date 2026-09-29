@@ -227,8 +227,7 @@ persist request. Coalescing for telemetry-class; ack-channel (the
 `flush_blocking` shape that `TaskPersister` already has) awaited via
 `spawn_blocking`-friendly async wrapper for operator-durable-class. The flock
 stays — but it is taken **only on the actor thread**, so contention can no
-longer pin a tokio worker. Batch operations (`bbox_note_resolve` over N notes,
-gap-a4e13310) become one mutate + one persist.
+longer pin a tokio worker. Batch operations become one mutate + one persist.
 
 ### 4.3 Index plane: the writer actor
 

@@ -858,8 +858,8 @@ struct Session {
     /// Captured full instruction section for strategies that rebuild memory in
     /// system. The typed ledger owns versions and delivery receipts.
     instruction_system: Option<String>,
-    /// Per-transport composition strategy: where persona, directives, memory,
-    /// and scope land for this session's transport
+    /// Per-transport composition strategy: where persona, memory, and scope
+    /// land for this session's transport
     /// (design/bro-harness/dispatch-prompt-slots.md §5).
     strategy: crate::context::dispatch::CompositionStrategy,
     /// Typed dispatch-context state (`--dispatch-context`): the current
@@ -1136,9 +1136,8 @@ impl Session {
         );
         // Dispatch-context resolution (dispatch-prompt-slots.md §4): the flag
         // replaces the persisted context wholesale; empty clears; absent
-        // restores persona and non-`needs_scope` directives from side-state
-        // with scope dropped. Strict parse — daemon-authored payloads fail
-        // loudly, they do not degrade.
+        // restores the persona from side-state with scope dropped. Strict
+        // parse: daemon-authored payloads fail loudly, they do not degrade.
         let restored_budget =
             crate::context::budget::BudgetCheckpoint::restore(&prior_side["context_budget"]);
         let dispatch_arg =
@@ -2580,8 +2579,7 @@ impl Session {
     }
 
     /// Strategy-routed sections for the stable system slot. Codex-shaped:
-    /// persona + standing directives only (memory/scope ride the
-    /// contextual-user lane). Vibe-shaped: memory, environment, and scope
+    /// persona only (memory/scope ride the contextual-user lane). Vibe-shaped: memory, environment, and scope
     /// additionally fold into the leading system block, rebuilt in place
     /// per request (vibe's `update_system_prompt` shape) — nothing
     /// context-shaped enters the user lane on that strategy.
@@ -2589,7 +2587,6 @@ impl Session {
         let mut sections = SystemSections {
             explicit: self.explicit_system.clone(),
             persona: self.dispatch.persona().map(str::to_string),
-            standing: self.dispatch.standing_text(),
             ..SystemSections::default()
         };
         if !self.strategy.context_rides_user_lane() {
@@ -3199,8 +3196,8 @@ fn est_tool_results(results: &[transport::ToolResult]) -> u64 {
 }
 
 /// Strategy-routed sections feeding the stable system slot
-/// (design/bro-harness/dispatch-prompt-slots.md §5). `explicit`, `persona`,
-/// and `standing` apply under every strategy; `memory`, `environment`, and
+/// (design/bro-harness/dispatch-prompt-slots.md §5). `explicit` and `persona`
+/// apply under every strategy; `memory`, `environment`, and
 /// `scope` are filled only by the vibe-shaped strategy, where
 /// those classes fold into the leading system message instead of the
 /// contextual-user lane.
@@ -3208,7 +3205,6 @@ fn est_tool_results(results: &[transport::ToolResult]) -> u64 {
 struct SystemSections {
     explicit: Option<String>,
     persona: Option<String>,
-    standing: Option<String>,
     memory: Option<String>,
     environment: Option<String>,
     scope: Option<String>,
@@ -3219,7 +3215,7 @@ struct SystemSections {
 ///
 /// Stable ordering (both strategies; base instructions render before all of
 /// this, transport-side): explicit `--system-prompt` override → persona →
-/// standing directives → memory → pinned-tools → environment → scope.
+/// memory → pinned-tools → environment → scope.
 /// The per-resume-mutable section (scope) sits at the suffix so the
 /// prefix stays byte-identical across leading-block rebuilds on the chat
 /// lane (cache vs salience trade, design §5).
@@ -3238,7 +3234,6 @@ fn compose_system(
     let mut parts: Vec<String> = Vec::new();
     push_part(&mut parts, sections.explicit.as_deref());
     push_part(&mut parts, sections.persona.as_deref());
-    push_part(&mut parts, sections.standing.as_deref());
     push_part(&mut parts, sections.memory.as_deref());
 
     let pinned = reg.pinned();
@@ -5939,12 +5934,6 @@ mod tests {
         let ctx = DispatchContext {
             v: 1,
             persona: Some("PERSONA_UNIQUE reviewer".into()),
-            directives: vec![DispatchDirective {
-                id: "standing".into(),
-                cadence: DirectiveCadence::Standing,
-                needs_scope: false,
-                text: "STANDING_UNIQUE directive".into(),
-            }],
             scope,
         };
         DispatchState::from_arg(DispatchContextArg::Provided(Box::new(ctx)), &Value::Null)
@@ -5977,7 +5966,7 @@ mod tests {
         run_user_turn(&mut session, "hello").await;
         let systems = shared.seen_systems.lock().unwrap();
         let stable = systems[0].stable_text().unwrap();
-        ordered(stable, &["PERSONA_UNIQUE", "STANDING_UNIQUE"]);
+        assert!(stable.contains("PERSONA_UNIQUE"), "{stable}");
         for absent in [
             "AGENTS_UNIQUE_RULE",
             "<bbox_scope>",
@@ -6013,7 +6002,6 @@ mod tests {
             stable,
             &[
                 "PERSONA_UNIQUE",
-                "STANDING_UNIQUE",
                 "AGENTS_UNIQUE_RULE",
                 "Always-available tools",
                 "<environment_context>",
@@ -6330,10 +6318,10 @@ mod tests {
     }
 
     #[test]
-    fn suppressed_defaults_with_dispatch_context_keeps_persona_and_directives() {
+    fn suppressed_defaults_with_dispatch_context_keeps_persona() {
         // `--system-prompt ""` clears explicit_system AND disables AGENTS
-        // discovery, but a dispatch context still lands persona + directives
-        // in stable (design §8): base + persona + directives, no AGENTS.
+        // discovery, but a dispatch context still lands the persona in
+        // stable (design §8): base + persona, no AGENTS.
         let (mut session, _shared) = mk_session(vec![]);
         session.explicit_system = None;
         session.instruction_system = None;
@@ -6341,7 +6329,6 @@ mod tests {
         let system = compose_system(&session.system_sections(), &session.reg, false);
         let stable = system.stable_text().unwrap();
         assert!(stable.contains("PERSONA_UNIQUE"));
-        assert!(stable.contains("STANDING_UNIQUE"));
         assert!(!stable.contains("# AGENTS.md instructions"));
     }
 

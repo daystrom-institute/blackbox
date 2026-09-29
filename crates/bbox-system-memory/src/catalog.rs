@@ -843,17 +843,4 @@ mod tests {
         assert_eq!(id_hits.len(), 1);
         assert_eq!(id_hits[0].id, "sm-gap-notes");
     }
-
-    #[test]
-    fn gap_notes_memory_is_distinct_from_side_channel_notes() {
-        let catalog = fixture_default_catalog();
-        let gap = catalog
-            .get("sm-gap-notes")
-            .expect("sm-gap-notes must exist");
-        let side = catalog
-            .get("sm-side-channel-notes")
-            .expect("sm-side-channel-notes must exist");
-        assert_ne!(gap.id, side.id);
-        assert_ne!(gap.content, side.content);
-    }
 }

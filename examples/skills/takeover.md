@@ -1,6 +1,6 @@
 ---
 description: Take over driving an existing agent session — composed of thread init (ensure a bbox work-item thread exists with full scope) and thread run (drive the agent against that scope). Threads persist across sessions and accumulate context from each takeover.
-allowed-tools: mcp__blackbox__bbox_thread, mcp__blackbox__bbox_thread_list, mcp__blackbox__bbox_notes, mcp__blackbox__bbox_session, mcp__blackbox__bbox_messages, mcp__blackbox__bbox_hybrid_search, mcp__blackbox__bro_resume, mcp__blackbox__bro_wait, mcp__blackbox__bro_status, mcp__blackbox__bro_dashboard, Agent, Read, Glob, Grep, Bash, AskUserQuestion
+allowed-tools: mcp__blackbox__bbox_thread, mcp__blackbox__bbox_thread_list, mcp__blackbox__bbox_session, mcp__blackbox__bbox_messages, mcp__blackbox__bbox_hybrid_search, mcp__blackbox__bro_resume, mcp__blackbox__bro_wait, mcp__blackbox__bro_status, mcp__blackbox__bro_dashboard, Agent, Read, Glob, Grep, Bash, AskUserQuestion
 argument-hint: <session name | session UUID | thread- prefix>
 ---
 
@@ -146,7 +146,7 @@ After each `wait` completes, **analyze the result**:
    - If the agent fixes it inline: note it as resolved.
    - If it's out of scope or deferred: **you must record it** before halting. If your
      project has a findings / issue / bug-tracker MCP surface, record it there. Otherwise
-     emit a `bbox_note(kind="followup", thread_id=<thread_id>, body=...)` so the next
+     add it as a thread note (`bbox_thread action=continue`) so the next
      takeover sees it. Defects that are observed but not recorded are lost work.
 
 3. **Update the thread.** After each iteration, `bbox_thread action=continue` with
@@ -208,7 +208,7 @@ When a halt condition is met or the work completes:
 
 2. **Record unresolved defects.** Any non-trivial defects observed but not fixed must
    be recorded — via your project's findings / issue tracker MCP if available, or as
-   `bbox_note(kind="followup", thread_id=<thread_id>, ...)` entries otherwise.
+   thread notes (`bbox_thread action=continue`) otherwise.
 
 3. **Report to the user:**
    - What triggered the halt (completion, halt condition, escalation)

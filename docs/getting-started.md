@@ -31,7 +31,7 @@ writable volume as described in
 [the runtime image README](../deploy/docker/README.md).
 
 One daemon serves every Claude / Codex / Gemini / Copilot / Vibe CLI. That is
-what makes transcript search, knowledge, threads, notes, and bro tasks shared
+what makes transcript search, knowledge, threads, and bro tasks shared
 instead of provider-local.
 
 On each checkout host, install the satellites:

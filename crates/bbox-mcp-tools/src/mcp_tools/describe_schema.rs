@@ -83,14 +83,8 @@ fn edge_families() -> Vec<serde_json::Value> {
         ),
         family(
             "Provenance",
-            &[
-                "TASK_PRODUCED_NOTE",
-                "NOTE_FROM_SESSION",
-                "NOTE_IN_THREAD",
-                "NOTE_FROM_TASK",
-                "SESSION_USED_BROFILE",
-            ],
-            "Use provenance edges to move from artifacts back to sessions, threads, notes, and brofiles.",
+            &["SESSION_USED_BROFILE"],
+            "Use provenance edges to move from sessions back to the brofiles that shaped them.",
         ),
         family(
             "Git",

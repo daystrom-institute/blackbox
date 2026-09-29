@@ -37,7 +37,7 @@ an agent is told to read.
 | [CLOSEOUT.md](CLOSEOUT.md) | Fold a worktree back into `main`: commit, ff-only merge, push, clean up. |
 | [CLOSEOUT-beta.md](CLOSEOUT-beta.md) | Beta-line sibling of CLOSEOUT.md: fold a worktree into `beta/blackbox-v2` instead of `main`. |
 | [DESIGN_PANEL.md](DESIGN_PANEL.md) | Produce a reviewed implementation plan for **one phase or slice**: author-critic default, three-author panel escalation, adjudicated repair loop, independent review bookend to exact PASS. Prototype-stage orchestration runbook; fan-out is operator-directed via child orchestrators. |
-| [RETRO_INTERACTIVE.md](RETRO_INTERACTIVE.md) | End-of-session retro for a **live interactive** agent (tools, MCP, instructions, operator steering). Files gaps + follow-up notes. |
+| [RETRO_INTERACTIVE.md](RETRO_INTERACTIVE.md) | End-of-session retro for a **live interactive** agent (tools, MCP, instructions, operator steering). Files gaps + follow-up thread notes. |
 | [RETRO_HARNESS.md](RETRO_HARNESS.md) | End-of-session self-report for a **`bro fleet` / bro-harness** session: what felt helpful, noisy, missing, or awkward. Files gaps only for reusable substrate defects. |
 | [RETRO_ISOLATE_REFACTOR.md](RETRO_ISOLATE_REFACTOR.md) | Post-probe retro for a **code-mode session driving the refactor namespace bindings** (`code.*`/`lsp.*`/`analysis.*`/`edits.*`) — the live-probe instrument for refactor-tools-v2. Files gaps in `*/refactor-tools/*`. |
 | [JAVA_REFACTOR_DELEGATION.md](JAVA_REFACTOR_DELEGATION.md) | Orchestrator playbook for **delegating Java structural refactoring** (god-class decomposition, extract-class) to a dispatched agent driving the code-mode refactor bindings: the flow, how to brief the agent, dispatch mechanics, footguns, and the verify loop. Pairs with [RETRO_ISOLATE_REFACTOR.md](RETRO_ISOLATE_REFACTOR.md). |
@@ -54,6 +54,6 @@ See [`agents/`](agents/README.md). Lens prompts referenced by brofiles/orchestra
   and knows what to do. Paths inside a prompt are **repo-root-relative**.
 - Dispatched-agent lenses should be the *single source of truth* for a bro's
   behavior, so the brofile stays a thin pointer (`prompts/agents/<lens>.md`).
-- Gap/note-filing prompts must reuse existing gap kinds (`mcp_surface`,
+- Gap-filing prompts must reuse existing gap kinds (`mcp_surface`,
   `tooling`, `workflow`, `agent`, `docs_runbook`, `refactor_primitive`,
   `ontology`, `eval_coverage`, `packet_ast`) — never coin a new kind.

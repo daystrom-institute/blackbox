@@ -10,7 +10,6 @@ use bbox_chunker::{EdgeConfidence, EdgeProvenance};
 use bbox_corpus_core::entity_ref::EntityRef;
 use bbox_corpus_index::index::{EdgeProjectionDoc, TranscriptIndex};
 pub use bbox_edge_sidecar::edge_sidecar::*;
-use bbox_threads::notes::Notes;
 use bbox_threads::threads::{EdgeKind, EdgeTarget, Threads};
 
 #[cfg(test)]
@@ -46,7 +45,6 @@ pub struct EdgeIndex {
 pub struct EdgeStoreRefs<'a> {
     pub index: &'a TranscriptIndex,
     pub threads: &'a Threads,
-    pub notes: &'a Notes,
     /// (provider, session_id, bro_label) rows extracted from the task
     /// store by the caller — dependency inversion keeping this store
     /// below orchestration in the crate DAG.
@@ -127,7 +125,7 @@ impl EdgeIndex {
     }
 
     /// Store-projection half of `rebuild`: walks the in-memory stores only.
-    /// Callers holding store read guards (knowledge/threads/notes/tasks/
+    /// Callers holding store read guards (knowledge/threads/tasks/
     /// idx) run just this half under them, then drop the guards
     /// before `load_sidecar_edges` — the sidecar load is a multi-GB disk
     /// parse that needs no store access, and parking_lot fairness means one
@@ -139,7 +137,6 @@ impl EdgeIndex {
         let mut seen = HashSet::new();
 
         index.project_thread_edges(stores.threads, &mut seen);
-        index.project_note_edges(stores.notes, &mut seen);
         index.project_task_edges(&stores.session_brofile_rows, &mut seen);
         if stores.include_tantivy_projection {
             index.project_tantivy_edges(stores.index, &mut seen);
@@ -484,57 +481,6 @@ impl EdgeIndex {
                         metadata,
                         project_id: None,
                     },
-                    seen,
-                );
-            }
-        }
-    }
-
-    fn project_note_edges(&mut self, notes: &Notes, seen: &mut HashSet<EdgeKey>) {
-        for note in notes.all() {
-            let note_ref = EntityRef::Note {
-                note_id: note.id.clone(),
-            };
-            if let Some(task_id) = &note.task_id {
-                self.insert(
-                    exact_edge(
-                        EntityRef::Task {
-                            task_id: task_id.clone(),
-                        },
-                        "TASK_PRODUCED_NOTE",
-                        note_ref.clone(),
-                        EdgeProvenance::Derived,
-                    ),
-                    seen,
-                );
-            }
-            if let Some(session_id) = &note.session_id {
-                self.insert(
-                    exact_edge(
-                        note_ref.clone(),
-                        "NOTE_FROM_SESSION",
-                        EntityRef::Session {
-                            provider: note
-                                .provider
-                                .clone()
-                                .unwrap_or_else(|| "unknown".to_string()),
-                            session_id: session_id.clone(),
-                        },
-                        EdgeProvenance::Derived,
-                    ),
-                    seen,
-                );
-            }
-            if let Some(thread_id) = &note.thread_id {
-                self.insert(
-                    exact_edge(
-                        note_ref.clone(),
-                        "NOTE_IN_THREAD",
-                        EntityRef::Thread {
-                            thread_id: thread_id.clone(),
-                        },
-                        EdgeProvenance::Derived,
-                    ),
                     seen,
                 );
             }

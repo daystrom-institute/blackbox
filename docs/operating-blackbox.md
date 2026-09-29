@@ -274,7 +274,7 @@ log keeps accumulating, and the next daemon replays from its cursor.
 ## Reindexing
 
 The daemon keeps a Tantivy index for transcripts, project files, git
-messages, knowledge entries, notes, threads, and tool-call records. The
+messages, knowledge entries, threads, and tool-call records. The
 background reindexer runs periodically, controlled by
 `BLACKBOX_REINDEX_INTERVAL_SECS` (default `120`).
 
@@ -385,7 +385,6 @@ Routes normally include:
 | `docs` | Markdown and doc chunks |
 | `git_message` | Commit subjects/bodies |
 | `knowledge` | Knowledge-store entries |
-| `notes` | Side-channel notes |
 | `transcripts` | Transcript blocks |
 
 Re-embed a route when:

@@ -24,7 +24,6 @@ pub enum EntityType {
     ProvisionalProjectGraphVertex,
     Session,
     Thread,
-    Note,
     Symbol,
     SymbolV2,
     Brofile,
@@ -35,7 +34,7 @@ pub enum EntityType {
 }
 
 impl EntityType {
-    pub const ALL: [EntityType; 19] = [
+    pub const ALL: [EntityType; 18] = [
         EntityType::Knowledge,
         EntityType::ProvisionalKnowledge,
         EntityType::SystemMemory,
@@ -47,7 +46,6 @@ impl EntityType {
         EntityType::ProvisionalProjectGraphVertex,
         EntityType::Session,
         EntityType::Thread,
-        EntityType::Note,
         EntityType::Symbol,
         EntityType::SymbolV2,
         EntityType::Brofile,
@@ -70,7 +68,6 @@ impl EntityType {
             EntityType::ProvisionalProjectGraphVertex => "provisional_project_graph_vertex",
             EntityType::Session => "session",
             EntityType::Thread => "thread",
-            EntityType::Note => "note",
             EntityType::Symbol => "symbol",
             EntityType::SymbolV2 => "symbol_v2",
             EntityType::Brofile => "brofile",
@@ -106,7 +103,6 @@ impl EntityType {
             }
             EntityType::Session => "session:<provider>:<session_id>",
             EntityType::Thread => "thread:<thread_id>",
-            EntityType::Note => "note:<note_id>",
             EntityType::Symbol => "symbol:<project_id>:<qualified_name>:<defn_hash>",
             EntityType::SymbolV2 => {
                 "symbol_v2:<project_id>:<snapshot_id>:<qualified_name>:<defn_hash>"
@@ -195,9 +191,6 @@ pub enum EntityRef {
     Thread {
         thread_id: String,
     },
-    Note {
-        note_id: String,
-    },
     Symbol {
         project_id: String,
         qualified_name: String,
@@ -284,9 +277,6 @@ impl EntityRef {
             EntityType::Session => parse_session(input, rest),
             EntityType::Thread => parse_single(input, rest, EntityType::Thread, |thread_id| {
                 EntityRef::Thread { thread_id }
-            }),
-            EntityType::Note => parse_single(input, rest, EntityType::Note, |note_id| {
-                EntityRef::Note { note_id }
             }),
             EntityType::Symbol => parse_symbol(input, rest),
             EntityType::SymbolV2 => parse_symbol_v2(input, rest),
@@ -399,7 +389,6 @@ impl EntityRef {
                 Ok(format!("session:{provider}:{session_id}"))
             }
             EntityRef::Thread { thread_id } => Ok(format!("thread:{thread_id}")),
-            EntityRef::Note { note_id } => Ok(format!("note:{note_id}")),
             EntityRef::Symbol {
                 project_id,
                 qualified_name,
@@ -443,7 +432,6 @@ impl EntityRef {
             }
             EntityRef::Session { .. } => EntityType::Session,
             EntityRef::Thread { .. } => EntityType::Thread,
-            EntityRef::Note { .. } => EntityType::Note,
             EntityRef::Symbol { .. } => EntityType::Symbol,
             EntityRef::SymbolV2 { .. } => EntityType::SymbolV2,
             EntityRef::Brofile { .. } => EntityType::Brofile,
@@ -1013,6 +1001,8 @@ mod tests {
         assert!(super::EntityType::from_prefix("roadmap_item").is_none());
         assert!(super::EntityRef::parse("whiteboard:board-legacy").is_err());
         assert!(super::EntityType::from_prefix("whiteboard").is_none());
+        assert!(super::EntityRef::parse("note:note-legacy").is_err());
+        assert!(super::EntityType::from_prefix("note").is_none());
     }
 
     use super::*;
@@ -1379,10 +1369,7 @@ mod tests {
             10 => EntityRef::Thread {
                 thread_id: rng.token("thread-"),
             },
-            11 => EntityRef::Note {
-                note_id: rng.token("note-"),
-            },
-            12 => EntityRef::Symbol {
+            11 => EntityRef::Symbol {
                 project_id: rng.hex(8),
                 qualified_name: format!(
                     "{}::{}::{}",
@@ -1392,7 +1379,7 @@ mod tests {
                 ),
                 defn_hash: rng.hex(64),
             },
-            13 => EntityRef::SymbolV2 {
+            12 => EntityRef::SymbolV2 {
                 project_id: rng.hex(8),
                 snapshot_id: format!("head-{}-{}", rng.hex(12), rng.hex(16)),
                 qualified_name: format!(
@@ -1403,21 +1390,21 @@ mod tests {
                 ),
                 defn_hash: rng.hex(64),
             },
-            14 => EntityRef::Brofile {
+            13 => EntityRef::Brofile {
                 name: rng.token("bro-"),
             },
-            15 => EntityRef::Commit {
+            14 => EntityRef::Commit {
                 repo_id: rng.hex(8),
                 sha: rng.hex(40),
             },
-            16 => EntityRef::Task {
+            15 => EntityRef::Task {
                 task_id: rng.token("task-"),
             },
-            17 => EntityRef::BashCall {
+            16 => EntityRef::BashCall {
                 session: format!("{}:{}", rng.token("sess-"), rng.token("tool-")),
                 turn: rng.next() as u32,
             },
-            18 => EntityRef::Artifact {
+            17 => EntityRef::Artifact {
                 kind: "workflow".into(),
                 name: rng.token("workflow-"),
                 version: Some("1".into()),

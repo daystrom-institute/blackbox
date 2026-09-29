@@ -2,10 +2,8 @@
 //!
 //! A "gap note" is a substrate-gap field report: a record that the blackbox
 //! substrate (a tool primitive, MCP surface, refactor atom, workflow shape,
-//! ontology edge, runbook) is missing a reusable capability. Gap notes used to
-//! ride inside the side-channel notes surface as a `blackbox.gap_note.v1` JSON
-//! envelope crammed into a `kind=followup` body. They are now first-class: a
-//! typed [`GapNote`] in a dedicated, repo-owned store that mirrors the
+//! ontology edge, runbook) is missing a reusable capability. Each is a typed
+//! [`GapNote`] in a dedicated, repo-owned store that mirrors the
 //! `.bbox/knowledge/` persistence model (one file per record, project/central
 //! split, atomic-write + store-lock, watcher reload).
 //!
