@@ -98,10 +98,10 @@ breaking:
 - Tool docs and prompts migrate to `cwd` opportunistically.
 
 **Status (2026-06-11, gap-6366c92d / thread-55d51135 item 3): done.** The
-schema-advertised name on the dispatch tools — `bro_exec`, `bro_resume`,
-`bro_broadcast`, `bro_agent_dispatch` — is now `cwd`, with `project_dir`
-retained as a deprecated serde alias (the inverse of the interim 830c2c0
-state, which advertised `project_dir` and aliased `cwd`). Tool docs, prompts,
+schema-advertised name on the dispatch tools (`bro_exec`, `bro_resume`) is
+now `cwd`, with `project_dir` retained as a deprecated serde alias (the
+inverse of the interim 830c2c0 state, which advertised `project_dir` and
+aliased `cwd`). Tool docs, prompts,
 example skills, and design-doc dispatch examples migrated in the same pass.
 Project-dir-*semantic* params (code-nav/refactor/slice `project_dir` read
 roots, `bro_team`/`bro_brofile`/badgey/allocator project scopes) keep their

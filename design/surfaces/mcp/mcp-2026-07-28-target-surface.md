@@ -270,7 +270,6 @@ than a few seconds". By that rule:
 | `bbox_edge_compact(apply)` / `bbox_storage_gc(apply)` / `bbox_storage_migrate_legacy_edges(apply)` | Storage maintenance over many projects; dry-run stays a tool, apply becomes a task |
 | `consultant_apply_proposal` (and badgey) | Already secretly a task: dispatches work, returns `applied_task_id`, and its Pending -> Applying -> Applied/Failed state machine is literally the task lifecycle. The split begin/complete-apply pair exists only because the protocol had no task primitive |
 | `atom_invoke` | Atom runs are dispatched executions with run records |
-| `bro_retro` | A dispatch (resume with reflection prompt); falls out of the bro_exec mapping for free |
 | `bbox_project_register` | Registration is instant but schedules background indexing; the follow-through deserves a task handle |
 
 The pattern worth naming: `consultant_apply_proposal`, `bro_exec`, and
@@ -381,7 +380,7 @@ durable objects), all mutations, anything parameterized ad hoc.
   cursors, descriptor-only listing (progressive disclosure; `resources/read`
   fetches one full body), plus `ttlMs`/`cacheScope`. This relieves the
   chronic over-cap list-tool pattern (`bbox_artifact_list`,
-  `bbox_describe_schema(include_agents=true)`) that the 80KB cap's bytes
+  `bbox_describe_schema(mode="full")`) that the 80KB cap's bytes
   telemetry exists to flag.
 - `resourcesListChanged` over listen on catalog mutation (artifact install,
   brofile upsert).

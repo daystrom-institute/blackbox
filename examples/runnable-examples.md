@@ -7,5 +7,5 @@ execution and resume; adapt model selection to `bro_providers`.
 
 Workflow, atom, cron, Slack and reaction application examples are retired.
 Their earlier revisions remain in Git history; no current installer activates
-them. Optional brofiles, simple agents and teams live in
+them. Optional brofiles and teams live in
 [system defaults](../system-defaults/system-defaults.md).

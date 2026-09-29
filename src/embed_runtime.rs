@@ -1,10 +1,9 @@
 //! Daemon-side embedding runtime — the upward-coupled half of the embed
 //! surface. The contract (Bucket, EmbeddingRouter, the queue handle and
 //! enqueue helpers) lives in `crate::embed` / `crate::embed_queue`; this
-//! module owns everything that needs `SharedState`, orchestration agent
-//! types, or routing-verdict dispatch: reembed orchestration, embedding
-//! route coverage, agent-manifest embeddings, and the knowledge
-//! contradiction detector (registered into the queue worker's hook at
+//! module owns everything that needs `SharedState` or routing-verdict
+//! dispatch: reembed orchestration, embedding route coverage, and the
+//! knowledge contradiction detector (registered into the queue worker's hook at
 //! SharedState construction).
 
 pub(crate) mod status_snapshot;
@@ -23,13 +22,10 @@ use std::sync::OnceLock;
 use crate::embed::queue::{EmbedRequest, EmbedStatusResponse};
 use crate::embed::{Bucket, EmbeddingRouter};
 use crate::embed_queue::status_response;
-use crate::orchestration::agents::types::{AgentManifest, AgentRef};
 use crate::server::state::SharedState;
 use std::path::PathBuf;
 
 use crate::embed::queue;
-use crate::embed_queue::content_hash;
-use crate::orchestration::agents::types::{AgentEmbedding, AgentEmbeddingComponents};
 use bbox_chunker::Chunk;
 use bbox_corpus_core::entity_ref::EntityRef;
 use bbox_corpus_index::index::EmbeddingSourceDoc;
@@ -686,9 +682,6 @@ pub(crate) fn route_coverage(
             )?;
         }
     }
-    if buckets.contains(&Bucket::AgentManifest) {
-        record_agent_manifest_coverage(stores, &router, &mut coverage, &mut active_by_route)?;
-    }
     if buckets.contains(&Bucket::Graph) {
         let views = stores.project_graph_views.read();
         for (project_id, view) in views.iter_published() {
@@ -732,60 +725,6 @@ pub(crate) fn route_coverage(
             })?;
     }
     Ok(coverage)
-}
-
-fn record_agent_manifest_coverage(
-    stores: &crate::providers::CorpusStores<'_>,
-    router: &EmbeddingRouter,
-    coverage: &mut BTreeMap<String, RouteCoverage>,
-    active_by_route: &mut BTreeMap<String, HashSet<(String, String)>>,
-) -> Result<()> {
-    let catalog = stores.artifacts.read();
-    let entries = catalog.list(&crate::artifacts::ArtifactListParams {
-        kind: Some(crate::artifacts::ArtifactKind::Agent),
-        name: None,
-        include_superseded: true,
-    })?;
-    for entry in entries {
-        // TODO(phase-4-shadowing): plumb project_id when caller has it to enable local shadowing.
-        let Some(value) =
-            catalog.load_artifact_value(crate::artifacts::ArtifactKind::Agent, &entry.name)?
-        else {
-            continue;
-        };
-        let manifest_value = value.get("manifest").unwrap_or(&value);
-        let Ok(manifest) = serde_json::from_value::<
-            crate::orchestration::agents::types::AgentManifest,
-        >(manifest_value.clone()) else {
-            continue;
-        };
-        let Ok(version) = entry.version.parse::<u32>() else {
-            continue;
-        };
-        let agent = crate::orchestration::agents::types::AgentRef {
-            name: entry.name,
-            version,
-        };
-        for component in [
-            AgentManifestComponent::Primary,
-            AgentManifestComponent::WhenToUse,
-            AgentManifestComponent::AntiPatterns,
-        ] {
-            let Some(chunk_hash) = agent_component_hash(&manifest, component) else {
-                continue;
-            };
-            record_coverage(
-                router,
-                coverage,
-                active_by_route,
-                Bucket::AgentManifest,
-                None,
-                &agent_component_entity_id(&agent, component),
-                &chunk_hash,
-            )?;
-        }
-    }
-    Ok(())
 }
 
 fn record_index_doc_coverage(
@@ -895,11 +834,7 @@ fn record_index_doc_coverage(
                 chunk_hash,
             )
         }
-        Bucket::Knowledge
-        | Bucket::Notes
-        | Bucket::Threads
-        | Bucket::AgentManifest
-        | Bucket::Graph => Ok(()),
+        Bucket::Knowledge | Bucket::Notes | Bucket::Threads | Bucket::Graph => Ok(()),
     }
 }
 
@@ -1020,13 +955,6 @@ fn enqueue_reembed_routes(
             if crate::embed_queue::enqueue_thread(thread) {
                 enqueued += 1;
             }
-        }
-    }
-    if buckets.contains(&Bucket::AgentManifest) {
-        let remaining = max_entities.map(|max| max.saturating_sub(enqueued));
-        enqueued += enqueue_agent_manifest_artifacts(state, remaining)?;
-        if limit_reached(max_entities, enqueued) {
-            return Ok(enqueued);
         }
     }
     if buckets.contains(&Bucket::Graph) {
@@ -1340,44 +1268,6 @@ pub(crate) fn spawn_embed_residue_sweeper(state: Arc<SharedState>) {
     });
 }
 
-fn enqueue_agent_manifest_artifacts(
-    state: &Arc<SharedState>,
-    max_entities: Option<usize>,
-) -> Result<usize> {
-    let catalog = state.artifacts.read();
-    let entries = catalog.list(&crate::artifacts::ArtifactListParams {
-        kind: Some(crate::artifacts::ArtifactKind::Agent),
-        name: None,
-        include_superseded: true,
-    })?;
-    let mut enqueued = 0usize;
-    for entry in entries {
-        if limit_reached(max_entities, enqueued) {
-            break;
-        }
-        let Some(value) =
-            catalog.load_artifact_value(crate::artifacts::ArtifactKind::Agent, &entry.name)?
-        else {
-            continue;
-        };
-        let manifest_value = value.get("manifest").unwrap_or(&value);
-        let Ok(manifest) = serde_json::from_value::<
-            crate::orchestration::agents::types::AgentManifest,
-        >(manifest_value.clone()) else {
-            continue;
-        };
-        let Ok(version) = entry.version.parse::<u32>() else {
-            continue;
-        };
-        let agent = crate::orchestration::agents::types::AgentRef {
-            name: entry.name,
-            version,
-        };
-        enqueued += enqueue_agent_manifest(&agent, &manifest);
-    }
-    Ok(enqueued)
-}
-
 #[cfg(test)]
 fn count_reembed_index_docs(buckets: &[Bucket], docs: &[EmbeddingSourceDoc]) -> usize {
     docs.iter()
@@ -1464,11 +1354,7 @@ fn enqueue_reembed_index_doc(buckets: &[Bucket], doc: &EmbeddingSourceDoc) -> bo
             };
             crate::embed_queue::enqueue_git_message(entity_id, chunk_hash, &doc.content)
         }
-        Bucket::Knowledge
-        | Bucket::Notes
-        | Bucket::Threads
-        | Bucket::AgentManifest
-        | Bucket::Graph => false,
+        Bucket::Knowledge | Bucket::Notes | Bucket::Threads | Bucket::Graph => false,
     }
 }
 
@@ -1812,7 +1698,6 @@ pub(crate) fn status_response_for_state(
         Bucket::GitMessage,
         Bucket::Notes,
         Bucket::Threads,
-        Bucket::AgentManifest,
         Bucket::Graph,
     ];
     let mut response =
@@ -1944,170 +1829,6 @@ fn project_status_response(
         });
     }
     Ok(value)
-}
-
-pub(crate) fn agent_manifest_embedding(
-    agent: &AgentRef,
-    manifest: &AgentManifest,
-) -> AgentEmbedding {
-    let route = crate::embed::EmbeddingRouter::load_default()
-        .and_then(|router| router.route(Bucket::AgentManifest, None))
-        .ok();
-    let model = route
-        .as_ref()
-        .map(|route| route.document_model.clone())
-        .unwrap_or_else(|| "unavailable".into());
-    let vector_route = route.map(|route| route.vector_route_id());
-    let primary = agent_component_entity_id(agent, AgentManifestComponent::Primary);
-    let when_to_use = if manifest.when_to_use.is_empty() {
-        None
-    } else {
-        Some(agent_component_entity_id(
-            agent,
-            AgentManifestComponent::WhenToUse,
-        ))
-    };
-    let anti_patterns = if manifest.anti_patterns.is_empty() {
-        None
-    } else {
-        Some(agent_component_entity_id(
-            agent,
-            AgentManifestComponent::AntiPatterns,
-        ))
-    };
-    AgentEmbedding {
-        model,
-        computed_at: crate::util::now_iso(),
-        vector_ref: primary.clone(),
-        vector_route,
-        components: AgentEmbeddingComponents {
-            primary,
-            when_to_use,
-            anti_patterns,
-        },
-    }
-}
-
-pub(crate) fn enqueue_agent_manifest(agent: &AgentRef, manifest: &AgentManifest) -> usize {
-    let mut enqueued = 0usize;
-    for component in agent_manifest_components(manifest) {
-        if crate::embed_queue::enqueue(EmbedRequest {
-            bucket: Bucket::AgentManifest,
-            project_id: None,
-            entity_id: agent_component_entity_id(agent, component.kind),
-            chunk_hash: content_hash(&component.text),
-            text: component.text,
-            visual_kind: None,
-            visual_payload: None,
-        }) {
-            enqueued += 1;
-        }
-    }
-    enqueued
-}
-
-pub(crate) fn agent_component_entity_id(
-    agent: &AgentRef,
-    component: AgentManifestComponent,
-) -> String {
-    format!(
-        "agent_embed:{}:v{}:{}",
-        agent.name,
-        agent.version,
-        component.as_str()
-    )
-}
-
-pub(crate) fn parse_agent_component_entity_id(
-    entity_id: &str,
-) -> Option<(AgentRef, AgentManifestComponent)> {
-    let (name, version, component) =
-        crate::embed_queue::parse_agent_component_entity_id_parts(entity_id)?;
-    Some((
-        AgentRef { name, version },
-        AgentManifestComponent::parse(&component)?,
-    ))
-}
-
-pub(crate) fn agent_component_hash(
-    manifest: &AgentManifest,
-    component: AgentManifestComponent,
-) -> Option<String> {
-    let text = agent_manifest_component_text(manifest, component)?;
-    Some(content_hash(&text))
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum AgentManifestComponent {
-    Primary,
-    WhenToUse,
-    AntiPatterns,
-}
-
-impl AgentManifestComponent {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::Primary => "primary",
-            Self::WhenToUse => "when_to_use",
-            Self::AntiPatterns => "anti_patterns",
-        }
-    }
-
-    pub(crate) fn parse(input: &str) -> Option<Self> {
-        match input {
-            "primary" => Some(Self::Primary),
-            "when_to_use" => Some(Self::WhenToUse),
-            "anti_patterns" => Some(Self::AntiPatterns),
-            _ => None,
-        }
-    }
-}
-
-struct AgentComponentText {
-    kind: AgentManifestComponent,
-    text: String,
-}
-
-fn agent_manifest_components(manifest: &AgentManifest) -> Vec<AgentComponentText> {
-    let mut components = Vec::new();
-    for kind in [
-        AgentManifestComponent::Primary,
-        AgentManifestComponent::WhenToUse,
-        AgentManifestComponent::AntiPatterns,
-    ] {
-        if let Some(text) = agent_manifest_component_text(manifest, kind) {
-            components.push(AgentComponentText { kind, text });
-        }
-    }
-    components
-}
-
-fn agent_manifest_component_text(
-    manifest: &AgentManifest,
-    component: AgentManifestComponent,
-) -> Option<String> {
-    match component {
-        AgentManifestComponent::Primary => Some(format!(
-            "description: {}\nwhen_to_use:\n{}\nanti_patterns:\n{}",
-            manifest.description,
-            manifest.when_to_use.join("\n"),
-            manifest.anti_patterns.join("\n")
-        )),
-        AgentManifestComponent::WhenToUse => {
-            if manifest.when_to_use.is_empty() {
-                None
-            } else {
-                Some(manifest.when_to_use.join("\n"))
-            }
-        }
-        AgentManifestComponent::AntiPatterns => {
-            if manifest.anti_patterns.is_empty() {
-                None
-            } else {
-                Some(manifest.anti_patterns.join("\n"))
-            }
-        }
-    }
 }
 
 pub(crate) fn maybe_detect_knowledge_contradiction(

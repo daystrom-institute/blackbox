@@ -363,21 +363,18 @@ mod tests {
     #[test]
     fn load_and_keep_default_order() {
         let catalog = fixture_default_catalog();
-        // Every .md file on disk except the `system-memory-catalog.md` nav-map
-        // (explicitly ignored by the loader, see loader.rs IGNORED_FILES).
+        // Every .md file on disk except the `system-memory-catalog.md`
+        // nav-map, which the loader ignores (loader.rs
+        // NON_MEMORY_MARKDOWN_FILES).
         let defaults = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join("system-defaults")
-            .join("memories");
+            .join("../../system-defaults/memories");
         let on_disk = fs::read_dir(&defaults)
             .unwrap()
             .filter_map(|entry| entry.ok())
             .filter(|entry| {
-                entry
-                    .path()
-                    .extension()
-                    .is_some_and(|extension| extension == "md")
-                    && entry.file_name() != "system-memory-catalog.md"
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                name.ends_with(".md") && name != "system-memory-catalog.md"
             })
             .count();
         assert_eq!(catalog.memories.len(), on_disk);

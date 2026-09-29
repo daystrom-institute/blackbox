@@ -137,8 +137,8 @@ Built-in surfaces (the tool lists are in `default_surfaces.toml`):
 
 | Surface | Caller | Shape |
 | --- | --- | --- |
-| `default` | External clients and ordinary dispatches | Disallow list: maintenance, admin, provenance and artifact-install tools, and `bro_broadcast` |
-| `interactive` | Fleet cockpit sessions | Disallow list: `bro_allocator_*`, `bro_agent_*` |
+| `default` | External clients and ordinary dispatches | Disallow list: maintenance, admin, provenance and artifact-install tools |
+| `interactive` | Fleet cockpit sessions | Disallow list: the operator tools, including `bro_allocator_*` |
 | `agent-internal` | Workflow-owned dispatches | Disallow list: dispatch lifecycle tools (`bro_exec`, `bro_resume`, `bro_cancel`, `bro_prune`) plus the `default` maintenance and admin set |
 | `readonly` | Reviewers, evaluators and observers | Allowlist of read-only retrieval and status tools |
 | `ops` | Operators | Empty table: the full catalog |

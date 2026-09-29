@@ -494,7 +494,6 @@ Protect:
 - `~/.local/state/blackbox/blackbox-knowledge.json`
 - `~/.local/state/blackbox/blackbox-notes.json`
 - `~/.local/state/blackbox/blackbox-threads.json`
-- `~/.local/state/blackbox/blackbox-pins.json`
 - `~/.local/state/blackbox/projects.json`
 - `~/.local/state/blackbox/project-catalog-migration.json`
 - `~/.local/state/blackbox/project-catalog-migration-receipt.json`

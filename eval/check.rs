@@ -643,11 +643,11 @@ mod tests {
     fn chunks_for_path(
         abs_path: &Path,
         rel_path: &Path,
-    ) -> anyhow::Result<Vec<crate::chunker::Chunk>> {
+    ) -> anyhow::Result<Vec<bbox_chunker::Chunk>> {
         let bytes = fs::read(abs_path)?;
         let sniff_len = bytes.len().min(4096);
         let mut chunks = Vec::new();
-        for chunker in crate::chunker::default_registry() {
+        for chunker in bbox_chunker::default_registry() {
             if !chunker.claims(rel_path, &bytes[..sniff_len]) {
                 continue;
             }
@@ -673,18 +673,17 @@ mod tests {
         ))
     }
 
-    fn bound_chunks(chunks: &[crate::chunker::Chunk]) -> Vec<crate::chunker::Chunk> {
+    fn bound_chunks(chunks: &[bbox_chunker::Chunk]) -> Vec<bbox_chunker::Chunk> {
         chunks
             .iter()
             .flat_map(|chunk| {
-                if chunk.content.len() <= crate::chunker::MAX_CHUNK_BYTES {
+                if chunk.content.len() <= bbox_chunker::MAX_CHUNK_BYTES {
                     return vec![chunk.clone()];
                 }
                 let mut out = Vec::new();
                 let mut start = 0usize;
                 while start < chunk.content.len() {
-                    let mut end =
-                        (start + crate::chunker::MAX_CHUNK_BYTES).min(chunk.content.len());
+                    let mut end = (start + bbox_chunker::MAX_CHUNK_BYTES).min(chunk.content.len());
                     while !chunk.content.is_char_boundary(end) {
                         end -= 1;
                     }

@@ -16,8 +16,7 @@ use serde_json::json;
 use super::state::{BlackboxServer, SharedState};
 use crate::orchestration;
 use crate::tools::bro_params::{
-    BroadcastParams, CancelParams, DashboardParams, ExecParams, InterruptParams, ResumeParams,
-    SteerParams,
+    CancelParams, DashboardParams, ExecParams, InterruptParams, ResumeParams, SteerParams,
 };
 
 #[derive(Debug, Deserialize)]
@@ -376,17 +375,32 @@ pub(crate) async fn control_interrupt_handler(
     AxumState(state): AxumState<Arc<SharedState>>,
     axum::Json(req): axum::Json<InterruptParams>,
 ) -> axum::Json<CallToolResult> {
-    axum::Json(BlackboxServer::new(state).bro_interrupt(Parameters(req)))
-}
-
-pub(crate) async fn control_broadcast_handler(
-    AxumState(state): AxumState<Arc<SharedState>>,
-    axum::Json(req): axum::Json<BroadcastParams>,
-) -> axum::Json<CallToolResult> {
+    let task = match state.task_store.read().get(&req.task_id) {
+        Some(task) => task,
+        None => {
+            return axum::Json(BlackboxServer::err_text(&format!(
+                "Unknown task ID: {}",
+                req.task_id
+            )));
+        }
+    };
+    {
+        let inner = task.inner.lock();
+        if inner.status != orchestration::TaskStatus::Running {
+            return axum::Json(BlackboxServer::err_text(&format!(
+                "task {} is {:?}, not running",
+                inner.id, inner.status
+            )));
+        }
+    }
     axum::Json(
-        BlackboxServer::new(state)
-            .bro_broadcast(Parameters(req))
-            .await,
+        match orchestration::interrupt_harness_task(&req.task_id, req.prompt) {
+            Ok(()) => BlackboxServer::ok_json(&json!({
+                "taskId": req.task_id,
+                "status": "interrupted",
+            })),
+            Err(e) => BlackboxServer::err_text(&e),
+        },
     )
 }
 
@@ -894,7 +908,6 @@ mod tests {
             state.tail_tx.clone(),
             Some(state.roster_events()),
             Some("roster-test".to_string()),
-            None,
             bro_core::Origin::Workflow,
         );
 

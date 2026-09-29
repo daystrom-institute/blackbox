@@ -499,7 +499,6 @@ mod smoke {
             tail_tx.clone(),
             None,
             None,
-            None,
             bro_core::Origin::AgentDispatch,
         );
         store

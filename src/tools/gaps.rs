@@ -128,7 +128,7 @@ impl BlackboxServer {
     /// Resolve a raw project path/id to its durable gap scope and optional
     /// committed-file write target — for filing and for the resolve/update
     /// rewrites alike. Delegates to the store-shared resolution in
-    /// [`BlackboxServer::resolve_project_write_scope`] (`src/tools/scope.rs`).
+    /// [`BlackboxServer::resolve_project_write`] (`src/tools/scope.rs`).
     fn resolve_gap_project(
         &self,
         raw: &str,

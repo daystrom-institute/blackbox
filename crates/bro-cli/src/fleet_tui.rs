@@ -1307,7 +1307,7 @@ fn focused_transcript_items(app: &App, idx: usize) -> Vec<TranscriptItem> {
     {
         let mut items = tail.items().to_vec();
         // The logged first user turn is the AMBIENT-WRAPPED prompt (scope
-        // block, recall directive, … with the operator's text last). When
+        // block, … with the operator's text last). When
         // this cockpit launched the dispatch it knows the operator's own
         // text — render that instead of the preamble blob. The full wrapped
         // turn stays in the event log for forensics; this is display only.
@@ -4627,7 +4627,7 @@ fn err_is_broken_pipe(e: &str) -> bool {
 }
 
 /// The daemon's `/control/steer|interrupt` reject any task whose status is not
-/// `Running` with "task … is {Status}, not running" (`bro_steer`/`bro_interrupt`).
+/// `Running` with "task … is {Status}, not running".
 /// A finished bidi agent must be resumed, so this rejection trips the resume
 /// fallback instead of dead-ending with the turn lost.
 fn err_is_not_running(e: &str) -> bool {

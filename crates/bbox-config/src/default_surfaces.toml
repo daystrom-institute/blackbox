@@ -34,7 +34,6 @@ disallow = [
     "bbox_edge_compact",
     "bbox_doctor",
     "bbox_artifact_*",
-    "bro_broadcast",
     "bbox_absorb",
     "bbox_bootstrap",
     "bbox_lint",
@@ -67,7 +66,6 @@ disallow = [
     "bbox_edge_compact",
     "bbox_doctor",
     "bbox_artifact_*",
-    "bro_agent_*",
 ]
 
 # Workflow-owned dispatches: no further dispatch, as a backstop to the
@@ -124,10 +122,6 @@ allow = [
     "bbox_project_list",
     "bro_status",
     "bro_dashboard",
-    "bro_agent_list",
-    "bro_agent_get",
-    "bro_agent_describe",
-    "bro_agent_search",
     "bbox_tool_calls",
 ]
 

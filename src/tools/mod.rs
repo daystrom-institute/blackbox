@@ -9,9 +9,7 @@
 // protect are still checked: --all-targets compiles these modules without
 // cfg(test) too, and scripts/lint-concurrency.sh is the syntactic backstop.
 #![cfg_attr(test, allow(clippy::disallowed_methods))]
-pub mod agents;
 pub mod artifacts;
-pub mod attention;
 mod body_page;
 pub mod bro_helpers;
 pub mod bro_params;

@@ -23,13 +23,7 @@
 
 extern crate self as blackbox;
 
-#[cfg(test)]
-#[path = "../eval/agents/check.rs"]
-mod agent_eval_check;
 use bbox_artifacts::artifacts;
-// chunker extracted into the bbox-chunker crate (stage 1); aliased back to
-// `crate::chunker` so existing call sites resolve unchanged.
-use bbox_chunker as chunker;
 pub use bbox_config::config;
 pub mod dispatch_mcp;
 mod doctor;
@@ -59,7 +53,6 @@ use bbox_threads::notes;
 mod orchestration;
 use bbox_mcp_tools::path_cache;
 use bbox_stores::checkout_mutations;
-use bbox_stores::pins;
 use bbox_stores::producer_claims;
 /// The transcript parser lives in the shared `bro-transcript` crate (the
 /// daemon's indexer and the `bro` cockpit both link it). Re-exported as

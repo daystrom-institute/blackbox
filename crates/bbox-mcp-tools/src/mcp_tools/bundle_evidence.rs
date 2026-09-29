@@ -495,7 +495,7 @@ mod tests {
             question: "what changed?".into(),
             entity_refs: vec![
                 "knowledge:a".into(),
-                "agent:code-reviewer@v3".into(),
+                "bash_call:session123:7".into(),
                 "artifact:team/example@1".into(),
                 "knowledge:b".into(),
                 "knowledge:c".into(),
@@ -523,7 +523,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|entity| entity["entity_ref"] == "agent:code-reviewer@v3")
+                .any(|entity| entity["entity_ref"] == "bash_call:session123:7")
         );
         assert!(
             value["entities"]

@@ -49,14 +49,6 @@ impl BlackboxServer {
             .unwrap_or_else(|| "default".to_string())
     }
 
-    /// Session project context, set at `initialize` from the `?project`
-    /// query parameter. `None` for sessions that did not select a project.
-    pub(crate) fn session_surface_project(&self) -> Option<String> {
-        self.surface_project
-            .get()
-            .and_then(|p| p.as_ref().map(|s| s.as_ref().to_string()))
-    }
-
     /// Tool names visible on this session's surface. `initialize` refuses
     /// unknown surfaces; a session that bypassed it resolves `default`, and a
     /// surface missing from the table shows nothing.

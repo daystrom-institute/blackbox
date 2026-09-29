@@ -24,9 +24,9 @@ source material:
 | Tantivy index | Fast BM25 search over transcript blocks, project files, git messages, knowledge, notes, and threads |
 | Vector store | Per-route embedding partitions for semantic retrieval |
 | EdgeIndex | Graph projection over indexed docs plus live knowledge/thread/note stores |
-| Knowledge store | Durable rules, decisions, memories, pins, notes, and render targets |
+| Knowledge store | Durable rules, decisions, memories, notes, and render targets |
 | Orchestration runtime | `bro` tasks, teams, workflows, waits, signals, and councils |
-| Artifact catalog | Installed workflows, atoms, packets, agents, and brofiles from `system-defaults/` |
+| Artifact catalog | Installed brofiles and teams; retired workflow, agent, atom, cron and packet receipts stay readable |
 
 The important boundary: operators maintain the daemon and its stores;
 agents consume the graph/search/tool surfaces through MCP.

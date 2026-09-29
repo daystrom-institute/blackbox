@@ -11,11 +11,9 @@ use serde_json::Value;
 use tokio::sync::broadcast;
 
 use crate::orchestration::providers::Provider;
-use crate::server::BlackboxServer;
 use crate::server::state::SharedState;
 use crate::tools::bro_helpers::split_csv;
-use crate::tools::bro_params::AgentVectorPlan;
-use crate::{embed, index, orchestration, vectors};
+use crate::{index, orchestration};
 
 const TASK_BRO_REF_CACHE_CAPACITY: usize = 512;
 const TASK_BRO_REF_MISS_TTL: Duration = Duration::from_secs(5);
@@ -223,78 +221,6 @@ where
     }
 
     resolved
-}
-
-pub(crate) fn resolve_agent_vector_search(
-    query: &str,
-    supplied_query_vector: Option<&[f32]>,
-) -> AgentVectorPlan {
-    #[cfg(test)]
-    if supplied_query_vector.is_none() {
-        return AgentVectorPlan {
-            search: None,
-            route: None,
-            error: Some("live query embedding disabled in unit tests".into()),
-        };
-    }
-    let route = match embed::EmbeddingRouter::load_default()
-        .and_then(|router| router.route(embed::Bucket::AgentManifest, None))
-    {
-        Ok(route) => route.vector_route_id(),
-        Err(err) => {
-            return AgentVectorPlan {
-                search: None,
-                route: None,
-                error: Some(format!("agent_manifest route unavailable: {err}")),
-            };
-        }
-    };
-    let Some(metrics) = vectors::metrics().get(&route).cloned() else {
-        return AgentVectorPlan {
-            search: None,
-            route: Some(route),
-            error: Some("agent_manifest vector partition has no active records".into()),
-        };
-    };
-    if metrics.active_count == 0 {
-        return AgentVectorPlan {
-            search: None,
-            route: Some(route),
-            error: Some("agent_manifest vector partition has no active records".into()),
-        };
-    }
-    let query_vector = match supplied_query_vector {
-        Some(vector) => vector.to_vec(),
-        None => match BlackboxServer::embed_agent_query(query) {
-            Ok(vector) => vector,
-            Err(err) => {
-                return AgentVectorPlan {
-                    search: None,
-                    route: Some(route),
-                    error: Some(format!("agent_manifest query embedding failed: {err}")),
-                };
-            }
-        },
-    };
-    if query_vector.len() != metrics.dims {
-        return AgentVectorPlan {
-            search: None,
-            route: Some(route),
-            error: Some(format!(
-                "query vector dims {} do not match agent_manifest partition dims {}",
-                query_vector.len(),
-                metrics.dims
-            )),
-        };
-    }
-    AgentVectorPlan {
-        search: Some(orchestration::agents::registry::AgentVectorSearch {
-            route: route.clone(),
-            query_vector,
-        }),
-        route: Some(route),
-        error: None,
-    }
 }
 
 // ---------------------------------------------------------------------------

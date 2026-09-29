@@ -48,7 +48,7 @@ Payload shape:
 | `quiescent_scope` | Always `"tasks,arcs,waiters"`; states what `quiescent` covers |
 | `recent_writes_total` | Thread/note/knowledge writes inside the window (same level as `quiescent`, deliberately not folded into it) |
 | `drain` | `{draining, set_at, reason, set_by, marker_path}` |
-| `running_tasks` | `count` + `tasks[]` (`task_id`, `session_id`, `provider`, `origin`, `bro`, `agent`, `name`, `cwd`, `started_at_ms`, `age_secs`) |
+| `running_tasks` | `count` + `tasks[]` (`task_id`, `session_id`, `provider`, `origin`, `bro`, `name`, `cwd`, `started_at_ms`, `age_secs`) |
 | `workflows_in_flight` | `count` + `arcs[]` (`arc_id`, `arc_thread_id`, `workflow`, `status`, `current_node`, `in_flight_nodes`, `started_at`, `age_secs`) |
 | `long_poll_waiters` | `count` + `waiters[]` (`id`, `tool`, `task_ids`, `age_secs`) |
 | `recent_writes` | `window_minutes`, `total`, `threads[]`, `notes[]`, `knowledge[]` |
@@ -80,9 +80,9 @@ While draining:
 - Fresh dispatches are refused with a retryable error whose text starts with
   `error.maintenance_pending` and names the window (`set_at`, `reason`) plus
   `retryable=true`. Covered: `bro_exec` (including the cockpit control
-  handler), `bro_agent_dispatch`, `atom_invoke`, cron/webhook-originated
-  dispatches, and top-level workflow arc starts (`bro_orchestrate_run`,
-  `/orchestrate`, routed `start_arc`).
+  handler), `atom_invoke`, cron/webhook-originated dispatches, and top-level
+  workflow arc starts (`bro_orchestrate_run`, `/orchestrate`, routed
+  `start_arc`).
 - In-flight work continues: an already-running arc's nodes, nested
   sub-workflows and fanout children, and auto-supervision atom invocations
   are exempt (dispatch origins `workflow` and `atom` bypass the gate;

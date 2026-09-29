@@ -13,13 +13,13 @@ from the store into `CLAUDE.md`, `AGENTS.md`, and `GEMINI.md`.
 | Standing rule or convention future sessions must load | `bbox_learn` |
 | Durable decision with rationale and possible supersession | `bbox_decide` |
 | Searchable fact that should not live in every prompt | `bbox_remember` |
-| Active-arc guidance that should disappear when the work ends | `bbox_pin` |
+| Active-arc guidance that should disappear when the work ends | the dispatch brief or `bbox_thread` |
 | Side-channel executor signal | `bbox_note` |
 | Multi-session investigation state | `bbox_thread` |
 
 The test for `bbox_learn` is simple: would this still be correct a year from
-now after the current migration or work item is over? If no, it is probably a
-pin, note, or thread entry.
+now after the current migration or work item is over? If no, it belongs in the
+dispatch brief, a note, or a thread entry.
 
 ## Learn
 
@@ -73,33 +73,6 @@ bbox_remember(
 Remembered facts are indexed and retrievable, but not rendered into provider
 instruction files.
 
-## Pin
-
-Pins are hot context for one execution lane:
-
-```text
-bbox_pin(
-  action="set",
-  scope="thread",
-  target="thread-abc123",
-  project="/repo/x",
-  title="Migration phase",
-  content="For this phase, do not migrate callers outside module A."
-)
-```
-
-Pins survive daemon restarts, but they are injected only when the dispatch
-matches their scope. They are the right place for phase notes, temporary
-executor charters, and "for this arc only" constraints.
-
-List pins explicitly:
-
-```text
-bbox_pin(action="list", project="/repo/x")
-```
-
-They do not show up through `bbox_knowledge`.
-
 ## Query
 
 Use `bbox_knowledge` early when prior decisions or rules could change the answer:
@@ -109,9 +82,8 @@ bbox_knowledge(query="retry policy", project="/repo/x")
 bbox_knowledge(query="sm-persistence-taxonomy")
 ```
 
-It also surfaces system memories (`sm-*`). For scoped pins, use
-`bbox_pin(action="list")`; for notes, use `bbox_notes`; for active threads,
-use `bbox_thread_list`.
+It also surfaces system memories (`sm-*`). For notes, use `bbox_notes`; for
+active threads, use `bbox_thread_list`.
 
 ## Render
 
@@ -129,7 +101,8 @@ files, run `bro render global` on the operator host (`--check` previews changes)
 that host lacks global render authority.
 
 Content outside managed markers is preserved. Do not use render to keep
-active-work guidance hot; use pins for that.
+active-work guidance hot; that belongs in the dispatch brief or the work-item
+thread.
 
 ## Discover Instructions And Review Entries
 
@@ -186,7 +159,8 @@ unresolved notes, open gaps, and failed bro tasks.
 - Forgetting to query before superseding a decision.
 - Using `bbox_note(kind="learned")` for a user-stated rule. User rules belong in
   `bbox_learn` or `bbox_decide`.
-- Rendering just to influence one active dispatch. Use `bbox_pin`.
+- Rendering just to influence one active dispatch. Put it in the dispatch brief
+  or the work-item thread.
 
 ## Instruction placement and satellites
 

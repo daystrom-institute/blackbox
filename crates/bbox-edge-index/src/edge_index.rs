@@ -1525,38 +1525,47 @@ mod tests {
         assert!(index.forward_edges(&orphan_source).is_empty());
     }
 
+    /// A legacy `agents` lane whose rows name agent entities loads without
+    /// error: the lane is not admitted under a registered set, and when every
+    /// lane is admitted its agent-typed rows are skipped as unparseable.
     #[test]
-    fn sidecar_loader_keeps_global_agent_edges_with_project_filter() {
+    fn legacy_agent_lane_rows_are_ignored() {
         let dir = tempfile::tempdir().unwrap();
-        let source = EntityRef::Agent {
-            name: "distilled-reviewer".into(),
-            version: 1,
-        };
         let target = EntityRef::Session {
             provider: "claude".into(),
             session_id: "sess-1".into(),
         };
-        append_edges_dedup(
-            dir.path(),
-            "agents",
-            &[Edge {
-                source: source.clone(),
-                kind: "DERIVED_FROM".into(),
-                target,
-                provenance: EdgeProvenance::Explicit,
-                confidence: EdgeConfidence::Exact,
-                metadata: BTreeMap::new(),
-                project_id: None,
-            }],
-        )
-        .unwrap();
+        let kept = Edge {
+            source: target.clone(),
+            kind: "DESCRIBES".into(),
+            target: target.clone(),
+            provenance: EdgeProvenance::Explicit,
+            confidence: EdgeConfidence::Exact,
+            metadata: BTreeMap::new(),
+            project_id: None,
+        };
+        let mut legacy = serde_json::to_value(&kept).unwrap();
+        legacy["source"] = serde_json::json!({
+            "type": "agent",
+            "name": "distilled-reviewer",
+            "version": 1,
+        });
+        legacy["kind"] = serde_json::json!("DERIVED_FROM");
+        let lines = [legacy.to_string(), serde_json::to_string(&kept).unwrap()];
+        let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+        write_jsonl(&dir.path().join("agents.jsonl"), &lines);
 
         let registered = HashSet::new();
         let mut index = EdgeIndex::default();
         let mut seen = HashSet::new();
         index.project_sidecar_edges(dir.path(), Some(&registered), &mut seen, true);
+        assert_eq!(index.edge_count(), 0);
 
-        assert_eq!(index.forward_edges(&source).len(), 1);
+        let mut index = EdgeIndex::default();
+        let mut seen = HashSet::new();
+        index.project_sidecar_edges(dir.path(), None, &mut seen, true);
+        assert_eq!(index.edge_count(), 1);
+        assert_eq!(index.forward_edges(&target).len(), 1);
     }
 
     #[test]
@@ -2804,7 +2813,7 @@ mod tests {
                 ("explicit", edges_dir.join("explicit")),
                 ("observed", edges_dir.join("observed")),
             ] {
-                for stem in ["p1", "ghost", AGENT_PROVENANCE_LANE] {
+                for stem in ["p1", "ghost", "agents"] {
                     let line =
                         make_explicit_edge_line(&format!("{lane}-{stem}"), "DESCRIBES", "target");
                     write_jsonl(&lane_dir.join(format!("{stem}.jsonl")), &[&line]);
@@ -2829,11 +2838,7 @@ mod tests {
 
         let expected: BTreeSet<String> = ["top", "explicit", "observed"]
             .into_iter()
-            .flat_map(|lane| {
-                ["p1", AGENT_PROVENANCE_LANE]
-                    .into_iter()
-                    .map(move |stem| format!("{lane}-{stem}"))
-            })
+            .flat_map(|lane| ["p1"].into_iter().map(move |stem| format!("{lane}-{stem}")))
             .collect();
         assert_eq!(legacy, expected, "legacy-missing mode admitted lanes");
         assert_eq!(

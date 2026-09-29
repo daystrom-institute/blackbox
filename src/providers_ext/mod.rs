@@ -46,7 +46,6 @@ mod tests {
             "commit:repo1234:abcdef1234567890",
             "task:task-12345678",
             "bash_call:session123:7",
-            "agent:code-reviewer@v3",
             "artifact:team/example@1",
         ]
     }

@@ -61,10 +61,6 @@ pub(super) fn build_http_app(
             axum::routing::post(control_interrupt_handler),
         )
         .route(
-            "/control/broadcast",
-            axum::routing::post(control_broadcast_handler),
-        )
-        .route(
             "/control/status/{task_id}",
             axum::routing::get(control_status_handler),
         )
@@ -270,14 +266,7 @@ mod tests {
     /// verbs yields 405 (not 404) — proving the path exists with a handler.
     #[tokio::test]
     async fn control_verbs_mounted() {
-        let verbs = [
-            "exec",
-            "resume",
-            "steer",
-            "interrupt",
-            "broadcast",
-            "cancel",
-        ];
+        let verbs = ["exec", "resume", "steer", "interrupt", "cancel"];
         for verb in verbs {
             let path = format!("/control/{verb}");
             let resp = test_app()

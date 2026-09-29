@@ -19,8 +19,8 @@ dispatched bro or `bro-harness` session.
 This is a manual, human-steered pass. Point the interactive agent at this
 document near the end of a meaningful session, especially when the session
 involved tool discovery, MCP setup, repo instructions, worktree/git closeout,
-or operator steering. The purpose is close to `bro_retro`: invite concrete
-substrate feedback without compelling the agent to invent any. Unlike
+or operator steering. The purpose is close to `bro_prune(retro=true)`: invite
+concrete substrate feedback without compelling the agent to invent any. Unlike
 `RETRO_HARNESS.md`, this does not focus on the `bro-harness` promise model or
 intern. It focuses on what the interactive agent actually had: its native tool
 catalog, MCP availability, shell environment, context/instruction stack, and

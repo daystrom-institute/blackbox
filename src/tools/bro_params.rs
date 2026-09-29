@@ -246,27 +246,6 @@ pub(crate) struct WhenParams {
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct BroadcastParams {
-    /// Team name
-    pub(crate) team: String,
-    /// Prompt sent to every member
-    pub(crate) prompt: String,
-    /// Working directory override for every member dispatch. `cwd` is
-    /// canonical; `project_dir` accepted as a deprecated alias.
-    #[serde(default, alias = "project_dir")]
-    pub(crate) cwd: Option<String>,
-    /// Skip anti-recursion guard (default: false)
-    #[serde(default)]
-    pub(crate) allow_recursion: Option<bool>,
-    /// Per-dispatch allow/disallow overlays applied to every member.
-    #[serde(default)]
-    pub(crate) allow_tools: Option<Vec<String>>,
-    #[serde(default)]
-    pub(crate) disallow_tools: Option<Vec<String>>,
-}
-
-#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct StatusParams {
     /// Task ID to check
     pub(crate) task_id: String,
@@ -523,116 +502,6 @@ pub(crate) struct PruneParams {
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct RetroParams {
-    /// Terminal (or any resumable) task to ask for a workload retrospective.
-    /// Resumes that task's own provider session with the reflection prompt;
-    /// does not delete the task. Decouples "reflect" from "prune".
-    pub(crate) task_id: String,
-}
-
-#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct AgentListParams {
-    #[serde(default)]
-    pub(crate) include_superseded: Option<bool>,
-    #[serde(default)]
-    pub(crate) cost_class: Option<String>,
-    #[serde(default)]
-    pub(crate) provenance_kind: Option<String>,
-    /// Maximum rows per page (default 20, capped at 100).
-    #[serde(default)]
-    pub(crate) limit: Option<usize>,
-    /// Continue from next_offset returned by the previous page.
-    #[serde(default)]
-    pub(crate) offset: Option<usize>,
-    /// Expand descriptions and installation diagnostics. Exact get/describe reads one record.
-    #[serde(default)]
-    pub(crate) detail: bool,
-}
-
-#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct AgentGetParams {
-    pub(crate) name: String,
-    /// Continue exact manifest body pages from body.next_cursor.
-    #[serde(default)]
-    pub(crate) cursor: Option<String>,
-    /// Maximum bytes per exact body page (default 4096, capped at 4096).
-    #[serde(default)]
-    pub(crate) body_limit: Option<usize>,
-}
-
-#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct AgentDescribeParams {
-    pub(crate) agent: String,
-    /// Exact body plane to page: manifest, brofile, metadata, or summary
-    /// (the complete dispatch summary, including all filters and warnings). Omit for the compact
-    /// all-plane summary.
-    #[serde(default)]
-    pub(crate) detail_plane: Option<String>,
-    /// Continue the selected plane's body pages from body.next_cursor.
-    #[serde(default)]
-    pub(crate) cursor: Option<String>,
-    /// Maximum bytes per exact body page (default 4096, capped at 4096).
-    #[serde(default)]
-    pub(crate) body_limit: Option<usize>,
-}
-
-#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct AgentDispatchParams {
-    pub(crate) agent: String,
-    #[schemars(with = "serde_json::Map<String, serde_json::Value>")]
-    pub(crate) args: serde_json::Value,
-    /// Working directory for the dispatched agent session. `cwd` is
-    /// canonical; `project_dir` accepted as a deprecated alias.
-    #[serde(default, alias = "project_dir")]
-    pub(crate) cwd: Option<String>,
-    #[serde(default)]
-    pub(crate) bro: Option<String>,
-    #[serde(default)]
-    pub(crate) ambient: Option<serde_json::Value>,
-    #[serde(default)]
-    pub(crate) caller_provider: Option<String>,
-    #[serde(default)]
-    pub(crate) caller_session_id: Option<String>,
-    /// Optional RuntimeRequest overlay applied after brofile and manifest runtime.
-    #[serde(default)]
-    pub(crate) runtime: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct AgentSearchParams {
-    pub(crate) query: String,
-    /// Include bounded ranking/vector diagnostics. Ordinary reads retain only
-    /// search mode, evidence identity and degradation flags.
-    #[serde(default)]
-    pub(crate) debug: bool,
-    #[serde(default)]
-    pub(crate) limit: Option<u64>,
-    #[serde(default)]
-    pub(crate) cost_class: Option<String>,
-    #[serde(default)]
-    pub(crate) provenance_kind: Option<String>,
-    #[serde(default)]
-    pub(crate) exclude_anti_pattern_matches: Option<bool>,
-    #[serde(default)]
-    pub(crate) include_vectors: Option<bool>,
-    #[serde(default)]
-    pub(crate) query_vector: Option<Vec<f32>>,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct AgentVectorPlan {
-    pub(crate) search: Option<orchestration::agents::registry::AgentVectorSearch>,
-    pub(crate) route: Option<String>,
-    pub(crate) error: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct ProvidersParams {
     /// Omit for provider summaries; select one provider to list its models and efforts.
     #[serde(default)]
@@ -822,14 +691,6 @@ mod tests {
                 "ResumeParams",
                 serde_json::to_value(rmcp::schemars::schema_for!(ResumeParams)).unwrap(),
             ),
-            (
-                "BroadcastParams",
-                serde_json::to_value(rmcp::schemars::schema_for!(BroadcastParams)).unwrap(),
-            ),
-            (
-                "AgentDispatchParams",
-                serde_json::to_value(rmcp::schemars::schema_for!(AgentDispatchParams)).unwrap(),
-            ),
         ] {
             let props = schema["properties"].as_object().unwrap();
             assert!(
@@ -864,7 +725,7 @@ mod tests {
     }
 
     #[test]
-    fn resume_broadcast_and_agent_dispatch_accept_project_dir_alias() {
+    fn resume_params_accept_project_dir_alias() {
         let resume: ResumeParams =
             serde_json::from_value(serde_json::json!({"prompt": "x", "project_dir": "/repo/r"}))
                 .unwrap();
@@ -872,23 +733,6 @@ mod tests {
         let resume: ResumeParams =
             serde_json::from_value(serde_json::json!({"prompt": "x", "cwd": "/repo/r2"})).unwrap();
         assert_eq!(resume.cwd.as_deref(), Some("/repo/r2"));
-
-        let bcast: BroadcastParams = serde_json::from_value(
-            serde_json::json!({"team": "t", "prompt": "x", "project_dir": "/repo/t"}),
-        )
-        .unwrap();
-        assert_eq!(bcast.cwd.as_deref(), Some("/repo/t"));
-
-        let agent: AgentDispatchParams = serde_json::from_value(
-            serde_json::json!({"agent": "a", "args": {}, "project_dir": "/repo/g"}),
-        )
-        .unwrap();
-        assert_eq!(agent.cwd.as_deref(), Some("/repo/g"));
-        let agent: AgentDispatchParams = serde_json::from_value(
-            serde_json::json!({"agent": "a", "args": {}, "cwd": "/repo/g2"}),
-        )
-        .unwrap();
-        assert_eq!(agent.cwd.as_deref(), Some("/repo/g2"));
     }
 
     /// Contract with the fleet cockpit's `/control/resume` body
