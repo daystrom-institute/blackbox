@@ -3,8 +3,8 @@
 # carrying live orchestration state.
 #
 # The protected resource is live orchestration state (running bro tasks,
-# bro_wait / bro_when_* long-polls, workflow arcs in flight, sessions still
-# writing threads / notes / knowledge), not build capacity. The daemon
+# bro_wait / bro_when_* long-polls, sessions still writing threads / notes /
+# knowledge), not build capacity. The daemon
 # exposes a cheap JSON probe plus an operator-togglable admission drain
 # (src/server/drain.rs); this script turns them into a gate an external
 # converge path can call.
@@ -116,20 +116,18 @@ window = int(sys.argv[1]); raw = sys.argv[2] == "1"
 snap = json.load(sys.stdin)
 if raw:
     print(json.dumps(snap, indent=2))
-tasks = snap["running_tasks"]; arcs = snap["workflows_in_flight"]
+tasks = snap["running_tasks"]
 waiters = snap["long_poll_waiters"]; writes = snap["recent_writes"]
 drain = snap.get("drain", {})
 blocking = []
 if tasks["count"]:
     blocking.append(f"{tasks['count']} running bro task(s)")
-if arcs["count"]:
-    blocking.append(f"{arcs['count']} workflow arc(s) in flight")
 if waiters["count"]:
     blocking.append(f"{waiters['count']} long-poll waiter(s)")
 if window > 0 and writes["total"]:
     blocking.append(f"{writes['total']} orchestration write(s) in the last {window} min")
 if not raw:
-    print(f"daemon quiescent(tasks,arcs,waiters)={snap['quiescent']} "
+    print(f"daemon quiescent(tasks,waiters)={snap['quiescent']} "
           f"drain={'ON' if drain.get('draining') else 'off'} sampled_at={snap.get('sampled_at')}")
     if blocking:
         print("ACTIVE, converging now would sandbag:")
@@ -137,9 +135,6 @@ if not raw:
             who = t.get("bro") or t.get("agent") or t.get("name") or "-"
             print(f"  task {t['task_id']}  {t.get('provider')}  origin={t.get('origin')}  "
                   f"who={who}  age={t.get('age_secs')}s  cwd={t.get('cwd') or '-'}")
-        for a in arcs["arcs"]:
-            print(f"  arc  {a['arc_id']}  workflow={a.get('workflow','?')}  status={a.get('status')}  "
-                  f"node={a.get('current_node')}  age={a.get('age_secs')}s")
         for w in waiters["waiters"]:
             print(f"  wait {w['tool']}  tasks={','.join(w['task_ids'])}  age={w['age_secs']}s")
         if window > 0 and writes["total"]:
@@ -151,7 +146,7 @@ if not raw:
                 print(f"  kb     {k['id']}  updated_at={k['updated_at']}  {k.get('title','')[:60]}")
         print("blocking: " + "; ".join(blocking))
     else:
-        print("QUIESCENT: no running tasks, arcs, waiters"
+        print("QUIESCENT: no running tasks, waiters"
               + (f", or writes in the last {window} min" if window > 0 else " (write recency ignored)"))
 sys.exit(1 if blocking else 0)
 PY
