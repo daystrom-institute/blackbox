@@ -77,7 +77,7 @@ impl ToolCategory {
                 "Track non-dispatchable work that spans sessions (investigations, QC walks, debugging, refinement loops). Lighter than the full dispatch pipeline, heavier than memory. Use `kind=work_item` for orchestrator-led propose→execute→review→refine loops."
             }
             Self::Notes => {
-                "Structured side channel for *notable* observations surfaced during delegated work — orchestrators query `bbox_notes` at round boundaries. Seven kinds: `dispute`, `assumption`, `surprise`, `followup`, `blocked`, `learned`, `done`. Emit one only when you have something genuinely worth flagging; this is a signal channel, not a progress log, and silence is the right default when nothing is notable. A `done` note with a one-line acceptance summary is useful when an explicit caller contract asks for a structured sign-off — it is not required on every dispatch."
+                "Structured side channel for *notable* observations surfaced during delegated work; orchestrators query `bbox_notes` at round boundaries. Seven kinds: `dispute`, `assumption`, `surprise`, `followup`, `blocked`, `learned`, `done`. Emit one only when you have something genuinely worth flagging; this is a signal channel, not a progress log, and silence is the right default when nothing is notable. A `done` note with a one-line acceptance summary is useful when an explicit caller contract asks for a structured sign-off; it is not required on every dispatch."
             }
             Self::Gaps => {
                 "First-class substrate gap-note store. File a gap when the blocker is in the blackbox substrate or shared agent workflow — a missing tool primitive, MCP surface, refactor atom, workflow shape, ontology edge, or runbook that agents in other projects could plausibly hit too — not in the current product codebase. Project-scoped gaps are repo-owned (committed under `<project>/.bbox/gaps/`, travel with the checkout); cross-project substrate gaps go to the central host store with `scope=\"global\"`. `bbox_gap` files (typed, validated, deduped by `dedupe_key`), `bbox_gaps` filters by typed fields, `bbox_gap_resolve` closes out (with structured supersession), `bbox_gap_update` edits in place. See `sm-gap-notes` via `bbox_knowledge` for the full envelope, vocabularies, and lifecycle."
@@ -947,7 +947,7 @@ broader recall.
 
 ## Roles and the core loop
 
-- **Orchestrator** — dispatches, reviews, reads `bbox_notes`, resolves notes, \
+- **Orchestrator**: dispatches, reviews, reads `bbox_notes`, resolves notes, \
 and records durable commitments.
 - **Executor** — when running as a dispatched bro/task actor, \
 does the work and returns its result. `bbox_note` is available for *notable* \
