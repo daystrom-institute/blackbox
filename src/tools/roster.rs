@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -17,46 +16,6 @@ use serde_json::{Value, json};
 
 pub(crate) fn router() -> ToolRouter<BlackboxServer> {
     BlackboxServer::roster_tools()
-}
-
-/// Per-agent rollup accumulated while scanning the task store for
-/// `bro_dashboard`. `dispatch_count` is the always-populated anchor (an agent
-/// only enters the map once it has been dispatched at least once); the rest are
-/// signal-gated on serialization so idle/still-running agents don't pad the
-/// response with zero tallies and null averages.
-#[derive(Default)]
-struct AgentDashboardMetrics {
-    dispatch_count: u64,
-    success_count: u64,
-    failure_count: u64,
-    elapsed_ms_total: u64,
-    elapsed_count: u64,
-    cost_usd_total: f64,
-}
-
-impl AgentDashboardMetrics {
-    /// Project to the dashboard wire object, omitting fields that carry no
-    /// signal: zero success/failure tallies, a null average (no terminal task
-    /// yet), and zero attributed cost are all dropped rather than serialized.
-    fn to_json(&self) -> Value {
-        let mut obj = serde_json::Map::new();
-        obj.insert("dispatch_count".into(), json!(self.dispatch_count));
-        if self.success_count > 0 {
-            obj.insert("success_count".into(), json!(self.success_count));
-        }
-        if self.failure_count > 0 {
-            obj.insert("failure_count".into(), json!(self.failure_count));
-        }
-        if self.elapsed_count > 0 {
-            let avg = (self.elapsed_ms_total as f64) / (self.elapsed_count as f64);
-            obj.insert("avg_elapsed_ms".into(), json!(avg));
-        }
-        let cost = (self.cost_usd_total * 10000.0).round() / 10000.0;
-        if cost > 0.0 {
-            obj.insert("cost_usd_total".into(), json!(cost));
-        }
-        Value::Object(obj)
-    }
 }
 
 /// Bounded preview of a free-text diagnostic field. Not a redaction: this
@@ -181,7 +140,6 @@ impl BlackboxServer {
                 .cmp(&a.started_at.or(a.last_event_at).unwrap_or(0))
                 .then_with(|| a.task_id.as_str().cmp(b.task_id.as_str()))
         });
-        let mut agent_metrics: BTreeMap<String, AgentDashboardMetrics> = BTreeMap::new();
         let entries: Vec<Value> = selected
             .into_iter()
             .skip(offset)
@@ -190,33 +148,6 @@ impl BlackboxServer {
                 let task_id_str = s.task_id.as_str().to_string();
                 let bro_name =
                     orchestration::team::find_bro_name_for_task(&task_id_str, &store_dir);
-
-                // Agent attribution rollup. The summary carries
-                // `agent_label` directly (wave 7c DTO extension);
-                // a missing label means "no agent attribution",
-                // matching the legacy semantics where only
-                // `inner.agent_label.is_some()` rolled into the
-                // agents map.
-                if let Some(label) = s.agent_label.as_ref() {
-                    let metrics = agent_metrics.entry(label.clone()).or_default();
-                    metrics.dispatch_count += 1;
-                    match s.status {
-                        bro_protocol::TaskStatus::Completed => metrics.success_count += 1,
-                        bro_protocol::TaskStatus::Failed | bro_protocol::TaskStatus::Cancelled => {
-                            metrics.failure_count += 1;
-                        }
-                        bro_protocol::TaskStatus::Running | bro_protocol::TaskStatus::Pending => {}
-                    }
-                    if s.status.is_terminal() {
-                        if let (Some(start), Some(end)) = (s.started_at, s.last_event_at) {
-                            metrics.elapsed_ms_total += end.saturating_sub(start);
-                            metrics.elapsed_count += 1;
-                        }
-                    }
-                    if let Some(cost) = s.cost {
-                        metrics.cost_usd_total += cost;
-                    }
-                }
 
                 // Recompute `elapsed` from summary timestamps so the
                 // dashboard row matches the legacy projection
@@ -249,21 +180,14 @@ impl BlackboxServer {
                 if let Some(ref label) = label_from_summary(&s) {
                     entry["broLabel"] = Value::String(label.clone());
                 }
-                if let Some(ref label) = s.agent_label {
-                    entry["agentLabel"] = Value::String(label.clone());
-                }
                 if s.interrupted {
                     entry["interrupted"] = Value::Bool(true);
                 }
                 entry
             })
             .collect();
-        let agents: BTreeMap<String, Value> = agent_metrics
-            .into_iter()
-            .map(|(label, metrics)| (label, metrics.to_json()))
-            .collect();
-
-        let mut response = json!({"count": entries.len(), "total": total, "offset": offset, "tasks": entries, "agents": agents});
+        let mut response =
+            json!({"count": entries.len(), "total": total, "offset": offset, "tasks": entries});
         let next_offset = offset.saturating_add(entries.len());
         if next_offset < total {
             response["next_offset"] = json!(next_offset);
@@ -1376,15 +1300,10 @@ fn team_discovery(server: &BlackboxServer, p: &TeamParams) -> anyhow::Result<Val
     team_summary_page(rows, "members", p, metadata)
 }
 
-/// Pick the `broLabel` value the legacy `bro_dashboard` row
-/// surfaced. `RosterSummaryV1.label` collapses `bro_label` and
-/// `agent_label` (one or the other) — but the dashboard
-/// historically used `inner.bro_label` (the team-shaped identity)
-/// when present. The summary's `name` field is the daemon display
-/// name and can match, but `label` is the closest field-by-field
-/// proxy. We read the same `label` slot the projection already
-/// computed; the dashboard never relied on `agent_label` falling
-/// into the `broLabel` row.
+/// Pick the `broLabel` value for a `bro_dashboard` row:
+/// `RosterSummaryV1.label`, the task's team-shaped bro identity. The
+/// summary's `name` field is the daemon display name and can match, but
+/// `label` is the field-by-field source.
 fn label_from_summary(s: &bro_protocol::RosterSummaryV1) -> Option<String> {
     s.label.clone()
 }
@@ -1916,47 +1835,6 @@ mod tests {
         assert_eq!(value["skipped_missing"], 1);
         assert_eq!(value["removal"]["status"], "removed");
         assert_eq!(running.inner.lock().status, orch::TaskStatus::Cancelled);
-    }
-
-    #[test]
-    fn idle_agent_metrics_omit_zero_and_null_fields() {
-        // A single still-running dispatch: only dispatch_count is meaningful.
-        let metrics = AgentDashboardMetrics {
-            dispatch_count: 1,
-            ..AgentDashboardMetrics::default()
-        };
-        let value = metrics.to_json();
-        assert_eq!(value["dispatch_count"], 1);
-        for absent in [
-            "success_count",
-            "failure_count",
-            "avg_elapsed_ms",
-            "cost_usd_total",
-        ] {
-            assert!(
-                value.get(absent).is_none(),
-                "idle agent should omit {absent}: {value}"
-            );
-        }
-    }
-
-    #[test]
-    fn active_agent_metrics_emit_populated_fields() {
-        // A completed dispatch with cost surfaces every signal-bearing field.
-        let metrics = AgentDashboardMetrics {
-            dispatch_count: 3,
-            success_count: 2,
-            failure_count: 1,
-            elapsed_ms_total: 6000,
-            elapsed_count: 3,
-            cost_usd_total: 0.1234,
-        };
-        let value = metrics.to_json();
-        assert_eq!(value["dispatch_count"], 3);
-        assert_eq!(value["success_count"], 2);
-        assert_eq!(value["failure_count"], 1);
-        assert_eq!(value["avg_elapsed_ms"], 2000.0);
-        assert_eq!(value["cost_usd_total"], 0.1234);
     }
 
     fn extract_text(result: &CallToolResult) -> String {
@@ -2495,7 +2373,6 @@ mod tests {
                 managed_worktree: Some("/wt/alpha".to_string()),
                 workflow_owned: false,
                 started_at: Some(started_at),
-                agent_label: Some(format!("agent-{id}@v1")),
                 interrupted: false,
                 error_teaser: None,
                 transcript_path: None,
@@ -2527,7 +2404,6 @@ mod tests {
                 managed_worktree: None,
                 workflow_owned: false,
                 started_at: Some(started_at),
-                agent_label: Some(format!("agent-{id}@v1")),
                 interrupted: false,
                 error_teaser: None,
                 transcript_path: None,
@@ -2593,7 +2469,6 @@ mod tests {
                 "live task with snippet should have hasLastMessage=true"
             );
             assert_eq!(live["broLabel"], "team::executor");
-            assert_eq!(live["agentLabel"], "agent-live-1@v1");
             // `elapsed` is a live display; just check it parses as
             // "<n>s" or "<n>m <n>s" — anything else is a regression
             // in `format_elapsed` rather than the dashboard.
@@ -2614,27 +2489,7 @@ mod tests {
             assert!(!term["hasResult"].as_bool().unwrap_or(true));
             assert!(!term["hasLastMessage"].as_bool().unwrap_or(true));
             assert_eq!(term["broLabel"], "team::reviewer");
-            assert_eq!(term["agentLabel"], "agent-term-1@v1");
             assert_eq!(term["elapsed"], "1s");
-
-            // Agents rollup: only the tasks that carry an
-            // `agent_label` show up in the agents map. Each seeded
-            // task is one dispatch for its agent label, but they
-            // share labels across `live-1` and `term-1`? No — each
-            // label is unique per seeded summary, so we expect two
-            // distinct entries with `dispatch_count: 1` each.
-            let agents = body["agents"].as_object().expect("agents must be object");
-            assert_eq!(agents.len(), 2);
-            assert_eq!(agents["agent-live-1@v1"]["dispatch_count"], 1);
-            assert_eq!(agents["agent-term-1@v1"]["dispatch_count"], 1);
-            // The terminal dispatch landed a success_count because
-            // status is `completed`; the live one has no
-            // success/failure tally yet.
-            assert_eq!(
-                agents["agent-term-1@v1"]["success_count"], 1,
-                "terminal success must roll up: {agents:?}"
-            );
-            assert_eq!(agents["agent-live-1@v1"]["success_count"].as_u64(), None);
         }
 
         #[test]
@@ -2667,7 +2522,7 @@ mod tests {
         }
 
         #[test]
-        fn dashboard_pagination_bounds_agent_rollup() {
+        fn dashboard_pagination_pages_tasks_in_start_order() {
             let tmp = tempfile::tempdir().unwrap();
             let server = test_server(&tmp);
             for idx in 0..4 {
@@ -2690,8 +2545,6 @@ mod tests {
             assert_eq!(first["total"], 4);
             assert_eq!(first["tasks"][0]["taskId"], "task-3");
             assert_eq!(second["tasks"][0]["taskId"], "task-2");
-            assert_eq!(first["agents"].as_object().unwrap().len(), 1);
-            assert_eq!(second["agents"].as_object().unwrap().len(), 1);
             assert!(serde_json::to_vec(&first).unwrap().len() < 4096);
         }
 
@@ -2960,7 +2813,6 @@ mod tests {
                     inner.started_at = t_live;
                     inner.completed_at = None;
                     inner.bro_label = Some("team::executor".into());
-                    inner.agent_label = Some("agent-live-1@v1".into());
                     inner.last_assistant_message = Some("hi".into());
                     inner.session_id = "sess-live-1".into();
                 }
@@ -2978,7 +2830,6 @@ mod tests {
                     inner.cost_usd = Some(0.5);
                     inner.num_turns = Some(2);
                     inner.bro_label = Some("team::reviewer".into());
-                    inner.agent_label = Some("agent-done-1@v1".into());
                     inner.last_assistant_message =
                         Some("retained output without a recoverable preview".into());
                     assert!(inner.latest_assistant_preview.text().is_none());
@@ -3010,7 +2861,6 @@ mod tests {
             assert_eq!(live["provider"], "glm");
             assert_eq!(live["status"], "running");
             assert_eq!(live["broLabel"], "team::executor");
-            assert_eq!(live["agentLabel"], "agent-live-1@v1");
             assert!(
                 !live["hasResult"].as_bool().unwrap_or(true),
                 "live task must not report hasResult"
@@ -3024,7 +2874,6 @@ mod tests {
             assert_eq!(done["provider"], "deepseek");
             assert_eq!(done["status"], "completed");
             assert_eq!(done["broLabel"], "team::reviewer");
-            assert_eq!(done["agentLabel"], "agent-done-1@v1");
             assert_eq!(done["elapsed"], "1s");
             assert_eq!(done["hasResult"], true);
             assert_eq!(done["hasLastMessage"], true);

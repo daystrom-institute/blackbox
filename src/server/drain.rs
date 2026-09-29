@@ -370,7 +370,6 @@ pub(crate) fn orchestration_activity_snapshot(
                 "provider": inner.provider.as_str(),
                 "origin": inner.origin.as_wire(),
                 "bro": inner.bro_label,
-                "agent": inner.agent_label,
                 "name": inner.name,
                 "cwd": inner.cwd,
                 "started_at_ms": inner.started_at,

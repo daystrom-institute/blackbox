@@ -814,7 +814,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bro_dashboard",
         category: ToolCategory::Orchestration,
         summary: "Page recent task summaries for lookup; do not take over another operator's task.",
-        when_to_use: "Defaults to 20 rows, maximum 100. Follow next_offset with the same filters; order is start time descending then task ID. Live state may change between pages. Agent metrics cover only returned tasks. Unknown provider, status, or team filters fail explicitly. Use bro_status for exact results, and coordination wait tools when awaiting completion.",
+        when_to_use: "Defaults to 20 rows, maximum 100. Follow next_offset with the same filters; order is start time descending then task ID. Live state may change between pages. Unknown provider, status, or team filters fail explicitly. Use bro_status for exact results, and coordination wait tools when awaiting completion.",
         example: None,
     },
     ToolDoc {

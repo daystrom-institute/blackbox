@@ -908,7 +908,6 @@ mod tests {
             state.tail_tx.clone(),
             Some(state.roster_events()),
             Some("roster-test".to_string()),
-            None,
             Some(state.system_events.clone()),
             bro_core::Origin::Workflow,
         );

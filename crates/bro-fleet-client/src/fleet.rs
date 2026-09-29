@@ -2671,7 +2671,6 @@ mod tests {
             managed_worktree: Some("/tmp/worktree".to_string()),
             workflow_owned: false,
             started_at: Some(42),
-            agent_label: Some(format!("agent-{id}")),
             interrupted: false,
             error_teaser: None,
             transcript_path: None,

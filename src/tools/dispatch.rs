@@ -43,7 +43,6 @@ pub(crate) struct FreshDispatchRequest {
     pub(crate) project_dir_for_lease: Option<String>,
     pub(crate) ambient_bro_name: Option<String>,
     pub(crate) spawn_bro_label: Option<String>,
-    pub(crate) spawn_agent_label: Option<String>,
     /// Roster display name hint (control-plane only). Takes priority over the
     /// prompt-derived teaser when seeding the task name, so a cockpit dispatch
     /// shows the operator's turn rather than the worktree-grounding preamble.
@@ -569,7 +568,6 @@ impl BlackboxServer {
             self.state.tail_tx.clone(),
             Some(self.state.roster_events()),
             request.spawn_bro_label,
-            request.spawn_agent_label,
             request.tool_placement,
             orch::merge_tool_arg_defaults(
                 ambient_ctx.tool_arg_defaults(),
@@ -719,7 +717,6 @@ impl BlackboxServer {
                     project_dir_for_lease: p.cwd.clone(),
                     ambient_bro_name: p.bro.clone(),
                     spawn_bro_label: None,
-                    spawn_agent_label: None,
                     display_name: p.display_name.clone(),
                     record_to_bro: p.bro.clone(),
                     brofile_context,
@@ -951,7 +948,6 @@ impl BlackboxServer {
             self.state.task_store.clone(),
             self.state.tail_tx.clone(),
             Some(self.state.roster_events()),
-            None,
             None,
             None,
             orch::merge_tool_arg_defaults(
@@ -2118,7 +2114,6 @@ impl BlackboxServer {
             self.state.tail_tx.clone(),
             Some(self.state.roster_events()),
             Some("workload-retro".to_string()),
-            None,
             Some(self.state.system_events.clone()),
             // The workload retro is a self-reflective resume started by
             // bro_prune, so it lands in AgentDispatch like other bro_*
@@ -3870,7 +3865,6 @@ mod tests {
             project_dir_for_lease: None,
             ambient_bro_name: None,
             spawn_bro_label: None,
-            spawn_agent_label: None,
             display_name: None,
             record_to_bro: None,
             origin,

@@ -500,7 +500,6 @@ mod smoke {
             None,
             None,
             None,
-            None,
             bro_core::Origin::AgentDispatch,
         );
         store

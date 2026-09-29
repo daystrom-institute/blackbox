@@ -250,7 +250,6 @@ struct WorkflowRenderContext {
 
 struct AgentRenderContext {
     agent_ref: String,                // "agent:reviewer/code-review@2"
-    agent_label: Option<String>,
     manifest_version: String,
 }
 ```

@@ -793,11 +793,6 @@ pub struct TaskInner {
     /// first user prompt for fresh dispatches and is independent of bro_label,
     /// which still carries bro/team identity.
     pub name: Option<String>,
-    /// Agent attribution set by bro_agent_dispatch. Format:
-    /// `agent:<name>@v<version>`. Preserved even when record_task_to_bro
-    /// overwrites bro_label for team routing. Surfaced in bro_status /
-    /// bro_dashboard as agentLabel alongside broLabel.
-    pub agent_label: Option<String>,
     /// True when the latest terminal result event represented an operator
     /// interrupt rather than a natural finish. This is a cause marker layered on
     /// top of `status`: finalization maps it to `Cancelled`, and status/roster
@@ -1157,7 +1152,6 @@ mod roster_view_tests {
                 managed_worktree: Some(format!("/wt/{id}")),
                 bro_label: Some(format!("bro-{id}")),
                 name: None,
-                agent_label: Some(format!("agent-{id}")),
                 interrupted: false,
                 recoverable: false,
                 transcript_location: None,
@@ -1204,7 +1198,6 @@ mod roster_view_tests {
             managed_worktree: None,
             workflow_owned: false,
             started_at: Some(42),
-            agent_label: None,
             interrupted: false,
             error_teaser: None,
             transcript_path: None,
@@ -1239,7 +1232,6 @@ mod roster_view_tests {
                 managed_worktree: None,
                 workflow_owned: false,
                 started_at: None,
-                agent_label: None,
                 interrupted: false,
                 error_teaser: None,
                 transcript_path: None,
@@ -1363,7 +1355,6 @@ mod roster_view_tests {
                 managed_worktree: None,
                 workflow_owned: false,
                 started_at: None,
-                agent_label: None,
                 interrupted: false,
                 error_teaser: None,
                 transcript_path: None,
@@ -1439,15 +1430,8 @@ pub fn roster_summary_from_task(task: &Task) -> bro_protocol::RosterSummaryV1 {
         turns: inner.num_turns,
         cwd: inner.cwd.clone(),
         managed_worktree: inner.managed_worktree.clone(),
-        label: inner
-            .bro_label
-            .clone()
-            .or_else(|| inner.agent_label.clone()),
-        name: inner
-            .name
-            .clone()
-            .or_else(|| inner.bro_label.clone())
-            .or_else(|| inner.agent_label.clone()),
+        label: inner.bro_label.clone(),
+        name: inner.name.clone().or_else(|| inner.bro_label.clone()),
         session_id: (!inner.session_id.is_empty())
             .then(|| bro_core::SessionId::new(inner.session_id.clone())),
         has_last_message: Some(inner.last_assistant_message.is_some()),
@@ -1465,11 +1449,6 @@ pub fn roster_summary_from_task(task: &Task) -> bro_protocol::RosterSummaryV1 {
         // Set from the same `TaskInner.started_at` that the
         // existing `last_event_at` derivation already reads.
         started_at: Some(inner.started_at),
-        // Wave 7c: dashboard needs `agentLabel` distinct from
-        // `broLabel`; the legacy projection collapsed them into
-        // `label`. Carry both so the dashboard's row projection
-        // can stay off the per-task inner mutex.
-        agent_label: inner.agent_label.clone(),
         interrupted: inner.interrupted,
         // Error teaser for failed/cancelled tasks: the last non-empty line
         // of stderr, trimmed and capped, so the fleet cockpit zoom view can
@@ -1624,7 +1603,6 @@ pub(crate) fn test_task(id: &str, status: TaskStatus, provider: Provider) -> Arc
             managed_worktree: None,
             bro_label: None,
             name: None,
-            agent_label: None,
             interrupted: false,
             recoverable: false,
             transcript_location: None,
@@ -1812,8 +1790,6 @@ struct PersistedTask {
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
-    agent_label: Option<String>,
-    #[serde(default)]
     interrupted: bool,
     /// True when the previous daemon instance was running this task
     /// at restart and the underlying provider session_id is still
@@ -1952,7 +1928,6 @@ impl TaskStore {
                     managed_worktree: inner.managed_worktree.clone(),
                     bro_label: inner.bro_label.clone(),
                     name: inner.name.clone(),
-                    agent_label: inner.agent_label.clone(),
                     interrupted: inner.interrupted,
                     recoverable: inner.recoverable,
                     transcript_location: inner.transcript_location.clone(),
@@ -2139,7 +2114,6 @@ impl TaskStore {
                     managed_worktree: rec.managed_worktree,
                     bro_label: rec.bro_label,
                     name: rec.name,
-                    agent_label: rec.agent_label,
                     interrupted: rec.interrupted,
                     recoverable: rec.recoverable,
                     transcript_location: rec.transcript_location,
@@ -2592,7 +2566,6 @@ pub struct SpawnTaskParams {
     pub tail_tx: tokio::sync::broadcast::Sender<tail::TailEvent>,
     pub roster_events: Option<RosterEventSink>,
     pub bro_label: Option<String>,
-    pub agent_label: Option<String>,
     /// System event hub for emitting task lifecycle events. Task events
     /// are observation-only: emit failures are logged but do not affect
     /// task dispatch.
@@ -2629,7 +2602,6 @@ fn failed_duplicate_task(
     session_id: String,
     cwd: Option<String>,
     bro_label: Option<String>,
-    agent_label: Option<String>,
     message: String,
     origin: bro_core::Origin,
 ) -> Arc<Task> {
@@ -2656,7 +2628,6 @@ fn failed_duplicate_task(
             cwd,
             bro_label,
             name: None,
-            agent_label,
             interrupted: false,
             recoverable: false,
             transcript_location: None,
@@ -2693,7 +2664,6 @@ pub fn spawn_in_process_task(
     tail_tx: tokio::sync::broadcast::Sender<tail::TailEvent>,
     roster_events: Option<RosterEventSink>,
     bro_label: Option<String>,
-    agent_label: Option<String>,
     system_events: Option<crate::system_events::SharedEventHub>,
     origin: bro_core::Origin,
 ) -> Arc<Task> {
@@ -2710,7 +2680,6 @@ pub fn spawn_in_process_task(
             session_id,
             cwd,
             bro_label,
-            agent_label,
             err.to_string(),
             origin,
         );
@@ -2741,7 +2710,6 @@ pub fn spawn_in_process_task(
             cwd,
             bro_label,
             name: None,
-            agent_label,
             interrupted: false,
             recoverable: false,
             transcript_location: None,
@@ -2769,7 +2737,6 @@ pub fn spawn_in_process_task(
             provider,
             session_id,
             task.inner.lock().cwd.clone(),
-            None,
             None,
             err.to_string(),
             origin,
@@ -3011,7 +2978,6 @@ pub async fn spawn_task(
     tail_tx: tokio::sync::broadcast::Sender<tail::TailEvent>,
     roster_events: Option<RosterEventSink>,
     bro_label: Option<String>,
-    agent_label: Option<String>,
     system_events: Option<crate::system_events::SharedEventHub>,
     origin: bro_core::Origin,
 ) -> Arc<Task> {
@@ -3027,7 +2993,6 @@ pub async fn spawn_task(
         tail_tx,
         roster_events,
         bro_label,
-        agent_label,
         None,
         None,
         system_events,
@@ -3146,7 +3111,6 @@ pub async fn spawn_task_with_tool_placement(
     tail_tx: tokio::sync::broadcast::Sender<tail::TailEvent>,
     roster_events: Option<RosterEventSink>,
     bro_label: Option<String>,
-    agent_label: Option<String>,
     tool_placement: Option<BTreeMap<String, String>>,
     tool_defaults: Option<BTreeMap<String, serde_json::Value>>,
     system_events: Option<crate::system_events::SharedEventHub>,
@@ -3168,7 +3132,6 @@ pub async fn spawn_task_with_tool_placement(
             session_id,
             cwd,
             bro_label,
-            agent_label,
             err.to_string(),
             origin,
         );
@@ -3187,7 +3150,6 @@ pub async fn spawn_task_with_tool_placement(
             tail_tx,
             roster_events,
             bro_label,
-            agent_label,
             system_events,
             origin,
         },
@@ -3225,7 +3187,6 @@ async fn spawn_reserved_dispatch(
         tail_tx,
         roster_events,
         bro_label,
-        agent_label,
         system_events,
         origin,
     } = params;
@@ -3287,7 +3248,6 @@ async fn spawn_reserved_dispatch(
             tail_tx,
             roster_events.clone(),
             bro_label,
-            agent_label,
             tool_placement,
             tool_defaults,
             system_events,
@@ -3325,7 +3285,6 @@ async fn spawn_reserved_dispatch(
         task_store,
         roster_events,
         bro_label,
-        agent_label,
         anyhow::anyhow!(
             "`{provider}` is not a dispatchable provider: it backs daemon-internal \
              tasks only and has no worker binary. Set a real provider on the brofile."
@@ -3348,7 +3307,6 @@ async fn spawn_harness_child_task(
     tail_tx: tokio::sync::broadcast::Sender<tail::TailEvent>,
     roster_events: Option<RosterEventSink>,
     bro_label: Option<String>,
-    agent_label: Option<String>,
     tool_placement: Option<BTreeMap<String, String>>,
     tool_defaults: Option<BTreeMap<String, serde_json::Value>>,
     system_events: Option<crate::system_events::SharedEventHub>,
@@ -3419,7 +3377,6 @@ async fn spawn_harness_child_task(
                 task_store,
                 roster_events,
                 bro_label,
-                agent_label,
                 error,
                 origin,
             );
@@ -3463,7 +3420,6 @@ async fn spawn_harness_child_task(
                 task_store,
                 roster_events,
                 bro_label,
-                agent_label,
                 error,
                 origin,
             );
@@ -3500,7 +3456,6 @@ async fn spawn_harness_child_task(
             managed_worktree: managed_worktrees::managed_worktree_for_cwd(cwd.as_deref()),
             bro_label,
             name: None,
-            agent_label,
             interrupted: false,
             recoverable: false,
             transcript_location,
@@ -3531,7 +3486,6 @@ async fn spawn_harness_child_task(
             provider,
             session_id,
             cwd,
-            None,
             None,
             err.to_string(),
             origin,
@@ -4131,7 +4085,6 @@ fn failed_harness_child_setup(
     task_store: Arc<RwLock<TaskStore>>,
     roster_events: Option<RosterEventSink>,
     bro_label: Option<String>,
-    agent_label: Option<String>,
     error: anyhow::Error,
     origin: bro_core::Origin,
 ) -> Arc<Task> {
@@ -4141,7 +4094,6 @@ fn failed_harness_child_setup(
         session_id,
         cwd,
         bro_label,
-        agent_label,
         format!("harness child setup failed: {error:#}"),
         origin,
     );
@@ -4919,9 +4871,6 @@ fn task_view_json_from_inner(
     }
     if let Some(ref label) = inner.bro_label {
         obj["broLabel"] = Value::String(label.clone());
-    }
-    if let Some(ref label) = inner.agent_label {
-        obj["agentLabel"] = Value::String(label.clone());
     }
     if transcript_coordinates {
         if let Some(ref location) = inner.transcript_location {
@@ -6378,7 +6327,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             bro_core::Origin::AgentDispatch,
         )
         .await;
@@ -6399,7 +6347,6 @@ mod tests {
             store_dir,
             store,
             tail_tx,
-            None,
             None,
             None,
             None,
@@ -6465,7 +6412,6 @@ mod tests {
                 tail_tx,
                 roster_events: None,
                 bro_label: None,
-                agent_label: None,
                 system_events: None,
                 origin: bro_core::Origin::AgentDispatch,
             },
@@ -6523,7 +6469,6 @@ mod tests {
                 tail_tx,
                 roster_events: None,
                 bro_label: None,
-                agent_label: None,
                 system_events: None,
                 origin: bro_core::Origin::AgentDispatch,
             },
@@ -6561,7 +6506,6 @@ mod tests {
             root.clone(),
             Arc::new(RwLock::new(TaskStore::new())),
             tail_tx.clone(),
-            None,
             None,
             None,
             None,
@@ -6617,7 +6561,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             bro_core::Origin::Workflow,
         );
         let mirror = root.join("daemon-bro/harness-sessions/mirror.events.jsonl");
@@ -6667,7 +6610,6 @@ mod tests {
             root.clone(),
             store.clone(),
             tail_tx.clone(),
-            None,
             None,
             None,
             None,
@@ -6806,7 +6748,6 @@ mod tests {
                 root.clone(),
                 store.clone(),
                 tail_tx.clone(),
-                None,
                 None,
                 None,
                 None,
@@ -7120,7 +7061,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             bro_core::Origin::Cockpit,
         );
         let managed_string = managed.to_string_lossy().into_owned();
@@ -7137,7 +7077,6 @@ mod tests {
             root.join("store"),
             store,
             tail_tx,
-            None,
             None,
             None,
             None,
@@ -7164,7 +7103,6 @@ mod tests {
             tempfile::tempdir().unwrap().path().to_path_buf(),
             store,
             tail_tx,
-            None,
             None,
             None,
             None,
@@ -7415,7 +7353,6 @@ mod tests {
                 managed_worktree: None,
                 bro_label: None,
                 name: None,
-                agent_label: None,
                 interrupted: false,
                 recoverable: false,
                 transcript_location: None,
@@ -7619,7 +7556,6 @@ mod tests {
                 tail_tx,
                 roster_events: None,
                 bro_label: None,
-                agent_label: None,
                 system_events: None,
                 origin: bro_core::Origin::Cockpit,
             },
@@ -7863,6 +7799,46 @@ mod tests {
             bro_core::Origin::Unknown,
             "pre-Slice-1b record (no origin field) must decode to Origin::Unknown"
         );
+    }
+
+    /// Rows persisted with an `agent_label` attribution still load; the
+    /// field is ignored and the bro label keeps driving the roster label.
+    #[test]
+    fn persisted_row_with_agent_label_loads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_dir = tmp.path().to_path_buf();
+        let legacy = serde_json::json!([{
+            "id": "legacy-agent-task",
+            "provider": "glm",
+            "session_id": "sess-legacy",
+            "events": [],
+            "last_assistant_message": null,
+            "usage": null,
+            "cost_usd": null,
+            "num_turns": 1,
+            "stderr": "",
+            "status": "completed",
+            "started_at": 1_700_000_000_000u64,
+            "completed_at": 1_700_000_000_001u64,
+            "exit_code": 0,
+            "bro_label": "team::member",
+            "agent_label": "agent:reviewer@v1",
+            "origin": "agentdispatch"
+        }]);
+        std::fs::write(
+            store_dir.join("tasks.json"),
+            serde_json::to_string(&legacy).unwrap(),
+        )
+        .unwrap();
+
+        let reloaded = TaskStore::load(&store_dir, u64::MAX);
+        let task = reloaded
+            .get("legacy-agent-task")
+            .expect("row with agent_label must load");
+        let summary = roster_summary_from_task(&task);
+        assert_eq!(summary.label.as_deref(), Some("team::member"));
+        let wire = serde_json::to_value(&summary).unwrap();
+        assert!(wire.get("agent_label").is_none(), "{wire}");
     }
 
     #[test]
@@ -8117,7 +8093,6 @@ mod tests {
                 managed_worktree: None,
                 bro_label: None,
                 name: None,
-                agent_label: None,
                 interrupted: false,
                 recoverable: false,
                 transcript_location: None,
@@ -8157,7 +8132,6 @@ mod tests {
                 managed_worktree: None,
                 bro_label: None,
                 name: None,
-                agent_label: None,
                 interrupted: false,
                 recoverable: false,
                 transcript_location: None,
@@ -8214,7 +8188,6 @@ mod tests {
                 managed_worktree: None,
                 bro_label: None,
                 name: None,
-                agent_label: None,
                 interrupted: false,
                 recoverable: false,
                 transcript_location: None,
@@ -8270,7 +8243,6 @@ mod tests {
                 managed_worktree: None,
                 bro_label: None,
                 name: None,
-                agent_label: None,
                 interrupted: false,
                 recoverable: false,
                 transcript_location: None,
@@ -8618,7 +8590,6 @@ mod tests {
                 managed_worktree: None,
                 bro_label: None,
                 name: None,
-                agent_label: None,
                 interrupted: false,
                 recoverable: false,
                 transcript_location: None,
@@ -8668,7 +8639,6 @@ mod tests {
                 tail_tx,
                 roster_events: None,
                 bro_label: None,
-                agent_label: None,
                 system_events: None,
                 // The legacy `spawn_with_pre_minted_id_tracks_known_id`
                 // test predates Slice 1b; pin origin to a sentinel
@@ -9378,7 +9348,6 @@ mod tests {
                 managed_worktree: None,
                 bro_label: None,
                 name: None,
-                agent_label: None,
                 interrupted: false,
                 recoverable: false,
                 transcript_location: None,
@@ -9638,7 +9607,6 @@ mod tests {
                 managed_worktree: None,
                 bro_label: None,
                 name: None,
-                agent_label: None,
                 interrupted: false,
                 recoverable: false,
                 transcript_location: None,
@@ -9696,7 +9664,6 @@ mod tests {
                 managed_worktree: None,
                 bro_label: None,
                 name: None,
-                agent_label: None,
                 interrupted: false,
                 recoverable: false,
                 transcript_location: None,
@@ -9754,7 +9721,6 @@ mod tests {
             managed_worktree: None,
             bro_label: None,
             name: None,
-            agent_label: None,
             interrupted: false,
             recoverable: false,
             transcript_location: None,
@@ -9814,7 +9780,6 @@ mod tests {
             managed_worktree: None,
             bro_label: None,
             name: None,
-            agent_label: None,
             interrupted: false,
             recoverable: false,
             transcript_location: None,
@@ -9889,7 +9854,6 @@ mod tests {
             managed_worktree: None,
             bro_label: None,
             name: None,
-            agent_label: None,
             interrupted: false,
             recoverable: false,
             transcript_location: None,
@@ -9949,7 +9913,6 @@ mod tests {
             managed_worktree: None,
             bro_label: None,
             name: None,
-            agent_label: None,
             interrupted: false,
             recoverable: false,
             transcript_location: None,
@@ -10281,7 +10244,6 @@ mod async_tests {
                 managed_worktree: None,
                 bro_label: None,
                 name: None,
-                agent_label: None,
                 interrupted: false,
                 recoverable: false,
                 transcript_location: None,
@@ -10327,7 +10289,6 @@ mod async_tests {
                 managed_worktree: None,
                 bro_label: None,
                 name: None,
-                agent_label: None,
                 interrupted: false,
                 recoverable: false,
                 transcript_location: None,
@@ -10379,7 +10340,6 @@ mod async_tests {
                 managed_worktree: None,
                 bro_label: None,
                 name: None,
-                agent_label: None,
                 interrupted: false,
                 recoverable: false,
                 transcript_location: None,
@@ -10427,7 +10387,6 @@ mod async_tests {
                 managed_worktree: None,
                 bro_label: None,
                 name: None,
-                agent_label: None,
                 interrupted: false,
                 recoverable: false,
                 transcript_location: None,
@@ -10487,7 +10446,6 @@ mod async_tests {
                 managed_worktree: None,
                 bro_label: None,
                 name: None,
-                agent_label: None,
                 interrupted: false,
                 recoverable: false,
                 transcript_location: None,
@@ -10540,7 +10498,6 @@ mod async_tests {
                 managed_worktree: None,
                 bro_label: None,
                 name: None,
-                agent_label: None,
                 interrupted: false,
                 recoverable: false,
                 transcript_location: None,
