@@ -143,13 +143,6 @@ pub struct ToolDoc {
 pub const TOOL_DOCS: &[ToolDoc] = &[
     // ── Transcripts ──────────────────────────────────────────────────
     ToolDoc {
-        name: "bbox_corpus_search",
-        category: ToolCategory::Transcripts,
-        summary: "Compatibility corpus lookup for harness capability projection. Returns ranked hits with stable id/text fields.",
-        when_to_use: "Normally called through the harness's flat `corpus_search` alias. Direct MCP callers should prefer `bbox_hybrid_search` for the richer typed-entity surface.",
-        example: Some(r#"bbox_corpus_search(query="session boundary", limit=10)"#),
-    },
-    ToolDoc {
         name: "bbox_search",
         category: ToolCategory::Transcripts,
         summary: "Search across all indexed transcripts. Default `mode=smart` broadens adjacent terms for recall; `mode=fulltext` gives raw Tantivy/Lucene-style boolean syntax.",

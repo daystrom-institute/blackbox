@@ -112,7 +112,7 @@ pub trait McpSurface: Send + Sync {
 
 fn capability_alias(call_name: &str) -> Option<&'static str> {
     match call_name {
-        "bbox_corpus_search" => Some("corpus_search"),
+        "bbox_hybrid_search" => Some("corpus_search"),
         _ => None,
     }
 }
@@ -707,7 +707,7 @@ mod tests {
         async fn list_tools(&self) -> anyhow::Result<Vec<McpToolSpec>> {
             Ok(vec![
                 McpToolSpec {
-                    name: "bbox_corpus_search".to_string(),
+                    name: "bbox_hybrid_search".to_string(),
                     description: "corpus".to_string(),
                     input_schema: serde_json::json!({"type": "object"}),
                     ..Default::default()
@@ -756,7 +756,7 @@ mod tests {
             names,
             vec![
                 "corpus_search",
-                "mcp__blackbox__bbox_corpus_search",
+                "mcp__blackbox__bbox_hybrid_search",
                 "mcp__blackbox__external_action",
                 "mcp__blackbox__bbox_search",
             ]
@@ -778,7 +778,7 @@ mod tests {
         let source_denied = load_mcp_tools_from_config_with_capability_aliases(
             &config,
             &ToolFilter::from_csv(
-                Some("mcp__blackbox__bbox_corpus_search"),
+                Some("mcp__blackbox__bbox_hybrid_search"),
                 Some("corpus_search"),
             ),
             Some("blackbox"),
