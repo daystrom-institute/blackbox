@@ -582,7 +582,6 @@ impl BlackboxServer {
                 request.brofile_tool_defaults.as_ref(),
                 request.tool_defaults.as_ref(),
             ),
-            Some(self.state.system_events.clone()),
             request.origin,
         )
         .await;
@@ -972,7 +971,6 @@ impl BlackboxServer {
                 brofile_tool_defaults.as_ref(),
                 p.tool_defaults.as_ref(),
             ),
-            Some(self.state.system_events.clone()),
             // bro_resume is the user-facing MCP tool for resuming an existing
             // session — same source class as bro_exec. The HTTP control plane
             // (`/control/resume`) overrides this to Cockpit, exactly like
@@ -2058,7 +2056,6 @@ impl BlackboxServer {
                             brofile.tool_defaults.as_ref(),
                             None,
                         ),
-                        Some(self.state.system_events.clone()),
                         // bro_broadcast fans out a single prompt to
                         // every team member; each per-member spawn
                         // is still driven by the operator's MCP call,
@@ -2128,7 +2125,6 @@ impl BlackboxServer {
                         brofile.tool_defaults.as_ref(),
                         None,
                     ),
-                    Some(self.state.system_events.clone()),
                     // bro_broadcast per-member fresh-spawn branch
                     // — same source class as the resume branch above.
                     bro_core::Origin::AgentDispatch,
@@ -2535,7 +2531,6 @@ impl BlackboxServer {
             Some(self.state.roster_events()),
             Some("workload-retro".to_string()),
             None,
-            Some(self.state.system_events.clone()),
             // bro_retro is a self-reflective resume — operator
             // initiated, lands in AgentDispatch like other bro_*
             // MCP tools.

@@ -937,8 +937,6 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         when_to_use: "Migrating pre-Phase-2 legacy sidecars into lane-split storage. The project selector resolves project_id, operator alias, and registered path through the SAME authority for dry-run and apply; an unknown selector refuses identically in both modes instead of returning an empty plan set. Dry-run without a filter plans every registered project with a sidecar, paged in project order (limit default 20, max 100; follow next_offset, restart at 0 after lifecycle actions) and reports unregistered sidecars it skipped. apply requires exactly one registered project; limit/offset are refused there before any scan. Operates on daemon-local edge storage; drops derived only when managed replacement exists; quarantines malformed lines.",
         example: None,
     },
-    // ── System Events ────────────────────────────────────────────────
-
     // ── Reactions ──────────────────────────────────────────────────
 
     // ── Identity ─────────────────────────────────────────────────────
@@ -1605,7 +1603,6 @@ mod tests {
                     || n.starts_with("whiteboard_")
                     || n.starts_with("work_")
                     || n.starts_with("atom_")
-                    || n.starts_with("system_event_")
                     || n.starts_with("reaction_")
                     || n.starts_with("identity_")
                 {

@@ -84,7 +84,6 @@ use bbox_edge_index::storage_health;
 pub use bbox_slack::slack_channel_bindings;
 pub use bbox_slack::slack_proposal_links;
 use bbox_stores::store_persister;
-use bbox_system_events::system_events;
 // `system_memory` extracted into bbox-system-memory (root-crate split);
 // aliased back to `crate::system_memory` so existing call sites resolve
 // unchanged.

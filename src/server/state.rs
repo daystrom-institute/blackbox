@@ -20,8 +20,7 @@ use crate::projects::ProjectRegistry;
 use crate::store_persister::StorePersister;
 use crate::threads::Threads;
 use crate::{
-    artifacts, edge_index, path_cache, slack_channel_bindings, slack_proposal_links, system_events,
-    whiteboards,
+    artifacts, edge_index, path_cache, slack_channel_bindings, slack_proposal_links, whiteboards,
 };
 
 // ---------------------------------------------------------------------------
@@ -320,7 +319,6 @@ pub(crate) struct SharedState {
     // kept: SharedState vector store handle; consumed by embed/queue path through alternate state plumbing, retained here for direct access
     #[allow(dead_code)]
     pub(crate) vector_store: std::sync::Arc<crate::vectors::VectorStore>,
-    pub(crate) system_events: system_events::SharedEventHub,
 }
 
 pub(crate) struct CodeReadView {
@@ -950,9 +948,6 @@ impl SharedState {
                 crate::vectors::VectorStore::open(store_dir.join("vectors"))
                     .expect("test vector store should open"),
             ),
-            system_events: Arc::new(system_events::EventHub::new(
-                system_events::EventStore::new_at(store_dir.join("events").join("journal")),
-            )),
         }
     }
 
