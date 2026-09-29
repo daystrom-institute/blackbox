@@ -35,7 +35,6 @@ That means create first, reconcile later is how duplicate state accumulates.
 - `bro_brofile(action="list")` before `bro_brofile(action="create", ...)`
 - `bro_team(action="list_templates")` before `save_template`
 - `bro_team(action="list")` before `create`
-- `bro_mcp(action="list")` before `add`
 - `bbox_thread_list(...)` before `bbox_thread(action="open", ...)`
 - `bbox_knowledge(query="...")` before `bbox_learn(...)` or `bbox_decide(...)`
 
