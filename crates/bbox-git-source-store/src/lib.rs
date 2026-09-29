@@ -1850,6 +1850,9 @@ impl GitSourceStore {
 /// them so their bytes are reclaimed; nothing reads them.
 const UNOWNED_TREES: [&str; 2] = ["provenance-receipts", "provenance-imports"];
 
+// Runs inside `GitSourceStore::open`, which the daemon calls at startup and
+// never on a tokio worker.
+#[allow(clippy::disallowed_methods)]
 fn remove_unowned_trees(root: &Path) -> Result<()> {
     for name in UNOWNED_TREES {
         let path = root.join(name);

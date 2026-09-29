@@ -2310,14 +2310,13 @@ fn recheck_capture(
     if path_exists_nofollow(&history_root)? != history_store.is_some() {
         return Err(changed("P3 history store presence"));
     }
-    if let Some(git_store) = git_store {
-        if git_store
+    if let Some(git_store) = git_store
+        && git_store
             .list_activation_journals()
             .map_err(|error| cutover_error("error.git_transport_cutover_history", error))?
             != history_journals
-        {
-            return Err(changed("transport journals"));
-        }
+    {
+        return Err(changed("transport journals"));
     }
     for repo in repos {
         if !capture_evidence_requires_recheck(&repo.coverage_status) {
