@@ -149,10 +149,6 @@ struct RawCodeCollectionConfig {
     pub max_git_history_commits: u64,
     #[serde(default = "default_git_history_max_logical_bytes")]
     pub max_git_history_logical_bytes: u64,
-    #[serde(default = "default_provenance_max_documents")]
-    pub max_provenance_documents: u64,
-    #[serde(default = "default_provenance_max_logical_bytes")]
-    pub max_provenance_logical_bytes: u64,
     #[serde(default = "default_cutback_retry_base_secs")]
     pub cutback_retry_base_secs: u64,
     #[serde(default = "default_cutback_retry_max_secs")]
@@ -194,8 +190,6 @@ impl Default for RawCodeCollectionConfig {
             stale_warning_hours: default_code_collection_stale_warning_hours(),
             max_git_history_commits: default_git_history_max_commits(),
             max_git_history_logical_bytes: default_git_history_max_logical_bytes(),
-            max_provenance_documents: default_provenance_max_documents(),
-            max_provenance_logical_bytes: default_provenance_max_logical_bytes(),
             cutback_retry_base_secs: default_cutback_retry_base_secs(),
             cutback_retry_max_secs: default_cutback_retry_max_secs(),
             cutback_max_attempts: default_cutback_max_attempts(),
@@ -242,14 +236,6 @@ fn default_git_history_max_commits() -> u64 {
 
 fn default_git_history_max_logical_bytes() -> u64 {
     8 * 1024 * 1024 * 1024
-}
-
-fn default_provenance_max_documents() -> u64 {
-    1_000_000
-}
-
-fn default_provenance_max_logical_bytes() -> u64 {
-    2 * 1024 * 1024 * 1024
 }
 
 fn default_cutback_retry_base_secs() -> u64 {
@@ -651,8 +637,6 @@ pub struct CodeCollectionConfig {
     pub stale_warning_hours: u64,
     pub max_git_history_commits: u64,
     pub max_git_history_logical_bytes: u64,
-    pub max_provenance_documents: u64,
-    pub max_provenance_logical_bytes: u64,
     pub cutback_retry_base_secs: u64,
     pub cutback_retry_max_secs: u64,
     pub cutback_max_attempts: u32,
@@ -1519,8 +1503,6 @@ pub fn load_with(options: LoadOptions) -> Result<Config> {
             stale_warning_hours: raw.code_collection.stale_warning_hours,
             max_git_history_commits: raw.code_collection.max_git_history_commits,
             max_git_history_logical_bytes: raw.code_collection.max_git_history_logical_bytes,
-            max_provenance_documents: raw.code_collection.max_provenance_documents,
-            max_provenance_logical_bytes: raw.code_collection.max_provenance_logical_bytes,
             cutback_retry_base_secs: raw.code_collection.cutback_retry_base_secs,
             cutback_retry_max_secs: raw.code_collection.cutback_retry_max_secs,
             cutback_max_attempts: raw.code_collection.cutback_max_attempts,
@@ -4115,8 +4097,6 @@ remote_authority = "workspace.example"
             stale_warning_hours: 0,
             max_git_history_commits: default_git_history_max_commits(),
             max_git_history_logical_bytes: default_git_history_max_logical_bytes(),
-            max_provenance_documents: default_provenance_max_documents(),
-            max_provenance_logical_bytes: default_provenance_max_logical_bytes(),
             cutback_retry_base_secs: default_cutback_retry_base_secs(),
             cutback_retry_max_secs: default_cutback_retry_max_secs(),
             cutback_max_attempts: default_cutback_max_attempts(),

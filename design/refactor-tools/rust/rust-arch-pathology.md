@@ -499,8 +499,8 @@ insufficient.
 
 Primary measurements: `bbox_search` for operator complaints, `bbox_notes` for
 agent-side pain, `bbox_thread_list` for abandoned work threads,
-`bbox_hybrid_search` for related design docs and decisions, git log for
-fix/revert density, and `bbox_blame` for line-level provenance where relevant.
+`bbox_hybrid_search` for related design docs and decisions, and git log for
+fix/revert density.
 
 Correction-plan output: transcript anchors, dates, current code state, trend,
 and how history corroborates or reorders other atom diagnoses.

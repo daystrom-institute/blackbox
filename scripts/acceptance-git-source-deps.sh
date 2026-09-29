@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Dependency-ceiling acceptance test for the typed Git/provenance wire leaf.
+# Dependency-ceiling acceptance test for the typed Git-history wire leaf.
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."

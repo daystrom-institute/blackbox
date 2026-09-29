@@ -2,8 +2,8 @@
 # Live attached-overlap Git transport cutover rehearsal on a FreshV2 catalog.
 #
 # The rehearsal owns one throwaway root and port. It drives the real daemon,
-# collector, Git history activation, provenance export/import, offline
-# preflight/apply/verify, and a covered restart. Production state and port
+# collector, Git history activation, offline preflight/apply/verify, and a
+# covered restart. Production state and port
 # 7264 are never selected.
 #
 # Usage:
@@ -217,44 +217,11 @@ status_timeout_secs = 180
 root = "$CHECKOUT"
 scope = { repo_id = "$SCOPE_REPO_ID", bbox_root_relpath = "." }
 git_history = true
-provenance = true
 EOF
 }
 
 collect() {
   "$BIN/bbox-code-collector" --config "$SMOKE/collector-config.toml" once
-}
-
-seed_observed_v2_edge() {
-  local project_id head target lane
-  project_id="$(jq -r '.project_id' "$SUMMARY")"
-  head="$(git -C "$CHECKOUT" rev-parse HEAD)"
-  target="$(jq -c 'select(.target.type == "project_file_v2") | .target' \
-    "$STATE/edges/derived/git/$project_id.jsonl" | head -n 1)"
-  [[ -n "$target" ]] || {
-    print -u2 "no materialized project-file target was found"
-    return 1
-  }
-  mkdir -p "$STATE/edges/observed"
-  lane="$STATE/edges/observed/$project_id.jsonl"
-  jq -cn \
-    --arg project_id "$project_id" \
-    --arg head "$head" \
-    --argjson target "$target" \
-    '{
-      source: {type:"transcript",provider:"fixture",session_id:"session-1",line_offset:1,event_idx:0},
-      kind:"EDITED_FILE",
-      target:$target,
-      provenance:"explicit",
-      confidence:"heuristic",
-      metadata:{
-        "anchor.commit_sha_at_edit":$head,
-        "anchor.file_path":"src/lib.rs",
-        "anchor.project_id":$project_id,
-        "tool.name":"Edit"
-      },
-      project_id:$project_id
-    }' > "$lane"
 }
 
 preflight() {
@@ -279,16 +246,8 @@ preflight() {
   jq -e '
     .status == "clean" and
     .prepared_history_journal_count == 0 and
-    .prepared_provenance_journal_count == 0 and
     .repos[0].history.parity == "equal" and
-    .repos[0].projects[0].ready == true and
-    .repos[0].projects[0].provenance.v2_document_count == 1 and
-    .repos[0].projects[0].provenance.typed_edge_key_count == 1 and
-    .repos[0].projects[0].provenance.imported_edge_key_count == 1 and
-    .repos[0].projects[0].provenance.typed_matches_import_journal == true and
-    .repos[0].projects[0].provenance.typed_covers_legacy == true and
-    any(.observation_baseline.counters[];
-      .kind == "provenance_note_io" and .outcome == "granted" and .count > 0)
+    .repos[0].projects[0].ready == true
   ' "$SMOKE/review/report.json" >/dev/null
   jq -e '
     .prior_p3_generation_id != null and
@@ -370,7 +329,6 @@ recutover_carries_current_row() {
     .repos[0].history == null and
     .repos[0].projects[0].code_head == null and
     .repos[0].projects[0].overlay == null and
-    .repos[0].projects[0].provenance == null and
     .carried_forward_rows == $first[0].rows and
     .predicted_marker.rows == $first[0].rows
   ' "$report" >/dev/null
@@ -404,7 +362,7 @@ assert_zero_post_boundary_deltas() {
     --slurpfile report "$SMOKE/review/report.json" \
     --slurpfile observations "$STATE/bro/checkout-access-observations.json" '
       def target_rows:
-        map(select(.kind == "git_history" or .kind == "provenance_note_io"))
+        map(select(.kind == "git_history"))
         | map({kind, source_lane, outcome, count})
         | sort_by(.kind, .source_lane, .outcome);
       def attributed_target_rows:
@@ -417,81 +375,6 @@ assert_zero_post_boundary_deltas() {
     ' >/dev/null
 }
 
-assert_legacy_provenance_overlap() {
-  local url="http://127.0.0.1:$PORT/mcp?surface=default"
-  local headers="$SMOKE/review/mcp-overlap-init.headers"
-  local body="$SMOKE/review/mcp-overlap-init.body"
-  local response="$SMOKE/review/mcp-overlap-response.body"
-  local json="$SMOKE/review/mcp-overlap-response.json"
-  local session project_id payload
-  payload="$(jq -cn '{jsonrpc:"2.0",id:1,method:"initialize",params:{protocolVersion:"2025-06-18",capabilities:{},clientInfo:{name:"ghg-smoke-overlap",version:"1"}}}')"
-  curl -sS -D "$headers" -o "$body" -X POST "$url" \
-    -H 'Content-Type: application/json' \
-    -H 'Accept: application/json, text/event-stream' \
-    --data "$payload"
-  session="$(sed -n 's/^[Mm][Cc][Pp]-[Ss][Ee][Ss][Ss][Ii][Oo][Nn]-[Ii][Dd]:[[:space:]]*//p' "$headers" | tr -d '\r' | head -1)"
-  [[ -n "$session" ]]
-  curl -sS -o /dev/null -X POST "$url" \
-    -H 'Content-Type: application/json' \
-    -H 'Accept: application/json, text/event-stream' \
-    -H "Mcp-Session-Id: $session" \
-    -H 'Mcp-Protocol-Version: 2025-06-18' \
-    --data '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}'
-  project_id="$(jq -r '.project_id' "$SUMMARY")"
-  payload="$(jq -cn --arg project_id "$project_id" '{jsonrpc:"2.0",id:2,method:"tools/call",params:{name:"bbox_provenance_import",arguments:{project_id:$project_id}}}')"
-  curl -sS -o "$response" -X POST "$url" \
-    -H 'Content-Type: application/json' \
-    -H 'Accept: application/json, text/event-stream' \
-    -H "Mcp-Session-Id: $session" \
-    -H 'Mcp-Protocol-Version: 2025-06-18' \
-    --data "$payload"
-  if grep -q '^data:' "$response"; then
-    sed -n 's/^data: //p' "$response" | tail -1 > "$json"
-  else
-    cp "$response" "$json"
-  fi
-  jq -e '.result.isError != true' "$json" >/dev/null
-}
-
-assert_legacy_provenance_refusal() {
-  local url="http://127.0.0.1:$PORT/mcp?surface=default"
-  local headers="$SMOKE/review/mcp-init.headers"
-  local body="$SMOKE/review/mcp-init.body"
-  local response="$SMOKE/review/mcp-provenance-response.body"
-  local json="$SMOKE/review/mcp-provenance-response.json"
-  local session project_id payload
-  payload="$(jq -cn '{jsonrpc:"2.0",id:1,method:"initialize",params:{protocolVersion:"2025-06-18",capabilities:{},clientInfo:{name:"ghg-smoke",version:"1"}}}')"
-  curl -sS -D "$headers" -o "$body" -X POST "$url" \
-    -H 'Content-Type: application/json' \
-    -H 'Accept: application/json, text/event-stream' \
-    --data "$payload"
-  session="$(sed -n 's/^[Mm][Cc][Pp]-[Ss][Ee][Ss][Ss][Ii][Oo][Nn]-[Ii][Dd]:[[:space:]]*//p' "$headers" | tr -d '\r' | head -1)"
-  [[ -n "$session" ]]
-  curl -sS -o /dev/null -X POST "$url" \
-    -H 'Content-Type: application/json' \
-    -H 'Accept: application/json, text/event-stream' \
-    -H "Mcp-Session-Id: $session" \
-    -H 'Mcp-Protocol-Version: 2025-06-18' \
-    --data '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}'
-  project_id="$(jq -r '.project_id' "$SUMMARY")"
-  payload="$(jq -cn --arg project_id "$project_id" '{jsonrpc:"2.0",id:2,method:"tools/call",params:{name:"bbox_provenance_export",arguments:{project_id:$project_id}}}')"
-  curl -sS -o "$response" -X POST "$url" \
-    -H 'Content-Type: application/json' \
-    -H 'Accept: application/json, text/event-stream' \
-    -H "Mcp-Session-Id: $session" \
-    -H 'Mcp-Protocol-Version: 2025-06-18' \
-    --data "$payload"
-  if grep -q '^data:' "$response"; then
-    sed -n 's/^data: //p' "$response" | tail -1 > "$json"
-  else
-    cp "$response" "$json"
-  fi
-  jq -e '
-    .result.isError == true and
-    ([.result.content[] | select(.type == "text") | .text] | join("\n") | contains("error.provenance_transport_authoritative"))
-  ' "$json" >/dev/null
-}
-
 run_all() {
   CLEANUP_ON_EXIT=true
   require_tools
@@ -501,16 +384,10 @@ run_all() {
   attach_checkout
   collect
   stop_daemon
-  seed_observed_v2_edge
-  start_daemon
-  collect
-  assert_legacy_provenance_overlap
-  stop_daemon
   preflight
   apply_cutover
   verify_cutover
   start_daemon
-  assert_legacy_provenance_refusal
   collect
   stop_daemon
   assert_zero_post_boundary_deltas
@@ -532,12 +409,11 @@ case "${1:-}" in
   setup) require_tools; setup ;;
   start) require_tools; start_daemon ;;
   collect) require_tools; collect ;;
-  seed) require_tools; seed_observed_v2_edge ;;
   preflight) require_tools; preflight ;;
   apply) require_tools; apply_cutover ;;
   verify) require_tools; verify_cutover ;;
   recutover) require_tools; recutover_carries_current_row ;;
   stop) stop_daemon ;;
   all) run_all ;;
-  *) print -u2 "usage: $0 {produce|setup|start|collect|seed|preflight|apply|verify|recutover|stop|all}"; exit 64 ;;
+  *) print -u2 "usage: $0 {produce|setup|start|collect|preflight|apply|verify|recutover|stop|all}"; exit 64 ;;
 esac

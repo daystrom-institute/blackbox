@@ -1,6 +1,6 @@
 //! Offline Git transport cutover preflight, apply, and verification.
 //!
-//! Preflight captures catalog, transport, P3, overlay, provenance, and
+//! Preflight captures catalog, transport, P3, overlay, and
 //! checkout-observation evidence into a reviewable artifact pair. Apply binds
 //! those exact bytes to the current predecessor marker and installs one
 //! checksummed, atomically selected marker. Runtime readers classify each row
@@ -13,7 +13,6 @@ use std::path::{Path, PathBuf};
 
 use bbox_code_source_store::{ActivationRecordV2, CodeSourceStorePaths, StoredGenerationV2};
 use bbox_config::config::Config;
-use bbox_corpus_core::entity_ref::EntityRef;
 use bbox_corpus_core::git_overlay::GitOverlaySelector;
 use bbox_corpus_core::git_transport_cutover::{
     RepoTransportBlockedReason, RepoTransportGrant, RepoTransportGrantProjection,
@@ -30,17 +29,12 @@ use bbox_corpus_core::project_catalog::{
 use bbox_corpus_index::index::history_generations::{
     HistoryGenerationRecordV1, HistoryGenerationStore, generations_root_for_index,
 };
-use bbox_edge_sidecar::edge_sidecar::{
-    edge_import_key, explicit_edge_lane_version, visit_explicit_edge_lane,
-};
 use bbox_edge_sidecar::manifest::ManifestIndex;
 use bbox_git_source::GitSourceLimits;
 use bbox_git_source_store::{
-    GitSourceStore, HistoryActivationJournalV1, HistoryActivationStageV1,
-    ProvenanceImportJournalV1, ProvenanceImportStageV1, StoreLimits,
+    GitSourceStore, HistoryActivationJournalV1, HistoryActivationStageV1, StoreLimits,
 };
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::checkout_access::{
     CheckoutAccessCounter, CheckoutAccessKind, CheckoutAccessObservations,
@@ -61,8 +55,6 @@ const RESOLUTION_VERSION: u32 = 1;
 const MARKER_VERSION: u32 = 1;
 const RECEIPT_VERSION: u32 = 1;
 const CHECKOUT_PARITY_PROOF_VERSION: u32 = 1;
-const MAX_EXPLICIT_EDGE_LINE_BYTES: usize = 16 * 1024 * 1024;
-const MAX_ACTIVE_SIDECAR_INPUT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 pub const MAX_GIT_TRANSPORT_CHECKOUT_PARITY_PROOF_BYTES: usize = 1024 * 1024;
 pub const MAX_GIT_TRANSPORT_CUTOVER_MARKER_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_GIT_TRANSPORT_CUTOVER_RECEIPT_BYTES: usize = 1024 * 1024;
@@ -282,30 +274,6 @@ pub struct GitTransportHistoryEvidenceV1 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct GitTransportProvenanceEvidenceV1 {
-    pub import_generation_id: String,
-    pub code_selector: String,
-    pub notes_ref: String,
-    pub notes_tip: String,
-    pub manifest_sha256: String,
-    pub v1_document_count: u64,
-    pub v2_document_count: u64,
-    pub explicit_lane_version_token: String,
-    pub explicit_lane_sha256: String,
-    pub legacy_edge_key_count: u64,
-    pub legacy_edge_keys_sha256: String,
-    pub typed_edge_key_count: u64,
-    pub typed_edge_keys_sha256: String,
-    pub imported_edge_key_count: u64,
-    pub imported_edge_keys_sha256: String,
-    pub typed_matches_import_journal: bool,
-    pub typed_covers_legacy: bool,
-    pub export_receipt_generation: String,
-    pub export_receipt_notes_tip: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct GitTransportCodeHeadEvidenceV1 {
     pub generation_id: String,
     pub selector: String,
@@ -322,8 +290,6 @@ pub struct GitTransportProjectEvidenceV1 {
     pub code_head: Option<GitTransportCodeHeadEvidenceV1>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub overlay: Option<GitOverlaySelector>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub provenance: Option<GitTransportProvenanceEvidenceV1>,
     pub ready: bool,
     pub defects: Vec<String>,
 }
@@ -373,10 +339,26 @@ pub struct PredictedGitTransportCutoverRowV1 {
     pub source_generation_id: String,
     pub p3_generation_id: String,
     pub history_parity_commitment: Sha256ValueV1,
+    /// Published member projects the row covers.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub members: BTreeSet<ProjectId>,
+    /// Per-member provenance evidence maps. Preflight writes them empty; a
+    /// row without `members` names its member projects by these keys.
     pub provenance_import_generations: BTreeMap<ProjectId, String>,
     pub provenance_export_generations: BTreeMap<ProjectId, String>,
     pub provenance_parity_commitments: BTreeMap<ProjectId, Sha256ValueV1>,
     pub capability_baselines: Vec<GitTransportCapabilityBaselineV1>,
+}
+
+impl PredictedGitTransportCutoverRowV1 {
+    /// The published member projects this row covers.
+    pub fn member_ids(&self) -> BTreeSet<&ProjectId> {
+        if self.members.is_empty() {
+            self.provenance_import_generations.keys().collect()
+        } else {
+            self.members.iter().collect()
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -407,7 +389,6 @@ pub struct GitTransportCutoverReportV1 {
     pub resolution_artifact_hash: Sha256ValueV1,
     pub observation_baseline: GitTransportObservationBaselineV1,
     pub prepared_history_journal_count: u64,
-    pub prepared_provenance_journal_count: u64,
     pub repos: Vec<GitTransportRepoEvidenceV1>,
     pub legacy_local_repos: Vec<GitTransportLegacyLocalRepoEvidenceV1>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -604,12 +585,10 @@ fn load_checkout_parity_proof_optional(
 
 fn derived_report_status(
     prepared_history_journal_count: u64,
-    prepared_provenance_journal_count: u64,
     repos: &[GitTransportRepoEvidenceV1],
     legacy_local_repos: &[GitTransportLegacyLocalRepoEvidenceV1],
 ) -> GitTransportCutoverStatusV1 {
     if prepared_history_journal_count == 0
-        && prepared_provenance_journal_count == 0
         && repos.iter().all(|repo| {
             !matches!(
                 repo.coverage_status,
@@ -647,7 +626,6 @@ fn cutover_inventory_hash(
     catalog_origin: &CatalogOriginV2,
     observation_baseline: &GitTransportObservationBaselineV1,
     prepared_history_journal_count: u64,
-    prepared_provenance_journal_count: u64,
     repos: &[GitTransportRepoEvidenceV1],
     legacy_local_repos: &[GitTransportLegacyLocalRepoEvidenceV1],
     carried_forward_rows: &[PredictedGitTransportCutoverRowV1],
@@ -659,7 +637,6 @@ fn cutover_inventory_hash(
         catalog_origin: &'a CatalogOriginV2,
         observation_baseline: &'a GitTransportObservationBaselineV1,
         prepared_history_journal_count: u64,
-        prepared_provenance_journal_count: u64,
         repos: &'a [GitTransportRepoEvidenceV1],
         legacy_local_repos: &'a [GitTransportLegacyLocalRepoEvidenceV1],
         carried_forward_rows: &'a [PredictedGitTransportCutoverRowV1],
@@ -670,7 +647,6 @@ fn cutover_inventory_hash(
         catalog_origin,
         observation_baseline,
         prepared_history_journal_count,
-        prepared_provenance_journal_count,
         repos,
         legacy_local_repos,
         carried_forward_rows,
@@ -702,7 +678,6 @@ pub fn decode_git_transport_cutover_report_v1(
         &report.catalog_origin,
         &report.observation_baseline,
         report.prepared_history_journal_count,
-        report.prepared_provenance_journal_count,
         &report.repos,
         &report.legacy_local_repos,
         &report.carried_forward_rows,
@@ -713,13 +688,11 @@ pub fn decode_git_transport_cutover_report_v1(
         report.inventory_hash.clone(),
         report.resolution_artifact_hash.clone(),
         report.prepared_history_journal_count,
-        report.prepared_provenance_journal_count,
         &report.repos,
         &report.carried_forward_rows,
     );
     let status = derived_report_status(
         report.prepared_history_journal_count,
-        report.prepared_provenance_journal_count,
         &report.repos,
         &report.legacy_local_repos,
     );
@@ -1018,9 +991,10 @@ impl GitTransportCutoverRuntimeV1 {
                 .filter(|project| matches!(project.scope, ProjectScope::Published(_)))
                 .map(|project| &project.project_id)
                 .collect::<BTreeSet<_>>();
+            let covered_members = row.member_ids();
             let committed_member_addition = current_members
                 .iter()
-                .any(|project_id| !row.provenance_import_generations.contains_key(*project_id));
+                .any(|project_id| !covered_members.contains(project_id));
             return if committed_member_addition
                 && matches!(grant_state, Some(RepoTransportGrantState::Blocked { .. }))
             {
@@ -1117,7 +1091,6 @@ fn carried_repo_evidence(
                 scope: scope.clone(),
                 code_head: None,
                 overlay: None,
-                provenance: None,
                 ready: true,
                 defects: Vec::new(),
             }),
@@ -1350,17 +1323,7 @@ impl ProjectCatalogGitTransportCutoverFacadeV1 {
             .transpose()
             .map_err(|error| cutover_error("error.git_transport_cutover_history", error))?
             .unwrap_or_default();
-        let provenance_journals = git_store
-            .as_ref()
-            .map(GitSourceStore::list_provenance_import_journals)
-            .transpose()
-            .map_err(|error| cutover_error("error.git_transport_cutover_provenance", error))?
-            .unwrap_or_default();
         let prepared_history_journal_count = history_journals
-            .iter()
-            .filter(|journal| !journal.stage.terminal())
-            .count() as u64;
-        let prepared_provenance_journal_count = provenance_journals
             .iter()
             .filter(|journal| !journal.stage.terminal())
             .count() as u64;
@@ -1405,8 +1368,6 @@ impl ProjectCatalogGitTransportCutoverFacadeV1 {
                             checkout_parity_proof.as_ref(),
                             &manifest,
                             &history_journals,
-                            &provenance_journals,
-                            &request.config,
                         )?);
                     }
                 }
@@ -1431,7 +1392,6 @@ impl ProjectCatalogGitTransportCutoverFacadeV1 {
             checkout_parity_proof.as_ref(),
             &manifest,
             &history_journals,
-            &provenance_journals,
             &repos,
         )?;
 
@@ -1441,7 +1401,6 @@ impl ProjectCatalogGitTransportCutoverFacadeV1 {
             &catalog.origin,
             &observation_baseline,
             prepared_history_journal_count,
-            prepared_provenance_journal_count,
             &repos,
             &legacy_local_repos,
             &carried_forward_rows,
@@ -1457,16 +1416,11 @@ impl ProjectCatalogGitTransportCutoverFacadeV1 {
             inventory_hash.clone(),
             resolution_artifact_hash.clone(),
             prepared_history_journal_count,
-            prepared_provenance_journal_count,
             &repos,
             &carried_forward_rows,
         );
-        let status = derived_report_status(
-            prepared_history_journal_count,
-            prepared_provenance_journal_count,
-            &repos,
-            &legacy_local_repos,
-        );
+        let status =
+            derived_report_status(prepared_history_journal_count, &repos, &legacy_local_repos);
         let report = GitTransportCutoverReportV1 {
             version: REPORT_VERSION,
             generated_at: request.generated_at,
@@ -1478,7 +1432,6 @@ impl ProjectCatalogGitTransportCutoverFacadeV1 {
             resolution_artifact_hash: resolution_artifact_hash.clone(),
             observation_baseline,
             prepared_history_journal_count,
-            prepared_provenance_journal_count,
             repos,
             legacy_local_repos,
             carried_forward_rows,
@@ -1840,20 +1793,10 @@ fn recheck_report_for_apply(
         .transpose()
         .map_err(|error| cutover_error("error.git_transport_cutover_history", error))?
         .unwrap_or_default();
-    let provenance_journals = git_store
-        .as_ref()
-        .map(GitSourceStore::list_provenance_import_journals)
-        .transpose()
-        .map_err(|error| cutover_error("error.git_transport_cutover_provenance", error))?
-        .unwrap_or_default();
     if history_journals
         .iter()
         .any(|journal| !journal.stage.terminal())
-        || provenance_journals
-            .iter()
-            .any(|journal| !journal.stage.terminal())
         || report.prepared_history_journal_count != 0
-        || report.prepared_provenance_journal_count != 0
     {
         return Err(cutover_error(
             "error.git_transport_cutover_prepared_journal",
@@ -1873,7 +1816,6 @@ fn recheck_report_for_apply(
         checkout_parity_proof.as_ref(),
         &manifest,
         &history_journals,
-        &provenance_journals,
         &report.repos,
     )?;
     for repo in report
@@ -1931,8 +1873,8 @@ fn verify_row_observations(
     current_observations: &GitTransportObservationBaselineV1,
 ) -> CutoverResult<Vec<GitTransportCapabilityObservationV1>> {
     let project_ids = row
-        .provenance_import_generations
-        .keys()
+        .member_ids()
+        .into_iter()
         .map(|project_id| project_id.as_str().to_string())
         .collect::<BTreeSet<_>>();
     let mut observations = Vec::with_capacity(row.capability_baselines.len());
@@ -2065,8 +2007,6 @@ fn git_store_limits(config: &Config) -> StoreLimits {
         contract: GitSourceLimits {
             max_history_commits: config.code_collection.max_git_history_commits,
             max_history_logical_bytes: config.code_collection.max_git_history_logical_bytes,
-            max_provenance_documents: config.code_collection.max_provenance_documents,
-            max_provenance_logical_bytes: config.code_collection.max_provenance_logical_bytes,
         },
         max_open_uploads_per_producer: config.code_collection.max_open_uploads_per_producer,
         retained_history_generations: config.code_collection.retained_generations,
@@ -2216,8 +2156,6 @@ fn capture_granted_repo(
     checkout_parity_proof: Option<&GitTransportCheckoutParityProofV1>,
     manifest: &ManifestIndex,
     history_journals: &[HistoryActivationJournalV1],
-    provenance_journals: &[ProvenanceImportJournalV1],
-    config: &Config,
 ) -> CutoverResult<GitTransportRepoEvidenceV1> {
     let mut defects = Vec::new();
     let history = capture_history(
@@ -2243,28 +2181,18 @@ fn capture_granted_repo(
             .get(member.project_id.as_str())
             .and_then(|entry| entry.git_overlay.clone());
         let mut project_defects = Vec::new();
-        let Some(store) = git_store else {
+        if git_store.is_none() {
             project_defects.push("Git source store is missing".to_string());
             projects.push(GitTransportProjectEvidenceV1 {
                 project_id: member.project_id.clone(),
                 scope: member.scope.clone(),
                 code_head,
                 overlay,
-                provenance: None,
                 ready: false,
                 defects: project_defects,
             });
             continue;
-        };
-        let provenance = capture_provenance(
-            layout,
-            store,
-            grant,
-            &member.project_id,
-            &member.scope,
-            provenance_journals,
-            config,
-        )?;
+        }
         let expected_history = history.as_ref();
         if !code_head.as_ref().is_some_and(|code| {
             expected_history.is_some_and(|history| code.head_commit == history.source_head)
@@ -2295,27 +2223,12 @@ fn capture_granted_repo(
             project_defects
                 .push("verified ProducerTransport overlay is missing or stale".to_string());
         }
-        match &provenance {
-            Some(evidence)
-                if evidence.typed_matches_import_journal
-                    && evidence.typed_covers_legacy
-                    && code_head
-                        .as_ref()
-                        .is_some_and(|code| code.selector == evidence.code_selector) => {}
-            Some(_) => project_defects.push(
-                "typed provenance parity, import journal, or code selector is stale".to_string(),
-            ),
-            None => {
-                project_defects.push("provenance import or export receipt is missing".to_string())
-            }
-        }
         let ready = project_defects.is_empty();
         projects.push(GitTransportProjectEvidenceV1 {
             project_id: member.project_id.clone(),
             scope: member.scope.clone(),
             code_head,
             overlay,
-            provenance,
             ready,
             defects: project_defects,
         });
@@ -2355,7 +2268,6 @@ fn recheck_capture(
     checkout_parity_proof: Option<&GitTransportCheckoutParityProofV1>,
     manifest: &ManifestIndex,
     history_journals: &[HistoryActivationJournalV1],
-    provenance_journals: &[ProvenanceImportJournalV1],
     repos: &[GitTransportRepoEvidenceV1],
 ) -> CutoverResult<()> {
     let changed = |detail: &str| {
@@ -2398,18 +2310,13 @@ fn recheck_capture(
     if path_exists_nofollow(&history_root)? != history_store.is_some() {
         return Err(changed("P3 history store presence"));
     }
-    if let Some(git_store) = git_store {
-        if git_store
+    if let Some(git_store) = git_store
+        && git_store
             .list_activation_journals()
             .map_err(|error| cutover_error("error.git_transport_cutover_history", error))?
             != history_journals
-            || git_store
-                .list_provenance_import_journals()
-                .map_err(|error| cutover_error("error.git_transport_cutover_provenance", error))?
-                != provenance_journals
-        {
-            return Err(changed("transport journals"));
-        }
+    {
+        return Err(changed("transport journals"));
     }
     for repo in repos {
         if !capture_evidence_requires_recheck(&repo.coverage_status) {
@@ -2470,44 +2377,6 @@ fn recheck_capture(
             if capture_code_head(layout, &project.project_id, &project.scope)? != project.code_head
             {
                 return Err(changed("active code HEAD"));
-            }
-            let Some(provenance) = &project.provenance else {
-                continue;
-            };
-            let Some(git_store) = git_store else {
-                return Err(changed("provenance store disappeared"));
-            };
-            if git_store
-                .current_ready_provenance_import_id(project.project_id.as_str())
-                .map_err(|error| cutover_error("error.git_transport_cutover_provenance", error))?
-                .as_deref()
-                != Some(provenance.import_generation_id.as_str())
-            {
-                return Err(changed("current provenance import"));
-            }
-            let receipt = git_store
-                .provenance_export_receipt(project.project_id.as_str())
-                .map_err(|error| cutover_error("error.git_transport_cutover_provenance", error))?
-                .ok_or_else(|| changed("provenance export receipt"))?;
-            let grant = repo
-                .grant
-                .as_ref()
-                .ok_or_else(|| changed("provenance grant"))?;
-            if receipt.producer_id != grant.producer_id
-                || receipt.project_id != project.project_id.as_str()
-                || receipt.receipt.scope != project.scope
-                || receipt.receipt.notes_ref != provenance.notes_ref
-                || receipt.receipt.generation != provenance.export_receipt_generation
-                || receipt.receipt.local_notes_tip != provenance.export_receipt_notes_tip
-            {
-                return Err(changed("provenance export receipt"));
-            }
-            let lane = explicit_edge_lane_version(&layout.edge_root, project.project_id.as_str())
-                .map_err(|error| {
-                cutover_error("error.git_transport_cutover_edge_inventory", error)
-            })?;
-            if lane.version_token != provenance.explicit_lane_version_token {
-                return Err(changed("explicit provenance edge lane"));
             }
         }
     }
@@ -2855,254 +2724,6 @@ fn history_generation_matches_journal(
             == journal.vector_input_commitment_sha256
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct LegacyProvenanceEdgeMatchV1 {
-    source: String,
-    kind: String,
-    commit: String,
-    file: Option<String>,
-    tool: Option<String>,
-    byte_start: Option<String>,
-    byte_end: Option<String>,
-}
-
-fn legacy_edge_match(edge: &bbox_edge_sidecar::edge_sidecar::Edge) -> LegacyProvenanceEdgeMatchV1 {
-    LegacyProvenanceEdgeMatchV1 {
-        source: edge.source.to_string(),
-        kind: edge.kind.clone(),
-        commit: edge
-            .metadata
-            .get("anchor.commit_sha_at_edit")
-            .cloned()
-            .unwrap_or_default(),
-        file: edge.metadata.get("anchor.file_path").cloned(),
-        tool: edge.metadata.get("tool.name").cloned(),
-        byte_start: edge.metadata.get("anchor.byte_start").cloned(),
-        byte_end: edge.metadata.get("anchor.byte_end").cloned(),
-    }
-}
-
-fn call_match(
-    note: &bbox_provenance::GitProvenanceNote,
-    call: &bbox_provenance::NoteToolCall,
-    kind: &str,
-    source: &EntityRef,
-) -> LegacyProvenanceEdgeMatchV1 {
-    LegacyProvenanceEdgeMatchV1 {
-        source: source.to_string(),
-        kind: kind.to_string(),
-        commit: note.commit.clone(),
-        file: call.file.clone(),
-        tool: Some(call.tool.clone()),
-        byte_start: call.byte_range.map(|range| range[0].to_string()),
-        byte_end: call.byte_range.map(|range| range[1].to_string()),
-    }
-}
-
-fn reconstruct_typed_provenance_keys(
-    project_id: &ProjectId,
-    notes: &[bbox_provenance::GitProvenanceNote],
-    legacy_matches: &BTreeMap<LegacyProvenanceEdgeMatchV1, BTreeSet<String>>,
-) -> CutoverResult<BTreeSet<String>> {
-    let mut keys = BTreeSet::new();
-    for note in notes {
-        for call in &note.tool_calls {
-            let Some(kind) = bbox_provenance::authenticated_edge_kind_for_call(call) else {
-                continue;
-            };
-            let Some(source_ref) = call.source_ref.as_deref() else {
-                continue;
-            };
-            let Ok(source) = EntityRef::parse(source_ref) else {
-                continue;
-            };
-            if note.schema_version == bbox_provenance::SCHEMA_VERSION_V1 {
-                if let Some(matched) = legacy_matches.get(&call_match(note, call, kind, &source)) {
-                    keys.extend(matched.iter().cloned());
-                }
-                continue;
-            }
-            let target = EntityRef::parse(call.target_ref.as_deref().unwrap_or_default())
-                .map_err(|error| cutover_error("error.git_transport_cutover_provenance", error))?;
-            let target_project = match &target {
-                EntityRef::ProjectFile {
-                    project_id: target_project,
-                    ..
-                }
-                | EntityRef::ProjectFileV2 {
-                    project_id: target_project,
-                    ..
-                } => target_project,
-                _ => {
-                    return Err(cutover_error(
-                        "error.git_transport_cutover_provenance",
-                        "authenticated V2 provenance target is not a project file",
-                    ));
-                }
-            };
-            if target_project != project_id.as_str() {
-                return Err(cutover_error(
-                    "error.git_transport_cutover_provenance",
-                    "authenticated V2 provenance target belongs to another project",
-                ));
-            }
-            let mut metadata = BTreeMap::new();
-            metadata.insert("anchor.commit_sha_at_edit".to_string(), note.commit.clone());
-            let edge = bbox_edge_sidecar::edge_sidecar::Edge {
-                source,
-                kind: kind.to_string(),
-                target,
-                provenance: bbox_chunker::EdgeProvenance::Explicit,
-                confidence: bbox_chunker::EdgeConfidence::Heuristic,
-                metadata,
-                project_id: None,
-            };
-            keys.insert(edge_import_key(&edge));
-        }
-    }
-    Ok(keys)
-}
-
-fn capture_provenance(
-    layout: &ProjectCatalogMigrationResolvedLayoutV1,
-    store: &GitSourceStore,
-    grant: &RepoTransportGrant,
-    project_id: &ProjectId,
-    scope: &PublishedScope,
-    journals: &[ProvenanceImportJournalV1],
-    config: &Config,
-) -> CutoverResult<Option<GitTransportProvenanceEvidenceV1>> {
-    let Some(import_generation_id) = store
-        .current_ready_provenance_import_id(project_id.as_str())
-        .map_err(|error| cutover_error("error.git_transport_cutover_provenance", error))?
-    else {
-        return Ok(None);
-    };
-    let source = store
-        .verified_provenance_import(&import_generation_id)
-        .map_err(|error| cutover_error("error.git_transport_cutover_provenance", error))?;
-    if source.producer_id != grant.producer_id
-        || source.project_id != project_id.as_str()
-        || source.scope != *scope
-        || source.notes_ref != layout.provenance_notes_ref
-    {
-        return Ok(None);
-    }
-    let Some(journal) = journals.iter().find(|journal| {
-        journal.project_id == project_id.as_str()
-            && journal.import_generation_id == import_generation_id
-    }) else {
-        return Ok(None);
-    };
-    if journal.stage != ProvenanceImportStageV1::Committed
-        || journal.producer_id != grant.producer_id
-    {
-        return Ok(None);
-    }
-    let Some(receipt) = store
-        .provenance_export_receipt(project_id.as_str())
-        .map_err(|error| cutover_error("error.git_transport_cutover_provenance", error))?
-    else {
-        return Ok(None);
-    };
-    if receipt.producer_id != grant.producer_id
-        || receipt.receipt.scope != *scope
-        || receipt.receipt.notes_ref != layout.provenance_notes_ref
-        || receipt.receipt.local_notes_tip != source.notes_tip
-    {
-        return Ok(None);
-    }
-    let mut v1_document_count = 0_u64;
-    let mut v2_document_count = 0_u64;
-    let mut notes = Vec::new();
-    store
-        .visit_verified_provenance_documents(&source, |document| {
-            let note = bbox_provenance::parse_note_document(&document.document)?;
-            match note.schema_version {
-                bbox_provenance::SCHEMA_VERSION_V1 => v1_document_count += 1,
-                bbox_provenance::SCHEMA_VERSION_V2 => v2_document_count += 1,
-                _ => unreachable!("verified parser accepts only v1 and v2"),
-            }
-            notes.push(note);
-            Ok(())
-        })
-        .map_err(|error| cutover_error("error.git_transport_cutover_provenance", error))?;
-
-    let mut legacy_keys = BTreeSet::new();
-    let mut resolved_matches = BTreeMap::<LegacyProvenanceEdgeMatchV1, BTreeSet<String>>::new();
-    let max_source_bytes = config
-        .code_collection
-        .max_provenance_logical_bytes
-        .saturating_mul(4)
-        .min(MAX_ACTIVE_SIDECAR_INPUT_BYTES)
-        .max(1);
-    let lane = visit_explicit_edge_lane(
-        &layout.edge_root,
-        project_id.as_str(),
-        max_source_bytes,
-        MAX_EXPLICIT_EDGE_LINE_BYTES,
-        |edge| {
-            if !matches!(edge.kind.as_str(), "READ_FILE" | "EDITED_FILE")
-                || edge.metadata.get("anchor.project_id").map(String::as_str)
-                    != Some(project_id.as_str())
-                || !edge.metadata.contains_key("anchor.commit_sha_at_edit")
-            {
-                return Ok(());
-            }
-            let key = edge_import_key(&edge);
-            resolved_matches
-                .entry(legacy_edge_match(&edge))
-                .or_default()
-                .insert(key.clone());
-            if !edge
-                .metadata
-                .contains_key("provenance.import_generation_id")
-            {
-                legacy_keys.insert(key);
-            }
-            Ok(())
-        },
-    )
-    .map_err(|error| cutover_error("error.git_transport_cutover_edge_inventory", error))?;
-    let typed_keys = reconstruct_typed_provenance_keys(project_id, &notes, &resolved_matches)?;
-    let legacy_edge_keys_sha256 = provenance_edge_key_commitment(&legacy_keys);
-    let typed_edge_keys_sha256 = provenance_edge_key_commitment(&typed_keys);
-    let typed_matches_import_journal = journal.edge_count == typed_keys.len() as u64
-        && journal.edge_keys_sha256 == typed_edge_keys_sha256;
-    let typed_covers_legacy = legacy_keys.is_subset(&typed_keys);
-    Ok(Some(GitTransportProvenanceEvidenceV1 {
-        import_generation_id,
-        code_selector: journal.code_selector.clone(),
-        notes_ref: source.notes_ref,
-        notes_tip: source.notes_tip,
-        manifest_sha256: source.manifest_sha256,
-        v1_document_count,
-        v2_document_count,
-        explicit_lane_version_token: lane.version_token,
-        explicit_lane_sha256: lane.content_sha256,
-        legacy_edge_key_count: legacy_keys.len() as u64,
-        legacy_edge_keys_sha256,
-        typed_edge_key_count: typed_keys.len() as u64,
-        typed_edge_keys_sha256,
-        imported_edge_key_count: journal.edge_count,
-        imported_edge_keys_sha256: journal.edge_keys_sha256.clone(),
-        typed_matches_import_journal,
-        typed_covers_legacy,
-        export_receipt_generation: receipt.receipt.generation,
-        export_receipt_notes_tip: receipt.receipt.local_notes_tip,
-    }))
-}
-
-fn provenance_edge_key_commitment(keys: &BTreeSet<String>) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(b"bbox-provenance-import-edge-keys-v1\0");
-    for key in keys {
-        hasher.update((key.len() as u64).to_be_bytes());
-        hasher.update(key.as_bytes());
-    }
-    hex::encode(hasher.finalize())
-}
-
 fn load_or_create_resolution(
     path: &Path,
     inventory_hash: Sha256ValueV1,
@@ -3165,7 +2786,6 @@ fn predicted_marker(
     inventory_hash: Sha256ValueV1,
     resolution_artifact_hash: Sha256ValueV1,
     prepared_history_journal_count: u64,
-    prepared_provenance_journal_count: u64,
     repos: &[GitTransportRepoEvidenceV1],
     carried_forward_rows: &[PredictedGitTransportCutoverRowV1],
 ) -> PredictedGitTransportCutoverMarkerV1 {
@@ -3189,45 +2809,14 @@ fn predicted_marker(
                 history_parity_commitment: Sha256ValueV1::digest(
                     &serde_json::to_vec(history).expect("history evidence is serializable"),
                 ),
-                provenance_import_generations: repo
+                members: repo
                     .projects
                     .iter()
-                    .filter_map(|project| {
-                        project.provenance.as_ref().map(|provenance| {
-                            (
-                                project.project_id.clone(),
-                                provenance.import_generation_id.clone(),
-                            )
-                        })
-                    })
+                    .map(|project| project.project_id.clone())
                     .collect(),
-                provenance_export_generations: repo
-                    .projects
-                    .iter()
-                    .filter_map(|project| {
-                        project.provenance.as_ref().map(|provenance| {
-                            (
-                                project.project_id.clone(),
-                                provenance.export_receipt_generation.clone(),
-                            )
-                        })
-                    })
-                    .collect(),
-                provenance_parity_commitments: repo
-                    .projects
-                    .iter()
-                    .filter_map(|project| {
-                        project.provenance.as_ref().map(|provenance| {
-                            (
-                                project.project_id.clone(),
-                                Sha256ValueV1::digest(
-                                    &serde_json::to_vec(provenance)
-                                        .expect("provenance evidence is serializable"),
-                                ),
-                            )
-                        })
-                    })
-                    .collect(),
+                provenance_import_generations: BTreeMap::new(),
+                provenance_export_generations: BTreeMap::new(),
+                provenance_parity_commitments: BTreeMap::new(),
                 capability_baselines: repo.capability_baselines.clone(),
             })
         })
@@ -3258,7 +2847,7 @@ fn predicted_marker(
         resolution_artifact_hash,
         aggregate_grant_hash,
         zero_prepared_history_journals: prepared_history_journal_count == 0,
-        zero_prepared_provenance_journals: prepared_provenance_journal_count == 0,
+        zero_prepared_provenance_journals: true,
         rows,
     }
 }
@@ -3266,13 +2855,10 @@ fn predicted_marker(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bbox_chunker::{EdgeConfidence, EdgeProvenance};
     use bbox_corpus_core::project_catalog::{
         CatalogSnapshotV2, CommitNamespace, CorpusProject, RecordedRepoAuthority,
         RepoHistoryAuthority, RepoHistoryRecord,
     };
-    use bbox_edge_sidecar::edge_sidecar::Edge;
-    use bbox_provenance::{GitProvenanceNote, NoteToolCall, ProducedBy};
 
     fn project_id() -> ProjectId {
         ProjectId::parse("p_00000000000000000000000000000001").unwrap()
@@ -3329,6 +2915,7 @@ mod tests {
             source_generation_id: "source-one".to_string(),
             p3_generation_id: format!("rhg_{}", "a".repeat(64)),
             history_parity_commitment: Sha256ValueV1::digest(b"history"),
+            members: BTreeSet::new(),
             provenance_import_generations: BTreeMap::from([(
                 project_id.clone(),
                 "import-one".to_string(),
@@ -3409,98 +2996,36 @@ mod tests {
         }
     }
 
-    fn call(target_ref: Option<String>, file: &str) -> NoteToolCall {
-        NoteToolCall {
-            tool: "Edit".to_string(),
-            edge_kind: Some("EDITED_FILE".to_string()),
-            source_ref: Some("transcript:test:session:10:0".to_string()),
-            target_ref,
-            file: Some(file.to_string()),
-            byte_range: Some([10, 20]),
-            turn: Some(10),
-        }
-    }
-
+    /// A marker row names its members explicitly; a row without `members`
+    /// names them by its per-member provenance map keys. Both shapes decode,
+    /// and the explicit shape serializes its members while the map-keyed
+    /// shape serializes without a `members` key.
     #[test]
-    fn reconstructed_typed_superset_covers_untagged_dedup_row() {
-        let project_id = project_id();
-        let target_one = format!("project_file:{project_id}:path:{}:0", "a".repeat(64));
-        let target_two = format!("project_file:{project_id}:path:{}:0", "b".repeat(64));
-        let legacy_call = call(None, "src/legacy.rs");
-        let v1 = GitProvenanceNote {
-            schema_version: bbox_provenance::SCHEMA_VERSION_V1,
-            commit: "1".repeat(40),
-            part: None,
-            produced_by: ProducedBy::default(),
-            tool_calls: vec![legacy_call.clone()],
-            knowledge_writes: Vec::new(),
-        };
-        let v2 = GitProvenanceNote::new_v2(
-            "2".repeat(40),
-            ProducedBy::default(),
-            vec![call(Some(target_two), "src/new.rs")],
-            Vec::new(),
-        );
-        let mut metadata = BTreeMap::from([
-            ("anchor.project_id".to_string(), project_id.to_string()),
-            ("anchor.file_path".to_string(), "src/legacy.rs".to_string()),
-            ("anchor.commit_sha_at_edit".to_string(), "1".repeat(40)),
-            ("tool.name".to_string(), "Edit".to_string()),
-            ("anchor.byte_start".to_string(), "10".to_string()),
-            ("anchor.byte_end".to_string(), "20".to_string()),
-        ]);
-        let legacy_edge = Edge {
-            source: EntityRef::parse("transcript:test:session:10:0").unwrap(),
-            kind: "EDITED_FILE".to_string(),
-            target: EntityRef::parse(&target_one).unwrap(),
-            provenance: EdgeProvenance::Explicit,
-            confidence: EdgeConfidence::Heuristic,
-            metadata: std::mem::take(&mut metadata),
-            project_id: None,
-        };
-        let legacy_key = edge_import_key(&legacy_edge);
-        let matches = BTreeMap::from([(
-            legacy_edge_match(&legacy_edge),
-            BTreeSet::from([legacy_key.clone()]),
-        )]);
-        let typed = reconstruct_typed_provenance_keys(&project_id, &[v1, v2], &matches).unwrap();
-        assert_eq!(typed.len(), 2);
-        assert!(typed.contains(&legacy_key));
-        assert_eq!(provenance_edge_key_commitment(&typed).len(), 64);
-    }
+    fn row_member_ids_read_both_row_shapes() {
+        let (_catalog, repo_history_id, _scope, row) = coverage_fixture();
+        let keyed_members = row
+            .provenance_import_generations
+            .keys()
+            .collect::<BTreeSet<_>>();
+        assert!(!keyed_members.is_empty(), "fixture row must carry members");
+        assert!(row.members.is_empty());
+        assert_eq!(row.member_ids(), keyed_members);
+        let keyed_json = serde_json::to_value(&row).unwrap();
+        assert!(keyed_json.get("members").is_none());
 
-    #[test]
-    fn provenance_reconstruction_refuses_cross_project_v2_and_leaves_unresolved_v1_unmatched() {
-        let project_id = project_id();
-        let other_target = format!(
-            "project_file:{}:path:{}:0",
-            "p_00000000000000000000000000000002",
-            "a".repeat(64)
-        );
-        let cross_project = GitProvenanceNote::new_v2(
-            "2".repeat(40),
-            ProducedBy::default(),
-            vec![call(Some(other_target), "src/other.rs")],
-            Vec::new(),
-        );
-        assert!(
-            reconstruct_typed_provenance_keys(&project_id, &[cross_project], &BTreeMap::new())
-                .is_err()
-        );
-
-        let unmatched_v1 = GitProvenanceNote {
-            schema_version: bbox_provenance::SCHEMA_VERSION_V1,
-            commit: "1".repeat(40),
-            part: None,
-            produced_by: ProducedBy::default(),
-            tool_calls: vec![call(None, "src/missing.rs")],
-            knowledge_writes: Vec::new(),
+        let explicit = PredictedGitTransportCutoverRowV1 {
+            members: keyed_members.into_iter().cloned().collect(),
+            provenance_import_generations: BTreeMap::new(),
+            provenance_export_generations: BTreeMap::new(),
+            provenance_parity_commitments: BTreeMap::new(),
+            ..row.clone()
         };
-        assert!(
-            reconstruct_typed_provenance_keys(&project_id, &[unmatched_v1], &BTreeMap::new())
-                .unwrap()
-                .is_empty()
-        );
+        assert_eq!(explicit.member_ids(), row.member_ids());
+        assert!(marker_rows_are_canonical(std::slice::from_ref(&explicit)));
+        let round_trip: PredictedGitTransportCutoverRowV1 =
+            serde_json::from_slice(&serde_json::to_vec(&explicit).unwrap()).unwrap();
+        assert_eq!(round_trip, explicit);
+        assert_eq!(round_trip.repo_history_id, repo_history_id);
     }
 
     #[test]
@@ -3814,18 +3339,12 @@ mod tests {
             source_generation_id: "source-three".to_string(),
             p3_generation_id: format!("rhg_{}", "c".repeat(64)),
             history_parity_commitment: Sha256ValueV1::digest(b"history-three"),
-            provenance_import_generations: BTreeMap::from([(
-                second_project.clone(),
-                "import-three".to_string(),
-            )]),
-            provenance_export_generations: BTreeMap::from([(
-                second_project.clone(),
-                "export-three".to_string(),
-            )]),
-            provenance_parity_commitments: BTreeMap::from([(
-                second_project,
-                Sha256ValueV1::digest(b"provenance-three"),
-            )]),
+            // A row written by the current preflight: an explicit member set
+            // and empty per-member provenance maps.
+            members: BTreeSet::from([second_project]),
+            provenance_import_generations: BTreeMap::new(),
+            provenance_export_generations: BTreeMap::new(),
+            provenance_parity_commitments: BTreeMap::new(),
             capability_baselines: first_row.capability_baselines.clone(),
         };
         let mut marker = marker_with_row(first_row.clone());
@@ -3926,7 +3445,6 @@ mod tests {
             Sha256ValueV1::digest(b"inventory"),
             Sha256ValueV1::digest(b"resolution"),
             0,
-            0,
             &[],
             std::slice::from_ref(&row),
         );
@@ -3981,7 +3499,6 @@ mod tests {
             42,
             Sha256ValueV1::digest(b"recutover-inventory"),
             Sha256ValueV1::digest(b"recutover-resolution"),
-            0,
             0,
             &repos,
             &carried_rows,

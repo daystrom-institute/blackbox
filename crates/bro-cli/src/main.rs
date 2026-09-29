@@ -24,12 +24,10 @@ use bro_fleet_client::Provider;
 use clap::{Args, Parser, Subcommand};
 use ratatui::prelude::{Color, Line, Modifier, Span, Style};
 
-mod blame;
 mod fleet_classifier;
 mod fleet_tui;
 mod logging;
 mod mcp_call;
-mod provenance;
 mod render_global;
 #[cfg(test)]
 mod test_backend;
@@ -62,10 +60,6 @@ enum BroCommand {
     Mcp(mcp_call::McpArgs),
     /// Guidance renders - pull the daemon's global render onto this host
     Render(render_global::RenderArgs),
-    /// Checkout-local provenance commands
-    Provenance(provenance::ProvenanceArgs),
-    /// Checkout-local Git blame with central corpus enrichment
-    Blame(blame::BlameArgs),
     /// Operator workspace binding lifecycle for one local checkout
     #[command(name = "workspace-binding")]
     WorkspaceBinding(workspace_binding::WorkspaceBindingArgs),
@@ -294,8 +288,6 @@ fn main() -> anyhow::Result<()> {
         BroCommand::Tail(args) => rt.block_on(run_tail_stream_printer(TailSelectors::from(args))),
         BroCommand::Mcp(args) => rt.block_on(mcp_call::run(args)),
         BroCommand::Render(args) => rt.block_on(render_global::run(args)),
-        BroCommand::Provenance(args) => rt.block_on(provenance::run(args)),
-        BroCommand::Blame(args) => rt.block_on(blame::run(args)),
         BroCommand::WorkspaceBinding(args) => rt.block_on(workspace_binding::run(args)),
         BroCommand::Fleet(args) => {
             default_fleet_harness_tee();
@@ -517,52 +509,5 @@ mod tests {
         };
         assert_eq!(args.provider, Provider::Brodex);
         assert!(args.prompt.is_empty());
-    }
-
-    #[test]
-    fn clap_routes_provenance_export() {
-        let cli = BroCli::parse_from([
-            "bro",
-            "provenance",
-            "export",
-            "--project-root",
-            "/tmp/project",
-            "--token-file",
-            "/tmp/token",
-        ]);
-        assert!(matches!(cli.command, BroCommand::Provenance(_)));
-    }
-
-    #[test]
-    fn clap_routes_checkout_local_blame() {
-        let cli = BroCli::parse_from([
-            "bro",
-            "blame",
-            "--token-file",
-            "/tmp/token",
-            "--file",
-            "src/lib.rs",
-            "--line",
-            "7",
-        ]);
-        assert!(matches!(cli.command, BroCommand::Blame(_)));
-    }
-
-    #[test]
-    fn clap_routes_blame_overlap_to_an_explicit_legacy_daemon() {
-        let cli = BroCli::parse_from([
-            "bro",
-            "blame",
-            "--token-file",
-            "/tmp/token",
-            "--file",
-            "src/lib.rs",
-            "--line",
-            "7",
-            "--verify-overlap",
-            "--legacy-daemon-url",
-            "http://127.0.0.1:17265",
-        ]);
-        assert!(matches!(cli.command, BroCommand::Blame(_)));
     }
 }

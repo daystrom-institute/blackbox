@@ -575,7 +575,7 @@ impl ProjectCatalogMigrationResolvedLayoutV1 {
         for path in self.all_paths() {
             validate_absolute_path(path)?;
         }
-        bbox_provenance::validate_notes_ref(&self.provenance_notes_ref)
+        crate::project_catalog_notes_owner::validate_notes_ref(&self.provenance_notes_ref)
             .map_err(|_| unsafe_layout("provenance notes ref is invalid"))?;
         if let Some(root) = &self.rehearsal_root {
             for path in self.all_paths() {
@@ -770,7 +770,7 @@ fn validated_notes_ref(namespace: &str) -> Result<String, ProjectCatalogMigratio
         return Err(unsafe_layout("provenance notes namespace is invalid"));
     }
     let notes_ref = format!("refs/notes/{namespace}/provenance");
-    bbox_provenance::validate_notes_ref(&notes_ref)
+    crate::project_catalog_notes_owner::validate_notes_ref(&notes_ref)
         .map_err(|_| unsafe_layout("provenance notes namespace is invalid"))?;
     Ok(notes_ref)
 }

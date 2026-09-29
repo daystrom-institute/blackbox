@@ -149,10 +149,6 @@ pub(crate) struct SharedState {
     /// proves the remote result matched its overlap reference.
     pub(crate) knowledge_transport_observations:
         bbox_indexing::knowledge_transport_observations::KnowledgeTransportObservationsV1,
-    /// Durable positive-use and shadow-parity evidence for checkout-local
-    /// blame execution. Contains identity and response checksums only.
-    pub(crate) blame_locality_observations:
-        bbox_indexing::blame_locality_observations::BlameLocalityObservationsV1,
     /// Durable exact-receipt evidence for checkout-owned project renders,
     /// keyed by project and explicit published/own/all view.
     pub(crate) render_locality_observations:
@@ -248,11 +244,6 @@ pub(crate) struct SharedState {
     /// monotonic no-fallback boundary even while it is pending re-cutover.
     pub(crate) knowledge_transport_cutover:
         Arc<bbox_indexing::knowledge_transport_cutover::KnowledgeTransportCutoverRuntimeV1>,
-    /// Strict per-project blame locality authority. A checksummed marker row
-    /// makes checkout-local execution mandatory before the legacy adapter can
-    /// acquire a daemon-side checkout lease.
-    pub(crate) blame_locality_cutover:
-        Arc<bbox_indexing::blame_locality_cutover::BlameLocalityCutoverRuntimeV1>,
     /// Strict per-project render locality authority. A checksummed marker row
     /// prevents any unbound daemon project-render adapter from reacquiring a
     /// checkout after the measured cut.
@@ -843,8 +834,6 @@ impl SharedState {
             checkout_access,
             knowledge_transport_observations:
                 bbox_indexing::knowledge_transport_observations::KnowledgeTransportObservationsV1::in_memory(),
-            blame_locality_observations:
-                bbox_indexing::blame_locality_observations::BlameLocalityObservationsV1::in_memory(),
             render_locality_observations:
                 bbox_indexing::render_locality_observations::RenderLocalityObservationsV1::in_memory(),
             publisher_refs: RwLock::new(
@@ -892,9 +881,6 @@ impl SharedState {
             ),
             knowledge_transport_cutover: Arc::new(
                 bbox_indexing::knowledge_transport_cutover::KnowledgeTransportCutoverRuntimeV1::default(),
-            ),
-            blame_locality_cutover: Arc::new(
-                bbox_indexing::blame_locality_cutover::BlameLocalityCutoverRuntimeV1::default(),
             ),
             render_locality_cutover: Arc::new(
                 bbox_indexing::render_locality_cutover::RenderLocalityCutoverRuntimeV1::default(),
@@ -1278,7 +1264,7 @@ mod clause_one_exit_proof {
     /// order. Deleting a row therefore fails rather than silently reducing
     /// coverage, which is how this proof came to cover two operations while
     /// claiming twelve.
-    const REQUIRED_OPERATIONS: [&str; 12] = [
+    const REQUIRED_OPERATIONS: [&str; 11] = [
         "lexical search",
         "hybrid search",
         "graph inspect",
@@ -1290,7 +1276,6 @@ mod clause_one_exit_proof {
         "collected activation and rebuild",
         "published knowledge",
         "published gaps",
-        "provenance export plan",
     ];
 
     fn rendered(result: &rmcp::model::CallToolResult) -> String {
@@ -1426,8 +1411,7 @@ mod clause_one_exit_proof {
     ///
     /// Equality is the proof, not success. Several of these operations
     /// legitimately refuse under `DenyCheckoutAccess` (the file provider
-    /// needs a checkout; the provenance plan needs an authoritative session
-    /// checkout). An identical refusal is exactly as strong a statement as
+    /// needs a checkout). An identical refusal is exactly as strong a statement as
     /// an identical success: neither varies with the attached-row view.
     #[tokio::test]
     async fn every_corpus_only_operation_is_identical_without_attached_rows() {
@@ -1516,9 +1500,6 @@ mod clause_one_exit_proof {
             "storage GC varied with the attached-row view"
         );
         executed.push("storage GC");
-        compare!("provenance export plan", server => server
-            .bbox_provenance_export_plan(Parameters(params(serde_json::json!({}))))
-            .await);
 
         // Collected activation and rebuild is not a tool call: it is the
         // index-side pass that seeds corpus identity from
@@ -1875,18 +1856,10 @@ mod code_read_view_tests {
                 source_generation_id: "source-one".to_string(),
                 p3_generation_id: format!("rhg_{}", "a".repeat(64)),
                 history_parity_commitment: Sha256ValueV1::digest(b"history"),
-                provenance_import_generations: BTreeMap::from([(
-                    project_id.clone(),
-                    "import-one".to_string(),
-                )]),
-                provenance_export_generations: BTreeMap::from([(
-                    project_id.clone(),
-                    "export-one".to_string(),
-                )]),
-                provenance_parity_commitments: BTreeMap::from([(
-                    project_id.clone(),
-                    Sha256ValueV1::digest(b"provenance"),
-                )]),
+                members: std::collections::BTreeSet::from([project_id.clone()]),
+                provenance_import_generations: BTreeMap::new(),
+                provenance_export_generations: BTreeMap::new(),
+                provenance_parity_commitments: BTreeMap::new(),
                 capability_baselines: Vec::new(),
             }],
             checksum_sha256: Sha256ValueV1::digest(b"checksum"),
@@ -2699,16 +2672,6 @@ pub(crate) struct BlackboxServer {
     /// self-MCP header. A raw query parameter can never populate this slot.
     pub(crate) session_workspace_binding:
         OnceLock<Option<Arc<super::knowledge_source::WorkspaceBindingGrant>>>,
-    /// Scope-bound attended blame authority authenticated from producer
-    /// bearer plus path-free identity headers. Other harness-local tools do
-    /// not consult this slot.
-    pub(crate) session_operator_blame_binding:
-        OnceLock<Option<Arc<super::blame_authority::OperatorBlameGrant>>>,
-    /// Scope-bound attended provenance-export authority authenticated from a
-    /// producer bearer plus path-free published-scope headers. This grant is
-    /// read-only corpus planning authority and cannot mutate project state.
-    pub(crate) session_operator_provenance_binding:
-        OnceLock<Option<Arc<super::provenance_authority::OperatorProvenanceGrant>>>,
 }
 
 /// Catalog-mode view fixtures shared by the published knowledge and gap
@@ -3036,8 +2999,7 @@ pub(crate) mod catalog_fixture {
         /// `repo_knowledge` only and therefore cannot express the section 9
         /// rows whose gate is a different bit. Composes with any of them
         /// rather than duplicating their identity-marker setup, so a row
-        /// that needs `render_output` or `blame` attaches normally and then
-        /// says so.
+        /// that needs `render_output` attaches normally and then says so.
         pub(crate) fn grant_capabilities(
             &self,
             attachment_id: &str,
@@ -3449,23 +3411,12 @@ mod clause_two_proof_a {
         );
     }
 
-    /// Row 5 (render/file provider) and row 4 (blame) reach the checkout
-    /// through the tool surface; both must refuse without opening one.
+    /// Row 5 (render/file provider) reaches the checkout through the tool
+    /// surface; it must refuse without opening one.
     #[tokio::test]
-    async fn blame_and_render_refuse_without_opening_a_checkout() {
+    async fn render_refuses_without_opening_a_checkout() {
         let (fixture, _, _) = denied_fixture();
         let server = fixture.server();
-
-        let blame = server
-            .bbox_blame(Parameters(crate::mcp_tools::blame::BlameParams {
-                file: Some("src/lib.rs".into()),
-                line: Some(1),
-                entity_ref: None,
-                locality: None,
-            }))
-            .await;
-        assert_eq!(blame.is_error, Some(true), "{blame:?}");
-        assert_denied(&server, "blame", &text_of(&blame));
 
         let render = server
             .bbox_render(Parameters(crate::knowledge::RenderParams {
@@ -3490,30 +3441,6 @@ mod clause_two_proof_a {
             .expect_err("file refs need a checkout");
 
         assert_denied(&server, "file provider", &error.to_string());
-    }
-
-    /// Row 6: legacy Git-note import and export both refuse; the PLAN is
-    /// corpus computation and is covered by the corpus-only row below.
-    #[tokio::test]
-    async fn provenance_note_io_refuses_without_opening_a_checkout() {
-        let (fixture, _, _) = denied_fixture();
-        let server = fixture.server();
-
-        let export = server
-            .bbox_provenance_export(Parameters(crate::mcp_tools::provenance::ProvenanceParams {
-                project_id: Some(PROJECT.into()),
-            }))
-            .await;
-        assert_eq!(export.is_error, Some(true), "{export:?}");
-        assert_denied(&server, "provenance export", &text_of(&export));
-
-        let import = server
-            .bbox_provenance_import(Parameters(crate::mcp_tools::provenance::ProvenanceParams {
-                project_id: Some(PROJECT.into()),
-            }))
-            .await;
-        assert_eq!(import.is_error, Some(true), "{import:?}");
-        assert_denied(&server, "provenance import", &text_of(&import));
     }
 
     /// Row 7: catalog-targeted mutation refuses. Eject is the mutation the
@@ -3677,7 +3604,7 @@ mod clause_three_exit_proof {
     }
 
     /// A refusal must name the missing attachment, never a missing project.
-    /// Plan 10.5 fixes this: file, blame, render, and mutation do not
+    /// Plan 10.5 fixes this: file, render, and mutation do not
     /// translate a missing attachment into project-not-found, because an
     /// operator who sees "not registered" goes looking for a registration
     /// that already exists.
@@ -3693,8 +3620,7 @@ mod clause_three_exit_proof {
     }
 
     /// The content-domain half of the table: published knowledge and gaps
-    /// serve accepted bytes with zero attachments, and the provenance PLAN
-    /// succeeds because it is corpus computation that opens no Git notes.
+    /// serve accepted bytes with zero attachments.
     #[test]
     fn accepted_content_serves_with_zero_attachments() {
         let (_fixture, server) = remote_only();
@@ -3720,22 +3646,11 @@ mod clause_three_exit_proof {
         );
     }
 
-    /// Blame, render, the file provider, and Git-note I/O all refuse, and
-    /// all refuse on the attachment.
+    /// Render and the file provider both refuse, and both refuse on the
+    /// attachment.
     #[tokio::test]
     async fn checkout_backed_surfaces_return_attachment_required() {
         let (_fixture, server) = remote_only();
-
-        let blame = server
-            .bbox_blame(Parameters(crate::mcp_tools::blame::BlameParams {
-                file: Some("src/lib.rs".into()),
-                line: Some(1),
-                entity_ref: None,
-                locality: None,
-            }))
-            .await;
-        assert_eq!(blame.is_error, Some(true));
-        assert_attachment_required("blame", &text_of(&blame));
 
         let render = server
             .bbox_render(Parameters(crate::knowledge::RenderParams {
@@ -3751,14 +3666,6 @@ mod clause_three_exit_proof {
             bbox_providers::providers::file::resolve_file(&server.provider_context(), "src/lib.rs")
                 .expect_err("a file ref needs a checkout");
         assert_attachment_required("file provider", &file.to_string());
-
-        let export = server
-            .bbox_provenance_export(Parameters(crate::mcp_tools::provenance::ProvenanceParams {
-                project_id: Some(PROJECT.into()),
-            }))
-            .await;
-        assert_eq!(export.is_error, Some(true));
-        assert_attachment_required("provenance note io", &text_of(&export));
 
         let eject = server
             .bbox_project_eject(Parameters(bbox_indexing::projects::ProjectEjectParams {

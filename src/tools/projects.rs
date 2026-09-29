@@ -7,7 +7,6 @@ use std::time::Duration;
 use crate::artifacts;
 use crate::config;
 use crate::index;
-use crate::mcp_tools;
 use crate::orchestration;
 use crate::projects::{
     ProjectEjectParams, ProjectInitParams, ProjectListResponse, ProjectRegisterParams,
@@ -428,7 +427,7 @@ impl BlackboxServer {
         }
         self.state.nudge_edge_index_rebuild();
         // Phase 2: heavy fs work (MCP migration, config load, artifact discovery,
-        // provenance import, watcher, kb sync) on the blocking pool.
+        // watcher, kb sync) on the blocking pool.
         let server = self.clone();
         let result: anyhow::Result<String> = tokio::task::spawn_blocking(move || {
             let response = server.run_post_register_pipeline(record)?;
@@ -560,10 +559,9 @@ impl BlackboxServer {
     }
 
     /// The post-register enrichment pipeline (plan §9.1): MCP migration,
-    /// project config + artifact discovery, provenance import, watcher and
-    /// kb registration, and the transcript-edge backfill, all behind the
-    /// same capability leases in both authority modes. Blocking work: call
-    /// from the blocking pool only.
+    /// project config + artifact discovery, watcher and kb registration, and
+    /// the transcript-edge backfill, all behind the same capability leases in
+    /// both authority modes. Blocking work: call from the blocking pool only.
     ///
     /// Capability semantics: a catalog attachment records what its checkout
     /// shape supports; a step whose capability is not recorded is skipped
@@ -649,58 +647,6 @@ impl BlackboxServer {
                 }
                 Err(error) => return Err(error),
             }
-            let edges_dir = crate::server::edge_sidecar_dir(&server.state);
-            let provenance_lease =
-                match crate::server::checkout_access::acquire_selected_project_access(
-                    &server.state.checkout_access,
-                    &record.project_id,
-                    CheckoutAccessKind::ProvenanceNoteIo,
-                    CheckoutAccessIntent::Read,
-                ) {
-                    Ok(lease) => Some(lease),
-                    Err(error) if capability_denied(&error) => {
-                        skipped_enrichment.push("provenance_import");
-                        None
-                    }
-                    Err(error) => return Err(error),
-                };
-            if let Some(provenance_lease) = provenance_lease {
-                let provenance_project = mcp_tools::provenance::ProvenanceProject {
-                    project_id: record.project_id.clone(),
-                    project_root: provenance_lease.project_root().to_path_buf(),
-                };
-                let resolve_legacy_target =
-                    |project_id: &str,
-                     root: &Path,
-                     absolute_path: &Path,
-                     byte_range: Option<(u64, u64)>| {
-                        if project_id != record.project_id {
-                            anyhow::bail!(
-                                "error.project_mismatch: provenance target belongs to another project"
-                            );
-                        }
-                        bbox_indexing::index::resolve_current_project_chunk_entity(
-                            &record.project_id,
-                            root,
-                            absolute_path,
-                            byte_range,
-                        )
-                    };
-                let prepared_provenance = mcp_tools::provenance::prepare_provenance_import(
-                    std::slice::from_ref(&provenance_project),
-                    &resolve_legacy_target,
-                )?;
-                let provenance_publication = server
-                    .state
-                    .checkout_access
-                    .publication_guard(&provenance_lease)
-                    .map_err(anyhow::Error::new)?;
-                mcp_tools::provenance::publish_prepared_provenance_import(
-                    prepared_provenance,
-                    &edges_dir,
-                )?;
-                drop(provenance_publication);
-            }
             // Register with the live .bbox/ watcher so future file changes
             // are picked up without a daemon restart.
             if let Ok(mut guard) = server.state.bbox_watcher.lock() {
@@ -747,27 +693,13 @@ impl BlackboxServer {
                         bbox_indexing::checkout_access::CheckoutAccessKind::LocalProjectWalk,
                         bbox_indexing::checkout_access::CheckoutAccessIntent::Read,
                         )?;
-                        let git = project_for_backfill
-                            .is_git_repo
-                            .then(|| {
-                                crate::server::checkout_access::acquire_selected_project_access(
-                                    &checkout_access,
-                                    &project_for_backfill.project_id,
-                                    bbox_indexing::checkout_access::CheckoutAccessKind::GitHistory,
-                                    bbox_indexing::checkout_access::CheckoutAccessIntent::Read,
-                                )
-                            })
-                            .transpose()?;
                         index::backfill_tool_edges_for_project(
                             &reindex_cfg,
                             &project_for_backfill.project_id,
                             local.project_root(),
-                            git.as_ref().map(|lease| lease.checkout_root()),
                             || {
                                 checkout_access
-                                    .publication_guard_for(
-                                        std::iter::once(&local).chain(git.iter()),
-                                    )
+                                    .publication_guard_for(std::iter::once(&local))
                                     .map_err(anyhow::Error::new)
                             },
                         )

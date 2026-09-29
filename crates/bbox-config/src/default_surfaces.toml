@@ -38,8 +38,6 @@ disallow = [
     "bbox_bootstrap",
     "bbox_lint",
     "bbox_review",
-    "bbox_provenance_export",
-    "bbox_provenance_import",
 ]
 
 [surfaces.interactive]
@@ -104,8 +102,6 @@ disallow = [
     "bbox_bootstrap",
     "bbox_lint",
     "bbox_review",
-    "bbox_provenance_export",
-    "bbox_provenance_import",
 ]
 
 [surfaces.readonly]
@@ -117,7 +113,6 @@ allow = [
     "bbox_session",
     "bbox_sessions_list",
     "bbox_topics",
-    "bbox_blame",
     "bbox_hybrid_search",
     "bbox_discover_seed_entities",
     "bbox_inspect_entity",

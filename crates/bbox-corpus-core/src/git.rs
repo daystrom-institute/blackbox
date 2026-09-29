@@ -5,7 +5,7 @@ use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 
 use crate::json_store::NofollowDirectory;
@@ -789,15 +789,6 @@ impl Drop for CatFileSession {
 struct CatObject {
     object_type: String,
     bytes: Vec<u8>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GitBlameLine {
-    pub commit_sha: String,
-    pub author: String,
-    pub author_time: Option<String>,
-    pub root: PathBuf,
-    pub rel_path: String,
 }
 
 pub fn git_root_for_path(path: &Path) -> Option<PathBuf> {
@@ -3024,321 +3015,8 @@ pub fn changed_files_for_commit(root: &Path, sha: &str) -> Result<Vec<String>> {
         .collect())
 }
 
-/// Config-resolved git-notes namespace, injected once at daemon startup.
-///
-/// Dependency inversion: this foundation crate must not reach UP into
-/// `blackbox::config` (that would be a workspace cycle). The daemon owns config
-/// loading and pushes the resolved value in via [`set_notes_namespace`] right
-/// after `config::load()`. Absent injection (standalone use / tests), we fall
-/// back to the `BBOX_GIT_NOTES_NAMESPACE` env var, then the `"bbox"` default —
-/// the same precedence the inlined `config` lookup used to provide.
-static NOTES_NAMESPACE_OVERRIDE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-
-/// Install the config-resolved git-notes namespace. Idempotent; first set wins.
-/// Called by the daemon at startup so corpus-core need not depend on the root
-/// crate's config loader.
-pub fn set_notes_namespace(namespace: String) -> Result<()> {
-    validate_notes_ref_component(&namespace, "namespace")?;
-    let _ = NOTES_NAMESPACE_OVERRIDE.set(namespace);
-    Ok(())
-}
-
-pub fn notes_namespace() -> String {
-    if let Some(ns) = NOTES_NAMESPACE_OVERRIDE.get() {
-        if !ns.is_empty() {
-            return ns.clone();
-        }
-    }
-    std::env::var("BBOX_GIT_NOTES_NAMESPACE")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "bbox".to_string())
-}
-
+/// Separator between documents appended to one Git note.
 pub const NOTE_DOCUMENT_SEPARATOR: &str = "--bbox-note-separator--";
-
-/// Build a bbox-owned git notes ref for an open-ended note kind.
-///
-/// Kind `provenance` is used today. `knowledge` is reserved for v2
-/// cross-machine knowledge serialization, and future kinds should remain under
-/// this namespace instead of adding parallel `refs/notes/bbox-*` roots.
-pub fn notes_ref(kind: &str) -> Result<String> {
-    let namespace = notes_namespace();
-    validate_notes_ref_component(&namespace, "namespace")?;
-    validate_notes_ref_component(kind, "kind")?;
-    Ok(format!("refs/notes/{namespace}/{kind}"))
-}
-
-fn validate_notes_ref_component(value: &str, role: &str) -> Result<()> {
-    if value.is_empty()
-        || value.len() > 128
-        || matches!(value, "." | "..")
-        || value.starts_with('-')
-        || value.ends_with('.')
-        || value.contains("..")
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
-    {
-        bail!("invalid git notes {role}");
-    }
-    Ok(())
-}
-
-pub fn write_note(root: &Path, notes_ref: &str, commit: &str, body: &str) -> Result<()> {
-    let mut command = Command::new("git");
-    command.arg("-C").arg(root).args([
-        "notes",
-        "--ref",
-        notes_ref,
-        "append",
-        &format!("--separator={NOTE_DOCUMENT_SEPARATOR}"),
-        "-F",
-        "-",
-        commit,
-    ]);
-    let output = run_git_bounded_with_stdin(
-        command,
-        root,
-        "appending git note",
-        body.as_bytes().to_vec(),
-    )
-    .with_context(|| format!("git notes append timed out in {}", root.display()))?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "git notes append failed in {}: {}",
-            root.display(),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    Ok(())
-}
-
-/// Idempotently set `notes.mergeStrategy = union` in the repo at `root`.
-///
-/// Cross-machine provenance exports push to the same notes ref from multiple
-/// machines. Without this setting, `git notes merge` uses the default
-/// "manual" strategy which aborts on conflict rather than unioning the note
-/// bodies. Setting `union` once per repo makes concurrent provenance pushes
-/// safe; git config writes are idempotent so calling this on every export is
-/// harmless.
-pub fn ensure_notes_merge_strategy_union(root: &Path) -> Result<()> {
-    let output = git_output(
-        root,
-        &["config", "notes.mergeStrategy", "union"],
-        "setting notes merge strategy",
-    )
-    .with_context(|| format!("setting notes.mergeStrategy union in {}", root.display()))?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "git config notes.mergeStrategy union failed in {}: {}",
-            root.display(),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    Ok(())
-}
-
-pub fn show_note(root: &Path, notes_ref: &str, commit: &str) -> Result<Option<String>> {
-    let Some(output) = git_output(
-        root,
-        &["notes", "--ref", notes_ref, "show", commit],
-        "showing git note",
-    ) else {
-        return Ok(None);
-    };
-    if !output.status.success() {
-        return Ok(None);
-    }
-    Ok(Some(String::from_utf8(output.stdout)?))
-}
-
-pub fn list_notes(root: &Path, notes_ref: &str) -> Result<Vec<(String, String)>> {
-    let Some(output) = git_output(
-        root,
-        &["notes", "--ref", notes_ref, "list"],
-        "listing git notes",
-    ) else {
-        return Ok(Vec::new());
-    };
-    if !output.status.success() {
-        return Ok(Vec::new());
-    }
-    let raw = String::from_utf8(output.stdout)?;
-    Ok(raw
-        .lines()
-        .filter_map(|line| {
-            let mut parts = line.split_whitespace();
-            let note_sha = parts.next()?;
-            let commit_sha = parts.next()?;
-            Some((note_sha.to_string(), commit_sha.to_string()))
-        })
-        .collect())
-}
-
-pub fn blame_for_line(file: &Path, line: u64) -> Result<Option<GitBlameLine>> {
-    if line == 0 {
-        anyhow::bail!("line must be 1-based");
-    }
-    let file = fs::canonicalize(file)
-        .with_context(|| format!("canonicalizing blame path {}", file.display()))?;
-    let Some(root) = git_root_for_path(&file) else {
-        return Ok(None);
-    };
-    let rel_path = file
-        .strip_prefix(&root)
-        .unwrap_or(&file)
-        .to_string_lossy()
-        .to_string();
-    let line_spec = format!("{line},{line}");
-    let output = git_output(
-        &root,
-        &["blame", "--porcelain", "-L", &line_spec, "--", &rel_path],
-        "running git blame",
-    )
-    .with_context(|| format!("failed to execute git blame in {}", root.display()))?;
-    if !output.status.success() {
-        return Ok(None);
-    }
-    parse_blame_porcelain(&output.stdout, root, rel_path)
-}
-
-/// Run blame inside an already-authorized Git root. The relative path is
-/// lexical and cannot redirect Git into a different repository through a
-/// post-validation symlink swap.
-pub fn blame_for_line_in_root(
-    root: &Path,
-    relative_path: &Path,
-    line: u64,
-) -> Result<Option<GitBlameLine>> {
-    if line == 0 {
-        anyhow::bail!("line must be 1-based");
-    }
-    if relative_path.as_os_str().is_empty()
-        || relative_path.is_absolute()
-        || relative_path
-            .components()
-            .any(|component| !matches!(component, std::path::Component::Normal(_)))
-    {
-        anyhow::bail!("blame path must be a non-empty safe relative path");
-    }
-    let rel_path = relative_path.to_string_lossy().replace('\\', "/");
-    let line_spec = format!("{line},{line}");
-    let output = git_output(
-        root,
-        &["blame", "--porcelain", "-L", &line_spec, "--", &rel_path],
-        "running git blame",
-    )
-    .with_context(|| format!("failed to execute git blame in {}", root.display()))?;
-    if !output.status.success() {
-        return Ok(None);
-    }
-    parse_blame_porcelain(&output.stdout, root.to_path_buf(), rel_path)
-}
-
-/// Blame one line against one exact commit, resolving an optional corpus byte
-/// offset against the file bytes from that SAME commit.
-///
-/// This is the path-free blame transport's shared checkout-side primitive.
-/// Keeping both the content read and blame revision here makes it impossible
-/// for either runtime implementer to resolve a snapshot offset against dirty
-/// working bytes or to blame a moving `HEAD` after reading an older blob.
-pub fn blame_for_line_or_offset_at_commit(
-    root: &Path,
-    relative_path: &Path,
-    commit: &str,
-    line: Option<u64>,
-    byte_offset: u64,
-) -> Result<(u64, Option<GitBlameLine>)> {
-    if relative_path.as_os_str().is_empty()
-        || relative_path.is_absolute()
-        || relative_path
-            .components()
-            .any(|component| !matches!(component, std::path::Component::Normal(_)))
-    {
-        anyhow::bail!("error.blame_path_invalid: blame path must be a safe relative path");
-    }
-    let rel_path = relative_path.to_string_lossy().replace('\\', "/");
-    let content = read_committed_file_bytes(root, commit, &rel_path).ok_or_else(|| {
-        anyhow::anyhow!(
-            "error.blame_snapshot_unavailable: the corpus snapshot commit does not contain this file"
-        )
-    })?;
-    let line = line.unwrap_or_else(|| {
-        let upto = (byte_offset as usize).min(content.len());
-        content[..upto]
-            .iter()
-            .filter(|byte| **byte == b'\n')
-            .count() as u64
-            + 1
-    });
-    if line == 0 {
-        anyhow::bail!("error.blame_path_invalid: line must be 1-based");
-    }
-    let line_spec = format!("{line},{line}");
-    let output = git_output(
-        root,
-        &[
-            "blame",
-            "--porcelain",
-            "-L",
-            &line_spec,
-            commit,
-            "--",
-            &rel_path,
-        ],
-        "running git blame at the corpus snapshot commit",
-    )
-    .ok_or_else(|| {
-        anyhow::anyhow!(
-            "error.checkout_io_failed: git blame could not read the corpus snapshot commit"
-        )
-    })?;
-    if !output.status.success() {
-        return Ok((line, None));
-    }
-    let parsed =
-        parse_blame_porcelain(&output.stdout, root.to_path_buf(), rel_path).map_err(|_| {
-            anyhow::anyhow!("error.checkout_io_failed: git blame output could not be parsed")
-        })?;
-    Ok((line, parsed))
-}
-
-pub fn parse_blame_porcelain(
-    stdout: &[u8],
-    root: PathBuf,
-    rel_path: String,
-) -> Result<Option<GitBlameLine>> {
-    let raw = String::from_utf8(stdout.to_vec())?;
-    let mut lines = raw.lines();
-    let Some(header) = lines.next() else {
-        return Ok(None);
-    };
-    let commit_sha = header.split_whitespace().next().unwrap_or("").to_string();
-    if commit_sha.is_empty() {
-        return Ok(None);
-    }
-    let mut author = String::new();
-    let mut author_time = None;
-    for line in lines {
-        if let Some(value) = line.strip_prefix("author ") {
-            author = value.to_string();
-        } else if let Some(value) = line.strip_prefix("author-time ") {
-            author_time = value
-                .parse::<i64>()
-                .ok()
-                .and_then(|seconds| chrono::DateTime::from_timestamp(seconds, 0))
-                .map(|dt| dt.to_rfc3339());
-        }
-    }
-    Ok(Some(GitBlameLine {
-        commit_sha,
-        author,
-        author_time,
-        root,
-        rel_path,
-    }))
-}
 
 pub fn head_fingerprint(root: &Path) -> Option<u64> {
     // HACK: project-file reindex metadata only has `(mtime, size)`, so git
@@ -3650,35 +3328,6 @@ fn run_git_bounded(cmd: Command, path: &Path, action: &'static str) -> Option<Ou
         return None;
     }
     Some(output.into_output())
-}
-
-fn run_git_bounded_with_stdin(
-    cmd: Command,
-    path: &Path,
-    action: &'static str,
-    stdin: Vec<u8>,
-) -> Option<Output> {
-    run_bounded_with_timeout_stdin_and_stdout_limit(
-        cmd,
-        path,
-        action,
-        GIT_OUTPUT_TIMEOUT,
-        Some(stdin),
-        Some(GIT_STDOUT_RETAINED_LIMIT),
-    )
-    .and_then(|output| {
-        if output.stdout_overflowed {
-            tracing::warn!(
-                path = %path.display(),
-                action,
-                limit_bytes = GIT_STDOUT_RETAINED_LIMIT,
-                "git stdout exceeded the compatibility helper limit"
-            );
-            None
-        } else {
-            Some(output.into_output())
-        }
-    })
 }
 
 #[cfg(test)]
@@ -4061,22 +3710,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_blame_porcelain_extracts_commit_author_and_time() {
-        let raw = b"abc123 1 1 1\nauthor Ada Lovelace\nauthor-mail <ada@example.test>\nauthor-time 1700000000\n\tlet x = 1;\n";
-        let blame = parse_blame_porcelain(raw, PathBuf::from("/repo"), "src/main.rs".into())
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(blame.commit_sha, "abc123");
-        assert_eq!(blame.author, "Ada Lovelace");
-        assert_eq!(blame.rel_path, "src/main.rs");
-        assert_eq!(
-            blame.author_time.as_deref(),
-            Some("2023-11-14T22:13:20+00:00")
-        );
-    }
-
-    #[test]
     fn parse_commit_log_with_changed_files_assigns_paths_to_the_preceding_commit() {
         // Two commits, newest first, as git prints them: the newest touched
         // one path, the root commit touched two. The path block follows the
@@ -4185,28 +3818,6 @@ mod tests {
         let commits = commit_log(repo.path(), Some(&old_head)).unwrap();
         assert_eq!(commits.len(), 1);
         assert_eq!(commits[0].message, "new root");
-    }
-
-    #[test]
-    fn git_notes_write_show_and_list_round_trip() {
-        let repo = tempfile::tempdir().unwrap();
-        run_git(repo.path(), &["init"]);
-        run_git(repo.path(), &["config", "user.name", "Test User"]);
-        run_git(repo.path(), &["config", "user.email", "test@example.test"]);
-        std::fs::write(repo.path().join("README.md"), "one\n").unwrap();
-        run_git(repo.path(), &["add", "README.md"]);
-        run_git(repo.path(), &["commit", "-m", "note target"]);
-        let head = current_head(repo.path()).unwrap();
-        let notes_ref = "refs/notes/bbox-test/provenance";
-
-        write_note(repo.path(), notes_ref, &head, "{\"ok\":true}\n").unwrap();
-        write_note(repo.path(), notes_ref, &head, "{\"again\":true}\n").unwrap();
-
-        let note = show_note(repo.path(), notes_ref, &head).unwrap().unwrap();
-        assert!(note.contains("{\"ok\":true}"));
-        assert!(note.contains(NOTE_DOCUMENT_SEPARATOR));
-        assert!(note.contains("{\"again\":true}"));
-        assert_eq!(list_notes(repo.path(), notes_ref).unwrap().len(), 1);
     }
 
     fn run_git(root: &Path, args: &[&str]) {
@@ -5255,27 +4866,5 @@ mod tests {
         fs::create_dir(&authority_path).unwrap();
 
         assert!(authority.ensure_still_current().is_err());
-    }
-
-    #[test]
-    fn git_notes_ref_components_are_structurally_confined() {
-        for accepted in ["bbox", "team.notes", "team_notes", "team-notes"] {
-            assert!(validate_notes_ref_component(accepted, "namespace").is_ok());
-        }
-        for rejected in [
-            "",
-            ".",
-            "..",
-            "-bbox",
-            "bbox/",
-            "bbox..notes",
-            "bbox.",
-            "bbox notes",
-        ] {
-            assert!(
-                validate_notes_ref_component(rejected, "namespace").is_err(),
-                "accepted {rejected:?}"
-            );
-        }
     }
 }

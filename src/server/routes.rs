@@ -955,7 +955,7 @@ fn build_edge_index_from_shared_at_authority(
     //                           writer then blocks new idx *readers* (parking_lot
     //                           is fair, so readers don't starve the writer)
     //   D (a graph tool, e.g.   holds edge_index.read (live arg), wants idx.read
-    //      bbox_blame)          -> blocked behind R
+    //      bbox_inspect_entity) -> blocked behind R
     // => A waits on D's edge_index.read, D waits on R's queued idx.write, R waits
     //    on A's idx.read. Cycle. Acquiring edge_index.write() with no store locks
     //    held removes A from the cycle entirely.
@@ -998,25 +998,6 @@ fn edge_index_rebuild_max_input_bytes() -> u64 {
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_EDGE_INDEX_REBUILD_MAX_INPUT_BYTES)
-}
-
-pub(crate) fn ensure_edge_index_rebuild_admitted_at(
-    state: &SharedState,
-    edges_dir: &std::path::Path,
-    additional_bytes: u64,
-) -> anyhow::Result<u64> {
-    let registered_project_ids = state.corpus_registered_project_ids();
-    let authority = capture_edge_rebuild_authority(edges_dir, Some(&registered_project_ids))?;
-    let max_bytes = edge_index_rebuild_max_input_bytes();
-    let projected_bytes = authority.signature.bytes.saturating_add(additional_bytes);
-    if projected_bytes > max_bytes {
-        anyhow::bail!(
-            "edge-index rebuild refused: projected active sidecar input is {} bytes (limit {}); compact/rematerialize the active edge set before retrying",
-            projected_bytes,
-            max_bytes
-        );
-    }
-    Ok(max_bytes)
 }
 
 fn edge_index_nudge_max_current_edges() -> usize {

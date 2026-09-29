@@ -119,9 +119,8 @@ does not schedule or probe local cutback.
 ### CS-D4: corpus features do not depend on checkout bytes
 
 Before this cutover, incremental transcript ingestion needed a local root to
-stamp `base_project_id` and emit `READ_FILE`, `EDITED_FILE`, and `RAN_BASH`
-edges. Simply removing the lease would have silently degraded search and graph
-coverage.
+stamp `base_project_id` and emit `RAN_BASH` edges. Simply removing the lease
+would have silently degraded search and graph coverage.
 
 For a governed attached project, the upper layer now supplies:
 

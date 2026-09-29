@@ -331,34 +331,6 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         when_to_use: "Use when legacy edge sidecars have grown from repeated full reindex replay. Call first with `apply=false` (default) for exactly one project_id, inspect removed/retained counts, then call with `apply=true` for that same project if the dry-run scope is acceptable. Leave `rebuild=false` while compacting multiple projects; after the last project, call with `apply=true,rebuild=true` once to reload graph state. If a requested rebuild fails after compaction, status=partial preserves the compaction stats and backup receipt. Retry apply=true,rebuild=true to rebuild the current compacted sidecar.",
         example: Some(r#"bbox_edge_compact(project_id="d723917f", apply=false)"#),
     },
-    ToolDoc {
-        name: "bbox_blame",
-        category: ToolCategory::Graph,
-        summary: "Walk back from a code line to the conversation that produced it. Two modes: 1. Anchor-matching: the line's git blame commit matches a bbox-tracked tool-call anchor, returning the full session/brofile/arc/trigger chain. 2. Git-only fallback: no bbox anchor matches, returning git blame author info only, marked as non-bbox. Use this when you want to understand WHY a line exists, not just WHO wrote it.",
-        when_to_use: "Use for WHY-this-line-exists questions; check anchor-matched vs git-only. When the daemon cannot run blame against the project's checkout itself (a workspace-bound or operator-bound session, a project whose blame authority is checkout-local, or a catalog checkout that is not on the daemon host), the call refuses with `error.blame_locality_required`. Run `bro blame --token-file <FILE> --entity-ref <REF>` or `bro blame --token-file <FILE> --file <PATH> --line <N>` on the checkout host instead.",
-        example: None,
-    },
-    ToolDoc {
-        name: "bbox_provenance_export",
-        category: ToolCategory::Graph,
-        summary: "Legacy overlap adapter that writes bbox provenance Git notes from blackboxd. Prefer bro provenance export for checkout-local application; retain this tool when one call must cover all registered projects.",
-        when_to_use: "Use only when the legacy all-registered-project export is required. For one checkout, run `bro provenance export` from that checkout instead. Prepares all serialized note documents before writes. A later write failure returns status=partial with known notes_written, completed_targets, unattempted_targets and failed-target uncertainty. The failed current target may have written; retries use deduplication.",
-        example: None,
-    },
-    ToolDoc {
-        name: "bbox_provenance_export_plan",
-        category: ToolCategory::Graph,
-        summary: "Return one deterministic, generation-bound provenance-note page for this MCP session's authoritative checkout. Project selection comes only from session context; callers may pass only cursor and generation pagination controls. Used by bro provenance export so Git-note writes stay checkout-local.",
-        when_to_use: "Used by `bro provenance export`. The project is fixed by MCP session context; callers may supply only the returned cursor and generation for later pages.",
-        example: None,
-    },
-    ToolDoc {
-        name: "bbox_provenance_import",
-        category: ToolCategory::Graph,
-        summary: "Read bbox provenance git notes and replay them into the local EdgeIndex sidecar.",
-        when_to_use: "Use after fetching or cloning bbox git notes from another machine.",
-        example: None,
-    },
     // ── Projects ─────────────────────────────────────────────────────
     ToolDoc {
         name: "bbox_project_register",
@@ -1153,7 +1125,7 @@ fn render_retrieval_workflow(out: &mut String) {
     out.push_str("## Retrieval workflow\n\n");
     out.push_str("Use Blackbox retrieval when stored decisions, conversation history, or indexed code evidence can change the answer. A direct local edit or an already-authoritative live result does not require a graph walk.\n\n");
     out.push_str("Use a short phrase from the task, not a single generic keyword. Query `bbox_knowledge` for durable rules and decisions, `bbox_search` for conversation history, and `bbox_hybrid_search` for indexed code or mixed evidence. Inspect relevant hits before relying on them.\n\n");
-    out.push_str("Describe the schema when graph vocabulary is unfamiliar. Traverse with `bbox_find_paths` only for multi-hop questions; pass returned path IDs unchanged. Bundle selected evidence with `bbox_bundle_evidence` when the task needs a durable, re-queryable evidence package. Use `bbox_blame` for line-level provenance.\n\n");
+    out.push_str("Describe the schema when graph vocabulary is unfamiliar. Traverse with `bbox_find_paths` only for multi-hop questions; pass returned path IDs unchanged. Bundle selected evidence with `bbox_bundle_evidence` when the task needs a durable, re-queryable evidence package.\n\n");
     out.push_str("Use tool-returned canonical entity refs and suggested fixes. Scope edge types and direction to the question. Retrieve `sm-agentic-opening-sequence` only for a graph investigation that needs its detailed recipes.\n\n");
 }
 

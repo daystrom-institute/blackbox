@@ -1,13 +1,4 @@
 use anyhow::{Context, bail};
-use bbox_corpus_core::blame_transport::{
-    OPERATOR_BLAME_REPO_ID_HEADER, OPERATOR_BLAME_ROOT_RELPATH_HEADER,
-    OPERATOR_BLAME_WORKSPACE_ID_HEADER,
-};
-use bbox_corpus_core::identity::PublishedScope;
-use bbox_provenance::{
-    OPERATOR_PROVENANCE_REPO_ID_HEADER, OPERATOR_PROVENANCE_ROOT_RELPATH_HEADER,
-};
-use bro_rpc::ServiceToken;
 use clap::{Args, Subcommand};
 use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap};
 use serde::de::DeserializeOwned;
@@ -94,18 +85,6 @@ impl fmt::Display for McpToolError {
 
 impl std::error::Error for McpToolError {}
 
-pub(crate) fn tool_error_has_code(error: &anyhow::Error, code: &str) -> bool {
-    error
-        .downcast_ref::<McpToolError>()
-        .is_some_and(|tool_error| {
-            let message = tool_error.message.trim();
-            let code_end = message
-                .find(|character: char| character == ':' || character.is_ascii_whitespace())
-                .unwrap_or(message.len());
-            &message[..code_end] == code
-        })
-}
-
 impl McpClient {
     pub(crate) async fn connect(
         base_url: &str,
@@ -121,73 +100,6 @@ impl McpClient {
     pub(crate) async fn connect_surface(base_url: &str, surface: &str) -> anyhow::Result<Self> {
         Self::connect_with_initialization_headers(base_url, None, Some(surface), HeaderMap::new())
             .await
-    }
-
-    pub(crate) async fn connect_with_operator_blame(
-        base_url: &str,
-        token: &ServiceToken,
-        scope: &PublishedScope,
-        workspace_id: &str,
-    ) -> anyhow::Result<Self> {
-        validate_credentialed_base_url(base_url)?;
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            reqwest::header::AUTHORIZATION,
-            format!("Bearer {}", token.expose_secret())
-                .parse()
-                .context("encoding operator blame authorization")?,
-        );
-        headers.insert(
-            OPERATOR_BLAME_REPO_ID_HEADER,
-            scope
-                .repo_id()
-                .parse()
-                .context("encoding operator blame repo id")?,
-        );
-        headers.insert(
-            OPERATOR_BLAME_ROOT_RELPATH_HEADER,
-            scope
-                .bbox_root_relpath()
-                .parse()
-                .context("encoding operator blame root relative path")?,
-        );
-        headers.insert(
-            OPERATOR_BLAME_WORKSPACE_ID_HEADER,
-            workspace_id
-                .parse()
-                .context("encoding operator blame workspace id")?,
-        );
-        Self::connect_with_initialization_headers(base_url, None, None, headers).await
-    }
-
-    pub(crate) async fn connect_with_operator_provenance(
-        base_url: &str,
-        token: &ServiceToken,
-        scope: &PublishedScope,
-    ) -> anyhow::Result<Self> {
-        validate_credentialed_base_url(base_url)?;
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            reqwest::header::AUTHORIZATION,
-            format!("Bearer {}", token.expose_secret())
-                .parse()
-                .context("encoding operator provenance authorization")?,
-        );
-        headers.insert(
-            OPERATOR_PROVENANCE_REPO_ID_HEADER,
-            scope
-                .repo_id()
-                .parse()
-                .context("encoding operator provenance repo id")?,
-        );
-        headers.insert(
-            OPERATOR_PROVENANCE_ROOT_RELPATH_HEADER,
-            scope
-                .bbox_root_relpath()
-                .parse()
-                .context("encoding operator provenance root relative path")?,
-        );
-        Self::connect_with_initialization_headers(base_url, None, None, headers).await
     }
 
     async fn connect_with_initialization_headers(
@@ -286,15 +198,6 @@ impl McpClient {
         ensure_json_rpc_response_id(&response, id, "tools/call")?;
         Ok(response)
     }
-}
-
-fn validate_credentialed_base_url(base_url: &str) -> anyhow::Result<()> {
-    let url = reqwest::Url::parse(base_url).context("parsing credentialed daemon URL")?;
-    let loopback = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "::1"));
-    if url.scheme() != "https" && !(url.scheme() == "http" && loopback) {
-        bail!("credentialed daemon URL must use HTTPS unless it is loopback HTTP");
-    }
-    Ok(())
 }
 
 /// The daemon base URL when no `--daemon-url` is given: `BLACKBOX_MCP_URL`'s
@@ -507,14 +410,6 @@ mod tests {
     }
 
     #[test]
-    fn credentialed_mcp_requires_https_or_loopback() {
-        assert!(validate_credentialed_base_url("https://corpus.example").is_ok());
-        assert!(validate_credentialed_base_url("http://127.0.0.1:7264").is_ok());
-        assert!(validate_credentialed_base_url("http://localhost:7264").is_ok());
-        assert!(validate_credentialed_base_url("http://192.0.2.10:7264").is_err());
-    }
-
-    #[test]
     fn extracts_json_tool_payload() {
         let response = json!({
             "jsonrpc": "2.0",
@@ -528,7 +423,7 @@ mod tests {
     }
 
     #[test]
-    fn preserves_structured_tool_error_code() {
+    fn tool_error_result_surfaces_its_message() {
         let response = json!({
             "jsonrpc": "2.0",
             "id": 2,
@@ -538,9 +433,8 @@ mod tests {
             },
         });
         let error = tool_response_json(&response).unwrap_err();
-        assert!(tool_error_has_code(&error, "error.stale_generation"));
-        assert!(!tool_error_has_code(&error, "stale_generation"));
-        assert!(!tool_error_has_code(&error, "error.stale"));
+        assert!(error.downcast_ref::<McpToolError>().is_some());
+        assert!(error.to_string().contains("error.stale_generation: retry"));
     }
 
     #[test]
