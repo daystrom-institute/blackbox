@@ -672,21 +672,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bbox-inbox"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "bbox-gaps",
- "bbox-knowledge",
- "bbox-threads",
- "rmcp",
- "schemars 0.8.22",
- "serde",
- "serde_json",
- "tempfile",
-]
-
-[[package]]
 name = "bbox-indexing"
 version = "0.0.1"
 dependencies = [
@@ -1271,7 +1256,6 @@ dependencies = [
  "bbox-gaps",
  "bbox-git-source",
  "bbox-git-source-store",
- "bbox-inbox",
  "bbox-indexing",
  "bbox-knowledge",
  "bbox-knowledge-source",

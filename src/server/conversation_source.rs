@@ -82,17 +82,12 @@ pub(crate) struct ProducerContact {
 /// alive: the status read renders the map without touching it.
 pub(crate) struct ProducerPresence {
     contacts: std::sync::Mutex<std::collections::BTreeMap<ConnectorScope, ProducerContact>>,
-    /// When this daemon started, so "never seen" can wait out a boot grace
-    /// before it is reported: a restart must not page one row per granted
-    /// scope for scopes whose satellites simply have not polled yet.
-    boot_epoch_secs: i64,
 }
 
 impl Default for ProducerPresence {
     fn default() -> Self {
         Self {
             contacts: std::sync::Mutex::new(std::collections::BTreeMap::new()),
-            boot_epoch_secs: chrono::Utc::now().timestamp(),
         }
     }
 }
@@ -119,10 +114,6 @@ impl ProducerPresence {
 
     fn contact(&self, scope: &ConnectorScope) -> Option<ProducerContact> {
         self.contacts.lock().unwrap().get(scope).cloned()
-    }
-
-    fn boot_epoch_secs(&self) -> i64 {
-        self.boot_epoch_secs
     }
 }
 
@@ -160,8 +151,7 @@ impl ConversationSourceRuntime {
         self.store.clone()
     }
 
-    /// Record an authenticated contact for the status surface and the
-    /// silence signal. Handlers call this after the grant check on the ingest
+    /// Record an authenticated contact for the status surface. Handlers call this after the grant check on the ingest
     /// verbs only; the status route reads and never records, so a poller can
     /// never refresh staleness. The presence tests age contacts through
     /// `ProducerPresence::note`'s injected clock, not through this wrapper.
@@ -170,16 +160,9 @@ impl ConversationSourceRuntime {
             .note(scope, user_agent, chrono::Utc::now().timestamp());
     }
 
-    /// Last contact for one scope, as the silence signal needs it: raw epoch
-    /// seconds, so the threshold comparison happens against one clock.
+    /// Last contact for one scope, as raw epoch seconds.
     pub(crate) fn producer_contact(&self, scope: &ConnectorScope) -> Option<ProducerContact> {
         self.presence.contact(scope)
-    }
-
-    /// When this daemon booted, so "never seen since boot" can wait out a
-    /// grace period instead of firing on every restart.
-    pub(crate) fn producer_boot_epoch_secs(&self) -> i64 {
-        self.presence.boot_epoch_secs()
     }
 
     #[cfg(test)]
@@ -325,8 +308,8 @@ impl ScopeQuery {
 /// The producer's own name for itself, verbatim up to a bound. Empty when
 /// absent: presence is the fact being recorded, and a producer that sends no
 /// User-Agent is still present. The bound keeps a misbehaving or hostile
-/// header from turning an in-memory map entry (and every status response and
-/// inbox row that renders it) into unbounded storage.
+/// header from turning an in-memory map entry (and every status response that
+/// renders it) into unbounded storage.
 fn user_agent(headers: &axum::http::HeaderMap) -> String {
     headers
         .get(axum::http::header::USER_AGENT)
@@ -454,8 +437,8 @@ async fn get_status(
 
     // Render WITHOUT recording: the status read is a read. If it refreshed
     // presence, last_seen_at would always be "now" and any bearer-holding
-    // poller could suppress the inbox silence row for a satellite that is
-    // actually down. Only the ingest verbs are contacts.
+    // poller could make a satellite that is actually down look alive. Only
+    // the ingest verbs are contacts.
     let producer = state
         .conversation_sources
         .producer_contact(&scope)

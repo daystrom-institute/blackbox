@@ -62,7 +62,6 @@ members = [
     "crates/bbox-project-render",
     "crates/bbox-threads",
     "crates/bbox-gaps",
-    "crates/bbox-inbox",
     "crates/bbox-slack",
     "crates/bbox-edge-index",
     "crates/bbox-tool-docs",
@@ -234,7 +233,6 @@ bbox-knowledge = { path = "crates/bbox-knowledge" }
 bbox-project-render = { path = "crates/bbox-project-render" }
 bbox-threads = { path = "crates/bbox-threads" }
 bbox-gaps = { path = "crates/bbox-gaps" }
-bbox-inbox = { path = "crates/bbox-inbox" }
 bbox-slack = { path = "crates/bbox-slack" }
 bbox-edge-index = { path = "crates/bbox-edge-index" }
 bbox-tool-docs = { path = "crates/bbox-tool-docs" }

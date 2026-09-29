@@ -541,8 +541,8 @@ impl Threads {
         format!("thread-{:08x}", hash as u32)
     }
 
-    /// Immutable slice of all stored threads — used by cross-store
-    /// aggregators (inbox) that can't go through the MCP layer.
+    /// Immutable slice of all stored threads, for in-process readers that
+    /// can't go through the MCP layer.
     pub fn all(&self) -> &[Thread] {
         &self.store.threads
     }

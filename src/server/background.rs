@@ -255,7 +255,7 @@ fn start_bbox_watcher(shared: &Arc<SharedState>) {
 
     // On a committed `.bbox/knowledge/` or top-level `.bbox/gaps/` change (e.g.
     // `git pull`, manual edit): reload the in-memory store(s) so
-    // `bbox_knowledge`/`bbox_gaps`/`render`/`bbox_inbox` see it immediately, and
+    // `bbox_knowledge`/`bbox_gaps`/`render` see it immediately, and
     // flag the reindex thread to refresh search on its next tick. A `Weak` ref
     // avoids a cycle — `SharedState` owns the watcher. The callback deliberately
     // does NOT touch the search index directly: the reindex thread is the single
