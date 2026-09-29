@@ -381,6 +381,28 @@ pub struct PredictedGitTransportCutoverMarkerV1 {
     pub rows: Vec<PredictedGitTransportCutoverRowV1>,
 }
 
+/// Why a predecessor marker row is not carried into the next marker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitTransportDroppedRowReasonV1 {
+    /// The row's repository history no longer exists in the catalog.
+    RepoHistoryAbsentFromCatalog,
+    /// The repository history exists but no Published project belongs to
+    /// it, so no transport grant can ever make the row current.
+    NoPublishedMember,
+}
+
+/// One predecessor marker row the next marker omits.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GitTransportDroppedRowV1 {
+    pub repo_history_id: RepoHistoryId,
+    pub membership_generation: u64,
+    pub grant_commitment: String,
+    pub source_generation_id: String,
+    pub reason: GitTransportDroppedRowReasonV1,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GitTransportCutoverReportV1 {
@@ -398,6 +420,8 @@ pub struct GitTransportCutoverReportV1 {
     pub legacy_local_repos: Vec<GitTransportLegacyLocalRepoEvidenceV1>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub carried_forward_rows: Vec<PredictedGitTransportCutoverRowV1>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dropped_rows: Vec<GitTransportDroppedRowV1>,
     pub predicted_marker: PredictedGitTransportCutoverMarkerV1,
 }
 
@@ -424,6 +448,8 @@ pub struct GitTransportCutoverPreflightReceiptV1 {
     pub refused_repo_count: u64,
     #[serde(default)]
     pub deferred_repo_count: u64,
+    #[serde(default)]
+    pub dropped_row_count: u64,
 }
 
 pub struct GitTransportCutoverPreflightRequestV1 {
@@ -638,7 +664,14 @@ fn cutover_inventory_hash(
     repos: &[GitTransportRepoEvidenceV1],
     legacy_local_repos: &[GitTransportLegacyLocalRepoEvidenceV1],
     carried_forward_rows: &[PredictedGitTransportCutoverRowV1],
+    dropped_rows: &[GitTransportDroppedRowV1],
 ) -> CutoverResult<Sha256ValueV1> {
+    fn no_dropped_rows(rows: &&[GitTransportDroppedRowV1]) -> bool {
+        rows.is_empty()
+    }
+    // Dropped rows join the hashed inventory only when present, so a report
+    // without drops keeps the inventory identity it had before the field
+    // existed.
     #[derive(Serialize)]
     struct Inventory<'a> {
         catalog_epoch: u64,
@@ -649,6 +682,8 @@ fn cutover_inventory_hash(
         repos: &'a [GitTransportRepoEvidenceV1],
         legacy_local_repos: &'a [GitTransportLegacyLocalRepoEvidenceV1],
         carried_forward_rows: &'a [PredictedGitTransportCutoverRowV1],
+        #[serde(skip_serializing_if = "no_dropped_rows")]
+        dropped_rows: &'a [GitTransportDroppedRowV1],
     }
     serde_json::to_vec(&Inventory {
         catalog_epoch,
@@ -659,6 +694,7 @@ fn cutover_inventory_hash(
         repos,
         legacy_local_repos,
         carried_forward_rows,
+        dropped_rows,
     })
     .map(|bytes| Sha256ValueV1::digest(&bytes))
     .map_err(|error| cutover_error("error.git_transport_cutover_artifact", error))
@@ -690,6 +726,7 @@ pub fn decode_git_transport_cutover_report_v1(
         &report.repos,
         &report.legacy_local_repos,
         &report.carried_forward_rows,
+        &report.dropped_rows,
     )?;
     let predicted = predicted_marker(
         report.predicted_marker.predecessor_marker_checksum.clone(),
@@ -1122,10 +1159,20 @@ fn carried_repo_evidence(
     }
 }
 
-fn carried_forward_marker_rows(
+/// Split the predecessor rows a new marker does not replace into rows
+/// carried forward unchanged and rows dropped because their repository
+/// history left the catalog or has no Published member. A row whose history
+/// still has a Published member is always carried, whatever its grant
+/// state, so staleness stays pending re-cutover.
+fn partition_predecessor_rows(
     predecessor_marker: Option<&GitTransportCutoverMarkerV1>,
+    catalog: &bbox_corpus_core::project_catalog::CatalogSnapshotV2,
+    projection: &RepoTransportGrantProjection,
     repos: &[GitTransportRepoEvidenceV1],
-) -> Vec<PredictedGitTransportCutoverRowV1> {
+) -> (
+    Vec<PredictedGitTransportCutoverRowV1>,
+    Vec<GitTransportDroppedRowV1>,
+) {
     let replacement_repo_ids = repos
         .iter()
         .filter(|repo| {
@@ -1136,16 +1183,32 @@ fn carried_forward_marker_rows(
         })
         .map(|repo| repo.repo_history_id.clone())
         .collect::<BTreeSet<_>>();
-    predecessor_marker
-        .map(|marker| {
-            marker
-                .rows
-                .iter()
-                .filter(|row| !replacement_repo_ids.contains(&row.repo_history_id))
-                .cloned()
-                .collect()
-        })
-        .unwrap_or_default()
+    let mut carried = Vec::new();
+    let mut dropped = Vec::new();
+    for row in predecessor_marker
+        .into_iter()
+        .flat_map(|marker| &marker.rows)
+    {
+        if replacement_repo_ids.contains(&row.repo_history_id) {
+            continue;
+        }
+        let reason = if !catalog.repo_histories.contains_key(&row.repo_history_id) {
+            GitTransportDroppedRowReasonV1::RepoHistoryAbsentFromCatalog
+        } else if !projection.grants.contains_key(&row.repo_history_id) {
+            GitTransportDroppedRowReasonV1::NoPublishedMember
+        } else {
+            carried.push(row.clone());
+            continue;
+        };
+        dropped.push(GitTransportDroppedRowV1 {
+            repo_history_id: row.repo_history_id.clone(),
+            membership_generation: row.membership_generation,
+            grant_commitment: row.grant_commitment.clone(),
+            source_generation_id: row.source_generation_id.clone(),
+            reason,
+        });
+    }
+    (carried, dropped)
 }
 
 pub struct ProjectCatalogGitTransportCutoverFacadeV1;
@@ -1388,7 +1451,8 @@ impl ProjectCatalogGitTransportCutoverFacadeV1 {
             repo.capability_baselines = capability_baselines(repo, &observation_baseline);
         }
         let legacy_local_repos = capture_legacy_local_repos(&catalog, &observation_baseline);
-        let carried_forward_rows = carried_forward_marker_rows(predecessor_marker.as_ref(), &repos);
+        let (carried_forward_rows, dropped_rows) =
+            partition_predecessor_rows(predecessor_marker.as_ref(), &catalog, &projection, &repos);
         recheck_capture(
             &request.layout,
             None,
@@ -1414,6 +1478,7 @@ impl ProjectCatalogGitTransportCutoverFacadeV1 {
             &repos,
             &legacy_local_repos,
             &carried_forward_rows,
+            &dropped_rows,
         )?;
         let (resolution, resolution_bytes) =
             load_or_create_resolution(&request.resolution_path, inventory_hash.clone(), &repos)?;
@@ -1445,6 +1510,7 @@ impl ProjectCatalogGitTransportCutoverFacadeV1 {
             repos,
             legacy_local_repos,
             carried_forward_rows,
+            dropped_rows,
             predicted_marker,
         };
         let report_bytes = serde_json::to_vec(&report)
@@ -1490,6 +1556,7 @@ impl ProjectCatalogGitTransportCutoverFacadeV1 {
             blocked_repo_count,
             refused_repo_count,
             deferred_repo_count,
+            dropped_row_count: report.dropped_rows.len() as u64,
         })
     }
 
@@ -1554,32 +1621,25 @@ impl ProjectCatalogGitTransportCutoverFacadeV1 {
                 "the current cutover marker changed after preflight",
             ));
         }
-        let replacement_repo_ids = report
-            .repos
-            .iter()
-            .filter(|repo| {
-                matches!(
-                    repo.coverage_status,
-                    GitTransportCutoverCoverageStatusV1::Proposed
-                )
-            })
-            .map(|repo| repo.repo_history_id.clone())
-            .collect::<BTreeSet<_>>();
-        let expected_carried_rows = predecessor
-            .as_ref()
-            .map(|marker| {
-                marker
-                    .rows
-                    .iter()
-                    .filter(|row| !replacement_repo_ids.contains(&row.repo_history_id))
-                    .cloned()
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        if report.carried_forward_rows != expected_carried_rows {
+        let state = store
+            .snapshot()
+            .map_err(|error| cutover_error("error.git_transport_cutover_catalog", error))?;
+        let projection = derive_repo_transport_grants(
+            state.catalog(),
+            &configured_assignments(&request.config)?,
+        );
+        let (expected_carried_rows, expected_dropped_rows) = partition_predecessor_rows(
+            predecessor.as_ref(),
+            state.catalog(),
+            &projection,
+            &report.repos,
+        );
+        if report.carried_forward_rows != expected_carried_rows
+            || report.dropped_rows != expected_dropped_rows
+        {
             return Err(cutover_error(
                 "error.git_transport_cutover_predecessor_changed",
-                "reviewed carry-forward rows do not match the current predecessor marker",
+                "reviewed carry-forward or dropped rows do not match the current predecessor marker",
             ));
         }
         recheck_report_for_apply(&request.layout, &request.config, &store, &report)?;
@@ -3544,8 +3604,26 @@ mod tests {
         );
         let repos = vec![replacement, carried];
 
-        let carried_rows = carried_forward_marker_rows(Some(&predecessor), &repos);
+        let mut catalog = catalog;
+        catalog.repo_histories.insert(second_repo.clone(), {
+            let mut record = catalog.repo_histories[&first_repo].clone();
+            record.repo_history_id = second_repo.clone();
+            record
+        });
+        let second_project = ProjectId::parse("p_00000000000000000000000000000002").unwrap();
+        catalog.projects.insert(second_project.clone(), {
+            let mut project = catalog.projects[&project_id()].clone();
+            project.project_id = second_project;
+            project.scope =
+                ProjectScope::Published(PublishedScope::try_new("neutral-repo", "second").unwrap());
+            project.repo_history = Some(second_repo.clone());
+            project
+        });
+        let projection = derive_repo_transport_grants(&catalog, &BTreeMap::new());
+        let (carried_rows, dropped_rows) =
+            partition_predecessor_rows(Some(&predecessor), &catalog, &projection, &repos);
         assert_eq!(carried_rows, vec![second_row.clone()]);
+        assert!(dropped_rows.is_empty());
         let predicted = predicted_marker(
             Some(predecessor.checksum_sha256.clone()),
             42,
@@ -4417,6 +4495,219 @@ mod tests {
         assert_eq!(
             (receipt.proposed_repo_count, receipt.deferred_repo_count),
             (1, 0)
+        );
+        fixture.apply().unwrap();
+        assert_eq!(marker_repo_ids(&fixture.installed_marker()), [REPO_A]);
+    }
+
+    #[test]
+    fn empty_dropped_rows_keep_the_prior_inventory_identity() {
+        let baseline = GitTransportObservationBaselineV1 {
+            sequence: 3,
+            counters: Vec::new(),
+            target_counters: Vec::new(),
+        };
+        let (_catalog, repo_history_id, _scope, row) = coverage_fixture();
+        let origin = CatalogOriginV2::FreshV2 {};
+        let carried = vec![row.clone()];
+        let without =
+            cutover_inventory_hash(4, "catalog", &origin, &baseline, 0, &[], &[], &carried, &[])
+                .unwrap();
+        #[derive(Serialize)]
+        struct PriorInventory<'a> {
+            catalog_epoch: u64,
+            catalog_sha256: &'a str,
+            catalog_origin: &'a CatalogOriginV2,
+            observation_baseline: &'a GitTransportObservationBaselineV1,
+            prepared_history_journal_count: u64,
+            repos: &'a [GitTransportRepoEvidenceV1],
+            legacy_local_repos: &'a [GitTransportLegacyLocalRepoEvidenceV1],
+            carried_forward_rows: &'a [PredictedGitTransportCutoverRowV1],
+        }
+        let prior = Sha256ValueV1::digest(
+            &serde_json::to_vec(&PriorInventory {
+                catalog_epoch: 4,
+                catalog_sha256: "catalog",
+                catalog_origin: &origin,
+                observation_baseline: &baseline,
+                prepared_history_journal_count: 0,
+                repos: &[],
+                legacy_local_repos: &[],
+                carried_forward_rows: &carried,
+            })
+            .unwrap(),
+        );
+        assert_eq!(without, prior);
+        let dropped = vec![GitTransportDroppedRowV1 {
+            repo_history_id,
+            membership_generation: row.membership_generation,
+            grant_commitment: row.grant_commitment.clone(),
+            source_generation_id: row.source_generation_id.clone(),
+            reason: GitTransportDroppedRowReasonV1::RepoHistoryAbsentFromCatalog,
+        }];
+        assert_ne!(
+            cutover_inventory_hash(
+                4,
+                "catalog",
+                &origin,
+                &baseline,
+                0,
+                &[],
+                &[],
+                &carried,
+                &dropped
+            )
+            .unwrap(),
+            without,
+            "dropped rows are bound into the reviewed inventory"
+        );
+        assert_eq!(
+            serde_json::to_value(&dropped[0]).unwrap()["reason"],
+            "repo_history_absent_from_catalog"
+        );
+        assert_eq!(
+            serde_json::to_value(GitTransportDroppedRowReasonV1::NoPublishedMember).unwrap(),
+            "no_published_member"
+        );
+    }
+
+    #[test]
+    fn cutover_drops_rows_for_repo_histories_that_left_the_catalog() {
+        const RETIRED: &str = "rh_000000000000000000000000000000c1";
+        const MEMBERLESS: &str = "rh_000000000000000000000000000000d1";
+        let live = FixtureRepo::new(REPO_A, PROJECT_A, "neutral-alpha");
+        let fixture = CeremonyFixture::new(&[&live]);
+        fixture.provision_evidence(&live, HEAD_ONE);
+        // A repository history that is still recorded but has no Published
+        // member left.
+        let memberless = RepoHistoryId::parse(MEMBERLESS).unwrap();
+        let store = fixture.catalog_store();
+        let epoch = store.snapshot().unwrap().epoch();
+        store
+            .transact(epoch, |catalog, _attachments| {
+                catalog.repo_histories.insert(
+                    memberless.clone(),
+                    RepoHistoryRecord {
+                        repo_history_id: memberless.clone(),
+                        membership_generation: 0,
+                        authority: RepoHistoryAuthority::Recorded(
+                            RecordedRepoAuthority::parse("neutral-memberless").unwrap(),
+                        ),
+                        primary_namespace: CommitNamespace::parse("neutral-memberless").unwrap(),
+                        compatibility_namespaces: BTreeSet::new(),
+                        materialization: RepoHistoryMaterialization::NotBuilt,
+                    },
+                );
+                Ok(())
+            })
+            .unwrap();
+        let row_for = |repo_history_id: &str| {
+            let mut row = fixture.stale_row(&live);
+            row.repo_history_id = RepoHistoryId::parse(repo_history_id).unwrap();
+            row
+        };
+        let predecessor = fixture.install_predecessor(vec![row_for(RETIRED), row_for(MEMBERLESS)]);
+
+        let receipt = fixture.preflight();
+        assert_eq!(receipt.status, GitTransportCutoverStatusV1::Clean);
+        assert_eq!(
+            (receipt.proposed_repo_count, receipt.dropped_row_count),
+            (1, 2)
+        );
+        let report = fixture.report();
+        assert!(report.carried_forward_rows.is_empty());
+        assert_eq!(
+            report
+                .dropped_rows
+                .iter()
+                .map(|row| (row.repo_history_id.as_str(), row.reason))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    RETIRED,
+                    GitTransportDroppedRowReasonV1::RepoHistoryAbsentFromCatalog
+                ),
+                (
+                    MEMBERLESS,
+                    GitTransportDroppedRowReasonV1::NoPublishedMember
+                ),
+            ]
+        );
+        assert_eq!(
+            report
+                .predicted_marker
+                .rows
+                .iter()
+                .map(|row| row.repo_history_id.as_str())
+                .collect::<Vec<_>>(),
+            [REPO_A]
+        );
+
+        // Apply refuses a self-consistent reviewed pair whose dropped rows
+        // were edited away: the drop is recomputed against the predecessor.
+        let reviewed = std::fs::read(fixture.report_path()).unwrap();
+        let reviewed_resolution = std::fs::read(fixture.resolution_path()).unwrap();
+        let mut tampered = report.clone();
+        tampered.dropped_rows.clear();
+        tampered.inventory_hash = cutover_inventory_hash(
+            tampered.catalog_epoch,
+            &tampered.catalog_sha256,
+            &tampered.catalog_origin,
+            &tampered.observation_baseline,
+            tampered.prepared_history_journal_count,
+            &tampered.repos,
+            &tampered.legacy_local_repos,
+            &tampered.carried_forward_rows,
+            &tampered.dropped_rows,
+        )
+        .unwrap();
+        let resolution_bytes = serde_json::to_vec(&GitTransportCutoverResolutionV1 {
+            version: RESOLUTION_VERSION,
+            inventory_hash: tampered.inventory_hash.clone(),
+            blocked_repo_acknowledgements: BTreeMap::new(),
+        })
+        .unwrap();
+        tampered.resolution_artifact_hash = Sha256ValueV1::digest(&resolution_bytes);
+        tampered.predicted_marker.inventory_hash = tampered.inventory_hash.clone();
+        tampered.predicted_marker.resolution_artifact_hash =
+            tampered.resolution_artifact_hash.clone();
+        let tampered_bytes = serde_json::to_vec(&tampered).unwrap();
+        decode_git_transport_cutover_report_v1(&tampered_bytes).unwrap();
+        std::fs::write(fixture.report_path(), tampered_bytes).unwrap();
+        std::fs::write(fixture.resolution_path(), resolution_bytes).unwrap();
+        assert_eq!(
+            fixture.apply().unwrap_err().code,
+            "error.git_transport_cutover_predecessor_changed"
+        );
+        std::fs::write(fixture.report_path(), reviewed).unwrap();
+        std::fs::write(fixture.resolution_path(), reviewed_resolution).unwrap();
+
+        let applied = fixture.apply().unwrap();
+        assert_eq!(applied.covered_repo_count, 1);
+        assert_eq!(applied.current_repo_count, 1);
+        let marker = fixture.installed_marker();
+        assert_eq!(marker_repo_ids(&marker), [REPO_A]);
+        assert_eq!(
+            marker.predecessor_marker_checksum,
+            Some(predecessor.checksum_sha256.clone())
+        );
+        let verified = fixture.verify();
+        assert_eq!(verified.covered_repo_count, 1);
+        assert_eq!(verified.current_repo_count, 1);
+    }
+
+    #[test]
+    fn cutover_without_drops_keeps_the_prior_report_shape() {
+        let live = FixtureRepo::new(REPO_A, PROJECT_A, "neutral-alpha");
+        let fixture = CeremonyFixture::new(&[&live]);
+        fixture.provision_evidence(&live, HEAD_ONE);
+        let receipt = fixture.preflight();
+        assert_eq!(receipt.dropped_row_count, 0);
+        let report_json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(fixture.report_path()).unwrap()).unwrap();
+        assert!(
+            report_json.get("dropped_rows").is_none(),
+            "a report without drops keeps the artifact shape older builds read"
         );
         fixture.apply().unwrap();
         assert_eq!(marker_repo_ids(&fixture.installed_marker()), [REPO_A]);

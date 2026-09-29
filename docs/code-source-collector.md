@@ -267,6 +267,14 @@ the reviewed report if its evidence changed, including when it became provable;
 rerun preflight to propose it. A repository a predecessor row covers that fails
 capture is still `refused` and blocks apply.
 
+A predecessor row whose repository history no longer exists in the catalog
+(reason `repo_history_absent_from_catalog`) or has no Published member (reason
+`no_published_member`) is listed under the report's `dropped_rows` and omitted
+from the new marker; it does not make the report non-clean. Apply recomputes
+the carried and dropped rows against the current predecessor and catalog and
+refuses a report whose rows differ. Every other predecessor row that the report
+does not replace is carried forward unchanged.
+
 Remote plain HTTP is rejected and redirects are disabled. Loopback HTTP is
 accepted for local smoke tests.
 
