@@ -1,10 +1,12 @@
 # bro-code-mode — vendored Codex code-mode runtime (V8 cells)
 
 Vendored near-verbatim from openai/codex `codex-rs/code-mode` (Apache-2.0).
-Two disciplines follow from that and are not negotiable:
+Three disciplines follow from that and are not negotiable:
 
-- **Zero `blackbox` dependency** (like bro-script: contract-bottom-adjacent;
-  it embeds V8, so the pinned `v8` version is a deliberate, reported choice).
+- **Zero `blackbox` dependency** (contract-bottom-adjacent; it embeds V8, so
+  the pinned `v8` version is a deliberate, reported choice).
+- **The only V8 embedder in the process.** Never add a second crate that calls
+  `v8::V8::initialize()`: two embedders poison V8 platform initialization.
 - **Mark every divergence** with a `Local addition (not vendored)` comment on
   the type/fn/branch. A future vendor refresh diffs against upstream;
   unmarked local changes are what gets silently clobbered or mis-merged.

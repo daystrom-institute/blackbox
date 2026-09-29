@@ -1787,8 +1787,7 @@ mod tests {
         // `#[tool(description = ...)]` (src/**/*.rs) must equal the
         // managed-layer `ToolDoc.summary` (this file). They're the same
         // text to the agent — let them drift and the agent gets
-        // contradictory guidance at the two surfaces. See the
-        // `bb846aad` decision entry for the four-surface policy.
+        // contradictory guidance at the two surfaces.
         let registered = parse_registered_tools();
         let summaries: std::collections::HashMap<&str, &str> =
             TOOL_DOCS.iter().map(|d| (d.name, d.summary)).collect();
