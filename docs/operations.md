@@ -226,7 +226,10 @@ mutation, recovery, or schema-marker fallback to a checkout. Producer removal,
 grant drift, scope migration, accepted-source change, or remote corruption
 degrades/refuses and requires a new reviewed cutover; it never reopens the
 local adapter. Bridge, uncovered, and `LegacyLocal` rows remain outside this
-marker. Back up the state directory's cutover marker and receipt with the
+marker. A predecessor row whose project no longer exists in the catalog is
+listed under the report's `dropped_rows` with reason
+`project_absent_from_catalog` and is omitted from the new marker; it does not
+make the report non-clean. Back up the state directory's cutover marker and receipt with the
 catalog authority.
 
 ### Project render locality overlap and cutover

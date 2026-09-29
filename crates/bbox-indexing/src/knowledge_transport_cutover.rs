@@ -190,6 +190,25 @@ pub struct PredictedKnowledgeTransportCutoverMarkerV1 {
     pub rows: Vec<PredictedKnowledgeTransportCutoverRowV1>,
 }
 
+/// Why a predecessor marker row is not carried into the next marker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KnowledgeTransportDroppedRowReasonV1 {
+    /// The row's project no longer exists in the catalog, so no runtime read
+    /// can resolve it and no re-cutover can ever make it current.
+    ProjectAbsentFromCatalog,
+}
+
+/// One predecessor marker row the next marker omits.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KnowledgeTransportDroppedRowV1 {
+    pub project_id: ProjectId,
+    pub scope: PublishedScope,
+    pub producer_id: String,
+    pub reason: KnowledgeTransportDroppedRowReasonV1,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KnowledgeTransportCutoverReportV1 {
@@ -205,6 +224,8 @@ pub struct KnowledgeTransportCutoverReportV1 {
     pub projects: Vec<KnowledgeTransportProjectEvidenceV1>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub carried_forward_rows: Vec<PredictedKnowledgeTransportCutoverRowV1>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dropped_rows: Vec<KnowledgeTransportDroppedRowV1>,
     pub predicted_marker: PredictedKnowledgeTransportCutoverMarkerV1,
 }
 
@@ -229,6 +250,8 @@ pub struct KnowledgeTransportCutoverPreflightReceiptV1 {
     pub proposed_project_count: u64,
     pub blocked_project_count: u64,
     pub refused_project_count: u64,
+    #[serde(default)]
+    pub dropped_row_count: u64,
 }
 
 pub struct KnowledgeTransportCutoverPreflightRequestV1 {
@@ -724,17 +747,8 @@ impl ProjectCatalogKnowledgeTransportCutoverFacadeV1 {
             })
             .map(|project| project.project_id.clone())
             .collect::<BTreeSet<_>>();
-        let carried_forward_rows = predecessor
-            .as_ref()
-            .map(|marker| {
-                marker
-                    .rows
-                    .iter()
-                    .filter(|row| !replacement_ids.contains(&row.project_id))
-                    .cloned()
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        let (carried_forward_rows, dropped_rows) =
+            partition_predecessor_rows(predecessor.as_ref(), state.catalog(), &replacement_ids);
         let inventory_hash = inventory_hash(
             state.epoch(),
             state.catalog_sha256(),
@@ -742,6 +756,7 @@ impl ProjectCatalogKnowledgeTransportCutoverFacadeV1 {
             &knowledge_observations,
             &projects,
             &carried_forward_rows,
+            &dropped_rows,
         )?;
         let (resolution, resolution_bytes, unresolved_blocked_projects) =
             load_or_create_resolution(&request.resolution_path, inventory_hash.clone(), &projects)?;
@@ -777,6 +792,7 @@ impl ProjectCatalogKnowledgeTransportCutoverFacadeV1 {
             resolution_artifact_hash: resolution_artifact_hash.clone(),
             projects,
             carried_forward_rows,
+            dropped_rows,
             predicted_marker,
         };
         let report_bytes = serde_json::to_vec(&report)
@@ -824,6 +840,7 @@ impl ProjectCatalogKnowledgeTransportCutoverFacadeV1 {
             proposed_project_count,
             blocked_project_count,
             refused_project_count,
+            dropped_row_count: report.dropped_rows.len() as u64,
         })
     }
 
@@ -899,21 +916,17 @@ impl ProjectCatalogKnowledgeTransportCutoverFacadeV1 {
             })
             .map(|project| project.project_id.clone())
             .collect::<BTreeSet<_>>();
-        let expected_carried_rows = predecessor
-            .as_ref()
-            .map(|marker| {
-                marker
-                    .rows
-                    .iter()
-                    .filter(|row| !replacement_ids.contains(&row.project_id))
-                    .cloned()
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        if report.carried_forward_rows != expected_carried_rows {
+        let state = store
+            .snapshot()
+            .map_err(|cause| error("error.knowledge_transport_cutover_catalog", cause))?;
+        let (expected_carried_rows, expected_dropped_rows) =
+            partition_predecessor_rows(predecessor.as_ref(), state.catalog(), &replacement_ids);
+        if report.carried_forward_rows != expected_carried_rows
+            || report.dropped_rows != expected_dropped_rows
+        {
             return Err(error(
                 "error.knowledge_transport_cutover_predecessor_changed",
-                "reviewed carry-forward rows do not match the current predecessor",
+                "reviewed carry-forward or dropped rows do not match the current predecessor",
             ));
         }
         let recomputed_inventory = inventory_hash(
@@ -923,6 +936,7 @@ impl ProjectCatalogKnowledgeTransportCutoverFacadeV1 {
             &report.knowledge_observations,
             &report.projects,
             &report.carried_forward_rows,
+            &report.dropped_rows,
         )?;
         if recomputed_inventory != report.inventory_hash {
             return Err(error(
@@ -1774,17 +1788,66 @@ fn inventory_hash(
     observations: &KnowledgeTransportObservationSnapshotV1,
     projects: &[KnowledgeTransportProjectEvidenceV1],
     carried_forward_rows: &[PredictedKnowledgeTransportCutoverRowV1],
+    dropped_rows: &[KnowledgeTransportDroppedRowV1],
 ) -> CutoverResult<Sha256ValueV1> {
-    serde_json::to_vec(&(
-        catalog_epoch,
-        catalog_sha256,
-        checkout_observation_sequence,
-        observations,
-        projects,
-        carried_forward_rows,
-    ))
-    .map(|bytes| Sha256ValueV1::digest(&bytes))
-    .map_err(|cause| error("error.knowledge_transport_cutover_artifact", cause))
+    // Dropped rows join the hashed tuple only when present, so a report
+    // without drops has the same inventory identity whether or not the
+    // reading build knows the field.
+    let bytes = if dropped_rows.is_empty() {
+        serde_json::to_vec(&(
+            catalog_epoch,
+            catalog_sha256,
+            checkout_observation_sequence,
+            observations,
+            projects,
+            carried_forward_rows,
+        ))
+    } else {
+        serde_json::to_vec(&(
+            catalog_epoch,
+            catalog_sha256,
+            checkout_observation_sequence,
+            observations,
+            projects,
+            carried_forward_rows,
+            dropped_rows,
+        ))
+    };
+    bytes
+        .map(|bytes| Sha256ValueV1::digest(&bytes))
+        .map_err(|cause| error("error.knowledge_transport_cutover_artifact", cause))
+}
+
+/// Split the predecessor's rows that a new marker does not replace into rows
+/// carried forward unchanged and rows dropped because their project left the
+/// catalog. A row for a catalog project is always carried, whatever its
+/// scope family, so scope drift stays pending re-cutover.
+fn partition_predecessor_rows(
+    predecessor: Option<&KnowledgeTransportCutoverMarkerV1>,
+    catalog: &bbox_corpus_core::project_catalog::CatalogSnapshotV2,
+    replacement_ids: &BTreeSet<ProjectId>,
+) -> (
+    Vec<PredictedKnowledgeTransportCutoverRowV1>,
+    Vec<KnowledgeTransportDroppedRowV1>,
+) {
+    let mut carried = Vec::new();
+    let mut dropped = Vec::new();
+    for row in predecessor.into_iter().flat_map(|marker| &marker.rows) {
+        if replacement_ids.contains(&row.project_id) {
+            continue;
+        }
+        if catalog.projects.contains_key(&row.project_id) {
+            carried.push(row.clone());
+        } else {
+            dropped.push(KnowledgeTransportDroppedRowV1 {
+                project_id: row.project_id.clone(),
+                scope: row.scope.clone(),
+                producer_id: row.producer_id.clone(),
+                reason: KnowledgeTransportDroppedRowReasonV1::ProjectAbsentFromCatalog,
+            });
+        }
+    }
+    (carried, dropped)
 }
 
 fn load_or_create_resolution(
@@ -2629,5 +2692,599 @@ mod tests {
             error.code,
             "error.knowledge_transport_cutover_marker_identity"
         );
+    }
+
+    const LIVE_PROJECT: &str = "p_00000000000000000000000000000001";
+    const RETIRED_PROJECT_A: &str = "p_000000000000000000000000000000a1";
+    const RETIRED_PROJECT_B: &str = "p_000000000000000000000000000000a2";
+
+    struct CeremonyFixture {
+        _directory: tempfile::TempDir,
+        root: PathBuf,
+        layout: ProjectCatalogMigrationResolvedLayoutV1,
+        config: Config,
+    }
+
+    impl CeremonyFixture {
+        /// A rehearsal layout whose catalog holds the given Published
+        /// projects, each assigned to `producer-a` with an accepted
+        /// publication bound to a ready remote candidate and both remote
+        /// published views exercised during overlap.
+        fn new(live_projects: &[(&str, &str)]) -> Self {
+            use bbox_config::config::{self, CodeCollectionProducerConfig};
+
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().canonicalize().unwrap();
+            let config_path = root.join("config.toml");
+            std::fs::write(
+                &config_path,
+                format!(
+                    "[paths]\nstate_dir = {:?}\nvectors_dir = {:?}\n",
+                    root.join("live"),
+                    root.join("live").join("vectors")
+                ),
+            )
+            .unwrap();
+            let mut config = {
+                let _guard = bbox_util::util::test_env_lock();
+                config::load_with(config::LoadOptions {
+                    config_path: Some(config_path),
+                    ..Default::default()
+                })
+                .unwrap()
+            };
+            config.code_collection.enabled = true;
+            config.code_collection.knowledge_transport_enabled = true;
+            let scopes = live_projects
+                .iter()
+                .map(|(_, relpath)| PublishedScope::try_new("repo-a", *relpath).unwrap())
+                .collect::<Vec<_>>();
+            if !scopes.is_empty() {
+                config
+                    .code_collection
+                    .producers
+                    .push(CodeCollectionProducerConfig {
+                        producer_id: "producer-a".into(),
+                        token_file: root.join("producer.token"),
+                        token_files: Vec::new(),
+                        scopes: scopes.clone(),
+                        claim_scopes: Default::default(),
+                        auto_publish: false,
+                    });
+            }
+            let layout = ProjectCatalogMigrationResolvedLayoutV1::from_rehearsal_root(
+                root.join("rehearsal"),
+                &config,
+            )
+            .unwrap();
+            std::fs::create_dir_all(&layout.bro_home).unwrap();
+            let store = ProjectCatalogStore::initialize_empty(layout.projects_path()).unwrap();
+            let epoch = store.snapshot().unwrap().epoch();
+            store
+                .transact(epoch, |catalog, _attachments| {
+                    for ((project_id, _), scope) in live_projects.iter().zip(&scopes) {
+                        let project_id = ProjectId::parse(*project_id).unwrap();
+                        catalog.projects.insert(
+                            project_id.clone(),
+                            CorpusProject {
+                                project_id,
+                                scope: ProjectScope::Published(scope.clone()),
+                                operator_aliases: BTreeSet::new(),
+                                nominated_aliases: BTreeSet::new(),
+                                display_name: "Neutral fixture".into(),
+                                created_at: "unix:1".into(),
+                                registered_at_compat: None,
+                                repo_history: None,
+                                languages: BTreeSet::new(),
+                            },
+                        );
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            let fixture = Self {
+                _directory: directory,
+                root,
+                layout,
+                config,
+            };
+            for ((project_id, _), scope) in live_projects.iter().zip(&scopes) {
+                fixture.publish_remote_candidate(project_id, scope);
+            }
+            fixture
+        }
+
+        fn publish_remote_candidate(&self, project_id: &str, scope: &PublishedScope) {
+            use bbox_knowledge::knowledge::{Category, KnowledgeEntry, Priority, Scope};
+            use bbox_knowledge_source::{
+                GitObjectFormatV1, PublicationCandidateDescriptorV1, SCHEMA_VERSION,
+                SourceFileManifestEntryV1, SourceLaneV1, SourceManifestDescriptorV1,
+                SourceManifestPageV1, source_file_blob_sha256, source_manifest_sha256,
+            };
+            use bbox_knowledge_source_store::PublicationAuthorityV1;
+            use std::io::Cursor;
+
+            let source_bytes = serde_json::to_vec(&KnowledgeEntry {
+                render_placement: Default::default(),
+                id: "knowledge-a".into(),
+                title: "Neutral entry".into(),
+                content: "remote candidate content".into(),
+                cluster: None,
+                category: Category::Convention,
+                scope: Scope::Project,
+                project: None,
+                project_id: None,
+                providers: Vec::new(),
+                priority: Priority::Standard,
+                render: true,
+                created_at: "2026-01-01T00:00:00Z".into(),
+                updated_at: "2026-01-02T00:00:00Z".into(),
+                recall_count: 0,
+                last_recalled: None,
+            })
+            .unwrap();
+            let entry = SourceFileManifestEntryV1 {
+                repository_relative_filename: ".bbox/knowledge/knowledge-a.json".into(),
+                encoded_bytes: source_bytes.len() as u64,
+                content_sha256: source_file_blob_sha256(&source_bytes),
+            };
+            let knowledge_manifest = vec![entry.clone()];
+            let empty = |lane| SourceManifestDescriptorV1 {
+                manifest_sha256: source_manifest_sha256(lane, &[]),
+                file_count: 0,
+                logical_bytes: 0,
+                page_count: 0,
+            };
+            let descriptor = PublicationCandidateDescriptorV1 {
+                schema_version: SCHEMA_VERSION,
+                scope: scope.clone(),
+                full_ref: "refs/heads/main".into(),
+                publisher_commit: "1".repeat(40),
+                object_format: GitObjectFormatV1::Sha1,
+                knowledge: SourceManifestDescriptorV1 {
+                    manifest_sha256: source_manifest_sha256(
+                        SourceLaneV1::Knowledge,
+                        &knowledge_manifest,
+                    ),
+                    file_count: 1,
+                    logical_bytes: source_bytes.len() as u64,
+                    page_count: 1,
+                },
+                gaps: empty(SourceLaneV1::Gaps),
+                graphs: SourceManifestDescriptorV1::default(),
+                evidence: SourceManifestDescriptorV1::default(),
+                config: None,
+            };
+            let store = KnowledgeSourceStore::open(
+                self.layout.state_dir.join("knowledge-sources"),
+                source_store_limits(&self.config),
+            )
+            .unwrap();
+            let authority = PublicationAuthorityV1 {
+                producer_id: "producer-a".into(),
+                project_id: project_id.into(),
+                scope: scope.clone(),
+            };
+            let upload = store
+                .begin_publication_upload(&authority, descriptor)
+                .unwrap();
+            store
+                .put_publication_manifest_page(
+                    &authority,
+                    &upload.upload_id,
+                    SourceLaneV1::Knowledge,
+                    0,
+                    &SourceManifestPageV1 {
+                        page_index: 0,
+                        entries: knowledge_manifest,
+                    },
+                )
+                .unwrap();
+            store
+                .missing_publication_blobs(&authority, &upload.upload_id, None)
+                .unwrap();
+            store
+                .install_publication_blob(
+                    &authority,
+                    &upload.upload_id,
+                    &entry.content_sha256,
+                    entry.encoded_bytes,
+                    Cursor::new(source_bytes),
+                )
+                .unwrap();
+            let finalized = store
+                .finalize_publication_upload(&authority, &upload.upload_id)
+                .unwrap();
+            let pinned = store
+                .pin_ready_publication_candidate(&finalized.source_generation_id)
+                .unwrap();
+            let candidate = pinned.candidate();
+            let files = |files: &[ReadyPublicationFile]| {
+                files
+                    .iter()
+                    .map(|file| PublishSourceFile {
+                        repository_relative_filename: file
+                            .manifest
+                            .repository_relative_filename
+                            .clone(),
+                        source_bytes: file.source_bytes.clone(),
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let accepted =
+                AcceptedPublicationRuntime::open_global(self.layout.projects_path()).unwrap();
+            let prepared = accepted
+                .prepare_publish(
+                    PublishRequest {
+                        mode: PublisherPublishMode::Establish,
+                        project_id: ProjectId::parse(project_id).unwrap(),
+                        source: AcceptedPublicationSourceBinding::Producer {
+                            producer_id: "producer-a".into(),
+                            source_generation_id: finalized.source_generation_id.clone(),
+                            source_generation_sha256: candidate.source_generation_sha256.clone(),
+                        },
+                        scope: scope.clone(),
+                        full_ref: candidate.descriptor.full_ref.clone(),
+                        accepted_commit: candidate.descriptor.publisher_commit.clone(),
+                        dry_run: false,
+                        auto_advance: Default::default(),
+                    },
+                    PublishSources {
+                        knowledge: files(&candidate.knowledge),
+                        gaps: files(&candidate.gaps),
+                        graphs: files(&candidate.graphs),
+                        evidence: files(&candidate.evidence),
+                        config: candidate.config.as_ref().map(|config| files(config)),
+                    },
+                )
+                .unwrap();
+            accepted.commit_publish(prepared, &mut || Ok(())).unwrap();
+
+            let observations =
+                crate::knowledge_transport_observations::KnowledgeTransportObservationsV1::open(
+                    self.layout
+                        .bro_home
+                        .join("knowledge-transport-observations.json"),
+                )
+                .unwrap();
+            for operation in [Operation::PublishedKnowledge, Operation::PublishedGaps] {
+                observations
+                    .record(project_id, operation, Outcome::Remote)
+                    .unwrap();
+            }
+        }
+
+        /// Install a verified predecessor marker and receipt whose rows name
+        /// the given projects.
+        fn install_predecessor(&self, project_ids: &[&str]) -> KnowledgeTransportCutoverMarkerV1 {
+            let mut rows = project_ids
+                .iter()
+                .map(|project_id| {
+                    let mut row = row();
+                    row.project_id = ProjectId::parse(*project_id).unwrap();
+                    row
+                })
+                .collect::<Vec<_>>();
+            rows.sort_by(|left, right| left.project_id.cmp(&right.project_id));
+            let mut marker = KnowledgeTransportCutoverMarkerV1 {
+                version: MARKER_VERSION,
+                applied_at: "unix:0".into(),
+                report_artifact_hash: Sha256ValueV1::digest(b"predecessor report"),
+                resolution_artifact_hash: Sha256ValueV1::digest(b"predecessor resolution"),
+                predecessor_marker_checksum: None,
+                predecessor_catalog_epoch: 1,
+                inventory_hash: Sha256ValueV1::digest(b"predecessor inventory"),
+                observation_snapshot_hash: Sha256ValueV1::digest(b"predecessor observations"),
+                rows,
+                checksum_sha256: Sha256ValueV1::digest(b"pending"),
+            };
+            marker.checksum_sha256 = marker_checksum(&marker).unwrap();
+            atomic_write_bytes_locked(
+                &knowledge_transport_cutover_marker_path(&self.layout.state_dir),
+                &serde_json::to_vec(&marker).unwrap(),
+            )
+            .unwrap();
+            write_receipt(&self.layout.state_dir, &marker, "unix:0").unwrap();
+            assert_eq!(
+                KnowledgeTransportCutoverRuntimeV1::open(&self.layout.state_dir)
+                    .unwrap()
+                    .marker(),
+                Some(&marker)
+            );
+            marker
+        }
+
+        fn report_path(&self) -> PathBuf {
+            self.root.join("knowledge-report.json")
+        }
+
+        fn resolution_path(&self) -> PathBuf {
+            self.root.join("knowledge-resolution.json")
+        }
+
+        fn preflight(&self) -> KnowledgeTransportCutoverPreflightReceiptV1 {
+            ProjectCatalogKnowledgeTransportCutoverFacadeV1::preflight(
+                KnowledgeTransportCutoverPreflightRequestV1 {
+                    layout: self.layout.clone(),
+                    config: self.config.clone(),
+                    report_path: self.report_path(),
+                    resolution_path: self.resolution_path(),
+                    generated_at: "unix:1".into(),
+                },
+            )
+            .unwrap()
+        }
+
+        fn report(&self) -> KnowledgeTransportCutoverReportV1 {
+            serde_json::from_slice(&std::fs::read(self.report_path()).unwrap()).unwrap()
+        }
+
+        fn apply(&self) -> CutoverResult<KnowledgeTransportCutoverVerificationReceiptV1> {
+            ProjectCatalogKnowledgeTransportCutoverFacadeV1::apply(
+                KnowledgeTransportCutoverApplyRequestV1 {
+                    layout: self.layout.clone(),
+                    config: self.config.clone(),
+                    report_path: self.report_path(),
+                    resolution_path: self.resolution_path(),
+                    applied_at: "unix:2".into(),
+                },
+            )
+        }
+
+        fn verify(&self) -> KnowledgeTransportCutoverVerificationReceiptV1 {
+            ProjectCatalogKnowledgeTransportCutoverFacadeV1::verify(
+                KnowledgeTransportCutoverVerifyRequestV1 {
+                    layout: self.layout.clone(),
+                    config: self.config.clone(),
+                    verified_at: "unix:3".into(),
+                },
+            )
+            .unwrap()
+        }
+
+        /// The installed marker and receipt, read back as raw bytes so the
+        /// assertions cover exactly what a daemon would open.
+        fn installed(
+            &self,
+        ) -> (
+            KnowledgeTransportCutoverMarkerV1,
+            KnowledgeTransportCutoverReceiptV1,
+        ) {
+            let marker = decode_knowledge_transport_cutover_marker_v1(
+                &std::fs::read(knowledge_transport_cutover_marker_path(
+                    &self.layout.state_dir,
+                ))
+                .unwrap(),
+            )
+            .unwrap();
+            let receipt = decode_receipt(
+                &std::fs::read(knowledge_transport_cutover_receipt_path(
+                    &self.layout.state_dir,
+                ))
+                .unwrap(),
+            )
+            .unwrap();
+            (marker, receipt)
+        }
+    }
+
+    fn project_ids(rows: &[PredictedKnowledgeTransportCutoverRowV1]) -> Vec<&str> {
+        rows.iter().map(|row| row.project_id.as_str()).collect()
+    }
+
+    fn assert_installed_marker_is_consistent(
+        fixture: &CeremonyFixture,
+        predecessor: Option<&KnowledgeTransportCutoverMarkerV1>,
+        expected_rows: &[&str],
+    ) {
+        let (marker, receipt) = fixture.installed();
+        assert_eq!(project_ids(&marker.rows), expected_rows);
+        assert_eq!(marker.checksum_sha256, marker_checksum(&marker).unwrap());
+        assert_eq!(
+            marker.predecessor_marker_checksum,
+            predecessor.map(|marker| marker.checksum_sha256.clone())
+        );
+        assert_eq!(receipt.marker_checksum_sha256, marker.checksum_sha256);
+        assert_eq!(receipt.covered_project_count, expected_rows.len() as u64);
+        assert_eq!(receipt.applied_at, marker.applied_at);
+        // Daemon startup opens the marker through exactly this gate.
+        let runtime = KnowledgeTransportCutoverRuntimeV1::open(&fixture.layout.state_dir).unwrap();
+        assert_eq!(runtime.marker(), Some(&marker));
+        for project_id in expected_rows {
+            assert!(runtime.covers_project_str(project_id));
+        }
+        for retired in [RETIRED_PROJECT_A, RETIRED_PROJECT_B] {
+            assert!(!runtime.covers_project_str(retired));
+        }
+    }
+
+    #[test]
+    fn partition_drops_only_rows_whose_project_left_the_catalog() {
+        let (mut catalog, _scope, live_row) = coverage_fixture();
+        let legacy_id = ProjectId::parse("p_00000000000000000000000000000002").unwrap();
+        catalog.projects.insert(
+            legacy_id.clone(),
+            CorpusProject {
+                project_id: legacy_id.clone(),
+                scope: ProjectScope::LegacyLocal,
+                operator_aliases: BTreeSet::new(),
+                nominated_aliases: BTreeSet::new(),
+                display_name: "Legacy fixture".into(),
+                created_at: "unix:1".into(),
+                registered_at_compat: None,
+                repo_history: None,
+                languages: BTreeSet::new(),
+            },
+        );
+        let mut legacy_row = row();
+        legacy_row.project_id = legacy_id.clone();
+        let mut retired_row = row();
+        retired_row.project_id = ProjectId::parse(RETIRED_PROJECT_A).unwrap();
+        let marker = KnowledgeTransportCutoverMarkerV1 {
+            version: MARKER_VERSION,
+            applied_at: "unix:0".into(),
+            report_artifact_hash: Sha256ValueV1::digest(b"report"),
+            resolution_artifact_hash: Sha256ValueV1::digest(b"resolution"),
+            predecessor_marker_checksum: None,
+            predecessor_catalog_epoch: 1,
+            inventory_hash: Sha256ValueV1::digest(b"inventory"),
+            observation_snapshot_hash: Sha256ValueV1::digest(b"observations"),
+            rows: vec![live_row.clone(), legacy_row.clone(), retired_row.clone()],
+            checksum_sha256: Sha256ValueV1::digest(b"unused"),
+        };
+
+        let (carried, dropped) =
+            partition_predecessor_rows(Some(&marker), &catalog, &BTreeSet::new());
+        assert_eq!(carried, vec![live_row, legacy_row.clone()]);
+        assert_eq!(
+            dropped,
+            vec![KnowledgeTransportDroppedRowV1 {
+                project_id: retired_row.project_id.clone(),
+                scope: retired_row.scope.clone(),
+                producer_id: retired_row.producer_id.clone(),
+                reason: KnowledgeTransportDroppedRowReasonV1::ProjectAbsentFromCatalog,
+            }]
+        );
+
+        let (carried, dropped) =
+            partition_predecessor_rows(Some(&marker), &catalog, &BTreeSet::from([project_id()]));
+        assert_eq!(carried, vec![legacy_row]);
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(
+            partition_predecessor_rows(None, &catalog, &BTreeSet::new()),
+            (Vec::new(), Vec::new())
+        );
+    }
+
+    #[test]
+    fn empty_dropped_rows_keep_the_prior_inventory_identity_and_serialization() {
+        let observations = KnowledgeTransportObservationsV1::in_memory().snapshot();
+        let carried = vec![row()];
+        let without = inventory_hash(1, "catalog", 2, &observations, &[], &carried, &[]).unwrap();
+        let prior = Sha256ValueV1::digest(
+            &serde_json::to_vec(&(
+                1u64,
+                "catalog",
+                2u64,
+                &observations,
+                &[] as &[KnowledgeTransportProjectEvidenceV1],
+                &carried,
+            ))
+            .unwrap(),
+        );
+        assert_eq!(without, prior);
+        let dropped = vec![KnowledgeTransportDroppedRowV1 {
+            project_id: ProjectId::parse(RETIRED_PROJECT_A).unwrap(),
+            scope: PublishedScope::try_new("repo", ".").unwrap(),
+            producer_id: "producer-1".into(),
+            reason: KnowledgeTransportDroppedRowReasonV1::ProjectAbsentFromCatalog,
+        }];
+        assert_ne!(
+            inventory_hash(1, "catalog", 2, &observations, &[], &carried, &dropped).unwrap(),
+            without,
+            "dropped rows are bound into the reviewed inventory"
+        );
+        assert_eq!(
+            serde_json::to_value(&dropped[0]).unwrap()["reason"],
+            "project_absent_from_catalog"
+        );
+    }
+
+    #[test]
+    fn cutover_drops_catalog_absent_rows_and_adds_uncovered_projects() {
+        let fixture = CeremonyFixture::new(&[(LIVE_PROJECT, ".")]);
+        let predecessor = fixture.install_predecessor(&[RETIRED_PROJECT_A, RETIRED_PROJECT_B]);
+
+        let receipt = fixture.preflight();
+        assert_eq!(receipt.status, KnowledgeTransportCutoverStatusV1::Clean);
+        assert_eq!(receipt.proposed_project_count, 1);
+        assert_eq!(receipt.dropped_row_count, 2);
+        let report = fixture.report();
+        assert_eq!(report.status, KnowledgeTransportCutoverStatusV1::Clean);
+        assert!(report.carried_forward_rows.is_empty());
+        assert_eq!(
+            report
+                .dropped_rows
+                .iter()
+                .map(|row| (row.project_id.as_str(), row.reason))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    RETIRED_PROJECT_A,
+                    KnowledgeTransportDroppedRowReasonV1::ProjectAbsentFromCatalog
+                ),
+                (
+                    RETIRED_PROJECT_B,
+                    KnowledgeTransportDroppedRowReasonV1::ProjectAbsentFromCatalog
+                ),
+            ]
+        );
+        assert_eq!(project_ids(&report.predicted_marker.rows), [LIVE_PROJECT]);
+
+        // Apply refuses a report whose dropped rows were edited away: the
+        // drop is part of the reviewed, predecessor-bound evidence.
+        let reviewed = std::fs::read(fixture.report_path()).unwrap();
+        let mut tampered = report.clone();
+        tampered.dropped_rows.clear();
+        std::fs::write(
+            fixture.report_path(),
+            serde_json::to_vec(&tampered).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            fixture.apply().unwrap_err().code,
+            "error.knowledge_transport_cutover_predecessor_changed"
+        );
+        std::fs::write(fixture.report_path(), reviewed).unwrap();
+
+        let applied = fixture.apply().unwrap();
+        assert_eq!(applied.covered_project_count, 1);
+        assert_eq!(applied.current_project_count, 1);
+        assert_installed_marker_is_consistent(&fixture, Some(&predecessor), &[LIVE_PROJECT]);
+
+        let verified = fixture.verify();
+        assert_eq!(verified.covered_project_count, 1);
+        assert_eq!(verified.current_project_count, 1);
+        assert_installed_marker_is_consistent(&fixture, Some(&predecessor), &[LIVE_PROJECT]);
+    }
+
+    #[test]
+    fn cutover_without_a_predecessor_marker_adds_uncovered_projects() {
+        let fixture = CeremonyFixture::new(&[(LIVE_PROJECT, ".")]);
+
+        let receipt = fixture.preflight();
+        assert_eq!(receipt.status, KnowledgeTransportCutoverStatusV1::Clean);
+        assert_eq!(receipt.proposed_project_count, 1);
+        assert_eq!(receipt.dropped_row_count, 0);
+        let report_json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(fixture.report_path()).unwrap()).unwrap();
+        assert!(
+            report_json.get("dropped_rows").is_none(),
+            "a report without drops keeps the artifact shape older builds read"
+        );
+
+        fixture.apply().unwrap();
+        assert_installed_marker_is_consistent(&fixture, None, &[LIVE_PROJECT]);
+        assert_eq!(fixture.verify().current_project_count, 1);
+    }
+
+    #[test]
+    fn cutover_whose_every_predecessor_row_is_retired_installs_an_empty_marker() {
+        let fixture = CeremonyFixture::new(&[]);
+        let predecessor = fixture.install_predecessor(&[RETIRED_PROJECT_A, RETIRED_PROJECT_B]);
+
+        let receipt = fixture.preflight();
+        assert_eq!(receipt.status, KnowledgeTransportCutoverStatusV1::Clean);
+        assert_eq!(receipt.proposed_project_count, 0);
+        assert_eq!(receipt.dropped_row_count, 2);
+        let report = fixture.report();
+        assert!(report.carried_forward_rows.is_empty());
+        assert!(report.predicted_marker.rows.is_empty());
+
+        let applied = fixture.apply().unwrap();
+        assert_eq!(applied.covered_project_count, 0);
+        assert_installed_marker_is_consistent(&fixture, Some(&predecessor), &[]);
+        assert_eq!(fixture.verify().covered_project_count, 0);
+        assert_installed_marker_is_consistent(&fixture, Some(&predecessor), &[]);
     }
 }
