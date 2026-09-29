@@ -244,7 +244,7 @@ fn release_inventory_installs_the_offline_cli_deliberately() {
 }
 
 #[test]
-fn git_transport_cutover_preflight_is_read_only_and_reports_missing_parity() {
+fn git_transport_cutover_preflight_is_read_only_and_defers_a_repo_missing_parity() {
     let directory = tempdir().unwrap();
     let root = directory.path().canonicalize().unwrap();
     let (state, projects_path, config_path, index_path) = isolated_state_root(&root);
@@ -293,8 +293,9 @@ fn git_transport_cutover_preflight_is_read_only_and_reports_missing_parity() {
         result["command"],
         "project_catalog_git_transport_cutover_preflight"
     );
-    assert_eq!(result["result"]["status"], "refused");
-    assert_eq!(result["result"]["refused_repo_count"], 1);
+    assert_eq!(result["result"]["status"], "clean");
+    assert_eq!(result["result"]["refused_repo_count"], 0);
+    assert_eq!(result["result"]["deferred_repo_count"], 1);
     assert!(!state.join("git-sources").exists());
     assert!(
         !bbox_corpus_index::index::history_generations::generations_root_for_index(&index_path)
@@ -307,14 +308,23 @@ fn git_transport_cutover_preflight_is_read_only_and_reports_missing_parity() {
     bbox_indexing::git_transport_cutover::decode_git_transport_cutover_report_v1(&report_bytes)
         .unwrap();
     let mut report_json: Value = serde_json::from_slice(&report_bytes).unwrap();
-    assert_eq!(report_json["status"], "refused");
+    assert_eq!(report_json["status"], "clean");
     assert_eq!(
         report_json["repos"][0]["projects"][0]["project_id"],
         project_id
     );
-    assert_eq!(report_json["repos"][0]["coverage_status"], "refused");
+    assert_eq!(
+        report_json["repos"][0]["coverage_status"],
+        "deferred_uncovered"
+    );
+    assert!(
+        !report_json["repos"][0]["defects"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
     let mut status_tampered = report_json.clone();
-    status_tampered["status"] = Value::String("clean".to_string());
+    status_tampered["status"] = Value::String("refused".to_string());
     assert!(
         bbox_indexing::git_transport_cutover::decode_git_transport_cutover_report_v1(
             &serde_json::to_vec(&status_tampered).unwrap()

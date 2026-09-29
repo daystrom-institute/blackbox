@@ -249,6 +249,24 @@ BBOX_GIT_CUTOVER_SMOKE_ROOT="$(mktemp -d /tmp/bbox-ghf-smoke.XXXXXX)" \
 The script leaves its review artifacts under the throwaway root and always
 stops its daemon before preflight and exit.
 
+## Git transport cutover
+
+`blackbox project-catalog git-transport-cutover` runs `--preflight`, then
+`--apply --configured`, then `--verify --configured`. Preflight and apply both
+run with the daemon stopped: apply refuses unless the checkout-access
+observation baseline, the activation journals, and the catalog still match what
+preflight captured, and a running daemon moves all three.
+
+A Granted repository that no predecessor marker row covers and whose capture
+cannot prove current transport evidence (for example, no committed activation
+journal at the current grant, or no Git source store at all) is reported with
+status `deferred_uncovered` and its `defects` as the reason. It gets no marker
+row, stays uncovered with its pre-cutover checkout adapter, and does not make
+the report non-clean. Apply recaptures every deferred repository and refuses
+the reviewed report if its evidence changed, including when it became provable;
+rerun preflight to propose it. A repository a predecessor row covers that fails
+capture is still `refused` and blocks apply.
+
 Remote plain HTTP is rejected and redirects are disabled. Loopback HTTP is
 accepted for local smoke tests.
 

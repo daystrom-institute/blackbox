@@ -76,6 +76,11 @@ pub enum GitTransportCutoverCoverageStatusV1 {
     Proposed,
     CarriedForwardCurrent,
     BlockedPublishedNeverCovered,
+    /// A Granted repository with no predecessor row whose capture cannot
+    /// prove current transport evidence. The report lists its `defects` as
+    /// the reason, the marker gets no row for it, and it stays `Uncovered`;
+    /// it does not make the report non-clean.
+    DeferredUncovered,
     CoveredProducerRemoved,
     CoveredBlockedPendingRecutover,
     CoverageStalePendingRecutover,
@@ -417,6 +422,8 @@ pub struct GitTransportCutoverPreflightReceiptV1 {
     pub proposed_repo_count: u64,
     pub blocked_repo_count: u64,
     pub refused_repo_count: u64,
+    #[serde(default)]
+    pub deferred_repo_count: u64,
 }
 
 pub struct GitTransportCutoverPreflightRequestV1 {
@@ -605,7 +612,8 @@ fn derived_report_status(
     }
 }
 
-fn preflight_repo_counts(repos: &[GitTransportRepoEvidenceV1]) -> (u64, u64, u64) {
+/// Proposed, blocked, refused, and deferred repository counts.
+fn preflight_repo_counts(repos: &[GitTransportRepoEvidenceV1]) -> (u64, u64, u64, u64) {
     let count = |status| {
         repos
             .iter()
@@ -616,6 +624,7 @@ fn preflight_repo_counts(repos: &[GitTransportRepoEvidenceV1]) -> (u64, u64, u64
         count(GitTransportCutoverCoverageStatusV1::Proposed),
         count(GitTransportCutoverCoverageStatusV1::BlockedPublishedNeverCovered),
         count(GitTransportCutoverCoverageStatusV1::Refused),
+        count(GitTransportCutoverCoverageStatusV1::DeferredUncovered),
     )
 }
 
@@ -1363,6 +1372,7 @@ impl ProjectCatalogGitTransportCutoverFacadeV1 {
                             &catalog.origin,
                             history_record,
                             grant,
+                            runtime_coverage,
                             git_store.as_ref(),
                             history_store.as_ref(),
                             checkout_parity_proof.as_ref(),
@@ -1466,7 +1476,7 @@ impl ProjectCatalogGitTransportCutoverFacadeV1 {
         )
         .map_err(|error| cutover_error("error.git_transport_cutover_artifact", error))?;
 
-        let (proposed_repo_count, blocked_repo_count, refused_repo_count) =
+        let (proposed_repo_count, blocked_repo_count, refused_repo_count, deferred_repo_count) =
             preflight_repo_counts(&report.repos);
         let _ = resolution;
         Ok(GitTransportCutoverPreflightReceiptV1 {
@@ -1479,6 +1489,7 @@ impl ProjectCatalogGitTransportCutoverFacadeV1 {
             proposed_repo_count,
             blocked_repo_count,
             refused_repo_count,
+            deferred_repo_count,
         })
     }
 
@@ -1732,6 +1743,7 @@ fn report_repo_matches_projection(
                 repo.coverage_status,
                 GitTransportCutoverCoverageStatusV1::Proposed
                     | GitTransportCutoverCoverageStatusV1::CarriedForwardCurrent
+                    | GitTransportCutoverCoverageStatusV1::DeferredUncovered
             ) && repo.blocked_reason.is_none()
                 && repo.grant.as_ref() == Some(grant)
         }
@@ -2151,6 +2163,7 @@ fn capture_granted_repo(
     origin: &CatalogOriginV2,
     history_record: &bbox_corpus_core::project_catalog::RepoHistoryRecord,
     grant: &RepoTransportGrant,
+    predecessor_coverage: GitTransportRuntimeCoverageV1,
     git_store: Option<&GitSourceStore>,
     history_store: Option<&HistoryGenerationStore>,
     checkout_parity_proof: Option<&GitTransportCheckoutParityProofV1>,
@@ -2236,8 +2249,13 @@ fn capture_granted_repo(
     if projects.iter().any(|project| !project.ready) {
         defects.push("one or more published members lack complete transport evidence".to_string());
     }
+    // Incomplete evidence refuses only a repository a predecessor row
+    // already governs; one that was never covered is deferred and stays
+    // outside the marker.
     let coverage_status = if defects.is_empty() {
         GitTransportCutoverCoverageStatusV1::Proposed
+    } else if predecessor_coverage == GitTransportRuntimeCoverageV1::Uncovered {
+        GitTransportCutoverCoverageStatusV1::DeferredUncovered
     } else {
         GitTransportCutoverCoverageStatusV1::Refused
     };
@@ -2322,6 +2340,37 @@ fn recheck_capture(
         if !capture_evidence_requires_recheck(&repo.coverage_status) {
             continue;
         }
+        if repo.coverage_status == GitTransportCutoverCoverageStatusV1::DeferredUncovered {
+            // A deferred repository's classification rests on evidence being
+            // absent, so it is recaptured whole: evidence that became
+            // provable (or changed shape) after preflight refuses the report.
+            let history_record = catalog
+                .repo_histories
+                .get(&repo.repo_history_id)
+                .ok_or_else(|| changed("repo history disappeared"))?;
+            let grant = repo
+                .grant
+                .as_ref()
+                .ok_or_else(|| changed("deferred repository grant disappeared"))?;
+            let mut recaptured = capture_granted_repo(
+                layout,
+                &catalog.origin,
+                history_record,
+                grant,
+                GitTransportRuntimeCoverageV1::Uncovered,
+                git_store,
+                history_store,
+                checkout_parity_proof,
+                manifest,
+                history_journals,
+            )?;
+            recaptured
+                .capability_baselines
+                .clone_from(&repo.capability_baselines);
+            if recaptured != *repo {
+                return Err(changed("deferred repository transport evidence"));
+            }
+        }
         if let Some(history) = &repo.history {
             let history_record = catalog
                 .repo_histories
@@ -2388,6 +2437,7 @@ fn capture_evidence_requires_recheck(status: &GitTransportCutoverCoverageStatusV
         status,
         GitTransportCutoverCoverageStatusV1::Proposed
             | GitTransportCutoverCoverageStatusV1::Refused
+            | GitTransportCutoverCoverageStatusV1::DeferredUncovered
     )
 }
 
@@ -2424,6 +2474,7 @@ fn capability_baselines(
             }
             GitTransportCutoverCoverageStatusV1::Proposed
             | GitTransportCutoverCoverageStatusV1::Refused
+            | GitTransportCutoverCoverageStatusV1::DeferredUncovered
                 if capability == CheckoutAccessKind::GitHistory
                     && repo.history.as_ref().is_some_and(|history| {
                         repo.grant.as_ref().is_some_and(|grant| {
@@ -2449,7 +2500,8 @@ fn capability_baselines(
                 GitTransportObservationCategoryV1::HistoryTransportCurrentPreCutover
             }
             GitTransportCutoverCoverageStatusV1::Proposed
-            | GitTransportCutoverCoverageStatusV1::Refused => {
+            | GitTransportCutoverCoverageStatusV1::Refused
+            | GitTransportCutoverCoverageStatusV1::DeferredUncovered => {
                 GitTransportObservationCategoryV1::OverlapWindow
             }
         };
@@ -3581,7 +3633,7 @@ mod tests {
             };
             assert!(report_repo_matches_projection(&repo, &state));
             assert!(!capture_evidence_requires_recheck(&report_status));
-            assert_eq!(preflight_repo_counts(&[repo]), (0, 0, 0));
+            assert_eq!(preflight_repo_counts(&[repo]), (0, 0, 0, 0));
         }
         assert_eq!(
             covered_report_status(GitTransportRuntimeCoverageV1::Uncovered),
@@ -3633,5 +3685,740 @@ mod tests {
                 "error.git_transport_cutover_observation_delta"
             );
         }
+    }
+
+    const REPO_A: &str = "rh_000000000000000000000000000000a1";
+    const REPO_B: &str = "rh_000000000000000000000000000000b1";
+    const PROJECT_A: &str = "p_000000000000000000000000000000a1";
+    const PROJECT_B: &str = "p_000000000000000000000000000000b1";
+    const HEAD_ONE: &str = "1111111111111111111111111111111111111111";
+
+    /// One single-member Published repository in a ceremony fixture.
+    #[derive(Clone)]
+    struct FixtureRepo {
+        repo_history_id: RepoHistoryId,
+        project_id: ProjectId,
+        scope: PublishedScope,
+        namespace: CommitNamespace,
+    }
+
+    impl FixtureRepo {
+        fn new(repo_history_id: &str, project_id: &str, repo_name: &str) -> Self {
+            Self {
+                repo_history_id: RepoHistoryId::parse(repo_history_id).unwrap(),
+                project_id: ProjectId::parse(project_id).unwrap(),
+                scope: PublishedScope::try_new(repo_name, ".").unwrap(),
+                namespace: CommitNamespace::parse(repo_name).unwrap(),
+            }
+        }
+    }
+
+    struct CeremonyFixture {
+        _directory: tempfile::TempDir,
+        root: PathBuf,
+        layout: ProjectCatalogMigrationResolvedLayoutV1,
+        config: Config,
+    }
+
+    impl CeremonyFixture {
+        /// A rehearsal layout whose catalog holds each repository as one
+        /// Published root project assigned to `producer-a`. No transport
+        /// store exists until a test provisions one.
+        fn new(repos: &[&FixtureRepo]) -> Self {
+            use bbox_config::config::{self, CodeCollectionProducerConfig};
+
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().canonicalize().unwrap();
+            let config_path = root.join("config.toml");
+            std::fs::write(
+                &config_path,
+                format!(
+                    "[paths]\nstate_dir = {:?}\nvectors_dir = {:?}\n",
+                    root.join("live"),
+                    root.join("live").join("vectors")
+                ),
+            )
+            .unwrap();
+            let mut config = {
+                let _guard = bbox_util::util::test_env_lock();
+                config::load_with(config::LoadOptions {
+                    config_path: Some(config_path),
+                    ..Default::default()
+                })
+                .unwrap()
+            };
+            config.code_collection.enabled = true;
+            config.code_collection.git_transport_enabled = true;
+            config.code_collection.producers = vec![CodeCollectionProducerConfig {
+                producer_id: "producer-a".into(),
+                token_file: root.join("producer.token"),
+                token_files: Vec::new(),
+                scopes: repos.iter().map(|repo| repo.scope.clone()).collect(),
+                claim_scopes: Default::default(),
+                auto_publish: false,
+            }];
+            let layout = ProjectCatalogMigrationResolvedLayoutV1::from_rehearsal_root(
+                root.join("rehearsal"),
+                &config,
+            )
+            .unwrap();
+            std::fs::create_dir_all(&layout.bro_home).unwrap();
+            let store = ProjectCatalogStore::initialize_empty(layout.projects_path()).unwrap();
+            let epoch = store.snapshot().unwrap().epoch();
+            store
+                .transact(epoch, |catalog, _attachments| {
+                    for repo in repos {
+                        catalog.repo_histories.insert(
+                            repo.repo_history_id.clone(),
+                            RepoHistoryRecord {
+                                repo_history_id: repo.repo_history_id.clone(),
+                                membership_generation: 0,
+                                authority: RepoHistoryAuthority::Recorded(
+                                    RecordedRepoAuthority::parse(repo.namespace.as_str()).unwrap(),
+                                ),
+                                primary_namespace: repo.namespace.clone(),
+                                compatibility_namespaces: BTreeSet::new(),
+                                materialization: RepoHistoryMaterialization::NotBuilt,
+                            },
+                        );
+                        catalog.projects.insert(
+                            repo.project_id.clone(),
+                            CorpusProject {
+                                project_id: repo.project_id.clone(),
+                                scope: ProjectScope::Published(repo.scope.clone()),
+                                operator_aliases: BTreeSet::new(),
+                                nominated_aliases: BTreeSet::new(),
+                                display_name: "Neutral fixture".into(),
+                                created_at: "unix:1".into(),
+                                registered_at_compat: None,
+                                repo_history: Some(repo.repo_history_id.clone()),
+                                languages: BTreeSet::new(),
+                            },
+                        );
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            Self {
+                _directory: directory,
+                root,
+                layout,
+                config,
+            }
+        }
+
+        fn catalog_store(&self) -> ProjectCatalogStore {
+            ProjectCatalogStore::open_existing(self.layout.projects_path()).unwrap()
+        }
+
+        fn grant(&self, repo: &FixtureRepo) -> RepoTransportGrant {
+            let catalog = self.catalog_store().snapshot().unwrap();
+            let assignments = configured_assignments(&self.config).unwrap();
+            let projection = derive_repo_transport_grants(catalog.catalog(), &assignments);
+            let RepoTransportGrantState::Granted { grant } =
+                &projection.grants[&repo.repo_history_id]
+            else {
+                panic!("fixture repositories are fully assigned")
+            };
+            grant.clone()
+        }
+
+        fn git_store(&self) -> GitSourceStore {
+            GitSourceStore::open(
+                self.layout.state_dir.join("git-sources"),
+                git_store_limits(&self.config),
+            )
+            .unwrap()
+        }
+
+        /// Install every piece of evidence capture requires for `repo` at
+        /// `head`.
+        fn provision_evidence(&self, repo: &FixtureRepo, head: &str) {
+            let (journal, overlay) = self.stage_evidence(repo, head);
+            self.commit_evidence(repo, journal, overlay);
+        }
+
+        /// Install an active code generation and edge snapshot, a verified
+        /// ready history source, and its P3 generation as the catalog's
+        /// ready materialization. Returns the unsaved Prepared journal and
+        /// the overlay a committed activation would select.
+        fn stage_evidence(
+            &self,
+            repo: &FixtureRepo,
+            head: &str,
+        ) -> (HistoryActivationJournalV1, GitOverlaySelector) {
+            use bbox_code_source_store::{CodeSourceStore, RuntimeRecordMode};
+            use bbox_git_source::{
+                GitHistoryCommitFragmentV1, GitHistoryCommitHeaderV1, GitHistoryDescriptorV1,
+                GitHistoryManifestEntryV1, GitHistoryManifestPageV1, GitObjectFormatV1,
+                encode_history_fragment, history_manifest_sha256,
+            };
+            use bbox_git_source_store::HistoryActivationOverlayV1;
+
+            // Active code generation, activation record, and edge snapshot.
+            let code_store = CodeSourceStore::open_with_mode(
+                &self.layout.code_source_root,
+                bbox_code_source_store::StoreLimits::default(),
+                RuntimeRecordMode::CatalogV2,
+            )
+            .unwrap();
+            let entries = Vec::new();
+            let descriptor = bbox_code_source::GenerationDescriptor {
+                schema_version: bbox_code_source::SCHEMA_VERSION,
+                walker_policy_version: bbox_code_source::WALKER_POLICY_VERSION.into(),
+                scope: repo.scope.clone(),
+                head_commit: head.to_string(),
+                dirty_fingerprint: bbox_code_source::dirty_fingerprint(head, &entries),
+                manifest_sha256: bbox_code_source::manifest_sha256(&entries),
+                file_count: 0,
+                logical_bytes: 0,
+            };
+            let upload = code_store.begin_upload("producer-a", descriptor).unwrap();
+            code_store
+                .complete_manifest("producer-a", &upload.upload_id)
+                .unwrap();
+            let generation = code_store
+                .finalize_upload_mixed("producer-a", &upload.upload_id)
+                .unwrap();
+            let code_generation = generation.generation_id().to_string();
+            let inventory = "b".repeat(64);
+            code_store
+                .record_materialization_mixed(&repo.scope, &code_generation, 0, inventory.clone())
+                .unwrap();
+            code_store
+                .mark_generation_state_mixed(
+                    &repo.scope,
+                    &code_generation,
+                    bbox_code_source::GenerationState::Active,
+                    None,
+                )
+                .unwrap();
+            let selector = crate::index::project_files::collected_materialization_selector(
+                repo.project_id.as_str(),
+                &code_generation,
+            );
+            let snapshot_id = bbox_edge_sidecar::snapshot::collected_snapshot_id(
+                repo.project_id.as_str(),
+                &code_generation,
+            );
+            code_store
+                .save_activation_v2(&bbox_code_source_store::ActivationRecordV2 {
+                    version: bbox_code_source_store::MIGRATION_STORE_VERSION,
+                    project_id: repo.project_id.clone(),
+                    published_scope: repo.scope.clone(),
+                    generation_id: code_generation.clone(),
+                    selector: selector.clone(),
+                    snapshot_id: snapshot_id.clone(),
+                    document_count: 0,
+                    entity_inventory_sha256: inventory,
+                    current_chunk_targets: BTreeMap::new(),
+                    activated_unix_secs: 1,
+                    cutback_pending: false,
+                    cutback: None,
+                    diagnostic: None,
+                })
+                .unwrap();
+            std::fs::create_dir_all(bbox_edge_sidecar::snapshot::snapshot_dir(
+                &self.layout.edge_root,
+                repo.project_id.as_str(),
+                &snapshot_id,
+            ))
+            .unwrap();
+            bbox_edge_sidecar::snapshot::activate_collected_snapshot(
+                &self.layout.edge_root,
+                repo.project_id.as_str(),
+                repo.scope.repo_id(),
+                head,
+                &code_generation,
+                &selector,
+                &snapshot_id,
+            )
+            .unwrap();
+
+            // Verified ready history source at the same head.
+            let fragment = GitHistoryCommitFragmentV1 {
+                commit_oid: head.to_string(),
+                fragment_index: 0,
+                fragment_count: 1,
+                header: Some(GitHistoryCommitHeaderV1 {
+                    parent_oids: Vec::new(),
+                    author_name: "A".into(),
+                    author_email: "a@example.invalid".into(),
+                    message: "neutral root".into(),
+                }),
+                changed_paths: vec!["README.md".into()],
+            };
+            let bytes = encode_history_fragment(&fragment);
+            let manifest = vec![GitHistoryManifestEntryV1 {
+                commit_oid: head.to_string(),
+                fragment_index: 0,
+                encoded_bytes: bytes.len() as u64,
+                content_sha256: Sha256ValueV1::digest(&bytes).as_str().to_string(),
+            }];
+            let git_store = self.git_store();
+            let upload = git_store
+                .begin_history_upload(
+                    "producer-a",
+                    &repo.repo_history_id,
+                    &repo.namespace,
+                    GitHistoryDescriptorV1 {
+                        schema_version: bbox_git_source::SCHEMA_VERSION,
+                        scope: repo.scope.clone(),
+                        repo_head: head.to_string(),
+                        object_format: GitObjectFormatV1::Sha1,
+                        manifest_sha256: history_manifest_sha256(&manifest),
+                        commit_count: 1,
+                        fragment_count: 1,
+                        logical_bytes: bytes.len() as u64,
+                    },
+                )
+                .unwrap();
+            git_store
+                .put_history_manifest_page(
+                    "producer-a",
+                    &upload.upload_id,
+                    0,
+                    &GitHistoryManifestPageV1 {
+                        entries: manifest.clone(),
+                    },
+                )
+                .unwrap();
+            git_store
+                .complete_history_manifest("producer-a", &upload.upload_id)
+                .unwrap();
+            git_store
+                .install_history_record(
+                    "producer-a",
+                    &upload.upload_id,
+                    &manifest[0].content_sha256,
+                    manifest[0].encoded_bytes,
+                    std::io::Cursor::new(bytes),
+                )
+                .unwrap();
+            let source_generation_id = git_store
+                .finalize_history_upload("producer-a", &upload.upload_id)
+                .unwrap()
+                .source_generation_id;
+            let source = git_store
+                .verified_history_source("producer-a", &source_generation_id)
+                .unwrap();
+
+            // P3 generation, selected as the catalog's ready materialization.
+            let prepared = crate::index::history_transport::prepare_typed_history_generation(
+                &git_store, &source,
+            )
+            .unwrap();
+            let generation_store =
+                HistoryGenerationStore::open_for_index(&self.layout.index_root).unwrap();
+            let generation =
+                crate::index::history_materializer::publish_prepared_history_generation(
+                    &generation_store,
+                    prepared.prepared,
+                )
+                .unwrap();
+            let catalog_store = self.catalog_store();
+            let epoch = catalog_store.snapshot().unwrap().epoch();
+            let p3_generation_id = generation.id.as_str().to_string();
+            catalog_store
+                .transact(epoch, |catalog, _attachments| {
+                    catalog
+                        .repo_histories
+                        .get_mut(&repo.repo_history_id)
+                        .unwrap()
+                        .materialization = RepoHistoryMaterialization::Ready {
+                        generation_id:
+                            bbox_corpus_core::project_catalog::RepoHistoryGenerationId::parse(
+                                p3_generation_id.clone(),
+                            )
+                            .unwrap(),
+                    };
+                    Ok(())
+                })
+                .unwrap();
+
+            // The Prepared journal at the current grant and its overlay.
+            let grant = self.grant(repo);
+            let overlay = GitOverlaySelector {
+                project_id: repo.project_id.as_str().to_string(),
+                code_generation: code_generation.clone(),
+                repo_history_generation: p3_generation_id.clone(),
+                source: bbox_corpus_core::git_overlay::GitOverlaySourceV1::ProducerTransport {
+                    producer_id: "producer-a".into(),
+                    source_generation_id: source_generation_id.clone(),
+                },
+                repo_head: head.to_string(),
+                commit_namespace: repo.namespace.as_str().to_string(),
+                overlay_generation: 1,
+            };
+            let journal = HistoryActivationJournalV1 {
+                version: 1,
+                stage: HistoryActivationStageV1::Prepared,
+                source_generation_id: source_generation_id.clone(),
+                producer_id: "producer-a".into(),
+                source_evidence: source.source_evidence.clone(),
+                grant_commitment: grant.commitment.clone(),
+                catalog_epoch_prepared: epoch,
+                catalog_epoch_after: None,
+                repo_history_id: repo.repo_history_id.clone(),
+                prior_p3_generation_id: None,
+                planned_p3_generation_id: p3_generation_id,
+                planned_p3_manifest_sha256: Sha256ValueV1::digest(
+                    &serde_json::to_vec(&generation.manifest).unwrap(),
+                )
+                .as_str()
+                .to_string(),
+                code_selectors: BTreeMap::from([(
+                    repo.project_id.as_str().to_string(),
+                    code_generation,
+                )]),
+                overlays: vec![HistoryActivationOverlayV1 {
+                    project_id: repo.project_id.as_str().to_string(),
+                    snapshot_id,
+                    selector: overlay.clone(),
+                    file_commitment: None,
+                }],
+                overlay_clears: Vec::new(),
+                commit_document_count: generation.manifest.body.commit_document_count,
+                commit_document_commitment_sha256: generation
+                    .manifest
+                    .body
+                    .commit_document_commitment_sha256
+                    .clone(),
+                vector_input_count: generation.manifest.body.vector_input_count,
+                vector_input_commitment_sha256: generation
+                    .manifest
+                    .body
+                    .vector_input_commitment_sha256
+                    .clone(),
+                commit_view_commitment: None,
+                diagnostic: None,
+                checksum_sha256: String::new(),
+            };
+            (journal, overlay)
+        }
+
+        /// Advance the staged journal to Committed and select its overlay.
+        fn commit_evidence(
+            &self,
+            repo: &FixtureRepo,
+            journal: HistoryActivationJournalV1,
+            overlay: GitOverlaySelector,
+        ) {
+            let git_store = self.git_store();
+            let mut journal = git_store.save_activation_journal(journal).unwrap();
+            for stage in [
+                HistoryActivationStageV1::GenerationVerified,
+                HistoryActivationStageV1::MaterializationAdvanced,
+                HistoryActivationStageV1::CommitViewPublished,
+                HistoryActivationStageV1::OverlaysPublished,
+                HistoryActivationStageV1::Committed,
+            ] {
+                journal.stage = stage;
+                if stage == HistoryActivationStageV1::MaterializationAdvanced {
+                    journal.catalog_epoch_after = Some(journal.catalog_epoch_prepared);
+                }
+                if stage == HistoryActivationStageV1::CommitViewPublished {
+                    journal.commit_view_commitment =
+                        Some(journal.commit_document_commitment_sha256.clone());
+                    for overlay in &mut journal.overlays {
+                        overlay.file_commitment = Some("f".repeat(64));
+                    }
+                }
+                journal = git_store.save_activation_journal(journal).unwrap();
+            }
+            let mut index = ManifestIndex::load(&self.layout.edge_root).unwrap();
+            index
+                .workspaces
+                .get_mut(repo.project_id.as_str())
+                .unwrap()
+                .git_overlay = Some(overlay);
+            index.write_atomic(&self.layout.edge_root).unwrap();
+        }
+
+        /// Install a verified predecessor marker and receipt holding `rows`.
+        fn install_predecessor(
+            &self,
+            mut rows: Vec<PredictedGitTransportCutoverRowV1>,
+        ) -> GitTransportCutoverMarkerV1 {
+            rows.sort_by(|left, right| left.repo_history_id.cmp(&right.repo_history_id));
+            let mut marker = GitTransportCutoverMarkerV1 {
+                version: MARKER_VERSION,
+                applied_at: "unix:0".into(),
+                report_artifact_hash: Sha256ValueV1::digest(b"predecessor report"),
+                resolution_artifact_hash: Sha256ValueV1::digest(b"predecessor resolution"),
+                predecessor_marker_checksum: None,
+                predecessor_catalog_epoch: 1,
+                inventory_hash: Sha256ValueV1::digest(b"predecessor inventory"),
+                aggregate_grant_hash: Sha256ValueV1::digest(b"predecessor grants"),
+                zero_prepared_history_journals: true,
+                zero_prepared_provenance_journals: true,
+                rows,
+                checksum_sha256: Sha256ValueV1::digest(b"pending"),
+            };
+            marker.checksum_sha256 = marker_checksum(&marker).unwrap();
+            atomic_write_bytes_locked(
+                &git_transport_cutover_marker_path(&self.layout.state_dir),
+                &serde_json::to_vec(&marker).unwrap(),
+            )
+            .unwrap();
+            write_cutover_receipt(&self.layout.state_dir, &marker, "unix:0").unwrap();
+            assert_eq!(
+                GitTransportCutoverRuntimeV1::open(&self.layout.state_dir)
+                    .unwrap()
+                    .marker(),
+                Some(&marker)
+            );
+            marker
+        }
+
+        /// A predecessor row covering `repo` whose grant commitment no
+        /// longer matches the catalog, so the runtime classifies it stale.
+        fn stale_row(&self, repo: &FixtureRepo) -> PredictedGitTransportCutoverRowV1 {
+            PredictedGitTransportCutoverRowV1 {
+                repo_history_id: repo.repo_history_id.clone(),
+                grant_commitment: "0".repeat(64),
+                membership_generation: 0,
+                source_generation_id: "source-predecessor".into(),
+                p3_generation_id: format!("rhg_{}", "e".repeat(64)),
+                history_parity_commitment: Sha256ValueV1::digest(b"predecessor history"),
+                members: BTreeSet::from([repo.project_id.clone()]),
+                provenance_import_generations: BTreeMap::new(),
+                provenance_export_generations: BTreeMap::new(),
+                provenance_parity_commitments: BTreeMap::new(),
+                capability_baselines: [
+                    CheckoutAccessKind::GitHistory,
+                    CheckoutAccessKind::ProvenanceNoteIo,
+                ]
+                .into_iter()
+                .map(|capability| GitTransportCapabilityBaselineV1 {
+                    capability,
+                    active_category: GitTransportObservationCategoryV1::OverlapWindow,
+                    observation_sequence: 0,
+                    overlap_window_granted_baseline: 0,
+                    overlap_window_denied_baseline: 0,
+                    target_granted_baseline: 0,
+                    target_denied_baseline: 0,
+                })
+                .collect(),
+            }
+        }
+
+        fn report_path(&self) -> PathBuf {
+            self.root.join("git-report.json")
+        }
+
+        fn resolution_path(&self) -> PathBuf {
+            self.root.join("git-resolution.json")
+        }
+
+        fn preflight(&self) -> GitTransportCutoverPreflightReceiptV1 {
+            ProjectCatalogGitTransportCutoverFacadeV1::preflight(
+                GitTransportCutoverPreflightRequestV1 {
+                    layout: self.layout.clone(),
+                    config: self.config.clone(),
+                    report_path: self.report_path(),
+                    resolution_path: self.resolution_path(),
+                    generated_at: "unix:1".into(),
+                },
+            )
+            .unwrap()
+        }
+
+        /// Discard the prior review pair so the next preflight binds a
+        /// fresh resolution to its new inventory.
+        fn repreflight(&self) -> GitTransportCutoverPreflightReceiptV1 {
+            let _ = std::fs::remove_file(self.report_path());
+            let _ = std::fs::remove_file(self.resolution_path());
+            self.preflight()
+        }
+
+        fn report(&self) -> GitTransportCutoverReportV1 {
+            decode_git_transport_cutover_report_v1(&std::fs::read(self.report_path()).unwrap())
+                .unwrap()
+        }
+
+        fn apply(&self) -> CutoverResult<GitTransportCutoverVerificationReceiptV1> {
+            ProjectCatalogGitTransportCutoverFacadeV1::apply(GitTransportCutoverApplyRequestV1 {
+                layout: self.layout.clone(),
+                config: self.config.clone(),
+                report_path: self.report_path(),
+                resolution_path: self.resolution_path(),
+                applied_at: "unix:2".into(),
+            })
+        }
+
+        fn verify(&self) -> GitTransportCutoverVerificationReceiptV1 {
+            ProjectCatalogGitTransportCutoverFacadeV1::verify(GitTransportCutoverVerifyRequestV1 {
+                layout: self.layout.clone(),
+                config: self.config.clone(),
+                verified_at: "unix:3".into(),
+            })
+            .unwrap()
+        }
+
+        fn installed_marker(&self) -> GitTransportCutoverMarkerV1 {
+            GitTransportCutoverRuntimeV1::open(&self.layout.state_dir)
+                .unwrap()
+                .marker()
+                .cloned()
+                .unwrap()
+        }
+    }
+
+    fn repo_status(
+        report: &GitTransportCutoverReportV1,
+        repo: &FixtureRepo,
+    ) -> GitTransportCutoverCoverageStatusV1 {
+        report
+            .repos
+            .iter()
+            .find(|evidence| evidence.repo_history_id == repo.repo_history_id)
+            .unwrap()
+            .coverage_status
+            .clone()
+    }
+
+    fn marker_repo_ids(marker: &GitTransportCutoverMarkerV1) -> Vec<&str> {
+        marker
+            .rows
+            .iter()
+            .map(|row| row.repo_history_id.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn never_covered_repo_without_evidence_is_deferred_and_the_report_stays_clean() {
+        let proven = FixtureRepo::new(REPO_A, PROJECT_A, "neutral-alpha");
+        let deferred = FixtureRepo::new(REPO_B, PROJECT_B, "neutral-beta");
+
+        // Never provisioned: no Git source store exists at all.
+        let fixture = CeremonyFixture::new(&[&deferred]);
+        let receipt = fixture.preflight();
+        assert_eq!(receipt.status, GitTransportCutoverStatusV1::Clean);
+        assert_eq!(
+            (
+                receipt.proposed_repo_count,
+                receipt.refused_repo_count,
+                receipt.deferred_repo_count
+            ),
+            (0, 0, 1)
+        );
+        let report = fixture.report();
+        assert_eq!(
+            repo_status(&report, &deferred),
+            GitTransportCutoverCoverageStatusV1::DeferredUncovered
+        );
+        assert!(
+            !report.repos[0].defects.is_empty(),
+            "the reason is reported"
+        );
+        assert_eq!(
+            serde_json::to_value(&report.repos[0].coverage_status).unwrap(),
+            "deferred_uncovered"
+        );
+        assert!(report.predicted_marker.rows.is_empty());
+        fixture.apply().unwrap();
+        assert!(fixture.installed_marker().rows.is_empty());
+        assert_eq!(
+            fixture.installed_marker().rows.len(),
+            fixture.verify().covered_repo_count as usize
+        );
+
+        // Absent: the store exists and another repository is proven, but
+        // this one has no source, journal, or overlay.
+        let fixture = CeremonyFixture::new(&[&proven, &deferred]);
+        fixture.provision_evidence(&proven, HEAD_ONE);
+        let receipt = fixture.preflight();
+        assert_eq!(receipt.status, GitTransportCutoverStatusV1::Clean);
+        assert_eq!(
+            (
+                receipt.proposed_repo_count,
+                receipt.refused_repo_count,
+                receipt.deferred_repo_count
+            ),
+            (1, 0, 1)
+        );
+        let report = fixture.report();
+        assert_eq!(
+            repo_status(&report, &proven),
+            GitTransportCutoverCoverageStatusV1::Proposed
+        );
+        assert_eq!(
+            repo_status(&report, &deferred),
+            GitTransportCutoverCoverageStatusV1::DeferredUncovered
+        );
+        let applied = fixture.apply().unwrap();
+        assert_eq!(applied.covered_repo_count, 1);
+        assert_eq!(applied.current_repo_count, 1);
+        let marker = fixture.installed_marker();
+        assert_eq!(marker_repo_ids(&marker), [REPO_A]);
+        let runtime = GitTransportCutoverRuntimeV1::from_marker(Some(marker));
+        let catalog = fixture.catalog_store().snapshot().unwrap();
+        let assignments = configured_assignments(&fixture.config).unwrap();
+        assert_eq!(
+            runtime.classify_repo(catalog.catalog(), &assignments, &deferred.repo_history_id),
+            GitTransportRuntimeCoverageV1::Uncovered,
+            "a deferred repository keeps its pre-cutover adapter"
+        );
+    }
+
+    #[test]
+    fn predecessor_covered_repo_failing_capture_stays_refused() {
+        let covered = FixtureRepo::new(REPO_A, PROJECT_A, "neutral-alpha");
+        let fixture = CeremonyFixture::new(&[&covered]);
+        fixture.install_predecessor(vec![fixture.stale_row(&covered)]);
+
+        let receipt = fixture.preflight();
+        assert_eq!(receipt.status, GitTransportCutoverStatusV1::Refused);
+        assert_eq!(
+            (receipt.refused_repo_count, receipt.deferred_repo_count),
+            (1, 0)
+        );
+        assert_eq!(
+            repo_status(&fixture.report(), &covered),
+            GitTransportCutoverCoverageStatusV1::Refused
+        );
+        assert_eq!(
+            fixture.apply().unwrap_err().code,
+            "error.git_transport_cutover_apply_refused"
+        );
+    }
+
+    #[test]
+    fn apply_refuses_a_deferred_repo_that_became_provable_after_preflight() {
+        let deferred = FixtureRepo::new(REPO_A, PROJECT_A, "neutral-alpha");
+        let fixture = CeremonyFixture::new(&[&deferred]);
+        // Sources and the catalog materialization exist at preflight; only
+        // the Committed journal and its overlay land afterwards, so the
+        // catalog, store presence, and journal-stage gates all still pass.
+        let (journal, overlay) = fixture.stage_evidence(&deferred, HEAD_ONE);
+        let receipt = fixture.preflight();
+        assert_eq!(receipt.deferred_repo_count, 1);
+
+        fixture.commit_evidence(&deferred, journal, overlay);
+        let error = fixture.apply().unwrap_err();
+        assert_eq!(error.code, "error.git_transport_cutover_capture_changed");
+        assert!(
+            error
+                .message
+                .contains("deferred repository transport evidence"),
+            "{error}"
+        );
+        assert!(
+            GitTransportCutoverRuntimeV1::open(&fixture.layout.state_dir)
+                .unwrap()
+                .marker()
+                .is_none(),
+            "a refused apply installs nothing"
+        );
+
+        // A fresh review proposes the now-provable repository.
+        let receipt = fixture.repreflight();
+        assert_eq!(
+            (receipt.proposed_repo_count, receipt.deferred_repo_count),
+            (1, 0)
+        );
+        fixture.apply().unwrap();
+        assert_eq!(marker_repo_ids(&fixture.installed_marker()), [REPO_A]);
     }
 }
