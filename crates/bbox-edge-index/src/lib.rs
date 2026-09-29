@@ -3,7 +3,6 @@
 //! lane files). The daemon keeps no in-memory edge graph; the sidecar
 //! remains the code-source activation and git-overlay authority.
 
-pub mod migration;
 pub mod storage_health;
 
 #[cfg(test)]

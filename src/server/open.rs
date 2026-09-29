@@ -769,23 +769,14 @@ pub(super) fn open_shared_state(
     )
     .context("pre-bind transaction recovery failed")?;
 
-    // Legacy-lane migration commits retain their manifest and rollback
-    // backup, but their extraction staging is disposable once the committed
-    // status is durable. Recover crash-window transactions and reclaim any
-    // committed staging residue; older daemons left a second full copy of
-    // every migrated lane here.
-    for message in crate::migration::recover_pending_migrations(&edges_dir)
-        .context("pre-bind legacy edge migration recovery failed")?
-    {
-        if message.starts_with("WARNING:") {
-            tracing::warn!(%message, "legacy edge migration recovery warning");
-        } else {
-            tracing::info!(%message, "legacy edge migration recovery completed");
-        }
-    }
+    // Edge families no reader consumes (the transcript-edge split lanes, the
+    // managed project lane directory and the split-lane migration records)
+    // leave the store once. The store-level marker makes every later start a
+    // single stat.
+    retire_legacy_edge_lanes_at_startup(&edges_dir)?;
 
-    // Retired transcript file-touch rows leave the durable lanes once. The
-    // store-level marker makes every later start a single stat.
+    // Retired transcript file-touch rows leave the remaining legacy lanes
+    // once. The store-level marker makes every later start a single stat.
     purge_file_touch_edges_at_startup(&edges_dir)?;
 
     // Pre-bind catalog-mode recovery (P4-F section 10.1 steps 5-8):
@@ -1070,6 +1061,23 @@ pub(super) fn open_shared_state(
     })
 }
 
+/// Pre-bind removal of edge families no reader consumes.
+fn retire_legacy_edge_lanes_at_startup(
+    edges_dir: &Path,
+) -> anyhow::Result<bbox_edge_sidecar::legacy_lane_retirement::LegacyLaneRetirementStats> {
+    let stats = bbox_edge_sidecar::legacy_lane_retirement::retire_legacy_edge_lanes(edges_dir)
+        .context("pre-bind legacy edge lane retirement failed")?;
+    if stats.families_removed > 0 {
+        tracing::info!(
+            families_removed = stats.families_removed,
+            files_removed = stats.files_removed,
+            bytes_removed = stats.bytes_removed,
+            "retired edge families removed"
+        );
+    }
+    Ok(stats)
+}
+
 /// Pre-bind purge of retired file-touch rows from the durable edge lanes.
 fn purge_file_touch_edges_at_startup(
     edges_dir: &Path,
@@ -1225,6 +1233,48 @@ fn refresh_history_reference_manifest(
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    /// The startup retirement is the daemon's pass over a real edge root: a
+    /// store carrying the transcript-edge split lanes, the managed project
+    /// lane directory and split-lane migration records loses them, snapshots
+    /// and Git source lanes stay, and the next start inspects nothing. The
+    /// file-touch purge that follows finds no split lane left to rewrite.
+    #[test]
+    fn startup_retires_legacy_edge_families_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let edges_dir = temp.path().canonicalize().unwrap().join("edges");
+        let project = "p_00000000000000000000000000000001";
+        let write = |relative: String, contents: &str| {
+            let path = edges_dir.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, contents).unwrap();
+        };
+        let bash = r#"{"source":{"type":"task","task_id":"one"},"kind":"RAN_BASH","target":{"type":"task","task_id":"two"},"provenance":"explicit","confidence":"exact"}"#;
+        write(format!("observed/{project}.jsonl"), &format!("{bash}\n"));
+        write(format!("explicit/{project}.jsonl"), "");
+        write(format!("derived/project/{project}.jsonl"), "{}\n");
+        write("migrations/m1/manifest.json".into(), "{}");
+        write(format!("derived/git/{project}.jsonl"), "{}\n");
+        write("materialized/manifest-index.json".into(), "{}");
+
+        let first = retire_legacy_edge_lanes_at_startup(&edges_dir).unwrap();
+        assert_eq!(first.families_removed, 4);
+        for gone in ["observed", "explicit", "derived/project", "migrations"] {
+            assert!(!edges_dir.join(gone).exists(), "{gone} must be removed");
+        }
+        assert!(
+            edges_dir
+                .join(format!("derived/git/{project}.jsonl"))
+                .is_file()
+        );
+        assert!(edges_dir.join("materialized/manifest-index.json").is_file());
+
+        let purge = purge_file_touch_edges_at_startup(&edges_dir).unwrap();
+        assert_eq!(purge.lanes_scanned, 0);
+
+        let second = retire_legacy_edge_lanes_at_startup(&edges_dir).unwrap();
+        assert!(second.already_complete);
+    }
 
     /// The startup purge is the daemon's pass over a real edge root: a
     /// store carrying file-touch rows loses them and is marked, and the

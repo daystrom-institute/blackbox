@@ -46,7 +46,6 @@ use bbox_indexing::index;
 pub use bbox_corpus_core::json_store;
 use bbox_knowledge::knowledge;
 mod managed_worktrees;
-use bbox_edge_index::migration;
 use bbox_mcp_tools::mcp_tools;
 mod orchestration;
 use bbox_stores::checkout_mutations;
