@@ -82,7 +82,6 @@ impl BlackboxServer {
                 + crate::tools::gaps::router()
                 + crate::tools::threads::router()
                 + crate::tools::artifacts::router()
-                + crate::tools::packets::router()
                 + crate::tools::attention::router()
                 + crate::tools::graph::router()
                 + crate::tools::transcripts::router()

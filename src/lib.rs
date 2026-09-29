@@ -58,10 +58,7 @@ use bbox_edge_index::migration;
 use bbox_mcp_tools::mcp_tools;
 use bbox_threads::notes;
 mod orchestration;
-// `packets` extracted into bbox-packets (root-crate split); aliased back to
-// `crate::packets` so existing call sites resolve unchanged.
 use bbox_mcp_tools::path_cache;
-use bbox_packets as packets;
 use bbox_stores::checkout_mutations;
 use bbox_stores::pins;
 use bbox_stores::producer_claims;

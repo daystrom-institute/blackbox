@@ -340,7 +340,7 @@ impl LegacyRowStamperV1 for ProjectCatalogOwnerRowStamperV1 {
             ),
             LegacyPathStoreKindV1::Packet => {
                 self.stamp_owner_path(store_kind, source_row_id, &self.paths.packet_root, |path| {
-                    bbox_packets::stamp_project_catalog_owner_row(
+                    bbox_indexing::project_catalog_packet_tree::stamp_project_catalog_owner_row(
                         path,
                         source_row_id,
                         expected_members,
@@ -608,7 +608,9 @@ impl LegacyRowOwnerReaderV1 for ProjectCatalogOwnerRowReaderV1 {
             }
             LegacyPathStoreKindV1::Packet => {
                 self.read_owner_path(store_kind, rows, &self.paths.packet_root, |path| {
-                    bbox_packets::read_project_catalog_owner_rows(path, rows, limits)
+                    bbox_indexing::project_catalog_packet_tree::read_project_catalog_owner_rows(
+                        path, rows, limits,
+                    )
                 })
             }
             LegacyPathStoreKindV1::Proposal => {

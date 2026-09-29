@@ -127,7 +127,7 @@ impl Drop for TestEnvGuard {
 
 /// ISO-8601 UTC timestamp with second precision and a trailing `Z`.
 /// Canonical store-timestamp format; the implementation lives in
-/// bbox-corpus-core so leaf crates (bbox-packets) share it.
+/// bbox-corpus-core so leaf crates share it.
 pub use bbox_corpus_core::util::now_iso;
 
 pub fn blackbox_mcp_name() -> String {
@@ -200,14 +200,6 @@ pub fn blackbox_pins_path(home: &Path) -> PathBuf {
 pub fn blackbox_projects_path(home: &Path) -> PathBuf {
     env_path("BLACKBOX_PROJECTS_PATH")
         .unwrap_or_else(|| blackbox_state_dir(home).join("projects.json"))
-}
-
-/// Rule-packets live as one-file-per-packet under a directory rather than
-/// a single merged JSON. Each packet can be substantial (rank tables,
-/// rule trees, provenance arrays) and the per-scope layout makes
-/// `global` vs `project` cleanup trivial.
-pub fn blackbox_packets_dir(home: &Path) -> PathBuf {
-    env_path("BLACKBOX_PACKETS_DIR").unwrap_or_else(|| blackbox_state_dir(home).join("packets"))
 }
 
 pub fn blackbox_artifacts_dir(home: &Path) -> PathBuf {
@@ -347,29 +339,6 @@ mod tests {
             unsafe { std::env::set_var("BRO_HOME", v) };
         } else {
             unsafe { std::env::remove_var("BRO_HOME") };
-        }
-    }
-
-    #[test]
-    fn packets_dir_default_is_state_packets() {
-        let _guard = test_env_lock();
-        let dir = tempdir().unwrap();
-        let home = dir.path();
-
-        // Save and clear env vars
-        let orig_packets_dir = std::env::var("BLACKBOX_PACKETS_DIR").ok();
-        unsafe {
-            std::env::remove_var("BLACKBOX_PACKETS_DIR");
-        }
-
-        let packets_dir = blackbox_packets_dir(home);
-        assert!(packets_dir == blackbox_state_dir(home).join("packets"));
-
-        // Restore
-        if let Some(v) = orig_packets_dir {
-            unsafe { std::env::set_var("BLACKBOX_PACKETS_DIR", v) };
-        } else {
-            unsafe { std::env::remove_var("BLACKBOX_PACKETS_DIR") };
         }
     }
 }

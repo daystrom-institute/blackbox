@@ -11,7 +11,6 @@ anyhow = "1"
 serde_json = "1"
 bbox-corpus-core = { path = "../bbox-corpus-core" }
 bbox-corpus-index = { path = "../bbox-corpus-index" }
-bbox-packets = { path = "../bbox-packets" }
 bbox-system-memory = { path = "../bbox-system-memory" }
 parking_lot = "0.12"
 bbox-whiteboards = { path = "../bbox-whiteboards" }

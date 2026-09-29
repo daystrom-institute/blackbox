@@ -128,8 +128,6 @@ allow = [
     "bbox_thread_list",
     "bbox_notes",
     "bbox_inbox",
-    "bbox_packet_list",
-    "bbox_packet_events",
     "bbox_project_list",
     "bro_status",
     "bro_dashboard",

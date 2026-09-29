@@ -14,7 +14,6 @@ use crate::knowledge::Knowledge;
 use crate::notes::Notes;
 use crate::orchestration::tail::TailEvent;
 use crate::orchestration::{self, TaskStore};
-use crate::packets::Packets;
 use crate::pins::Pins;
 use crate::projects::ProjectRegistry;
 use crate::store_persister::StorePersister;
@@ -214,7 +213,6 @@ pub(crate) struct SharedState {
     /// bypass the cached decision immediately.
     pub(crate) publisher_authorization_cache:
         RwLock<super::knowledge_lifecycle::PublisherAuthorizationCache>,
-    pub(crate) packets: RwLock<Packets>,
     pub(crate) artifacts: RwLock<artifacts::ArtifactCatalog>,
     pub(crate) bbox_watcher: std::sync::Mutex<Option<crate::watcher::BbxWatcher>>,
     /// Out-of-band trigger for the background reindex thread. The `.bbox/knowledge`
@@ -661,7 +659,6 @@ impl SharedState {
                     }
                 }
             },
-            packets: &self.packets,
             artifacts: &self.artifacts,
             whiteboards: self.whiteboards.as_ref(),
             project_graph_views: &self.project_graph_views,
@@ -866,7 +863,6 @@ impl SharedState {
             catalog_gap_published_cache: RwLock::new(BTreeMap::new()),
             project_graph_views: RwLock::new(Default::default()),
             publisher_authorization_cache: RwLock::new(Default::default()),
-            packets: RwLock::new(Packets::open(store_dir).unwrap()),
             artifacts: RwLock::new(artifacts::ArtifactCatalog::open(store_dir).unwrap()),
             bbox_watcher: std::sync::Mutex::new(None),
             reindex_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),

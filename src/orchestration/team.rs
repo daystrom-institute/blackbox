@@ -104,8 +104,6 @@ pub struct TeamAdvisorConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exit_conditions: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub packet_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_seconds: Option<f64>,
     #[serde(default)]
     pub mode: AdvisorMode,
@@ -974,7 +972,6 @@ mod tests {
                     context: None,
                     halt_conditions: vec![],
                     exit_conditions: vec![],
-                    packet_id: None,
                     timeout_seconds: None,
                     mode: AdvisorMode::Blocking,
                 },

@@ -4224,7 +4224,7 @@ impl<'a> project_catalog_admin::RetirementDischargeWorkers for CliRetirementDisc
             &selectors,
         )
         .map_err(|error| discharge_error("whiteboard_rows", error))?;
-        bbox_packets::discharge_project_catalog_rows(
+        bbox_indexing::project_catalog_packet_tree::discharge_project_catalog_rows(
             &self.config.paths.packets_dir,
             project_id.as_str(),
             &selectors,
@@ -4992,7 +4992,7 @@ fn probe_retire_evidence(
         ),
         (
             "packet_rows",
-            bbox_packets::capture_project_catalog_owner_snapshot(
+            bbox_indexing::project_catalog_packet_tree::capture_project_catalog_owner_snapshot(
                 &config.paths.packets_dir,
                 owner_limits,
             ),

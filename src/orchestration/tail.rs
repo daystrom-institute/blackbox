@@ -41,7 +41,7 @@ pub enum TailEvent {
         source_session: String,
         /// Brofile / team context label from `TaskInner.bro_label`.
         /// Populated as `task_kind` in the routing entity so downstream
-        /// packets can filter by bro type (executor vs. ensemble, etc.).
+        /// consumers can filter by bro type (executor vs. ensemble, etc.).
         task_kind: Option<String>,
     },
     TaskFailed {

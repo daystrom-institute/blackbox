@@ -321,13 +321,13 @@ mod tests {
     }
 
     #[test]
-    fn packet_and_artifact_refs_measure_provider_properties_json() {
+    fn agent_and_artifact_refs_measure_provider_properties_json() {
         let ctx = ProviderContext::empty_for_tests();
         let out = ref_size(
             &RefSizeParams {
                 refs: vec![
-                    "packet:domain:phase-decompose/triage".into(),
-                    "artifact:packet/phase-decompose/triage@1".into(),
+                    "agent:code-reviewer@v3".into(),
+                    "artifact:team/example@1".into(),
                 ],
                 project_dir: None,
                 ..Default::default()
@@ -338,15 +338,9 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(value["status"], "ok");
         assert_eq!(value["per_ref"].as_array().unwrap().len(), 2);
-        assert_eq!(
-            value["per_ref"][0]["ref"],
-            "packet:domain:phase-decompose/triage"
-        );
-        assert_eq!(value["per_ref"][0]["entity_type"], "packet");
-        assert_eq!(
-            value["per_ref"][1]["ref"],
-            "artifact:packet/phase-decompose/triage@1"
-        );
+        assert_eq!(value["per_ref"][0]["ref"], "agent:code-reviewer@v3");
+        assert_eq!(value["per_ref"][0]["entity_type"], "agent");
+        assert_eq!(value["per_ref"][1]["ref"], "artifact:team/example@1");
         assert_eq!(value["per_ref"][1]["entity_type"], "artifact");
     }
 

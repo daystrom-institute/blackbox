@@ -93,10 +93,6 @@ pub(super) fn build_http_app(
             axum::routing::get(control_team_handler),
         )
         .route(
-            "/admin/packet/compile",
-            axum::routing::post(admin_packet_compile),
-        )
-        .route(
             "/admin/artifact/install",
             axum::routing::post(admin_artifact_install),
         )

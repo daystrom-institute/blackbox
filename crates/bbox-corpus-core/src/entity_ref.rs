@@ -33,12 +33,11 @@ pub enum EntityType {
     Task,
     BashCall,
     Agent,
-    Packet,
     Artifact,
 }
 
 impl EntityType {
-    pub const ALL: [EntityType; 22] = [
+    pub const ALL: [EntityType; 21] = [
         EntityType::Knowledge,
         EntityType::ProvisionalKnowledge,
         EntityType::SystemMemory,
@@ -59,7 +58,6 @@ impl EntityType {
         EntityType::Task,
         EntityType::BashCall,
         EntityType::Agent,
-        EntityType::Packet,
         EntityType::Artifact,
     ];
 
@@ -85,7 +83,6 @@ impl EntityType {
             EntityType::Task => "task",
             EntityType::BashCall => "bash_call",
             EntityType::Agent => "agent",
-            EntityType::Packet => "packet",
             EntityType::Artifact => "artifact",
         }
     }
@@ -126,7 +123,6 @@ impl EntityType {
             EntityType::Task => "task:<task_id>",
             EntityType::BashCall => "bash_call:<session>:<turn>",
             EntityType::Agent => "agent:<name>@v<version>",
-            EntityType::Packet => "packet:domain:<domain>",
             EntityType::Artifact => "artifact:<kind>/<name>@<version>",
         }
     }
@@ -242,9 +238,6 @@ pub enum EntityRef {
         name: String,
         version: u32,
     },
-    Packet {
-        selector: String,
-    },
     Artifact {
         kind: String,
         name: String,
@@ -326,7 +319,6 @@ impl EntityRef {
             }),
             EntityType::BashCall => parse_bash_call(input, rest),
             EntityType::Agent => parse_agent(input, rest),
-            EntityType::Packet => parse_packet(input, rest),
             EntityType::Artifact => parse_artifact(input, rest),
         }
     }
@@ -459,7 +451,6 @@ impl EntityRef {
                 }
                 Ok(format!("agent:{name}@v{version}"))
             }
-            EntityRef::Packet { selector } => Ok(format!("packet:{selector}")),
             EntityRef::Artifact {
                 kind,
                 name,
@@ -495,7 +486,6 @@ impl EntityRef {
             EntityRef::Task { .. } => EntityType::Task,
             EntityRef::BashCall { .. } => EntityType::BashCall,
             EntityRef::Agent { .. } => EntityType::Agent,
-            EntityRef::Packet { .. } => EntityType::Packet,
             EntityRef::Artifact { .. } => EntityType::Artifact,
         }
     }
@@ -885,17 +875,6 @@ fn parse_agent(input: &str, rest: &str) -> Result<EntityRef, EntityRefParseError
         name: name.to_string(),
         version: parse_u32(input, version_str, EntityType::Agent, "version")?,
     })
-}
-
-fn parse_packet(input: &str, rest: &str) -> Result<EntityRef, EntityRefParseError> {
-    let selector = non_empty(input, rest, EntityType::Packet, "selector")?;
-    if selector.starts_with("domain:") || selector.starts_with("packet-") {
-        Ok(EntityRef::Packet {
-            selector: selector.to_string(),
-        })
-    } else {
-        Err(shape_error(input, EntityType::Packet))
-    }
 }
 
 fn parse_artifact(input: &str, rest: &str) -> Result<EntityRef, EntityRefParseError> {
@@ -1558,10 +1537,7 @@ mod tests {
                 name: rng.token("agent-"),
                 version: 1 + (rng.next() as u32) % 10,
             },
-            20 => EntityRef::Packet {
-                selector: format!("domain:{}", rng.token("packet-domain-")),
-            },
-            21 => EntityRef::Artifact {
+            20 => EntityRef::Artifact {
                 kind: "workflow".into(),
                 name: rng.token("workflow-"),
                 version: Some("1".into()),

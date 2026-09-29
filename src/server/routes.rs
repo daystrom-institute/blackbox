@@ -18,7 +18,6 @@ use crate::entity_ref;
 use crate::index;
 use crate::orchestration;
 use crate::orchestration::providers::Provider;
-use crate::packets;
 use crate::projects::ProjectRecord;
 use crate::tools::bro_helpers::{
     build_member_entry, infer_provider_from_path, roster_entry_key, split_csv,
@@ -144,32 +143,6 @@ pub(crate) async fn admin_drain_set(
     }
 }
 
-pub(crate) async fn admin_packet_compile(
-    AxumState(state): AxumState<Arc<SharedState>>,
-    axum::Json(req): axum::Json<Value>,
-) -> impl axum::response::IntoResponse {
-    use axum::response::IntoResponse;
-    let p: packets::CompileParams = match serde_json::from_value(req) {
-        Ok(p) => p,
-        Err(e) => {
-            return (
-                axum::http::StatusCode::BAD_REQUEST,
-                format!("compile params parse: {e}"),
-            )
-                .into_response();
-        }
-    };
-    let result = state.packets.read().compile(&p);
-    match result {
-        Ok(msg) => axum::Json(json!({"status": "ok", "message": msg})).into_response(),
-        Err(e) => (
-            axum::http::StatusCode::BAD_REQUEST,
-            format!("compile: {e:#}"),
-        )
-            .into_response(),
-    }
-}
-
 pub(crate) async fn read_artifact_source(source: &str) -> anyhow::Result<Value> {
     const MAX_ARTIFACT_BYTES: usize = 1024 * 1024;
     let raw = if source.starts_with("http://") || source.starts_with("https://") {
@@ -229,10 +202,11 @@ pub(crate) async fn install_artifact_from_params(
         !matches!(
             p.kind,
             artifacts::ArtifactKind::Workflow
+                | artifacts::ArtifactKind::Packet
                 | artifacts::ArtifactKind::Atom
                 | artifacts::ArtifactKind::Cron
         ),
-        "error.retired_artifact_kind: workflows, atoms and crons cannot be activated"
+        "error.retired_artifact_kind: workflows, packets, atoms and crons cannot be activated"
     );
     let value = read_artifact_source(&p.source).await?;
     install_artifact_value(state, p, value).await
@@ -285,21 +259,19 @@ pub(crate) async fn install_artifact_value(
         !matches!(
             p.kind,
             artifacts::ArtifactKind::Workflow
+                | artifacts::ArtifactKind::Packet
                 | artifacts::ArtifactKind::Atom
                 | artifacts::ArtifactKind::Cron
         ),
-        "error.retired_artifact_kind: workflows, atoms and crons cannot be activated"
+        "error.retired_artifact_kind: workflows, packets, atoms and crons cannot be activated"
     );
     let mut completed = Vec::new();
     let mut failed = "validation";
     let kind = p.kind;
-    let requested_name = p.name.clone().or_else(|| {
-        value
-            .get("name")
-            .or_else(|| value.get("domain"))
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-    });
+    let requested_name = p
+        .name
+        .clone()
+        .or_else(|| value.get("name").and_then(Value::as_str).map(str::to_owned));
     let supersedes = p
         .supersedes
         .as_deref()
@@ -310,17 +282,21 @@ pub(crate) async fn install_artifact_value(
     remaining.extend(match kind {
         artifacts::ArtifactKind::Workflow => {
             anyhow::bail!(
-                "error.retired_artifact_kind: workflows, atoms and crons cannot be activated"
+                "error.retired_artifact_kind: workflows, packets, atoms and crons cannot be activated"
             );
         }
-        artifacts::ArtifactKind::Packet => vec!["packet_compilation"],
+        artifacts::ArtifactKind::Packet => {
+            anyhow::bail!(
+                "error.retired_artifact_kind: workflows, packets, atoms and crons cannot be activated"
+            );
+        }
         artifacts::ArtifactKind::Brofile => vec!["brofile_file", "brofile_verification"],
         artifacts::ArtifactKind::Team => {
             vec!["teamplate_file", "team_instance", "team_verification"]
         }
         artifacts::ArtifactKind::Cron => {
             anyhow::bail!(
-                "error.retired_artifact_kind: workflows, atoms and crons cannot be activated"
+                "error.retired_artifact_kind: workflows, packets, atoms and crons cannot be activated"
             );
         }
         _ => vec![],
@@ -346,12 +322,7 @@ pub(crate) async fn install_artifact_value(
             p.name.as_deref(),
             p.version.as_deref(),
         )?;
-        let identity_field = if kind == artifacts::ArtifactKind::Packet {
-            "domain"
-        } else {
-            "name"
-        };
-        value[identity_field] = Value::String(effective_name);
+        value["name"] = Value::String(effective_name);
         // Preserve version's original JSON type unless an override was requested.
         if p.version.is_some() {
             value["version"] = if value.get("version").is_some_and(Value::is_number)
@@ -378,15 +349,13 @@ pub(crate) async fn install_artifact_value(
         match p.kind {
             artifacts::ArtifactKind::Workflow => {
                 anyhow::bail!(
-                    "error.retired_artifact_kind: workflows, atoms and crons cannot be activated"
+                    "error.retired_artifact_kind: workflows, packets, atoms and crons cannot be activated"
                 );
             }
             artifacts::ArtifactKind::Packet => {
-                let params: packets::CompileParams = serde_json::from_value(value.clone())?;
-                completed.push("validation");
-                failed = "packet_compilation";
-                state.packets.read().compile(&params)?;
-                completed.push("packet_compilation");
+                anyhow::bail!(
+                    "error.retired_artifact_kind: workflows, packets, atoms and crons cannot be activated"
+                );
             }
             artifacts::ArtifactKind::Brofile => {
                 let brofile: orchestration::brofile::Brofile =
@@ -472,7 +441,7 @@ pub(crate) async fn install_artifact_value(
             }
             artifacts::ArtifactKind::Cron => {
                 anyhow::bail!(
-                    "error.retired_artifact_kind: workflows, atoms and crons cannot be activated"
+                    "error.retired_artifact_kind: workflows, packets, atoms and crons cannot be activated"
                 );
             }
             artifacts::ArtifactKind::Agent => {
@@ -531,7 +500,7 @@ pub(crate) async fn install_artifact_value(
             }
             artifacts::ArtifactKind::Atom => {
                 anyhow::bail!(
-                    "error.retired_artifact_kind: workflows, atoms and crons cannot be activated"
+                    "error.retired_artifact_kind: workflows, packets, atoms and crons cannot be activated"
                 );
             }
         }
@@ -628,10 +597,7 @@ pub(crate) fn restore_runtime_artifacts_from_catalog(
             // (dissolution must stick; re-install is the explicit
             // re-materialization path). Teamplate/team stores are
             // file-backed and survive restarts on their own.
-            matches!(
-                entry.kind,
-                artifacts::ArtifactKind::Packet | artifacts::ArtifactKind::Brofile
-            )
+            entry.kind == artifacts::ArtifactKind::Brofile
         })
     {
         let Some(value) = state
@@ -650,29 +616,8 @@ pub(crate) fn restore_runtime_artifacts_from_catalog(
         match entry.kind {
             artifacts::ArtifactKind::Workflow => {
                 anyhow::bail!(
-                    "error.retired_artifact_kind: workflows, atoms and crons cannot be activated"
+                    "error.retired_artifact_kind: workflows, packets, atoms and crons cannot be activated"
                 );
-            }
-            artifacts::ArtifactKind::Packet => {
-                let params: packets::CompileParams = serde_json::from_value(value.clone())
-                    .with_context(|| format!("parsing packet artifact '{}'", entry.name))?;
-                // Idempotent on purpose: this runs on every daemon boot, and
-                // the unconditional compile used to mint a new packet file
-                // per restart (33 artifacts × N restarts ≈ 2k duplicates).
-                match state
-                    .packets
-                    .read()
-                    .compile_idempotent(&params)
-                    .with_context(|| format!("compiling packet artifact '{}'", entry.name))?
-                {
-                    packets::CompileOutcome::Created(id) => {
-                        tracing::info!(artifact = %entry.name, packet = %id, "packet artifact compiled");
-                    }
-                    packets::CompileOutcome::UnchangedExisting(id) => {
-                        tracing::debug!(artifact = %entry.name, packet = %id, "packet artifact unchanged; reusing existing packet");
-                    }
-                }
-                restored += 1;
             }
             artifacts::ArtifactKind::Brofile => {
                 let brofile: orchestration::brofile::Brofile =
@@ -820,10 +765,7 @@ pub(crate) fn deactivate_artifact(
     name: &str,
 ) -> anyhow::Result<()> {
     match kind {
-        artifacts::ArtifactKind::Workflow => {}
-        artifacts::ArtifactKind::Packet => {
-            state.packets.read().remove_domain(name)?;
-        }
+        artifacts::ArtifactKind::Workflow | artifacts::ArtifactKind::Packet => {}
         artifacts::ArtifactKind::Brofile => {
             orchestration::brofile::delete_brofile(name, "global", &state.store_dir, None);
         }
@@ -1569,13 +1511,6 @@ pub(crate) fn project_ref_counts(state: &Arc<SharedState>, project: &str) -> any
         .filter(|note| note.project.as_deref() == Some(project))
         .count();
     let pins = state.pins.read().project_ref_count(project);
-    let packets = state
-        .packets
-        .read()
-        .list_all()?
-        .iter()
-        .filter(|packet| packet.project.as_deref() == Some(project))
-        .count();
     let slack_channel_bindings = state.slack_channel_bindings.list(None, Some(project)).len();
     let slack_proposal_links = state.slack_proposal_links.project_ref_count(project);
     let teams = orchestration::team::load_all_teams(&state.store_dir)
@@ -1605,7 +1540,6 @@ pub(crate) fn project_ref_counts(state: &Arc<SharedState>, project: &str) -> any
         "threads": threads,
         "notes": notes,
         "pins": pins,
-        "packets": packets,
         "slack_channel_bindings": slack_channel_bindings,
         "slack_proposal_links": slack_proposal_links,
         "teams": teams,
@@ -1853,10 +1787,6 @@ pub(crate) fn migrate_project_refs(
         // This sync migration helper cannot await; pins persistence is write-behind here.
         state.pins_persister.request();
     }
-    let packets = state
-        .packets
-        .read()
-        .rename_project_refs(old_project, new_project)?;
     let slack_channel_bindings = state.slack_channel_bindings.rename_project_refs(
         old_project,
         new_project,
@@ -1880,7 +1810,6 @@ pub(crate) fn migrate_project_refs(
         "threads": threads,
         "notes": notes,
         "pins": pins,
-        "packets": packets,
         "slack_channel_bindings": slack_channel_bindings,
         "slack_proposal_links": slack_proposal_links,
         "teams": teams,

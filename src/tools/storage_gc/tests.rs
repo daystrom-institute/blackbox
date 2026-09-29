@@ -11,7 +11,6 @@ fn gc_defaults_keep_policy_and_return_summary() {
     assert!(params.prune_temps);
     assert!(!params.prune_orphans);
     assert!(!params.prune_inactive_snapshots);
-    assert!(!params.prune_duplicate_packets);
     assert!(!params.prune_explicitly_unregistered);
     assert_eq!(params.keep_newest_backup_per_source, 1);
     assert_eq!(params.max_snapshots_per_workspace, Some(32));
@@ -26,7 +25,6 @@ fn gc_rejects_mutating_or_ambiguous_pagination_before_work() {
     for input in [
         json!({"dry_run":false, "cursor":"cursor", "detail":"full"}),
         json!({"receipt_id":"receipt", "dry_run":false}),
-        json!({"receipt_id":"receipt", "prune_duplicate_packets":true}),
         json!({"receipt_id":"receipt", "project":"different"}),
         json!({"receipt_id":"receipt", "keep_newest_backup_per_source":0}),
         json!({"receipt_id":"receipt", "max_backup_total_bytes":null}),

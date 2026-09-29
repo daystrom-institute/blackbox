@@ -6,7 +6,6 @@ pub mod commit;
 pub mod file;
 pub mod knowledge;
 pub mod note;
-pub mod packet;
 pub mod project_file;
 pub mod session;
 pub mod symbol;
@@ -26,7 +25,6 @@ use bbox_corpus_core::entity_ref::{EntityRef, EntityType};
 use bbox_corpus_index::index::TranscriptIndex;
 use bbox_edge_index::edge_index::Edge;
 use bbox_knowledge::knowledge::Knowledge;
-use bbox_packets::Packets;
 use bbox_threads::notes::Notes;
 use bbox_threads::threads::Threads;
 use bbox_whiteboards::whiteboards::WhiteboardRegistry;
@@ -144,7 +142,6 @@ pub struct CorpusStores<'a> {
     /// The runtime project authority the daemon selected at startup, handed
     /// to providers explicitly.
     pub project_authority: ProviderProjectAuthority<'a>,
-    pub packets: &'a RwLock<Packets>,
     pub artifacts: &'a RwLock<ArtifactCatalog>,
     pub whiteboards: &'a WhiteboardRegistry,
     /// Installed published project-graph views: the source of the graph
@@ -465,7 +462,6 @@ fn registry() -> &'static Vec<Box<dyn InspectableEntityProvider>> {
             Box::new(commit::CommitProvider),
             Box::new(virtual_bash_call::BashCallProvider),
             Box::new(agent::AgentProvider),
-            Box::new(packet::PacketProvider),
             Box::new(artifact::ArtifactProvider),
         ];
         providers.append(

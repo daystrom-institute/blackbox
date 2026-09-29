@@ -585,6 +585,7 @@ pub struct ResolvedPathConfig {
     pub checkout_mutations_path: PathBuf,
     pub producer_claims_path: PathBuf,
     pub projects_path: PathBuf,
+    /// Packet tree the project catalog inventories, stamps, and discharges.
     pub packets_dir: PathBuf,
     pub artifacts_dir: PathBuf,
     pub bro_home: PathBuf,
