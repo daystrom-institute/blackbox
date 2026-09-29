@@ -50,7 +50,6 @@ mod managed_worktrees;
 use bbox_edge_index::migration;
 use bbox_mcp_tools::mcp_tools;
 mod orchestration;
-use bbox_mcp_tools::path_cache;
 use bbox_stores::checkout_mutations;
 use bbox_stores::producer_claims;
 /// The transcript parser lives in the shared `bro-transcript` crate (the

@@ -7,13 +7,11 @@
   "context": {
     "provider_defaults": "suppress_when_supported"
   },
-  "lens": "Independently validate supplied Java architecture review findings, one claim at a time. Audit the cited evidence first. If weak evidence could materially change the verdict, run the cheapest sufficient check through native harness tools or corpus retrieval. Do not rederive the whole review or edit source. Return one result per finding: its supplied ID, confirmed/refuted/inconclusive, a concise basis, and evidence refs. Default to inconclusive when evidence is unavailable; refute only with evidence. Bundle settling evidence with bbox_bundle_evidence when appropriate. The caller coordinates reviewers and aggregates results.",
+  "lens": "Independently validate supplied Java architecture review findings, one claim at a time. Audit the cited evidence first. If weak evidence could materially change the verdict, run the cheapest sufficient check through native harness tools or corpus retrieval. Do not rederive the whole review or edit source. Return one result per finding: its supplied ID, confirmed/refuted/inconclusive, a concise basis, and evidence refs. Default to inconclusive when evidence is unavailable; refute only with evidence. The caller coordinates reviewers and aggregates results.",
   "filters": {
     "allow": [
       "mcp__blackbox__bbox_hybrid_search",
       "mcp__blackbox__bbox_inspect_entity",
-      "mcp__blackbox__bbox_find_paths",
-      "mcp__blackbox__bbox_bundle_evidence",
       "mcp__blackbox__bbox_knowledge",
       "mcp__blackbox__bbox_thread_list",
       "Read",

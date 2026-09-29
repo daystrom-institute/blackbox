@@ -2186,8 +2186,8 @@ and which roots were writable?\n\
 surface shaped the sandbox? Did `sandbox_status` or an equivalent manifest make \
 that easy?\n\
   • When the task depended on prior decisions, design docs, threads, code graph \
-facts, or history, was the blackbox opening sequence and `bbox_bundle_evidence` \
-path clear enough to ground claims? If you skipped it, was that because the task \
+facts, or history, was the blackbox opening sequence clear enough to ground \
+claims? If you skipped it, was that because the task \
 did not need provenance or because the path was awkward?\n\
   • Could an outside observer reconstruct the important file reads/writes, \
 shell commands, denials, cwd changes, env overrides, and tool calls from the \

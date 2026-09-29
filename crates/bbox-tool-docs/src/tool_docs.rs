@@ -234,31 +234,6 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         example: None,
     },
     ToolDoc {
-        name: "bbox_describe_schema",
-        category: ToolCategory::Graph,
-        summary: "Orient to entity types and edge families. mode=full expands fields and filters. body_limit/cursor recovers exact schema JSON; oversized replies automatically start body pages.",
-        when_to_use: "Use once for graph vocabulary and traversal orientation. Unknown modes fail. No rendered text mirror is returned. Orientation retains entity types, population counts and edge families while omitting per-type field tables. mode=full expands fields. body_limit/cursor recovers the selected complete JSON; oversized responses automatically start body pages. Concatenate body.text before parsing; changed selectors or evidence refuse continuation.",
-        example: Some("bbox_describe_schema()"),
-    },
-    ToolDoc {
-        name: "bbox_find_paths",
-        category: ToolCategory::Graph,
-        summary: "Find direction-preserving paths to an exact ref (to) or entity type (to_type); a target is required. Filter edge_types and use a small max_depth. Fanout omissions and evidence freshness are explicit. Pass returned path IDs to bbox_bundle_evidence.",
-        when_to_use: "Step 4 of the agentic opening sequence (`sm-agentic-opening-sequence`): only when the answer depends on a chain, not a single entity. Prefer narrow `edge_types`, set `to` or `to_type` when known, and pass returned path IDs to `bbox_bundle_evidence` before making a provenance-sensitive claim. Always name a target: `to` for an exact ref, `to_type` for an open-ended walk; a call with neither is refused, not silently empty. On project graphs, pass the logical `to_type=\"project_graph_vertex\"` under any visibility; the provisional overlay type name is only needed to target overlay vertices exclusively. When truncated_expansions is non-empty, say so: the walk covered only the first max_fanout edges of the named vertices, and a wider cap or narrower edge_types is needed for completeness. State edge directions as the path returned them; do not invert from memory, and expect backward hops labeled `in` alongside forward `out` hops. When a path crosses an evidence binding, report its freshness: do not present a `stale` or `missing` hop as a current fact, and pass the path ID to `bbox_bundle_evidence` so the binding's provenance travels with the claim.",
-        example: Some(
-            r#"bbox_find_paths(from="knowledge:abc12345", edge_types="SUPERSEDES", max_depth=3)"#,
-        ),
-    },
-    ToolDoc {
-        name: "bbox_bundle_evidence",
-        category: ToolCategory::Graph,
-        summary: "Bundle entity refs and cached paths with provenance and freshness. Properties default to summary; full/none are explicit. body_limit/cursor recovers exact bundle JSON, and oversized replies automatically start body pages.",
-        when_to_use: "Step 5 of the agentic opening sequence (`sm-agentic-opening-sequence`) - close the loop before answering. Pass `path_ids` from `bbox_find_paths` directly; do not reconstruct path text from memory (the server holds the validated graph). Use `property_mode=\"summary\"` when bundling broad knowledge/tool refs or other long entities. This tool packages evidence only; it does not synthesize the answer for you. When a bundled binding reports a non-current freshness, say so in the answer; the bundle records what was asserted, not that it is still true. body_limit/cursor recovers the complete selected bundle, including freshness and provenance metadata. Oversized replies automatically start exact body pages. Repeat the same selectors and concatenate body.text as JSON; changed evidence refuses continuation.",
-        example: Some(
-            r#"bbox_bundle_evidence(question="Why was this replaced?", entity_refs=["knowledge:abc12345"], path_ids=["P1"], property_mode="summary")"#,
-        ),
-    },
-    ToolDoc {
         name: "bbox_edge_compact",
         category: ToolCategory::Graph,
         summary: "Dry-run or apply legacy edge sidecar compaction for one project. Removes append-only derived edges from edges/<project_id>.jsonl while retaining explicit/provenance/malformed lines; apply defaults false and writes a backup before replacement. With apply=true, rebuild=true forces a sidecar-only in-memory EdgeIndex rebuild even when compaction is already complete.",
@@ -402,7 +377,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_knowledge",
         category: ToolCategory::Knowledge,
-        summary: "Query durable knowledge entries by free-text or filters. Use early when prior decisions, conventions, remembered facts, or system runbooks could change the answer. Also surfaces a bounded system-memory sidecar; system memories include system_memory:<id> refs usable with bbox_inspect_entity or bbox_bundle_evidence. Pass category=\"system_memory\" to list memory metadata.",
+        summary: "Query durable knowledge entries by free-text or filters. Use early when prior decisions, conventions, remembered facts, or system runbooks could change the answer. Also surfaces a bounded system-memory sidecar; system memories include system_memory:<id> refs usable with bbox_inspect_entity. Pass category=\"system_memory\" to list memory metadata.",
         when_to_use: "Use near the start of tasks where durable knowledge-store context could matter: prior decisions, project conventions, rendered rules, remembered facts, or system runbooks. This is not the surface for active threads (`bbox_thread_list`) or transcript history (`bbox_hybrid_search`). Prefer a short phrase from the user's request over a single generic keyword; adjacent terms broaden recall, quoted phrases stay exact, `AND` / `OR` work explicitly, and `-term` excludes. If the first query is empty or too broad, try one sharper phrase. Use `mode=substring` for literal whole-query matching. Add `project=<cwd>` when looking for an entry to update or replace; `project` also accepts a project_id or a registered operator alias and matches entries by project identity, and a value that resolves to no registered project keeps literal substring matching and says so in the response diagnostics. System memories can also be paged by canonical `sm-*` ID. Oversized structured entry content or metadata becomes a bounded preview whose detail recovery arguments carry the canonical entity_ref and the same filters; pass entry_detail=<entity_ref>, then concatenate body.text pages from detail_cursor through next_cursor and parse the complete JSON. Pass diagnostics_detail=true with the same filters to page exact omitted diagnostics. Content changes invalidate cursors; restart the same read without detail_cursor. offset continues the selected ranked knowledge page or system-memory catalog. Requests cap at 100 rows and 16 KiB selectors; complete-envelope budgeting can return fewer. Follow structuredContent.page.next_offset for knowledge. The selection is live, so concurrent changes can move rows.",
         example: Some(r#"bbox_knowledge(query="retry policy")"#),
     },
@@ -828,7 +803,6 @@ fn render_retrieval_workflow(out: &mut String) {
     out.push_str("## Retrieval workflow\n\n");
     out.push_str("Use Blackbox retrieval when stored decisions, conversation history, or indexed code evidence can change the answer. A direct local edit or an already-authoritative live result does not require a graph walk.\n\n");
     out.push_str("Use a short phrase from the task, not a single generic keyword. Query `bbox_knowledge` for durable rules and decisions, and `bbox_hybrid_search` for conversation history, indexed code or mixed evidence. Inspect relevant hits before relying on them.\n\n");
-    out.push_str("Describe the schema when graph vocabulary is unfamiliar. Traverse with `bbox_find_paths` only for multi-hop questions; pass returned path IDs unchanged. Bundle selected evidence with `bbox_bundle_evidence` when the task needs a durable, re-queryable evidence package.\n\n");
     out.push_str("Use tool-returned canonical entity refs and suggested fixes. Scope edge types and direction to the question. Retrieve `sm-agentic-opening-sequence` only for a graph investigation that needs its detailed recipes.\n\n");
 }
 

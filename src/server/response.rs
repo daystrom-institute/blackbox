@@ -45,9 +45,6 @@ impl BlackboxServer {
             Some("bbox_hybrid_search") => {
                 "Use a smaller limit and narrower project/doc_type filters; omit debug detail."
             }
-            Some("bbox_bundle_evidence") => {
-                "Use fewer entity_refs/path_ids and property_mode=summary; inspect selected refs individually."
-            }
             Some("bbox_inspect_entity") => {
                 "Use targeted edge_types, a smaller per_type_limit, and property_mode=summary."
             }

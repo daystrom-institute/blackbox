@@ -112,7 +112,7 @@ try:
  else:raise AssertionError('note cursor did not finish')
  assert json.loads(joined)['note']==note
  print('thread exact recovery PASS',len(note.encode()),'bytes',flush=True)
- for name,args in [('bbox_describe_schema',{}),('bbox_knowledge',{'query':'synthetic-no-match-audit'}),('bro_dashboard',{})]:
+ for name,args in [('bbox_knowledge',{'query':'synthetic-no-match-audit'}),('bro_dashboard',{})]:
   if name in names:call(name,args)
  # Extended adversarial recovery cases for the reviewed integration.
  def exact(name,args,cursor_field='cursor',body_field='body',expect_error=False):
@@ -166,19 +166,6 @@ try:
  call('bbox_thread',{'action':'get','id':tid,'note':'wrong-action'},True)
  thread_metadata=exact('bbox_thread',{'action':'get','id':tid,'detail':'metadata','body_limit':512})
  assert tid in json.dumps(thread_metadata)
- orientation=call('bbox_describe_schema',{})
- schema=exact('bbox_describe_schema',{'mode':'full','body_limit':4096})
- assert [r['entity_type'] for r in orientation['vertex_types']]==[r['entity_type'] for r in schema['vertex_types']]
- assert all('key_fields' not in r for r in orientation['vertex_types'])
- assert all('key_fields' in r for r in schema['vertex_types'])
- assert 'roadmap' not in json.dumps(schema).lower()
- long_ref='knowledge:'+('synthetic-missing-界'*1500)
- bundle=call('bbox_bundle_evidence',{'question':'Synthetic unresolved evidence','entity_refs':[long_ref],'path_ids':[]},True)
- assert bundle['detail_limited']
- recovered_bundle=exact('bbox_bundle_evidence',{'question':'Synthetic unresolved evidence','entity_refs':[long_ref],'path_ids':[],'body_limit':4096},expect_error=True)
- assert long_ref in json.dumps(recovered_bundle,ensure_ascii=False)
- first=call('bbox_bundle_evidence',{'question':'Synthetic unresolved evidence','entity_refs':[long_ref],'path_ids':[],'body_limit':128},True)
- call('bbox_bundle_evidence',{'question':'Changed selection','entity_refs':[long_ref],'path_ids':[],'body_limit':128,'cursor':first['body']['next_cursor']},True)
  artifact_metadata=exact('bbox_artifact_list',{'kind':'agent','name':'synthetic-summary-agent','metadata':True,'body_limit':128})
  assert artifact_metadata['name']=='synthetic-summary-agent' and 'source' not in artifact_metadata and 'project_path' not in artifact_metadata
  artifact_inventory=exact('bbox_artifact_list',{'kind':'agent','body_limit':512})
@@ -186,7 +173,7 @@ try:
  call('bbox_artifact_list',{'kind':'agent','body_limit':512,'limit':1},True)
  call('bro_allocator_probe',{'provider':'glm','clear':True,'raw_summary':'contradictory'},True)
  call('bro_allocator_status',{'detail':'probes','probe_offset':1},True)
- print('reconciled safety, schema, metadata and bundle recovery PASS',flush=True)
+ print('reconciled safety and metadata recovery PASS',flush=True)
  # Immutable embedding report pages never invoke producer work again.
  for args in [{'diagnostic_routes':[]},{'diagnostic_routes':['synthetic'],'include_diagnostics':False},{'probe_k':10},{'diagnostic_deadline_ms':10},{'body_limit':0},{'recall_probe_route':'../synthetic-outside'},{'recall_probe_route':'/synthetic-absolute'}]:
   call('bbox_embed_status',args,True)

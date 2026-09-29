@@ -16,7 +16,7 @@ use crate::orchestration::{self, TaskStore};
 use crate::projects::ProjectRegistry;
 use crate::store_persister::StorePersister;
 use crate::threads::Threads;
-use crate::{artifacts, edge_index, path_cache, slack_channel_bindings, slack_proposal_links};
+use crate::{artifacts, edge_index, slack_channel_bindings, slack_proposal_links};
 
 // ---------------------------------------------------------------------------
 // Shared state
@@ -254,7 +254,6 @@ pub(crate) struct SharedState {
     pub(crate) edge_rebuild_nudge_tx: std::sync::mpsc::SyncSender<()>,
     /// Receiver half, taken once by `spawn_edge_index_rebuild_watcher`.
     pub(crate) edge_rebuild_nudge_rx: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
-    pub(crate) path_cache: RwLock<path_cache::PathCache>,
     pub(crate) task_store: Arc<RwLock<TaskStore>>,
     pub(crate) tail_tx: broadcast::Sender<TailEvent>,
     pub(crate) roster_version: Arc<AtomicU64>,
@@ -886,7 +885,6 @@ impl SharedState {
             )),
             edge_rebuild_nudge_tx,
             edge_rebuild_nudge_rx: std::sync::Mutex::new(Some(edge_rebuild_nudge_rx)),
-            path_cache: RwLock::new(path_cache::PathCache::default()),
             task_store: Arc::new(RwLock::new(TaskStore::new())),
             tail_tx,
             roster_version: Arc::new(AtomicU64::new(0)),
@@ -1253,12 +1251,10 @@ mod clause_one_exit_proof {
     /// order. Deleting a row therefore fails rather than silently reducing
     /// coverage, which is how this proof came to cover two operations while
     /// claiming twelve.
-    const REQUIRED_OPERATIONS: [&str; 9] = [
+    const REQUIRED_OPERATIONS: [&str; 7] = [
         "lexical search",
         "hybrid search",
         "graph inspect",
-        "graph path traversal",
-        "evidence bundle",
         "storage GC",
         "collected activation and rebuild",
         "published knowledge",
@@ -1459,18 +1455,6 @@ mod clause_one_exit_proof {
             .bbox_inspect_entity(Parameters(params(
                 serde_json::json!({"entity_ref": "knowledge:knowledge-a"})
             )))
-            .await);
-        compare!("graph path traversal", server => server
-            .bbox_find_paths(Parameters(params(
-                serde_json::json!({"from": "knowledge:knowledge-a"})
-            )))
-            .await);
-        compare!("evidence bundle", server => server
-            .bbox_bundle_evidence(Parameters(params(serde_json::json!({
-                "question": "what is published?",
-                "entity_refs": ["knowledge:knowledge-a"],
-                "path_ids": [],
-            }))))
             .await);
         let expected_gc = complete_gc_semantics(&populated).await;
         let actual_gc = complete_gc_semantics(&recordless).await;

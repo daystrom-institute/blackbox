@@ -98,9 +98,7 @@ else:
     instructions = """Use the full agentic loop:
 1. bbox_hybrid_search for seeds.
 2. bbox_inspect_entity on the best 1-3 seeds.
-3. bbox_find_paths when the question asks for provenance, a chain, or cross-modal evidence.
-4. bbox_bundle_evidence with the final entity_refs and path_ids.
-Collect entity_refs from the evidence bundle."""
+Collect entity_refs from the refs you inspected."""
 print(common + "\nStrategy: " + strategy + "\n" + instructions)
 PY
 }

@@ -17,7 +17,7 @@ use crate::projects::ProjectRegistry;
 use crate::store_persister::StorePersister;
 use crate::threads::Threads;
 use crate::{
-    artifacts, config, edge_index, index, orchestration, path_cache, slack_channel_bindings,
+    artifacts, config, edge_index, index, orchestration, slack_channel_bindings,
     slack_proposal_links, system_memory, tool_docs, vectors,
 };
 
@@ -982,7 +982,6 @@ pub(super) fn open_shared_state(
         )),
         edge_rebuild_nudge_tx,
         edge_rebuild_nudge_rx: std::sync::Mutex::new(Some(edge_rebuild_nudge_rx)),
-        path_cache: RwLock::new(path_cache::PathCache::default()),
         task_store: Arc::new(RwLock::new(task_store)),
         tail_tx,
         roster_version: Arc::new(std::sync::atomic::AtomicU64::new(0)),

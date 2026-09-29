@@ -533,48 +533,20 @@ step_published_traversal() {
         return 1
     }
 
-    mcp_call "$PUBLISHED_SESSION" bbox_find_paths \
-        "$(jq -cn --arg from "$claim" --arg to "$evidence_ref" \
-            '{from:$from,to:$to,edge_types:"gov:CITES",max_depth:2}')" published-find-paths || {
-        cat "$EVIDENCE/published-find-paths.json" >&2
+    mcp_call "$PUBLISHED_SESSION" bbox_inspect_entity \
+        "$(jq -cn --arg ref "$evidence_ref" '{entity_ref:$ref,edge_types:"gov:CITES",direction:"in"}')" published-inspect-evidence || {
+        cat "$EVIDENCE/published-inspect-evidence.json" >&2
         return 1
     }
-    jq -e --arg from "$claim" --arg to "$evidence_ref" '
-        (.paths | length) >= 1 and
-        (.paths[0].steps[0].edge_kind == "gov:CITES") and
-        (.paths[0].steps[0].from.vertex_id == "claim/scope@2") and
-        (.paths[0].steps[0].to.vertex_id == "evidence/document@1")
-    ' "$EVIDENCE/published-find-paths.json" >/dev/null || {
-        echo "no cites path from the claim to its evidence" >&2
-        cat "$EVIDENCE/published-find-paths.json" >&2
+    jq -e --arg ref "$evidence_ref" '
+        .entity_ref == $ref and
+        ([.edges.in[] | select(.kind == "gov:CITES" and (.source | contains("claim/scope@2")))] | length) >= 1
+    ' "$EVIDENCE/published-inspect-evidence.json" >/dev/null || {
+        echo "the evidence vertex does not report the claim's cites edge" >&2
+        cat "$EVIDENCE/published-inspect-evidence.json" >&2
         return 1
     }
-    local path_id
-    path_id="$(jq -r '.paths[0].path_id // .paths[0].id // empty' "$EVIDENCE/published-find-paths.json")"
-
-    local bundle
-    if [ -n "$path_id" ]; then
-        bundle="$(jq -cn --arg ref "$claim" --arg path "$path_id" \
-            '{question:"What evidence supports the active scope claim?",entity_refs:[$ref],path_ids:[$path],property_mode:"summary"}')"
-    else
-        bundle="$(jq -cn --arg ref "$claim" \
-            '{question:"What evidence supports the active scope claim?",entity_refs:[$ref],path_ids:[],property_mode:"summary"}')"
-    fi
-    mcp_call "$PUBLISHED_SESSION" bbox_bundle_evidence "$bundle" published-bundle || {
-        cat "$EVIDENCE/published-bundle.json" >&2
-        return 1
-    }
-    jq -e --arg ref "$claim" '
-        ([.entities[] | select(.entity_ref == $ref)] | length) == 1 and
-        (.entities[0].properties.source == "published") and
-        ((.paths | length) >= 1) and
-        (.degraded.stale_path_ids == null)
-    ' "$EVIDENCE/published-bundle.json" >/dev/null || {
-        echo "evidence bundle did not resolve the graph vertex ref" >&2
-        cat "$EVIDENCE/published-bundle.json" >&2
-        return 1
-    }
-    note "inspect, find_paths across gov:CITES, and bundle_evidence all resolved published graph refs"
+    note "inspect resolved the published claim and its cited evidence across gov:CITES in both directions"
 }
 
 step_mint_binding() {
@@ -916,7 +888,7 @@ run_step "producer onboarding through collector" step_onboard
 run_step "committed candidate publication"       step_publish
 run_step "acceptance through the merge gate"     step_accept
 run_step "published graph list/describe/validate" step_published_reads
-run_step "published inspect/find_paths/bundle"   step_published_traversal
+run_step "published inspect"   step_published_traversal
 run_step "operator workspace binding mint"       step_mint_binding
 run_step "provisional capture of working edits"  step_provisional_capture
 run_step "own versus published visibility"       step_own_visibility

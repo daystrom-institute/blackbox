@@ -909,34 +909,6 @@ impl BlackboxServer {
 }
 
 impl ProjectGraphEntityResolver for BlackboxServer {
-    /// Live graph-selection gate for traversal expansion (unified-retrieval
-    /// 5.2). The gate owns GRAPH lanes only: a non-graph ref (a project file,
-    /// a knowledge entry) is admitted untouched, because its readability is
-    /// enforced by its own provider and the evidence-status algebra. A graph
-    /// hop is admitted only when the destination lane resolves under the
-    /// caller's active plane AND its policy leaves text retrieval on AND its
-    /// source is not the never-indexable local-scratch plane. Resolution
-    /// failure means the lane is absent for this caller, which is the same
-    /// answer the entity loader would give one step later; refusing here
-    /// keeps the vertex out of the frontier instead of leaking a truncated
-    /// path that implies it exists.
-    fn traversal_admits(&self, r: &EntityRef, provisional: Option<&str>) -> bool {
-        use bbox_project_graph::GraphSource;
-
-        if !matches!(
-            r.entity_type(),
-            bbox_corpus_core::entity_ref::EntityType::ProjectGraphVertex
-                | bbox_corpus_core::entity_ref::EntityType::ProvisionalProjectGraphVertex
-        ) {
-            return true;
-        }
-        let Ok(resolved) = self.resolve_project_graph_vertex(r, provisional) else {
-            return false;
-        };
-        !matches!(resolved.graph.key.source, GraphSource::LocalScratch)
-            && resolved.graph.schema.index_policy.text_retrieval_enabled
-    }
-
     fn resolve_entity(&self, r: &EntityRef, provisional: Option<&str>) -> Result<EntityView> {
         let resolved = self.resolve_project_graph_vertex(r, provisional)?;
         let mut properties = BTreeMap::from([

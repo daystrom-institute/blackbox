@@ -1158,7 +1158,7 @@ impl TranscriptIndex {
         // Transcript docs store a legacy unprefixed entity_id
         // (`<provider>:<session>:<offset>:<idx>`, jsonl_entity_id in
         // transcripts/types.rs) that is not a parseable EntityRef, so
-        // downstream tools (inspect, find_paths, bundle_evidence) and eval
+        // downstream tools (inspect) and eval
         // expected refs can never match it. Canonicalize transcript ids at
         // read time from the doc fields instead of trusting the stored
         // form; non-transcript docs keep their explicit id verbatim.

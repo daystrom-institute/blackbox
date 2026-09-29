@@ -936,7 +936,7 @@ fn build_next_steps(results: &[HybridResult]) -> Vec<String> {
     }
     let top = &results[0].entity_id;
     vec![format!(
-        "Inspect the top seed with bbox_inspect_entity(entity_ref=\"{top}\"); use bbox_find_paths for multi-hop questions, then bbox_bundle_evidence with selected refs and path_ids."
+        "Inspect the top seed's properties and provenance with bbox_inspect_entity(entity_ref=\"{top}\")."
     )]
 }
 
@@ -2147,8 +2147,8 @@ mod tests {
                 .any(|s| s.contains("bbox_inspect_entity(entity_ref=\"knowledge:top\")"))
         );
         assert_eq!(steps.len(), 1);
-        assert!(steps[0].contains("bbox_find_paths"));
-        assert!(steps[0].contains("bbox_bundle_evidence"));
+        assert!(!steps[0].contains("bbox_find_paths"));
+        assert!(!steps[0].contains("bbox_bundle_evidence"));
         assert_eq!(steps[0].matches("knowledge:top").count(), 1);
     }
 

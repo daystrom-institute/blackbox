@@ -57,9 +57,8 @@ bbox_hybrid_search(
 )
 ```
 
-Use `bbox_inspect_entity` and `bbox_find_paths` when a claim depends on indexed
-graph relationships. Bundle evidence before answering provenance-sensitive
-questions.
+Use `bbox_inspect_entity` to read the exact stored chunk behind a search hit
+before relying on it.
 
 3. Make edits with the normal code editing path, then validate with project
 commands. Common commands:

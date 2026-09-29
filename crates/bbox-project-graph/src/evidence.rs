@@ -690,8 +690,8 @@ pub fn aggregate_endpoint_status(
 
 /// The metadata every read-plane surface attaches to an evidence edge.
 ///
-/// One producer so `bbox_inspect_entity`, `bbox_find_paths`, and
-/// `bbox_bundle_evidence` cannot drift into three dialects of the same edge.
+/// One producer so every read surface that renders an evidence edge (the
+/// graph resolver and `bbox_inspect_entity`) speaks one dialect of it.
 pub fn binding_metadata(
     binding: &EvidenceBinding,
     source_status: EvidenceEndpointStatus,

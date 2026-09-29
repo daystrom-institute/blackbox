@@ -1814,7 +1814,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_knowledge",
-        description = "Query durable knowledge entries by free-text or filters. Use early when prior decisions, conventions, remembered facts, or system runbooks could change the answer. Also surfaces a bounded system-memory sidecar; system memories include system_memory:<id> refs usable with bbox_inspect_entity or bbox_bundle_evidence. Pass category=\"system_memory\" to list memory metadata."
+        description = "Query durable knowledge entries by free-text or filters. Use early when prior decisions, conventions, remembered facts, or system runbooks could change the answer. Also surfaces a bounded system-memory sidecar; system memories include system_memory:<id> refs usable with bbox_inspect_entity. Pass category=\"system_memory\" to list memory metadata."
     )]
     pub(crate) async fn bbox_knowledge(
         &self,
@@ -1928,10 +1928,7 @@ impl BlackboxServer {
                 }
                 combined.push_str("\n── Next steps ───────────────────────────────\n");
                 combined.push_str(&format!(
-                    "  → Inspect the top entry's edges + provenance: bbox_inspect_entity(entity_ref=\"{entity_ref}\")\n"
-                ));
-                combined.push_str(&format!(
-                    "  → Package an answer: bbox_bundle_evidence(question=<q>, entity_refs=[\"{entity_ref}\"])\n"
+                    "  → Inspect the top entry's properties + provenance: bbox_inspect_entity(entity_ref=\"{entity_ref}\")\n"
                 ));
             }
             let mut structured = view.structured_response(&returned_ids);

@@ -14,8 +14,7 @@ Files in `system-defaults/memories/` use bare slugs such as
 ## Retrieval And Corpus Navigation
 
 - [sm-agentic-opening-sequence](agentic-opening-sequence.md) - first-loop
-  grounding across schema, search, entity inspection, path finding, and
-  evidence bundles.
+  grounding across knowledge recall, search, and entity inspection.
 - [sm-transcript-retrieval](transcript-retrieval.md) - transcript search,
   citation, context, session, and message retrieval ladders.
 

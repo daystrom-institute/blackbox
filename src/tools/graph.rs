@@ -1,9 +1,6 @@
-use anyhow::{Result, bail};
+use anyhow::bail;
 
 use crate::mcp_tools;
-use crate::mcp_tools::bundle_evidence::BundleEvidenceParams;
-use crate::mcp_tools::describe_schema::DescribeSchemaOptions;
-use crate::mcp_tools::find_paths::FindPathsParams;
 use crate::mcp_tools::inspect::InspectEntityParams;
 use crate::server::BlackboxServer;
 use crate::{edge_index, entity_ref};
@@ -32,18 +29,6 @@ pub(crate) struct EdgeCompactParams {
     /// rebuild. Defaults to false because graph rebuilds can be expensive while
     /// legacy sidecars are still large.
     pub rebuild: Option<bool>,
-}
-
-#[derive(Debug, Default, Serialize, Deserialize, schemars::JsonSchema)]
-pub(crate) struct DescribeSchemaParams {
-    /// `full` expands entity properties and filters; `orientation` (the
-    /// default) returns compact graph vocabulary and traversal tips.
-    pub mode: Option<String>,
-    /// Exact schema body pages. Changed population evidence refuses
-    /// continuation.
-    pub cursor: Option<String>,
-    /// Exact body bytes, clamped to 4..=4096. Oversized replies also start a body page.
-    pub body_limit: Option<usize>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, schemars::JsonSchema)]
@@ -147,16 +132,6 @@ pub(crate) struct ProjectGraphValidateParams {
     pub variant_offset: Option<usize>,
     /// Stamp from the previous variant page; changed evidence refuses continuation.
     pub expected_view_stamp: Option<String>,
-}
-
-impl DescribeSchemaParams {
-    fn full_mode(&self) -> Result<bool> {
-        match self.mode.as_deref() {
-            None | Some("orientation") => Ok(false),
-            Some("full") => Ok(true),
-            Some(_) => bail!("Invalid schema mode; use orientation or full"),
-        }
-    }
 }
 
 #[tool_router(router = graph_tools)]
@@ -524,105 +499,6 @@ impl BlackboxServer {
     }
 
     #[tool(
-        name = "bbox_describe_schema",
-        description = "Orient to entity types and edge families. mode=full expands fields and filters. body_limit/cursor recovers exact schema JSON; oversized replies automatically start body pages."
-    )]
-    pub(crate) fn bbox_describe_schema(
-        &self,
-        Parameters(p): Parameters<DescribeSchemaParams>,
-    ) -> CallToolResult {
-        Self::run("bbox_describe_schema", || {
-            let full = p.full_mode()?;
-            let read_view = self.state.complete_code_read_view()?;
-            let rendered = mcp_tools::describe_schema::describe_schema_with_options(
-                &self.describe_schema_counts_from_view(&read_view),
-                DescribeSchemaOptions { compact: !full },
-            )?;
-            let scope = json!(["schema", full, p.mode]).to_string();
-            let page = bbox_corpus_core::response_page::bounded_json_response(
-                &scope,
-                serde_json::from_str(&rendered)?,
-                p.cursor.as_deref(),
-                p.body_limit,
-            )?;
-            Ok(page.to_string())
-        })
-    }
-
-    #[tool(
-        name = "bbox_find_paths",
-        description = "Find direction-preserving paths to an exact ref (to) or entity type (to_type); a target is required. Filter edge_types and use a small max_depth. Fanout omissions and evidence freshness are explicit. Pass returned path IDs to bbox_bundle_evidence."
-    )]
-    pub(crate) async fn bbox_find_paths(
-        &self,
-        Parameters(p): Parameters<FindPathsParams>,
-    ) -> CallToolResult {
-        let server = self.clone();
-        Self::run_blocking("bbox_find_paths", move || {
-            let read_view = server.state.complete_code_read_view()?;
-            let edge_index = read_view.edge_index.as_ref();
-            let provider_ctx = server
-                .provider_context()
-                .with_edge_index(edge_index)
-                .with_searcher(&read_view.searcher)
-                .with_project_graph_resolver(&server, p.provisional.as_deref());
-            mcp_tools::find_paths::find_paths(
-                &p,
-                &provider_ctx,
-                edge_index,
-                &mut server.state.path_cache.write(),
-            )
-        })
-        .await
-    }
-
-    #[tool(
-        name = "bbox_bundle_evidence",
-        description = "Bundle entity refs and cached paths with provenance and freshness. Properties default to summary; full/none are explicit. body_limit/cursor recovers exact bundle JSON, and oversized replies automatically start body pages."
-    )]
-    pub(crate) async fn bbox_bundle_evidence(
-        &self,
-        Parameters(p): Parameters<BundleEvidenceParams>,
-    ) -> CallToolResult {
-        let server = self.clone();
-        Self::run_blocking_with_structured("bbox_bundle_evidence", move || {
-            let read_view = server.state.complete_code_read_view()?;
-            let knowledge_view = server.session_knowledge_view(None, p.provisional.as_deref())?;
-            let edge_index = read_view.edge_index.as_ref();
-            let provider_ctx = server
-                .provider_context()
-                .with_knowledge_view(&knowledge_view.knowledge)
-                .with_edge_index(edge_index)
-                .with_searcher(&read_view.searcher)
-                .with_project_graph_resolver(&server, p.provisional.as_deref());
-            let output = mcp_tools::bundle_evidence::bundle_evidence(
-                &p,
-                &provider_ctx,
-                edge_index,
-                &mut server.state.path_cache.write(),
-            )?;
-            let (_, enriched) = knowledge_view.enrich_json_response(output)?;
-            let scope = json!([
-                "bundle",
-                p.question,
-                p.entity_refs,
-                p.path_ids,
-                p.provisional,
-                p.property_mode
-            ])
-            .to_string();
-            let bounded = bbox_corpus_core::response_page::bounded_json_response(
-                &scope,
-                enriched,
-                p.cursor.as_deref(),
-                p.body_limit,
-            )?;
-            Ok((bounded.to_string(), bounded))
-        })
-        .await
-    }
-
-    #[tool(
         name = "bbox_edge_compact",
         description = "Dry-run or apply legacy edge sidecar compaction for one project. Removes append-only derived edges from edges/<project_id>.jsonl while retaining explicit/provenance/malformed lines; apply defaults false and writes a backup before replacement. With apply=true, rebuild=true forces a sidecar-only in-memory EdgeIndex rebuild even when compaction is already complete."
     )]
@@ -781,25 +657,6 @@ mod tests {
         assert!(extract_text(&stale).contains("error.graph_view_changed"));
     }
 
-    #[test]
-    fn schema_mode_rejects_unknown_values() {
-        for mode in ["ful", "agents"] {
-            let params = DescribeSchemaParams {
-                mode: Some(mode.into()),
-                ..Default::default()
-            };
-            assert!(params.full_mode().is_err(), "{mode}");
-        }
-        assert!(!DescribeSchemaParams::default().full_mode().unwrap());
-        assert!(
-            DescribeSchemaParams {
-                mode: Some("full".into()),
-                ..Default::default()
-            }
-            .full_mode()
-            .unwrap()
-        );
-    }
     use crate::server::state::SharedState;
     use bbox_corpus_core::identity::PublishedScope;
     use std::path::PathBuf;
@@ -953,76 +810,6 @@ mod tests {
                 serde_json::from_value(index_policy).expect("test policy block is valid");
         }
         generation
-    }
-
-    /// One authored graph with a hub vertex and `leaves` leaf vertices, joined
-    /// by one edge type. The fan-out exit gate needs a neighborhood wider
-    /// than the default per-hop cap without depending on fixture file order.
-    fn hub_graph(project_id: &str, leaves: usize) -> bbox_project_graph::GraphGeneration {
-        let schema = serde_json::to_vec(&json!({
-            "version": 1,
-            "namespace": "fan",
-            "vertex_types": {
-                "fan:Hub": {"properties": {"name": "string"}},
-                "fan:Leaf": {"properties": {"name": "string"}}
-            },
-            "edge_types": [
-                {
-                    "type": "fan:LINKS",
-                    "endpoints": [{"from": "fan:Hub", "to": "fan:Leaf"}],
-                    "properties": {"note": "string"}
-                }
-            ]
-        }))
-        .unwrap();
-        let mut vertices = String::new();
-        vertices.push_str(
-            &serde_json::to_string(&json!({
-                "id": "hub",
-                "type": "fan:Hub",
-                "label": "hub",
-                "properties": {"name": "hub"}
-            }))
-            .unwrap(),
-        );
-        vertices.push('\n');
-        for idx in 1..=leaves {
-            let leaf = serde_json::to_string(&json!({
-                "id": format!("leaf-{idx}"),
-                "type": "fan:Leaf",
-                "label": format!("leaf-{idx}"),
-                "properties": {"name": format!("leaf-{idx}")}
-            }))
-            .unwrap();
-            vertices.push_str(&leaf);
-            vertices.push('\n');
-        }
-        let mut edges = String::new();
-        for idx in 1..=leaves {
-            let edge = serde_json::to_string(&json!({
-                "from": "hub",
-                "type": "fan:LINKS",
-                "to": format!("leaf-{idx}"),
-                "properties": {"note": format!("leaf-{idx}")}
-            }))
-            .unwrap();
-            edges.push_str(&edge);
-            edges.push('\n');
-        }
-        let loaded = bbox_project_graph::load_graph_documents(
-            project_id,
-            "fan",
-            bbox_project_graph::GraphDocumentBytes {
-                descriptor: None,
-                schema: &schema,
-                vertices: vertices.as_bytes(),
-                edges: edges.as_bytes(),
-            },
-            bbox_project_graph::GraphParseLimits::default(),
-            std::path::PathBuf::new(),
-        );
-        assert!(loaded.report.valid, "{:?}", loaded.report.errors);
-        loaded.generation.unwrap()
     }
 
     fn graph_entry(
@@ -1394,211 +1181,17 @@ mod tests {
         serde_json::from_str(&extract_text(&result)).unwrap()
     }
 
-    /// The JSON a serialized `EntityRef` takes on a path step.
-    ///
-    /// `EntityRef` is an internally tagged enum, so it rides the wire as an
-    /// OBJECT keyed by `type`, not as its rendered `type:segments` string.
-    /// `steps[n]["to"]` is therefore never a JSON string, and comparing it
-    /// against a rendered ref silently compares an object to a string rather
-    /// than failing loudly at the point of the mistake. Build the expected
-    /// value from the ref itself so the assertion tracks the real wire shape.
-    fn step_ref(rendered: &str) -> serde_json::Value {
-        serde_json::to_value(entity_ref::EntityRef::parse(rendered).unwrap()).unwrap()
-    }
-
-    /// THE EXIT GATE for milestone 3: a tenant record vertex traverses through
-    /// a source vertex to a published project file, and the reverse traversal
-    /// preserves provenance.
+    /// A graph whose policy disables text retrieval keeps its evidence
+    /// bindings visible to inspection (a binding is the caller's own
+    /// assertion), and the describe surface explains why the lane is absent
+    /// from search.
     #[tokio::test]
-    async fn a_record_vertex_traverses_through_a_source_vertex_to_a_project_file() {
+    async fn retrieval_disabled_graph_keeps_bindings_inspectable() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
         let server = test_server(&tmp);
-        let (project_id, file_ref) = install_evidence_fixture(&server, &root);
+        let (project_id, _file_ref) = install_retrieval_gated_fixture(&server, &root, false);
         let record_ref = format!("project_graph_vertex:{project_id}:records:filing-1");
-
-        let forward = server
-            .bbox_find_paths(Parameters(FindPathsParams {
-                from: record_ref.clone(),
-                provisional: Some("published".into()),
-                to: Some(file_ref.clone()),
-                to_type: None,
-                edge_types: None,
-                max_depth: Some(3),
-                limit: Some(5),
-                max_fanout: None,
-            }))
-            .await;
-        let forward_text = extract_text(&forward);
-        let forward: serde_json::Value = serde_json::from_str(&forward_text).unwrap();
-        let paths = forward["paths"].as_array().expect("paths array");
-        assert!(
-            !paths.is_empty(),
-            "record vertex must reach the project file: {forward_text}"
-        );
-        let steps = paths[0]["steps"].as_array().unwrap();
-        assert_eq!(steps.len(), 2, "{forward_text}");
-        // Hop one crosses from the record graph into a DIFFERENT graph of the
-        // same project, which is what the cross-graph namespace split needed.
-        assert_eq!(steps[0]["edge_kind"], "record:CORRESPONDS_TO");
-        assert_eq!(
-            steps[0]["metadata"]["evidence.binding_id"],
-            "record-to-source"
-        );
-        assert_eq!(
-            steps[0]["metadata"]["evidence.mapping_version"],
-            "mapping-v1"
-        );
-        assert_eq!(
-            steps[0]["to"],
-            step_ref(&format!("project_graph_vertex:{project_id}:source:asset-1")),
-            "{forward_text}"
-        );
-        // Hop two leaves the graph plane entirely for a project file ref.
-        assert_eq!(steps[1]["edge_kind"], "dataset:EVIDENCED_BY");
-        assert_eq!(
-            steps[1]["metadata"]["evidence.observation_id"],
-            "observation-file-1"
-        );
-        assert_eq!(steps[1]["to"], step_ref(&file_ref), "{forward_text}");
-
-        // The reverse traversal preserves provenance: same bindings, same
-        // authority and observation labels, walked from the file back.
-        let reverse = server
-            .bbox_find_paths(Parameters(FindPathsParams {
-                from: file_ref.clone(),
-                provisional: Some("published".into()),
-                to: Some(record_ref),
-                to_type: None,
-                edge_types: None,
-                max_depth: Some(3),
-                limit: Some(5),
-                max_fanout: None,
-            }))
-            .await;
-        let reverse_text = extract_text(&reverse);
-        let reverse: serde_json::Value = serde_json::from_str(&reverse_text).unwrap();
-        let paths = reverse["paths"].as_array().expect("paths array");
-        assert!(
-            !paths.is_empty(),
-            "the project file must reach back to the record vertex: {reverse_text}"
-        );
-        let steps = paths[0]["steps"].as_array().unwrap();
-        assert_eq!(steps.len(), 2, "{reverse_text}");
-        // Walking back: file -> source vertex -> record vertex. A step records
-        // `from`/`to` in walk order and labels the edge direction separately,
-        // so both hops are `in` while the refs advance toward the record.
-        assert_eq!(steps[0]["direction"], "in");
-        assert_eq!(steps[0]["from"], step_ref(&file_ref), "{reverse_text}");
-        assert_eq!(
-            steps[0]["to"],
-            step_ref(&format!("project_graph_vertex:{project_id}:source:asset-1")),
-            "{reverse_text}"
-        );
-        assert_eq!(
-            steps[0]["metadata"]["evidence.observation_id"], "observation-file-1",
-            "reverse traversal must carry the same observation provenance"
-        );
-        assert_eq!(
-            steps[0]["metadata"]["evidence.assertion_authority"],
-            "connector"
-        );
-        assert_eq!(steps[1]["direction"], "in");
-        assert_eq!(
-            steps[1]["to"],
-            step_ref(&format!(
-                "project_graph_vertex:{project_id}:records:filing-1"
-            )),
-            "{reverse_text}"
-        );
-        assert_eq!(
-            steps[1]["metadata"]["evidence.assertion_authority"],
-            "project"
-        );
-        assert_eq!(
-            steps[1]["metadata"]["evidence.mapping_version"],
-            "mapping-v1"
-        );
-    }
-
-    /// THE EXIT GATE for M9a (c): a traversal that would cross into a graph
-    /// whose policy disables text retrieval does not enumerate that graph's
-    /// vertices. The binding still exists and inspection still shows it (the
-    /// deliberate asymmetry: a binding is the caller's own assertion), but
-    /// the walk refuses the hop: no path, no truncated-expansion note, and no
-    /// rendered mention that could imply the excluded lane exists.
-    #[tokio::test]
-    async fn traversal_does_not_cross_into_a_retrieval_disabled_graph() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().canonicalize().unwrap();
-        let server = test_server(&tmp);
-        let (project_id, file_ref) = install_retrieval_gated_fixture(&server, &root, false);
-        let record_ref = format!("project_graph_vertex:{project_id}:records:filing-1");
-
-        // The walk toward the file must cross the disabled lane; it refuses
-        // at the hop instead of returning a truncated path.
-        let blocked = server
-            .bbox_find_paths(Parameters(FindPathsParams {
-                from: record_ref.clone(),
-                provisional: Some("published".into()),
-                to: Some(file_ref.clone()),
-                to_type: None,
-                edge_types: None,
-                max_depth: Some(3),
-                limit: Some(5),
-                max_fanout: None,
-            }))
-            .await;
-        let blocked_text = extract_text(&blocked);
-        assert!(
-            blocked_text.contains("No paths found"),
-            "the disabled lane must not be walked: {blocked_text}"
-        );
-        assert!(
-            !blocked_text.contains("source:asset-1"),
-            "the refused hop must not disclose the excluded vertex: {blocked_text}"
-        );
-        let blocked_value: serde_json::Value = serde_json::from_str(&blocked_text).unwrap();
-        assert!(
-            blocked_value["truncated_expansions"]
-                .as_array()
-                .is_none_or(std::vec::Vec::is_empty),
-            "no count or note may imply the excluded lane exists: {blocked_text}"
-        );
-
-        // An open-ended walk to the nearest graph vertices refuses the same
-        // hop; the record vertex itself is the root, not a found path.
-        let open = server
-            .bbox_find_paths(Parameters(FindPathsParams {
-                from: record_ref.clone(),
-                provisional: Some("published".into()),
-                to: None,
-                to_type: Some("project_graph_vertex".into()),
-                edge_types: None,
-                max_depth: Some(2),
-                limit: Some(5),
-                max_fanout: None,
-            }))
-            .await;
-        let open_text = extract_text(&open);
-        let open: serde_json::Value = serde_json::from_str(&open_text).unwrap();
-        // The record vertex's own reflected meta:INSTANCE_OF hop stays
-        // walkable (it lives in the readable lane); the disabled lane does
-        // not. No path may contain a vertex of the source graph.
-        for path in open["paths"].as_array().unwrap() {
-            for step in path["steps"].as_array().unwrap() {
-                let endpoint = step["to"].as_object().unwrap();
-                assert_ne!(
-                    endpoint.get("graph_id").and_then(|value| value.as_str()),
-                    Some("source"),
-                    "the disabled lane must not enter the frontier: {open_text}"
-                );
-            }
-        }
-        assert!(
-            !open_text.contains("source:asset-1"),
-            "the refused hop must not disclose the excluded vertex: {open_text}"
-        );
 
         // Inspection keeps the binding: it is the caller's own assertion,
         // retained for diagnosis exactly like an unauthorized endpoint.
@@ -1650,126 +1243,6 @@ mod tests {
             described_text.contains("\"embedded_vertex_count\": 0"),
             "{described_text}"
         );
-
-        // Control: the identical fixture with retrieval enabled walks the
-        // same two hops, proving the refusal above is the policy gate and
-        // not the fixture shape.
-        let control_tmp = tempfile::tempdir().unwrap();
-        let control_root = control_tmp.path().canonicalize().unwrap();
-        let control_server = test_server(&control_tmp);
-        let (control_project, control_file) =
-            install_retrieval_gated_fixture(&control_server, &control_root, true);
-        let forward = control_server
-            .bbox_find_paths(Parameters(FindPathsParams {
-                from: format!("project_graph_vertex:{control_project}:records:filing-1"),
-                provisional: Some("published".into()),
-                to: Some(control_file),
-                to_type: None,
-                edge_types: None,
-                max_depth: Some(3),
-                limit: Some(5),
-                max_fanout: None,
-            }))
-            .await;
-        let forward_text = extract_text(&forward);
-        assert!(
-            !forward_text.contains("No paths found"),
-            "the enabled lane must be walkable: {forward_text}"
-        );
-    }
-
-    /// THE EXIT GATE for M9a (fan-out cap): a hub wider than the default
-    /// per-hop cap is expanded to the cap only, and the response says so
-    /// explicitly in both the structured field and the rendered text.
-    #[tokio::test]
-    async fn find_paths_caps_fanout_and_reports_the_truncation_at_the_tool_boundary() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().canonicalize().unwrap();
-        let server = test_server(&tmp);
-        let project = server
-            .state
-            .project_authority
-            .bridge_registry()
-            .unwrap()
-            .write()
-            .register_path(&root)
-            .unwrap();
-        let project_id =
-            bbox_corpus_core::project_catalog::ProjectId::parse(project.project_id.clone())
-                .unwrap();
-        let graph = hub_graph(project_id.as_str(), 20);
-        let scope = PublishedScope::try_new("repo-fan", ".").unwrap();
-        server.state.project_graph_views.write().install_published(
-            bbox_indexing::project_graph_view::PublishedProjectGraphView {
-                project_id,
-                scope,
-                accepted_generation: "test-accepted-generation".into(),
-                graphs: std::collections::BTreeMap::from([("fan".to_string(), graph_entry(graph))]),
-                evidence: bbox_project_graph::EvidenceBindingSet::default(),
-            },
-        );
-        let hub_ref = format!("project_graph_vertex:{}:fan:hub", project.project_id);
-
-        let capped = server
-            .bbox_find_paths(Parameters(FindPathsParams {
-                from: hub_ref.clone(),
-                provisional: Some("published".into()),
-                to: None,
-                to_type: Some("project_graph_vertex".into()),
-                edge_types: None,
-                max_depth: Some(1),
-                limit: Some(30),
-                max_fanout: None,
-            }))
-            .await;
-        let capped_text = extract_text(&capped);
-        let capped: serde_json::Value = serde_json::from_str(&capped_text).unwrap();
-        let capped_paths = capped["paths"].as_array().unwrap();
-        assert_eq!(
-            capped_paths.len(),
-            16,
-            "the default cap enumerates sixteen neighbors of the hub: {capped_text}"
-        );
-        let truncations = capped["truncated_expansions"].as_array().unwrap();
-        assert_eq!(truncations.len(), 1, "{capped_text}");
-        assert_eq!(truncations[0]["vertex"], json!(hub_ref));
-        assert!(
-            capped_text.contains("Expansion truncated at the max_fanout cap"),
-            "{capped_text}"
-        );
-
-        // Raising the cap past the neighborhood enumerates every neighbor
-        // and reports no truncation at all. The reflected graph adds the
-        // hub's meta:INSTANCE_OF edge to its schema-as-data type vertex, so
-        // the full neighborhood is the twenty authored leaves plus one
-        // reflected hop; the capped run's reported edge count must equal the
-        // full run's found paths, keeping the two runs consistent.
-        let full = server
-            .bbox_find_paths(Parameters(FindPathsParams {
-                from: hub_ref.clone(),
-                provisional: Some("published".into()),
-                to: None,
-                to_type: Some("project_graph_vertex".into()),
-                edge_types: None,
-                max_depth: Some(1),
-                limit: Some(30),
-                max_fanout: Some(64),
-            }))
-            .await;
-        let full_text = extract_text(&full);
-        let full: serde_json::Value = serde_json::from_str(&full_text).unwrap();
-        let full_paths = full["paths"].as_array().unwrap();
-        assert_eq!(
-            full_paths.len(),
-            21,
-            "a raised cap enumerates every neighbor: {full_text}"
-        );
-        assert_eq!(
-            full["truncated_expansions"].as_array().unwrap().len(),
-            0,
-            "{full_text}"
-        );
-        assert_eq!(truncations[0]["edge_count"], json!(full_paths.len()));
     }
 
     /// Q10: `provisional` is the canonical spelling on the project graph
@@ -3096,53 +2569,8 @@ mod tests {
         assert_eq!(binding["properties"]["evidence.freshness"], "stale");
     }
 
-    /// Contract: bindings and their provenance appear in bundles.
     #[tokio::test]
-    async fn bundles_carry_evidence_bindings_and_their_provenance() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().canonicalize().unwrap();
-        let server = test_server(&tmp);
-        let (project_id, _) = install_evidence_fixture(&server, &root);
-
-        let bundled = server
-            .bbox_bundle_evidence(Parameters(BundleEvidenceParams {
-                question: "what does this filing correspond to?".into(),
-                entity_refs: vec![
-                    format!("project_graph_vertex:{project_id}:records:filing-1"),
-                    format!("project_graph_vertex:{project_id}:source:asset-1"),
-                ],
-                path_ids: Vec::new(),
-                provisional: Some("published".into()),
-                property_mode: Some("summary".into()),
-                cursor: None,
-                body_limit: None,
-            }))
-            .await;
-        let text = extract_text(&bundled);
-        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
-        let edges = value["intra_bundle_edges"]
-            .as_array()
-            .unwrap_or_else(|| panic!("bundle must carry the binding: {text}"));
-        let binding = edges
-            .iter()
-            .find(|edge| edge["kind"] == "record:CORRESPONDS_TO")
-            .unwrap_or_else(|| panic!("{text}"));
-        assert_eq!(
-            binding["properties"]["evidence.binding_id"],
-            "record-to-source"
-        );
-        assert_eq!(
-            binding["properties"]["evidence.assertion_authority"],
-            "project"
-        );
-        assert_eq!(
-            binding["properties"]["evidence.mapping_version"],
-            "mapping-v1"
-        );
-    }
-
-    #[tokio::test]
-    async fn project_graph_tools_inspect_and_traverse_governance_fixture() {
+    async fn project_graph_tools_list_describe_validate_and_inspect_governance_fixture() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
         let server = test_server(&tmp);
@@ -3237,143 +2665,6 @@ mod tests {
             .await;
         let inspected_text = extract_text(&inspected);
         assert!(inspected_text.contains("record/case@1"), "{inspected_text}");
-
-        let paths = server
-            .bbox_find_paths(Parameters(FindPathsParams {
-                from: vertex_ref,
-                provisional: Some("published".into()),
-                to: None,
-                to_type: Some("project_graph_vertex".into()),
-                edge_types: None,
-                max_depth: Some(2),
-                limit: Some(5),
-                max_fanout: None,
-            }))
-            .await;
-        assert!(extract_text(&paths).contains("\"paths\""));
-    }
-
-    /// gap-e41499a9: under own visibility an authored graph materializes as
-    /// `provisional_project_graph_vertex` overlay refs, so a caller filtering
-    /// on the logical type used to walk the whole neighborhood and match
-    /// nothing. The logical type must be enough; the overlay type name stays
-    /// available for callers that want the overlay form exclusively.
-    #[tokio::test]
-    async fn find_paths_to_type_admits_overlay_vertices_under_own_visibility() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().canonicalize().unwrap();
-        let server = test_server(&tmp);
-        let project_id = install_governance_graph(&server, &root);
-        let scope = PublishedScope::try_new("repo-governance", ".").unwrap();
-        let workspace_id = bro_core::WorkspaceId::parse("a".repeat(32)).unwrap();
-        server.set_session_checkout_for_test(
-            project_id.clone(),
-            scope.clone(),
-            workspace_id.to_string(),
-            root.clone(),
-        );
-        let graph = load_governance_generation(&project_id, &root);
-        let content_hash = graph.fingerprint.clone();
-        server
-            .state
-            .project_graph_views
-            .write()
-            .install_provisional(
-                bbox_indexing::project_graph_view::ProvisionalProjectGraphOverlay {
-                    project_id: bbox_corpus_core::project_catalog::ProjectId::parse(
-                        project_id.clone(),
-                    )
-                    .unwrap(),
-                    scope,
-                    workspace_id: workspace_id.clone(),
-                    source_generation_id: "working-one".into(),
-                    graphs: std::collections::BTreeMap::from([(
-                        "governance-record".into(),
-                        bbox_indexing::project_graph_view::ProjectGraphOverlayValue::Upsert(
-                            bbox_indexing::project_graph_view::ProjectGraphViewEntry::valid(
-                                "governance-record".into(),
-                                bbox_indexing::project_graph_view::ProjectGraphGenerationIdentity {
-                                    accepted_generation: "generation-one".into(),
-                                    accepted_commit: "a".repeat(40),
-                                    source_generation: Some("working-one".into()),
-                                    workspace_id: Some(workspace_id),
-                                    content_hash,
-                                },
-                                graph,
-                            ),
-                        ),
-                    )]),
-                    evidence: None,
-                },
-            );
-
-        let vertex_ref =
-            format!("project_graph_vertex:{project_id}:governance-record:record/case@1");
-        let logical = server
-            .bbox_find_paths(Parameters(FindPathsParams {
-                from: vertex_ref.clone(),
-                provisional: Some("own".into()),
-                to: None,
-                to_type: Some("project_graph_vertex".into()),
-                edge_types: None,
-                max_depth: Some(2),
-                limit: Some(5),
-                max_fanout: None,
-            }))
-            .await;
-        let logical_text = extract_text(&logical);
-        assert!(!logical_text.contains("No paths found"), "{logical_text}");
-        assert!(
-            logical_text.contains("provisional_project_graph_vertex:"),
-            "{logical_text}"
-        );
-
-        // The overlay type name keeps working for callers that already know it.
-        let explicit = server
-            .bbox_find_paths(Parameters(FindPathsParams {
-                from: vertex_ref,
-                provisional: Some("own".into()),
-                to: None,
-                to_type: Some("provisional_project_graph_vertex".into()),
-                edge_types: None,
-                max_depth: Some(2),
-                limit: Some(5),
-                max_fanout: None,
-            }))
-            .await;
-        let explicit_text = extract_text(&explicit);
-        assert!(!explicit_text.contains("No paths found"), "{explicit_text}");
-        assert!(
-            explicit_text.contains("provisional_project_graph_vertex:"),
-            "{explicit_text}"
-        );
-    }
-
-    /// gap-e41499a9: a targetless call is a malformed call, not an empty
-    /// neighborhood, and must say so at the tool boundary.
-    #[tokio::test]
-    async fn find_paths_without_a_target_refuses_at_the_tool_boundary() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().canonicalize().unwrap();
-        let server = test_server(&tmp);
-        let project_id = install_governance_graph(&server, &root);
-
-        let refused = server
-            .bbox_find_paths(Parameters(FindPathsParams {
-                from: format!("project_graph_vertex:{project_id}:governance-record:record/case@1"),
-                provisional: Some("published".into()),
-                to: None,
-                to_type: None,
-                edge_types: None,
-                max_depth: Some(2),
-                limit: Some(5),
-                max_fanout: None,
-            }))
-            .await;
-        let refused_text = extract_text(&refused);
-        assert!(refused_text.contains("error.bad_input"), "{refused_text}");
-        assert!(refused_text.contains("suggested_fix"), "{refused_text}");
-        assert!(!refused_text.contains("No paths found"), "{refused_text}");
     }
 
     #[tokio::test]
@@ -3553,42 +2844,6 @@ mod tests {
         );
     }
 
-    /// gap-edc84378: transcript entities are deliberately excluded from
-    /// EdgeIndex's active counts, so bbox_describe_schema's transcript
-    /// population_count must come from a tantivy doc_type count instead. This
-    /// used to fall through to 0 for every caller.
-    #[test]
-    fn bbox_describe_schema_reports_transcript_count_from_tantivy() {
-        let tmp = tempfile::tempdir().unwrap();
-        let server = test_server(&tmp);
-        {
-            let idx = server.state.idx.write();
-            let fields = idx.field_handles();
-            let mut writer = idx.index_handle().writer(50_000_000).unwrap();
-            let mut transcript = tantivy::TantivyDocument::new();
-            transcript.add_text(fields.doc_type, "transcript");
-            transcript.add_text(fields.account, "claude");
-            transcript.add_text(fields.session_id, "sess-1");
-            transcript.add_u64(fields.byte_offset, 0);
-            writer.add_document(transcript).unwrap();
-            writer.commit().unwrap();
-            idx.reader_reload_for_test();
-        }
-
-        let result = server.bbox_describe_schema(Parameters(DescribeSchemaParams::default()));
-        assert_ne!(result.is_error, Some(true));
-        let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
-        let vertex_types = body["vertex_types"].as_array().unwrap();
-        let transcript_vertex = vertex_types
-            .iter()
-            .find(|v| v["entity_type"] == "transcript")
-            .expect("transcript vertex type present");
-        assert!(
-            transcript_vertex["population_count"].as_u64().unwrap() >= 1,
-            "expected transcript population_count >= 1, got {transcript_vertex}"
-        );
-    }
-
     /// gap-edc84378 fold: bbox_inspect_entity used to 404 real transcript
     /// refs hybrid_search had just returned, because
     /// TranscriptIndex::transcript_properties capped its per-session doc
@@ -3681,10 +2936,6 @@ mod tests {
 
         assert_eq!(result.is_error, Some(true));
         assert!(extract_text(&result).contains("error.edge_index_warming"));
-
-        let schema = server.bbox_describe_schema(Parameters(DescribeSchemaParams::default()));
-        assert_eq!(schema.is_error, Some(true));
-        assert!(extract_text(&schema).contains("error.edge_index_warming"));
     }
 }
 

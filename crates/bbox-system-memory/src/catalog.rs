@@ -317,8 +317,8 @@ pub fn format_for_signpost(memory: &SystemMemory) -> String {
         out.push_str(&format!("  {preview}\n"));
     }
     out.push_str(&format!(
-        "  → full runbook: bbox_knowledge(query=\"{}\"); bundle ref: system_memory:{}\n",
-        memory.id, memory.id
+        "  → full runbook: bbox_knowledge(query=\"{}\")\n",
+        memory.id
     ));
     out
 }

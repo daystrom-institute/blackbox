@@ -22,11 +22,8 @@
         "bro_when_all",
         "enter_worktree",
         "exit_worktree",
-        "bbox_describe_schema",
         "bbox_hybrid_search",
         "bbox_inspect_entity",
-        "bbox_find_paths",
-        "bbox_bundle_evidence",
         "bbox_knowledge"
     ],
     "classifier": {

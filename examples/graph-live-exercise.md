@@ -37,7 +37,7 @@ its port is already serving.
 | Committed candidate | the collector captures the committed `.bbox/knowledge`, `.bbox/gaps`, and `.bbox/graphs` lanes at a real HEAD and drives the publication candidate to Ready |
 | Acceptance | the daemon accepts the Ready candidate as it finalizes, running the daemon-side merge gate and establishing the accepted pointer; `bbox_project_publisher_status` names the candidate, and the graph views are populated by that acceptance, with no restart |
 | Published reads | `bbox_project_graph_list` / `_describe` / `_validate` report the accepted generation, its committed descriptor and schema, and a clean validation |
-| Published traversal | `bbox_inspect_entity` on a `project_graph_vertex` ref, `bbox_find_paths` across a `gov:CITES` edge from a claim to its evidence, and `bbox_bundle_evidence` over the vertex and the returned path id |
+| Published traversal | `bbox_inspect_entity` on a `project_graph_vertex` claim ref and on its cited evidence vertex, following the `gov:CITES` edge in both directions |
 | Binding mint | `bro workspace-binding mint` mints a workspace binding for the onboarded checkout, installs it `0600` in `.bbox/local`, and the file's scope survives being sourced by a shell |
 | Provisional capture | uncommitted working edits (a new `record/case@3` vertex and its `gov:SUPERSEDES` edge) are captured by `bro workspace-binding capture`, the operator half of the provisional lane |
 | Own versus published | a cold own read (no knowledge or gap read first) already serves the captured overlay, and the bound session sees one more vertex with a provisional source and its checkout id while published visibility still serves the accepted generation |

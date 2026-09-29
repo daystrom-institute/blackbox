@@ -1571,6 +1571,9 @@ mod tests {
             "bbox_note",
             "bbox_notes",
             "bbox_note_resolve",
+            "bbox_find_paths",
+            "bbox_bundle_evidence",
+            "bbox_describe_schema",
         ];
         let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut offenders = Vec::new();
