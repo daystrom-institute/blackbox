@@ -1171,7 +1171,7 @@ static WRITER_TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::A
 pub(crate) const MANAGED_EDGE_SET_VERSION: &str = "edge-set-v2-deduplicated";
 const MAX_MANAGED_EDGE_COMPACTION_INPUT_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
-fn writer_temp_sequence() -> u64 {
+pub(crate) fn writer_temp_sequence() -> u64 {
     WRITER_TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 

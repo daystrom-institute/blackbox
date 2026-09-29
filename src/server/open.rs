@@ -804,6 +804,11 @@ pub(super) fn open_shared_state(
         }
     }
 
+    // Retired transcript file-touch rows leave the durable lanes once, before
+    // graph authority is captured. The store-level marker makes every later
+    // start a single stat.
+    purge_file_touch_edges_at_startup(&edges_dir)?;
+
     // Pre-bind catalog-mode recovery (P4-F section 10.1 steps 5-8):
     // once-only classification, relationship chain validation,
     // retirement-journal detection, and startup reducer sweep. All run
@@ -1110,6 +1115,24 @@ pub(super) fn open_shared_state(
     })
 }
 
+/// Pre-bind purge of retired file-touch rows from the durable edge lanes.
+fn purge_file_touch_edges_at_startup(
+    edges_dir: &Path,
+) -> anyhow::Result<bbox_edge_sidecar::file_touch_purge::FileTouchPurgeStats> {
+    let stats = bbox_edge_sidecar::file_touch_purge::purge_retired_file_touch_edges(edges_dir)
+        .context("pre-bind file-touch edge purge failed")?;
+    if stats.lanes_scanned > 0 {
+        tracing::info!(
+            lanes_scanned = stats.lanes_scanned,
+            lanes_rewritten = stats.lanes_rewritten,
+            rows_removed = stats.rows_removed,
+            bytes_removed = stats.bytes_removed,
+            "retired file-touch edge rows purged"
+        );
+    }
+    Ok(stats)
+}
+
 fn sync_tool_docs(kb: &mut Knowledge) -> bool {
     match tool_docs::sync_into_knowledge(kb) {
         Ok(r) if r.wrote => {
@@ -1282,6 +1305,30 @@ fn refresh_history_reference_manifest(
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    /// The startup purge is the daemon's pass over a real edge root: a
+    /// store carrying file-touch rows loses them and is marked, and the
+    /// next start opens no lane.
+    #[test]
+    fn startup_purges_file_touch_rows_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let edges_dir = temp.path().canonicalize().unwrap().join("edges");
+        let lane = edges_dir
+            .join("observed")
+            .join("p_00000000000000000000000000000001.jsonl");
+        std::fs::create_dir_all(lane.parent().unwrap()).unwrap();
+        let bash = r#"{"source":{"type":"task","task_id":"one"},"kind":"RAN_BASH","target":{"type":"task","task_id":"two"},"provenance":"explicit","confidence":"exact"}"#;
+        let read = r#"{"source":{"type":"task","task_id":"one"},"kind":"READ_FILE","target":{"type":"task","task_id":"two"},"provenance":"explicit","confidence":"heuristic"}"#;
+        std::fs::write(&lane, format!("{read}\n{bash}\n")).unwrap();
+
+        let first = purge_file_touch_edges_at_startup(&edges_dir).unwrap();
+        assert_eq!(first.rows_removed, 1);
+        assert_eq!(std::fs::read_to_string(&lane).unwrap(), format!("{bash}\n"));
+
+        let second = purge_file_touch_edges_at_startup(&edges_dir).unwrap();
+        assert!(second.already_complete);
+        assert_eq!(second.lanes_scanned, 0);
+    }
 
     #[test]
     fn bridge_mode_never_opens_the_accepted_publication_runtime() {
