@@ -255,6 +255,8 @@ pub(super) fn execute_reindex_pass(
         fields,
         &edges_dir,
     )?;
+    let retired_tool_calls =
+        purge_retired_tool_call_documents(&recovery_reader.searcher(), fields, writer)?;
     let provisional_documents = if full {
         collect_provisional_documents(index, fields)?
     } else {
@@ -765,6 +767,7 @@ pub(super) fn execute_reindex_pass(
     let no_changes = !full
         && indexed_files == 0
         && purged == 0
+        && retired_tool_calls == 0
         && !dirty
         && project_stats.pending_local_snapshots.is_empty()
         && project_stats.publication.is_empty();
@@ -941,6 +944,33 @@ pub(super) fn execute_reindex_pass(
     );
     tracing::info!("{}", summary);
     Ok(summary)
+}
+
+/// Document type of the retired per-call tool projection. Transcript records
+/// carry the same content, so no pass produces these documents any more.
+pub(super) const RETIRED_TOOL_CALL_DOC_TYPE: &str = "tool_call";
+
+/// Delete every live retired tool-call document in the pass's commit. The
+/// check counts live documents only, so once the deletion commits later passes
+/// find nothing and the purge is a no-op without a separate marker.
+pub(super) fn purge_retired_tool_call_documents(
+    searcher: &tantivy::Searcher,
+    fields: FieldHandles,
+    writer: &mut IndexWriter,
+) -> Result<u64> {
+    let term = Term::from_field_text(fields.doc_type, RETIRED_TOOL_CALL_DOC_TYPE);
+    let live = searcher.search(
+        &TermQuery::new(term.clone(), IndexRecordOption::Basic),
+        &Count,
+    )? as u64;
+    if live > 0 {
+        writer.delete_term(term);
+        tracing::info!(
+            documents = live,
+            "auto-reindex: purging retired tool-call documents"
+        );
+    }
+    Ok(live)
 }
 
 /// The index directory, derived from the pass config's `_meta.json` path. The
@@ -1303,9 +1333,9 @@ mod tests {
         writer.commit().unwrap();
 
         assert_eq!(files, 1, "one session log discovered");
-        // user + assistant text + tool_use transcript docs, plus the tool_call
-        // doc projected from the shell_run tool_use.
-        assert_eq!(docs, 4, "indexed docs");
+        // user + assistant text + tool_use transcript docs; the shell_run
+        // tool_use projects no separate tool-call document.
+        assert_eq!(docs, 3, "indexed docs");
 
         let reader = index.reader().unwrap();
         let searcher = reader.searcher();
@@ -1316,11 +1346,12 @@ mod tests {
         let hits = searcher
             .search(&query, &tantivy::collector::TopDocs::with_limit(10))
             .unwrap();
-        assert_eq!(hits.len(), 4);
+        assert_eq!(hits.len(), 3);
 
         let mut saw_user = false;
         for (_score, addr) in hits {
             let doc: TantivyDocument = searcher.doc(addr).unwrap();
+            assert_eq!(first_text(&doc, fields.doc_type), "transcript");
             assert_eq!(first_text(&doc, fields.account), "brodex");
             assert_eq!(first_text(&doc, fields.project), "/repo/hx");
             assert!(first_text(&doc, fields.timestamp).starts_with("2026-06-10T01:00:0"));

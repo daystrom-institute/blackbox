@@ -62,8 +62,8 @@ before results are ranked:
 
 | Filter | Use |
 |---|---|
-| `doc_type` | One document family: `transcript`, `tool_call`, `project_file`, `commit`, `knowledge`, `thread`, ... |
-| `project` | Keep results scoped to the repo you care about. Transcripts and tool calls scope by recorded working directory or base project when the search is narrowed to conversations. |
+| `doc_type` | One document family: `transcript`, `project_file`, `commit`, `knowledge`, `thread`, ... |
+| `project` | Keep results scoped to the repo you care about. Transcripts scope by recorded working directory or base project when the search is narrowed to conversations. |
 | `role` | Find user directives, assistant summaries, tool results, or thinking blocks. |
 | `account` | Separate multiple Claude/Codex accounts. |
 | `include_subagents` | Include or exclude subagent transcript blocks (default true). |
@@ -73,7 +73,7 @@ before results are ranked:
 | `channel` | Conversation documents: one Slack channel by name or id. |
 
 The response is JSON. Each entry in `results[]` has `entity_id`, `label` and
-`excerpt`; transcript and tool-call hits add a `conversation` object with
+`excerpt`; transcript hits add a `conversation` object with
 `session_id`, `file_path`, `byte_offset`, `timestamp`, `account`, `source`,
 `project`, `author`, `channel`, `permalink`, and `exact_read` when an indexed
 recovery handle exists. `next_steps` lists the follow-up readers

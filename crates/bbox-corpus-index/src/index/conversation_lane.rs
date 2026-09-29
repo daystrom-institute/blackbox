@@ -20,7 +20,7 @@ use bbox_corpus_core::entity_ref::EntityRef;
 
 /// Document types that carry conversation fields: session, role, account,
 /// source lane, and for retained conversations the channel and author.
-pub const CONVERSATION_DOC_TYPES: [&str; 2] = ["transcript", "tool_call"];
+pub const CONVERSATION_DOC_TYPES: [&str; 1] = ["transcript"];
 
 /// How the word lane reads the query text.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

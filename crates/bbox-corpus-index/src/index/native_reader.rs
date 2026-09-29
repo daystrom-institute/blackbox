@@ -242,7 +242,7 @@ impl TranscriptIndex {
     fn native_reader_document(&self, doc: &TantivyDocument) -> bool {
         let kind = first_text(doc, self.fields.doc_type);
         let locator = first_text(doc, self.fields.file_path);
-        matches!(kind.as_str(), "transcript" | "tool_call")
+        kind == "transcript"
             && !locator.trim().is_empty()
             && !locator.starts_with("slack:")
             && first_text(doc, self.fields.source) != "slack"
@@ -339,12 +339,6 @@ impl TranscriptIndex {
             ("content", self.fields.content),
             ("project", self.fields.project),
             ("base_project_id", self.fields.base_project_id),
-            ("server", self.fields.tool_server),
-            ("tool_name", self.fields.tool_name),
-            ("tool_kind", self.fields.tool_kind),
-            ("target", self.fields.tool_target),
-            ("outcome", self.fields.tool_outcome),
-            ("task_id", self.fields.task_id),
         ] {
             let value = first_text(&doc, field);
             if !value.is_empty() {

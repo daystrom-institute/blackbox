@@ -37,8 +37,8 @@ pub struct HybridSearchParams {
     /// Maximum returned hits. Defaults to 10; clamped to 1..=50.
     #[serde(default)]
     pub limit: Option<u64>,
-    /// Restrict to one document type: `transcript`, `tool_call`,
-    /// `project_file`, `commit`, `knowledge`, `thread`, ...
+    /// Restrict to one document type: `transcript`, `project_file`, `commit`,
+    /// `knowledge`, `thread`, ...
     #[serde(default)]
     pub doc_type: Option<String>,
     /// Exact message role or document kind (`user`, `assistant`,
@@ -94,9 +94,9 @@ pub struct HybridSearchParams {
     /// project_file entries from that project, thread entries whose stored
     /// project resolves to that id, and project graph vertices stamped with
     /// that project id are kept; commits, knowledge, and other
-    /// project-agnostic entity types pass through unfiltered. Transcripts and
-    /// tool calls pass through too, unless the search is narrowed to
-    /// conversations (`doc_type` transcript or tool_call, or any of `role`,
+    /// project-agnostic entity types pass through unfiltered. Transcripts pass
+    /// through too, unless the search is narrowed to conversations
+    /// (`doc_type` transcript, or any of `role`,
     /// `account`, `source`, `author`, `channel`, `include_subagents=false`,
     /// `exclude_self`): then they are scoped by recorded working directory or
     /// base project. Use this to

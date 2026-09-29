@@ -22,7 +22,7 @@ Core MCP namespaces:
 - `bro_*` - orchestration and dispatch primitives.
 
 External callers compose bro operations and use their harness for file,
-shell and Git work. `bbox_tool_calls` reads indexed history.
+shell and Git work.
 
 ## Fast Orientation
 

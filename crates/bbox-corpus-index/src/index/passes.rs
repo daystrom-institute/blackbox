@@ -20,7 +20,7 @@ use super::{FieldHandles, FileMeta, ReindexConfig};
 use crate::transcripts::adapters::{
     TranscriptAdapterRegistry, TranscriptReadAdapter, TranscriptScanTarget,
 };
-use crate::transcripts::projection::{normalized_to_doc, normalized_to_tool_call_doc};
+use crate::transcripts::projection::normalized_to_doc;
 use crate::transcripts::types::TranscriptLocation;
 
 /// A publication may advance after index discovery but before the purge scan.
@@ -485,18 +485,6 @@ pub fn index_adapter_location(
         };
         writer.add_document(doc)?;
         *indexed_docs += 1;
-        if let Some(tool_doc) = normalized_to_tool_call_doc(
-            event,
-            account,
-            &path_str,
-            location.is_subagent,
-            project_fallback,
-            base_project_id.as_deref(),
-            fields,
-        ) {
-            writer.add_document(tool_doc)?;
-            *indexed_docs += 1;
-        }
     }
 
     meta.insert(

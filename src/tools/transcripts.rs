@@ -178,18 +178,102 @@ mod tests {
         let body: Value = serde_json::from_str(page["body"]["text"].as_str().unwrap()).unwrap();
         assert_eq!(body["content"], "hybridfoldneedle alpha");
     }
+
+    /// Tool invocations are searchable through their transcript records alone:
+    /// each event is one hit with readable conversation coordinates, and the
+    /// retired tool-call document type matches nothing.
+    #[tokio::test]
+    async fn hybrid_tool_use_search_reads_transcript_records_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let server = BlackboxServer::new(std::sync::Arc::new(
+            crate::server::state::SharedState::for_test(&root),
+        ));
+        {
+            let index = server.state.idx.read();
+            let fields = index.field_handles();
+            let mut writer = index
+                .index_handle()
+                .writer::<tantivy::TantivyDocument>(15_000_000)
+                .unwrap();
+            for (offset, role, content) in [
+                (0u64, "user", "run toolneedle checks"),
+                (
+                    1,
+                    "tool_use",
+                    "tool:Bash {\"command\":\"toolneedle --check\"}",
+                ),
+                (
+                    2,
+                    "tool_use",
+                    "tool:Read {\"file_path\":\"/repo/toolneedle.rs\"}",
+                ),
+            ] {
+                let mut doc = tantivy::TantivyDocument::new();
+                doc.add_text(fields.doc_type, "transcript");
+                doc.add_text(fields.content, content);
+                doc.add_text(fields.file_path, "native:synthetic/tool-stream");
+                doc.add_text(fields.session_id, "tool-session");
+                doc.add_text(fields.account, "claude");
+                doc.add_text(fields.source, "claude");
+                doc.add_text(fields.project, "/synthetic/tool-project");
+                doc.add_text(fields.timestamp, "2026-09-01T00:00:00Z");
+                doc.add_text(fields.role, role);
+                doc.add_u64(fields.is_subagent, 0);
+                doc.add_u64(fields.byte_offset, offset);
+                writer.add_document(doc).unwrap();
+            }
+            writer.commit().unwrap();
+            index.reader_reload_for_test();
+        }
+        let current = server.state.code_read_view.read().clone();
+        *server.state.code_read_view.write() =
+            std::sync::Arc::new(crate::server::state::CodeReadView {
+                active_selectors: current.active_selectors.clone(),
+                searcher: server.state.idx.read().searcher(),
+                catalog_epoch: current.catalog_epoch,
+                git_overlays: current.git_overlays.clone(),
+            });
+
+        let tool_uses = hybrid(
+            &server,
+            json!({"query": "toolneedle", "role": "tool_use",
+                "include_vectors": false, "rerank": "none"}),
+        )
+        .await;
+        let mut ids = entity_ids(&tool_uses);
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec![
+                "transcript:claude:tool-session:1:0",
+                "transcript:claude:tool-session:2:0",
+            ],
+            "{tool_uses}"
+        );
+        for hit in tool_uses["results"].as_array().unwrap() {
+            assert_eq!(hit["conversation"]["session_id"], "tool-session", "{hit}");
+        }
+
+        let retired = hybrid(
+            &server,
+            json!({"query": "toolneedle", "doc_type": "tool_call",
+                "include_vectors": false, "rerank": "none"}),
+        )
+        .await;
+        assert!(entity_ids(&retired).is_empty(), "{retired}");
+    }
 }
 
 pub(crate) fn router() -> ToolRouter<BlackboxServer> {
     BlackboxServer::transcripts_tools()
 }
 
-/// Filter-class boundary for the corpus listing family (`bbox_sessions_list`,
-/// `bbox_tool_calls`): resolve the raw
-/// selector once here and hand the index engine a typed filter. The
-/// literal travels unchanged so the substring lane keeps its semantics;
-/// the `base_project_id` term lane fires only when the selector resolved
-/// to a registered project.
+/// Filter-class boundary for the corpus listing family (`bbox_sessions_list`):
+/// resolve the raw selector once here and hand the index engine a typed
+/// filter. The literal travels unchanged so the substring lane keeps its
+/// semantics; the `base_project_id` term lane fires only when the selector
+/// resolved to a registered project.
 pub(crate) fn corpus_project_filter(
     server: &BlackboxServer,
     raw: Option<&str>,

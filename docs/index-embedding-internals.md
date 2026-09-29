@@ -34,8 +34,7 @@ Indexed sources include:
   channel, and permalink fields;
 - git commit messages;
 - knowledge entries;
-- threads;
-- selected tool-call records.
+- threads.
 
 The background reindex thread runs on an interval controlled by
 `BLACKBOX_REINDEX_INTERVAL_SECS` (default `120`). Interactive search can

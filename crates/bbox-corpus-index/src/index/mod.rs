@@ -112,7 +112,7 @@ pub struct FieldHandles {
     /// `chunk.project_id`.
     #[allow(dead_code)]
     pub project_id: Field,
-    /// Resolved base-project id stamped on transcript and tool_call docs at
+    /// Resolved base-project id stamped on transcript docs at
     /// ingest (gap-72fd5932): the registered project owning the session's
     /// cwd, including any worktree of it. Lets a project filter match work
     /// from every checkout while `project` keeps the literal session cwd.
@@ -156,6 +156,8 @@ pub struct FieldHandles {
     pub commit_author_name: Field,
     #[allow(dead_code)]
     pub commit_author_email: Field,
+    /// Retired tool-call projection fields. No document writes them any more;
+    /// they stay in the schema so the index schema version is unchanged.
     pub tool_server: Field,
     pub tool_name: Field,
     pub tool_kind: Field,
@@ -164,7 +166,7 @@ pub struct FieldHandles {
     pub task_id: Field,
     pub tool_use_id: Field,
     /// The transcript SOURCE lane a document came from (`glm`, `claude`,
-    /// `slack`, ...), stamped on every transcript and tool_call doc.
+    /// `slack`, ...), stamped on every transcript doc.
     ///
     /// Distinct from `account`, which names WHICH account or workspace inside
     /// a lane. Connector-landed conversations need one filter that includes or

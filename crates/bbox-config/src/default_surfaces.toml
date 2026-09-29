@@ -110,7 +110,6 @@ allow = [
     "bbox_project_list",
     "bro_status",
     "bro_dashboard",
-    "bbox_tool_calls",
 ]
 
 [surfaces.ops]

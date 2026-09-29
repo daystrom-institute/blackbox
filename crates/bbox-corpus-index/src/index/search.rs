@@ -3183,8 +3183,8 @@ mod native_drilldown_tests {
             doc.add_u64(fields.byte_offset, n as u64 * 100);
             doc.add_u64(fields.is_subagent, 0);
             writer.add_document(doc.clone()).unwrap();
-            // Tool-call projections share native event coordinates but must
-            // not duplicate transcript messages in the read family.
+            // Legacy tool-call projections share native event coordinates but
+            // must not duplicate transcript messages in the read family.
             if n == 0 {
                 let mut tool = TantivyDocument::new();
                 tool.add_text(fields.doc_type, "tool_call");

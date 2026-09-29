@@ -4285,6 +4285,67 @@ mod tests {
         assert_eq!(visibility_count(&index, "provisional"), 1);
     }
 
+    fn doc_type_count(index: &TranscriptIndex, doc_type: &str) -> usize {
+        use tantivy::collector::Count;
+        use tantivy::query::TermQuery;
+        use tantivy::schema::{IndexRecordOption, Term};
+
+        let reader = index.index_handle().reader().unwrap();
+        let searcher = reader.searcher();
+        let query = TermQuery::new(
+            Term::from_field_text(index.field_handles().doc_type, doc_type),
+            IndexRecordOption::Basic,
+        );
+        searcher.search(&query, &Count).unwrap()
+    }
+
+    /// An index written by an earlier release still holds tool-call
+    /// projections. The first pass deletes them in its commit, leaves the
+    /// transcript records that carry the same content, and later passes find
+    /// nothing to purge.
+    #[test]
+    fn reindex_pass_purges_legacy_tool_call_documents_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = test_index(dir.path());
+        let fields = index.field_handles();
+        {
+            let mut writer = index.index_handle().writer(15_000_000).unwrap();
+            for offset in 0..3u64 {
+                let mut transcript = tantivy::TantivyDocument::new();
+                transcript.add_text(fields.doc_type, "transcript");
+                transcript.add_text(fields.session_id, "legacy-session");
+                transcript.add_text(fields.file_path, "/legacy/session.jsonl");
+                transcript.add_text(fields.role, "tool_use");
+                transcript.add_text(fields.content, "tool:Bash {\"command\":\"true\"}");
+                transcript.add_u64(fields.byte_offset, offset);
+                writer.add_document(transcript).unwrap();
+                let mut tool_call = tantivy::TantivyDocument::new();
+                tool_call.add_text(fields.doc_type, "tool_call");
+                tool_call.add_text(fields.session_id, "legacy-session");
+                tool_call.add_text(fields.file_path, "/legacy/session.jsonl");
+                tool_call.add_text(fields.role, "tool_use");
+                tool_call.add_text(fields.tool_kind, "bash");
+                tool_call.add_text(fields.content, "tool:Bash {\"command\":\"true\"}");
+                tool_call.add_u64(fields.byte_offset, offset);
+                writer.add_document(tool_call).unwrap();
+            }
+            writer.commit().unwrap();
+        }
+        assert_eq!(doc_type_count(&index, "tool_call"), 3);
+        assert_eq!(doc_type_count(&index, "transcript"), 3);
+
+        let actor = IndexWriterActor::spawn_for(&index);
+        let first = actor.run_reindex_pass(false, false).unwrap();
+        assert_ne!(first, "auto-reindex: no changes after re-check");
+        assert_eq!(doc_type_count(&index, "tool_call"), 0);
+        assert_eq!(doc_type_count(&index, "transcript"), 3);
+
+        let second = actor.run_reindex_pass(false, false).unwrap();
+        assert_eq!(second, "auto-reindex: no changes after re-check");
+        assert_eq!(doc_type_count(&index, "tool_call"), 0);
+        assert_eq!(doc_type_count(&index, "transcript"), 3);
+    }
+
     #[test]
     fn scope_replace_preserves_globals_and_unrelated_projects() {
         let dir = tempfile::tempdir().unwrap();

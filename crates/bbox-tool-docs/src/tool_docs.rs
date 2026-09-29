@@ -32,7 +32,6 @@ pub enum ToolCategory {
     Artifacts,
     Orchestration,
     StorageHealth,
-    Workspace,
     Operations,
 }
 
@@ -50,7 +49,6 @@ impl ToolCategory {
             Self::Artifacts => "Artifact catalog",
             Self::Orchestration => "Bro orchestration",
             Self::StorageHealth => "Storage health",
-            Self::Workspace => "Tool-call history",
             Self::Operations => "Operations",
         }
     }
@@ -87,9 +85,6 @@ impl ToolCategory {
             }
             Self::StorageHealth => {
                 "Read-only storage inventory for edge sidecar hygiene. Operator tools, served on the `ops` surface: `bro mcp call <tool> '<json>' --surface ops`."
-            }
-            Self::Workspace => {
-                "Search indexed historical tool calls with bbox_tool_calls. Execute file, shell and Git operations in the caller harness."
             }
             Self::Operations => {
                 "Day-2 operational health surfaces: aggregate daemon/corpus/route status with classified findings and suggested next commands. Operator tools, served on the `ops` surface: `bro mcp call <tool> '<json>' --surface ops`."
@@ -613,13 +608,6 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     // ── Workflows ────────────────────────────────────────────────────
 
     // ── Atoms ───────────────────────────────────────────────────
-    ToolDoc {
-        name: "bbox_tool_calls",
-        category: ToolCategory::Workspace,
-        summary: "Search indexed tool-call history by server, tool name, kind, target, project and time. Returns bounded rows and next_offset; paths in records describe historical calls, not files the caller must open.",
-        when_to_use: "Use for tool-use evidence from indexed transcripts. Exact server/tool/kind filters narrow the index query. Glob (* wildcard), target substring, project and since filters apply to a bounded candidate page. Rows preview long fields with explicit truncation markers. When context is present, pass it as the arguments to bbox_context for the surrounding indexed source events. exact_read arguments instead recover the stored call's complete fields through bounded bbox_context body pages, including target/outcome and omitted identifiers. Native recovery uses an indexed-transcript handle when the original locator is oversized or names a source-host path; handles are corpus/content-bound and require rediscovery after deletion or segment replacement. outcome=requested records invocation, not successful completion. Default limit 20, maximum 100. Follow next_offset even when rows is empty; use identical filters, and restart after index changes. Offsets stop at 100000; narrow filters beyond that window. since requires RFC 3339 with timezone. No automatic reindex or local file read occurs.",
-        example: Some(r#"bbox_tool_calls(server="blackbox", tool_name="bro_exec", limit=20)"#),
-    },
     // ── Operations ──────────────────────────────────────────────────
     ToolDoc {
         name: "bbox_doctor",
@@ -882,7 +870,6 @@ pub fn render_satellite(topic: GuidanceTopic) -> String {
         ToolCategory::StorageHealth,
         ToolCategory::ProjectCatalog,
         ToolCategory::ProjectGraphs,
-        ToolCategory::Workspace,
     ]) {
         if topic_for_category(cat) != topic {
             continue;
@@ -1093,22 +1080,6 @@ mod tests {
                     doc.name
                 );
             }
-        }
-    }
-
-    #[test]
-    fn render_omits_workspace_tools_from_hot_layer() {
-        let md = render_markdown();
-        assert!(!md.contains("## Workspace tools"));
-        for doc in TOOL_DOCS
-            .iter()
-            .filter(|d| d.category == ToolCategory::Workspace)
-        {
-            assert!(
-                !md.contains(doc.name),
-                "workspace tool leaked into rendered hot layer: {}",
-                doc.name
-            );
         }
     }
 

@@ -62,7 +62,6 @@ corpus refs for remote reads and native harness tools for file, shell and Git wo
 - Read conversations by narrowing `bbox_hybrid_search` with `doc_type` or a
   conversation filter (`role`, `source`, `channel`, ...), then follow hits with
   `bbox_context` and `bbox_messages`.
-  `bbox_tool_calls` pages through indexed historical tool calls.
 - Query durable conventions with `bbox_knowledge`. Track active investigation
   state with `bbox_thread`; durable memory changes require operator authority.
 - Start a model turn with `bro_exec`, retain its task/session handles and use
