@@ -664,10 +664,26 @@ pub struct CodeCollectionProducerConfig {
     pub scopes: Vec<bbox_corpus_core::identity::PublishedScope>,
     #[serde(default)]
     pub claim_scopes: ProducerScopeClaimPolicy,
-    /// Operator pre-grant for establishing the first accepted publication
-    /// from this producer's current project assignment.
-    #[serde(default)]
-    pub auto_publish: bool,
+    /// `auto_publish` has no effect: every valid Ready candidate from a
+    /// project's owning producer is accepted. The key parses so existing
+    /// configs load, and it is never written back.
+    #[serde(default, rename = "auto_publish", skip_serializing)]
+    pub retired_auto_publish: RetiredConfigKey,
+}
+
+/// A configuration key that still parses so existing configs load, but whose
+/// value is ignored and never re-serialized.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RetiredConfigKey;
+
+impl<'de> Deserialize<'de> for RetiredConfigKey {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        serde::de::IgnoredAny::deserialize(deserializer)?;
+        Ok(Self)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -3555,7 +3571,7 @@ state_dir = "~"
             token_files: token_files.into_iter().map(PathBuf::from).collect(),
             scopes: Vec::new(),
             claim_scopes: ProducerScopeClaimPolicy::None,
-            auto_publish: false,
+            retired_auto_publish: RetiredConfigKey,
         }
     }
 
@@ -3578,17 +3594,6 @@ state_dir = "~"
             .extract()
             .unwrap();
         assert_eq!(unclaimed.claim_scopes, ProducerScopeClaimPolicy::Unclaimed);
-        assert!(!defaulted.auto_publish);
-
-        let auto_publish: CodeCollectionProducerConfig = Figment::new()
-            .merge(Toml::string(
-                "producer_id = \"host-a\"\n\
-                 token_file = \"/tmp/token\"\n\
-                 auto_publish = true\n",
-            ))
-            .extract()
-            .unwrap();
-        assert!(auto_publish.auto_publish);
     }
 
     #[test]
@@ -3608,25 +3613,33 @@ state_dir = "~"
         );
     }
 
+    /// A config written for a daemon that honored `auto_publish` still
+    /// loads; the key is accepted, ignored, and never written back.
     #[test]
-    fn code_collection_producer_auto_publish_defaults_off_and_parses_true() {
-        let defaulted: CodeCollectionProducerConfig = Figment::new()
+    fn code_collection_producer_retired_auto_publish_key_still_parses() {
+        for value in ["true", "false"] {
+            let legacy: CodeCollectionProducerConfig = Figment::new()
+                .merge(Toml::string(&format!(
+                    "producer_id = \"host-a\"\n\
+                     token_file = \"/tmp/token\"\n\
+                     auto_publish = {value}\n"
+                )))
+                .extract()
+                .unwrap();
+            assert_eq!(legacy.producer_id, "host-a");
+            let rendered: figment::value::Dict =
+                Figment::from(figment::providers::Serialized::defaults(&legacy))
+                    .extract()
+                    .unwrap();
+            assert!(!rendered.contains_key("auto_publish"), "{rendered:?}");
+        }
+        let absent: CodeCollectionProducerConfig = Figment::new()
             .merge(Toml::string(
                 "producer_id = \"host-a\"\ntoken_file = \"/tmp/token\"\n",
             ))
             .extract()
             .unwrap();
-        assert!(!defaulted.auto_publish);
-
-        let enabled: CodeCollectionProducerConfig = Figment::new()
-            .merge(Toml::string(
-                "producer_id = \"host-a\"\n\
-                 token_file = \"/tmp/token\"\n\
-                 auto_publish = true\n",
-            ))
-            .extract()
-            .unwrap();
-        assert!(enabled.auto_publish);
+        assert_eq!(absent.retired_auto_publish, RetiredConfigKey);
     }
 
     #[test]

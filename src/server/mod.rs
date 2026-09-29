@@ -1,6 +1,7 @@
 mod background;
 mod bridge_parity;
 mod built_from;
+pub(crate) mod candidate_acceptance;
 /// Phase 5 plan section 14.4: the bridge parity proof. Test-only.
 #[cfg(test)]
 #[cfg(test)]
@@ -33,7 +34,6 @@ mod open;
 pub(crate) mod producer_auth;
 pub(crate) mod producer_commands;
 pub mod progress;
-pub(crate) mod publisher_auto_advance;
 pub(crate) mod render_operations;
 pub(crate) mod render_owner;
 pub(crate) mod repo_io;

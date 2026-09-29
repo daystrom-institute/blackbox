@@ -1563,9 +1563,6 @@ fn capture_publication_parity(
                 full_ref: candidate.descriptor.full_ref.clone(),
                 accepted_commit: candidate.descriptor.publisher_commit.clone(),
                 dry_run: true,
-                // A parity rebuild must not touch the standing grant, and a
-                // dry run installs no pointer to touch it on.
-                auto_advance: Default::default(),
             },
             PublishSources {
                 knowledge: candidate
@@ -2749,7 +2746,7 @@ mod tests {
                         token_files: Vec::new(),
                         scopes: scopes.clone(),
                         claim_scopes: Default::default(),
-                        auto_publish: false,
+                        retired_auto_publish: Default::default(),
                     });
             }
             let layout = ProjectCatalogMigrationResolvedLayoutV1::from_rehearsal_root(
@@ -2927,7 +2924,6 @@ mod tests {
                         full_ref: candidate.descriptor.full_ref.clone(),
                         accepted_commit: candidate.descriptor.publisher_commit.clone(),
                         dry_run: false,
-                        auto_advance: Default::default(),
                     },
                     PublishSources {
                         knowledge: files(&candidate.knowledge),

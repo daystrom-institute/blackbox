@@ -26,7 +26,7 @@ pub(crate) fn render(state: &SharedState) -> String {
          Registration is an operator operation served on the `ops` MCP surface. Run these commands from a shell with `bro`, or ask the operator to run them.\n\n\
          1. `bro mcp call bbox_project_register '{{\"path\":\"<absolute path on the checkout host>\"}}' --surface ops`. Add `\"producer\":\"<producer id>\"` only when the call returns `error.project_onboarding_ambiguous`.\n\
          2. If the receipt has `identity_committed: false`, commit exactly the returned `commit_paths` on `published_ref` in that checkout. Do not push unless the user asks. The collector reads the local ref.\n\
-         3. Verify the project with `bro mcp call bbox_project_catalog_list '{{\"query\":\"<project name>\"}}' --surface ops` and `bro mcp call bbox_project_publisher_status '{{\"project_id\":\"<project_id>\"}}' --surface ops`. Publication starts on the collector's next pass after the identity commit.\n\n\
+         3. Verify the project with `bro mcp call bbox_project_catalog_list '{{\"query\":\"<project name>\"}}' --surface ops` and `bro mcp call bbox_project_publisher_status '{{\"project_id\":\"<project_id>\"}}' --surface ops`. Publication starts on the collector's next pass after the identity commit: the daemon accepts the first valid candidate from the owning producer, and every later candidate on the same ref.\n\n\
          ## Checkout hosts\n\n"
     );
 
@@ -34,15 +34,14 @@ pub(crate) fn render(state: &SharedState) -> String {
         body.push_str("No checkout-host collector has fresh presence.\n\n");
     } else {
         body.push_str(
-            "| Producer | Host | Enroll roots | Config path | Service | Claims unclaimed scopes | Auto-publishes |\n\
-             | --- | --- | --- | --- | --- | --- | --- |\n",
+            "| Producer | Host | Enroll roots | Config path | Service | Claims unclaimed scopes |\n\
+             | --- | --- | --- | --- | --- | --- |\n",
         );
         for producer in &presences {
             let policy = policies.get(producer.producer_id.as_str()).copied();
             let claims = policy.is_some_and(|producer| {
                 producer.claim_scopes == ProducerScopeClaimPolicy::Unclaimed
             });
-            let auto_publish = policy.is_some_and(|producer| producer.auto_publish);
             let roots = producer
                 .presence
                 .enroll_roots
@@ -51,7 +50,7 @@ pub(crate) fn render(state: &SharedState) -> String {
                 .collect::<Vec<_>>()
                 .join("<br>");
             body.push_str(&format!(
-                "| `{}` | {} | {} | `{}` | {} | {} | {} |\n",
+                "| `{}` | {} | {} | `{}` | {} | {} |\n",
                 markdown_cell(&producer.producer_id),
                 markdown_cell(&producer.presence.host_label),
                 roots,
@@ -63,7 +62,6 @@ pub(crate) fn render(state: &SharedState) -> String {
                     .map(markdown_cell)
                     .unwrap_or_else(|| "not configured".to_string()),
                 yes_no(claims),
-                yes_no(auto_publish),
             ));
         }
         body.push('\n');
@@ -93,10 +91,9 @@ pub(crate) fn render(state: &SharedState) -> String {
     } else {
         for producer in &configured {
             body.push_str(&format!(
-                "- `{}`: claims unclaimed scopes: {}; auto-publishes: {}.\n",
+                "- `{}`: claims unclaimed scopes: {}.\n",
                 producer.producer_id,
                 yes_no(producer.claim_scopes == ProducerScopeClaimPolicy::Unclaimed),
-                yes_no(producer.auto_publish),
             ));
         }
         body.push('\n');
@@ -168,7 +165,6 @@ mod tests {
         state: &SharedState,
         producer_id: &str,
         claim_scopes: ProducerScopeClaimPolicy,
-        auto_publish: bool,
     ) {
         state
             .config
@@ -181,7 +177,7 @@ mod tests {
                 token_files: Vec::new(),
                 scopes: Vec::new(),
                 claim_scopes,
-                auto_publish,
+                retired_auto_publish: Default::default(),
             });
     }
 
@@ -217,13 +213,8 @@ mod tests {
     #[test]
     fn render_reflects_fresh_presence_policy_and_advertise_url() {
         let (_dir, state) = test_state();
-        install_producer(
-            &state,
-            "producer-b",
-            ProducerScopeClaimPolicy::Unclaimed,
-            true,
-        );
-        install_producer(&state, "producer-a", ProducerScopeClaimPolicy::None, false);
+        install_producer(&state, "producer-b", ProducerScopeClaimPolicy::Unclaimed);
+        install_producer(&state, "producer-a", ProducerScopeClaimPolicy::None);
         poll_presence(&state, "producer-b", "host-b", Some("collector-b.service"));
         poll_presence(&state, "producer-a", "host-a", None);
         state.config.write().daemon.advertise_url =
@@ -233,7 +224,8 @@ mod tests {
         assert!(text.starts_with("---\nname: onboard-project\ndescription:"));
         assert!(text.contains("https://blackbox.example.test"));
         assert!(text.contains("collector-b.service"));
-        assert!(text.contains("`producer-b`: claims unclaimed scopes: yes; auto-publishes: yes."));
+        assert!(text.contains("`producer-b`: claims unclaimed scopes: yes."));
+        assert!(!text.contains("auto-publish"));
         assert!(text.find("producer-a").unwrap() < text.find("producer-b").unwrap());
         assert!(!text.contains("No producer claims unclaimed scopes."));
         assert_eq!(text, render(&state));
@@ -242,7 +234,7 @@ mod tests {
     #[test]
     fn render_omits_stale_presence_and_explains_missing_claim_policy_and_url() {
         let (_dir, state) = test_state();
-        install_producer(&state, "producer-a", ProducerScopeClaimPolicy::None, false);
+        install_producer(&state, "producer-a", ProducerScopeClaimPolicy::None);
         poll_presence(&state, "producer-a", "stale-host", None);
         state.producer_commands.age_presence_for_test(
             "producer-a",

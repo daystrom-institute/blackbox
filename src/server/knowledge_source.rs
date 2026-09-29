@@ -136,10 +136,10 @@ pub(crate) struct KnowledgeSourceRuntime {
     /// so every minting path (managed worker spawn and the operator mint
     /// route) shares one registry instead of one per authority instance.
     workspace_binding_renewals: parking_lot::Mutex<BTreeMap<String, CancellationToken>>,
-    /// Bounded record of what the auto-advance policy last did per
-    /// project. It lives beside the publication candidates it reacts to,
-    /// so no new field has to be threaded through `SharedState`.
-    auto_advance: Arc<super::publisher_auto_advance::PublisherAutoAdvanceLedger>,
+    /// Bounded record of what candidate acceptance last did per project.
+    /// It lives beside the publication candidates it reacts to, so no new
+    /// field has to be threaded through `SharedState`.
+    acceptance: Arc<super::candidate_acceptance::CandidateAcceptanceLedger>,
 }
 
 pub(crate) struct KnowledgeTransportCheckoutPolicy {
@@ -191,9 +191,7 @@ impl KnowledgeSourceRuntime {
             store,
             workspace_bindings: parking_lot::RwLock::new(Vec::new()),
             workspace_binding_renewals: parking_lot::Mutex::new(BTreeMap::new()),
-            auto_advance: Arc::new(
-                super::publisher_auto_advance::PublisherAutoAdvanceLedger::default(),
-            ),
+            acceptance: Arc::new(super::candidate_acceptance::CandidateAcceptanceLedger::default()),
         })
     }
 
@@ -206,16 +204,14 @@ impl KnowledgeSourceRuntime {
             ),
             workspace_bindings: parking_lot::RwLock::new(Vec::new()),
             workspace_binding_renewals: parking_lot::Mutex::new(BTreeMap::new()),
-            auto_advance: Arc::new(
-                super::publisher_auto_advance::PublisherAutoAdvanceLedger::default(),
-            ),
+            acceptance: Arc::new(super::candidate_acceptance::CandidateAcceptanceLedger::default()),
         }
     }
 
-    pub(crate) fn auto_advance_ledger(
+    pub(crate) fn acceptance_ledger(
         &self,
-    ) -> Arc<super::publisher_auto_advance::PublisherAutoAdvanceLedger> {
-        self.auto_advance.clone()
+    ) -> Arc<super::candidate_acceptance::CandidateAcceptanceLedger> {
+        self.acceptance.clone()
     }
 
     pub(crate) fn store(&self) -> Arc<KnowledgeSourceStore> {
@@ -1472,10 +1468,10 @@ async fn finalize_publication_upload(
         blocking(move || store.finalize_publication_upload(&authority, &upload_id)).await?
     };
     // The candidate is durable and Ready by the time finalize returns, so
-    // this is where operator policy gets its one attempt. With no pointer,
-    // producer config may pre-grant the owning producer's first publication.
-    // With a pointer, its standing auto-advance grant governs the attempt.
-    // Both policies default off.
+    // this is where it gets its one acceptance attempt. With no pointer,
+    // the first valid candidate from the owning producer establishes one.
+    // With a pointer, a candidate on the bound producer, scope, and
+    // configured ref advances it.
     //
     // The attempt runs before the response so a producer that polls status
     // immediately cannot observe an unserved Ready candidate that the
@@ -1487,7 +1483,7 @@ async fn finalize_publication_upload(
         let source_generation_id = response.source_generation_id.clone();
         blocking(move || {
             let server = super::BlackboxServer::new(state);
-            server.attempt_publisher_auto_advance(&project_id, &source_generation_id);
+            server.accept_ready_candidate(&project_id, &source_generation_id);
             Ok::<_, anyhow::Error>(())
         })
         .await?;
@@ -3160,8 +3156,58 @@ mod tests {
         assert_eq!(finalized.status(), StatusCode::ACCEPTED);
     }
 
+    /// Finalize is where a Ready candidate is accepted: an admitted project
+    /// with no pointer is established by its first valid candidate, with no
+    /// grant anywhere.
     #[tokio::test]
-    async fn auto_publish_refusal_is_recorded_without_failing_finalize() {
+    async fn finalize_establishes_the_first_valid_candidate() {
+        let (_fixture, state, project_id) = finalize_candidate_for_acceptance(true).await;
+        let attempt = state
+            .knowledge_sources
+            .acceptance_ledger()
+            .last_attempt(project_id.as_str())
+            .expect("the acceptance is recorded for publisher status");
+        assert!(attempt.outcome.accepted(), "{attempt:?}");
+        let installed = state
+            .accepted_publications
+            .as_ref()
+            .unwrap()
+            .installed_pointer(&project_id)
+            .unwrap()
+            .expect("the first valid candidate establishes the pointer");
+        assert_eq!(installed.full_ref, "refs/heads/main");
+        assert_eq!(installed.source.kind(), "producer");
+    }
+
+    /// A project that was never admitted (no repo-knowledge capable
+    /// attachment) is not established, and the refusal is recorded without
+    /// failing the upload.
+    #[tokio::test]
+    async fn acceptance_refusal_is_recorded_without_failing_finalize() {
+        let (_fixture, state, project_id) = finalize_candidate_for_acceptance(false).await;
+        let attempt = state
+            .knowledge_sources
+            .acceptance_ledger()
+            .last_attempt(project_id.as_str())
+            .expect("the refusal is recorded for publisher status");
+        assert_eq!(
+            attempt.outcome,
+            crate::server::candidate_acceptance::AcceptanceOutcome::NoAttachedCheckout
+        );
+        assert_eq!(
+            state
+                .accepted_publications
+                .as_ref()
+                .unwrap()
+                .installed_pointer(&project_id)
+                .unwrap(),
+            None
+        );
+    }
+
+    async fn finalize_candidate_for_acceptance(
+        repo_knowledge: bool,
+    ) -> (CatalogFixture, Arc<SharedState>, ProjectId) {
         use std::io::Cursor;
 
         use bbox_corpus_core::project_catalog::{
@@ -3171,7 +3217,7 @@ mod tests {
 
         let catalog_fixture = CatalogFixture::new();
         let scope = CatalogFixture::scope(".");
-        let project_id = ProjectId::parse("p_auto_publish_finalize").unwrap();
+        let project_id = ProjectId::parse("p_acceptance_finalize").unwrap();
         catalog_fixture.add_published_project(project_id.as_str(), &scope);
         let attachment_id = AttachmentId::parse("att_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
         let checkout_dir = catalog_fixture
@@ -3197,7 +3243,7 @@ mod tests {
                         computed_repo_hint: None,
                         branch_ref: Some("main".into()),
                         capabilities: AttachmentCapabilities {
-                            repo_knowledge: false,
+                            repo_knowledge,
                             ..Default::default()
                         },
                         status: AttachmentStatus::Attached,
@@ -3209,7 +3255,7 @@ mod tests {
             })
             .unwrap();
         let state = catalog_fixture.server().state.clone();
-        let producer_id = "auto-publish-producer";
+        let producer_id = "acceptance-producer";
         let grant = ProducerGrant {
             producer_id: producer_id.into(),
             projects: BTreeMap::from([(scope.clone(), project_id.as_str().to_string())]),
@@ -3220,13 +3266,12 @@ mod tests {
             .unwrap()
             .catalog()
             .clone();
-        state.code_sources.install_auth_for_test(Arc::new(
-            ProducerAuthRuntime::for_test_catalog_with_auto_publish(
+        state
+            .code_sources
+            .install_auth_for_test(Arc::new(ProducerAuthRuntime::for_test_catalog(
                 vec![(ServiceToken::parse("6".repeat(64)).unwrap(), grant.clone())],
                 catalog.as_ref(),
-                BTreeSet::from([producer_id.to_string()]),
-            ),
-        ));
+            )));
 
         let store = state.knowledge_sources.store();
         let authority = PublicationAuthorityV1 {
@@ -3234,7 +3279,22 @@ mod tests {
             project_id: project_id.as_str().to_string(),
             scope: scope.clone(),
         };
-        let descriptor = publication_descriptor(scope);
+        // A normalizable knowledge entry, so the only thing that can stop
+        // acceptance is the admission check under test.
+        let knowledge_bytes = serde_json::to_vec(
+            &crate::server::state::catalog_fixture::knowledge_entry("knowledge-1", "accepted"),
+        )
+        .unwrap();
+        let manifest_entry = SourceFileManifestEntryV1 {
+            repository_relative_filename: ".bbox/knowledge/knowledge-1.json".to_string(),
+            encoded_bytes: knowledge_bytes.len() as u64,
+            content_sha256: source_file_blob_sha256(&knowledge_bytes),
+        };
+        let mut descriptor = publication_descriptor(scope);
+        descriptor.knowledge = manifest(
+            SourceLaneV1::Knowledge,
+            std::slice::from_ref(&manifest_entry),
+        );
         let upload = store
             .begin_publication_upload(&authority, descriptor)
             .unwrap();
@@ -3246,21 +3306,20 @@ mod tests {
                 0,
                 &SourceManifestPageV1 {
                     page_index: 0,
-                    entries: vec![entry()],
+                    entries: vec![manifest_entry.clone()],
                 },
             )
             .unwrap();
         store
             .missing_publication_blobs(&authority, &upload.upload_id, None)
             .unwrap();
-        let manifest_entry = entry();
         store
             .install_publication_blob(
                 &authority,
                 &upload.upload_id,
                 &manifest_entry.content_sha256,
                 manifest_entry.encoded_bytes,
-                Cursor::new(KNOWLEDGE_BYTES),
+                Cursor::new(knowledge_bytes),
             )
             .unwrap();
 
@@ -3270,17 +3329,10 @@ mod tests {
             Path(upload.upload_id),
         )
         .await
-        .expect("auto-publish refusal must not fail finalize");
+        .expect("acceptance never fails finalize");
         assert_eq!(status, StatusCode::ACCEPTED);
-        let attempt = state
-            .knowledge_sources
-            .auto_advance_ledger()
-            .last_attempt(project_id.as_str())
-            .expect("the refusal is recorded for publisher status");
-        assert_eq!(
-            attempt.outcome,
-            crate::server::publisher_auto_advance::AutoAdvanceOutcome::RefChanged
-        );
+        // The fixture owns the catalog tempdir, so the caller holds it.
+        (catalog_fixture, state, project_id)
     }
 
     #[tokio::test]

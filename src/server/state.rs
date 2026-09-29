@@ -3102,6 +3102,16 @@ pub(crate) mod catalog_fixture {
             .unwrap();
         }
 
+        /// The installed accepted-publication pointer file for one project.
+        pub(crate) fn accepted_pointer_path(&self, project_id: &str) -> PathBuf {
+            self.catalog_projects_path
+                .parent()
+                .unwrap()
+                .join("accepted-publications")
+                .join("pointers")
+                .join(format!("{project_id}.json"))
+        }
+
         pub(crate) fn corrupt_generation(&self, project_id: &str, generation_id: &str) {
             corrupt_accepted_generation_for_test(
                 &self.catalog_projects_path,
@@ -3706,13 +3716,13 @@ mod clause_three_exit_proof {
     #[tokio::test]
     async fn publisher_advance_returns_attachment_required() {
         let (fixture, server) = remote_only();
-        // Real CAS tokens, so the refusal below is the ATTACHMENT gate and
-        // not the earlier missing-token gate. Getting this wrong produces a
+        // The project publishes, so the refusal below is the ATTACHMENT
+        // gate and not a missing-pointer gate. Getting this wrong produces a
         // green row that never reached the property under proof.
-        let status = server
-            .state
-            .project_runtime_status(PROJECT)
-            .expect("status carries the tokens an advance must present");
+        assert!(
+            server.state.project_runtime_status(PROJECT).is_some(),
+            "the fixture project has published status"
+        );
 
         let advance = server
             .bbox_project_publisher_advance(Parameters(
@@ -3720,11 +3730,8 @@ mod clause_three_exit_proof {
                     project_id: PROJECT.into(),
                     attachment_id: Some(CatalogFixture::attachment().as_str().to_string()),
                     source_generation_id: None,
-                    mode: "advance".into(),
+                    operation: "rebind".into(),
                     full_ref: Some("refs/heads/main".into()),
-                    expected_generation_id: status.accepted.generation_id.clone(),
-                    expected_pointer_sha256: status.binding.pointer_sha256.clone(),
-                    auto_advance: None,
                     dry_run: false,
                     expected_catalog_epoch: fixture.epoch(),
                     audit_reason: "clause three walk".into(),

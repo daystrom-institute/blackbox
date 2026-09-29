@@ -3859,7 +3859,7 @@ mod tests {
                 token_files: Vec::new(),
                 scopes: repos.iter().map(|repo| repo.scope.clone()).collect(),
                 claim_scopes: Default::default(),
-                auto_publish: false,
+                retired_auto_publish: Default::default(),
             }];
             let layout = ProjectCatalogMigrationResolvedLayoutV1::from_rehearsal_root(
                 root.join("rehearsal"),

@@ -446,11 +446,11 @@ fn accepted_publication_section(
         let project = &status.project_id;
         findings.push(match status.accepted.state {
             // Serving old accepted truth under its old scope until a
-            // new-scope advance clears the bridge (plan 4.9).
+            // scope move at the new scope clears the bridge (plan 4.9).
             _ if status.accepted.scope_agreement == "refresh_required" => Finding::action(
                 format!(
                     "project {project} serves accepted content at a scope the catalog has since \
-                     migrated; publishing at the current scope clears the bridge"
+                     migrated; a scope_move to a candidate at the current scope clears the bridge"
                 ),
                 ops_call("bbox_project_publisher_advance", "<json>"),
             ),
@@ -463,8 +463,8 @@ fn accepted_publication_section(
                 publisher_status_call(project),
             ),
             "missing" => Finding::info(format!(
-                "project {project} has no accepted publication pointer; an explicit establish \
-                 creates the first one"
+                "project {project} has no accepted publication pointer; its first valid \
+                 candidate from the owning producer establishes one"
             )),
             "corrupt" => Finding::blocked(format!(
                 "project {project} has an accepted pointer whose current and prior arms both \

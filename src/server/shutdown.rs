@@ -304,7 +304,7 @@ mod tests {
             token_files: Vec::new(),
             scopes: vec![scope.clone()],
             claim_scopes: Default::default(),
-            auto_publish: false,
+            retired_auto_publish: Default::default(),
         }];
 
         let mut state = SharedState::for_test_catalog(&state_dir, &catalog_path);

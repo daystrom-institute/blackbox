@@ -28,7 +28,8 @@ use bbox_corpus_core::project_catalog::{
 use bbox_corpus_core::project_selector::{ProjectResolveError, ProjectSelectorRequest};
 use bbox_indexing::accepted_publication_runtime::{
     AcceptedPublicationScopeAgreement, AcceptedPublicationSourceBinding, AcceptedPublicationState,
-    AutoAdvanceGrantUpdate, PublishError, PublishSourceFile, PublishSources, PublisherPublishMode,
+    InstalledAcceptedPointer, PublishError, PublishSourceFile, PublishSources,
+    PublisherPublishMode,
 };
 use bbox_indexing::checkout_access::{
     CheckoutAccessIntent, CheckoutAccessKind, CheckoutAccessRequest, CheckoutAccessSourceLane,
@@ -404,37 +405,26 @@ pub(crate) struct ProjectScopeMigrateParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct ProjectPublisherAdvanceParams {
     pub project_id: String,
-    /// Local attachment whose checkout carries the ref being published.
-    /// Mutually exclusive with source_generation_id.
-    #[serde(default)]
-    pub attachment_id: Option<String>,
+    /// `rebind` moves the pointer onto a different producer, configured
+    /// ref, or attachment (and establishes a project with no pointer);
+    /// `scope_move` publishes at the catalog's current scope, clearing a
+    /// scope-migration bridge; `rollback` serves a specific earlier Ready
+    /// candidate from the bound producer, scope, and ref.
+    pub operation: String,
     /// Ready remote publication candidate. Mutually exclusive with
     /// attachment_id.
     #[serde(default)]
     pub source_generation_id: Option<String>,
-    /// `establish` for a project's first pointer, `advance` to move one.
-    pub mode: String,
+    /// Uncovered projects only: local attachment whose checkout carries
+    /// the ref being published. Mutually exclusive with
+    /// source_generation_id.
+    #[serde(default)]
+    pub attachment_id: Option<String>,
     /// Attachment publication only: fully qualified publisher ref, for
     /// example `refs/heads/main`. Remote candidates carry their ref in
     /// immutable source evidence and refuse this parameter.
     #[serde(default)]
     pub full_ref: Option<String>,
-    /// Advance only: the generation id the caller expects to replace.
-    #[serde(default)]
-    pub expected_generation_id: Option<String>,
-    /// Advance only: the SHA-256 of the pointer the caller expects to
-    /// replace.
-    #[serde(default)]
-    pub expected_pointer_sha256: Option<String>,
-    /// Operator authority over this project's standing auto-advance grant.
-    /// Omit to leave the grant exactly as it is (the default). `true`
-    /// installs it on the pointer this call writes, which is the audited
-    /// operator act that lets later Ready candidates from the SAME bound
-    /// producer, scope, and ref be accepted without a further operator
-    /// call. `false` revokes it. Agents pass this through from operator
-    /// input and never default or infer it.
-    #[serde(default)]
-    pub auto_advance: Option<bool>,
     #[serde(default)]
     pub dry_run: bool,
     pub expected_catalog_epoch: u64,
@@ -448,8 +438,8 @@ pub(crate) enum ProjectPublisherStatusDetail {
     Health,
     /// The complete connector publication view as exact body pages.
     Connector,
-    /// The complete auto-advance grant and latest policy attempt.
-    AutoAdvance,
+    /// The latest candidate acceptance attempt.
+    Acceptance,
 }
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
@@ -733,25 +723,22 @@ fn validate_publisher_status_detail(p: &ProjectPublisherStatusParams) -> anyhow:
 // Preserve ordinary identity/CAS strings byte-for-byte. Diagnostic prose has
 // a smaller preview budget; oversized identities are exact-reader markers,
 // never plausible but invalid prefixes callers could submit as selectors.
-fn publisher_auto_advance_summary(value: &serde_json::Value) -> serde_json::Value {
+fn publisher_acceptance_summary(value: &serde_json::Value) -> serde_json::Value {
     match value {
         serde_json::Value::String(text) if text.len() > 256 => json!({
-            "total_bytes": text.len(), "omitted": true, "detail": "auto_advance",
+            "total_bytes": text.len(), "omitted": true, "detail": "acceptance",
         }),
         serde_json::Value::Object(fields) => serde_json::Value::Object(
             fields
                 .iter()
                 .map(|(key, value)| {
-                    let summary = if matches!(
-                        key.as_str(),
-                        "detail" | "granted_reason" | "message" | "error"
-                    ) {
+                    let summary = if matches!(key.as_str(), "detail" | "message" | "error") {
                         value
                             .as_str()
                             .map(publisher_status_bounded_text)
-                            .unwrap_or_else(|| publisher_auto_advance_summary(value))
+                            .unwrap_or_else(|| publisher_acceptance_summary(value))
                     } else {
-                        publisher_auto_advance_summary(value)
+                        publisher_acceptance_summary(value)
                     };
                     (key.clone(), summary)
                 })
@@ -1819,7 +1806,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_project_publisher_advance",
-        description = "Establish or advance one published project's accepted publication. mode=establish creates the first pointer; mode=advance requires the generation and pointer tokens from bbox_project_publisher_status. Select exactly one source: attachment_id with full_ref reads a capable attached checkout, while source_generation_id consumes a Ready remote publication candidate and derives its producer, scope, ref, commit, and both source lanes from pinned immutable evidence. Candidate mode refuses caller-supplied full_ref. Both paths validate knowledge and gaps into one immutable generation and swap only after rechecking catalog authority and source freshness. Publishing uses the catalog's current scope, which clears a scope-migration bridge. dry_run validates and writes nothing. Requires expected_catalog_epoch and a bounded audit_reason. auto_advance is operator authority over this project's standing auto-advance grant: omit it to leave the grant unchanged, pass true to install it on the pointer this call writes, or false to revoke it. A granted project accepts later Ready candidates from the same bound producer, catalog scope, and published ref through this same validation and compare-and-swap discipline, with audit_reason policy:auto_advance; establish, rollback, scope changes, and every other non-linear move stay manual. Returns error.project_catalog_inactive while the version-1 registry is the runtime authority."
+        description = "Operator moves of one published project's accepted-publication pointer that automatic acceptance does not make. Every Ready candidate from the bound producer on the accepted scope and configured ref is accepted as it finalizes, and a project with no pointer is established by its first valid candidate from the owning producer, so this tool never accepts routine content. operation=rebind moves the pointer onto a candidate from a different producer or ref (the candidate's ref becomes the configured ref), onto a producer from an attachment binding, or establishes a project whose first candidate was refused; operation=scope_move publishes at the catalog's current scope after a scope migration, clearing the bridge; operation=rollback serves a specific earlier Ready candidate from the bound producer, scope, and ref until the next candidate finalizes. Select exactly one source: source_generation_id names a Ready remote candidate whose producer, scope, ref, commit, and lanes come from pinned immutable evidence (full_ref is refused), while attachment_id with full_ref publishes an uncovered project's attached checkout (rebind or scope_move only). The pointer is compare-and-swapped against the pointer this call read, so a concurrent acceptance refuses the move instead of being overwritten. dry_run validates and writes nothing. Requires expected_catalog_epoch and a bounded audit_reason. Returns error.project_catalog_inactive while the version-1 registry is the runtime authority."
     )]
     pub(crate) async fn bbox_project_publisher_advance(
         &self,
@@ -1857,23 +1844,12 @@ impl BlackboxServer {
         let result =
             Self::run_blocking("bbox_project_publisher_advance", move || {
                 let audit_reason = bounded_audit_reason(&p.audit_reason)?;
-                let mode = publish_mode_from_params(&p)?;
-                // The grant this call installs, revokes, or leaves alone.
-                // It is bound to the operator's own audit reason, so the
-                // pointer records WHICH operator act authorized every
-                // later policy acceptance.
-                let auto_advance_update = match p.auto_advance {
-                    None => AutoAdvanceGrantUpdate::Inherit,
-                    Some(enabled) => AutoAdvanceGrantUpdate::Set {
-                        enabled,
-                        reason: audit_reason.clone(),
-                    },
-                };
-                let receipt = match (&p.attachment_id, &p.source_generation_id) {
+                let operation = PublisherOperation::parse(&p.operation)?;
+                let (receipt, replaced) = match (&p.attachment_id, &p.source_generation_id) {
                 (Some(attachment_id), None) => {
                     if knowledge_transport_governed {
                         anyhow::bail!(
-                            "error.knowledge_transport_authoritative: covered projects may advance accepted publication only from a Ready remote candidate"
+                            "error.knowledge_transport_authoritative: covered projects move accepted publication only to a Ready remote candidate"
                         );
                     }
                     let attachment_id = parse_attachment_id(attachment_id)?;
@@ -1890,6 +1866,10 @@ impl BlackboxServer {
                         &attachment_id,
                     )
                     .map_err(|error| anyhow::anyhow!("{error}"))?;
+                    let installed = runtime
+                        .installed_pointer(&committed)
+                        .map_err(|error| anyhow::anyhow!("{error}"))?;
+                    operation.check_attachment(installed.as_ref(), &catalog_scope)?;
                     let lease = Arc::new(
                         checkout_access
                             .acquire(CheckoutAccessRequest {
@@ -1913,19 +1893,21 @@ impl BlackboxServer {
                             })
                         })
                     })?;
-                    project_catalog_admin::publish_accepted_publication(
-                        &store,
-                        runtime.as_ref(),
-                        &project_catalog_admin::PublisherPublishRequest {
-                            mode: mode.clone(),
-                            project_id: committed.clone(),
-                            attachment_id,
-                            full_ref: full_ref.to_string(),
-                            expected_epoch: p.expected_catalog_epoch,
-                            dry_run: p.dry_run,
-                            auto_advance: auto_advance_update.clone(),
-                        },
-                        probe,
+                    (
+                        project_catalog_admin::publish_accepted_publication(
+                            &store,
+                            runtime.as_ref(),
+                            &project_catalog_admin::PublisherPublishRequest {
+                                mode: publish_mode_for(installed.as_ref()),
+                                project_id: committed.clone(),
+                                attachment_id,
+                                full_ref: full_ref.to_string(),
+                                expected_epoch: p.expected_catalog_epoch,
+                                dry_run: p.dry_run,
+                            },
+                            probe,
+                        ),
+                        installed,
                     )
                 }
                 (None, Some(source_generation_id)) => {
@@ -1935,43 +1917,72 @@ impl BlackboxServer {
                              derives full_ref from immutable source evidence"
                         );
                     }
-                    // The SAME entry point the auto-advance policy calls.
-                    // Keeping one candidate-acceptance path is what makes
-                    // "policy acceptance validates identically to an
-                    // operator acceptance" structural.
-                    crate::server::publisher_auto_advance::publish_from_ready_candidate(
+                    // Catalog authority first: a denied caller learns
+                    // nothing about which candidates exist.
+                    let catalog_scope = project_catalog_admin::preflight_candidate_publish_authority(
                         &store,
-                        runtime.as_ref(),
-                        producer_auth.as_ref(),
-                        knowledge_sources.as_ref(),
-                        &committed,
-                        source_generation_id,
-                        mode.clone(),
                         p.expected_catalog_epoch,
-                        p.dry_run,
-                        auto_advance_update.clone(),
+                        &committed,
+                    )
+                    .map_err(|error| anyhow::anyhow!("{error}"))?;
+                    let installed = runtime
+                        .installed_pointer(&committed)
+                        .map_err(|error| anyhow::anyhow!("{error}"))?;
+                    let facts = {
+                        let pinned = knowledge_sources
+                            .pin_ready_publication_candidate(source_generation_id)
+                            .map_err(|error| {
+                                anyhow::anyhow!(
+                                    "error.accepted_publication_candidate_required: {error}"
+                                )
+                            })?;
+                        let candidate = pinned.candidate();
+                        CandidateFacts {
+                            source_generation_id: candidate.source_generation_id.clone(),
+                            producer_id: candidate.producer_id.clone(),
+                            scope: candidate.descriptor.scope.clone(),
+                            full_ref: candidate.descriptor.full_ref.clone(),
+                        }
+                    };
+                    operation.check_candidate(installed.as_ref(), &catalog_scope, &facts)?;
+                    // The same entry point finalize-time acceptance calls,
+                    // so an operator move validates the candidate exactly
+                    // as automatic acceptance would.
+                    (
+                        crate::server::candidate_acceptance::publish_from_ready_candidate(
+                            &store,
+                            runtime.as_ref(),
+                            producer_auth.as_ref(),
+                            knowledge_sources.as_ref(),
+                            &committed,
+                            source_generation_id,
+                            publish_mode_for(installed.as_ref()),
+                            p.expected_catalog_epoch,
+                            p.dry_run,
+                        ),
+                        installed,
                     )
                 }
                 _ => anyhow::bail!(
                     "error.accepted_publication_candidate_required: provide exactly one of \
                      attachment_id or source_generation_id"
                 ),
-            }
-            .map_err(|error| {
-                // A failure raised at or after the swap leaves the new
-                // pointer possibly installed. The caller still sees the
-                // refusal, and the daemon still has to reconverge from
-                // whatever is installed, so the flag travels out of the
-                // blocking closure beside the error.
-                if error.may_have_swapped() {
-                    swap_uncertain_inner.store(true, std::sync::atomic::Ordering::SeqCst);
-                }
-                anyhow::anyhow!("{error}")
-            })?;
+            };
+                let receipt = receipt.map_err(|error| {
+                    // A failure raised at or after the swap leaves the new
+                    // pointer possibly installed. The caller still sees the
+                    // refusal, and the daemon still has to reconverge from
+                    // whatever is installed, so the flag travels out of the
+                    // blocking closure beside the error.
+                    if error.may_have_swapped() {
+                        swap_uncertain_inner.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    anyhow::anyhow!("{error}")
+                })?;
                 tracing::info!(
                     tool = "bbox_project_publisher_advance",
                     project_id = %committed,
-                    mode = %p.mode,
+                    operation = operation.as_str(),
                     dry_run = p.dry_run,
                     generation_id = %receipt.generation_id(),
                     audit_reason = %audit_reason,
@@ -1980,19 +1991,17 @@ impl BlackboxServer {
                 Ok(serde_json::to_string_pretty(&json!({
                     "status": if receipt.is_dry_run() { "dry_run" } else { "ok" },
                     "project_id": committed.as_str(),
-                    "mode": p.mode,
+                    "operation": operation.as_str(),
                     "dry_run": receipt.is_dry_run(),
                     "generation_id": receipt.generation_id(),
                     "generation_sha256": receipt.generation_hash(),
                     "pointer_sha256": receipt.pointer_sha256(),
                     "previous_pointer_sha256": receipt.previous_pointer_sha256(),
+                    "replaced_generation_id": replaced
+                        .as_ref()
+                        .map(|installed| installed.expected_generation_id.as_str()),
                     "audit_reason": audit_reason,
                     "epoch": p.expected_catalog_epoch,
-                    "auto_advance_grant": match &auto_advance_update {
-                        AutoAdvanceGrantUpdate::Inherit => "inherited",
-                        AutoAdvanceGrantUpdate::Set { enabled: true, .. } => "granted",
-                        AutoAdvanceGrantUpdate::Set { enabled: false, .. } => "revoked",
-                    },
                 }))?)
             })
             .await;
@@ -2038,7 +2047,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_project_publisher_status",
-        description = "Read one catalog project's accepted-publication status: state, scope/ref/commit identity, typed source binding, advance availability, and the generation_id plus pointer_sha256 compare-and-swap tokens. Default health and connector sections are compact bounded summaries that keep stale, unavailable, queued, and partial signals visible with total, status, and omission counts; recorded rows are observations, not live filesystem authority. Oversized summary strings become explicit size-and-truncation markers (diagnostics keep a bounded prefix) whose exact bytes live only in detail pages. detail=health returns the complete runtime view, detail=connector the complete connector view, and detail=auto_advance the grant and latest policy attempt as exact bounded body pages; replay detail.body.next_cursor while the body is unchanged. Connector detail requires a connector-scoped project. Observational, path-free, and takes no checkout lease; see design/daemon-runtime/publisher-auto-advance.md for deep mechanics. Returns error.project_catalog_inactive while the version-1 registry is the runtime authority."
+        description = "Read one catalog project's accepted-publication status: state, scope/ref/commit identity, typed source binding, advance availability, the generation_id and pointer_sha256 identities, and the latest candidate acceptance attempt. Default health and connector sections are compact bounded summaries that keep stale, unavailable, queued, and partial signals visible with total, status, and omission counts; recorded rows are observations, not live filesystem authority. Oversized summary strings become explicit size-and-truncation markers (diagnostics keep a bounded prefix) whose exact bytes live only in detail pages. detail=health returns the complete runtime view, detail=connector the complete connector view, and detail=acceptance the latest candidate acceptance attempt as exact bounded body pages; replay detail.body.next_cursor while the body is unchanged. Connector detail requires a connector-scoped project. Observational, path-free, and takes no checkout lease; see design/daemon-runtime/publisher-auto-advance.md for deep mechanics. Returns error.project_catalog_inactive while the version-1 registry is the runtime authority."
     )]
     pub(crate) async fn bbox_project_publisher_status(
         &self,
@@ -2103,30 +2112,16 @@ impl BlackboxServer {
                 ),
                 None => (serde_json::Value::Null, serde_json::Value::Null),
             };
-            // Auto-advance state is REPORTED, never inferred by the caller:
-            // the standing grant is a pointer fact and the last attempt is
-            // the only place a policy refusal is visible without a log
-            // dive. A Ready candidate that is not serving must be able to
-            // say why (design/daemon-runtime/publisher-auto-advance.md).
-            let auto_advance_grant = runtime
-                .auto_advance_grant(&project_id)
-                .ok()
-                .flatten()
-                .map(|grant| {
-                    json!({
-                        "enabled": grant.enabled,
-                        "granted_reason": grant.granted_reason,
-                        "eligible_binding": grant.source.kind() == "producer",
-                    })
-                });
-            let auto_advance_last_attempt = server
-                .state
-                .knowledge_sources
-                .auto_advance_ledger()
-                .last_attempt(project_id.as_str());
-            let auto_advance_detail = json!({
-                "grant": auto_advance_grant,
-                "last_attempt": auto_advance_last_attempt,
+            // The last acceptance attempt is REPORTED, never inferred by the
+            // caller: it is the only place a refusal is visible without a
+            // log dive, so a Ready candidate that is not serving can say why
+            // (design/daemon-runtime/publisher-auto-advance.md).
+            let acceptance_detail = json!({
+                "last_attempt": server
+                    .state
+                    .knowledge_sources
+                    .acceptance_ledger()
+                    .last_attempt(project_id.as_str()),
             });
             let connector_detail_source = project.scope.connector().map(|scope| {
                 let file_source =
@@ -2153,11 +2148,11 @@ impl BlackboxServer {
                         p.detail_limit,
                     )?,
                 )),
-                Some(ProjectPublisherStatusDetail::AutoAdvance) => Some((
-                    "auto_advance",
+                Some(ProjectPublisherStatusDetail::Acceptance) => Some((
+                    "acceptance",
                     super::body_page::json_body_page(
-                        &format!("publisher-status:{project_id}:{}:auto_advance", state.epoch()),
-                        &auto_advance_detail,
+                        &format!("publisher-status:{project_id}:{}:acceptance", state.epoch()),
+                        &acceptance_detail,
                         p.detail_cursor.as_deref(),
                         p.detail_limit,
                     )?,
@@ -2200,9 +2195,9 @@ impl BlackboxServer {
                 "pointer_sha256": status.binding_stamp().map(|stamp| stamp.pointer_sha256()),
                 "diagnostic": status.failure().map(|failure| failure.code()),
                 "epoch": state.epoch(),
-                "auto_advance": publisher_auto_advance_summary(&auto_advance_detail),
+                "acceptance": publisher_acceptance_summary(&acceptance_detail),
                 "health": health_summary,
-                "detail_hint": "detail=health, detail=connector or detail=auto_advance returns exact bounded pages; replay detail.body.next_cursor while the body is unchanged",
+                "detail_hint": "detail=health, detail=connector or detail=acceptance returns exact bounded pages; replay detail.body.next_cursor while the body is unchanged",
             });
             if let Some((selector, body)) = detail {
                 response["detail"] = json!({"selector": selector, "body": body});
@@ -2483,42 +2478,135 @@ fn pointer_content_sha256(projects_path: &Path, project_id: &ProjectId) -> Optio
     Some(hex::encode(Sha256::digest(&bytes)))
 }
 
-/// Map the wire mode plus its optional tokens onto the typed publish mode.
-/// Establish must not carry compare-and-swap tokens and advance must carry
-/// both: a half-specified advance is a caller error, never a silent
-/// establish (D-040).
-fn publish_mode_from_params(
-    params: &ProjectPublisherAdvanceParams,
-) -> anyhow::Result<PublisherPublishMode> {
-    match params.mode.trim() {
-        "establish" => {
-            if params.expected_generation_id.is_some() || params.expected_pointer_sha256.is_some() {
+/// The operator moves `bbox_project_publisher_advance` makes. Routine
+/// acceptance is automatic, so each operation states which non-routine move
+/// the operator intends and refuses a candidate that is not that move.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublisherOperation {
+    Rebind,
+    ScopeMove,
+    Rollback,
+}
+
+/// The candidate facts an operation is checked against, read from the
+/// pinned immutable candidate.
+struct CandidateFacts {
+    source_generation_id: String,
+    producer_id: String,
+    scope: PublishedScope,
+    full_ref: String,
+}
+
+const OPERATION_MISMATCH: &str = "error.project_publisher_operation_mismatch";
+
+impl PublisherOperation {
+    fn parse(raw: &str) -> anyhow::Result<Self> {
+        match raw.trim() {
+            "rebind" => Ok(Self::Rebind),
+            "scope_move" => Ok(Self::ScopeMove),
+            "rollback" => Ok(Self::Rollback),
+            other => anyhow::bail!(
+                "{OPERATION_MISMATCH}: unknown operation {other}; use rebind, scope_move, or rollback"
+            ),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Rebind => "rebind",
+            Self::ScopeMove => "scope_move",
+            Self::Rollback => "rollback",
+        }
+    }
+
+    /// A scope move needs a pointer whose accepted scope the catalog has
+    /// moved away from; every other operation needs them to agree, so a
+    /// scope change never rides along unannounced.
+    fn check_scope(
+        self,
+        installed: Option<&InstalledAcceptedPointer>,
+        catalog_scope: &PublishedScope,
+    ) -> anyhow::Result<()> {
+        let bridged = installed.is_some_and(|pointer| &pointer.accepted_scope != catalog_scope);
+        match (self, installed, bridged) {
+            (Self::ScopeMove, None, _) => anyhow::bail!(
+                "{OPERATION_MISMATCH}: scope_move needs an accepted pointer; rebind establishes one"
+            ),
+            (Self::ScopeMove, Some(_), false) => anyhow::bail!(
+                "{OPERATION_MISMATCH}: the accepted scope already equals the catalog scope"
+            ),
+            (Self::Rebind | Self::Rollback, Some(_), true) => anyhow::bail!(
+                "{OPERATION_MISMATCH}: the catalog scope moved away from the accepted scope; \
+                 use scope_move"
+            ),
+            _ => Ok(()),
+        }
+    }
+
+    fn check_attachment(
+        self,
+        installed: Option<&InstalledAcceptedPointer>,
+        catalog_scope: &PublishedScope,
+    ) -> anyhow::Result<()> {
+        if self == Self::Rollback {
+            anyhow::bail!(
+                "{OPERATION_MISMATCH}: rollback selects an earlier Ready candidate by \
+                 source_generation_id"
+            );
+        }
+        self.check_scope(installed, catalog_scope)
+    }
+
+    fn check_candidate(
+        self,
+        installed: Option<&InstalledAcceptedPointer>,
+        catalog_scope: &PublishedScope,
+        candidate: &CandidateFacts,
+    ) -> anyhow::Result<()> {
+        self.check_scope(installed, catalog_scope)?;
+        let Some(pointer) = installed else {
+            // check_scope already refused a scope move with no pointer.
+            if self == Self::Rollback {
                 anyhow::bail!(
-                    "error.project_catalog_admin_publish_mode: establish carries no expected \
-                     pointer tokens; a project that already publishes advances instead"
+                    "{OPERATION_MISMATCH}: rollback needs an accepted pointer; rebind establishes one"
                 );
             }
-            Ok(PublisherPublishMode::Establish)
+            return Ok(());
+        };
+        let bound_producer = pointer.source.producer_id();
+        let on_bound_lane = bound_producer == Some(candidate.producer_id.as_str())
+            && pointer.full_ref == candidate.full_ref
+            && pointer.accepted_scope == candidate.scope;
+        match self {
+            Self::Rebind if on_bound_lane => anyhow::bail!(
+                "{OPERATION_MISMATCH}: the candidate is on the bound producer and configured ref, \
+                 which acceptance serves automatically; use rollback to serve a specific candidate"
+            ),
+            Self::Rollback if !on_bound_lane => anyhow::bail!(
+                "{OPERATION_MISMATCH}: rollback serves a candidate from the bound producer, scope, \
+                 and configured ref; use rebind to change them"
+            ),
+            Self::Rollback
+                if pointer.source.source_generation_id()
+                    == Some(candidate.source_generation_id.as_str()) =>
+            {
+                anyhow::bail!("{OPERATION_MISMATCH}: the pointer already serves this candidate")
+            }
+            _ => Ok(()),
         }
-        "advance" => {
-            let (Some(expected_generation_id), Some(expected_pointer_sha256)) = (
-                params.expected_generation_id.clone(),
-                params.expected_pointer_sha256.clone(),
-            ) else {
-                anyhow::bail!(
-                    "error.project_catalog_admin_publish_mode: advance requires both \
-                     expected_generation_id and expected_pointer_sha256; \
-                     bbox_project_publisher_status returns them"
-                );
-            };
-            Ok(PublisherPublishMode::Advance {
-                expected_generation_id,
-                expected_pointer_sha256,
-            })
-        }
-        other => anyhow::bail!(
-            "error.project_catalog_admin_publish_mode: unknown mode {other}; use establish or advance"
-        ),
+    }
+}
+
+/// Establish when no pointer exists, otherwise advance against the tokens
+/// of the pointer the operation was checked against. A move that lands
+/// between that read and the swap refuses as a pointer conflict.
+fn publish_mode_for(installed: Option<&InstalledAcceptedPointer>) -> PublisherPublishMode {
+    match installed {
+        None => PublisherPublishMode::Establish,
+        Some(pointer) => PublisherPublishMode::Advance {
+            expected_generation_id: pointer.expected_generation_id.clone(),
+            expected_pointer_sha256: pointer.expected_pointer_sha256.clone(),
+        },
     }
 }
 
@@ -2998,17 +3086,18 @@ impl BlackboxServer {
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
+    use crate::server::candidate_acceptance::AcceptanceOutcome;
     use crate::server::state::SharedState;
 
     #[test]
-    fn auto_advance_summary_preserves_cas_ids_and_never_prefixes_oversized_selectors() {
+    fn acceptance_summary_preserves_ids_and_never_prefixes_oversized_selectors() {
         let generation = format!("kps_{}", "a".repeat(64));
         let value = json!({"source_generation_id":generation,
             "expected_generation_id":format!("generation_{}", "b".repeat(64)),
             "expected_pointer_sha256":"c".repeat(64),
             "full_ref":format!("refs/heads/{}", "d".repeat(120)),
             "producer_id":"界".repeat(1000), "detail":"diagnostic".repeat(100)});
-        let summary = publisher_auto_advance_summary(&value);
+        let summary = publisher_acceptance_summary(&value);
         for key in [
             "source_generation_id",
             "expected_generation_id",
@@ -3019,7 +3108,7 @@ mod tests {
         }
         assert_eq!(summary["producer_id"]["omitted"], true);
         assert!(summary["producer_id"].get("text").is_none());
-        assert_eq!(summary["producer_id"]["detail"], "auto_advance");
+        assert_eq!(summary["producer_id"]["detail"], "acceptance");
         assert_eq!(summary["detail"]["truncated"], true);
     }
 
@@ -3035,7 +3124,7 @@ mod tests {
                 ..Default::default()
             },
             ProjectPublisherStatusParams {
-                detail: Some(ProjectPublisherStatusDetail::AutoAdvance),
+                detail: Some(ProjectPublisherStatusDetail::Acceptance),
                 detail_limit: Some(3),
                 ..Default::default()
             },
@@ -3045,18 +3134,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn publisher_policy_refusal_is_bounded_and_exactly_recoverable() {
-        use crate::server::publisher_auto_advance::{AutoAdvanceAttempt, AutoAdvanceOutcome};
+    async fn acceptance_refusal_is_bounded_and_exactly_recoverable() {
+        use crate::server::candidate_acceptance::{AcceptanceAttempt, AcceptanceOutcome};
         let (fixture, _, _) = publisher_health_fixture("p_status_policy", 1);
         let server = fixture.server();
-        let ledger = server.state.knowledge_sources.auto_advance_ledger();
+        let ledger = server.state.knowledge_sources.acceptance_ledger();
         let detail = "escaped-\"\n诊断".repeat(5000);
         ledger.record(
             "p_status_policy",
-            AutoAdvanceAttempt {
+            AcceptanceAttempt {
                 source_generation_id: "source-a".into(),
                 producer_id: "producer-a".into(),
-                outcome: AutoAdvanceOutcome::Refused {
+                outcome: AcceptanceOutcome::Refused {
                     code: "error.refused".into(),
                     detail: detail.clone(),
                     may_have_swapped: true,
@@ -3076,17 +3165,18 @@ mod tests {
         );
         let value: serde_json::Value = serde_json::from_str(&error_text(&summary)).unwrap();
         assert_eq!(
-            value["auto_advance"]["last_attempt"]["may_have_swapped"],
+            value["acceptance"]["last_attempt"]["may_have_swapped"],
             true
         );
         assert_eq!(
-            value["auto_advance"]["last_attempt"]["detail"]["truncated"],
+            value["acceptance"]["last_attempt"]["detail"]["truncated"],
             true
         );
+        assert!(value.get("auto_advance").is_none(), "no grant is reported");
         let full = page_publisher_status_detail(
             &server,
             "p_status_policy",
-            ProjectPublisherStatusDetail::AutoAdvance,
+            ProjectPublisherStatusDetail::Acceptance,
         )
         .await;
         let recovered: serde_json::Value = serde_json::from_str(&full).unwrap();
@@ -3094,7 +3184,7 @@ mod tests {
         let first = server
             .bbox_project_publisher_status(Parameters(ProjectPublisherStatusParams {
                 project_id: "p_status_policy".into(),
-                detail: Some(ProjectPublisherStatusDetail::AutoAdvance),
+                detail: Some(ProjectPublisherStatusDetail::Acceptance),
                 detail_limit: Some(128),
                 ..Default::default()
             }))
@@ -3106,17 +3196,17 @@ mod tests {
             .to_owned();
         ledger.record(
             "p_status_policy",
-            AutoAdvanceAttempt {
+            AcceptanceAttempt {
                 source_generation_id: "source-b".into(),
                 producer_id: "producer-a".into(),
-                outcome: AutoAdvanceOutcome::PolicyDisabled,
+                outcome: AcceptanceOutcome::RefChanged,
                 at_unix_secs: 43,
             },
         );
         let stale = server
             .bbox_project_publisher_status(Parameters(ProjectPublisherStatusParams {
                 project_id: "p_status_policy".into(),
-                detail: Some(ProjectPublisherStatusDetail::AutoAdvance),
+                detail: Some(ProjectPublisherStatusDetail::Acceptance),
                 detail_cursor: Some(cursor),
                 ..Default::default()
             }))
@@ -3584,42 +3674,120 @@ mod tests {
         );
     }
 
+    /// Each operation names one non-routine move and refuses a candidate
+    /// that is some other move, so routine content is never accepted by
+    /// hand and a scope change never rides along unannounced.
     #[test]
-    fn publish_mode_parsing_refuses_half_specified_requests() {
-        fn params(
-            mode: &str,
-            generation: Option<&str>,
-            pointer: Option<&str>,
-        ) -> ProjectPublisherAdvanceParams {
-            ProjectPublisherAdvanceParams {
-                project_id: "p_00000000000000000000000000000000".into(),
-                attachment_id: Some("att_00000000000000000000000000000000".into()),
-                source_generation_id: None,
-                mode: mode.into(),
-                full_ref: Some("refs/heads/main".into()),
-                expected_generation_id: generation.map(str::to_owned),
-                expected_pointer_sha256: pointer.map(str::to_owned),
-                auto_advance: None,
-                dry_run: false,
-                expected_catalog_epoch: 1,
-                audit_reason: "mode parsing".into(),
-            }
-        }
+    fn publisher_operations_refuse_the_moves_they_do_not_name() {
+        use bbox_indexing::accepted_publication_runtime::AcceptedPublicationSourceBinding;
+
+        let scope = PublishedScope::try_new("repo_ops", ".").unwrap();
+        let moved_scope = PublishedScope::try_new("repo_ops", "moved").unwrap();
+        let pointer = InstalledAcceptedPointer {
+            expected_generation_id: "a".repeat(64),
+            expected_pointer_sha256: "b".repeat(64),
+            accepted_scope: scope.clone(),
+            full_ref: "refs/heads/main".into(),
+            source: AcceptedPublicationSourceBinding::Producer {
+                producer_id: "producer-a".into(),
+                source_generation_id: "kps_current".into(),
+                source_generation_sha256: "c".repeat(64),
+            },
+            prior_generation_id: None,
+        };
+        let candidate = |producer: &str, full_ref: &str, id: &str| CandidateFacts {
+            source_generation_id: id.into(),
+            producer_id: producer.into(),
+            scope: scope.clone(),
+            full_ref: full_ref.into(),
+        };
+        let mismatch = |result: anyhow::Result<()>| {
+            let error = result.expect_err("the operation must refuse").to_string();
+            assert!(error.starts_with(OPERATION_MISMATCH), "{error}");
+        };
+
+        assert!(PublisherOperation::parse("advance").is_err());
+        assert!(PublisherOperation::parse("establish").is_err());
+        assert_eq!(
+            PublisherOperation::parse(" rollback ").unwrap(),
+            PublisherOperation::Rollback
+        );
+
+        let rebind = PublisherOperation::Rebind;
+        rebind
+            .check_candidate(
+                None,
+                &scope,
+                &candidate("producer-a", "refs/heads/main", "kps_x"),
+            )
+            .expect("rebind establishes a project with no pointer");
+        rebind
+            .check_candidate(
+                Some(&pointer),
+                &scope,
+                &candidate("producer-a", "refs/heads/release", "kps_x"),
+            )
+            .expect("rebind changes the configured ref");
+        rebind
+            .check_candidate(
+                Some(&pointer),
+                &scope,
+                &candidate("producer-b", "refs/heads/main", "kps_x"),
+            )
+            .expect("rebind changes the producer");
+        mismatch(rebind.check_candidate(
+            Some(&pointer),
+            &scope,
+            &candidate("producer-a", "refs/heads/main", "kps_x"),
+        ));
+
+        let rollback = PublisherOperation::Rollback;
+        rollback
+            .check_candidate(
+                Some(&pointer),
+                &scope,
+                &candidate("producer-a", "refs/heads/main", "kps_older"),
+            )
+            .expect("rollback serves an earlier candidate on the bound lane");
+        mismatch(rollback.check_candidate(
+            Some(&pointer),
+            &scope,
+            &candidate("producer-a", "refs/heads/main", "kps_current"),
+        ));
+        mismatch(rollback.check_candidate(
+            Some(&pointer),
+            &scope,
+            &candidate("producer-a", "refs/heads/release", "kps_older"),
+        ));
+        mismatch(rollback.check_candidate(
+            None,
+            &scope,
+            &candidate("producer-a", "refs/heads/main", "kps_older"),
+        ));
+        mismatch(rollback.check_attachment(Some(&pointer), &scope));
+
+        let scope_move = PublisherOperation::ScopeMove;
+        mismatch(scope_move.check_attachment(Some(&pointer), &scope));
+        mismatch(scope_move.check_attachment(None, &moved_scope));
+        scope_move
+            .check_attachment(Some(&pointer), &moved_scope)
+            .expect("scope_move clears a scope-migration bridge");
+        mismatch(rebind.check_attachment(Some(&pointer), &moved_scope));
+        rebind
+            .check_attachment(Some(&pointer), &scope)
+            .expect("an uncovered project republishes from its attachment");
 
         assert!(matches!(
-            publish_mode_from_params(&params("establish", None, None)).unwrap(),
+            publish_mode_for(None),
             PublisherPublishMode::Establish
         ));
-        // Establish carries no compare-and-swap tokens (D-040): a caller
-        // that has tokens is advancing, not establishing.
-        assert!(publish_mode_from_params(&params("establish", Some("a"), None)).is_err());
-        assert!(publish_mode_from_params(&params("advance", Some("a"), None)).is_err());
-        assert!(publish_mode_from_params(&params("advance", None, Some("b"))).is_err());
-        assert!(matches!(
-            publish_mode_from_params(&params("advance", Some("a"), Some("b"))).unwrap(),
-            PublisherPublishMode::Advance { .. }
-        ));
-        assert!(publish_mode_from_params(&params("bind", None, None)).is_err());
+        assert_eq!(
+            publish_mode_for(Some(&pointer)),
+            PublisherPublishMode::Advance {
+                expected_generation_id: "a".repeat(64),
+                expected_pointer_sha256: "b".repeat(64),
+            }
+        );
     }
 
     #[tokio::test]
@@ -3699,11 +3867,8 @@ mod tests {
                     project_id: "p_00000000000000000000000000000000".into(),
                     attachment_id: Some("att_00000000000000000000000000000000".into()),
                     source_generation_id: None,
-                    mode: "establish".into(),
+                    operation: "rebind".into(),
                     full_ref: Some("refs/heads/main".into()),
-                    expected_generation_id: None,
-                    expected_pointer_sha256: None,
-                    auto_advance: None,
                     dry_run: false,
                     expected_catalog_epoch: 1,
                     audit_reason: "bridge refusal".into(),
@@ -4128,19 +4293,14 @@ mod tests {
             &[knowledge_entry("knowledge-a", "generationtwo")],
             &[],
         );
-        let runtime = server.state.accepted_publications.clone().unwrap();
-        let tokens = runtime.advance_tokens(&project_id).unwrap().unwrap();
 
         let response = server
             .bbox_project_publisher_advance(Parameters(ProjectPublisherAdvanceParams {
                 project_id: "p_dryrun".into(),
                 attachment_id: Some("att_00000000000000000000000000000d01".into()),
                 source_generation_id: None,
-                mode: "advance".into(),
+                operation: "rebind".into(),
                 full_ref: Some("refs/heads/main".into()),
-                expected_generation_id: Some(tokens.0),
-                expected_pointer_sha256: Some(tokens.1),
-                auto_advance: None,
                 dry_run: true,
                 expected_catalog_epoch: fixture.epoch(),
                 audit_reason: "dry run".into(),
@@ -4200,11 +4360,8 @@ mod tests {
                 project_id: PROJECT_ID.into(),
                 attachment_id: Some(ATTACHMENT_ID.into()),
                 source_generation_id: None,
-                mode: "establish".into(),
+                operation: "rebind".into(),
                 full_ref: Some("refs/heads/main".into()),
-                expected_generation_id: None,
-                expected_pointer_sha256: None,
-                auto_advance: None,
                 dry_run: true,
                 expected_catalog_epoch: fixture.epoch(),
                 audit_reason: "uncovered positive control".into(),
@@ -4223,11 +4380,8 @@ mod tests {
                 project_id: PROJECT_ID.into(),
                 attachment_id: Some(ATTACHMENT_ID.into()),
                 source_generation_id: None,
-                mode: "establish".into(),
+                operation: "rebind".into(),
                 full_ref: Some("refs/heads/main".into()),
-                expected_generation_id: None,
-                expected_pointer_sha256: None,
-                auto_advance: None,
                 dry_run: true,
                 expected_catalog_epoch: fixture.epoch(),
                 audit_reason: "covered refusal".into(),
@@ -4404,11 +4558,8 @@ mod tests {
                 project_id: "p_denied".into(),
                 attachment_id: Some("att_00000000000000000000000000000f01".into()),
                 source_generation_id: None,
-                mode: "establish".into(),
+                operation: "rebind".into(),
                 full_ref: Some("refs/heads/main".into()),
-                expected_generation_id: None,
-                expected_pointer_sha256: None,
-                auto_advance: None,
                 dry_run: false,
                 expected_catalog_epoch: 9_999,
                 audit_reason: "stale epoch".into(),
@@ -4422,11 +4573,8 @@ mod tests {
                 project_id: "p_denied".into(),
                 attachment_id: None,
                 source_generation_id: Some(format!("kps_{}", "1".repeat(64))),
-                mode: "establish".into(),
+                operation: "rebind".into(),
                 full_ref: None,
-                expected_generation_id: None,
-                expected_pointer_sha256: None,
-                auto_advance: None,
                 dry_run: false,
                 expected_catalog_epoch: 9_999,
                 audit_reason: "stale candidate epoch".into(),
@@ -4452,11 +4600,8 @@ mod tests {
                 project_id: "p_denied".into(),
                 attachment_id: Some("att_00000000000000000000000000000f01".into()),
                 source_generation_id: None,
-                mode: "establish".into(),
+                operation: "rebind".into(),
                 full_ref: Some("refs/heads/main".into()),
-                expected_generation_id: None,
-                expected_pointer_sha256: None,
-                auto_advance: None,
                 dry_run: false,
                 expected_catalog_epoch: epoch,
                 audit_reason: "unknown attachment".into(),
@@ -4669,11 +4814,8 @@ mod tests {
                 project_id: "p_candidate_tool".into(),
                 attachment_id: None,
                 source_generation_id: Some(source_generation_id.clone()),
-                mode: "establish".into(),
+                operation: "rebind".into(),
                 full_ref: None,
-                expected_generation_id: None,
-                expected_pointer_sha256: None,
-                auto_advance: None,
                 dry_run: false,
                 expected_catalog_epoch: epoch,
                 audit_reason: "accept remote candidate".into(),
@@ -4751,41 +4893,33 @@ mod tests {
         assert!(inspected_text.contains("record/case@2"), "{inspected_text}");
     }
 
-    // ── Auto-advance policy ─────────────────────────────────────────
+    // ── Candidate acceptance ────────────────────────────────────────
     //
     // design/daemon-runtime/publisher-auto-advance.md. These drive the
     // real HTTP-free store path: a producer grant, a real Ready candidate
     // in the knowledge-source store, and the real acceptance path.
 
-    /// Stand up a published project with a producer grant, and return the
-    /// server plus a closure that mints one Ready publication candidate.
+    /// A published project with a producer grant and an admitted
+    /// repo-knowledge attachment.
     ///
-    /// It returns the fixture too: dropping a `CatalogFixture` removes its
-    /// tempdir, so the caller must hold it for the life of the test.
-    struct AutoAdvanceFixture {
+    /// It holds the catalog fixture too: dropping a `CatalogFixture` removes
+    /// its tempdir, so the caller must hold it for the life of the test.
+    struct AcceptanceFixture {
         fixture: crate::server::state::catalog_fixture::CatalogFixture,
         server: crate::server::BlackboxServer,
         scope: bbox_corpus_core::identity::PublishedScope,
         project_id: String,
     }
 
-    impl AutoAdvanceFixture {
+    impl AcceptanceFixture {
         fn new(project_id: &str) -> Self {
-            Self::new_with_auto_publish(project_id, false)
+            Self::with_attachment(project_id, Some("main"), true)
         }
 
-        fn new_with_auto_publish(project_id: &str, auto_publish: bool) -> Self {
-            Self::new_with_auto_publish_and_attachment_branch(
-                project_id,
-                auto_publish,
-                Some("main"),
-            )
-        }
-
-        fn new_with_auto_publish_and_attachment_branch(
+        fn with_attachment(
             project_id: &str,
-            auto_publish: bool,
             attachment_branch_ref: Option<&str>,
+            repo_knowledge: bool,
         ) -> Self {
             use crate::server::state::catalog_fixture::CatalogFixture;
             use bbox_corpus_core::project_catalog::{
@@ -4819,7 +4953,7 @@ mod tests {
                             computed_repo_hint: None,
                             branch_ref: attachment_branch_ref.map(str::to_owned),
                             capabilities: AttachmentCapabilities {
-                                repo_knowledge: true,
+                                repo_knowledge,
                                 ..Default::default()
                             },
                             status: AttachmentStatus::Attached,
@@ -4831,34 +4965,43 @@ mod tests {
                 })
                 .unwrap();
             let server = fixture.server();
-            let catalog = fixture.store().snapshot().unwrap().catalog().clone();
-            server
+            let this = Self {
+                fixture,
+                server,
+                scope: scope.clone(),
+                project_id: project_id.to_string(),
+            };
+            this.grant_scope(&scope);
+            this
+        }
+
+        /// Install the producer transport grant mapping `scope` to this
+        /// project, as daemon config does.
+        fn grant_scope(&self, scope: &bbox_corpus_core::identity::PublishedScope) {
+            let catalog = self.fixture.store().snapshot().unwrap().catalog().clone();
+            self.server
                 .state
                 .code_sources
                 .install_auth_for_test(std::sync::Arc::new(
-                    crate::server::producer_auth::ProducerAuthRuntime::for_test_catalog_with_auto_publish(
+                    crate::server::producer_auth::ProducerAuthRuntime::for_test_catalog(
                         vec![(
                             bro_rpc::ServiceToken::parse("1".repeat(64)).unwrap(),
                             crate::server::producer_auth::ProducerGrant {
                                 producer_id: "producer-a".into(),
                                 projects: std::collections::BTreeMap::from([(
                                     scope.clone(),
-                                    project_id.into(),
+                                    self.project_id.clone(),
                                 )]),
                             },
                         )],
                         catalog.as_ref(),
-                        auto_publish
-                            .then(|| std::collections::BTreeSet::from(["producer-a".to_string()]))
-                            .unwrap_or_default(),
                     ),
                 ));
-            Self {
-                fixture,
-                server,
-                scope,
-                project_id: project_id.to_string(),
-            }
+        }
+
+        fn accept(&self, source_generation_id: &str) -> AcceptanceOutcome {
+            self.server
+                .accept_ready_candidate(&self.project_id, source_generation_id)
         }
 
         fn epoch(&self) -> u64 {
@@ -5294,27 +5437,43 @@ mod tests {
             .unwrap()
         }
 
-        async fn establish_from(
-            &self,
-            source_generation_id: &str,
-            auto_advance: Option<bool>,
-            audit_reason: &str,
-        ) -> CallToolResult {
+        /// Establish through the operator tool: a `rebind` on a project
+        /// with no pointer.
+        async fn establish_from(&self, source_generation_id: &str) -> CallToolResult {
+            let result = self.operate("rebind", source_generation_id).await;
+            assert_ne!(result.is_error, Some(true), "{}", error_text(&result));
+            result
+        }
+
+        async fn operate(&self, operation: &str, source_generation_id: &str) -> CallToolResult {
             self.server
                 .bbox_project_publisher_advance(Parameters(ProjectPublisherAdvanceParams {
                     project_id: self.project_id.clone(),
                     attachment_id: None,
                     source_generation_id: Some(source_generation_id.to_string()),
-                    mode: "establish".into(),
+                    operation: operation.into(),
                     full_ref: None,
-                    expected_generation_id: None,
-                    expected_pointer_sha256: None,
-                    auto_advance,
                     dry_run: false,
                     expected_catalog_epoch: self.epoch(),
-                    audit_reason: audit_reason.into(),
+                    audit_reason: format!("operator {operation}"),
                 }))
                 .await
+        }
+
+        /// Add a retired acceptance-grant object to the installed pointer,
+        /// as a pointer written by an earlier daemon carries it.
+        fn add_legacy_grant_to_pointer(&self, enabled: bool) {
+            let path = self.fixture.accepted_pointer_path(&self.project_id);
+            let mut pointer: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            pointer["auto_advance"] = json!({
+                "enabled": enabled,
+                "granted_reason": "operator grant",
+            });
+            std::fs::write(&path, serde_json::to_vec_pretty(&pointer).unwrap()).unwrap();
+            self.server.invalidate_catalog_published_content(
+                &ProjectId::parse(self.project_id.clone()).unwrap(),
+            );
         }
 
         async fn status(&self) -> serde_json::Value {
@@ -5331,34 +5490,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auto_publish_establishes_once_and_then_normal_auto_advance_continues() {
+    async fn the_first_valid_candidate_establishes_and_later_candidates_advance() {
         use crate::server::state::catalog_fixture::{COMMIT_ONE, COMMIT_TWO};
 
-        let fixture = AutoAdvanceFixture::new_with_auto_publish("p_auto_publish", true);
+        let fixture = AcceptanceFixture::new("p_accept_chain");
         let first = fixture.stage_candidate("knowledge-a", "first", COMMIT_ONE);
-        let established = fixture
-            .server
-            .attempt_publisher_auto_advance("p_auto_publish", &first);
-        assert!(established.accepted(), "{established:?}");
+        assert!(fixture.accept(&first).accepted());
 
         let after_establish = fixture.status().await;
         assert_eq!(after_establish["accepted_commit"], COMMIT_ONE);
+        assert_eq!(after_establish["full_ref"], "refs/heads/main");
         assert_eq!(
             after_establish["source_binding"]["source_generation_id"],
             first
         );
-        assert_eq!(after_establish["auto_advance"]["grant"]["enabled"], true);
+        assert!(
+            after_establish.get("auto_advance").is_none(),
+            "status reports no grant: {after_establish}"
+        );
         assert_eq!(
-            after_establish["auto_advance"]["grant"]["granted_reason"],
-            "policy:auto_publish producer=producer-a"
+            after_establish["acceptance"]["last_attempt"]["outcome"],
+            "accepted"
         );
 
         let second = fixture.stage_candidate("knowledge-a", "second", COMMIT_TWO);
-        let advanced = fixture
-            .server
-            .attempt_publisher_auto_advance("p_auto_publish", &second);
-        assert!(advanced.accepted(), "{advanced:?}");
-
+        assert!(fixture.accept(&second).accepted());
         let after_advance = fixture.status().await;
         assert_eq!(after_advance["accepted_commit"], COMMIT_TWO);
         assert_eq!(
@@ -5366,82 +5522,79 @@ mod tests {
             second
         );
         assert_eq!(
-            after_advance["auto_advance"]["grant"]["granted_reason"],
-            "policy:auto_publish producer=producer-a",
-            "normal auto-advance inherits the grant installed by auto-publish"
+            after_advance["acceptance"]["last_attempt"]["source_generation_id"],
+            second
+        );
+
+        // Exactly once. A repeated finalize of the same upload must not
+        // produce a second attempt.
+        assert_eq!(fixture.accept(&second), AcceptanceOutcome::AlreadyAttempted);
+        assert_eq!(
+            fixture.status().await["generation_id"],
+            after_advance["generation_id"]
         );
     }
 
     #[tokio::test]
-    async fn auto_publish_accepts_a_short_attachment_branch_name() {
+    async fn establish_ignores_the_checked_out_attachment_branch() {
         use crate::server::state::catalog_fixture::COMMIT_ONE;
 
-        let fixture = AutoAdvanceFixture::new_with_auto_publish_and_attachment_branch(
-            "p_auto_publish_short_branch",
-            true,
-            Some("main"),
-        );
-        let candidate = fixture.stage_candidate("knowledge-a", "first", COMMIT_ONE);
-        let outcome = fixture
-            .server
-            .attempt_publisher_auto_advance("p_auto_publish_short_branch", &candidate);
-        assert!(outcome.accepted(), "{outcome:?}");
-        assert_eq!(fixture.status().await["full_ref"], "refs/heads/main");
+        for branch in [Some("main"), Some("feature-x"), None] {
+            let fixture = AcceptanceFixture::with_attachment("p_accept_branch", branch, true);
+            let candidate = fixture.stage_candidate("knowledge-a", "first", COMMIT_ONE);
+            let outcome = fixture.accept(&candidate);
+            assert!(outcome.accepted(), "{branch:?}: {outcome:?}");
+            assert_eq!(fixture.status().await["full_ref"], "refs/heads/main");
+        }
     }
 
+    /// A pointer the operator established is advanced by the next valid
+    /// candidate with no grant anywhere.
     #[tokio::test]
-    async fn auto_publish_ignores_a_different_checked_out_attachment_branch() {
-        use crate::server::state::catalog_fixture::COMMIT_ONE;
-
-        let fixture = AutoAdvanceFixture::new_with_auto_publish_and_attachment_branch(
-            "p_auto_publish_different_branch",
-            true,
-            Some("feature-x"),
-        );
-        let candidate = fixture.stage_candidate("knowledge-a", "first", COMMIT_ONE);
-        let outcome = fixture
-            .server
-            .attempt_publisher_auto_advance("p_auto_publish_different_branch", &candidate);
-        assert!(outcome.accepted(), "{outcome:?}");
-        assert_eq!(fixture.status().await["full_ref"], "refs/heads/main");
-    }
-
-    #[tokio::test]
-    async fn auto_publish_never_reestablishes_when_a_pointer_exists() {
+    async fn an_operator_established_pointer_advances_without_any_grant() {
         use crate::server::state::catalog_fixture::{COMMIT_ONE, COMMIT_TWO};
 
-        let fixture = AutoAdvanceFixture::new_with_auto_publish("p_auto_publish_existing", true);
+        let fixture = AcceptanceFixture::new("p_accept_after_rebind");
         let first = fixture.stage_candidate("knowledge-a", "first", COMMIT_ONE);
-        let established = fixture
-            .establish_from(&first, None, "operator establishes without auto-advance")
-            .await;
-        assert_ne!(
-            established.is_error,
-            Some(true),
-            "{}",
-            error_text(&established)
-        );
-        let before = fixture.status().await;
-
+        fixture.establish_from(&first).await;
         let second = fixture.stage_candidate("knowledge-a", "second", COMMIT_TWO);
-        let outcome = fixture
-            .server
-            .attempt_publisher_auto_advance("p_auto_publish_existing", &second);
-        assert_eq!(
-            outcome,
-            crate::server::publisher_auto_advance::AutoAdvanceOutcome::PolicyDisabled
-        );
-
-        let after = fixture.status().await;
-        assert_eq!(after["generation_id"], before["generation_id"]);
-        assert_eq!(after["accepted_commit"], COMMIT_ONE);
+        assert!(fixture.accept(&second).accepted());
+        assert_eq!(fixture.status().await["accepted_commit"], COMMIT_TWO);
     }
 
+    /// A pointer written by an earlier daemon may carry a grant field,
+    /// including a disabled one. Acceptance ignores it, and the pointer it
+    /// writes no longer carries it.
     #[tokio::test]
-    async fn auto_publish_requires_the_owner_and_catalog_scope() {
+    async fn a_legacy_pointer_with_a_disabled_grant_still_accepts() {
+        use crate::server::state::catalog_fixture::{COMMIT_ONE, COMMIT_TWO};
+
+        let fixture = AcceptanceFixture::new("p_accept_legacy");
+        let first = fixture.stage_candidate("knowledge-a", "first", COMMIT_ONE);
+        fixture.establish_from(&first).await;
+        fixture.add_legacy_grant_to_pointer(false);
+        let legacy = fixture.status().await;
+        assert_eq!(legacy["accepted_state"], "current");
+        assert_eq!(legacy["accepted_commit"], COMMIT_ONE);
+
+        let second = fixture.stage_candidate("knowledge-a", "second", COMMIT_TWO);
+        assert!(fixture.accept(&second).accepted());
+        assert_eq!(fixture.status().await["accepted_commit"], COMMIT_TWO);
+        let pointer: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(fixture.fixture.accepted_pointer_path("p_accept_legacy")).unwrap(),
+        )
+        .unwrap();
+        assert!(pointer.get("auto_advance").is_none(), "{pointer}");
+    }
+
+    /// Establish still requires the owning producer, the catalog scope, and
+    /// an admitted attachment; every refusal is visible in status. (The
+    /// candidate store itself refuses a non-branch ref before Ready.)
+    #[tokio::test]
+    async fn establish_requires_the_owner_scope_branch_and_admission() {
         use crate::server::state::catalog_fixture::COMMIT_ONE;
 
-        let non_owner = AutoAdvanceFixture::new_with_auto_publish("p_auto_publish_non_owner", true);
+        let non_owner = AcceptanceFixture::new("p_accept_non_owner");
         let candidate = non_owner.stage_candidate_as_at(
             "producer-b",
             "knowledge-a",
@@ -5451,27 +5604,25 @@ mod tests {
             &non_owner.scope,
         );
         assert_eq!(
-            non_owner
-                .server
-                .attempt_publisher_auto_advance("p_auto_publish_non_owner", &candidate),
-            crate::server::publisher_auto_advance::AutoAdvanceOutcome::ProducerMismatch
+            non_owner.accept(&candidate),
+            AcceptanceOutcome::ProducerMismatch
         );
         let status = non_owner.status().await;
-        assert!(status["auto_advance"]["grant"].is_null());
+        assert!(status["generation_id"].is_null());
         assert_eq!(
-            status["auto_advance"]["last_attempt"]["outcome"], "producer_mismatch",
-            "the auto-publish failure is visible through auto-advance status"
+            status["acceptance"]["last_attempt"]["outcome"], "producer_mismatch",
+            "the refusal is visible through status"
         );
         let detail = page_publisher_status_detail(
             &non_owner.server,
-            "p_auto_publish_non_owner",
-            ProjectPublisherStatusDetail::AutoAdvance,
+            "p_accept_non_owner",
+            ProjectPublisherStatusDetail::Acceptance,
         )
         .await;
         let detail: serde_json::Value = serde_json::from_str(&detail).unwrap();
         assert_eq!(detail["last_attempt"]["outcome"], "producer_mismatch");
 
-        let changed_scope = AutoAdvanceFixture::new_with_auto_publish("p_auto_publish_scope", true);
+        let changed_scope = AcceptanceFixture::new("p_accept_scope");
         let other_scope =
             bbox_corpus_core::identity::PublishedScope::try_new("another_repo", ".").unwrap();
         let candidate = changed_scope.stage_candidate_at(
@@ -5482,11 +5633,17 @@ mod tests {
             &other_scope,
         );
         assert_eq!(
-            changed_scope
-                .server
-                .attempt_publisher_auto_advance("p_auto_publish_scope", &candidate),
-            crate::server::publisher_auto_advance::AutoAdvanceOutcome::ScopeChanged
+            changed_scope.accept(&candidate),
+            AcceptanceOutcome::ScopeChanged
         );
+
+        let unadmitted = AcceptanceFixture::with_attachment("p_accept_unadmitted", None, false);
+        let candidate = unadmitted.stage_candidate("knowledge-a", "content", COMMIT_ONE);
+        assert_eq!(
+            unadmitted.accept(&candidate),
+            AcceptanceOutcome::NoAttachedCheckout
+        );
+        assert!(unadmitted.status().await["generation_id"].is_null());
     }
 
     /// Configuration is parsed in the daemon's configuration domain before
@@ -5498,7 +5655,7 @@ mod tests {
     async fn configuration_candidates_are_parsed_before_they_can_displace_accepted_content() {
         use crate::server::state::catalog_fixture::COMMIT_ONE;
 
-        let fixture = AutoAdvanceFixture::new("p_config_publish");
+        let fixture = AcceptanceFixture::new("p_config_publish");
         let valid = br#"{"name":"reviewer","provider":"deepseek","model":"accepted"}"#;
         let first = fixture.stage_config_candidate(
             COMMIT_ONE,
@@ -5507,10 +5664,7 @@ mod tests {
                 (".bro/brofiles/reviewer.json", valid),
             ]),
         );
-        let result = fixture
-            .establish_from(&first, Some(true), "operator establishes")
-            .await;
-        assert_ne!(result.is_error, Some(true), "{}", error_text(&result));
+        fixture.establish_from(&first).await;
         let before = fixture.status().await;
         let state = &fixture.server.state;
         let accepted = state
@@ -5534,13 +5688,11 @@ mod tests {
                 br#"{"name":"reviewer","provider":"not-a-provider"}"#,
             )]),
         );
-        let outcome = fixture
-            .server
-            .attempt_publisher_auto_advance("p_config_publish", &malformed);
+        let outcome = fixture.accept(&malformed);
         match outcome {
-            crate::server::publisher_auto_advance::AutoAdvanceOutcome::Refused {
-                ref code, ..
-            } => assert_eq!(code, "error.project_config_invalid"),
+            AcceptanceOutcome::Refused { ref code, .. } => {
+                assert_eq!(code, "error.project_config_invalid")
+            }
             other => panic!("malformed configuration must be refused, got {other:?}"),
         }
         let after = fixture.status().await;
@@ -5553,14 +5705,9 @@ mod tests {
 
         let pre_lane =
             fixture.stage_config_candidate("3333333333333333333333333333333333333333", None);
-        let outcome = fixture
-            .server
-            .attempt_publisher_auto_advance("p_config_publish", &pre_lane);
+        let outcome = fixture.accept(&pre_lane);
         assert!(
-            matches!(
-                outcome,
-                crate::server::publisher_auto_advance::AutoAdvanceOutcome::Accepted { .. }
-            ),
+            matches!(outcome, AcceptanceOutcome::Accepted { .. }),
             "{outcome:?}"
         );
         let error = state
@@ -5569,156 +5716,25 @@ mod tests {
         assert_eq!(error.code(), "error.project_config_lane_unsupported");
     }
 
-    /// Default OFF. A project whose operator never granted the policy sees
-    /// a Ready candidate arrive and keeps serving the generation it was
-    /// serving before.
-    #[tokio::test]
-    async fn policy_off_leaves_a_ready_candidate_unaccepted() {
-        use crate::server::state::catalog_fixture::COMMIT_ONE;
-
-        let fixture = AutoAdvanceFixture::new("p_policy_off");
-        let first = fixture.stage_candidate("knowledge-a", "first", COMMIT_ONE);
-        let result = fixture
-            .establish_from(&first, None, "operator establishes")
-            .await;
-        assert_ne!(result.is_error, Some(true), "{}", error_text(&result));
-        let before = fixture.status().await;
-
-        let second = fixture.stage_candidate(
-            "knowledge-a",
-            "second",
-            "2222222222222222222222222222222222222222",
-        );
-        let outcome = fixture
-            .server
-            .attempt_publisher_auto_advance("p_policy_off", &second);
-        assert_eq!(
-            outcome,
-            crate::server::publisher_auto_advance::AutoAdvanceOutcome::PolicyDisabled
-        );
-
-        let after = fixture.status().await;
-        assert_eq!(
-            after["generation_id"], before["generation_id"],
-            "an ungranted project does not move its pointer"
-        );
-        assert_eq!(after["auto_advance"]["grant"]["enabled"], false);
-        assert_eq!(
-            after["auto_advance"]["last_attempt"]["outcome"],
-            "policy_disabled"
-        );
-    }
-
-    /// The activation rule. The grant is read from the CURRENTLY ACCEPTED
-    /// generation's pointer, so the operator advance that installs it does
-    /// NOT retroactively authorize itself, and the next candidate is the
-    /// first one the policy may accept.
-    #[tokio::test]
-    async fn the_grant_is_read_from_the_accepted_pointer_not_the_incoming_candidate() {
-        use crate::server::state::catalog_fixture::COMMIT_ONE;
-
-        let fixture = AutoAdvanceFixture::new("p_policy_activation");
-        let first = fixture.stage_candidate("knowledge-a", "first", COMMIT_ONE);
-        // Before any pointer exists there is nothing to read a grant from,
-        // and establish stays manual.
-        let premature = fixture
-            .server
-            .attempt_publisher_auto_advance("p_policy_activation", &first);
-        assert_eq!(
-            premature,
-            crate::server::publisher_auto_advance::AutoAdvanceOutcome::NoAcceptedPublication
-        );
-
-        let granted = fixture
-            .establish_from(&first, Some(true), "operator grants auto-advance")
-            .await;
-        assert_ne!(granted.is_error, Some(true), "{}", error_text(&granted));
-        let status = fixture.status().await;
-        assert_eq!(status["auto_advance"]["grant"]["enabled"], true);
-        assert_eq!(
-            status["auto_advance"]["grant"]["granted_reason"],
-            "operator grants auto-advance"
-        );
-        assert_eq!(status["auto_advance"]["grant"]["eligible_binding"], true);
-    }
-
-    /// Policy on: one Ready candidate from the bound producer, on the same
-    /// scope and ref, advances exactly once and stamps the policy audit
-    /// reason. A second attempt for the same candidate does nothing.
-    #[tokio::test]
-    async fn policy_on_advances_a_ready_candidate_exactly_once() {
-        use crate::server::state::catalog_fixture::{COMMIT_ONE, COMMIT_TWO};
-
-        let fixture = AutoAdvanceFixture::new("p_policy_on");
-        let first = fixture.stage_candidate("knowledge-a", "first", COMMIT_ONE);
-        fixture
-            .establish_from(&first, Some(true), "operator grants auto-advance")
-            .await;
-        let before = fixture.status().await;
-
-        let second = fixture.stage_candidate("knowledge-a", "second", COMMIT_TWO);
-        let outcome = fixture
-            .server
-            .attempt_publisher_auto_advance("p_policy_on", &second);
-        assert!(outcome.accepted(), "{outcome:?}");
-
-        let after = fixture.status().await;
-        assert_ne!(
-            after["generation_id"], before["generation_id"],
-            "the policy moved the accepted pointer"
-        );
-        assert_eq!(after["accepted_commit"], COMMIT_TWO);
-        assert_eq!(after["source_binding"]["kind"], "producer");
-        assert_eq!(after["source_binding"]["source_generation_id"], second);
-        // The grant survives the policy's own advance: a policy acceptance
-        // inherits, it does not re-grant.
-        assert_eq!(after["auto_advance"]["grant"]["enabled"], true);
-        assert_eq!(
-            after["auto_advance"]["grant"]["granted_reason"],
-            "operator grants auto-advance"
-        );
-        assert_eq!(after["auto_advance"]["last_attempt"]["outcome"], "accepted");
-        assert_eq!(
-            after["auto_advance"]["last_attempt"]["source_generation_id"],
-            second
-        );
-
-        // Exactly once. A repeated finalize of the same upload must not
-        // produce a second attempt.
-        let repeat = fixture
-            .server
-            .attempt_publisher_auto_advance("p_policy_on", &second);
-        assert_eq!(
-            repeat,
-            crate::server::publisher_auto_advance::AutoAdvanceOutcome::AlreadyAttempted
-        );
-        let unchanged = fixture.status().await;
-        assert_eq!(unchanged["generation_id"], after["generation_id"]);
-    }
-
-    /// A policy acceptance leaves the published graph view naming the
+    /// An acceptance leaves the published graph view naming the
     /// generation it just accepted.
     ///
     /// Graph reads have no rebuild-on-read, so this is the only moment the
     /// view can be corrected without a restart. The regression this pins
-    /// is a policy acceptance whose pointer moved while the read surface
+    /// is an acceptance whose pointer moved while the read surface
     /// kept answering from the previous generation.
     #[tokio::test]
-    async fn policy_acceptance_moves_the_published_graph_view_with_the_pointer() {
+    async fn acceptance_moves_the_published_graph_view_with_the_pointer() {
         use crate::server::state::catalog_fixture::{COMMIT_ONE, COMMIT_TWO};
 
-        let fixture = AutoAdvanceFixture::new("p_policy_graphview");
+        let fixture = AcceptanceFixture::new("p_policy_graphview");
         let first = fixture.stage_graph_candidate("knowledge-a", "first", COMMIT_ONE);
-        fixture
-            .establish_from(&first, Some(true), "operator grants auto-advance")
-            .await;
+        fixture.establish_from(&first).await;
         let established = fixture.served_graph_generation();
         assert_eq!(established["accepted_commit"], COMMIT_ONE);
 
         let second = fixture.stage_graph_candidate("knowledge-a", "second", COMMIT_TWO);
-        let outcome = fixture
-            .server
-            .attempt_publisher_auto_advance("p_policy_graphview", &second);
+        let outcome = fixture.accept(&second);
         assert!(outcome.accepted(), "{outcome:?}");
 
         let status = fixture.status().await;
@@ -5749,12 +5765,10 @@ mod tests {
         use crate::server::state::catalog_fixture::{COMMIT_ONE, COMMIT_TWO};
         use bbox_corpus_core::project_catalog::ProjectId;
 
-        let fixture = AutoAdvanceFixture::new("p_policy_inflight");
+        let fixture = AcceptanceFixture::new("p_policy_inflight");
         let project_id = ProjectId::parse("p_policy_inflight".to_string()).unwrap();
         let first = fixture.stage_graph_candidate("knowledge-a", "first", COMMIT_ONE);
-        fixture
-            .establish_from(&first, Some(true), "operator grants auto-advance")
-            .await;
+        fixture.establish_from(&first).await;
         // Exactly what a slow caller is holding: the view it built from the
         // accepted content it resolved before the acceptance landed.
         let in_flight = fixture
@@ -5767,12 +5781,7 @@ mod tests {
             .expect("the establish installed a published view");
 
         let second = fixture.stage_graph_candidate("knowledge-a", "second", COMMIT_TWO);
-        assert!(
-            fixture
-                .server
-                .attempt_publisher_auto_advance("p_policy_inflight", &second)
-                .accepted()
-        );
+        assert!(fixture.accept(&second).accepted());
         let accepted = fixture.served_graph_generation();
         assert_eq!(accepted["accepted_commit"], COMMIT_TWO);
 
@@ -5804,18 +5813,11 @@ mod tests {
         use crate::server::state::catalog_fixture::{COMMIT_ONE, COMMIT_TWO};
         use bbox_corpus_core::project_catalog::ProjectId;
 
-        let fixture = AutoAdvanceFixture::new("p_policy_priorarm");
+        let fixture = AcceptanceFixture::new("p_policy_priorarm");
         let first = fixture.stage_graph_candidate("knowledge-a", "first", COMMIT_ONE);
-        fixture
-            .establish_from(&first, Some(true), "operator grants auto-advance")
-            .await;
+        fixture.establish_from(&first).await;
         let second = fixture.stage_graph_candidate("knowledge-a", "second", COMMIT_TWO);
-        assert!(
-            fixture
-                .server
-                .attempt_publisher_auto_advance("p_policy_priorarm", &second)
-                .accepted()
-        );
+        assert!(fixture.accept(&second).accepted());
         let accepted = fixture.served_graph_generation();
         assert_eq!(accepted["accepted_commit"], COMMIT_TWO);
 
@@ -5842,37 +5844,18 @@ mod tests {
         );
     }
 
-    /// The policy audit trail names the policy, the producer, and the
-    /// source generation, so a policy acceptance is distinguishable from
-    /// an operator one after the fact.
+    /// A candidate on another ref is valid content but changes the
+    /// configured ref, so it waits for an operator rebind; after the rebind
+    /// the new ref is the configured ref and its candidates are accepted.
     #[tokio::test]
-    async fn a_policy_acceptance_stamps_a_policy_audit_reason() {
-        use crate::server::publisher_auto_advance::policy_audit_reason;
-
-        let reason = policy_audit_reason("producer-a", "kps_example");
-        assert_eq!(
-            reason,
-            "policy:auto_advance producer=producer-a source=kps_example"
-        );
-    }
-
-    /// A candidate the acceptance path refuses leaves the prior accepted
-    /// generation serving, and the refusal is observable rather than
-    /// silent. Here the candidate is from a producer the accepted pointer
-    /// is not bound to.
-    #[tokio::test]
-    async fn a_candidate_the_policy_refuses_leaves_the_pointer_untouched() {
+    async fn a_candidate_on_another_ref_waits_for_an_operator_rebind() {
         use crate::server::state::catalog_fixture::{COMMIT_ONE, COMMIT_TWO};
 
-        let fixture = AutoAdvanceFixture::new("p_policy_refused");
+        let fixture = AcceptanceFixture::new("p_accept_rebind");
         let first = fixture.stage_candidate("knowledge-a", "first", COMMIT_ONE);
-        fixture
-            .establish_from(&first, Some(true), "operator grants auto-advance")
-            .await;
+        assert!(fixture.accept(&first).accepted());
         let before = fixture.status().await;
 
-        // A candidate on a different published ref is not the linear fast
-        // path this policy covers.
         let moved = fixture.stage_candidate_at(
             "knowledge-a",
             "second",
@@ -5880,24 +5863,165 @@ mod tests {
             "refs/heads/release",
             &fixture.scope,
         );
-        let outcome = fixture
-            .server
-            .attempt_publisher_auto_advance("p_policy_refused", &moved);
-        assert_eq!(
-            outcome,
-            crate::server::publisher_auto_advance::AutoAdvanceOutcome::RefChanged
-        );
-
+        assert_eq!(fixture.accept(&moved), AcceptanceOutcome::RefChanged);
         let after = fixture.status().await;
         assert_eq!(
             after["generation_id"], before["generation_id"],
             "a refused candidate must not move the pointer"
         );
-        assert_eq!(after["accepted_commit"], COMMIT_ONE);
         assert_eq!(
-            after["auto_advance"]["last_attempt"]["outcome"], "ref_changed",
-            "the refusal is surfaced in status, not only logged"
+            after["acceptance"]["last_attempt"]["outcome"],
+            "ref_changed"
         );
+
+        // Rollback cannot change the ref, and a candidate on the bound lane
+        // is not a rebind.
+        let refused = fixture.operate("rollback", &moved).await;
+        assert!(
+            error_text(&refused).contains("error.project_publisher_operation_mismatch"),
+            "{}",
+            error_text(&refused)
+        );
+        let rebound = fixture.operate("rebind", &moved).await;
+        assert_ne!(rebound.is_error, Some(true), "{}", error_text(&rebound));
+        let body: serde_json::Value = serde_json::from_str(&error_text(&rebound)).unwrap();
+        assert_eq!(body["operation"], "rebind");
+        assert_eq!(body["replaced_generation_id"], before["generation_id"]);
+        assert_eq!(fixture.status().await["full_ref"], "refs/heads/release");
+
+        let next = fixture.stage_candidate_at(
+            "knowledge-a",
+            "third",
+            "3333333333333333333333333333333333333333",
+            "refs/heads/release",
+            &fixture.scope,
+        );
+        assert!(fixture.accept(&next).accepted());
+        let routine = fixture.stage_candidate_at(
+            "knowledge-a",
+            "fourth",
+            "4444444444444444444444444444444444444444",
+            "refs/heads/release",
+            &fixture.scope,
+        );
+        let refused = fixture.operate("rebind", &routine).await;
+        assert!(
+            error_text(&refused).contains("error.project_publisher_operation_mismatch"),
+            "routine content is never accepted by hand: {}",
+            error_text(&refused)
+        );
+    }
+
+    /// Rollback serves an earlier candidate from the bound lane until the
+    /// next candidate finalizes, which is accepted as usual.
+    #[tokio::test]
+    async fn rollback_serves_an_earlier_candidate_until_the_next_one_arrives() {
+        use crate::server::state::catalog_fixture::{COMMIT_ONE, COMMIT_TWO};
+
+        let fixture = AcceptanceFixture::new("p_accept_rollback");
+        let first = fixture.stage_candidate("knowledge-a", "first", COMMIT_ONE);
+        assert!(fixture.accept(&first).accepted());
+        let second = fixture.stage_candidate("knowledge-a", "second", COMMIT_TWO);
+        assert!(fixture.accept(&second).accepted());
+
+        let already = fixture.operate("rollback", &second).await;
+        assert!(
+            error_text(&already).contains("error.project_publisher_operation_mismatch"),
+            "{}",
+            error_text(&already)
+        );
+        let rolled_back = fixture.operate("rollback", &first).await;
+        assert_ne!(
+            rolled_back.is_error,
+            Some(true),
+            "{}",
+            error_text(&rolled_back)
+        );
+        let status = fixture.status().await;
+        assert_eq!(status["accepted_commit"], COMMIT_ONE);
+        assert_eq!(status["source_binding"]["source_generation_id"], first);
+
+        let third = fixture.stage_candidate(
+            "knowledge-a",
+            "third",
+            "3333333333333333333333333333333333333333",
+        );
+        assert!(fixture.accept(&third).accepted());
+        assert_eq!(
+            fixture.status().await["accepted_commit"],
+            "3333333333333333333333333333333333333333"
+        );
+    }
+
+    /// After a catalog scope migration, candidates at the new scope wait
+    /// for the operator's scope move, which clears the bridge; later
+    /// candidates at the new scope are accepted.
+    #[tokio::test]
+    async fn scope_move_clears_the_bridge_and_acceptance_resumes() {
+        use crate::server::state::catalog_fixture::{COMMIT_ONE, COMMIT_TWO};
+
+        let mut fixture = AcceptanceFixture::new("p_accept_scope_move");
+        let first = fixture.stage_candidate("knowledge-a", "first", COMMIT_ONE);
+        assert!(fixture.accept(&first).accepted());
+
+        let moved_scope =
+            bbox_corpus_core::identity::PublishedScope::try_new("moved_repo", ".").unwrap();
+        // The catalog and its attachment move to the new scope together;
+        // the accepted pointer stays at the old one, which is the bridge.
+        let epoch = fixture.epoch();
+        fixture
+            .fixture
+            .store()
+            .transact(epoch, |catalog, attachments| {
+                let project_id = ProjectId::parse("p_accept_scope_move").unwrap();
+                catalog.projects.get_mut(&project_id).unwrap().scope =
+                    ProjectScope::Published(moved_scope.clone());
+                for attachment in attachments.attachments.values_mut() {
+                    attachment.validated_scope = Some(moved_scope.clone());
+                }
+                Ok(())
+            })
+            .unwrap();
+        // A restart over the same durable state picks up the migrated
+        // catalog; the producer grant follows the scope.
+        fixture.server = fixture.fixture.server();
+        fixture.grant_scope(&moved_scope);
+        let at_new_scope = fixture.stage_candidate_at(
+            "knowledge-a",
+            "second",
+            COMMIT_TWO,
+            "refs/heads/main",
+            &moved_scope,
+        );
+        assert_eq!(
+            fixture.accept(&at_new_scope),
+            AcceptanceOutcome::ScopeChanged
+        );
+        assert_eq!(
+            fixture.status().await["scope_agreement"],
+            "scope_refresh_required"
+        );
+
+        let refused = fixture.operate("rebind", &at_new_scope).await;
+        assert!(
+            error_text(&refused).contains("use scope_move"),
+            "{}",
+            error_text(&refused)
+        );
+        let moved = fixture.operate("scope_move", &at_new_scope).await;
+        assert_ne!(moved.is_error, Some(true), "{}", error_text(&moved));
+        let status = fixture.status().await;
+        assert_eq!(status["accepted_commit"], COMMIT_TWO);
+        assert_eq!(status["scope_agreement"], "agreed");
+
+        let third = fixture.stage_candidate_at(
+            "knowledge-a",
+            "third",
+            "3333333333333333333333333333333333333333",
+            "refs/heads/main",
+            &moved_scope,
+        );
+        assert!(fixture.accept(&third).accepted());
     }
 
     /// A candidate the ACCEPTANCE PATH itself refuses is reported with the
@@ -5906,20 +6030,15 @@ mod tests {
     async fn an_acceptance_path_refusal_surfaces_its_own_error_code() {
         use crate::server::state::catalog_fixture::COMMIT_ONE;
 
-        let fixture = AutoAdvanceFixture::new("p_policy_stale");
+        let fixture = AcceptanceFixture::new("p_accept_stale");
         let first = fixture.stage_candidate("knowledge-a", "first", COMMIT_ONE);
-        fixture
-            .establish_from(&first, Some(true), "operator grants auto-advance")
-            .await;
+        fixture.establish_from(&first).await;
         let before = fixture.status().await;
 
         // A generation id that names no candidate: the acceptance path
         // refuses at candidate selection.
-        let outcome = fixture
-            .server
-            .attempt_publisher_auto_advance("p_policy_stale", &format!("kps_{}", "9".repeat(64)));
-        let crate::server::publisher_auto_advance::AutoAdvanceOutcome::Refused { code, .. } =
-            outcome
+        let AcceptanceOutcome::Refused { code, .. } =
+            fixture.accept(&format!("kps_{}", "9".repeat(64)))
         else {
             panic!("expected a refusal");
         };
@@ -5928,7 +6047,7 @@ mod tests {
         let after = fixture.status().await;
         assert_eq!(after["generation_id"], before["generation_id"]);
         assert_eq!(
-            after["auto_advance"]["last_attempt"]["code"],
+            after["acceptance"]["last_attempt"]["code"],
             "error.accepted_publication_candidate_required"
         );
     }
@@ -6814,7 +6933,6 @@ mod tests {
                     full_ref: "refs/heads/main".into(),
                     accepted_commit: COMMIT_ONE.into(),
                     dry_run: false,
-                    auto_advance: AutoAdvanceGrantUpdate::Inherit,
                 },
                 PublishSources {
                     knowledge: vec![PublishSourceFile {

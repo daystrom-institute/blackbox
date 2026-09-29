@@ -35,7 +35,7 @@ its port is already serving.
 | Daemon boot | throwaway `blackboxd` binds its port under a fully isolated environment |
 | Producer onboarding | `bbox-code-collector` probes the checkout and onboards it over the authenticated producer channel; the catalog gains the project, a live attachment, and the checkout identity marker |
 | Committed candidate | the collector captures the committed `.bbox/knowledge`, `.bbox/gaps`, and `.bbox/graphs` lanes at a real HEAD and drives the publication candidate to Ready |
-| Acceptance | `bbox_project_publisher_advance` in candidate mode runs the daemon-side merge gate and establishes the accepted pointer; the graph views are populated by that call, with no restart |
+| Acceptance | the daemon accepts the Ready candidate as it finalizes, running the daemon-side merge gate and establishing the accepted pointer; `bbox_project_publisher_status` names the candidate, and the graph views are populated by that acceptance, with no restart |
 | Published reads | `bbox_project_graph_list` / `_describe` / `_validate` report the accepted generation, its committed descriptor and schema, and a clean validation |
 | Published traversal | `bbox_inspect_entity` on a `project_graph_vertex` ref, `bbox_find_paths` across a `gov:CITES` edge from a claim to its evidence, and `bbox_bundle_evidence` over the vertex and the returned path id |
 | Binding mint | `bro workspace-binding mint` mints a workspace binding for the onboarded checkout, installs it `0600` in `.bbox/local`, and the file's scope survives being sourced by a shell |
@@ -65,7 +65,7 @@ overlay pair, so a cold own-visibility graph read answered from the published
 lane, and a read after a second capture answered from the previous provisional
 generation. A finalized capture now installs that workspace's provisional graph
 views at the finalize chokepoint, the mirror of what
-`bbox_project_publisher_advance` does for the published lane through
+candidate acceptance does for the published lane through
 `refresh_published_graph_views`, with the same degrade-warn tolerance. The
 exercise reads the own lane cold, before any knowledge or gap own read, and
 asserts it already serves the captured generation

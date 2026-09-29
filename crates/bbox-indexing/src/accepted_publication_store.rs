@@ -605,23 +605,25 @@ pub(crate) struct AcceptedPublicationPriorPointerV1 {
     pub(crate) generation_hash: PublicationSha256,
 }
 
-/// The operator's standing grant for policy-driven acceptance, carried by
-/// the pointer that the operator installed (`publisher-auto-advance.md`).
+/// A pointer field this store no longer writes, accepted on read so pointers
+/// written by earlier daemons keep decoding.
 ///
-/// It lives on the mutable pointer rather than in accepted CONTENT because
-/// the grant is an operator fact about a project, not a producer-attested
-/// fact about a commit. A producer supplies candidate bytes; it never
-/// supplies this. The field is additive and optional, so every pointer
-/// written before the feature decodes and re-encodes byte-identically and
-/// keeps its compare-and-swap digest.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct AcceptedPublicationAutoAdvanceV1 {
-    pub(crate) enabled: bool,
-    /// The `audit_reason` of the operator advance that installed this
-    /// grant, retained so audit history can name the human act that
-    /// authorized every later policy acceptance.
-    pub(crate) granted_reason: String,
+/// A pointer may carry a legacy `auto_advance` acceptance-grant object.
+/// Acceptance never consults a grant, so the value is parsed only far enough
+/// to be skipped and is never re-emitted. A legacy pointer keeps its
+/// installed bytes, and therefore its `pointer_sha256`, until the next
+/// publish replaces it with a pointer that omits the field.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RetiredPointerFieldV1;
+
+impl<'de> Deserialize<'de> for RetiredPointerFieldV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        serde::de::IgnoredAny::deserialize(deserializer)?;
+        Ok(Self)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -638,8 +640,9 @@ pub(crate) struct AcceptedPublicationPointerV1 {
     pub(crate) accepted_scope: PublishedScope,
     pub(crate) accepted_generation: AcceptedPublicationGenerationId,
     pub(crate) generation_hash: PublicationSha256,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) auto_advance: Option<AcceptedPublicationAutoAdvanceV1>,
+    /// Legacy acceptance-grant field: decoded and ignored, never written.
+    #[serde(default, rename = "auto_advance", skip_serializing)]
+    pub(crate) retired_auto_advance: RetiredPointerFieldV1,
     pub(crate) prior_pointer: Option<AcceptedPublicationPriorPointerV1>,
 }
 
@@ -668,10 +671,6 @@ pub(crate) struct AcceptedPublicationBuildInputV1 {
     pub(crate) evidence: Vec<AcceptedEvidenceSourceV1Input>,
     /// `None` when the candidate carries no configuration lane.
     pub(crate) config: Option<Vec<AcceptedConfigSourceV1Input>>,
-    /// The auto-advance grant this pointer will carry. The runtime resolves
-    /// it from the installed pointer plus the caller's explicit operator
-    /// update before it gets here; the builder only writes what it is told.
-    pub(crate) auto_advance: Option<AcceptedPublicationAutoAdvanceV1>,
     pub(crate) prior_pointer: Option<AcceptedPublicationPriorPointerV1>,
 }
 
@@ -1729,7 +1728,7 @@ pub(crate) fn prepare_accepted_publication_v1(
         accepted_scope: input.scope,
         accepted_generation: generation_id.clone(),
         generation_hash: generation_hash.clone(),
-        auto_advance: input.auto_advance,
+        retired_auto_advance: RetiredPointerFieldV1,
         prior_pointer: input.prior_pointer,
     };
     validate_pointer_v1(&pointer)?;
@@ -2278,39 +2277,10 @@ fn validate_prior_pointer_v1(
         .map_err(|error| invalid_pointer(error.to_string()))
 }
 
-/// Longest `granted_reason` a pointer may carry. It mirrors the catalog's
-/// own bounded audit reason, because the value IS one: the audit reason of
-/// the operator advance that installed the grant.
-pub(crate) const MAX_AUTO_ADVANCE_REASON_BYTES: usize = 1024;
-
-fn validate_auto_advance_v1(
-    policy: &AcceptedPublicationAutoAdvanceV1,
-) -> AcceptedPublicationStoreResult<()> {
-    if policy.granted_reason.trim().is_empty() {
-        return Err(invalid_pointer(
-            "an auto-advance grant must record the operator audit reason that installed it",
-        ));
-    }
-    if policy.granted_reason.len() > MAX_AUTO_ADVANCE_REASON_BYTES {
-        return Err(invalid_pointer(
-            "auto-advance granted_reason exceeds the bounded audit-reason length",
-        ));
-    }
-    if policy.granted_reason.chars().any(char::is_control) {
-        return Err(invalid_pointer(
-            "auto-advance granted_reason must not contain control characters",
-        ));
-    }
-    Ok(())
-}
-
 fn validate_pointer_v1(
     pointer: &AcceptedPublicationPointerV1,
 ) -> AcceptedPublicationStoreResult<()> {
     pointer_source_binding(pointer)?;
-    if let Some(policy) = &pointer.auto_advance {
-        validate_auto_advance_v1(policy)?;
-    }
     pointer
         .accepted_scope
         .validate()
@@ -3152,10 +3122,6 @@ pub(crate) mod fixtures {
             graphs: Vec::new(),
             evidence: Vec::new(),
             config: None,
-            // The shared fixture stays grant-free. A test that wants the
-            // auto-advance policy installs the grant explicitly, so no
-            // fixture consumer silently inherits one.
-            auto_advance: None,
             prior_pointer,
         };
         prepare_accepted_publication_v1(input, &AcceptedPublicationLimits::default()).unwrap()
@@ -3306,7 +3272,6 @@ mod tests {
             graphs: Vec::new(),
             evidence: Vec::new(),
             config: None,
-            auto_advance: None,
             prior_pointer: None,
         }
     }
@@ -3958,73 +3923,62 @@ mod tests {
         );
     }
 
-    /// The grant is additive: a pointer without one serializes exactly the
-    /// bytes it serialized before the field existed, so every project that
-    /// never enables the policy keeps its compare-and-swap digest.
+    /// New pointers never carry an acceptance grant.
     #[test]
-    fn a_pointer_without_an_auto_advance_grant_omits_the_field_entirely() {
+    fn a_new_pointer_omits_the_retired_grant_field() {
         let prepared = prepared();
         let value = serde_json::to_value(&prepared.pointer).unwrap();
         assert!(
             value.get("auto_advance").is_none(),
-            "the absent grant must not appear in pointer bytes: {value}"
+            "a retired field must not appear in pointer bytes: {value}"
         );
     }
 
+    /// A pointer installed by an earlier daemon may still carry an
+    /// `auto_advance` grant object, including shapes the old validator would
+    /// have refused. It decodes, the grant is ignored, and re-encoding drops
+    /// the field.
     #[test]
-    fn an_auto_advance_grant_round_trips_through_pointer_bytes() {
-        let mut input = build_input();
-        input.auto_advance = Some(AcceptedPublicationAutoAdvanceV1 {
-            enabled: true,
-            granted_reason: "operator grant for the producer lane".to_string(),
-        });
-        let prepared =
-            prepare_accepted_publication_v1(input, &AcceptedPublicationLimits::default()).unwrap();
-        let decoded = decode_pointer_v1(
-            &prepared.pointer_bytes,
-            &AcceptedPublicationLimits::default(),
-        )
-        .unwrap();
-        let grant = decoded
-            .auto_advance
-            .as_ref()
-            .expect("the grant survives a round trip");
-        assert!(grant.enabled);
-        assert_eq!(grant.granted_reason, "operator grant for the producer lane");
-        // Re-encoding the WHOLE decoded pointer is the point: the grant has
-        // to survive the round trip in place, not merely be readable, so
-        // `decoded` must still be intact here.
-        assert_eq!(
-            encode_pointer_v1(&decoded, &AcceptedPublicationLimits::default()).unwrap(),
-            prepared.pointer_bytes
-        );
+    fn a_legacy_pointer_carrying_a_grant_field_decodes_and_ignores_it() {
+        let prepared = prepared();
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&prepared.pointer_bytes).unwrap();
+        for grant in [
+            serde_json::json!({"enabled": true, "granted_reason": "operator grant"}),
+            serde_json::json!({"enabled": false, "granted_reason": "   "}),
+            serde_json::Value::Null,
+        ] {
+            legacy
+                .as_object_mut()
+                .unwrap()
+                .insert("auto_advance".into(), grant.clone());
+            let bytes = serde_json::to_vec(&legacy).unwrap();
+            let decoded = decode_pointer_v1(&bytes, &AcceptedPublicationLimits::default())
+                .unwrap_or_else(|error| panic!("legacy grant {grant} must decode: {error}"));
+            assert_eq!(
+                decoded.accepted_generation,
+                prepared.pointer.accepted_generation
+            );
+            assert_eq!(
+                encode_pointer_v1(&decoded, &AcceptedPublicationLimits::default()).unwrap(),
+                prepared.pointer_bytes,
+                "re-encoding drops the retired field"
+            );
+        }
     }
 
-    /// The grant records WHY it exists. A blank reason would leave an
-    /// audited acceptance pointing at nothing, so it is refused at the
-    /// same layer that refuses every other malformed pointer field.
+    /// The retired field is the only tolerated addition: every other
+    /// unknown pointer field still refuses.
     #[test]
-    fn an_auto_advance_grant_without_an_operator_reason_is_refused() {
-        let mut input = build_input();
-        input.auto_advance = Some(AcceptedPublicationAutoAdvanceV1 {
-            enabled: true,
-            granted_reason: "   ".to_string(),
-        });
-        let error = prepare_accepted_publication_v1(input, &AcceptedPublicationLimits::default())
-            .expect_err("a reasonless grant is not a valid pointer");
-        assert_eq!(error.code(), "error.accepted_publication_invalid_pointer");
-    }
-
-    #[test]
-    fn an_oversized_auto_advance_reason_is_refused() {
-        let mut input = build_input();
-        input.auto_advance = Some(AcceptedPublicationAutoAdvanceV1 {
-            enabled: true,
-            granted_reason: "r".repeat(MAX_AUTO_ADVANCE_REASON_BYTES + 1),
-        });
-        let error = prepare_accepted_publication_v1(input, &AcceptedPublicationLimits::default())
-            .expect_err("an unbounded reason is not a valid pointer");
-        assert_eq!(error.code(), "error.accepted_publication_invalid_pointer");
+    fn an_unknown_pointer_field_still_refuses() {
+        let prepared = prepared();
+        let mut value: serde_json::Value = serde_json::from_slice(&prepared.pointer_bytes).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("unexpected".into(), serde_json::json!(true));
+        let bytes = serde_json::to_vec(&value).unwrap();
+        assert!(decode_pointer_v1(&bytes, &AcceptedPublicationLimits::default()).is_err());
     }
 
     #[test]

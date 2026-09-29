@@ -426,40 +426,28 @@ step_publish() {
 }
 
 step_accept() {
-    # Publication and activation advance the catalog epoch, so the
-    # compare-and-swap token has to be read immediately before the call.
-    mcp_call "$PUBLISHED_SESSION" bbox_project_catalog_list '{}' catalog-list-before-accept || {
-        cat "$EVIDENCE/catalog-list-before-accept.json" >&2
-        return 1
-    }
-    CATALOG_EPOCH="$(jq -r '.epoch' "$EVIDENCE/catalog-list-before-accept.json")"
-    local arguments
-    arguments="$(jq -cn \
-        --arg project "$PROJECT_ID" \
-        --arg generation "$SOURCE_GENERATION" \
-        --argjson epoch "$CATALOG_EPOCH" \
-        '{project_id:$project,source_generation_id:$generation,mode:"establish",expected_catalog_epoch:$epoch,audit_reason:"graph live exercise acceptance"}')"
-    mcp_call "$PUBLISHED_SESSION" bbox_project_publisher_advance "$arguments" publisher-advance || {
-        cat "$EVIDENCE/publisher-advance.json" >&2
-        return 1
-    }
+    # The daemon accepts a valid candidate as it finalizes: the first one
+    # from the owning producer establishes the accepted pointer. Status must
+    # already name the candidate the collector just drove to Ready.
     mcp_call "$PUBLISHED_SESSION" bbox_project_publisher_status \
         "$(jq -cn --arg project "$PROJECT_ID" '{project_id:$project}')" publisher-status || {
         cat "$EVIDENCE/publisher-status.json" >&2
         return 1
     }
-    jq -e --arg generation "$(jq -r '.generation_id' "$EVIDENCE/publisher-advance.json")" '
+    jq -e --arg source "$SOURCE_GENERATION" '
         .accepted_state == "current" and
-        .generation_id == $generation and
+        .source_binding.source_generation_id == $source and
+        .acceptance.last_attempt.outcome == "accepted" and
         .accepted_scope.repo_id != null and
         .health.accepted.serves_published_content == true
     ' "$EVIDENCE/publisher-status.json" >/dev/null || {
-        echo "publisher status reports no accepted publication" >&2
+        echo "the Ready candidate was not accepted at finalize" >&2
+        jq '.acceptance' "$EVIDENCE/publisher-status.json" >&2
         return 1
     }
-    CATALOG_EPOCH="$(jq -r '.epoch // empty' "$EVIDENCE/publisher-advance.json")"
+    CATALOG_EPOCH="$(jq -r '.epoch // empty' "$EVIDENCE/publisher-status.json")"
     [ -n "$CATALOG_EPOCH" ] || CATALOG_EPOCH="$(jq -r '.epoch' "$EVIDENCE/catalog-list.json")"
-    note "acceptance ran the merge gate and established generation $(jq -r '.generation_id' "$EVIDENCE/publisher-advance.json" | cut -c1-16)"
+    note "acceptance at finalize ran the merge gate and established generation $(jq -r '.generation_id' "$EVIDENCE/publisher-status.json" | cut -c1-16)"
 }
 
 step_published_reads() {

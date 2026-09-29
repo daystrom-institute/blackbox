@@ -1204,7 +1204,7 @@ mod tests {
             token_files: Vec::new(),
             scopes: scopes.to_vec(),
             claim_scopes: Default::default(),
-            auto_publish: false,
+            retired_auto_publish: Default::default(),
         }];
         let layout = ProjectCatalogMigrationResolvedLayoutV1::from_config(
             &config,

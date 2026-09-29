@@ -56,8 +56,8 @@ use bbox_corpus_index::index::TranscriptIndex;
 use bbox_corpus_index::index::schema_replacement::CatalogIndexReplacementCause;
 use bbox_edge_sidecar::manifest::ManifestIndex;
 use bbox_indexing::accepted_publication_runtime::{
-    AcceptedPublicationRuntime, AcceptedPublicationSourceBinding, AutoAdvanceGrantUpdate,
-    PublishRequest, PublishSources, PublisherPublishMode,
+    AcceptedPublicationRuntime, AcceptedPublicationSourceBinding, PublishRequest, PublishSources,
+    PublisherPublishMode,
 };
 use bbox_indexing::index::schema_rebuild::SchemaRebuildResume;
 use bbox_indexing::project_catalog_backfill::{
@@ -2308,7 +2308,6 @@ fn a_legitimate_advance_after_apply_keeps_backfill_verify_valid() {
                 dry_run: false,
                 // A backfill advance is not an operator grant decision: it
                 // carries whatever the installed pointer already holds.
-                auto_advance: AutoAdvanceGrantUpdate::Inherit,
             },
             PublishSources::default(),
         )

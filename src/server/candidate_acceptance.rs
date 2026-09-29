@@ -1,33 +1,37 @@
-//! Policy-gated auto-advance of the accepted publication for producer
-//! lanes (`design/daemon-runtime/publisher-auto-advance.md`).
+//! Acceptance of Ready publication candidates
+//! (`design/daemon-runtime/publisher-auto-advance.md`).
 //!
-//! Two things live here:
+//! Merging to a project's configured ref is the only gate on what the
+//! daemon serves. Every Ready candidate from the project's bound producer,
+//! at its accepted scope, on its configured ref, is accepted as it
+//! finalizes, provided it passes the validation every publish runs:
+//! producer transport grant, catalog scope, byte integrity, configuration
+//! parse, and normalization. No grant, policy flag, or operator act stands
+//! between a valid candidate and the pointer.
+//!
+//! This module holds:
 //!
 //! 1. [`publish_from_ready_candidate`], the single candidate-acceptance
-//!    path. `bbox_project_publisher_advance` and the policy trigger both
-//!    call it, so "auto-advance reuses the exact same acceptance path" is
-//!    a structural fact rather than a claim about two similar functions.
-//! 2. The finalize-triggered policy: operator config may establish the first
-//!    pointer for the project's owning producer, and the pointer's durable
-//!    grant may advance later candidates.
-//! 3. [`PublisherAutoAdvanceLedger`], the bounded per-project record of what
-//!    the last policy attempt did, which makes a refusal observable in
+//!    path. The finalize trigger and `bbox_project_publisher_advance` both
+//!    call it, so a candidate validates identically whichever caller
+//!    accepts it.
+//! 2. The finalize-triggered acceptance. With no pointer, the first valid
+//!    candidate from the project's owning producer establishes one and its
+//!    full branch ref becomes the configured ref. With a pointer, every
+//!    candidate on the bound producer, scope, and ref advances it.
+//!    Candidates that would change the producer, scope, or ref are refused
+//!    and wait for an operator rebind or scope move.
+//! 3. [`CandidateAcceptanceLedger`], the bounded per-project record of the
+//!    last attempt, which makes a refusal observable in
 //!    `bbox_project_publisher_status` instead of only in logs.
-//!
-//! The narrowing argument for the transport plan's "no automatic knowledge
-//! acceptance by a producer or model" non-goal lives in the design doc. In
-//! code it reduces to one invariant: authority comes from operator-owned
-//! daemon config or from the pointer the operator installed, never from the
-//! candidate being accepted. Continuing auto-advance always passes
-//! [`AutoAdvanceGrantUpdate::Inherit`] so it cannot widen its own authority.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use bbox_corpus_core::project_catalog::{AttachmentStatus, ProjectId, ProjectScope};
 use bbox_indexing::accepted_publication_runtime::{
-    AcceptedPublicationRuntime, AutoAdvanceGrantUpdate, PublishError, PublishReceipt,
-    PublishSourceFile, PublishSources, PublisherPublishMode,
+    AcceptedPublicationRuntime, PublishError, PublishReceipt, PublishSourceFile, PublishSources,
+    PublisherPublishMode,
 };
 use bbox_indexing::project_catalog_admin;
 use bbox_indexing::project_catalog_store::ProjectCatalogStore;
@@ -35,15 +39,15 @@ use bbox_knowledge_source_store::KnowledgeSourceStore;
 
 use super::producer_auth::ProducerAuthRuntime;
 
-/// Longest `audit_reason` the catalog accepts, mirrored here so a
-/// generated policy reason is bounded at the point it is built.
+/// Longest audit reason the catalog accepts, mirrored here so a generated
+/// reason is bounded at the point it is built.
 const MAX_AUDIT_REASON_BYTES: usize = 1024;
 
 /// The stable refusal every candidate-selection failure carries.
 const CANDIDATE_REQUIRED: &str = "error.accepted_publication_candidate_required";
 
-/// Most recent policy attempts retained per daemon lifetime. The ledger is
-/// an observability surface, not a queue: it must never be the reason the
+/// Most recent attempts retained per daemon lifetime. The ledger is an
+/// observability surface, not a queue: it must never be the reason the
 /// daemon grows without bound.
 const MAX_LEDGER_PROJECTS: usize = 512;
 
@@ -51,17 +55,17 @@ const MAX_LEDGER_PROJECTS: usize = 512;
 /// uploaded candidate" needs memory of which candidates were attempted;
 /// bounding it is what keeps a chatty producer from turning that memory
 /// into a leak. Eviction is oldest-first within a project, and an evicted
-/// candidate cannot be retried into a pointer move anyway: the accepted
-/// pointer already names it, which the pre-checks refuse.
+/// candidate that the pointer already names is refused as already
+/// accepted.
 const MAX_ATTEMPTED_PER_PROJECT: usize = 64;
 
 /// The single candidate-acceptance path.
 ///
-/// It resolves the Ready candidate, re-proves the producer grant, builds
-/// the publish probe, and hands the whole thing to the same admin
-/// entry point the operator tool has always used. Callers differ only in
-/// the mode, the audit reason, and whether they may touch the standing
-/// grant.
+/// It resolves the Ready candidate, re-proves the producer transport grant,
+/// parses the configuration lane, builds the publish probe, and hands the
+/// whole thing to the admin entry point that normalizes and swaps. The
+/// finalize trigger and the operator tool differ only in the mode they
+/// pass.
 pub(crate) fn publish_from_ready_candidate(
     store: &ProjectCatalogStore,
     runtime: &AcceptedPublicationRuntime,
@@ -72,7 +76,6 @@ pub(crate) fn publish_from_ready_candidate(
     mode: PublisherPublishMode,
     expected_catalog_epoch: u64,
     dry_run: bool,
-    auto_advance: AutoAdvanceGrantUpdate,
 ) -> Result<PublishReceipt, PublishError> {
     // `PublishError` and not `anyhow` on purpose: it carries the refusing
     // layer's own code AND `may_have_swapped`, which the operator tool uses
@@ -223,43 +226,47 @@ pub(crate) fn publish_from_ready_candidate(
             source_generation_id: source_generation_id.to_string(),
             expected_epoch: expected_catalog_epoch,
             dry_run,
-            auto_advance,
         },
         probe,
     )
 }
 
-/// Why a policy attempt did not move the pointer, or that it did.
+/// Why an acceptance attempt did not move the pointer, or that it did.
 ///
 /// Every non-accepting outcome is a REASON, never silence. A candidate
-/// that sat unserved with nothing recorded anywhere is the failure this
-/// feature exists to end, and replacing it with an unexplained skip would
-/// reproduce it.
+/// that sits unserved with nothing recorded anywhere is the failure this
+/// ledger exists to prevent.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
-pub(crate) enum AutoAdvanceOutcome {
+pub(crate) enum AcceptanceOutcome {
     /// The pointer moved. `generation_id` is the newly accepted generation.
     Accepted { generation_id: String },
-    /// The project has no installed pointer and its owning producer has no
-    /// operator-configured auto-publish grant.
-    NoAcceptedPublication,
-    /// A pointer exists and carries no standing operator grant. This is
-    /// the default for every project.
-    PolicyDisabled,
-    /// The accepted pointer is bound to an attachment, not a producer.
-    /// Only producer-bound projects are in scope.
+    /// The daemon is not running the project catalog, so there is no
+    /// accepted publication to move.
+    CatalogInactive,
+    /// The project has no pointer and no producer owns its catalog scope,
+    /// so no candidate can establish one.
+    NoOwningProducer,
+    /// The project has no pointer and no attached, repo-knowledge capable
+    /// attachment carries its catalog scope, so it has not been admitted
+    /// for publication.
+    NoAttachedCheckout,
+    /// The project has no pointer and the candidate's ref is not a full
+    /// branch ref, so it cannot become the configured ref.
+    RefNotBranch,
+    /// The accepted pointer is bound to an attachment, not a producer. An
+    /// operator rebind moves it onto a producer.
     BindingNotProducer,
-    /// The candidate came from a producer other than the one the accepted
-    /// pointer is bound to.
+    /// The candidate came from a producer other than the bound (or, with no
+    /// pointer, owning) producer. An operator rebind changes the producer.
     ProducerMismatch,
-    /// The candidate's published scope is not the accepted scope. A scope
-    /// change is a non-linear move and stays manual.
+    /// The candidate's scope is not the accepted (or, with no pointer,
+    /// catalog) scope. An operator scope move changes the scope.
     ScopeChanged,
-    /// The candidate's full ref is not the accepted ref. A ref change is a
-    /// non-linear move and stays manual.
+    /// The candidate's full ref is not the configured ref. An operator
+    /// rebind changes the configured ref.
     RefChanged,
-    /// The accepted pointer already names this candidate. Re-finalizing an
-    /// upload must not re-attempt an acceptance that already happened.
+    /// The accepted pointer already names this candidate.
     AlreadyAccepted,
     /// This candidate was already attempted in this daemon lifetime. At
     /// most one attempt per uploaded candidate, always.
@@ -276,7 +283,7 @@ pub(crate) enum AutoAdvanceOutcome {
     },
 }
 
-impl AutoAdvanceOutcome {
+impl AcceptanceOutcome {
     /// Test-only. Production code matches the variant it cares about
     /// directly; this exists so an assertion can say "it accepted" without
     /// naming the generation id it does not know in advance.
@@ -305,6 +312,22 @@ impl AutoAdvanceOutcome {
         }
     }
 
+    /// Outcomes an operator has to act on: the candidate is valid content
+    /// but changes the producer, scope, or ref, or the project cannot be
+    /// established. These log at warn; the benign skips log at debug.
+    fn needs_operator(&self) -> bool {
+        matches!(
+            self,
+            Self::NoOwningProducer
+                | Self::NoAttachedCheckout
+                | Self::RefNotBranch
+                | Self::BindingNotProducer
+                | Self::ProducerMismatch
+                | Self::ScopeChanged
+                | Self::RefChanged
+        )
+    }
+
     /// A refusal from the acceptance path keeps the refusing layer's own
     /// code verbatim, exactly as the operator tool reports it, and carries
     /// its swap uncertainty rather than flattening it away.
@@ -326,7 +349,7 @@ impl AutoAdvanceOutcome {
                 (code.to_string(), detail.to_string())
             }
             _ => (
-                "error.accepted_publication_auto_advance_failed".to_string(),
+                "error.accepted_publication_acceptance_failed".to_string(),
                 rendered,
             ),
         };
@@ -334,8 +357,8 @@ impl AutoAdvanceOutcome {
             code,
             detail: bounded_detail(detail),
             // A refusal built from a plain error never reached the
-            // acceptance path's swap: these are the policy's own
-            // pre-checks, which run before any pointer is touched.
+            // acceptance path's swap: these are pre-checks, which run
+            // before any pointer is touched.
             may_have_swapped: false,
         }
     }
@@ -349,35 +372,34 @@ fn bounded_detail(detail: String) -> String {
         .collect()
 }
 
-/// One recorded policy attempt, surfaced by publisher status.
+/// One recorded acceptance attempt, surfaced by publisher status.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub(crate) struct AutoAdvanceAttempt {
+pub(crate) struct AcceptanceAttempt {
     pub(crate) source_generation_id: String,
     pub(crate) producer_id: String,
     #[serde(flatten)]
-    pub(crate) outcome: AutoAdvanceOutcome,
+    pub(crate) outcome: AcceptanceOutcome,
     pub(crate) at_unix_secs: u64,
 }
 
-/// Bounded per-project memory of policy attempts.
+/// Bounded per-project memory of acceptance attempts.
 ///
 /// Deliberately in-process and non-durable. The ledger answers "what did
-/// the policy just do", not "what has the policy ever done": the durable
-/// answer is the accepted pointer itself plus the audit trail, and making
-/// this durable would add a write to a path whose whole safety argument is
-/// that it adds no new authority.
+/// acceptance just do", not "what has it ever done": the durable answer is
+/// the accepted pointer itself, whose producer binding names the exact
+/// source generation it serves.
 #[derive(Debug, Default)]
-pub(crate) struct PublisherAutoAdvanceLedger {
+pub(crate) struct CandidateAcceptanceLedger {
     inner: parking_lot::Mutex<LedgerInner>,
 }
 
 #[derive(Debug, Default)]
 struct LedgerInner {
-    last: BTreeMap<String, AutoAdvanceAttempt>,
+    last: BTreeMap<String, AcceptanceAttempt>,
     attempted: BTreeMap<String, Vec<String>>,
 }
 
-impl PublisherAutoAdvanceLedger {
+impl CandidateAcceptanceLedger {
     /// Claim the single attempt for one candidate.
     ///
     /// Returns false when this candidate was already claimed, which is how
@@ -398,7 +420,7 @@ impl PublisherAutoAdvanceLedger {
         true
     }
 
-    pub(crate) fn record(&self, project_id: &str, attempt: AutoAdvanceAttempt) {
+    pub(crate) fn record(&self, project_id: &str, attempt: AcceptanceAttempt) {
         let mut inner = self.inner.lock();
         inner.last.insert(project_id.to_string(), attempt);
         while inner.last.len() > MAX_LEDGER_PROJECTS {
@@ -415,54 +437,39 @@ impl PublisherAutoAdvanceLedger {
         }
     }
 
-    pub(crate) fn last_attempt(&self, project_id: &str) -> Option<AutoAdvanceAttempt> {
+    pub(crate) fn last_attempt(&self, project_id: &str) -> Option<AcceptanceAttempt> {
         self.inner.lock().last.get(project_id).cloned()
     }
 }
 
-/// The audit reason a policy acceptance writes.
+/// Which kind of acceptance an attempt made, for its audit reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcceptanceKind {
+    Establish,
+    Advance,
+}
+
+/// The audit reason an acceptance writes into its log line.
 ///
-/// It names the policy, the producer, and the source generation, so
-/// audit history distinguishes a policy acceptance from an operator
-/// one without inspecting anything else.
-pub(crate) fn policy_audit_reason(producer_id: &str, source_generation_id: &str) -> String {
-    let reason =
-        format!("policy:auto_advance producer={producer_id} source={source_generation_id}");
+/// It names the acceptance kind, the producer, and the source generation,
+/// so a daemon acceptance is distinguishable from an operator move.
+pub(crate) fn acceptance_audit_reason(
+    establish: bool,
+    producer_id: &str,
+    source_generation_id: &str,
+) -> String {
+    let kind = if establish { "establish" } else { "advance" };
+    let reason = format!("acceptance:{kind} producer={producer_id} source={source_generation_id}");
     if reason.len() <= MAX_AUDIT_REASON_BYTES {
         return reason;
     }
     reason.chars().take(MAX_AUDIT_REASON_BYTES / 4).collect()
 }
 
-/// The audit reason written into a pointer established by the producer-level
-/// auto-publish pre-grant.
-pub(crate) fn auto_publish_audit_reason(producer_id: &str) -> String {
-    let reason = format!("policy:auto_publish producer={producer_id}");
-    if reason.len() <= MAX_AUDIT_REASON_BYTES {
-        return reason;
-    }
-    reason.chars().take(MAX_AUDIT_REASON_BYTES / 4).collect()
-}
-
-fn is_full_branch_ref(value: &str) -> bool {
+pub(crate) fn is_full_branch_ref(value: &str) -> bool {
     value
         .strip_prefix("refs/heads/")
         .is_some_and(|branch| !branch.is_empty())
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PublisherPolicyKind {
-    AutoAdvance,
-    AutoPublish,
-}
-
-impl PublisherPolicyKind {
-    fn audit_reason(self, producer_id: &str, source_generation_id: &str) -> String {
-        match self {
-            Self::AutoAdvance => policy_audit_reason(producer_id, source_generation_id),
-            Self::AutoPublish => auto_publish_audit_reason(producer_id),
-        }
-    }
 }
 
 fn now_unix_secs() -> u64 {
@@ -473,8 +480,7 @@ fn now_unix_secs() -> u64 {
 }
 
 impl super::BlackboxServer {
-    /// One establish-or-advance policy attempt for one freshly Ready
-    /// publication candidate.
+    /// One acceptance attempt for one freshly Ready publication candidate.
     ///
     /// Blocking, at most once per candidate, and never retried. Every exit
     /// records a reason in the ledger, so `bbox_project_publisher_status`
@@ -482,37 +488,34 @@ impl super::BlackboxServer {
     /// dive. On any refusal the prior accepted generation keeps serving:
     /// this function only ever calls the ordinary acceptance path, which
     /// swaps a pointer or refuses.
-    pub(crate) fn attempt_publisher_auto_advance(
+    pub(crate) fn accept_ready_candidate(
         &self,
         project_id: &str,
         source_generation_id: &str,
-    ) -> AutoAdvanceOutcome {
-        let ledger = self.state.knowledge_sources.auto_advance_ledger();
+    ) -> AcceptanceOutcome {
+        let ledger = self.state.knowledge_sources.acceptance_ledger();
         if !ledger.claim_attempt(project_id, source_generation_id) {
-            return AutoAdvanceOutcome::AlreadyAttempted;
+            return AcceptanceOutcome::AlreadyAttempted;
         }
-        let (producer_id, policy, outcome) =
-            self.run_publisher_auto_advance(project_id, source_generation_id);
-        let audit_reason = policy.audit_reason(&producer_id, source_generation_id);
+        let (producer_id, kind, outcome) =
+            self.run_candidate_acceptance(project_id, source_generation_id);
         ledger.record(
             project_id,
-            AutoAdvanceAttempt {
+            AcceptanceAttempt {
                 source_generation_id: source_generation_id.to_string(),
-                producer_id,
+                producer_id: producer_id.clone(),
                 outcome: outcome.clone(),
                 at_unix_secs: now_unix_secs(),
             },
         );
-        // The same convergence the operator tool performs after a real
-        // (non dry-run) swap, on the same trigger it uses: acceptance OR a
-        // refusal that reached the swap. A refusal raised at or after the
-        // pointer replacement leaves the new pointer durably installed,
-        // and skipping convergence there leaves every projection built
-        // from accepted content serving a generation no pointer names.
-        // Graph views are the sticky case: they have no rebuild-on-read,
-        // so they stay stale until the next accept or a daemon restart.
-        // Converging is not a retry: it touches projections only and never
-        // re-enters the acceptance path, so the no-storm rule holds.
+        // Converge on acceptance OR on a refusal that reached the swap. A
+        // refusal raised at or after the pointer replacement leaves the new
+        // pointer durably installed, and skipping convergence there leaves
+        // every projection built from accepted content serving a generation
+        // no pointer names. Graph views are the sticky case: they have no
+        // rebuild-on-read, so they stay stale until the next accept or a
+        // daemon restart. Converging touches projections only and never
+        // re-enters the acceptance path.
         if outcome.requires_convergence()
             && let Ok(parsed) = ProjectId::parse(project_id.to_string())
         {
@@ -521,14 +524,19 @@ impl super::BlackboxServer {
             self.refresh_published_graph_views(&parsed);
         }
         match &outcome {
-            AutoAdvanceOutcome::Accepted { generation_id } => {
+            AcceptanceOutcome::Accepted { generation_id } => {
                 self.observe_knowledge_transport_operation(
                     project_id,
                     bbox_indexing::knowledge_transport_observations::KnowledgeTransportOperationV1::AcceptedPublicationMutation,
                     bbox_indexing::knowledge_transport_observations::KnowledgeTransportOutcomeV1::Remote,
                 );
+                let audit_reason = acceptance_audit_reason(
+                    kind == AcceptanceKind::Establish,
+                    &producer_id,
+                    source_generation_id,
+                );
                 tracing::info!(
-                    tool = "publisher_auto_advance",
+                    tool = "candidate_acceptance",
                     project_id,
                     source_generation_id,
                     generation_id = %generation_id,
@@ -536,25 +544,34 @@ impl super::BlackboxServer {
                     "catalog administration mutation"
                 );
             }
-            AutoAdvanceOutcome::Refused {
+            AcceptanceOutcome::Refused {
                 code,
                 detail,
                 may_have_swapped,
             } => {
                 // Loud, once, and then done. A retry loop here would turn
                 // one bad candidate into a storm against the publication
-                // lock; the operator advances manually after a refusal.
-                // `may_have_swapped` says which generation is serving after
-                // this refusal, so the log answers that without a pointer
-                // read.
+                // lock. `may_have_swapped` says which generation is serving
+                // after this refusal, so the log answers that without a
+                // pointer read.
                 tracing::warn!(
                     project_id,
                     source_generation_id,
                     code = %code,
                     detail = %detail,
                     may_have_swapped,
-                    "publisher auto-advance refused; the prior accepted generation keeps serving \
+                    "candidate acceptance refused; the prior accepted generation keeps serving \
                      unless the refusal reached the pointer swap"
+                );
+            }
+            operator if operator.needs_operator() => {
+                tracing::warn!(
+                    project_id,
+                    source_generation_id,
+                    producer_id = %producer_id,
+                    outcome = ?operator,
+                    "Ready candidate not accepted; it changes the bound producer, scope, or \
+                     configured ref, which takes bbox_project_publisher_advance"
                 );
             }
             skipped => {
@@ -562,7 +579,7 @@ impl super::BlackboxServer {
                     project_id,
                     source_generation_id,
                     outcome = ?skipped,
-                    "publisher auto-advance did not apply"
+                    "candidate acceptance did not apply"
                 );
             }
         }
@@ -571,26 +588,26 @@ impl super::BlackboxServer {
 
     /// The decision half, split out so the ledger write and the logging
     /// happen on exactly one path regardless of where the attempt exits.
-    fn run_publisher_auto_advance(
+    fn run_candidate_acceptance(
         &self,
         project_id: &str,
         source_generation_id: &str,
-    ) -> (String, PublisherPolicyKind, AutoAdvanceOutcome) {
+    ) -> (String, AcceptanceKind, AcceptanceOutcome) {
         // Each early exit builds its own empty producer label: the
         // producer is not known until the accepted binding is read.
         let unknown_producer = String::new;
         let Some(store) = self.state.project_authority.catalog_store().cloned() else {
             return (
                 unknown_producer(),
-                PublisherPolicyKind::AutoAdvance,
-                AutoAdvanceOutcome::NoAcceptedPublication,
+                AcceptanceKind::Advance,
+                AcceptanceOutcome::CatalogInactive,
             );
         };
         let Some(runtime) = self.state.accepted_publications.clone() else {
             return (
                 unknown_producer(),
-                PublisherPolicyKind::AutoAdvance,
-                AutoAdvanceOutcome::NoAcceptedPublication,
+                AcceptanceKind::Advance,
+                AcceptanceOutcome::CatalogInactive,
             );
         };
         let parsed = match ProjectId::parse(project_id.to_string()) {
@@ -598,61 +615,50 @@ impl super::BlackboxServer {
             Err(error) => {
                 return (
                     unknown_producer(),
-                    PublisherPolicyKind::AutoAdvance,
-                    AutoAdvanceOutcome::refused(&anyhow::anyhow!("{error}")),
+                    AcceptanceKind::Advance,
+                    AcceptanceOutcome::refused(&anyhow::anyhow!("{error}")),
                 );
             }
         };
-        // Continuing auto-advance reads authority from the currently
-        // accepted pointer. The no-pointer branch below reads the separate
-        // producer-level operator grant.
-        let grant = match runtime.auto_advance_grant(&parsed) {
-            Ok(Some(grant)) => grant,
+        let installed = match runtime.installed_pointer(&parsed) {
+            Ok(Some(installed)) => installed,
             Ok(None) => {
-                let (producer_id, outcome) = self.run_publisher_auto_publish(
+                let (producer_id, outcome) = self.run_candidate_establish(
                     &store,
                     runtime.as_ref(),
                     &parsed,
                     source_generation_id,
                 );
-                return (producer_id, PublisherPolicyKind::AutoPublish, outcome);
+                return (producer_id, AcceptanceKind::Establish, outcome);
             }
             Err(error) => {
                 return (
                     unknown_producer(),
-                    PublisherPolicyKind::AutoAdvance,
-                    AutoAdvanceOutcome::refused(&anyhow::anyhow!("{error}")),
+                    AcceptanceKind::Advance,
+                    AcceptanceOutcome::refused(&anyhow::anyhow!("{error}")),
                 );
             }
         };
-        if !grant.enabled {
-            return (
-                unknown_producer(),
-                PublisherPolicyKind::AutoAdvance,
-                AutoAdvanceOutcome::PolicyDisabled,
-            );
-        }
-        let (accepted_producer, accepted_source_generation) = match (
-            grant.source.producer_id(),
-            grant.source.source_generation_id(),
+        let (bound_producer, bound_source_generation) = match (
+            installed.source.producer_id(),
+            installed.source.source_generation_id(),
         ) {
             (Some(producer_id), Some(source)) => (producer_id.to_string(), source.to_string()),
-            // An attachment-bound project is out of scope: its accepted
-            // content comes from a checkout the operator drives, and the
-            // linear fast path this policy covers does not exist there.
+            // An attachment-bound project publishes from a checkout the
+            // operator drives; an operator rebind moves it onto a producer.
             _ => {
                 return (
                     unknown_producer(),
-                    PublisherPolicyKind::AutoAdvance,
-                    AutoAdvanceOutcome::BindingNotProducer,
+                    AcceptanceKind::Advance,
+                    AcceptanceOutcome::BindingNotProducer,
                 );
             }
         };
-        if accepted_source_generation == source_generation_id {
+        if bound_source_generation == source_generation_id {
             return (
-                accepted_producer,
-                PublisherPolicyKind::AutoAdvance,
-                AutoAdvanceOutcome::AlreadyAccepted,
+                bound_producer,
+                AcceptanceKind::Advance,
+                AcceptanceOutcome::AlreadyAccepted,
             );
         }
         let knowledge_sources = self.state.knowledge_sources.store();
@@ -660,38 +666,37 @@ impl super::BlackboxServer {
             Ok(pinned) => pinned,
             Err(error) => {
                 return (
-                    accepted_producer,
-                    PublisherPolicyKind::AutoAdvance,
-                    AutoAdvanceOutcome::refused(&anyhow::anyhow!(
+                    bound_producer,
+                    AcceptanceKind::Advance,
+                    AcceptanceOutcome::refused(&anyhow::anyhow!(
                         "error.accepted_publication_candidate_required: {error}"
                     )),
                 );
             }
         };
-        // The linear fast path, and only it. Same producer, same catalog
-        // scope, same published ref. Anything else is a move an operator
-        // has to look at.
+        // Same producer, same scope, same configured ref. A candidate that
+        // changes any of them is a move an operator makes.
         {
             let candidate = pinned.candidate();
-            if candidate.producer_id != accepted_producer {
+            if candidate.producer_id != bound_producer {
                 return (
                     candidate.producer_id.clone(),
-                    PublisherPolicyKind::AutoAdvance,
-                    AutoAdvanceOutcome::ProducerMismatch,
+                    AcceptanceKind::Advance,
+                    AcceptanceOutcome::ProducerMismatch,
                 );
             }
-            if candidate.descriptor.scope != grant.accepted_scope {
+            if candidate.descriptor.scope != installed.accepted_scope {
                 return (
                     candidate.producer_id.clone(),
-                    PublisherPolicyKind::AutoAdvance,
-                    AutoAdvanceOutcome::ScopeChanged,
+                    AcceptanceKind::Advance,
+                    AcceptanceOutcome::ScopeChanged,
                 );
             }
-            if candidate.descriptor.full_ref != grant.full_ref {
+            if candidate.descriptor.full_ref != installed.full_ref {
                 return (
                     candidate.producer_id.clone(),
-                    PublisherPolicyKind::AutoAdvance,
-                    AutoAdvanceOutcome::RefChanged,
+                    AcceptanceKind::Advance,
+                    AcceptanceOutcome::RefChanged,
                 );
             }
         }
@@ -700,9 +705,9 @@ impl super::BlackboxServer {
             Ok(snapshot) => snapshot.epoch(),
             Err(error) => {
                 return (
-                    accepted_producer,
-                    PublisherPolicyKind::AutoAdvance,
-                    AutoAdvanceOutcome::refused(&anyhow::anyhow!("{error}")),
+                    bound_producer,
+                    AcceptanceKind::Advance,
+                    AcceptanceOutcome::refused(&anyhow::anyhow!("{error}")),
                 );
             }
         };
@@ -714,57 +719,56 @@ impl super::BlackboxServer {
             knowledge_sources.as_ref(),
             &parsed,
             source_generation_id,
-            // A current pointer always uses the linear advance path. The
-            // separate no-pointer branch is the only policy establish path.
+            // The tokens of the pointer the checks above read: a concurrent
+            // move between that read and the swap refuses as a pointer
+            // conflict instead of being overwritten.
             PublisherPublishMode::Advance {
-                expected_generation_id: grant.expected_generation_id.clone(),
-                expected_pointer_sha256: grant.expected_pointer_sha256.clone(),
+                expected_generation_id: installed.expected_generation_id.clone(),
+                expected_pointer_sha256: installed.expected_pointer_sha256.clone(),
             },
             epoch,
             false,
-            // Never Set. A policy acceptance inherits the operator's grant
-            // and cannot widen it.
-            AutoAdvanceGrantUpdate::Inherit,
         );
         match outcome {
             Ok(receipt) => (
-                accepted_producer,
-                PublisherPolicyKind::AutoAdvance,
-                AutoAdvanceOutcome::Accepted {
+                bound_producer,
+                AcceptanceKind::Advance,
+                AcceptanceOutcome::Accepted {
                     generation_id: receipt.generation_id().to_string(),
                 },
             ),
             Err(error) => (
-                accepted_producer,
-                PublisherPolicyKind::AutoAdvance,
-                AutoAdvanceOutcome::from_publish_error(&error),
+                bound_producer,
+                AcceptanceKind::Advance,
+                AcceptanceOutcome::from_publish_error(&error),
             ),
         }
     }
 
-    /// Establish the first pointer only when operator config pre-grants the
-    /// current owning producer and the Ready candidate matches the project's
-    /// catalog scope with a full branch ref.
-    fn run_publisher_auto_publish(
+    /// Establish the first pointer from the first valid candidate: the
+    /// project's owning producer, its catalog scope, a full branch ref that
+    /// becomes the configured ref, and an attached repo-knowledge capable
+    /// attachment at that scope proving the project was admitted.
+    fn run_candidate_establish(
         &self,
         store: &ProjectCatalogStore,
         runtime: &AcceptedPublicationRuntime,
         project_id: &ProjectId,
         source_generation_id: &str,
-    ) -> (String, AutoAdvanceOutcome) {
+    ) -> (String, AcceptanceOutcome) {
         let snapshot = match store.snapshot() {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 return (
                     String::new(),
-                    AutoAdvanceOutcome::refused(&anyhow::anyhow!("{error}")),
+                    AcceptanceOutcome::refused(&anyhow::anyhow!("{error}")),
                 );
             }
         };
         let Some(project) = snapshot.catalog().projects.get(project_id) else {
             return (
                 String::new(),
-                AutoAdvanceOutcome::refused(&anyhow::anyhow!(
+                AcceptanceOutcome::refused(&anyhow::anyhow!(
                     "error.project_catalog_admin_unknown_project: the requested project is not in the catalog"
                 )),
             );
@@ -772,20 +776,16 @@ impl super::BlackboxServer {
         let ProjectScope::Published(catalog_scope) = &project.scope else {
             return (
                 String::new(),
-                AutoAdvanceOutcome::refused(&anyhow::anyhow!(
+                AcceptanceOutcome::refused(&anyhow::anyhow!(
                     "error.project_catalog_admin_scope_required: a legacy-local project has no published scope"
                 )),
             );
         };
         let producer_auth = self.state.code_sources.producer_auth();
-        let Some((owning_producer, auto_publish)) =
-            producer_auth.project_assignment(project_id, catalog_scope)
+        let Some(owning_producer) = producer_auth.project_assignment(project_id, catalog_scope)
         else {
-            return (String::new(), AutoAdvanceOutcome::NoAcceptedPublication);
+            return (String::new(), AcceptanceOutcome::NoOwningProducer);
         };
-        if !auto_publish {
-            return (String::new(), AutoAdvanceOutcome::NoAcceptedPublication);
-        }
         let owning_producer = owning_producer.to_string();
         let knowledge_sources = self.state.knowledge_sources.store();
         let pinned = match knowledge_sources.pin_ready_publication_candidate(source_generation_id) {
@@ -793,7 +793,7 @@ impl super::BlackboxServer {
             Err(error) => {
                 return (
                     owning_producer,
-                    AutoAdvanceOutcome::refused(&anyhow::anyhow!(
+                    AcceptanceOutcome::refused(&anyhow::anyhow!(
                         "error.accepted_publication_candidate_required: {error}"
                     )),
                 );
@@ -804,19 +804,19 @@ impl super::BlackboxServer {
             if candidate.producer_id != owning_producer {
                 return (
                     candidate.producer_id.clone(),
-                    AutoAdvanceOutcome::ProducerMismatch,
+                    AcceptanceOutcome::ProducerMismatch,
                 );
             }
             if candidate.descriptor.scope != *catalog_scope {
                 return (
                     candidate.producer_id.clone(),
-                    AutoAdvanceOutcome::ScopeChanged,
+                    AcceptanceOutcome::ScopeChanged,
                 );
             }
             if !is_full_branch_ref(&candidate.descriptor.full_ref) {
                 return (
                     candidate.producer_id.clone(),
-                    AutoAdvanceOutcome::RefChanged,
+                    AcceptanceOutcome::RefNotBranch,
                 );
             }
             let has_eligible_attachment =
@@ -833,13 +833,12 @@ impl super::BlackboxServer {
             if !has_eligible_attachment {
                 return (
                     candidate.producer_id.clone(),
-                    AutoAdvanceOutcome::RefChanged,
+                    AcceptanceOutcome::NoAttachedCheckout,
                 );
             }
         }
         drop(pinned);
 
-        let audit_reason = auto_publish_audit_reason(&owning_producer);
         let outcome = publish_from_ready_candidate(
             store,
             runtime,
@@ -850,21 +849,17 @@ impl super::BlackboxServer {
             PublisherPublishMode::Establish,
             snapshot.epoch(),
             false,
-            AutoAdvanceGrantUpdate::Set {
-                enabled: true,
-                reason: audit_reason,
-            },
         );
         match outcome {
             Ok(receipt) => (
                 owning_producer,
-                AutoAdvanceOutcome::Accepted {
+                AcceptanceOutcome::Accepted {
                     generation_id: receipt.generation_id().to_string(),
                 },
             ),
             Err(error) => (
                 owning_producer,
-                AutoAdvanceOutcome::from_publish_error(&error),
+                AcceptanceOutcome::from_publish_error(&error),
             ),
         }
     }
@@ -876,7 +871,7 @@ mod tests {
 
     #[test]
     fn a_candidate_may_be_attempted_exactly_once() {
-        let ledger = PublisherAutoAdvanceLedger::default();
+        let ledger = CandidateAcceptanceLedger::default();
         assert!(ledger.claim_attempt("p_one", "kps_a"));
         assert!(!ledger.claim_attempt("p_one", "kps_a"));
         assert!(
@@ -891,7 +886,7 @@ mod tests {
 
     #[test]
     fn the_attempt_memory_is_bounded_per_project() {
-        let ledger = PublisherAutoAdvanceLedger::default();
+        let ledger = CandidateAcceptanceLedger::default();
         for index in 0..(MAX_ATTEMPTED_PER_PROJECT + 8) {
             assert!(ledger.claim_attempt("p_one", &format!("kps_{index}")));
         }
@@ -903,24 +898,21 @@ mod tests {
     }
 
     #[test]
-    fn the_policy_audit_reason_names_the_policy_producer_and_source() {
-        let reason = policy_audit_reason("producer-a", "kps_abc");
-        assert!(reason.starts_with("policy:auto_advance"), "{reason}");
-        assert!(reason.contains("producer=producer-a"), "{reason}");
-        assert!(reason.contains("source=kps_abc"), "{reason}");
-        assert!(reason.len() <= MAX_AUDIT_REASON_BYTES);
-    }
-
-    #[test]
-    fn the_auto_publish_audit_reason_names_the_policy_and_producer() {
+    fn the_audit_reason_names_the_kind_producer_and_source() {
         assert_eq!(
-            auto_publish_audit_reason("producer-a"),
-            "policy:auto_publish producer=producer-a"
+            acceptance_audit_reason(false, "producer-a", "kps_abc"),
+            "acceptance:advance producer=producer-a source=kps_abc"
         );
+        assert_eq!(
+            acceptance_audit_reason(true, "producer-a", "kps_abc"),
+            "acceptance:establish producer=producer-a source=kps_abc"
+        );
+        let long = acceptance_audit_reason(false, &"p".repeat(2048), "kps_abc");
+        assert!(long.len() <= MAX_AUDIT_REASON_BYTES);
     }
 
     #[test]
-    fn auto_publish_ref_validation_refuses_non_branch_refs() {
+    fn establish_ref_validation_refuses_non_branch_refs() {
         assert!(is_full_branch_ref("refs/heads/main"));
         assert!(!is_full_branch_ref("refs/heads/"));
         assert!(!is_full_branch_ref("refs/tags/v1"));
@@ -929,12 +921,12 @@ mod tests {
 
     #[test]
     fn a_refusal_keeps_the_refusing_layers_error_code() {
-        let outcome = AutoAdvanceOutcome::refused(&anyhow::anyhow!(
+        let outcome = AcceptanceOutcome::refused(&anyhow::anyhow!(
             "error.project_catalog_stale_epoch: the catalog changed"
         ));
         assert_eq!(
             outcome,
-            AutoAdvanceOutcome::Refused {
+            AcceptanceOutcome::Refused {
                 code: "error.project_catalog_stale_epoch".into(),
                 detail: "the catalog changed".into(),
                 may_have_swapped: false,
@@ -945,21 +937,20 @@ mod tests {
 
     #[test]
     fn an_uncoded_failure_still_reports_a_stable_code() {
-        let outcome = AutoAdvanceOutcome::refused(&anyhow::anyhow!("something unstructured"));
-        let AutoAdvanceOutcome::Refused { code, detail, .. } = outcome else {
+        let outcome = AcceptanceOutcome::refused(&anyhow::anyhow!("something unstructured"));
+        let AcceptanceOutcome::Refused { code, detail, .. } = outcome else {
             panic!("expected a refusal");
         };
-        assert_eq!(code, "error.accepted_publication_auto_advance_failed");
+        assert_eq!(code, "error.accepted_publication_acceptance_failed");
         assert_eq!(detail, "something unstructured");
     }
 
-    /// The convergence trigger is the operator tool's, not "accepted only".
     /// A refusal raised at or after the swap left the new pointer
     /// installed, so every projection built from accepted content has to
     /// be reconverged even though the attempt reported an error.
     #[test]
     fn a_refusal_that_reached_the_swap_still_obliges_convergence() {
-        let swapped = AutoAdvanceOutcome::from_publish_error(
+        let swapped = AcceptanceOutcome::from_publish_error(
             &PublishError::refusal("error.accepted_publication_invalid_generation", "read-back")
                 .with_swap_uncertainty_for_test(true),
         );
@@ -967,39 +958,48 @@ mod tests {
             swapped.requires_convergence(),
             "a swap-uncertain refusal moves the pointer and must reconverge"
         );
-        let refused_before_the_swap = AutoAdvanceOutcome::from_publish_error(
+        let refused_before_the_swap = AcceptanceOutcome::from_publish_error(
             &PublishError::refusal("error.project_catalog_stale_epoch", "epoch moved"),
         );
         assert!(!refused_before_the_swap.requires_convergence());
         assert!(
-            AutoAdvanceOutcome::Accepted {
+            AcceptanceOutcome::Accepted {
                 generation_id: "apg_x".into(),
             }
             .requires_convergence()
         );
-        assert!(!AutoAdvanceOutcome::PolicyDisabled.requires_convergence());
-        assert!(!AutoAdvanceOutcome::AlreadyAttempted.requires_convergence());
+        assert!(!AcceptanceOutcome::RefChanged.requires_convergence());
+        assert!(!AcceptanceOutcome::AlreadyAttempted.requires_convergence());
+    }
+
+    #[test]
+    fn operator_outcomes_are_distinguished_from_benign_skips() {
+        assert!(AcceptanceOutcome::RefChanged.needs_operator());
+        assert!(AcceptanceOutcome::NoOwningProducer.needs_operator());
+        assert!(!AcceptanceOutcome::AlreadyAccepted.needs_operator());
+        assert!(!AcceptanceOutcome::AlreadyAttempted.needs_operator());
+        assert!(!AcceptanceOutcome::CatalogInactive.needs_operator());
     }
 
     #[test]
     fn the_ledger_reports_the_last_attempt_per_project() {
-        let ledger = PublisherAutoAdvanceLedger::default();
+        let ledger = CandidateAcceptanceLedger::default();
         assert_eq!(ledger.last_attempt("p_one"), None);
         ledger.record(
             "p_one",
-            AutoAdvanceAttempt {
+            AcceptanceAttempt {
                 source_generation_id: "kps_a".into(),
                 producer_id: "producer-a".into(),
-                outcome: AutoAdvanceOutcome::PolicyDisabled,
+                outcome: AcceptanceOutcome::RefChanged,
                 at_unix_secs: 10,
             },
         );
         ledger.record(
             "p_one",
-            AutoAdvanceAttempt {
+            AcceptanceAttempt {
                 source_generation_id: "kps_b".into(),
                 producer_id: "producer-a".into(),
-                outcome: AutoAdvanceOutcome::Accepted {
+                outcome: AcceptanceOutcome::Accepted {
                     generation_id: "apg_x".into(),
                 },
                 at_unix_secs: 20,

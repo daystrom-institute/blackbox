@@ -21,7 +21,7 @@ use bbox_corpus_core::project_catalog::{
 };
 
 use crate::accepted_publication_runtime::{
-    AcceptedPublicationRuntime, AcceptedPublicationSourceBinding, AutoAdvanceGrantUpdate,
+    AcceptedPublicationRuntime, AcceptedPublicationSourceBinding,
     ERROR_ACCEPTED_PUBLICATION_REF_MOVED, ERROR_ACCEPTED_PUBLICATION_SCOPE_ADVANCE_REQUIRED,
     PublishError, PublishReceipt, PublishRequest, PublishSources, PublisherPublishMode,
 };
@@ -856,9 +856,6 @@ pub struct PublisherPublishRequest {
     pub full_ref: String,
     pub expected_epoch: u64,
     pub dry_run: bool,
-    /// Operator authority over the project's standing auto-advance grant.
-    /// Defaults to `Inherit`, which neither installs nor revokes one.
-    pub auto_advance: AutoAdvanceGrantUpdate,
 }
 
 pub struct PublisherCandidatePublishProbe {
@@ -878,10 +875,6 @@ pub struct PublisherCandidatePublishRequest {
     pub source_generation_id: String,
     pub expected_epoch: u64,
     pub dry_run: bool,
-    /// Operator authority over the project's standing auto-advance grant.
-    /// A policy-driven acceptance always passes `Inherit`: the producer
-    /// never widens its own grant.
-    pub auto_advance: AutoAdvanceGrantUpdate,
 }
 
 pub fn preflight_candidate_publish_authority(
@@ -1001,7 +994,6 @@ pub fn publish_accepted_publication(
             full_ref: request.full_ref.clone(),
             accepted_commit: probe.resolved_commit.clone(),
             dry_run: request.dry_run,
-            auto_advance: request.auto_advance.clone(),
         },
         probe.sources,
     )?;
@@ -1075,7 +1067,6 @@ pub fn publish_accepted_publication_candidate(
             full_ref: probe.full_ref,
             accepted_commit: probe.accepted_commit,
             dry_run: request.dry_run,
-            auto_advance: request.auto_advance.clone(),
         },
         probe.sources,
     )?;
@@ -7831,8 +7822,8 @@ mod tests {
 mod publisher_publish_tests {
     use super::*;
     use crate::accepted_publication_runtime::{
-        AcceptedPublicationRuntime, AcceptedPublicationSourceBinding, AutoAdvanceGrantUpdate,
-        PublishSourceFile, PublisherPublishMode,
+        AcceptedPublicationRuntime, AcceptedPublicationSourceBinding, PublishSourceFile,
+        PublisherPublishMode,
     };
     use crate::accepted_publication_store::fixtures;
     use bbox_corpus_core::project_catalog::CorpusProject;
@@ -8051,7 +8042,6 @@ mod publisher_publish_tests {
                 full_ref: "refs/heads/main".into(),
                 expected_epoch: self.epoch(),
                 dry_run: false,
-                auto_advance: AutoAdvanceGrantUpdate::Inherit,
             }
         }
 
@@ -8066,7 +8056,6 @@ mod publisher_publish_tests {
                 source_generation_id: SOURCE_GENERATION.into(),
                 expected_epoch: self.epoch(),
                 dry_run,
-                auto_advance: AutoAdvanceGrantUpdate::Inherit,
             }
         }
 
