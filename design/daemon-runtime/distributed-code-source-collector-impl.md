@@ -36,8 +36,8 @@ At the end of this slice:
   cache and requests only missing blobs;
 - a completed generation is indexed from its immutable manifest without the
   corpus process opening the producer checkout;
-- all code-search and graph readers see one activated project-file generation,
-  while staged and retained generations remain invisible;
+- all code-search and inspection readers see one activated project-file
+  generation, while staged and retained generations remain invisible;
 - a collector-owned scope stops local project-file walking only after its first
   collected generation activates successfully;
 - disabling collector ownership performs an explicit, successful local rebuild
@@ -476,15 +476,15 @@ collected selector. This rule covers old vectors even before physical
 retirement. Non-project-file corpus lanes are unaffected.
 
 The daemon publishes an immutable `CodeReadView` containing the active selector
-map and an `Arc<EdgeIndex>` built from the same prospective manifest index.
-Search and graph handlers capture one view at request start. Existing direct
-`state.edge_index` reads migrate to that view. This makes one request internally
-generation-consistent without a global request lock.
+map derived from the same prospective manifest index, the searcher, the catalog
+epoch, and the Git overlay map. Search and inspection handlers capture one view
+at request start. This makes one request internally generation-consistent
+without a global request lock. The daemon keeps no in-memory edge graph.
 
-All code paths that rebuild the in-memory edge index, including explicit-edge
-append, background sidecar detection, local project reindex, and startup, must
-publish a replacement `CodeReadView` rather than mutate a separate edge-index
-lock. Direct inspection of an explicitly supplied historical V2 ref may remain
+Code-source activation publishes a complete replacement `CodeReadView`
+directly. The code read view refresher republishes it when the manifest
+authority, the registered corpus project set, or the catalog epoch changes.
+Direct inspection of an explicitly supplied historical V2 ref may remain
 available, but discovery and result expansion use the captured active view and
 cannot surface staged or retired refs.
 
@@ -502,8 +502,8 @@ Finalization does not immediately change readers. The indexing actor performs:
    Activation metadata records the committed document count and a full
    SHA-256 digest over the sorted stored entity ids for later preservation
    checks.
-4. Build a prospective `EdgeIndex` from an in-memory manifest index selecting
-   the new snapshot, and build the corresponding active-selector map.
+4. Build the prospective active-selector map from an in-memory manifest index
+   selecting the new snapshot.
 5. Under the project activation lock, confirm the generation is still newest,
    atomically replace `manifest-index.json`, then atomically swap the in-memory
    `CodeReadView`. Requests that began earlier retain the old complete view;
@@ -536,13 +536,14 @@ client acknowledgement.
 `manifest-index.json` is a multi-project file, so per-project locks alone are
 not sufficient. Every read-modify-write of it routes through one manifest
 coordinator owned by the serialized indexing actor. Local snapshot updates,
-collected activation, cutback, and background edge rebuilds cannot write the
-file independently. The coordinator preserves unrelated workspace rows and
-publishes the matching `CodeReadView` after each successful replacement.
+collected activation, and cutback cannot write the file independently. The
+coordinator preserves unrelated workspace rows and publishes the matching
+`CodeReadView` after each successful replacement.
 
-Embeddings are not an activation prerequisite. Lexical search and graph become
-active together; vectors arrive asynchronously and inactive old vectors are
-filtered. Embedding retry already derives from indexed documents.
+Embeddings are not an activation prerequisite. Lexical search and the edge
+snapshot become active together; vectors arrive asynchronously and inactive
+old vectors are filtered. Embedding retry already derives from indexed
+documents.
 
 ### 9.4 Reindex and purge integration
 
@@ -700,7 +701,7 @@ HTTP errors use stable codes and appropriate statuses:
   state.
 
 Handlers do not hold `SharedState` locks across body reads, hashing, filesystem
-I/O, chunking, Tantivy commits, or edge-index construction. Blocking work runs
+I/O, chunking, Tantivy commits, or read-view construction. Blocking work runs
 off Tokio workers. Store operations use per-upload and per-project locks with a
 fixed order: auth snapshot, upload lock, project activation lock, serialized
 manifest coordinator, store GC lock. No code takes those locks in reverse.
@@ -750,7 +751,7 @@ both the previous auth table and previous desired-source table in force.
 3. Add writer-actor staging acknowledgement and the combined manifest/read-view
    activation sequence.
 4. Integrate active sources into incremental scan, full rebuild, purge,
-   embedding, edge rebuild, startup recovery, and storage GC.
+   embedding, edge snapshot materialization, startup recovery, and storage GC.
 5. Split current-file and Git-history phases in summaries and control flow.
 
 ### Phase 3: Thin producer and overlap controls
@@ -779,9 +780,9 @@ Unit and integration coverage must include:
 - finalize replay, out-of-order generations, concurrent finalize, restart at
   every upload/activation journal state, blob-cache loss, GC versus active/open
   references, and disk-write failure;
-- staged generations absent from lexical, code-symbol, hybrid-vector, inspect
-  expansion, and graph discovery; old requests retaining the old read view;
-  new requests receiving the new selector and edge snapshot together;
+- staged generations absent from lexical, code-symbol, hybrid-vector, and
+  inspect expansion; old requests retaining the old read view; new requests
+  receiving the new selector map;
 - a vector-only hybrid query after cutover returning no V1 local project-file
   or symbol hit, plus local-selector retirement waiting for old read views;
 - incremental and full rebuild from an active collected manifest, no local file
@@ -824,7 +825,7 @@ returns `PASS`.
 
 This slice is complete when one configured base root can publish, activate,
 refresh, survive restart/full rebuild/cache loss, and cut back while search and
-graph readers expose one generation and the producer dependency ceiling holds.
+inspection readers expose one generation and the producer dependency ceiling holds.
 The daemon must perform no project-file walk for that scope in `collected`
 state.
 

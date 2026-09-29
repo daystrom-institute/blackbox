@@ -129,8 +129,8 @@ bbox_embed_status()
 bbox_reembed(route="code")
 ```
 
-Graph edges are rebuilt from sidecars and live stores. If a legacy sidecar grows
-large, `bbox_edge_compact` can compact one project at a time.
+If a legacy top-level edge sidecar grows large, `bbox_edge_compact` can compact
+one project at a time.
 
 ## Checkout On Another Host
 
@@ -172,10 +172,6 @@ generation (or nothing, before the first acceptance).
 `examples/graph-live-exercise.sh` runs the sequence end to end
 (`step_publish` uploads the candidate, `step_accept` confirms its acceptance).
 
-A successful acceptance triggers a full rebuild of the complete graph view.
-Graph queries, including `bbox_project_graph_list`, `bbox_project_graph_describe`,
-`bbox_inspect_entity`, and `bbox_find_paths`, can answer
-`error.edge_index_warming` for the few minutes the rebuild takes on a large
-index. That is the daemon holding queries to a complete old view or a
-complete new view rather than ever answering a half-built one; it is not a
-failure. Retry the call rather than treating it as one.
+After a candidate is accepted, graph queries (`bbox_project_graph_list`,
+`bbox_project_graph_describe`, `bbox_inspect_entity` on a vertex ref) serve
+the newly accepted generation.

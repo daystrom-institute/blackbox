@@ -76,7 +76,7 @@ disposition below is one config edit.
 
 | Family | Keep | Ops-only | Delete / Fold | Open |
 | --- | --- | --- | --- | --- |
-| Retrieval | `bbox_hybrid_search`, `bbox_context`, `bbox_messages`, `bbox_session`, `bbox_sessions_list`, `bbox_inspect_entity` | `bbox_stats` | Fold `bbox_search` into `bbox_hybrid_search`. Delete `bbox_cite`, `bbox_topics`, `bbox_discover_seed_entities`, `bbox_ref_size`. Delete `bbox_corpus_search` and repoint the harness `corpus_search` alias at `bbox_hybrid_search`. | `bbox_find_paths`, `bbox_bundle_evidence`, `bbox_describe_schema`, `bbox_tool_calls` |
+| Retrieval | `bbox_hybrid_search`, `bbox_context`, `bbox_messages`, `bbox_session`, `bbox_sessions_list`, `bbox_inspect_entity` | `bbox_stats` | Fold `bbox_search` into `bbox_hybrid_search`. Delete `bbox_cite`, `bbox_topics`, `bbox_discover_seed_entities`, `bbox_ref_size`. Delete `bbox_corpus_search` and repoint the harness `corpus_search` alias at `bbox_hybrid_search`. Delete `bbox_find_paths`, `bbox_bundle_evidence`, `bbox_describe_schema` (graph family). | `bbox_tool_calls` |
 | Knowledge | `bbox_knowledge`, `bbox_learn`, `bbox_forget`, `bbox_render` | | Fold `bbox_remember` into `bbox_learn` (`render=false`). Delete `bbox_decide`, `bbox_knowledge_link`, `bbox_lint`, `bbox_review`, `bbox_absorb`, `bbox_bootstrap`. | |
 | Work tracking | `bbox_thread`, `bbox_thread_list`, `bbox_gap`, `bbox_gaps`, `bbox_gap_update`, `bbox_gap_resolve` | | Delete `bbox_inbox`, `bbox_pin`, `bbox_note`, `bbox_notes`, `bbox_note_resolve` | |
 | Dispatch | `bro_exec`, `bro_resume`, `bro_status`, `bro_wait`, `bro_when_all`, `bro_when_any`, `bro_steer`, `bro_cancel`, `bro_dashboard`, `bro_providers`, `bro_brofile` | `bro_prune`, `bro_allocator_status`, `bro_allocator_trace`, `bro_allocator_probe`, `bro_mcp` | Delete `bro_retro`, `bro_broadcast`, `bro_interrupt`, `bro_report`, `bro_agent_list`, `bro_agent_get`, `bro_agent_describe`, `bro_agent_search`, `bro_agent_dispatch` | `bro_team` |
@@ -87,7 +87,7 @@ disposition below is one config edit.
 | Provenance | | | Delete `bbox_blame`, `bbox_provenance_export`, `_export_plan`, `_import` (Stage 5) | |
 | Surfaces | | | Delete `bbox_mcp_surface` (Stage 1) | |
 
-End state: 28 agent-facing tools, 36 ops-only, 39 deleted or folded, 5 open.
+End state: 28 agent-facing tools, 36 ops-only, 42 deleted or folded, 2 open.
 
 Per-tool notes:
 
@@ -231,9 +231,8 @@ Deleted:
   `bbox-git-source` and `bbox-code-collector`;
   `src/server/provenance_import.rs` and `provenance_authority.rs`.
 - `EDITED_FILE` and `READ_FILE` edge emission in `tool_edges.rs`, the
-  `anchor.*` metadata, `commit_anchor_index` in `EdgeIndex`, their
-  sidecar and migration handling, the file-to-transcript neighbour views in
-  `bbox-providers`, and their entries in `describe_schema`.
+  `anchor.*` metadata, `commit_anchor_index`, their sidecar and migration
+  handling, and the file-to-transcript neighbour views in `bbox-providers`.
 - The stored file-touch edges, purged from the durable lanes at startup.
 
 The Git-source contract, store and HTTP routes carry Git history only; the
@@ -269,8 +268,8 @@ Removed:
 - **Startup legacy-path migration** (`legacy_migration.rs`), which moved
   `~/.claude-shared` and `~/.bro` state into the configured paths.
 - **`bbox_storage_migrate_legacy_edges`** with its extraction planner and
-  apply path. Startup recovery of pending edge migrations and the loader's
-  reading of the explicit and observed lanes stay.
+  apply path, and startup recovery of pending edge migrations. The explicit
+  and observed lanes are retired at startup (graph family below).
 
 Kept, each with the condition that gates its removal:
 
@@ -298,13 +297,30 @@ Also in this stage:
 `bbox_project_scope_migrate` is the v2 scope move (relpath or repository
 authority), not v1 migration code; it is ops-only.
 
+## Graph family
+
+`bbox_find_paths`, `bbox_bundle_evidence` and `bbox_describe_schema` are
+deleted with their path cache. `sm-agentic-opening-sequence` keeps its id and
+names three primitives: `bbox_knowledge` (recall), `bbox_hybrid_search`
+(seeds) and `bbox_inspect_entity` (confirm properties and provenance).
+
+The daemon keeps no in-memory edge graph. `bbox_inspect_entity` reads an
+entity's properties from its provider's store. Only project graph vertices
+carry edges (their graph edges and evidence bindings); a project file or
+knowledge entry named by an evidence binding shows that binding. `symbol:`
+and `symbol_v2:` refs return `error.not_found`.
+
+Reindex writes no transcript tool edges, and thread and session-brofile edges
+are not materialized. Code-structure edges stay in snapshot `project.jsonl`
+members and `derived/project` staging; Git commit edges stay in `derived/git`
+and snapshot `git-current.jsonl`. The edge sidecar manifest, snapshots, dirty
+overlays and Git overlays remain code-source activation authority. A one-time
+startup pass removes `edges/observed/`, `edges/explicit/`,
+`edges/derived/project/` and `edges/migrations/` and stamps
+`edges/.versions/legacy-edge-lanes-retired-v1`.
+
 ## Open decisions
 
-- **Graph family.** After Stage 5 the edge index holds thread, session,
-  brofile and knowledge relationships. Decide whether `bbox_find_paths`,
-  `bbox_bundle_evidence` and `bbox_describe_schema` still earn their place,
-  and with them how much of the edge store and sidecar remains.
-  `bbox_inspect_entity` stays as the reader for refs returned by search.
 - **Knowledge publishing machinery.** Provisional and published overlays
   and the knowledge-source crates publish project entries that already live
   in git. Revisit once Stage 4 has slimmed the model.

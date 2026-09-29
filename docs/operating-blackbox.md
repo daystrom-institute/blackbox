@@ -29,7 +29,7 @@ daemon:
 bbox_stats()
 bbox_embed_status()
 bbox_project_list()
-bbox_describe_schema()
+bbox_doctor(section="snapshots")
 bbox_hybrid_search(query="blackbox daemon", limit=5)
 ```
 
@@ -40,7 +40,7 @@ Healthy output usually means:
 | `bbox_stats` | Non-zero indexed documents; counts may be cached up to 60 seconds | Check the relevant source publication and search results; totals do not assess source coverage or freshness |
 | `bbox_embed_status` | `available: true`, `last_error: null`; queue drains after churn | Fix provider/API key, then `bbox_reembed(route="...")` if needed |
 | `bbox_project_list` | Expected repos registered with stable `project_id`s | Register missing repos before blaming search |
-| `bbox_describe_schema` | Entity populations are non-zero for transcripts/project files/knowledge | Reindex and watch EdgeIndex rebuild logs |
+| `bbox_doctor(section="snapshots")` | Snapshot manifest present and valid; selected members present; Git overlays pinned in the read view | Check code-source collection and activation |
 | `bbox_hybrid_search` | Results include useful refs and sources; project filter works | Check index freshness, embedding status, and project registration |
 
 The daemon's own log is the workload's container log stream.
@@ -111,20 +111,21 @@ Then watch the daemon log. Expected after a normal restart:
 - Existing index opens.
 - Background reindex starts after its startup delay.
 - Embedding queues may receive new/changed docs.
-- EdgeIndex rebuilds if the indexed corpus grew.
+- Before bind, a one-time pass removes the retired edge families
+  (`edges/observed/`, `edges/explicit/`, `edges/derived/project/`,
+  `edges/migrations/`) and stamps
+  `edges/.versions/legacy-edge-lanes-retired-v1`; later starts cost one stat.
 
 Expected after a schema change:
 
 - Log contains `dropping transcript index for schema migration`.
 - Reindex takes minutes on a large corpus.
-- EdgeIndex rebuild follows after the document count changes.
 
 Smoke the daemon after the journal quiets:
 
 ```text
 bbox_stats()
 bbox_embed_status()
-bbox_describe_schema()
 bbox_hybrid_search(query="recent changes", project="/abs/path/to/repo", limit=5)
 ```
 
@@ -307,7 +308,6 @@ Watch for:
 
 ```text
 auto-reindex: indexed N files (M docs)
-edge-index watcher: corpus grew, EdgeIndex rebuilt
 ```
 
 The rebuildable index lives at:
@@ -335,7 +335,7 @@ bro mcp call bbox_project_register '{"path":"/abs/path/to/repo"}' --surface ops
 ```
 
 Registration records the root in `~/.local/state/blackbox/projects.json`,
-starts an incremental reindex, and triggers graph projection work. Large
+starts an incremental reindex, and nudges the code read view refresher. Large
 repos can take 10+ minutes on first index.
 
 If source navigation or refactor tools cannot see a repo, verify in this
@@ -421,7 +421,7 @@ share the same fix.
 | Area | What grows | Normal action |
 |---|---|---|
 | Vector partitions | WAL records under `~/.local/state/blackbox/vectors/` | Automatic background compactor |
-| Edge sidecars | JSONL graph sidecars under `~/.local/state/blackbox/edges/` | `bbox_edge_compact` when sidecars grow from repeated full reindex replay |
+| Edge sidecars | Legacy top-level JSONL sidecars under `~/.local/state/blackbox/edges/` | `bbox_edge_compact` when sidecars grow from repeated full reindex replay |
 
 ### Vector compaction
 
@@ -438,8 +438,8 @@ bbox_reembed(route="<route>")
 
 ### Edge sidecar compaction
 
-Project graph sidecars can grow when old derived edges are appended by
-repeated full refreshes. Compact one project at a time.
+Legacy top-level edge sidecars can grow when old derived edges are
+appended by repeated full refreshes. Compact one project at a time.
 
 First dry-run:
 
@@ -450,23 +450,16 @@ bbox_edge_compact(project_id="d723917f", apply=false)
 Review removed/retained counts. If the scope is expected, apply:
 
 ```text
-bbox_edge_compact(project_id="d723917f", apply=true, rebuild=false)
+bbox_edge_compact(project_id="d723917f", apply=true)
 ```
 
-When compacting several projects, leave `rebuild=false` until the last
-one. On the final project:
-
-```text
-bbox_edge_compact(project_id="d723917f", apply=true, rebuild=true)
-```
-
-The tool keeps explicit and malformed lines and removes legacy
+The tool keeps explicit, provenance and malformed lines and removes legacy
 derived edges. It writes a backup before replacing the sidecar.
 
 ## Backup and restore boundary
 
 Protect durable JSON stores and installed operator artifacts. Rebuild
-indexes, vectors, edge projections, and git metadata.
+indexes, vectors, edge sidecars, and git metadata.
 
 Protect:
 
@@ -487,7 +480,7 @@ Rebuild:
 
 - `~/.local/share/blackbox/index/` with `bbox_reindex(full=true)`
 - `~/.local/state/blackbox/vectors/` with `bbox_reembed(route="...")`
-- `~/.local/state/blackbox/edges/` via reindex/EdgeIndex rebuild
+- `~/.local/state/blackbox/edges/` via reindex
 - `~/.local/state/blackbox/git_meta/` via the next reindex
 
 The longer backup checklist lives in [Operations](operations.md).
@@ -516,7 +509,6 @@ the transaction root as a whole.
 | Search returns deleted files | project registration, index age | `bbox_reindex(full=true)` |
 | Hybrid search is lexical only | `bbox_embed_status` | Fix route/provider, then `bbox_reembed(route="...")` |
 | Code nav cannot see repo | `bbox_project_list` | `bro mcp call bbox_project_register '{"path":"/abs/path"}' --surface ops` |
-| Graph paths look sparse | `bbox_describe_schema`, EdgeIndex log lines | Reindex, then wait for EdgeIndex rebuild |
 | Disk grows under `vectors/` | daemon log compaction lines | Usually wait; re-embed only after provider/data issues |
 | Disk grows under `edges/` | sidecar size, project id | Dry-run `bbox_edge_compact` |
 | Provider markdown stale | rendered files | `bbox_render(scope="global")` on the daemon host; `bro render global` on any other operator host (pulls the plan from a remote daemon) |
@@ -539,7 +531,7 @@ host with `bro render global`.
 | `~/.local/share/blackbox/index/` | Rebuildable Tantivy index |
 | `~/.local/share/blackbox/memories/` | Shipped system memories and runbooks |
 | `~/.local/state/blackbox/vectors/` | Rebuildable vector partitions |
-| `~/.local/state/blackbox/edges/` | Rebuildable graph sidecars |
+| `~/.local/state/blackbox/edges/` | Edge sidecars: snapshot manifest, snapshots and overlays |
 | `~/.local/state/blackbox/git_meta/` | Rebuildable git fingerprints |
 | `~/.local/state/blackbox/fleetd.sock` | Prod daemon<->fleetd socket |
 | `~/.local/state/blackbox/fleetd.token` | Prod fleetd shared secret (owner-only) |

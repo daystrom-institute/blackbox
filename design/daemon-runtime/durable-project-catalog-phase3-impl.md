@@ -30,7 +30,7 @@ bridge parity harness:
 
 1. A remote-only catalog fixture project with an active collected generation
    and zero attachments activates, incrementally rebuilds, fully rebuilds,
-   serves lexical and hybrid search, exposes graph data, and survives GC with
+   serves lexical and hybrid search, and survives GC with
    `DenyCheckoutAccess` asserted and zero lease acquisitions on the collected
    paths.
 2. New project-file documents contain no corpus-host absolute path. They carry
@@ -365,8 +365,9 @@ observable stays at parity, enforced by the parity harness:
    transcript lanes, result sets can only grow; the project-file
    literal-lane narrowing at the P3-E cut is the separate enumerated change
    in item 2, not covered by this sentence.
-5. The background storage GC pass and runtime edge rebuild seed from
-   `corpus_project_ids` (F3/F4). In bridge mode the two sets are identical
+5. The background storage GC pass seeds from `corpus_project_ids` (F4). The
+   daemon keeps no runtime edge rebuild (F3); the code read view refresher
+   tracks the registered corpus project set. In bridge mode the two sets are identical
    by construction (every registered project is attached), so this is a
    no-op there; the parity harness asserts exactly that.
 6. Defect repair discovered by the P3-B bridge bootsmoke: the first
@@ -410,9 +411,8 @@ structure. All construction sites are updated: the four runtime republish
 writers, the startup initial construction in `src/server/open.rs` (which
 must seed `catalog_epoch` and `git_overlays` from the boot snapshot), and
 the three test constructors; the searcher-only writer
-(`publish_code_read_searcher`) must clone the new fields through exactly as
-it clones `edge_index` today, with a regression test for the drop-on-commit
-bug class.
+(`publish_code_read_searcher`) must clone the new fields through unchanged,
+with a regression test for the drop-on-commit bug class.
 
 ### 4.6 Identity and keying decisions
 
@@ -631,8 +631,8 @@ Ownership: `bbox-indexing` (reindex, writer_actor), `src/server/*`,
    normally on that pass and clear the health record; detach/unregister and
    retire also clear the state by removing the project from `Local`
    planning. Both escapes carry test rows.
-3. F3 and F4: the runtime edge rebuild and the background storage GC pass
-   seed from `corpus_project_ids`. F8 is a catalog-mode-only change: in
+3. F4: the background storage GC pass seeds from `corpus_project_ids`; the
+   daemon keeps no runtime edge rebuild (F3). F8 is a catalog-mode-only change: in
    catalog mode the hourly GC calls `gc_blobs_for_scopes` with the catalog
    scope set (LegacyLocal projects contribute their activation/anchor roots
    as today; they have no `PublishedScope` and add no scope entry). In
@@ -661,8 +661,7 @@ refusal tests on both purge loops, plus the acknowledgement round trip
 (`accept_empty_projects` purges and clears the health record; detach clears
 it too); detached-local preservation verification against the per-project
 freshness inventory, including the mismatch-aborts-before-delete arm;
-edge-set and GC-set equality tests between startup, runtime rebuild, tool,
-and background pass; bridge blob-GC parity (empty-scope call preserved,
+GC-set equality tests between the tool and the background pass; bridge blob-GC parity (empty-scope call preserved,
 protected set and reclaim behavior byte-unchanged) and catalog-mode
 retained-only scope protection; filter lane test proving a resolved id
 reaches project-file docs with the literal lane removed from the fixture;
@@ -1020,7 +1019,7 @@ the Phase 3 acceptance block, executed in CI and live:
    active collected generation and stale history, and a non-Git LegacyLocal
    project.
 2. Remote-only assertions: activation, incremental, full rebuild, lexical
-   and hybrid search, inspect expansion, graph discovery, and GC complete
+   and hybrid search, inspect expansion, and GC complete
    under `DenyCheckoutAccess` with zero leases (observation counters
    asserted); active selectors and edge sets include the catalog-only id.
 3. Replacement assertions: forced schema replacement rematerializes the
@@ -1047,8 +1046,8 @@ the Phase 3 acceptance block, executed in CI and live:
   advances catalog state through the regular transact CAS; the rebuild
   manifest is written before, and verified after, the destructive step it
   authorizes.
-- Read views pin catalog epoch, selector map, overlay map, searcher, and
-  edge snapshot at request start; writers replace whole views and preserve
+- Read views pin catalog epoch, selector map, overlay map, and searcher at
+  request start; writers replace whole views and preserve
   fields they do not own.
 - The single-writer actor discipline is preserved: materializer index scans
   run through the existing sanctioned read paths; generation re-emission

@@ -1,17 +1,16 @@
 # bbox-providers — entity providers for graph inspection
 
-- **Symbols are edge-projected vertices: no entity doc exists.** The
-  indexer derives DEFINED_IN/CONTAINS_SYMBOL/CALLS edges for `symbol:` /
-  `symbol_v2:` refs but never writes a doc the entity index can resolve
-  (gap-496fe07f). Existence = edge participation: the symbol providers
-  treat `entity_properties` as enrichment and fall back to
-  `ctx.edge_index()` when it misses, stamping `source=edge_projection`.
-  Requiring an indexed doc here silently 404s every symbol vertex the
-  graph itself emits — that ran undetected in prod until 2026-06.
-- `ProviderContext::with_edge_index` is optional by design: call sites
-  that hold an edge-index read guard (the graph tool adapters) wire it;
-  without it the symbol providers keep the strict indexed-doc requirement.
-  A provider needing edges for existence must degrade closed, not guess.
+- **Providers are property readers.** Each loads its entity from its own
+  store. Only project graph vertices carry a neighborhood (their graph
+  edges and evidence bindings); every other provider returns an empty one
+  and no `recommended_next_hops`. A project file or knowledge entry named by
+  an evidence binding gets that binding from the context's evidence
+  resolver, so the edge is visible from both ends.
+- **Symbol refs have no existence proof.** The indexer writes no entity doc
+  a `symbol:` / `symbol_v2:` ref can resolve and the daemon keeps no edge
+  graph, so the symbol providers resolve a ref only where an indexed entity
+  doc backs it; otherwise they answer not found. A provider must degrade
+  closed, never infer existence from a well-formed ref.
 - A symbol's `defn_hash` IS the defining chunk's `chunk_hash`
   (`symbol_ref` in bbox-corpus-index project_files.rs) — current symbol
   refs were derivable from the retired `bbox_refactor_project_refs` MCP

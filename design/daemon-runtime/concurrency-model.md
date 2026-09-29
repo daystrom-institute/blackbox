@@ -31,14 +31,10 @@ brief: "Holistic concurrency architecture for blackboxd: current as-built map, t
 > holding it for the daemon lifetime (keeps boot initial build + cross-process
 > guard semantics; the queue, not the held lock, provides serialization).
 > Measured: idle mean poll 1791µs → ~236µs across the campaign; under-load
-> samples confounded by host rustc storms (see thread note 22). Wave 12
-> (2026-06-10 evening) closed the edge plane: `EdgeIndex::rebuild` split so
-> store read guards cover only the in-memory projections (the multi-GB
-> sidecar parse — measured 13–109s in prod — now runs guard-free on the
-> watcher thread); `bbox_thread` link / project unregister nudge the watcher
-> via a coalescing channel instead of rebuilding inline on tokio workers
-> (edges go eventually-consistent, ~seconds); gap-store mutations moved to
-> run_blocking; snapshot growth root-caused (one ~0.5GB generation per HEAD
+> samples confounded by host rustc storms (see thread note 22). The daemon
+> keeps no in-memory edge graph, so no edge rebuild holds store guards or runs
+> on a watcher thread. Wave 12 (2026-06-10 evening) moved gap-store mutations
+> to run_blocking; snapshot growth root-caused (one ~0.5GB generation per HEAD
 > commit, 14d age floor retained a 23.7GB week — maintenance GC default
 > tightened to 2d via `BLACKBOX_STORAGE_GC_SNAPSHOT_MAX_AGE_DAYS`, emptied
 > snapshot dirs now pruned). Waves 13–15 (2026-06-10/11) closed the
@@ -241,9 +237,8 @@ write enqueued mid-pass lands within seconds instead of failing LockBusy and
 waiting for the next cycle. LockBusy ceases to exist as a normal outcome
 (remaining only as the cross-*process* guard). `sync_knowledge_entry_to_index`
 becomes enqueue-and-return; the embed queue path is already decoupled and
-unchanged. Edge-index rebuild stops holding six guards: it clones the
-edge-relevant projections per store under sequential short reads, drops all
-guards, then scans sidecars.
+unchanged. The daemon keeps no in-memory edge graph, so the index plane has
+no edge rebuild that stacks store guards.
 
 ### 4.4 Dispatch plane: bounded ingest, published snapshots
 
@@ -310,7 +305,7 @@ worst-worker mean poll sustained >50ms under compile-free fleet load.
   sync MCP handlers to `spawn_blocking` wrappers. Batch note resolve.
 - **Phase 2 — index plane.** `IndexWriterActor`; route sync upserts + reindex
   passes through it; commit-boundary interleaving; retire fresh-writer sites
-  (A2). Edge rebuild snapshot inputs.
+  (A2).
 - **Phase 3 — dispatch plane.** Bounded event ring + status-snapshot publish;
   `RosterView`; tee/allocator I/O off the event path; tail decoration cache.
 - **Phase 4 — enforcement.** Lock-discipline lint pass: wrapper guard types

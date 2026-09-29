@@ -18,7 +18,7 @@ Related:
 - `src/mcp_tools/hybrid_search.rs` — `hybrid_search_typed`; the retrieval pipeline this harness grades.
 - `src/search/rrf.rs` — `fuse_rrf`. `src/search/rerank.rs` — `apply_rerank`.
 - `src/index/search.rs` - BM25 fetch (`hybrid_bm25_hits`).
-- `src/mcp_tools/inspect.rs`, `find_paths.rs`, `bundle_evidence.rs` — the traversal/bundling tools graded by Conditioned/EndToEnd modes.
+- `src/mcp_tools/inspect.rs`: `bbox_inspect_entity`, the property and provenance reader graded by Conditioned/EndToEnd modes.
 - `src/server/state.rs` — `SharedState::for_test`; isolated index construction for fixtures.
 - Spike provenance: `../daystrom-mk2/spikes/Daystrom.Spike.McpPoc/EvaluationHarness.cs`.
 
@@ -119,26 +119,20 @@ The first two are deterministic and need **no LLM**; only EndToEnd does.
   and at what rank? Isolates pure retrieval ranking. Emits the stage-funnel
   verdict per expected entity. This is the workhorse and the cheapest signal.
 - **Conditioned** — inject the *known-correct* seed ref, skip retrieval, and run
-  the downstream tools (`inspect_entity` → `find_paths` → `bundle_evidence`).
-  Does the expected *answer* entity surface given the right seed? Isolates
-  traversal/bundling from retrieval ranking — a Brick-2 lens regression shows
+  the downstream tool (`inspect_entity`, following project graph vertex edges
+  and evidence bindings where the seed carries them). Does the expected
+  *answer* entity surface given the right seed? Isolates inspection from
+  retrieval ranking; a Brick-2 lens regression shows
   here even when SearchOnly is green.
-- **EndToEnd** — `question → hybrid_search → pick top seed → inspect/paths →
-  bundle`. Full pipeline; the only mode whose seed selection and synthesis need
+- **EndToEnd**: `question → hybrid_search → pick top seed → inspect`. Full
+  pipeline; the only mode whose seed selection and synthesis need
   an agent turn (bounded LLM spend, see Run surface).
 
-## Bundle A/B (grades Brick 2's consolidation)
+## Bundle A/B
 
-Per query, compare two ways of answering and measure cost, not just
-correctness — the metric that proves "one path, many filters" beats parallel
-matchers:
-
-- **Bundle path:** single `bbox_bundle_evidence` over the funnel's top refs.
-- **Baseline path:** the manual sequence (`hybrid_search` + N `inspect_entity`
-  calls).
-- Record: answer-correctness, grounding (did it produce typed evidence/paths),
-  tool-call count, and token estimate. Aggregate into a reduction ratio
-  (Daystrom reported ~1 vs 3–4 calls and a token ratio per query).
+Outside the current surface: the MCP surface has no evidence-bundling tool, so
+there is no single-call bundled path to compare against the manual sequence
+(`hybrid_search` + N `inspect_entity` calls).
 
 ## Suite format & corpus isolation
 
@@ -185,7 +179,6 @@ meaningful against a corpus the harness fully owns.
 - **Failure-stage histogram** — the headline: count by `MissStage` across the
   suite, so the single highest-leverage fix is obvious.
 - `recall@k` at a couple of k values.
-- Bundle A/B: correctness/grounding deltas + tool-call and token reductions.
 - Cross-run JSON so a tuning change's effect is a diff, not a vibe.
 
 ## Build order (net-new code)
@@ -194,8 +187,8 @@ meaningful against a corpus the harness fully owns.
    (`SharedState::for_test`).
 2. `hybrid_search_traced` trace hook + `StageTrace → MissStage` mapping.
 3. SearchOnly runner + failure-stage histogram + JSON/markdown emitter.
-4. Conditioned runner (seed injection through inspect/paths/bundle).
-5. Bundle A/B comparator.
+4. Conditioned runner (seed injection through inspect).
+5. Bundle A/B comparator: outside the current surface (no evidence-bundling tool).
 6. EndToEnd runner (flagged, budgeted) — last, and optional for the Brick 2 gate.
 
 Steps 1–3 are the minimum that makes Brick 2 measurable; 4–6 deepen it.

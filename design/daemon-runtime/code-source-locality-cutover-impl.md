@@ -8,14 +8,14 @@ topic:
   - corpus
   - indexing
 tags: [locality, code-source, collector, indexing, cutover]
-brief: "Make a verified collected generation authoritative for selected Published projects, close LocalProjectWalk and local cutback, and preserve transcript tool edges from immutable collected blobs."
+brief: "Make a verified collected generation authoritative for selected Published projects, close LocalProjectWalk and local cutback, and keep transcript base-project attribution without reading the checkout."
 ---
 
 # Code-source locality cutover
 
 > **Status: implemented and workspace test-verified as of 2026-08-09.** The
 > checked-in code contains the evidence store, offline cutover, startup and
-> reload fences, pre-broker refusal, collected tool-edge attribution, and
+> reload fences, pre-broker refusal, collected transcript attribution, and
 > recovery tests. Applying a production marker remains an operator-authorized
 > ceremony. Bridge, uncovered, and `LegacyLocal` projects remain outside this
 > cutover.
@@ -38,9 +38,9 @@ For an explicitly selected Published project:
    startup and config reload refuse assignment or generation loss and the
    checkout broker refuses `LocalProjectWalk` before path resolution or
    observation; and
-6. transcript project stamps and file-tool edges continue to resolve from the
-   verified immutable generation blobs. The attachment path is used only as a
-   lexical transcript namespace and is never read.
+6. transcript base-project stamps continue to resolve for the governed
+   project. The attachment path is used only as a lexical transcript namespace
+   and is never read.
 
 The cutover deliberately does not return a governed project to local source.
 Removing its producer assignment is an invalid configuration, not cutback.
@@ -62,10 +62,9 @@ Removing its producer assignment is an invalid configuration, not cutback.
   after the index and sidecar publication commits. It also constructs
   collected transcript attribution from the exact active activation and
   generation.
-- `crates/bbox-corpus-index/src/index/tool_edges.rs` resolves collected file
-  calls lexically, verifies the generation blob, chunks those bytes under the
-  active snapshot id, and emits the same project-relative edge metadata. It
-  never canonicalizes or reads the governed checkout.
+- `crates/bbox-corpus-index/src/index/tool_edges.rs` resolves a collected
+  project's session cwds lexically against its transcript namespace to stamp
+  the base project. It never canonicalizes or reads the governed checkout.
 - `src/bin/blackbox.rs` exposes the offline
   `project-catalog code-source-locality-cutover` command.
 
@@ -118,23 +117,22 @@ does not schedule or probe local cutback.
 
 ### CS-D4: corpus features do not depend on checkout bytes
 
-Before this cutover, incremental transcript ingestion needed a local root to
-stamp `base_project_id` and emit `RAN_BASH` edges. Simply removing the lease
-would have silently degraded search and graph coverage.
+Incremental transcript ingestion stamps `base_project_id` on transcript
+documents. Simply removing the lease must not silently degrade that
+attribution.
 
 For a governed attached project, the upper layer now supplies:
 
-- stable project id;
+- stable project id; and
 - the attachment root only as a lexical namespace for historical transcript
-  cwd and file arguments;
-- exact activation snapshot and generation head;
-- exact generation manifest; and
-- a handle that verifies immutable content-addressed blobs.
+  cwds.
 
-File edges are chunked from those verified blobs and receive V2 entity refs for
-the active snapshot. Bash edges and base-project stamps use the same lexical
-project match. A missing manifest path is diagnosed and skipped. It is never
-read from the checkout and never reassigned to another project.
+Reindex refuses a governed project that has no active collected generation or
+that still holds a `LocalProjectWalk` lease.
+
+Base-project stamps use a lexical project match against the attachment
+namespace. A cwd is never read from the checkout and never reassigned to
+another project.
 
 Remote-only projects have no local transcript namespace to map. Their collected
 project documents remain complete, while a path event with no stable project
@@ -152,8 +150,8 @@ The executable gates include:
   revision left intact;
 - broker refusal before an observation is written;
 - source planning with no local-walk request during governed full rebuild; and
-- a collected tool edge resolved while the named checkout does not exist,
-  including V2 target, content hash, commit anchor, and base-project stamp.
+- a collected base-project stamp resolved while the named checkout does not
+  exist.
 
 ## 4. Compatibility and non-goals
 

@@ -813,8 +813,8 @@ auth flow.
 ## 19. Acceptance criteria
 
 - A source onboards through two-sided operator config, publishes, and appears as
-  an ordinary corpus project: hybrid search, graph inspection, and evidence
-  bundling operate on collected content with no connector-specific branch
+  an ordinary corpus project: hybrid search and entity inspection operate on
+  collected content with no connector-specific branch
   anywhere on the corpus host.
 - The daemon opens no socket to a vendor API and holds no vendor credential in
   any state of any source, provable by dependency ceiling plus config audit. No

@@ -19,7 +19,7 @@ footer chrome", "the tool-call renderer". Today they stitch this together with
 That works, but it burns context and is easy to miss the comparable component.
 
 This design adds a focused locator on top of the existing code-navigation and
-graph substrate. It is not a general semantic parser; it is a role-oriented
+search substrate. It is not a general semantic parser; it is a role-oriented
 bundle builder for UI component/style work.
 
 ## Proposed tool
@@ -126,11 +126,11 @@ preview answers "what did the UI actually render after the edit?"
 - Use live file/symbol reads only; no new index schema required.
 - Return `semantic_status="heuristic_bundle"` explicitly.
 
-### Phase 2: Indexed graph integration
+### Phase 2: Indexed entity integration
 
-- Add graph/entity refs for returned symbols and files.
-- Include `bbox_bundle_evidence`-compatible entity refs where available.
-- Use recent edge provenance when code indexing can tie a symbol to commits.
+- Add entity refs for returned files that `bbox_inspect_entity` resolves;
+  `symbol:` refs are not resolvable on the current surface.
+- Use Git history provenance when code indexing can tie a file to commits.
 
 ### Phase 3: General UI frameworks
 
@@ -154,5 +154,5 @@ preview answers "what did the UI actually render after the edit?"
 - Returned line windows are narrow enough to read directly.
 - The response labels itself heuristic and includes enough evidence to audit why
   each component was selected.
-- The tool degrades cleanly when git history, indexed graph data, or Ratatui
+- The tool degrades cleanly when git history, indexed data, or Ratatui
   imports are unavailable.

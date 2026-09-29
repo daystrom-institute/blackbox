@@ -57,8 +57,8 @@ corpus refs for remote reads and native harness tools for file, shell and Git wo
 
 ## Using the surface
 
-- Retrieve evidence with `bbox_hybrid_search`, inspect exact entity refs with
-  `bbox_inspect_entity`, and package supporting refs with `bbox_bundle_evidence`.
+- Retrieve evidence with `bbox_hybrid_search` and inspect exact entity refs
+  (properties and provenance) with `bbox_inspect_entity`.
 - Read conversations by narrowing `bbox_hybrid_search` with `doc_type` or a
   conversation filter (`role`, `source`, `channel`, ...), then follow hits with
   `bbox_context` and `bbox_messages`.

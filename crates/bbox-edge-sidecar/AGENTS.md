@@ -2,9 +2,19 @@
 
 Store-agnostic persistence floor for the edge corpus: the workspace and
 materialization manifest, snapshot dir layout, and the append/replace/merge/
-purge/compact primitives over the observed / explicit / managed-derived lanes.
-The store to edge emitters live in the root crate; this crate never sees store
+purge/compact primitives over the surviving lanes (legacy top-level project
+lanes, `derived/git`, and `derived/project` as local snapshot staging). The
+store to edge emitters live in the root crate; this crate never sees store
 types.
+
+The manifest, snapshots, dirty overlays and Git overlays are code-source
+activation authority; no in-memory edge graph reads any lane. The transcript
+lanes (`observed/`, `explicit/`), `derived/project/` and the split-lane
+`migrations/` records are removed once at startup, before bind, and a
+store-level marker under `.versions/` makes every later start a single stat.
+Removal never follows a symlink. A host that still walks local checkouts
+regrows `derived/project/` as snapshot staging; that is live state and the
+marker keeps the pass from removing it again.
 
 ## Scale is the design constraint
 

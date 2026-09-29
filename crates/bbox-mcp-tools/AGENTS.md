@@ -1,4 +1,4 @@
-# bbox-mcp-tools - graph retrieval pipeline (hybrid search, inspect, paths)
+# bbox-mcp-tools - retrieval pipeline (hybrid search, inspect)
 
 - Hybrid pipeline order: BM25 field boosts → RRF fusion (k=60, vector weight
   0.6 default) → model rerank (DEFAULT since the measured 2026-07-11
@@ -44,17 +44,16 @@
   doc_type, distinguishes them), so `doc_type="project_file"` already
   includes them by prefix match.
 
-## Traversal admission (M9a, design/connectors/unified-retrieval.md 5.2)
+## Inspect is a property reader
 
-- Graph selection gates neighbor ENUMERATION, not the response: a vertex
-  whose graph the caller cannot read (policy-disabled text retrieval,
-  local scratch) never enters the frontier. The per-hop admission check
-  consults the resolver's live view, never a readability stamp baked into
-  an indexed document. The gate owns graph refs only; non-graph refs pass
-  through to their own providers and evidence algebra.
-- Fan-out truncation must say what it cut: `truncated_expansions` carries
-  the vertex and the full edge count beside the rendered bullets, so a
-  capped prefix never masquerades as the neighborhood. Truncation or
-  exclusion must never disclose the existence or size of unreadable
-  vertices: unreadable graph is absent everywhere, not labeled hidden. The
-  fan-out budget and edge_count are computed on the admitted list only.
+- `bbox_inspect_entity` loads the entity from its provider's store. Only
+  project graph vertices carry edges (their graph edges and evidence
+  bindings) and `recommended_next_hops`; a project file or knowledge entry
+  named by an evidence binding shows that binding. No other entity has an
+  edge neighborhood, and `symbol:` / `symbol_v2:` refs answer
+  `error.not_found`. `edge_types`, `direction`, `per_type_limit` and
+  `edge_cursor` page a vertex's edges.
+- Graph readability comes from the resolver's live view, never a
+  readability stamp baked into an indexed document. Unreadable graph is
+  absent everywhere, not labeled hidden: no edge page or count may disclose
+  the existence or size of unreadable vertices.

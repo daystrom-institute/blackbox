@@ -33,8 +33,8 @@ listing, or traversal from known graph vertices."*). That was the right
 first cut, and it is now the binding constraint. Today
 `BlackboxServer::resolve_project_graph_vertex` is a strict
 `graph.vertices.get(vertex_id)`: no prefix match, no label match, no fuzzy
-resolution. `bbox_inspect_entity` and `bbox_find_paths` are the only doors,
-and both need a canonical ref the caller already holds. A tenant who
+resolution. `bbox_inspect_entity` is the only door, and it needs a
+canonical ref the caller already holds. A tenant who
 authored a record graph can only reach it if they already know the vertex
 id, and a connector-projected source graph is invisible to every agent that
 starts from a question rather than from a ref.
@@ -53,8 +53,9 @@ Concretely, after M9:
 - every graph-bearing result carries graph id, authority plane, generation,
   and provisional labeling, so a caller can tell a tenant assertion from a
   connector projection without a second call;
-- a result can be expanded along its evidence bindings into a bounded path,
-  with `path_id`s the caller hands straight to `bbox_bundle_evidence`;
+- a result can be expanded along its evidence bindings into a bounded path
+  whose hops are canonical refs the caller hands straight to
+  `bbox_inspect_entity`;
 - a placed file chunk points back at the remote source vertex that placed
   it;
 - authorization is applied before ranking, in both lanes, never as a
@@ -455,8 +456,8 @@ provisional_project_graph_vertex:<scope_hash>:<checkout_id>:<graph_id>:<vertex_i
 Both ref families already exist in
 `crates/bbox-corpus-core/src/entity_ref.rs`. M9 introduces no ref family and
 no domain-specific variant, which keeps campaign invariant 1 intact.
-`entity_id` is the only join key across Tantivy, the vector store, and the
-edge index, so a graph vertex needs nothing else to participate.
+`entity_id` is the only join key across Tantivy and the vector store, so a
+graph vertex needs nothing else to participate.
 
 The alternative, one document per `(vertex, text property)`, gives sharper
 BM25 term statistics and would let a hit name the property that matched. It
@@ -650,17 +651,16 @@ shadowing at write time would make one checkout's in-flight edit mutate
 what every other checkout retrieves, which is the exact failure the
 provisional lane exists to prevent.
 
-Two existing accommodations must be preserved so the provisional form stays
-an implementation detail for callers:
+One existing accommodation must be preserved, and one widening added, so the
+provisional form stays an implementation detail for callers:
 
 - `resolve_published_form_vertex` already accepts the logical
   `project_graph_vertex:` form and materializes the provisional compound ref
   when the hit came from an overlay. A search result should present the
   same courtesy: the logical ref is what a caller pastes into the next tool.
-- `find_paths`'s `TargetTypeFilter { admit_provisional_graph_vertex }`
-  already widens `to_type = "project_graph_vertex"` to match the overlay
-  form under `own` / `all`, one-directionally (gap-e41499a9). Search needs
-  the same widening in `scope_lists_to_doc_type`, which today special-cases
+- Search needs `doc_type = "project_graph_vertex"` to match the overlay
+  form under `own` / `all`, one-directionally, in
+  `scope_lists_to_doc_type`, which today special-cases
   exactly one pair (`project_file` also keeping `project_file_v2:`). Graph
   is the second such pair and should be written as one, not as a growing
   chain of prefix special cases.
@@ -735,17 +735,18 @@ retrofitting a filter into a pipeline that ranks first.
 
 ### 5.2 Traversal expansion
 
-`bbox_find_paths` expands neighbors. With graph vertices in the graph, an
-expansion step can cross from a knowledge entry into a record vertex, from
-a record vertex into a source vertex, and from a source vertex into a placed
-file chunk. Each of those hops crosses an authority boundary.
+`bbox_inspect_entity` reads the neighbors of a project graph vertex (its
+graph edges and evidence bindings), and a knowledge entry or project file
+named by an evidence binding shows that binding. With graph vertices in
+retrieval, an expansion step can cross from a knowledge entry into a record
+vertex, from a record vertex into a source vertex, and from a source vertex
+into a placed file chunk. Each of those hops crosses an authority boundary.
 
-The rule, extending the landed `evidence_step_is_traversable` precedent one
-layer out: **graph selection precedes neighbor enumeration**. Before
+The rule: **graph selection precedes neighbor enumeration**. Before
 expanding out of a vertex, the traversal resolves which graphs the caller
 may read (the same inputs as section 5.1) and enumerates only within that
 set. An unreadable graph is not walked, its vertices never enter the
-frontier, and no truncated path is emitted implying a path exists.
+frontier, and no truncated neighbor list is emitted implying an edge exists.
 
 The asymmetry with the evidence-status algebra is deliberate and worth
 stating, because at first read the two look inconsistent. An evidence
@@ -762,7 +763,7 @@ Budgets change character here and the change is easy to miss. Today
 hand. A connector source graph can carry tens of thousands of vertices and
 association vertices with very high fan-out, which makes an unbounded
 expansion catastrophic in a way the current corpus never exercises. The
-existing `max_depth` plus a new per-hop fan-out cap are the bound, and a
+existing `per_type_limit` plus a new per-hop fan-out cap are the bound, and a
 truncated expansion says so explicitly in the response rather than silently
 returning a prefix.
 
@@ -775,11 +776,8 @@ expansion closes that gap without a second round trip.
 When requested, each graph-bearing result carries up to `k` bounded evidence
 paths rooted at it, drawn from the accepted binding set for its project
 (`ProjectGraphViewCatalog::evidence_published` and the `own` / `all`
-variants). Each path carries the same `path_id` machinery
-`bbox_find_paths` produces, so the caller hands it directly to
-`bbox_bundle_evidence` without restating anything. The corpus already has a
-hard rule about this: do not restate paths from memory, pass `path_id`s,
-because the server holds the validated graph.
+variants). Each hop is a canonical ref, so the caller hands it directly to
+`bbox_inspect_entity` without restating anything.
 
 Every hop in an expanded path carries its `EvidenceEndpointStatus` and the
 aggregate `evidence.freshness`. A stale chain is still the answer to "what
@@ -879,13 +877,12 @@ which is the v1 capability. Two additions:
   schema edges ahead of structural ones, matching the semantic-first
   ordering that `project_file.rs` already documents as load-bearing.
 
-### 6.3 `bbox_find_paths` and `bbox_bundle_evidence`
+### 6.3 Graph vertex neighbor reads
 
-`find_paths` gains the graph-selection gate and the per-hop fan-out cap
-(section 5.2), plus per-hop source labeling. `bundle_evidence` already
-accepts graph vertex refs from M3; M9's change is that bundled graph
-vertices render through the annotation lens and carry plane identity, so a
-bundle a caller re-reads later still says which authority asserted what.
+The project graph vertex neighbor read in `bbox_inspect_entity` gains the
+graph-selection gate and the per-hop fan-out cap (section 5.2), plus per-hop
+source labeling, so a neighbor list a caller re-reads later still says which
+authority asserted what.
 
 ### 6.4 Operator surfaces
 
@@ -896,15 +893,10 @@ surface that answers "why is my graph not showing up in search" without
 reading a schema artifact, and it is the review point section 3.3 assumes
 for connector graphs.
 
-`bbox_describe_schema` reports `project_graph_vertex` and
-`provisional_project_graph_vertex` populations alongside the existing entity
-types, since it already returns live population counts and currently has no
-graph awareness at all.
-
 One consistency note while these surfaces are being touched: the
 `bbox_project_graph_*` family names its visibility parameter `visibility`
-while `bbox_inspect_entity`, `bbox_find_paths`, and `bbox_bundle_evidence`
-name the identical policy `provisional`. Same values, same parser. M9 should
+while `bbox_inspect_entity` and `bbox_hybrid_search` name the identical
+policy `provisional`. Same values, same parser. M9 should
 not add a third spelling, and aligning the existing two is a cheap
 correction to make while the family is in hand.
 

@@ -45,8 +45,8 @@ known id, not discovery by question.
 
 The opposite is the goal: **a question-shaped query should surface the runbook,
 or knowledge entry that answers it**, without the agent knowing the
-artifact exists. That is precisely what proper indexing + evidence bundling
-buys, and it is the through-line of this design.
+artifact exists. That is precisely what proper indexing + provenance-carrying
+inspection buys, and it is the through-line of this design.
 
 ## What the Daystrom spike proved
 
@@ -94,15 +94,15 @@ traversal" as a measured fix — prose treated as a tunable parameter.
 
 | Plane | Members | Reached via | Daystrom levers applied? |
 |---|---|---|---|
-| **Indexed corpus** (tantivy BM25 + vector + graph) | `knowledge`, `transcript`, `project_file`, `thread`, `commit`, `note`, `roadmap` | `hybrid_search` | yes - typed refs, breadcrumbs, tiering |
-| **In-memory memory store** | system memories | **only** `bbox_knowledge` (string-match, was full-body dump) | no: not indexed, not graph-addressable |
+| **Indexed corpus** (tantivy BM25 + vector) | `knowledge`, `transcript`, `project_file`, `thread`, `commit`, `note`, `roadmap` | `hybrid_search` | yes - typed refs, breadcrumbs, tiering |
+| **In-memory memory store** | system memories | **only** `bbox_knowledge` (string-match, was full-body dump) | no: not indexed, not inspectable |
 | **Artifact catalogs** | brofiles, teams | bespoke `*_list` / `*_describe` | no, each its own shape |
 
 The decisive evidence: the search index (`add_text(f.doc_type, …)` across
 `src/index/`) only covers `project_file, thread, commit, knowledge, roadmap`
-(+`transcript`/`note`), and system memories are not graph entities: they are a
+(+`transcript`/`note`), and system memories are not inspectable entities: they are a
 parallel file catalog reached only through `bbox_knowledge`'s string matcher. `bbox_knowledge` is the only tool that bolts
-the in-memory store onto a query, and it did so without index, graph, or
+the in-memory store onto a query, and it did so without index, inspection, or
 tiering.
 
 The graph plane is itself a faithful Daystrom port: `bbox_inspect_entity`'s
@@ -129,15 +129,15 @@ overflow.
 Every locate-information surface now ends by naming the next tool with concrete
 refs:
 - `bbox_hybrid_search` → structured `next_steps` + text footer carrying the top
-  seed ref into `inspect_entity` / `find_paths` / `bundle_evidence`;
+  seed ref into `inspect_entity` to read its properties and provenance;
   conversation hits carry `conversation` coordinates and an `exact_read` for
   `bbox_context(file, offset)` / `bbox_messages(session)`; empty results yield
   a broaden-the-query hint.
 - `bbox_knowledge` → top-level "Next steps" pulling the highest-ranked entry
-  into `inspect_entity` + `bundle_evidence`; memories carry the Brick-0
+  into `inspect_entity`; memories carry the Brick-0
   signpost.
 
-The discover → inspect → paths → bundle sequence is now injected at each
+The discover → inspect sequence is now injected at each
 decision point rather than recalled from `sm-agentic-opening-sequence`. This is
 the highest ROI-per-line change and the part the graph plane was missing at its
 entry points.
@@ -154,9 +154,9 @@ Concretely:
   `thread_docs.rs`), wired into the reindex pipeline and an embedding
   `Bucket` (reuse `Knowledge` or add dedicated routes; see `src/embed/mod.rs`).
 - New `EntityType::SystemMemory` in `src/entity_ref.rs` (ref grammar
-  `system_memory:<id>`) so memories become **inspectable and bundleable** — a
-  runbook can then be an answer entity in an evidence bundle, with edges to the
-  tools it signposts.
+  `system_memory:<id>`) so memories become **inspectable**: a runbook can then
+  be an answer entity whose properties and provenance `bbox_inspect_entity`
+  reads.
 - `bbox_knowledge` becomes `hybrid_search` filtered to
   `knowledge | system_memory` with the tiered renderer (signpost default,
   full on exact id). One retrieval path with two filters, not two retrieval
@@ -175,17 +175,16 @@ deferred; it is not a substitute for it.
 - System-memory chunking: whole-body single doc vs per-section chunks (the big
   runbooks are ~40KB; per-section lifts recall, matching the project-file
   aggregation rationale in `hybrid_search.rs`).
-- Graph edges for memories: do we materialize `SystemMemory --SIGNPOSTS-->
-  Tool` edges from the runbook prose, or leave memories edge-light?
+- Graph edges for memories (`SystemMemory --SIGNPOSTS--> Tool`) are outside
+  the current surface: only project graph vertices carry edges.
 - Lens migration: keep the `category="system_memory"` catalog listing and the
   exact-id short-circuit as fast paths, or route everything through the index.
 
 ### Brick 3 — the eval harness *(proposed; do before/with Brick 2)*
 
 Port the Daystrom measurement discipline so Brick 2 is measured, not asserted:
-mode decomposition (retrieval vs traversal), a precedence-ordered miss funnel
-that classifies *where* an expected answer was dropped, and a bundle A/B that
-quantifies the consolidation win. The `NotIndexed` bucket of that funnel *is*
+mode decomposition (retrieval vs inspection) and a precedence-ordered miss
+funnel that classifies *where* an expected answer was dropped. The `NotIndexed` bucket of that funnel *is*
 the Brick 2 thesis, quantified — which is why the harness should land before or
 alongside Brick 2.
 

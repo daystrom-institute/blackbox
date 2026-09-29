@@ -26,8 +26,9 @@ model selection — separate concern).
 
 The `S2`/`S3` chunker registry that landed during the agentic-corpus
 foundation phases is format-extensible by design — each new chunker
-just registers an extractor and emits typed chunks + edges into the
-existing EdgeIndex. Seven format chunkers were marked `[marker]` in
+just registers an extractor and emits typed chunks. The per-format edge
+families below are design notes: the daemon keeps no in-memory edge graph
+that would consume chunker edges. Seven format chunkers were marked `[marker]` in
 the impl skeleton (deferred placeholders, not partially-done work) and
 are now spun out here so they can be deliberated independently.
 

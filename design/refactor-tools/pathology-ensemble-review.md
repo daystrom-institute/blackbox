@@ -246,7 +246,7 @@ It is **not** bridgecrew's prose claim-tracer (`R10.5`), and deliberately so:
 re-deriving every finding from scratch is redundant with the lenses (which already
 run `rust_impl_partition_analysis` etc. themselves) and unbounded — a v1 prose-tracer
 validator ground for 25 minutes on one file and posted nothing. We have what the
-donor lacked — the typed graph, refactor dry-runs, and **evidence bundles** — so the
+donor lacked (the typed graph, refactor dry-runs, and **cited, re-inspectable entity refs**), so the
 validator is reframed as an **evidence-prover with a divided labor**:
 
 - **Lenses (actors)** make a claim, cite the evidence they ran, and self-assign an
@@ -259,13 +259,13 @@ validator is reframed as an **evidence-prover with a divided labor**:
   the grade is weak AND the finding would drive a remediation slice**, running the one
   operation that settles it (an LSP-verified partition, `rust_public_api_guard`, an
   object-safety report, an `extract` dry-run; for perf, the call-path fetch/await/
-  materialization check plus `baseline_refs` corroboration); (3) **bundles** what it
-  touched with `bbox_bundle_evidence` and (4) **returns one verdict per finding**
-  (`confirmed`/`refuted`/`inconclusive`) with the bundle id.
+  materialization check plus `baseline_refs` corroboration); (3) **cites** the entity refs it
+  touched and the operation it ran, and (4) **returns one verdict per finding**
+  (`confirmed`/`refuted`/`inconclusive`) with those citations.
 
 Emitting a verdict per finding is also the **convergence mechanism**: the
-validator cannot silently burn time investigating without emitting. The bundle
-persists in bbox, re-queryable by id. This makes the exclusion teeth
+validator cannot silently burn time investigating without emitting. The cited
+refs stay re-inspectable with `bbox_inspect_entity`. This makes the exclusion teeth
 **evidence-backed**: a refuted finding is dropped because a reproducible operation
 shows the claim false, not because an LLM asserted it.
 

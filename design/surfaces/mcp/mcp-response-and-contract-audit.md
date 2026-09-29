@@ -385,6 +385,9 @@ just to reduce the catalog count.
 
 **Priority: P2. Confirmed in source and representative inspection.**
 
+`bbox_describe_schema` and `bbox_bundle_evidence` are not part of the surface;
+of the points below, only those about inspection apply.
+
 `bbox_describe_schema` omits installed agents by default but always adds a
 Badgey consultant section. Make orientation about supported entity/edge
 vocabulary and traversal, scoped to what the caller can use; move consultant

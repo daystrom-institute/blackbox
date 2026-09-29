@@ -11,13 +11,14 @@ Even with BM25 transcript search, naive rerank on the top-N results
 performs poorly on questions that require provenance or reasoning across
 multiple entities.
 
-Blackbox improves that by giving agents a structured traversal surface.
-The model is not expected to remember the chain. The daemon carries refs,
-edges, path IDs, and evidence bundles forward.
+Blackbox improves that by giving agents a structured retrieval surface.
+The model is not expected to remember the chain. The daemon carries
+canonical refs forward: search returns them and inspection confirms their
+properties and provenance.
 
 ## Tool shapes and how they compose
 
-Each graph tool is shaped to feed the next.
+Each retrieval tool is shaped to feed the next.
 
 ### `bbox_hybrid_search`
 
@@ -27,7 +28,7 @@ Output: ranked entity refs.
 families: lexical chunk, file-level lexical, knowledge, and per-route
 vector lanes.
 
-The important behavior is that search returns graph refs, not just text.
+The important behavior is that search returns entity refs, not just text.
 The next call can inspect those refs without reconstructing paths or
 guessing filenames.
 
@@ -35,11 +36,15 @@ guessing filenames.
 
 Input: a canonical `<type>:<segments>` entity ref.
 
-Output: entity properties, filtered edges, and
-`recommended_next_hops`.
+Output: entity properties loaded from the entity's provider store. Only
+project graph vertices carry edges (their graph edges and evidence
+bindings) and `recommended_next_hops`; a project file or knowledge entry
+named by an evidence binding shows that binding. Other entity types have no
+edge neighborhood.
 
-Use `direction=both` for orientation, then narrow to `direction=out` or
-`direction=in` once the traversal is clear. If the tool returns
+For a project graph vertex, use `direction=both` for orientation, then
+narrow to `direction=out` or `direction=in` once the traversal is clear;
+`edge_types`, `per_type_limit` and `edge_cursor` bound the edge page. If the tool returns
 `error.bad_input` with a `suggested_fix`, use the suggestion verbatim.
 The ref encodes details that are not reliably reconstructible by hand.
 
@@ -61,60 +66,28 @@ and `evidence.content_limitation` remain visible in summaries and exact pages.
 Completing those pages recovers the stored message, not omitted original Git
 bytes. Retrieval uses the pinned index generation; it does not read a checkout.
 
-### `bbox_find_paths`
-
-Input: a source ref, a destination (an exact `to` ref or a `to_type`
-entity type, at least one of which is required), and optional edge
-filters. A call with neither destination is refused with
-`error.bad_input`; it is a malformed call, not an empty neighborhood.
-
-Over project graphs, pass the logical `to_type="project_graph_vertex"`
-under any visibility. Under `own` and `all` it also matches the
-`provisional_project_graph_vertex` refs that a working generation
-materializes as, so the caller never has to know the overlay type name.
-Pass `to_type="provisional_project_graph_vertex"` only to target overlay
-vertices exclusively.
-
-Output: direction-preserving paths plus opaque `path_ids`. Each step
-carries its own direction label, so backward hops come back as `in`
-steps next to forward `out` steps; state them as returned.
-
-`path_ids` are server-held handles for validated traversals. Pass them
-to `bbox_bundle_evidence`; do not restate the path from memory.
-
-### `bbox_bundle_evidence`
-
-Input: selected refs and `path_ids`.
-
-Output: a structured bundle with previews, refs, and validated path text.
-Use it before answering when the answer depends on multi-hop traversal.
-
 ## Opening sequence
 
 For codebase, history, or decision questions:
 
 ```text
-1. bbox_describe_schema
+1. bbox_knowledge(query="...")
 2. bbox_hybrid_search(query="...", limit=5)
 3. bbox_inspect_entity(entity_ref="...")
-4. bbox_find_paths(from="...", to_type="...")
-5. bbox_bundle_evidence(entity_refs=[...], path_ids=[...])
 ```
 
-Step 1 is once per session. Step 4 is only needed for multi-hop
-questions. Step 5 is the evidence close.
+Step 1 recalls durable rules and decisions. Step 2 finds seeds. Step 3
+confirms the seed's properties and provenance before answering.
 
 Data flows forward:
 
 - Step 2 returns canonical entity refs, so step 3 inspects them directly.
-- Step 3 returns `recommended_next_hops`, so traversal is ranked by the index.
-- Step 4 returns `path_ids`, so evidence does not depend on model memory.
-- Step 5 packages the refs and paths into a reviewable answer kit.
+- On a project graph vertex, step 3 returns `recommended_next_hops`, so the
+  next inspection follows the schema's declared edges.
 
 ## Corpus entity types
 
-`bbox_describe_schema` returns live population counts. The common entity
-types are:
+The common entity types are:
 
 | Entity type | What it holds | Question it answers |
 |---|---|---|
@@ -124,8 +97,6 @@ types are:
 | `transcript` | One content block from a session | "what did this turn say?" |
 | `session` | A full agent conversation | "what was this session about?" |
 | `thread` | Persistent work across sessions | "what is still active?" |
-| `symbol` | Named code symbols | "what calls or defines this?" |
-| `symbol_v2` | Snapshot-scoped code symbols | "which definition is live?" |
 | `brofile` | Persona/model/lens triple | "which agent produced this?" |
 | `commit` | Git commit metadata and touched files | "when did this change?" |
 | `task` | A dispatched bro unit | "what produced this artifact?" |
@@ -136,26 +107,18 @@ One Tantivy document is indexed per content block, not per session. A
 long session yields many searchable blocks with independent roles and
 offsets.
 
-## Edge families
+## Edges
 
-Edges are directional and typed.
+Edges are directional and typed. Only project graph vertices carry them:
+the typed edges their graph schema declares, and evidence bindings to
+project files and knowledge entries. A project file or knowledge entry
+named by an evidence binding shows that binding; no other entity has an
+edge neighborhood. `symbol:` and `symbol_v2:` refs return
+`error.not_found`.
 
-| Family | Edge kinds |
-|---|---|
-| Structural | `IN_FILE`, `IN_SESSION`, `NEXT_SECTION`, `NEXT_CHUNK`, `PREV_CHUNK`, `THREAD_HAS_SESSION`, `THREAD_SPAWNED_FROM`, `THREAD_BLOCKED_BY`, `THREAD_RELATES_TO`, `THREAD_SUBSUMES` |
-| AST | `DEFINED_IN`, `CONTAINS_SYMBOL`, `CALLS`, `USES_TYPE`, `HAS_FIELD`, `IMPLEMENTS_TRAIT` |
-| Knowledge | `KNOWLEDGE_FROM_SESSION` |
-| Provenance | `SESSION_USED_BROFILE`, `ARC_USED_BROFILE`, `NOTE_FROM_SESSION`, `NOTE_IN_THREAD`, `NOTE_FROM_TASK`, `TASK_PRODUCED_NOTE` |
-| Git | `COMMIT_PARENT`, `COMMIT_TOUCHED_FILE`, `COMMIT_PRODUCED_BY_ARC` |
-| Format-specific | `LINKS_TO_FILE`, `LINKS_TO_SECTION`, `DESCRIBES`, `ON_PAGE`, `FIGURE_OF`, `TABLE_OF` |
-| Tool-call | `RAN_BASH` |
-
-`bbox_describe_schema`'s edge catalog is currently narrower than this
-table, so its output can omit edge kinds listed here.
-
-The EdgeIndex is built from per-project JSONL sidecars plus live
-knowledge and thread stores, with virtual edges for
-tasks and tool calls.
+Code-structure edges (AST, sections) and Git commit edges are written into
+snapshot members as part of code-source publication. Retrieval does not
+read them.
 
 ## Hybrid search mechanics
 
@@ -254,15 +217,13 @@ milestone M9 of the graph-native connector campaign: project-graph
 vertices become word-indexed (and optionally vector-indexed) documents
 under per-graph policy, with authority filters running before ranking.
 That design is in progress; until it lands, graph vertices remain
-reachable only through exact-ref inspection and traversal, not
+reachable only through exact-ref inspection, not
 `bbox_hybrid_search`.
 
 ## Schema-declared next hops
 
-Most providers answer `recommended_next_hops` with a direction-blind
-count per edge family, which tells an agent a family exists but not
-which way to follow it. Project-graph vertices do better, because their
-schema knows: a vertex type in `schema.json` may declare a `hints` array
+Only project-graph vertices answer `recommended_next_hops`, because their
+schema knows which way each edge family runs: a vertex type in `schema.json` may declare a `hints` array
 of `{edge_type, direction, label}` entries in priority order, and any
 vertex type also gets a tier-0 derivation from every edge type whose
 declared endpoints touch it. `bbox_inspect_entity` renders the resolved

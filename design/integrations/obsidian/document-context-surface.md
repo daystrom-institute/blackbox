@@ -89,8 +89,8 @@ blackbox, Obsidian, or MCP tooling might expect them:
 - **No markdown mutation in v1.** Accepted document relations are written to
   `.bbox/` sidecar state, never to the source markdown. A later design may
   deliberately opt into markdown mutation; v1 does not.
-- **No per-chunk MCP calls.** The enrichment recipe reads edges through internal
-  batched EdgeIndex/store lookups. It does not call `bbox_inspect_entity` or any
+- **No per-chunk MCP calls.** The enrichment recipe reads relations through
+  internal batched store lookups. It does not call `bbox_inspect_entity` or any
   other MCP tool per chunk. This is a server-side composition, not an agent
   scripting exercise.
 - **No LLM-generated text in the response.** Every string the server returns is
@@ -150,10 +150,8 @@ Relevant existing capabilities:
 |---|---|
 | Indexed file chunks | `project_file` entities, chunked by document section/code block, with `file_path`, `project_id`, `chunk_kind`, `language`, and content preview. |
 | Graph search | `bbox_hybrid_search` ranks typed entities with BM25/vector fusion and project filtering. |
-| Entity inspection | `bbox_inspect_entity` returns properties and targeted edges for one entity ref. |
-| Path finding | `bbox_find_paths` returns direction-preserving graph paths for multi-hop explanations. |
-| Evidence bundles | `bbox_bundle_evidence` packages entity refs and path ids into a bounded evidence object. |
-| Work context | Transcript sessions, threads, notes, and commits are already modeled in the graph. |
+| Entity inspection | `bbox_inspect_entity` returns properties and provenance for one entity ref; project graph vertices also carry their graph edges and evidence bindings, and a project file or knowledge entry named by an evidence binding shows that binding. |
+| Work context | Transcript sessions, threads, notes, and commits are already stored and indexed. |
 | Edge vocabulary | `SUPERSEDES` and `DERIVED_FROM` are existing knowledge and artifact edge kinds. |
 | HTTP daemon | `blackboxd` already serves non-MCP routes beside `/mcp`. |
 
@@ -402,9 +400,11 @@ The default recipe for markdown design documents:
    - all `project_file` chunks for the path;
    - title from first H1 or filename;
    - document kind from path and frontmatter.
-2. **Direct graph edges**
-   - collect graph edges for document chunk refs through an internal batched
-     EdgeIndex lookup, not one MCP call per chunk;
+2. **Direct relations**
+   - collect relations for the document through internal batched store
+     lookups (Git history, note and thread stores, knowledge, evidence
+     bindings), not one MCP call per chunk; project file chunks carry no edge
+     neighborhood, so relations come from those stores;
    - collect `LINKS_TO_FILE`, `LINKS_TO_SECTION`, `DESCRIBES`,
      `EDITED_IN_COMMIT`, `COMMIT_TOUCHED_FILE`,
      `NOTE_IN_THREAD`, `NOTE_FROM_SESSION`, `KNOWLEDGE_FROM_SESSION`,
@@ -439,10 +439,10 @@ section, not globally.
 Bounds:
 
 - Do not call `bbox_inspect_entity` per chunk through MCP. The server-side
-  service reads EdgeIndex/store internals directly.
-- Edge collection may consider all chunk refs but must cap rendered items per
+  service reads store internals directly.
+- Relation collection may consider all chunk refs but must cap rendered items per
   section with `max_items`.
-- Full edge aggregation may consider at most `max_chunks_aggregated` document
+- Full relation aggregation may consider at most `max_chunks_aggregated` document
   chunks, default 50. Larger documents return partial context plus degraded
   markers.
 - Representative chunks for related-doc query seeds are capped to 5 by default:
@@ -569,13 +569,13 @@ append/merge friendly enough, easy for a focused importer to ingest, and avoids
 catalog machinery. If relation volume becomes large, shard by source path hash
 later. Do not start with per-edge files unless merge behavior demands it.
 
-Accepted relations should ingest as first-class relation records, then project
-queryable graph edges from those records. Do not collapse the JSONL entry into a
-bare edge and lose why/who/when/evidence. The source relation record is the
-durable provenance object; graph edges are an indexed projection for traversal.
-Projected edges must carry metadata that preserves `confidence`,
-`acceptance_state`, and `acceptance_provenance`, or use a distinct edge kind
-that cannot be confused with an asserted content-authored link.
+Accepted relations should ingest as first-class relation records and are read
+from those records. Do not collapse the JSONL entry into a bare edge and lose
+why/who/when/evidence. The source relation record is the durable provenance
+object, and it preserves `confidence`, `acceptance_state`, and
+`acceptance_provenance` so an accepted relation cannot be confused with an
+asserted content-authored link. Projecting relations into queryable graph edges
+is outside the current surface: only project graph vertices carry edges.
 
 ## Actions
 
@@ -710,10 +710,10 @@ change without touching the source file.
 
 - Implement `git`, `lifecycle`, `knowledge`, `threads`,
   `attention`, `implementation`, and `explicit_links` sections from existing
-  stores and graph edges.
+  stores.
 - Deduplicate by target entity ref and by target path.
-- Rank section items with explicit edges before text matches.
-- Use internal batched EdgeIndex/store lookups and section-level item caps.
+- Rank section items with explicit relations before text matches.
+- Use internal batched store lookups and section-level item caps.
 
 ### Phase 3 - Potential Related
 
@@ -730,7 +730,7 @@ change without touching the source file.
 - Add `bbox_document_context` using the same service function.
 - Document it as a document-context helper, not a raw graph primitive.
 - Add the `bbox_document_context` stanza to `tool_docs.rs`.
-- Keep `bbox_*` graph tools as the lower-level expert surface.
+- Keep `bbox_hybrid_search` and `bbox_inspect_entity` as the lower-level expert surface.
 
 ### Phase 5 - Obsidian Plugin Prototype
 
@@ -751,7 +751,7 @@ change without touching the source file.
 
 - Add separate confirmations and capability checks for:
   - a focused importer for `.bbox/document-context/relations.jsonl` with
-    validation, replay diagnostics, and projected graph-edge emission;
+    validation and replay diagnostics;
   - accepting related-doc link candidates into `.bbox/` sidecar state;
   - creating bbox followup notes;
   - linking documents to work threads.
@@ -781,9 +781,9 @@ change without touching the source file.
 
 ## Open Questions
 
-1. What exact projected edge kind should accepted document relations use:
+1. What exact relation kind should accepted document relations record:
    `DOCUMENT_RELATED_TO`, `OPERATOR_RELATED_TO`, `RELATES_TO`, or an existing
-   edge family with typed metadata?
-2. Should accepted relation projection use a new document relation entity type,
+   relation family with typed metadata?
+2. Should accepted relation records use a new document relation entity type,
    a generic artifact/sidecar entity type, or a knowledge-like entry with
    document-specific fields?

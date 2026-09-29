@@ -8,9 +8,9 @@ topic:
   - storage
 tags:
   - retention
-  - edge-index
+  - edge-sidecar
   - vectors
-brief: "Define one bounded lifecycle for primary corpus inputs, indexes, vectors, and resident graph state."
+brief: "Define one bounded lifecycle for primary corpus inputs, indexes, vectors, and edge sidecar state."
 ---
 
 # Corpus Retention and Resident-State Bounds
@@ -18,10 +18,9 @@ brief: "Define one bounded lifecycle for primary corpus inputs, indexes, vectors
 ## Problem
 
 Blackbox bounds several secondary stores, but its primary corpus lifecycle is
-not governed by one retention contract. Transcript documents, transcript-derived
-edges, vector records, and Git-history projections can continue accumulating as
-their source histories grow. The resident `EdgeIndex` makes this a memory-bound
-problem as well as an on-disk retention problem.
+not governed by one retention contract. Transcript documents, vector records,
+and Git-history projections can continue accumulating as their source histories
+grow.
 
 Allocator tuning and storage garbage collection can reduce operational pressure,
 but they do not define which primary facts remain hot, which move to cold
@@ -35,14 +34,13 @@ observability remains a separate concern in `gap-bcced6fb`.
 
 One policy must govern every representation of retained corpus history. A fact
 outside the retained set must not survive accidentally in Tantivy, a vector
-partition, an edge sidecar, or the resident graph merely because that store has
-a different cleanup path.
+partition, or an edge sidecar merely because that store has a different cleanup
+path.
 
 The policy must be applied consistently at:
 
 - ingestion, so newly discovered old material follows the declared contract;
 - reindex, so rebuilds do not resurrect evicted material;
-- boot hydration, so cold or expired edges do not return to resident memory;
 - background maintenance, so a long-running daemon converges without restart;
 - diagnostics, so operators can distinguish retained, cold, pending-eviction,
   and inconsistent state.
@@ -64,22 +62,15 @@ Choose one of three user-visible outcomes for material outside the hot set:
 2. a cold searchable tier with slower retrieval;
 3. a cold archive that must be explicitly rehydrated.
 
-Silent partial recall is not acceptable. Search and graph tools must disclose
+Silent partial recall is not acceptable. Search and inspection tools must disclose
 when a query can only see the hot set.
-
-### Resident graph shape
-
-Decide whether `EdgeIndex` remains fully resident over a bounded hot set or
-moves to a paged/on-disk representation. Bounding the hot set is the smaller
-change. Paging removes the structural requirement that retained history fit in
-RAM, but changes traversal latency and consistency mechanics.
 
 ### Cross-store transaction
 
 Eviction spans independently durable stores. The design needs an idempotent
 journal or equivalent transaction record so crashes cannot leave a document
-searchable without its edges, an edge inspectable without its entity, or a
-vector active after its source document is gone.
+searchable after its source is evicted or a vector active after its source
+document is gone.
 
 ### Git-history policy
 

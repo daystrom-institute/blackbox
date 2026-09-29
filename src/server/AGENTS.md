@@ -52,12 +52,17 @@
   automatic filesystem export. Producers own pagination and detail reads;
   clients own any local persistence of received results. Domain outcomes such
   as a failed task remain distinct from invocation errors.
-- Deferred EdgeIndex startup is a fail-closed warmup, never an empty graph.
-  The watcher immediately publishes the first complete sidecar view and graph
-  consumers return `error.edge_index_warming` until that publication lands.
-  Selector-changing publications lower the readiness fence before publishing
-  their intentionally empty placeholder, then nudge the same watcher; a graph
-  reader may retain a complete old immutable view or wait for the complete new
-  one, but may never observe the placeholder as a valid graph.
+- The daemon keeps no in-memory edge graph. The pinned code read view
+  carries active selectors, the searcher, the catalog epoch and the Git
+  overlay map. The code read view refresher republishes it when the manifest
+  authority, the registered corpus project set or the catalog epoch changes,
+  or when nudged (registration, unregistration and derived-manifest
+  publishers nudge it); otherwise it refreshes only the searcher when the
+  document count moved. It reads the manifest only and never parses edge
+  rows. Code-source activations publish a complete view directly. The view's
+  Git overlay selectors are the Git source GC roots, so maintenance protects
+  exactly the sources they name.
+- Before bind, a one-time pass removes the retired edge families and stamps
+  a store-level marker; later starts cost one stat.
 - Raw `?project=` remains a surface/filter selector only. Managed-workspace
   authority comes only from the workspace binding header.

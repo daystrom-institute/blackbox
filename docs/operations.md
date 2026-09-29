@@ -11,8 +11,7 @@ only satellites: `fleetd`, `bro-harness`, `bro`, `bbox-code-collector` and
 `bbox-transcript-collector`.
 
 Maintenance tools named here other than `bbox_thread_list`,
-`bbox_describe_schema`, `bbox_hybrid_search`, `bbox_project_list` and
-`bbox_render` are on the `ops` surface: run them from an `ops` MCP session or
+`bbox_hybrid_search`, `bbox_project_list` and `bbox_render` are on the `ops` surface: run them from an `ops` MCP session or
 with `bro mcp call <tool> '<json>' --surface ops`.
 
 ## What to protect vs. what's rebuildable
@@ -57,7 +56,7 @@ repos. Don't waste backup space on them.
 |---|---|
 | `~/.local/share/blackbox/index/` | Automatic on next daemon start after a schema version bump; manual: `bbox_reindex(full=true)` |
 | `~/.local/state/blackbox/vectors/` | `bbox_reembed(route="<route>")` per route after restart |
-| `~/.local/state/blackbox/edges/` | Automatic via EdgeIndex watcher after reindex; manual: restart daemon |
+| `~/.local/state/blackbox/edges/` | Repopulated by reindex and code-source publication |
 | `~/.local/state/blackbox/git_meta/` | Rebuilt automatically on next incremental reindex |
 | `~/.local/state/blackbox/backups/` | Pre-render snapshots; the rendered files themselves are the source of truth |
 | `~/.local/state/blackbox/logs/` | Structured event logs; rotated automatically |
@@ -172,7 +171,7 @@ state dir so it never touches the deployed daemon's state. See
     │   ├── tasks.json
     │   └── ...                  # historical records the catalog inventories
     ├── vectors/                 ← REBUILD (bbox_reembed per route)
-    ├── edges/                   ← REBUILD (EdgeIndex auto-rebuild)
+    ├── edges/                   ← REBUILD (next reindex)
     ├── git_meta/                ← REBUILD (next reindex)
     ├── backups/                 ← skip
     └── logs/                    ← skip
@@ -443,8 +442,7 @@ see `dropping transcript index for schema migration` in the daemon log.
 Wait for:
 
 1. `auto-reindex: indexed N files (M docs)` - tantivy rebuild done
-2. `edge-index watcher: corpus grew, EdgeIndex rebuilt` - graph projection done (~6 sec after)
-3. Smoke: `bbox_describe_schema` should return all entity types with non-zero populations; `bbox_hybrid_search("test", limit=5)` should show both `bm25` and `vector` sources.
+2. Smoke: `bbox_hybrid_search("test", limit=5)` should show both `bm25` and `vector` sources.
 
 ### After changing an embedding route provider
 
@@ -460,19 +458,16 @@ bbox_embed_status()            # queue_depth drains as re-embedding runs
 bro mcp call bbox_project_register '{"path":"/abs/path/to/repo"}' --surface ops
 ```
 
-This adds the project to the registry, triggers an EdgeIndex rebuild,
-and fires an incremental reindex. The auto-reindex thread (120s tick)
+This adds the project to the registry, nudges the code read view
+refresher, and fires an incremental reindex. The auto-reindex thread (120s tick)
 picks up new files within 1–2 cycles. Large repos (10k+ files) can take
 10+ minutes on first index.
 
 ### After edge sidecar grows large
 
 ```bash
-bbox_edge_compact(project_id="<id>")  # compress JSONL sidecar
+bbox_edge_compact(project_id="<id>")  # compress legacy top-level JSONL sidecar
 ```
-
-Default threshold for auto-compact: watch for it if EdgeIndex rebuilds
-start taking noticeably longer.
 
 ### Periodic knowledge hygiene
 
@@ -506,7 +501,7 @@ vectors, run `bbox_reembed(route="<route>")` for each configured route.
 3. Restore the deployment's configuration and secrets.
 4. Start the daemon - index rebuilds automatically.
 5. Run `bbox_reembed(route="<route>")` for each embedding route.
-6. Verify: `bbox_describe_schema`, `bbox_embed_status`, `bbox_doctor`.
+6. Verify: `bbox_embed_status`, `bbox_doctor`.
 
 Multi-machine active setups: the JSON stores are not concurrency-safe
 across machines. Use one canonical host and treat others as read-only

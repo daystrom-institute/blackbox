@@ -2,7 +2,7 @@
 
 **Blackbox** is a long-lived HTTP MCP daemon plus operator CLIs for AI-dev-tool
 coordination. It indexes provider transcripts and registered project source into
-tantivy, projects that corpus into a typed graph, manages shared knowledge and
+tantivy, exposes that corpus as typed entity refs and project graphs, manages shared knowledge and
 work threads, and dispatches/resumes agents across multiple providers.
 
 The crate is `blackbox` (`Cargo.toml`). Binary entry points:
@@ -39,8 +39,7 @@ Major code ownership boundaries:
   without a matching stanza should fail tests.
 - `index/`, `providers/`, `chunker/`, `vectors/`, `embed/` - corpus indexing,
   entity providers, chunking, vector storage, and embedding routes.
-- `mcp_tools/` - graph retrieval helpers (`hybrid_search`, `inspect`,
-  `find_paths`, evidence bundling).
+- `mcp_tools/` - retrieval helpers (`hybrid_search`, `inspect`).
 - `knowledge.rs`, `render.rs`, `system_memory/` - durable knowledge, rendered
   provider memory, and runtime-loaded system memories.
 - `threads.rs` - thread store (threads and their notes).

@@ -1,7 +1,7 @@
 # Index and embedding internals
 
 This page covers the rebuildable storage projections: Tantivy index,
-embedding partitions, EdgeIndex sidecars, schema migration, and
+embedding partitions, edge sidecars, schema migration, and
 compaction. For the operational runbook, see
 [Operating blackbox](operating-blackbox.md).
 
@@ -14,7 +14,7 @@ transcripts, registered projects, git history, and durable JSON stores.
 |---|---|---|
 | `~/.local/share/blackbox/index/` | Tantivy index and schema marker | No |
 | `~/.local/state/blackbox/vectors/` | HNSW partitions and WALs | No |
-| `~/.local/state/blackbox/edges/` | Project edge sidecars | No |
+| `~/.local/state/blackbox/edges/` | Edge sidecar manifest, snapshots and overlays | No |
 | `~/.local/state/blackbox/git_meta/` | Git indexing fingerprints | No |
 | `~/.local/state/blackbox/projects.json` | Registered project roots and IDs | Yes |
 | `~/.local/state/blackbox/blackbox-*.json` | Knowledge, notes, threads | Yes |
@@ -106,7 +106,11 @@ Registered projects are read from `projects.json`. Project chunks feed:
 - code/doc embedding routes;
 - git commit document indexing.
 
-Per-project edge sidecars live under:
+Code-structure edges land in snapshot `project.jsonl` members under
+`edges/materialized/`, named by `edges/materialized/manifest-index.json`
+(`edges/derived/project/` is local snapshot staging). Git commit edges go to
+`edges/derived/git/` and snapshot `git-current.jsonl`. Legacy top-level
+lanes remain at:
 
 ```text
 ~/.local/state/blackbox/edges/<project_id>.jsonl
@@ -292,30 +296,23 @@ vector partition compacted
 vector partition compaction failed; will retry
 ```
 
-## EdgeIndex and sidecar compaction
+## Edge sidecars and compaction
 
-EdgeIndex combines:
+The daemon keeps no in-memory edge graph. The edge sidecar manifest,
+snapshot directories, dirty overlays and Git overlays are code-source
+activation authority; a background code read view refresher republishes the
+pinned read view from the manifest and never parses edge rows.
 
-- per-project sidecars from project indexing;
-- live edges from knowledge and thread stores;
-- virtual edges for tasks and tool calls.
-
-The watcher rebuilds EdgeIndex when Tantivy's document count grows.
-
-Legacy sidecars can accumulate derived edges after repeated full project
-refreshes. `bbox_edge_compact` removes old derived lines while retaining
-explicit and malformed lines.
+Legacy top-level sidecars can accumulate derived edges after repeated full
+project refreshes. `bbox_edge_compact` removes old derived lines while
+retaining explicit, provenance and malformed lines.
 
 Safe sequence:
 
 ```text
 bbox_edge_compact(project_id="d723917f", apply=false)
-bbox_edge_compact(project_id="d723917f", apply=true, rebuild=false)
-bbox_edge_compact(project_id="d723917f", apply=true, rebuild=true)
+bbox_edge_compact(project_id="d723917f", apply=true)
 ```
-
-Use `rebuild=false` while compacting several projects, then `rebuild=true`
-on the final one.
 
 ## Failure boundaries
 

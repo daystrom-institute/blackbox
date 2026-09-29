@@ -29,23 +29,22 @@ Use this sequence before codebase, design, history, or coordination claims:
 3. **Blackbox evidence bundle** — when the task depends on prior decisions,
    design docs, threads, code graph facts, or conversation history, use the
    blackbox opening sequence instead of memory:
-   `bbox_describe_schema` once per session, `bbox_hybrid_search` for seeds,
-   `bbox_inspect_entity` to confirm refs, `bbox_find_paths` only for multi-hop
-   claims, and `bbox_bundle_evidence` before making provenance-sensitive
-   claims. Pass returned entity refs/path IDs directly; do not reconstruct them
-   from memory. Use `property_mode="summary"` when bundling broad tool/knowledge
-   refs or other long entities. The detailed question-shape runbook is
+   `bbox_knowledge` for recall, `bbox_hybrid_search` for seeds, and
+   `bbox_inspect_entity` to confirm properties and provenance before making
+   provenance-sensitive claims. Pass returned entity refs directly; do not
+   reconstruct them from memory. Use `property_mode="summary"` when inspecting
+   broad tool/knowledge refs or other long entities. The detailed question-shape runbook is
    `sm-agentic-opening-sequence`; pull it only when the injected tool guidance is
    insufficient for the question shape. For fresh probe/retro evidence, if
    hybrid search returns only generic seeds, no results, or a degraded
    BM25-only/vector-warming notice, pivot to `bbox_gaps` with exact
    task, project, bro, or short substrings before broadening to git/filesystem
-   evidence. If `bbox_describe_schema` reports `project_file` /
-   `project_file_v2` population `0`, do not investigate or patch indexing as
+   evidence. If `project_file` / `project_file_v2` refs are absent from
+   search results, do not investigate or patch indexing as
    part of a sandbox probe. State the corpus gap, dedupe/file a
    `sandbox-observability` gap if one does not already exist, and use
    `work_smart_read` or scoped file reads for exact code locations while still
-   bundling any non-code bbox evidence that resolved cleanly.
+   citing any non-code bbox evidence that resolved cleanly.
 4. **Work execution** — read/edit/validate in the grounded cwd/worktree, keeping
    evidence refs and validation output narrow enough for another agent to audit.
 

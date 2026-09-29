@@ -23,7 +23,7 @@ source material:
 | Transcript adapters | Read Claude, Codex, Gemini, and other provider session formats |
 | Tantivy index | Fast BM25 search over transcript blocks, project files, git messages, knowledge, and threads |
 | Vector store | Per-route embedding partitions for semantic retrieval |
-| EdgeIndex | Graph projection over indexed docs plus live knowledge and thread stores |
+| Edge sidecars | Manifest, snapshots and overlays that authorize code-source activation (no in-memory edge graph) |
 | Knowledge store | Durable rules, conventions, memories, and render targets |
 | Orchestration runtime | `bro` tasks, teams, waits, and cancellation |
 | Artifact catalog | Installed brofiles and teams; retired workflow, agent, atom, cron and packet receipts stay readable |
@@ -48,8 +48,7 @@ agents consume the graph/search/tool surfaces through MCP.
 ## Where to go next
 
 - Use [Graph And Retrieval Internals](graph-retrieval-internals.md) for
-  `bbox_hybrid_search`, `bbox_inspect_entity`, `bbox_find_paths`, and the
-  evidence bundle flow.
+  `bbox_hybrid_search`, `bbox_inspect_entity`, and the opening sequence.
 - Use [Index And Embedding Internals](index-embedding-internals.md) for
   schema versioning, background reindex, embedding queues, vector WAL
   compaction, and edge sidecar compaction.

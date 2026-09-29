@@ -118,10 +118,9 @@ no checkouts, or point it only at throwaway clones of the registered repos.
 | Env var | Default | Dev value | Effect |
 |---|---|---|---|
 | `BLACKBOX_REINDEX_INTERVAL_SECS` | `120` | `999999` | Background reindex runs very rarely |
-| `BLACKBOX_EDGE_INDEX_BOOT_REBUILD` | `false` | `false` | Skip edge-index rebuild at boot |
 
-`BLACKBOX_EDGE_INDEX_BOOT_REBUILD` is already `false` by default, but
-setting it explicitly makes the intent clear in the env block.
+`BLACKBOX_EDGE_INDEX_BOOT_REBUILD` is ignored: the daemon keeps no
+in-memory edge graph, so there is no boot rebuild to skip.
 
 ### Transcript roots
 
@@ -355,7 +354,6 @@ XDG_CACHE_HOME=/tmp/blackbox-dev-throwaway/cache \
 XDG_DATA_HOME=/tmp/blackbox-dev-throwaway/data \
 XDG_STATE_HOME=/tmp/blackbox-dev-throwaway/xdg-state \
 BLACKBOX_REINDEX_INTERVAL_SECS=999999 \
-BLACKBOX_EDGE_INDEX_BOOT_REBUILD=false \
 RUST_LOG=blackbox=info \
 path/to/blackboxd
 ```

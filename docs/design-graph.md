@@ -16,7 +16,7 @@ The graph holds STATE; the design docs hold STORY.
   contract. Mutations stage, run `check` against the staged graph, and refuse
   to land on any error; `graph.json`'s generation bumps on every landing.
 - **Read**: the blackbox daemon via MCP (`bbox_hybrid_search` graph lane,
-  `bbox_inspect_entity`, `bbox_find_paths`; the `bbox_project_graph_*`
+  `bbox_inspect_entity` with vertex edges; the `bbox_project_graph_*`
   administration tools are on the `ops` surface). Logical
   refs look like `project_graph_vertex:<project>:design:<vertex-id>`.
 - **Renders**: `render-state <doc-id> [--write]` mints the state block into a

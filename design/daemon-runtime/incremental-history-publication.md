@@ -6,7 +6,7 @@ corpus: blackbox-design
 topic:
   - daemon-runtime
   - corpus
-tags: [git-history, incremental-publication, activation-journal, force-push, edge-index, embedding, vector-gc]
+tags: [git-history, incremental-publication, activation-journal, force-push, edge-sidecar, embedding, vector-gc]
 brief: "Reconcile the typed Git-history publication design with per-commit cost: keep complete logical snapshots at the wire and P3 layers, publish commit-lane deltas derived corpus-side from two verified P3 manifests under a strict admission guard with a live-lane pre-probe, drive per-project edge work from resolved target-identity sets, give committed activations a sibling overlay-revision ledger with bounded settle semantics, and fix generation vector tombstoning for overlapping inventories."
 ---
 # Incremental typed-history publication and activation-journal evolution
@@ -20,8 +20,8 @@ Driving gap: `gap-a7d80bb2` (impact critical, blocks_class_of_work). Gating thre
 The typed-history publication design is correct about trust and recovery but
 broken about cost: any genuine HEAD advance on a history-enabled repo
 republishes that repository's ENTIRE consolidated `(repo_id, doc_type=commit)`
-tantivy lane, rewrites every member project's materialized git edge sidecar,
-and thereby forces full EdgeIndex rebuilds. One commit pays the whole-repo
+tantivy lane and rewrites every member project's materialized git edge
+sidecar. One commit pays the whole-repo
 worst case every time.
 
 Production evidence (2026-08-08 through 2026-08-23):
@@ -50,14 +50,14 @@ finding 4): per-commit cost for the COMMIT LANE and its embedding enqueue,
 elimination of no-op churn (selector-only drift touches nothing), and
 edge-sidecar writes bounded to genuinely changed per-project edge sets. A
 HEAD advance that activates new code snapshots for member projects still
-recomputes those projects' complete touched-file edge sets and still
-triggers a full EdgeIndex rebuild per changed sidecar batch: touched-file
-edges bind snapshot-specific targets, and the EdgeIndex has no incremental
-build. True per-commit EDGE cost requires incremental or content-addressed
-edge segments, rebuild coalescing, or a stable file-target indirection, and
-is explicitly follow-up work. The rollout therefore carries a sustained-
-cadence soak gate (section 8) proving rebuild duration, heap, and backlog
-stay bounded at realistic commit cadence.
+recomputes those projects' complete touched-file edge sets and rewrites
+their sidecars, because touched-file edges bind snapshot-specific targets.
+The daemon keeps no in-memory edge graph, so a sidecar change costs the
+sidecar write, not a graph rebuild. True per-commit EDGE cost requires
+incremental or content-addressed edge segments or a stable file-target
+indirection, and is explicitly follow-up work. The rollout therefore carries
+a sustained-cadence soak gate (section 8) proving sidecar write duration,
+heap, and backlog stay bounded at realistic commit cadence.
 
 ## 2. The load-bearing rules being reconciled
 
@@ -148,10 +148,9 @@ Non-goals:
   KIND and a corrected tombstone rule, but no new owner).
 - No change to the cutover marker's authority model, grants, or the
   producer trust boundary.
-- No incremental EdgeIndex data structure and no per-commit EDGE cost claim
-  (section 1); this design bounds how often sidecars change. Incremental
-  edge segments, rebuild coalescing, or stable file-target indirection are
-  named follow-up work.
+- No per-commit EDGE cost claim (section 1); this design bounds how often
+  sidecars change. Incremental edge segments or stable file-target
+  indirection are named follow-up work.
 
 ## 4. Design
 
@@ -326,7 +325,7 @@ names each project's disposition before the first write (GH plan section
 
 Honest cost statement (round-2 finding 4): a HEAD advance that activates
 new member snapshots makes those members `Publish`, recomputing their full
-historical touched-file edge sets and triggering EdgeIndex rebuilds. The
+historical touched-file edge sets and rewriting their sidecars. The
 win over today is the elimination of no-op churn (selector drift, unchanged
 projects) and receipt/sidecar writes for unchanged lanes, not per-commit
 edge cost. The sustained-cadence soak in section 8 is the gate proving this
@@ -555,13 +554,13 @@ Decision Ledger entry whose number is assigned at implementation time.
    across a crash; quarantined/superseded generations refused as base.
 7. **Churn regression:** replay the incident shape (repeated activations
    with selector-only drift, then a one-commit advance) and assert zero
-   lane writes for drift, one bounded delta for the advance, EdgeIndex
-   rebuild count equal to real change count, and activation-time embed
+   lane writes for drift, one bounded delta for the advance, edge sidecar
+   rewrite count equal to real change count, and activation-time embed
    enqueue equal to new-commit count.
 8. **Sustained-cadence soak (rollout gate):** realistic commit cadence
    against a corpus-scale fixture (multi-repo, ~1.5M edges), measuring
-   EdgeIndex rebuild duration, heap, and backlog; the gate is bounded
-   backlog and flat heap when cadence exceeds single-rebuild duration
+   edge sidecar write duration, heap, and backlog; the gate is bounded
+   backlog and flat heap when cadence exceeds single-publication duration
    (round-2 finding 4).
 9. **Coverage persistence (hard gate):** two-restart matrix WITH an
    intervening GC pass proving the previously re-seeding residue cohort
