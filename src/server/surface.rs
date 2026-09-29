@@ -262,9 +262,6 @@ mod tests {
             assert!(!visible.is_empty(), "{name}");
             assert!(visible.is_subset(&ops), "{name}");
         }
-        let agent_internal = visible_tool_set(&surfaces["agent-internal"], &universe);
-        assert!(!agent_internal.contains("bro_exec"));
-        assert!(agent_internal.contains("bro_status"));
         let readonly = visible_tool_set(&surfaces["readonly"], &universe);
         assert!(!readonly.contains("bbox_learn"));
         assert!(readonly.contains("bbox_hybrid_search"));
@@ -276,6 +273,111 @@ mod tests {
                     !visible_tool_set(&surface(&[pattern], &[]), &universe).is_empty(),
                     "surface {name}: pattern {pattern} matches no served tool"
                 );
+            }
+        }
+    }
+
+    /// Agent-facing tools (shedding plan, Stage 2 Keep column).
+    const KEEP: &[&str] = &[
+        "bbox_hybrid_search",
+        "bbox_context",
+        "bbox_messages",
+        "bbox_session",
+        "bbox_sessions_list",
+        "bbox_inspect_entity",
+        "bbox_knowledge",
+        "bbox_learn",
+        "bbox_forget",
+        "bbox_render",
+        "bbox_thread",
+        "bbox_thread_list",
+        "bbox_gap",
+        "bbox_gaps",
+        "bbox_gap_update",
+        "bbox_gap_resolve",
+        "bro_exec",
+        "bro_resume",
+        "bro_status",
+        "bro_wait",
+        "bro_when_all",
+        "bro_when_any",
+        "bro_steer",
+        "bro_cancel",
+        "bro_dashboard",
+        "bro_providers",
+        "bro_brofile",
+        "bbox_project_list",
+    ];
+
+    /// Operator tools served only on `ops` (shedding plan, Ops-only column).
+    const OPS_ONLY: &[&str] = &[
+        "bbox_stats",
+        "bro_prune",
+        "bro_allocator_status",
+        "bro_allocator_trace",
+        "bro_allocator_probe",
+        "bro_mcp",
+        "bbox_project_register",
+        "bbox_project_init",
+        "bbox_project_rename",
+        "bbox_project_unregister",
+        "bbox_project_eject",
+        "bbox_project_catalog_list",
+        "bbox_project_catalog_get",
+        "bbox_project_attach",
+        "bbox_project_detach",
+        "bbox_project_default_attachment",
+        "bbox_project_promote",
+        "bbox_project_publisher_bind",
+        "bbox_project_publisher_advance",
+        "bbox_project_publisher_status",
+        "bbox_project_graph_list",
+        "bbox_project_graph_describe",
+        "bbox_project_graph_validate",
+        "bbox_reindex",
+        "bbox_reembed",
+        "bbox_embed_status",
+        "bbox_embed_partitions",
+        "bbox_storage_gc",
+        "bbox_storage_health",
+        "bbox_edge_compact",
+        "bbox_doctor",
+        "bbox_artifact_install",
+        "bbox_artifact_list",
+        "bbox_artifact_remove",
+        "bbox_artifact_supersede",
+    ];
+
+    #[test]
+    fn agent_facing_surfaces_serve_keep_and_hide_operator_tools() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let srv = BlackboxServer::new(Arc::new(SharedState::for_test(tmp.path())));
+        let universe: Vec<String> = srv
+            .tool_router
+            .list_all()
+            .iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        let surfaces = crate::config::default_surfaces();
+        let ops = visible_tool_set(&surfaces["ops"], &universe);
+        for name in KEEP.iter().chain(OPS_ONLY) {
+            assert!(ops.contains(*name), "ops must serve {name}");
+        }
+        let dispatch_capable = ["bro_exec", "bro_resume", "bro_cancel"];
+        for surface in ["default", "interactive", "agent-internal", "readonly"] {
+            let visible = visible_tool_set(&surfaces[surface], &universe);
+            for name in OPS_ONLY {
+                assert!(!visible.contains(*name), "{surface} must hide {name}");
+            }
+            if surface == "readonly" {
+                continue;
+            }
+            for name in KEEP {
+                if surface == "agent-internal" && dispatch_capable.contains(name) {
+                    assert!(!visible.contains(*name), "{surface} must hide {name}");
+                } else {
+                    assert!(visible.contains(*name), "{surface} must serve {name}");
+                }
             }
         }
     }
