@@ -211,6 +211,9 @@ async fn queued_knowledge_preserves_the_complete_canonical_entry() {
     entry.providers = vec!["provider".into()];
     entry.priority = crate::knowledge::Priority::Critical;
     entry.render = false;
+    entry.render_placement = crate::knowledge::RenderPlacement::Satellite {
+        topic: crate::knowledge::GuidanceTopic::Operations,
+    };
     publish(&fixture, &server, &scope, "2", &[entry.clone()]);
     server
         .mutate_queued_knowledge(PROJECT, scope.clone(), "touch", |transaction| {
@@ -226,6 +229,75 @@ async fn queued_knowledge_preserves_the_complete_canonical_entry() {
         crate::knowledge::committed_knowledge_entry_bytes(&updated).unwrap(),
         crate::knowledge::committed_knowledge_entry_bytes(&entry).unwrap()
     );
+}
+
+/// An id-addressed update that omits `render_placement` or `render` keeps
+/// the published entry's values, and one that passes them changes them.
+#[tokio::test]
+async fn queued_knowledge_update_by_id_preserves_omitted_render_fields() {
+    use crate::knowledge::{GuidanceTopic, RenderPlacement};
+
+    let (fixture, server, scope) = fixture();
+    let mut entry = knowledge_entry(ENTRY, "satellite");
+    entry.project_id = Some(PROJECT.into());
+    entry.render = false;
+    entry.render_placement = RenderPlacement::Satellite {
+        topic: GuidanceTopic::Operations,
+    };
+    publish(&fixture, &server, &scope, "2", &[entry.clone()]);
+
+    update_by_id(&server, ENTRY, "omitted fields")
+        .unwrap()
+        .unwrap();
+    let updated = latest(&server, &scope, ENTRY);
+    assert_eq!(updated.content, "omitted fields");
+    assert_eq!(updated.render_placement, entry.render_placement);
+    assert!(!updated.render);
+    let row = server
+        .state
+        .checkout_mutations
+        .read()
+        .outstanding_writes()
+        .last()
+        .unwrap()
+        .mutation
+        .content_json
+        .clone()
+        .unwrap();
+    assert!(
+        row.contains("\"render_placement\""),
+        "the delivered file keeps its placement: {row}"
+    );
+
+    let mut params = learn(Some(ENTRY), "passed fields");
+    params.project = None;
+    params.render = Some(true);
+    params.render_placement = Some(RenderPlacement::Satellite {
+        topic: GuidanceTopic::Build,
+    });
+    server
+        .enqueue_learn_update_by_id_via_checkout_owner(&params, ENTRY)
+        .unwrap()
+        .unwrap();
+    let changed = latest(&server, &scope, ENTRY);
+    assert_eq!(
+        changed.render_placement,
+        RenderPlacement::Satellite {
+            topic: GuidanceTopic::Build
+        }
+    );
+    assert!(changed.render);
+
+    params.content = "back inline".into();
+    params.render = None;
+    params.render_placement = Some(RenderPlacement::Inline);
+    server
+        .enqueue_learn_update_by_id_via_checkout_owner(&params, ENTRY)
+        .unwrap()
+        .unwrap();
+    let inline = latest(&server, &scope, ENTRY);
+    assert!(inline.render_placement.is_inline());
+    assert!(inline.render, "an omitted render keeps the queued value");
 }
 
 #[tokio::test]
