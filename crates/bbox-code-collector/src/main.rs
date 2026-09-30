@@ -2431,7 +2431,17 @@ async fn publish_history_repositories_pass(
                 // repository's history this pass.
                 return Ok(());
             }
-            let captured = capture_git_history(project)?;
+            // Probe the cheap head identity first: an unchanged HEAD is
+            // already current on the server, so the complete history walk
+            // runs only on a probe miss.
+            let head = resolve_git_history_head(project)?;
+            if probe_git_history(runtime, &head.scope, &head.repo_head, head.object_format)
+                .await?
+                .is_some()
+            {
+                return Ok(());
+            }
+            let captured = capture_git_history_at(head)?;
             publish_git_history(
                 runtime,
                 captured,
@@ -2445,11 +2455,13 @@ async fn publish_history_repositories_pass(
     outcome
 }
 
-async fn publish_git_history(
+/// Ask the server whether this exact history head is already a ready source.
+async fn probe_git_history(
     runtime: &Runtime,
-    captured: CapturedGitHistory,
-    status_timeout: Duration,
-) -> Result<()> {
+    scope: &PublishedScope,
+    repo_head: &str,
+    object_format: GitObjectFormatV1,
+) -> Result<Option<GitHistorySourceStatusV1>> {
     let probe: GitHistoryProbeResponseV1 = send_json(
         runtime
             .request(
@@ -2457,19 +2469,39 @@ async fn publish_git_history(
                 runtime.endpoint("internal/code-source/v1/git-history/probe")?,
             )
             .json(&GitHistoryProbeRequestV1 {
-                scope: captured.descriptor.scope.clone(),
-                repo_head: captured.descriptor.repo_head.clone(),
-                object_format: captured.descriptor.object_format,
+                scope: scope.clone(),
+                repo_head: repo_head.to_string(),
+                object_format,
             }),
     )
     .await?;
-    if let Some(current) = probe.current {
+    if let Some(current) = &probe.current {
         tracing::info!(
             source_generation = %current.source_generation_id,
             commits = current.commit_count,
             bytes = current.logical_bytes,
             "Git-history source is already current"
         );
+    }
+    Ok(probe.current)
+}
+
+async fn publish_git_history(
+    runtime: &Runtime,
+    captured: CapturedGitHistory,
+    status_timeout: Duration,
+) -> Result<()> {
+    // HEAD can move between the pre-capture probe and the walk; the captured
+    // head is probed again so an already-current capture is not re-uploaded.
+    if probe_git_history(
+        runtime,
+        &captured.descriptor.scope,
+        &captured.descriptor.repo_head,
+        captured.descriptor.object_format,
+    )
+    .await?
+    .is_some()
+    {
         return Ok(());
     }
 
@@ -2851,7 +2883,17 @@ fn scan_project(config: &ProjectConfig) -> Result<ScannedProject> {
     })
 }
 
-fn capture_git_history(config: &ProjectConfig) -> Result<CapturedGitHistory> {
+/// A repository's history identity (HEAD, object format, committed scope),
+/// resolved without walking any commit, plus the open repository a capture
+/// walks from.
+struct GitHistoryHead {
+    repository: bbox_corpus_core::git::StableGitRepository,
+    scope: PublishedScope,
+    repo_head: String,
+    object_format: GitObjectFormatV1,
+}
+
+fn resolve_git_history_head(config: &ProjectConfig) -> Result<GitHistoryHead> {
     let root = config
         .root
         .canonicalize()
@@ -2867,8 +2909,8 @@ fn capture_git_history(config: &ProjectConfig) -> Result<CapturedGitHistory> {
     let head = repository
         .verified_head()?
         .ok_or_else(|| anyhow!("Git-history publication requires a commit HEAD"))?;
-    let actual_scope = resolve_committed_scope(&root, head.oid())?;
-    if actual_scope != config.scope {
+    let scope = resolve_committed_scope(&root, head.oid())?;
+    if scope != config.scope {
         bail!("configured scope does not match committed project identity");
     }
     let object_format = match repository.object_id_hex_len()? {
@@ -2876,13 +2918,35 @@ fn capture_git_history(config: &ProjectConfig) -> Result<CapturedGitHistory> {
         64 => GitObjectFormatV1::Sha256,
         _ => bail!("Git repository uses an unsupported object format"),
     };
+    Ok(GitHistoryHead {
+        repo_head: head.oid().to_string(),
+        repository,
+        scope,
+        object_format,
+    })
+}
+
+#[cfg(test)]
+fn capture_git_history(config: &ProjectConfig) -> Result<CapturedGitHistory> {
+    capture_git_history_at(resolve_git_history_head(config)?)
+}
+
+fn capture_git_history_at(head: GitHistoryHead) -> Result<CapturedGitHistory> {
+    #[cfg(test)]
+    tests::HISTORY_CAPTURES.with(|captures| captures.set(captures.get() + 1));
+    let GitHistoryHead {
+        repository,
+        scope: actual_scope,
+        repo_head,
+        object_format,
+    } = head;
     let limits = GitSourceLimits::default();
     let max_commits = usize::try_from(limits.max_history_commits)
         .context("Git-history commit limit exceeds this platform")?;
     let max_logical_bytes = usize::try_from(limits.max_history_logical_bytes)
         .context("Git-history logical-byte limit exceeds this platform")?;
     let commits =
-        repository.complete_history_bounded(head.oid(), max_commits, max_logical_bytes)?;
+        repository.complete_history_bounded(&repo_head, max_commits, max_logical_bytes)?;
     let records = tempfile::tempdir().context("creating Git-history record spool")?;
     let mut entries = Vec::new();
     for commit in &commits {
@@ -2909,7 +2973,7 @@ fn capture_git_history(config: &ProjectConfig) -> Result<CapturedGitHistory> {
     let descriptor = GitHistoryDescriptorV1 {
         schema_version: GIT_SOURCE_SCHEMA_VERSION,
         scope: actual_scope,
-        repo_head: head.oid().to_string(),
+        repo_head,
         object_format,
         manifest_sha256: history_manifest_sha256(&entries),
         commit_count: commits.len() as u64,
@@ -3785,6 +3849,146 @@ mod tests {
     use super::*;
 
     const KNOWLEDGE_BYTES: &[u8] = br#"{"id":"knowledge-1"}"#;
+
+    thread_local! {
+        /// Complete history walks run on this thread (a current-thread
+        /// tokio test runs the lane inline).
+        pub(super) static HISTORY_CAPTURES: std::cell::Cell<usize> =
+            const { std::cell::Cell::new(0) };
+    }
+
+    /// A history-lane server whose probe answers `current` for exactly the
+    /// heads in `current_heads`, and which records every request path. An
+    /// upload begin is refused so a miss stops right after capture.
+    async fn history_test_runtime(
+        current_heads: Vec<String>,
+    ) -> (
+        Runtime,
+        tokio::task::JoinHandle<()>,
+        Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        use axum::Json;
+        use axum::Router;
+        use axum::routing::post;
+
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let probe_sink = requests.clone();
+        let upload_sink = requests.clone();
+        let app = Router::new()
+            .route(
+                "/internal/code-source/v1/git-history/probe",
+                post(move |Json(request): Json<GitHistoryProbeRequestV1>| {
+                    let probe_sink = probe_sink.clone();
+                    let current = current_heads.contains(&request.repo_head).then(|| {
+                        GitHistorySourceStatusV1 {
+                            source_generation_id: "gh_current".into(),
+                            state: GitHistorySourceStateV1::Active,
+                            commit_count: 1,
+                            logical_bytes: 1,
+                            diagnostic: None,
+                        }
+                    });
+                    async move {
+                        probe_sink
+                            .lock()
+                            .unwrap()
+                            .push(format!("probe:{}", request.repo_head));
+                        Json(GitHistoryProbeResponseV1 { current })
+                    }
+                }),
+            )
+            .route(
+                "/internal/code-source/v1/git-history/uploads",
+                post(move |Json(request): Json<BeginGitHistoryUploadRequestV1>| {
+                    let upload_sink = upload_sink.clone();
+                    async move {
+                        upload_sink.lock().unwrap().push(format!(
+                            "upload:{}:{}",
+                            request.descriptor.repo_head, request.descriptor.commit_count
+                        ));
+                        (
+                            axum::http::StatusCode::CONFLICT,
+                            Json(ErrorResponse {
+                                code: "test_stop".into(),
+                                message: "upload refused by the test server".into(),
+                            }),
+                        )
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let runtime = Runtime {
+            base_url: Url::parse(&format!("http://{address}/")).unwrap(),
+            token: ServiceToken::parse("8".repeat(64)).unwrap(),
+            client: Client::builder().build().unwrap(),
+        };
+        (runtime, server, requests)
+    }
+
+    fn history_fixture_repo(root: &Path) -> String {
+        git(root, &["init", "--quiet"]);
+        git(root, &["config", "user.name", "History Fixture"]);
+        git(root, &["config", "user.email", "history@example.invalid"]);
+        fs::create_dir_all(root.join(".bbox")).unwrap();
+        fs::write(
+            root.join(".bbox/config.toml"),
+            "[project]\nrepo_id = \"history-probe\"\n",
+        )
+        .unwrap();
+        fs::write(root.join("README.md"), "root\n").unwrap();
+        git(root, &["add", ".bbox/config.toml", "README.md"]);
+        git(root, &["commit", "--quiet", "-m", "root"]);
+        bbox_corpus_core::git::current_head(root).unwrap()
+    }
+
+    #[tokio::test]
+    async fn history_lane_probes_head_before_walking_and_captures_only_on_a_miss() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let head = history_fixture_repo(&root);
+        let mut config = mutation_config(
+            &root,
+            PublishedScope::try_new("history-probe", ".").unwrap(),
+        );
+        config.projects[0].git_history = true;
+
+        // Unchanged HEAD: one probe, no walk, no upload.
+        let (runtime, server, requests) = history_test_runtime(vec![head.clone()]).await;
+        HISTORY_CAPTURES.with(|captures| captures.set(0));
+        let outcome = publish_history_repositories_pass(&runtime, &config).await;
+        assert!(outcome.failures.is_empty(), "{:?}", outcome.failures);
+        assert_eq!(HISTORY_CAPTURES.with(std::cell::Cell::get), 0);
+        assert_eq!(
+            requests.lock().unwrap().clone(),
+            vec![format!("probe:{head}")]
+        );
+        server.abort();
+
+        // HEAD moved: the probe misses, the walk runs once, and the captured
+        // head is uploaded.
+        fs::write(root.join("README.md"), "next\n").unwrap();
+        git(&root, &["commit", "--quiet", "-am", "next"]);
+        let next = bbox_corpus_core::git::current_head(&root).unwrap();
+        let (runtime, server, requests) = history_test_runtime(vec![head.clone()]).await;
+        let outcome = publish_history_repositories_pass(&runtime, &config).await;
+        assert_eq!(
+            outcome.failures.len(),
+            1,
+            "the test server refuses the upload"
+        );
+        assert_eq!(HISTORY_CAPTURES.with(std::cell::Cell::get), 1);
+        assert_eq!(
+            requests.lock().unwrap().clone(),
+            vec![
+                format!("probe:{next}"),
+                format!("probe:{next}"),
+                format!("upload:{next}:2"),
+            ]
+        );
+        server.abort();
+    }
 
     fn git(root: &Path, args: &[&str]) {
         let output = std::process::Command::new("git")
