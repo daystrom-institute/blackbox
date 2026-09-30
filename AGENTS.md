@@ -3,6 +3,14 @@
 
 ## Conventions
 
+**No private client details in committed artifacts (public repo)**
+
+This is a PUBLIC repo — never commit private client/customer identifiers into any repo artifact. No real repo names, company/org names, package paths, or class/method/field/file names from a client codebase may appear in design docs, code comments, system memories, knowledge entries, gap notes, or commit messages. When a probe, refactor, or campaign runs against a real client codebase, genericize before committing: "a ~3,700-line Vaadin view", "an admin service class", "a write-concern method cluster", "a large client repo". Probe/session labels (probe-pg-1, probe-dash-1) are fine — they do not identify the client. Synthetic fixtures use neutral names (com.acme, OrderService). Scrub before every commit; a leaked blob in pushed history is a real exposure even after the tip is fixed.
+
+**Blackbox work pipeline automations are maintained from ~/.config/bbox-automation**
+
+The scheduled Orca automations that run the blackbox work pipeline (gap triage, issue review, design review, dispatcher, PR review, weekly review) are operator-local. Their prompts, prechecks, helper scripts, and the pipeline contract (issue Status and labels, PR labels and commit statuses, stage eligibility, merge rule, operator return paths) live in ~/.config/bbox-automation/. Read its AGENTS.md before changing any automation, prompt, pipeline label, or project Status. Orca stores its own copy of each prompt and precheck: edit the file, apply it with `orca automations edit`, and confirm the stored copy matches.
+
 **Multiple agents operate concurrently across worktrees — only touch files you changed**
 
 Multiple agents operate concurrently in this repo — the main worktree plus additional git/Claude worktrees — against shared working state. Treat the working tree as multi-tenant: only stage, commit, discard, restore, or stash files that THIS session changed. Files you didn't touch may carry a peer agent's uncommitted edits.
@@ -11,16 +19,12 @@ Why: a clean repo at session start does not stay clean — background/peer agent
 
 How to apply: scope every git mutation to your own files by explicit path. Before discarding or overwriting anything you didn't create, inspect it and surface it to the operator rather than reverting. When you need a clean tree to rebase, stash only the peer-foreign dirty files by path and restore them afterward. Complements the test-isolation invariants (per-test tempdirs / real-HOME isolation) and the ask-before-mutating-shared-services convention.
 
-**No private client details in committed artifacts (public repo)**
-
-This is a PUBLIC repo — never commit private client/customer identifiers into any repo artifact. No real repo names, company/org names, package paths, or class/method/field/file names from a client codebase may appear in design docs, code comments, system memories, knowledge entries, gap notes, or commit messages. When a probe, refactor, or campaign runs against a real client codebase, genericize before committing: "a ~3,700-line Vaadin view", "an admin service class", "a write-concern method cluster", "a large client repo". Probe/session labels (probe-pg-1, probe-dash-1) are fine — they do not identify the client. Synthetic fixtures use neutral names (com.acme, OrderService). Scrub before every commit; a leaked blob in pushed history is a real exposure even after the tip is fixed.
-
 
 ## Workflow
 
 **List Before Create**
 
-Before any create/open/save/add action that could duplicate an existing object, call the list/get/search variant first to check for an existing match. Applies to brofiles, teamplates/teams, MCP servers, threads, and dedupe-sensitive knowledge/decision writes.
+Before any create/open/save/add action that could duplicate an existing object, call the list/get/search variant first to check for an existing match. Applies to brofiles, MCP servers, threads, and dedupe-sensitive knowledge/decision writes.
 
 ### Shared Infrastructure Safety
 
@@ -35,10 +39,10 @@ For project architecture, implementation, or operational work, read `PROJECT.md`
 
 Read the matching guide before that operation. Skip unrelated guides. Read a guide once unless its contents change or are no longer available in context.
 
-- Changing subsystem boundaries, protocols, or public tool surfaces: `.bbox/guidance/47f92ad9d8bbcf48073b7818e61fb6fb751d4eb8b9aaa815859385e7e0c270b1/agents-architecture.md`
-- Writing project documentation, prompts, research, specifications, or system memories: `.bbox/guidance/47f92ad9d8bbcf48073b7818e61fb6fb751d4eb8b9aaa815859385e7e0c270b1/agents-authoring.md`
-- Building, formatting, or testing this project: `.bbox/guidance/47f92ad9d8bbcf48073b7818e61fb6fb751d4eb8b9aaa815859385e7e0c270b1/agents-build.md`
-- Operating or troubleshooting Blackbox infrastructure, configuration, or substrate gaps: `.bbox/guidance/47f92ad9d8bbcf48073b7818e61fb6fb751d4eb8b9aaa815859385e7e0c270b1/agents-operations.md`
-- Dispatching, supervising, or validating agents and Fleet: `.bbox/guidance/47f92ad9d8bbcf48073b7818e61fb6fb751d4eb8b9aaa815859385e7e0c270b1/agents-orchestration.md`
-- Creating, changing, or retiring durable memory: `.bbox/guidance/47f92ad9d8bbcf48073b7818e61fb6fb751d4eb8b9aaa815859385e7e0c270b1/agents-persistence.md`
-- Changing or executing structural refactor tooling: `.bbox/guidance/47f92ad9d8bbcf48073b7818e61fb6fb751d4eb8b9aaa815859385e7e0c270b1/agents-refactoring.md`
+- Changing subsystem boundaries, protocols, or public tool surfaces: `.bbox/guidance/2170631e44f06a8df9f794cb5393f8ebeaac151b474baf87da3222611e064031/agents-architecture.md`
+- Writing project documentation, prompts, research, specifications, or system memories: `.bbox/guidance/2170631e44f06a8df9f794cb5393f8ebeaac151b474baf87da3222611e064031/agents-authoring.md`
+- Building, formatting, or testing this project: `.bbox/guidance/2170631e44f06a8df9f794cb5393f8ebeaac151b474baf87da3222611e064031/agents-build.md`
+- Operating or troubleshooting Blackbox infrastructure, configuration, or substrate gaps: `.bbox/guidance/2170631e44f06a8df9f794cb5393f8ebeaac151b474baf87da3222611e064031/agents-operations.md`
+- Dispatching, supervising, or validating agents and Fleet: `.bbox/guidance/2170631e44f06a8df9f794cb5393f8ebeaac151b474baf87da3222611e064031/agents-orchestration.md`
+- Creating, changing, or retiring durable memory: `.bbox/guidance/2170631e44f06a8df9f794cb5393f8ebeaac151b474baf87da3222611e064031/agents-persistence.md`
+- Changing or executing structural refactor tooling: `.bbox/guidance/2170631e44f06a8df9f794cb5393f8ebeaac151b474baf87da3222611e064031/agents-refactoring.md`

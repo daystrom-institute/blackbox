@@ -4,6 +4,14 @@
 For project architecture, implementation, or operational work, read `PROJECT.md`. Skip it for unrelated tasks.
 ## Conventions
 
+**No private client details in committed artifacts (public repo)**
+
+This is a PUBLIC repo — never commit private client/customer identifiers into any repo artifact. No real repo names, company/org names, package paths, or class/method/field/file names from a client codebase may appear in design docs, code comments, system memories, knowledge entries, gap notes, or commit messages. When a probe, refactor, or campaign runs against a real client codebase, genericize before committing: "a ~3,700-line Vaadin view", "an admin service class", "a write-concern method cluster", "a large client repo". Probe/session labels (probe-pg-1, probe-dash-1) are fine — they do not identify the client. Synthetic fixtures use neutral names (com.acme, OrderService). Scrub before every commit; a leaked blob in pushed history is a real exposure even after the tip is fixed.
+
+**Blackbox work pipeline automations are maintained from ~/.config/bbox-automation**
+
+The scheduled Orca automations that run the blackbox work pipeline (gap triage, issue review, design review, dispatcher, PR review, weekly review) are operator-local. Their prompts, prechecks, helper scripts, and the pipeline contract (issue Status and labels, PR labels and commit statuses, stage eligibility, merge rule, operator return paths) live in ~/.config/bbox-automation/. Read its AGENTS.md before changing any automation, prompt, pipeline label, or project Status. Orca stores its own copy of each prompt and precheck: edit the file, apply it with `orca automations edit`, and confirm the stored copy matches.
+
 **Multiple agents operate concurrently across worktrees — only touch files you changed**
 
 Multiple agents operate concurrently in this repo — the main worktree plus additional git/Claude worktrees — against shared working state. Treat the working tree as multi-tenant: only stage, commit, discard, restore, or stash files that THIS session changed. Files you didn't touch may carry a peer agent's uncommitted edits.
@@ -12,16 +20,12 @@ Why: a clean repo at session start does not stay clean — background/peer agent
 
 How to apply: scope every git mutation to your own files by explicit path. Before discarding or overwriting anything you didn't create, inspect it and surface it to the operator rather than reverting. When you need a clean tree to rebase, stash only the peer-foreign dirty files by path and restore them afterward. Complements the test-isolation invariants (per-test tempdirs / real-HOME isolation) and the ask-before-mutating-shared-services convention.
 
-**No private client details in committed artifacts (public repo)**
-
-This is a PUBLIC repo — never commit private client/customer identifiers into any repo artifact. No real repo names, company/org names, package paths, or class/method/field/file names from a client codebase may appear in design docs, code comments, system memories, knowledge entries, gap notes, or commit messages. When a probe, refactor, or campaign runs against a real client codebase, genericize before committing: "a ~3,700-line Vaadin view", "an admin service class", "a write-concern method cluster", "a large client repo". Probe/session labels (probe-pg-1, probe-dash-1) are fine — they do not identify the client. Synthetic fixtures use neutral names (com.acme, OrderService). Scrub before every commit; a leaked blob in pushed history is a real exposure even after the tip is fixed.
-
 
 ## Workflow
 
 **List Before Create**
 
-Before any create/open/save/add action that could duplicate an existing object, call the list/get/search variant first to check for an existing match. Applies to brofiles, teamplates/teams, MCP servers, threads, and dedupe-sensitive knowledge/decision writes.
+Before any create/open/save/add action that could duplicate an existing object, call the list/get/search variant first to check for an existing match. Applies to brofiles, MCP servers, threads, and dedupe-sensitive knowledge/decision writes.
 
 ### Shared Infrastructure Safety
 
@@ -35,10 +39,10 @@ Before restarting, stopping, reloading, replacing, or otherwise mutating shared 
 
 Read the matching guide before that operation. Skip unrelated guides. Read a guide once unless its contents change or are no longer available in context.
 
-- Changing subsystem boundaries, protocols, or public tool surfaces: `.bbox/guidance/b50134a50936e2205264928f80b137e14fe974119868c488b0ff2024dbfad62b/gemini-architecture.md`
-- Writing project documentation, prompts, research, specifications, or system memories: `.bbox/guidance/b50134a50936e2205264928f80b137e14fe974119868c488b0ff2024dbfad62b/gemini-authoring.md`
-- Building, formatting, or testing this project: `.bbox/guidance/b50134a50936e2205264928f80b137e14fe974119868c488b0ff2024dbfad62b/gemini-build.md`
-- Operating or troubleshooting Blackbox infrastructure, configuration, or substrate gaps: `.bbox/guidance/b50134a50936e2205264928f80b137e14fe974119868c488b0ff2024dbfad62b/gemini-operations.md`
-- Dispatching, supervising, or validating agents and Fleet: `.bbox/guidance/b50134a50936e2205264928f80b137e14fe974119868c488b0ff2024dbfad62b/gemini-orchestration.md`
-- Creating, changing, or retiring durable memory: `.bbox/guidance/b50134a50936e2205264928f80b137e14fe974119868c488b0ff2024dbfad62b/gemini-persistence.md`
-- Changing or executing structural refactor tooling: `.bbox/guidance/b50134a50936e2205264928f80b137e14fe974119868c488b0ff2024dbfad62b/gemini-refactoring.md`
+- Changing subsystem boundaries, protocols, or public tool surfaces: `.bbox/guidance/9df339e94c2a48077d071015c08ef956c0811e75886d71d5715431641c2e43d8/gemini-architecture.md`
+- Writing project documentation, prompts, research, specifications, or system memories: `.bbox/guidance/9df339e94c2a48077d071015c08ef956c0811e75886d71d5715431641c2e43d8/gemini-authoring.md`
+- Building, formatting, or testing this project: `.bbox/guidance/9df339e94c2a48077d071015c08ef956c0811e75886d71d5715431641c2e43d8/gemini-build.md`
+- Operating or troubleshooting Blackbox infrastructure, configuration, or substrate gaps: `.bbox/guidance/9df339e94c2a48077d071015c08ef956c0811e75886d71d5715431641c2e43d8/gemini-operations.md`
+- Dispatching, supervising, or validating agents and Fleet: `.bbox/guidance/9df339e94c2a48077d071015c08ef956c0811e75886d71d5715431641c2e43d8/gemini-orchestration.md`
+- Creating, changing, or retiring durable memory: `.bbox/guidance/9df339e94c2a48077d071015c08ef956c0811e75886d71d5715431641c2e43d8/gemini-persistence.md`
+- Changing or executing structural refactor tooling: `.bbox/guidance/9df339e94c2a48077d071015c08ef956c0811e75886d71d5715431641c2e43d8/gemini-refactoring.md`
