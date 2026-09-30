@@ -383,6 +383,9 @@ pub const MAX_PRODUCER_COMMAND_REF_BYTES: usize = 1024;
 pub const MAX_PRODUCER_COMMAND_ERROR_BYTES: usize = 4096;
 pub const MAX_ENROLL_RECEIPT_COMMIT_PATHS: usize = 64;
 
+/// A collector's source pass interval when its configuration names none.
+pub const DEFAULT_COLLECTOR_INTERVAL_SECS: u64 = 120;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ProducerPresenceV1 {
@@ -391,6 +394,11 @@ pub struct ProducerPresenceV1 {
     pub config_path: String,
     pub service_label: Option<String>,
     pub collector_version: String,
+    /// The collector's source pass interval. Every pass probes each
+    /// configured project, so the daemon judges a producer's reports stale
+    /// against this cadence. Absent from collectors that predate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval_secs: Option<u64>,
 }
 
 impl ProducerPresenceV1 {
@@ -1550,6 +1558,33 @@ mod tests {
         }
     }
 
+    /// A presence from a collector that predates the interval report still
+    /// decodes, and a current one round-trips its interval.
+    #[test]
+    fn presence_interval_is_optional_on_the_wire() {
+        let legacy: ProducerPresenceV1 = serde_json::from_value(serde_json::json!({
+            "enroll_roots": [],
+            "host_label": "checkout-host-a",
+            "config_path": "/etc/blackbox/code-collector.toml",
+            "service_label": null,
+            "collector_version": "0.0.1",
+        }))
+        .unwrap();
+        assert_eq!(legacy.interval_secs, None);
+        legacy.validate().unwrap();
+        assert!(
+            !serde_json::to_value(&legacy)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("interval_secs")
+        );
+        let current = valid_presence();
+        let decoded: ProducerPresenceV1 =
+            serde_json::from_slice(&serde_json::to_vec(&current).unwrap()).unwrap();
+        assert_eq!(decoded.interval_secs, Some(120));
+    }
+
     fn valid_presence() -> ProducerPresenceV1 {
         ProducerPresenceV1 {
             enroll_roots: vec!["/home/operator/repos".into()],
@@ -1557,6 +1592,7 @@ mod tests {
             config_path: "/etc/blackbox/code-collector.toml".into(),
             service_label: Some("collector-a".into()),
             collector_version: "0.0.1".into(),
+            interval_secs: Some(120),
         }
     }
 

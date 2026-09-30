@@ -33,6 +33,7 @@ pub(crate) mod onboarding_skill;
 mod open;
 pub(crate) mod producer_auth;
 pub(crate) mod producer_commands;
+pub(crate) mod producer_currency;
 pub mod progress;
 pub(crate) mod render_operations;
 pub(crate) mod render_owner;

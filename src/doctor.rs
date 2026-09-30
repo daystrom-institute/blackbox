@@ -1159,140 +1159,24 @@ fn code_sources_section(state: &crate::server::state::SharedState) -> SectionRep
     }
     findings.extend(history_activation_deadletter_findings(state));
 
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let stale_hours = state.config.read().code_collection.stale_warning_hours;
+    // The HEAD each active collected generation serves. Doctor judges
+    // currency from what producers report against this, never from content
+    // age and never from a checkout.
+    let mut served_code_heads = std::collections::BTreeMap::new();
     match store.activation_records_mixed() {
         Ok(activations) => {
             for activation in activations {
-                let generation = match store.find_generation_mixed(activation.generation_id()) {
-                    Ok(generation) => generation,
-                    Err(error) => {
-                        findings.push(Finding::blocked(format!(
-                            "project `{}` active collected generation is unreadable: {error:#}",
-                            activation.project_id()
-                        )));
-                        continue;
+                match store.find_generation_mixed(activation.generation_id()) {
+                    Ok(generation) => {
+                        served_code_heads.insert(
+                            activation.project_id().to_string(),
+                            generation.descriptor().head_commit.clone(),
+                        );
                     }
-                };
-                let age_hours = now
-                    .saturating_sub(activation.activated_unix_secs())
-                    .checked_div(3_600)
-                    .unwrap_or_default();
-                if age_hours >= stale_hours {
-                    findings.push(Finding::warn(format!(
-                        "project `{}` collected generation is {} hours old",
-                        activation.project_id(),
-                        age_hours
-                    )));
-                } else if generation.state() == bbox_code_source::GenerationState::Active {
-                    findings.push(Finding::ok(format!(
-                        "project `{}` collected generation active ({} files, {} bytes, age {}h)",
-                        activation.project_id(),
-                        generation.descriptor().file_count,
-                        generation.descriptor().logical_bytes,
-                        age_hours
-                    )));
-                }
-                if let Some(project) = state
-                    .records_provider
-                    .records_snapshot()
-                    .records
-                    .iter()
-                    .cloned()
-                    .find(|project| project.project_id == activation.project_id())
-                {
-                    use bbox_indexing::checkout_access::{
-                        CheckoutAccessIntent, CheckoutAccessKind, CheckoutAccessRequest,
-                        CheckoutAccessSourceLane, CheckoutAttachmentSelector,
-                    };
-                    let request = |kind, expected_scope| CheckoutAccessRequest {
-                        project_id: project.project_id.clone(),
-                        attachment: CheckoutAttachmentSelector::Selected,
-                        expected_scope,
-                        kind,
-                        intent: CheckoutAccessIntent::Read,
-                        source_lane: CheckoutAccessSourceLane::LegacyProjectRecord,
-                    };
-                    let expected_scope = if let Some(catalog_store) =
-                        state.project_authority.catalog_store()
-                    {
-                        let project_id =
-                            bbox_corpus_core::project_catalog::ProjectId::parse(
-                                project.project_id.clone(),
-                            )
-                            .map_err(|_| {
-                                bbox_indexing::checkout_access::CheckoutAccessError::new(
-                                    bbox_indexing::checkout_access::CheckoutAccessErrorCode::ScopeMismatch,
-                                    "catalog project id is invalid",
-                                )
-                            });
-                        project_id.and_then(|project_id| {
-                            let snapshot = catalog_store.snapshot().map_err(|error| {
-                                bbox_indexing::checkout_access::CheckoutAccessError::new(
-                                    bbox_indexing::checkout_access::CheckoutAccessErrorCode::ScopeMismatch,
-                                    format!("catalog scope is unavailable: {error}"),
-                                )
-                            })?;
-                            snapshot
-                                .catalog()
-                                .projects
-                                .get(&project_id)
-                                .map(|project| match &project.scope {
-                                    bbox_corpus_core::project_catalog::ProjectScope::Published(
-                                        scope,
-                                    ) => Some(scope.clone()),
-                                    bbox_corpus_core::project_catalog::ProjectScope::LegacyLocal
-                                    | bbox_corpus_core::project_catalog::ProjectScope::Connector(
-                                        _,
-                                    ) => None,
-                                })
-                                .ok_or_else(|| {
-                                    bbox_indexing::checkout_access::CheckoutAccessError::new(
-                                        bbox_indexing::checkout_access::CheckoutAccessErrorCode::ScopeMismatch,
-                                        "catalog project disappeared",
-                                    )
-                                })
-                        })
-                    } else {
-                        state
-                            .checkout_access
-                            .acquire(request(CheckoutAccessKind::PublisherConfigTreeRead, None))
-                            .map(|scope| scope.published_scope().cloned())
-                    };
-                    let git = expected_scope.and_then(|expected_scope| {
-                        state
-                            .checkout_access
-                            .acquire(request(CheckoutAccessKind::GitHistory, expected_scope))
-                    });
-                    let git = match git {
-                        Ok(git) => git,
-                        Err(error) => {
-                            findings.push(Finding::warn(format!(
-                                "project `{}` Git-history freshness unavailable ({})",
-                                activation.project_id(),
-                                error.code.as_str()
-                            )));
-                            continue;
-                        }
-                    };
-                    let local_head = bbox_corpus_core::git::current_head(git.checkout_root());
-                    if let Err(error) = state.checkout_access.revalidate(&git) {
-                        findings.push(Finding::warn(format!(
-                            "project `{}` Git-history freshness unavailable ({})",
-                            activation.project_id(),
-                            error.code.as_str()
-                        )));
-                        continue;
-                    }
-                    if local_head.as_deref() != Some(generation.descriptor().head_commit.as_str()) {
-                        findings.push(Finding::warn(format!(
-                            "project `{}` local Git-history HEAD differs from collected current files",
-                            activation.project_id()
-                        )));
-                    }
+                    Err(error) => findings.push(Finding::blocked(format!(
+                        "project `{}` active collected generation is unreadable: {error:#}",
+                        activation.project_id()
+                    ))),
                 }
             }
         }
@@ -1300,6 +1184,11 @@ fn code_sources_section(state: &crate::server::state::SharedState) -> SectionRep
             "code-source activation records are unreadable: {error:#}"
         ))),
     }
+    findings.extend(producer_currency_findings(
+        state,
+        &served_code_heads,
+        crate::server::producer_currency::now_secs(),
+    ));
     findings.extend(repo_history_findings(state));
     if findings.is_empty() {
         findings.push(if state.config.read().code_collection.enabled {
@@ -1311,6 +1200,224 @@ fn code_sources_section(state: &crate::server::state::SharedState) -> SectionRep
     SectionReport {
         section: "code_sources",
         findings,
+    }
+}
+
+/// One producer-assigned project, with what the daemon serves for it.
+#[derive(Debug, Clone)]
+struct ProducerCurrencyInput {
+    project_id: String,
+    producer_id: String,
+    repo_history_id: Option<String>,
+    /// HEAD of the project's active collected generation.
+    served_code_head: Option<String>,
+    /// HEAD of the served producer history overlay for the project's
+    /// repository.
+    served_history_head: Option<String>,
+}
+
+/// Currency of every producer-assigned project, from what its producer last
+/// reported. A producer silent past its bound, or a reported HEAD left
+/// unserved past the same bound, warns; nothing warns because content is old
+/// or because this daemon cannot read a checkout.
+fn producer_currency_findings(
+    state: &crate::server::state::SharedState,
+    served_code_heads: &std::collections::BTreeMap<String, String>,
+    now: u64,
+) -> Vec<Finding> {
+    let assignments = state.code_sources.producer_auth().assignment_map();
+    if assignments.is_empty() {
+        return Vec::new();
+    }
+    let catalog = state
+        .project_authority
+        .catalog_store()
+        .and_then(|store| store.snapshot().ok());
+    let repo_of = |project_id: &str| {
+        let catalog = catalog.as_ref()?;
+        let project_id =
+            bbox_corpus_core::project_catalog::ProjectId::parse(project_id.to_string()).ok()?;
+        catalog
+            .catalog()
+            .projects
+            .get(&project_id)?
+            .repo_history
+            .as_ref()
+            .map(|id| id.as_str().to_string())
+    };
+    let mut served_history_heads = std::collections::BTreeMap::new();
+    for (project_id, overlay) in &state.code_read_view.read().git_overlays {
+        if overlay.source.producer_transport().is_some()
+            && let Some(repo) = repo_of(project_id)
+        {
+            served_history_heads.insert(repo, overlay.repo_head.clone());
+        }
+    }
+    let inputs = assignments
+        .into_values()
+        .map(|(project_id, producer_id)| {
+            let repo_history_id = repo_of(&project_id);
+            ProducerCurrencyInput {
+                served_code_head: served_code_heads.get(&project_id).cloned(),
+                served_history_head: repo_history_id
+                    .as_ref()
+                    .and_then(|repo| served_history_heads.get(repo))
+                    .cloned(),
+                repo_history_id,
+                project_id,
+                producer_id,
+            }
+        })
+        .collect::<Vec<_>>();
+    evaluate_producer_currency(&state.producer_currency.snapshot(), &inputs, now)
+}
+
+fn evaluate_producer_currency(
+    reports: &crate::server::producer_currency::ProducerCurrencySnapshot,
+    inputs: &[ProducerCurrencyInput],
+    now: u64,
+) -> Vec<Finding> {
+    let mut inputs = inputs.to_vec();
+    inputs.sort_by(|left, right| left.project_id.cmp(&right.project_id));
+    let mut findings = Vec::new();
+    let mut histories_seen = std::collections::BTreeSet::new();
+    for input in &inputs {
+        let project = &input.project_id;
+        let producer = &input.producer_id;
+        let bound = reports.bound_secs(producer);
+        let bound_text = format!(
+            "bound {}: {}x its {}s interval, at least {}",
+            human_secs(bound),
+            crate::server::producer_currency::CURRENCY_BOUND_INTERVALS,
+            reports.interval_secs(producer),
+            human_secs(crate::server::producer_currency::CURRENCY_BOUND_FLOOR_SECS),
+        );
+        let mut current = true;
+        let key = (producer.clone(), project.clone());
+        match reports.contacts.get(&key) {
+            Some(contact) if now.saturating_sub(*contact) > bound => {
+                current = false;
+                findings.push(
+                    Finding::warn(format!(
+                        "project `{project}` producer `{producer}` is stale: last report {} ago ({bound_text})",
+                        human_secs(now.saturating_sub(*contact)),
+                    ))
+                    .with_next(
+                        "check that producer's collector for this project: its service, its configuration, and its log",
+                    ),
+                );
+            }
+            Some(_) => {}
+            None => {
+                current = false;
+                let uptime = now.saturating_sub(reports.started_secs);
+                if uptime > bound {
+                    findings.push(
+                        Finding::warn(format!(
+                            "project `{project}` producer `{producer}` is stale: no report since the daemon started {} ago ({bound_text})",
+                            human_secs(uptime),
+                        ))
+                        .with_next(
+                            "check that producer's collector for this project: its service, its configuration, and its log",
+                        ),
+                    );
+                } else {
+                    findings.push(Finding::info(format!(
+                        "project `{project}` producer `{producer}` has not reported since the daemon started {} ago; its first pass is due within the {bound_text}",
+                        human_secs(uptime),
+                    )));
+                }
+            }
+        }
+        if let Some(report) = reports.code_heads.get(&key)
+            && input.served_code_head.as_deref() != Some(report.head.as_str())
+        {
+            current = false;
+            findings.push(behind_finding(
+                &format!("project `{project}` code"),
+                producer,
+                report,
+                input.served_code_head.as_deref(),
+                "the active collected generation",
+                bound,
+                &bound_text,
+                now,
+            ));
+        }
+        if let Some(repo) = &input.repo_history_id
+            && let Some(report) = reports.history_heads.get(&(producer.clone(), repo.clone()))
+            && input.served_history_head.as_deref() != Some(report.head.as_str())
+        {
+            current = false;
+            if histories_seen.insert((producer.clone(), repo.clone())) {
+                findings.push(behind_finding(
+                    &format!("repository history `{repo}`"),
+                    producer,
+                    report,
+                    input.served_history_head.as_deref(),
+                    "the served history overlay",
+                    bound,
+                    &bound_text,
+                    now,
+                ));
+            }
+        }
+        if current {
+            let contact = reports.contacts.get(&key).copied().unwrap_or(now);
+            let head = reports
+                .code_heads
+                .get(&key)
+                .map(|report| format!(" at HEAD {}", short_head(&report.head)))
+                .unwrap_or_default();
+            findings.push(Finding::info(format!(
+                "project `{project}` is current with producer `{producer}`: last report {} ago{head}",
+                human_secs(now.saturating_sub(contact)),
+            )));
+        }
+    }
+    findings
+}
+
+#[allow(clippy::too_many_arguments)]
+fn behind_finding(
+    subject: &str,
+    producer: &str,
+    report: &crate::server::producer_currency::ReportedHead,
+    served: Option<&str>,
+    served_name: &str,
+    bound: u64,
+    bound_text: &str,
+    now: u64,
+) -> Finding {
+    let unserved = report.unserved_for(now);
+    let served = served.map_or_else(
+        || "nothing".to_string(),
+        |head| format!("HEAD {}", short_head(head)),
+    );
+    let message = format!(
+        "{subject} is behind producer `{producer}`: it reported HEAD {} and {served_name} serves {served}, unconverged for {} ({bound_text})",
+        short_head(&report.head),
+        human_secs(unserved),
+    );
+    if unserved > bound {
+        Finding::warn(message).with_next(
+            "inspect the project's code-source and repository-history health records and the daemon log for the upload or activation that has not landed",
+        )
+    } else {
+        Finding::info(message.replacen(" is behind ", " is converging on ", 1))
+    }
+}
+
+fn short_head(head: &str) -> &str {
+    head.get(..12).unwrap_or(head)
+}
+
+fn human_secs(secs: u64) -> String {
+    match secs {
+        0..60 => format!("{secs}s"),
+        60..3_600 => format!("{}m", secs / 60),
+        3_600..86_400 => format!("{}h{}m", secs / 3_600, secs % 3_600 / 60),
+        _ => format!("{}d{}h", secs / 86_400, secs % 86_400 / 3_600),
     }
 }
 
@@ -3152,6 +3259,339 @@ mod catalog_health_tests {
         assert!(
             text.contains("project p_connector has no accepted publication lane"),
             "{text}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod producer_currency_tests {
+    use super::*;
+    use crate::server::producer_currency::{
+        CURRENCY_BOUND_FLOOR_SECS, ProducerCurrencyRuntime, now_secs,
+    };
+    use crate::server::state::catalog_fixture::CatalogFixture;
+
+    const PROJECT: &str = "p_currency";
+    const PRODUCER: &str = "producer-currency";
+    const HEAD: &str = "1111111111111111111111111111111111111111";
+    const NEXT_HEAD: &str = "2222222222222222222222222222222222222222";
+
+    /// A catalog server whose producer owns `PROJECT` and whose currency
+    /// record started `started_ago` seconds before now.
+    fn assigned(fixture: &CatalogFixture, started_ago: u64) -> crate::server::BlackboxServer {
+        use crate::server::producer_auth::{ProducerAuthRuntime, ProducerGrant};
+
+        fixture.add_published_project(PROJECT, &CatalogFixture::scope("."));
+        let mut state = crate::server::state::SharedState::for_test_catalog(
+            fixture.root(),
+            &fixture.root().join("catalog").join("projects.json"),
+        );
+        state.producer_currency = std::sync::Arc::new(ProducerCurrencyRuntime::started_at(
+            now_secs().saturating_sub(started_ago),
+        ));
+        let token = bro_rpc::ServiceToken::parse("e".repeat(64)).unwrap();
+        state
+            .code_sources
+            .install_auth_for_test(std::sync::Arc::new(ProducerAuthRuntime::for_test(
+                true,
+                false,
+                vec![(
+                    token,
+                    ProducerGrant {
+                        producer_id: PRODUCER.into(),
+                        projects: std::collections::BTreeMap::from([(
+                            CatalogFixture::scope("."),
+                            PROJECT.to_string(),
+                        )]),
+                    },
+                )],
+            )));
+        crate::server::BlackboxServer::new(std::sync::Arc::new(state))
+    }
+
+    /// Activate a collected generation at `head` whose activation is a year
+    /// old: its content is old, which says nothing about currency.
+    fn activate_old_generation(state: &crate::server::state::SharedState, head: &str) {
+        use bbox_code_source::{
+            GenerationDescriptor, SCHEMA_VERSION, WALKER_POLICY_VERSION, dirty_fingerprint,
+            manifest_sha256,
+        };
+
+        let store = state.code_sources.store();
+        let scope = CatalogFixture::scope(".");
+        let descriptor = GenerationDescriptor {
+            schema_version: SCHEMA_VERSION,
+            walker_policy_version: WALKER_POLICY_VERSION.into(),
+            scope: scope.clone(),
+            head_commit: head.to_string(),
+            dirty_fingerprint: dirty_fingerprint(head, &[]),
+            manifest_sha256: manifest_sha256(&[]),
+            file_count: 0,
+            logical_bytes: 0,
+        };
+        let upload = store.begin_upload(PRODUCER, descriptor).unwrap();
+        store
+            .complete_manifest(PRODUCER, &upload.upload_id)
+            .unwrap();
+        let generation = store.finalize_upload(PRODUCER, &upload.upload_id).unwrap();
+        // The test daemon's code-source store runs in bridge record mode.
+        store
+            .save_activation(&bbox_code_source_store::ActivationRecord {
+                version: 1,
+                project_id: PROJECT.to_string(),
+                generation_id: generation.generation_id.clone(),
+                selector:
+                    bbox_corpus_index::index::project_files::collected_materialization_selector(
+                        PROJECT,
+                        &generation.generation_id,
+                    ),
+                snapshot_id: format!("collected-{}", "f".repeat(32)),
+                document_count: 0,
+                entity_inventory_sha256: "e".repeat(64),
+                current_chunk_targets: Default::default(),
+                activated_unix_secs: now_secs().saturating_sub(365 * 86_400),
+                cutback_pending: false,
+                diagnostic: None,
+            })
+            .unwrap();
+    }
+
+    fn currency(state: &crate::server::state::SharedState) -> Vec<Finding> {
+        code_sources_section(state)
+            .findings
+            .into_iter()
+            .filter(|finding| finding.message.contains(PROJECT))
+            .collect()
+    }
+
+    fn warns(findings: &[Finding]) -> Vec<&Finding> {
+        findings
+            .iter()
+            .filter(|finding| finding.level >= FindingLevel::Warn)
+            .collect()
+    }
+
+    /// A project whose producer reported its served HEAD a moment ago is
+    /// current even though its generation was activated a year ago.
+    #[test]
+    fn current_project_with_old_content_does_not_warn() {
+        crate::init_system_memory_for_tests();
+        let fixture = CatalogFixture::new();
+        let server = assigned(&fixture, 7 * 86_400);
+        activate_old_generation(&server.state, HEAD);
+        server.state.producer_currency.record_code_report(
+            PRODUCER,
+            PROJECT,
+            HEAD,
+            true,
+            now_secs(),
+        );
+
+        let findings = currency(&server.state);
+        assert!(warns(&findings).is_empty(), "{findings:?}");
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.level == FindingLevel::Info
+                    && finding.message.contains("is current with producer")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .all(|finding| !finding.message.contains("hours old")
+                    && !finding.message.contains("freshness")),
+            "{findings:?}"
+        );
+    }
+
+    /// A producer silent past its bound is stale; after a fresh report the
+    /// project is current again.
+    #[test]
+    fn producer_silent_past_the_bound_warns_until_it_reports() {
+        crate::init_system_memory_for_tests();
+        let fixture = CatalogFixture::new();
+        let server = assigned(&fixture, 7 * 86_400);
+        activate_old_generation(&server.state, HEAD);
+        let currency_runtime = &server.state.producer_currency;
+        currency_runtime.record_code_report(
+            PRODUCER,
+            PROJECT,
+            HEAD,
+            true,
+            now_secs() - CURRENCY_BOUND_FLOOR_SECS - 60,
+        );
+
+        let findings = currency(&server.state);
+        let stale = warns(&findings);
+        assert_eq!(stale.len(), 1, "{findings:?}");
+        assert!(
+            stale[0].message.contains("is stale: last report"),
+            "{findings:?}"
+        );
+
+        currency_runtime.record_code_report(PRODUCER, PROJECT, HEAD, true, now_secs());
+        assert!(warns(&currency(&server.state)).is_empty());
+    }
+
+    /// A reported HEAD the active generation does not serve warns once it has
+    /// gone unserved past the bound, and clears when a report finds it
+    /// served.
+    #[test]
+    fn reported_head_not_served_past_the_window_warns_until_it_converges() {
+        crate::init_system_memory_for_tests();
+        let fixture = CatalogFixture::new();
+        let server = assigned(&fixture, 7 * 86_400);
+        activate_old_generation(&server.state, HEAD);
+        let currency_runtime = &server.state.producer_currency;
+        let now = now_secs();
+
+        // Inside the window the project is converging, not behind.
+        currency_runtime.record_code_report(PRODUCER, PROJECT, NEXT_HEAD, false, now - 60);
+        let findings = currency(&server.state);
+        assert!(warns(&findings).is_empty(), "{findings:?}");
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("is converging on producer")),
+            "{findings:?}"
+        );
+
+        // Unserved since past the window, while still reporting: behind.
+        let fixture = CatalogFixture::new();
+        let server = assigned(&fixture, 7 * 86_400);
+        activate_old_generation(&server.state, HEAD);
+        let currency_runtime = &server.state.producer_currency;
+        currency_runtime.record_code_report(
+            PRODUCER,
+            PROJECT,
+            NEXT_HEAD,
+            false,
+            now - CURRENCY_BOUND_FLOOR_SECS - 60,
+        );
+        currency_runtime.record_code_report(PRODUCER, PROJECT, NEXT_HEAD, false, now);
+        let findings = currency(&server.state);
+        let behind = warns(&findings);
+        assert_eq!(behind.len(), 1, "{findings:?}");
+        assert!(
+            behind[0].message.contains("code is behind producer")
+                && behind[0].message.contains(&NEXT_HEAD[..12])
+                && behind[0].message.contains(&HEAD[..12]),
+            "{findings:?}"
+        );
+
+        // The new generation lands and the next report finds it served.
+        activate_old_generation(&server.state, NEXT_HEAD);
+        assert!(warns(&currency(&server.state)).is_empty());
+        currency_runtime.record_code_report(PRODUCER, PROJECT, NEXT_HEAD, true, now);
+        let findings = currency(&server.state);
+        assert!(warns(&findings).is_empty(), "{findings:?}");
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("is current with producer")),
+            "{findings:?}"
+        );
+    }
+
+    /// A never-provisioned daemon (no producer assignment) has no currency
+    /// finding; an assigned project with no report waits one bound after a
+    /// start and then warns.
+    #[test]
+    fn absent_and_unreported_producers() {
+        crate::init_system_memory_for_tests();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let bridge = crate::server::state::SharedState::for_test(&root);
+        assert!(
+            code_sources_section(&bridge)
+                .findings
+                .iter()
+                .all(|finding| !finding.message.contains("producer `")),
+        );
+
+        let fixture = CatalogFixture::new();
+        let fresh = assigned(&fixture, 60);
+        let findings = currency(&fresh.state);
+        assert!(warns(&findings).is_empty(), "{findings:?}");
+        assert!(
+            findings.iter().any(|finding| finding
+                .message
+                .contains("has not reported since the daemon started")),
+            "{findings:?}"
+        );
+
+        let fixture = CatalogFixture::new();
+        let long_running = assigned(&fixture, CURRENCY_BOUND_FLOOR_SECS + 60);
+        let findings = currency(&long_running.state);
+        let stale = warns(&findings);
+        assert_eq!(stale.len(), 1, "{findings:?}");
+        assert!(
+            stale[0]
+                .message
+                .contains("is stale: no report since the daemon started"),
+            "{findings:?}"
+        );
+    }
+
+    fn input(served_code: Option<&str>, served_history: Option<&str>) -> ProducerCurrencyInput {
+        ProducerCurrencyInput {
+            project_id: PROJECT.into(),
+            producer_id: PRODUCER.into(),
+            repo_history_id: Some("rh_currency".into()),
+            served_code_head: served_code.map(str::to_string),
+            served_history_head: served_history.map(str::to_string),
+        }
+    }
+
+    /// History currency compares the reported history HEAD with the served
+    /// overlay, once per repository, with the same window. A slow producer
+    /// widens its own bound past the floor.
+    #[test]
+    fn history_head_behind_the_served_overlay_warns_past_the_window() {
+        let runtime = ProducerCurrencyRuntime::started_at(0);
+        let now = 100_000;
+        runtime.record_interval(PRODUCER, 1_200);
+        let bound = 3 * 1_200;
+        runtime.record_code_report(PRODUCER, PROJECT, HEAD, true, now);
+        runtime.record_history_report(
+            PRODUCER,
+            PROJECT,
+            "rh_currency",
+            NEXT_HEAD,
+            false,
+            now - bound + 60,
+        );
+        runtime.record_history_report(PRODUCER, PROJECT, "rh_currency", NEXT_HEAD, false, now);
+        let converging =
+            evaluate_producer_currency(&runtime.snapshot(), &[input(Some(HEAD), Some(HEAD))], now);
+        assert!(warns(&converging).is_empty(), "{converging:?}");
+
+        let behind = evaluate_producer_currency(
+            &runtime.snapshot(),
+            &[input(Some(HEAD), Some(HEAD)), input(Some(HEAD), Some(HEAD))],
+            now + 120,
+        );
+        let warned = warns(&behind);
+        assert_eq!(warned.len(), 1, "{behind:?}");
+        assert!(
+            warned[0]
+                .message
+                .contains("repository history `rh_currency` is behind producer"),
+            "{behind:?}"
+        );
+
+        let served = evaluate_producer_currency(
+            &runtime.snapshot(),
+            &[input(Some(HEAD), Some(NEXT_HEAD))],
+            now + 120,
+        );
+        assert!(warns(&served).is_empty(), "{served:?}");
+        assert!(
+            served
+                .iter()
+                .any(|finding| finding.message.contains("is current with producer")),
+            "{served:?}"
         );
     }
 }

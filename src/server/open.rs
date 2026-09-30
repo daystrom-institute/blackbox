@@ -877,6 +877,7 @@ pub(super) fn open_shared_state(
         producer_claims_persister,
         producer_claim_lock: tokio::sync::Mutex::new(()),
         producer_commands: Arc::new(super::producer_commands::ProducerCommandRuntime::new()),
+        producer_currency: Arc::new(super::producer_currency::ProducerCurrencyRuntime::new()),
         render_operations,
         project_authority,
         accepted_publications,

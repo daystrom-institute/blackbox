@@ -142,8 +142,12 @@ struct RawCodeCollectionConfig {
     pub max_migration_survivor_rows: usize,
     #[serde(default = "default_code_collection_migration_survivor_bytes")]
     pub max_migration_survivor_bytes: usize,
-    #[serde(default = "default_code_collection_stale_warning_hours")]
-    pub stale_warning_hours: u64,
+    /// `stale_warning_hours` has no effect: doctor judges currency from what
+    /// producers report, not from content age. The key parses so existing
+    /// configs load, and it is never written back.
+    #[serde(default, rename = "stale_warning_hours", skip_serializing)]
+    #[allow(dead_code)] // parsed only so legacy configs keep loading
+    pub retired_stale_warning_hours: RetiredConfigKey,
     #[serde(default = "default_git_history_max_commits")]
     pub max_git_history_commits: u64,
     #[serde(default = "default_git_history_max_logical_bytes")]
@@ -186,7 +190,7 @@ impl Default for RawCodeCollectionConfig {
             unreferenced_blob_grace_hours: default_code_collection_blob_grace_hours(),
             max_migration_survivor_rows: default_code_collection_migration_survivor_rows(),
             max_migration_survivor_bytes: default_code_collection_migration_survivor_bytes(),
-            stale_warning_hours: default_code_collection_stale_warning_hours(),
+            retired_stale_warning_hours: RetiredConfigKey,
             max_git_history_commits: default_git_history_max_commits(),
             max_git_history_logical_bytes: default_git_history_max_logical_bytes(),
             cutback_retry_base_secs: default_cutback_retry_base_secs(),
@@ -223,10 +227,6 @@ fn default_code_collection_migration_survivor_rows() -> usize {
 
 fn default_code_collection_migration_survivor_bytes() -> usize {
     512 * 1024 * 1024
-}
-
-fn default_code_collection_stale_warning_hours() -> u64 {
-    24
 }
 
 fn default_git_history_max_commits() -> u64 {
@@ -637,7 +637,6 @@ pub struct CodeCollectionConfig {
     pub unreferenced_blob_grace_hours: u64,
     pub max_migration_survivor_rows: usize,
     pub max_migration_survivor_bytes: usize,
-    pub stale_warning_hours: u64,
     pub max_git_history_commits: u64,
     pub max_git_history_logical_bytes: u64,
     pub cutback_retry_base_secs: u64,
@@ -1530,7 +1529,6 @@ pub fn load_with(options: LoadOptions) -> Result<Config> {
             unreferenced_blob_grace_hours: raw.code_collection.unreferenced_blob_grace_hours,
             max_migration_survivor_rows: raw.code_collection.max_migration_survivor_rows,
             max_migration_survivor_bytes: raw.code_collection.max_migration_survivor_bytes,
-            stale_warning_hours: raw.code_collection.stale_warning_hours,
             max_git_history_commits: raw.code_collection.max_git_history_commits,
             max_git_history_logical_bytes: raw.code_collection.max_git_history_logical_bytes,
             cutback_retry_base_secs: raw.code_collection.cutback_retry_base_secs,
@@ -3712,6 +3710,23 @@ state_dir = "~"
     }
 
     #[test]
+    fn code_collection_retired_stale_warning_hours_key_still_parses() {
+        let legacy: RawCodeCollectionConfig = Figment::new()
+            .merge(Toml::string("enabled = true\nstale_warning_hours = 24\n"))
+            .extract()
+            .unwrap();
+        assert!(legacy.enabled);
+        let rendered: figment::value::Dict =
+            Figment::from(figment::providers::Serialized::defaults(&legacy))
+                .extract()
+                .unwrap();
+        assert!(
+            !rendered.contains_key("stale_warning_hours"),
+            "{rendered:?}"
+        );
+    }
+
+    #[test]
     fn code_collection_producer_token_files_parses_the_ordered_list_form() {
         let raw: CodeCollectionProducerConfig = Figment::new()
             .merge(Toml::string(
@@ -4177,7 +4192,6 @@ remote_authority = "workspace.example"
             unreferenced_blob_grace_hours: 0,
             max_migration_survivor_rows: 0,
             max_migration_survivor_bytes: 0,
-            stale_warning_hours: 0,
             max_git_history_commits: default_git_history_max_commits(),
             max_git_history_logical_bytes: default_git_history_max_logical_bytes(),
             cutback_retry_base_secs: default_cutback_retry_base_secs(),

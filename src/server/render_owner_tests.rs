@@ -604,6 +604,7 @@ async fn owner_failures_refuse_with_setup_and_never_open_a_daemon_checkout() {
                         config_path: "/etc/collector.toml".into(),
                         service_label: None,
                         collector_version: "0.0.1".into(),
+                        interval_secs: None,
                     },
                 },
             )

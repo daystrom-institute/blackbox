@@ -340,6 +340,7 @@ mod tests {
             config_path: format!("/etc/blackbox/{host}.toml"),
             service_label: None,
             collector_version: "0.0.1".into(),
+            interval_secs: None,
         }
     }
 

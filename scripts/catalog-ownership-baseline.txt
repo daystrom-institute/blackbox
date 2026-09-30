@@ -100,7 +100,6 @@ checkout_root_path	crates/bbox-providers/src/providers/file.rs	fn resolve_catalo
 checkout_root_path	src/bin/blackbox.rs	fn capture_retirement_evidence	1	collapse into the lease confined readers
 checkout_root_path	src/bin/blackbox.rs	fn execute_get	1	collapse into the lease confined readers
 checkout_root_path	src/bin/blackbox.rs	fn probe_retire_evidence	1	collapse into the lease confined readers
-checkout_root_path	src/doctor.rs	fn code_sources_section	1	collapse into the lease confined readers
 checkout_root_path	src/server/checkout_access.rs	fn project_root	1	collapse into the lease confined readers
 checkout_root_path	src/server/code_source.rs	fn stage_git_current_overlay_after_activation	2	collapse into the lease confined readers
 checkout_root_path	src/server/gap_view.rs	fn refresh_dark_gap_overlay	1	collapse into the lease confined readers

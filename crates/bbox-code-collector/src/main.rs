@@ -257,7 +257,7 @@ struct CapturedPublicationCandidate {
 }
 
 fn default_interval_secs() -> u64 {
-    120
+    bbox_code_source::DEFAULT_COLLECTOR_INTERVAL_SECS
 }
 
 fn default_mutation_interval_secs() -> u64 {
@@ -474,6 +474,7 @@ async fn apply_producer_commands(runtime: &Runtime, config: &CollectorConfig) ->
         config_path: config.config_path.to_string_lossy().into_owned(),
         service_label: config.service_label.clone(),
         collector_version: env!("CARGO_PKG_VERSION").into(),
+        interval_secs: Some(config.interval_secs.max(1)),
     };
     let poll = ProducerCommandPollRequestV1 {
         schema_version: PRODUCER_COMMAND_SCHEMA_VERSION,
@@ -3598,6 +3599,7 @@ fn validate_loaded_config(config: &CollectorConfig) -> Result<()> {
         config_path: config.config_path.to_string_lossy().into_owned(),
         service_label: config.service_label.clone(),
         collector_version: env!("CARGO_PKG_VERSION").into(),
+        interval_secs: Some(config.interval_secs.max(1)),
     }
     .validate()
     .map_err(|error| anyhow!("invalid producer presence configuration: {error}"))

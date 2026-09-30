@@ -1366,6 +1366,7 @@ mod tests {
                     config_path: "/etc/blackbox/collector.toml".into(),
                     service_label: Some("collector".into()),
                     collector_version: "0.0.1".into(),
+                    interval_secs: None,
                 },
             },
         );
@@ -1401,6 +1402,7 @@ mod tests {
                         config_path: "/etc/blackbox/collector.toml".into(),
                         service_label: Some("collector".into()),
                         collector_version: "0.0.1".into(),
+                        interval_secs: None,
                     },
                 },
             );

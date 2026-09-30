@@ -42,7 +42,6 @@ max_manifest_logical_bytes = 5368709120
 max_open_uploads_per_producer = 2
 retained_generations = 2
 unreferenced_blob_grace_hours = 168
-stale_warning_hours = 24
 max_git_history_commits = 2000000
 max_git_history_logical_bytes = 8589934592
 
@@ -284,11 +283,40 @@ generation stays active and the project records a structural
 Staleness also preserves the last good collected generation. Restore the
 producer and publish again, or perform a deliberate configuration cutback.
 
+## Producer currency
+
+Every collector pass probes the daemon for each configured project before it
+walks anything: the code lane reports the scanned HEAD, and the history lane
+reports the resolved history HEAD. The daemon records, per producer and
+project, the last report time and the last reported code and history HEAD, and
+each collector reports its `interval_secs` on the checkout-mutation cadence.
+The record is in memory, so after a restart each project awaits its first
+report.
+
+Doctor's `code_sources` section derives currency from those reports, with one
+bound per producer: three times its reported interval, at least 30 minutes (a
+collector that reports no interval is judged at the 120 second default).
+
+- **Stale** (`warn`): the producer has not reported for the project within
+  the bound, or has not reported since a daemon start longer ago than the
+  bound. Before the bound elapses after a start, the project is reported as
+  awaiting its first report (`info`).
+- **Behind** (`warn`): the last reported code HEAD differs from the active
+  collected generation's HEAD, or the last reported history HEAD differs from
+  the served history overlay's HEAD, and no report has found it served within
+  the bound. Inside the bound it is converging (`info`).
+- **Current** (`info`): reported within the bound, and every reported HEAD is
+  served.
+
+Nothing warns because content is old or because the daemon cannot read a
+checkout; doctor never opens one. A project with no producer assignment has no
+reporter and gets no currency finding.
+
 ## Health and storage
 
-Run `bbox_doctor` on the `ops` surface to inspect active generations, staleness, collected versus
-local Git `HEAD`, missing or corrupt blobs, failed activation, pending cutback,
-and failed retirement. The durable store is under
+Run `bbox_doctor` on the `ops` surface to inspect producer currency, missing
+or corrupt blobs, failed activation, pending cutback, and failed retirement.
+The durable store is under
 `<state_dir>/code-sources/`. Upload sessions expire after 24 idle hours, while
 active and retained generations remain protected. Blob garbage collection and
 retained-generation scrubbing run in the background.

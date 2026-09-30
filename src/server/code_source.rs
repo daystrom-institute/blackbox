@@ -744,10 +744,9 @@ fn build_snapshot(
             || limits.max_manifest_logical_bytes == 0
             || limits.max_open_uploads_per_producer == 0
             || limits.max_migration_survivor_rows == 0
-            || limits.max_migration_survivor_bytes == 0
-            || config.code_collection.stale_warning_hours == 0)
+            || limits.max_migration_survivor_bytes == 0)
     {
-        bail!("code-collection limits and stale warning hours must be nonzero");
+        bail!("code-collection limits must be nonzero");
     }
     let store = if let Some(store) = existing_store {
         store
@@ -876,9 +875,46 @@ async fn begin_upload(
 ) -> Result<impl IntoResponse, HttpError> {
     require_scope(&grant, &request.descriptor.scope)?;
     let store = state.code_sources.store();
-    let response =
-        blocking(move || store.begin_upload(&grant.producer_id, request.descriptor)).await?;
+    let currency = state.producer_currency.clone();
+    let response = blocking(move || {
+        record_code_report(&currency, &store, &grant, &request.descriptor, false);
+        store.begin_upload(&grant.producer_id, request.descriptor)
+    })
+    .await?;
     Ok((StatusCode::CREATED, Json(response)))
+}
+
+/// Record a producer's code-lane report of `descriptor` (its contact and the
+/// HEAD it scanned) for the project the scope names. `known_served` is true
+/// when the caller already proved the active generation serves it.
+fn record_code_report(
+    currency: &super::producer_currency::ProducerCurrencyRuntime,
+    store: &CodeSourceStore,
+    grant: &ProducerGrant,
+    descriptor: &bbox_code_source::GenerationDescriptor,
+    known_served: bool,
+) {
+    let Some(project_id) = grant.projects.get(&descriptor.scope) else {
+        return;
+    };
+    let served = known_served
+        || served_code_head(store, project_id).as_deref() == Some(descriptor.head_commit.as_str());
+    currency.record_code_report(
+        &grant.producer_id,
+        project_id,
+        &descriptor.head_commit,
+        served,
+        super::producer_currency::now_secs(),
+    );
+}
+
+/// HEAD of the project's active collected generation, if it has one.
+pub(crate) fn served_code_head(store: &CodeSourceStore, project_id: &str) -> Option<String> {
+    let activation = store.load_activation_mixed(project_id).ok()??;
+    store
+        .find_generation_mixed(activation.generation_id())
+        .ok()
+        .map(|generation| generation.descriptor().head_commit.clone())
 }
 
 async fn probe_code_source(
@@ -891,13 +927,24 @@ async fn probe_code_source(
         .map_err(|error| HttpError::from_store(anyhow::Error::new(error)))?;
     require_scope(&grant, &request.descriptor.scope)?;
     let store = state.code_sources.store();
-    let current = blocking(move || store.probe_current_generation(&request.descriptor))
-        .await?
-        .map(|generation| CodeSourceProbeCurrentV1 {
-            generation_id: generation.generation_id().to_string(),
-            file_count: generation.descriptor().file_count,
-            logical_bytes: generation.descriptor().logical_bytes,
-        });
+    let currency = state.producer_currency.clone();
+    let current = blocking(move || {
+        let current = store.probe_current_generation(&request.descriptor)?;
+        record_code_report(
+            &currency,
+            &store,
+            &grant,
+            &request.descriptor,
+            current.is_some(),
+        );
+        Ok(current)
+    })
+    .await?
+    .map(|generation| CodeSourceProbeCurrentV1 {
+        generation_id: generation.generation_id().to_string(),
+        file_count: generation.descriptor().file_count,
+        logical_bytes: generation.descriptor().logical_bytes,
+    });
     Ok(Json(CodeSourceProbeResponseV1 { current }))
 }
 
@@ -1416,6 +1463,11 @@ async fn poll_producer_commands(
     request.validate().map_err(|error| {
         HttpError::unprocessable("invalid_producer_command_poll", error.to_string())
     })?;
+    if let Some(interval_secs) = request.presence.interval_secs {
+        state
+            .producer_currency
+            .record_interval(&grant.producer_id, interval_secs);
+    }
     Ok(Json(
         state.producer_commands.poll(&grant.producer_id, request),
     ))
@@ -7930,6 +7982,7 @@ mod tests {
                 config_path: format!("/etc/blackbox/{host}.toml"),
                 service_label: None,
                 collector_version: "0.0.1".into(),
+                interval_secs: Some(900),
             },
         };
 
@@ -7947,6 +8000,16 @@ mod tests {
         let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
         let page: ProducerCommandPollResponseV1 = serde_json::from_slice(&body).unwrap();
         assert!(page.commands.is_empty());
+        // The poll carries the collector's pass interval for currency.
+        assert_eq!(
+            state
+                .producer_currency
+                .snapshot()
+                .intervals
+                .into_values()
+                .collect::<Vec<_>>(),
+            [900]
+        );
 
         let wrong_ack = ProducerCommandAckRequestV1 {
             command_id: command.command_id.clone(),
@@ -9652,7 +9715,7 @@ mod tests {
             &[],
             store.clone(),
             &broker,
-            "code-collection limits and stale warning hours must be nonzero",
+            "code-collection limits must be nonzero",
         );
 
         let broker = snapshot_broker(vec![candidate_a.clone(), candidate_b.clone()]);
@@ -10033,6 +10096,66 @@ mod tests {
             bbox_edge_sidecar::snapshot::snapshot_dir(&edges_dir, project_id, &snapshot_id);
         assert!(snapshot_dir.join("project.jsonl").is_file());
         assert!(!snapshot_dir.join("git-current.jsonl").exists());
+    }
+
+    /// A code probe is the producer's report: its contact for the project
+    /// and the scanned HEAD, served or not.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn code_probe_records_the_producer_report() {
+        let activation = activate_collected_with_broker(CheckoutAccessBroker::new(
+            Arc::new(bbox_indexing::checkout_access::DenyCheckoutAccess),
+            CheckoutAccessObservations::in_memory(),
+        ))
+        .await;
+        let state = activation.state.clone();
+        let generation = state
+            .code_sources
+            .store()
+            .find_generation_mixed(&activation.generation_id)
+            .unwrap();
+        let descriptor = generation.descriptor().clone();
+        let grant = ProducerGrant {
+            producer_id: "git-unavailable-producer".into(),
+            projects: BTreeMap::from([(descriptor.scope.clone(), activation.project_id.clone())]),
+        };
+        let key = (
+            "git-unavailable-producer".to_string(),
+            activation.project_id.clone(),
+        );
+
+        let current = probe_code_source(
+            State(state.clone()),
+            Extension(grant.clone()),
+            Json(CodeSourceProbeRequestV1 {
+                descriptor: descriptor.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+        // A bridge activation carries no published scope, so the probe
+        // misses; the report is still served because the active generation
+        // is at the scanned HEAD.
+        assert!(current.0.current.is_none());
+        let reports = state.producer_currency.snapshot();
+        assert_eq!(reports.code_heads[&key].head, descriptor.head_commit);
+        assert_eq!(reports.code_heads[&key].unserved_since, None);
+        assert!(reports.contacts.contains_key(&key));
+
+        let mut moved = descriptor.clone();
+        moved.head_commit = "e".repeat(40);
+        moved.dirty_fingerprint = bbox_code_source::dirty_fingerprint(&moved.head_commit, &[]);
+        let missed = probe_code_source(
+            State(state.clone()),
+            Extension(grant),
+            Json(CodeSourceProbeRequestV1 { descriptor: moved }),
+        )
+        .await
+        .unwrap();
+        assert!(missed.0.current.is_none());
+        let reports = state.producer_currency.snapshot();
+        assert_eq!(reports.code_heads[&key].head, "e".repeat(40));
+        assert!(reports.code_heads[&key].unserved_since.is_some());
     }
 
     /// A daemon with no checkout authority never walks a checkout after a

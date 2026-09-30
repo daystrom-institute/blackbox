@@ -200,6 +200,13 @@ async fn probe_history(
         .validate()
         .map_err(|error| HttpError::from_contract(&error))?;
     let repo_grant = require_repo_grant(&state, &grant, &request.scope)?;
+    record_history_report(
+        &state,
+        &grant,
+        &request.scope,
+        &repo_grant,
+        &request.repo_head,
+    );
     let store = state.git_sources.store();
     let producer_id = grant.producer_id;
     let repo_history_id = repo_grant.repo_history_id;
@@ -213,12 +220,51 @@ async fn probe_history(
     Ok(Json(GitHistoryProbeResponseV1 { current }))
 }
 
+/// Record a producer's history-lane report of `repo_head` (its contact for
+/// the project `scope` names, and the HEAD it resolved for the repository).
+fn record_history_report(
+    state: &SharedState,
+    grant: &ProducerGrant,
+    scope: &bbox_corpus_core::identity::PublishedScope,
+    repo_grant: &RepoTransportGrant,
+    repo_head: &str,
+) {
+    let Some(project_id) = grant.projects.get(scope) else {
+        return;
+    };
+    let served = {
+        let view = state.code_read_view.read();
+        repo_grant.members.iter().any(|member| {
+            view.git_overlays
+                .get(member.project_id.as_str())
+                .is_some_and(|overlay| {
+                    overlay.source.producer_transport().is_some() && overlay.repo_head == repo_head
+                })
+        })
+    };
+    state.producer_currency.record_history_report(
+        &grant.producer_id,
+        project_id,
+        repo_grant.repo_history_id.as_str(),
+        repo_head,
+        served,
+        super::producer_currency::now_secs(),
+    );
+}
+
 async fn begin_history_upload(
     State(state): State<Arc<SharedState>>,
     Extension(grant): Extension<ProducerGrant>,
     Json(mut request): Json<BeginGitHistoryUploadRequestV1>,
 ) -> Result<impl IntoResponse, HttpError> {
     let repo_grant = require_repo_grant(&state, &grant, &request.descriptor.scope)?;
+    record_history_report(
+        &state,
+        &grant,
+        &request.descriptor.scope,
+        &repo_grant,
+        &request.descriptor.repo_head,
+    );
     // The caller supplies only a member scope for authorization. Persist the
     // catalog-derived canonical repo scope so one monorepo has one source.
     request.descriptor.scope = repo_grant.authority_scope;
@@ -859,7 +905,7 @@ mod tests {
                 Body::from(
                     serde_json::to_vec(&GitHistoryProbeRequestV1 {
                         scope,
-                        repo_head: commit,
+                        repo_head: commit.clone(),
                         object_format: GitObjectFormatV1::Sha1,
                     })
                     .unwrap(),
@@ -874,5 +920,21 @@ mod tests {
             probe.current.unwrap().source_generation_id,
             finalized.source_generation_id
         );
+
+        // The begin and the probe are the producer's reports: its contact for
+        // the project and the history HEAD it resolved, not yet served.
+        let reports = state.producer_currency.snapshot();
+        let project = "p_00000000000000000000000000000001".to_string();
+        assert!(
+            reports
+                .contacts
+                .contains_key(&("git-http-producer".to_string(), project))
+        );
+        let reported = &reports.history_heads[&(
+            "git-http-producer".to_string(),
+            "rh_00000000000000000000000000000001".to_string(),
+        )];
+        assert_eq!(reported.head, commit);
+        assert!(reported.unserved_since.is_some());
     }
 }

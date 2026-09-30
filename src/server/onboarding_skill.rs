@@ -197,6 +197,7 @@ mod tests {
                     config_path: format!("/etc/blackbox/{producer_id}.toml"),
                     service_label: service_label.map(str::to_string),
                     collector_version: "1.0.0".to_string(),
+                    interval_secs: None,
                 },
             },
         );
