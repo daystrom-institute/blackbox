@@ -154,44 +154,38 @@ impl Drop for DirtyRestore<'_> {
     }
 }
 
-fn tool_edge_project_access(
-    records_provider: &Arc<dyn ProjectRecordsProvider>,
+/// Transcript tool-edge attribution for one pass. `projects` holds the
+/// projects this pass walks, attributed from their live `LocalProjectWalk`
+/// lease. Every other attached project whose effective source is an active
+/// collected generation is attributed lexically: its attachment path is the
+/// transcript namespace and nothing reads the checkout. A project with
+/// neither has no attribution authority this pass.
+pub(super) fn tool_edge_project_access(
     plans: &[super::writer_actor::ProjectSourcePlan],
     transcript_namespaces: &std::collections::BTreeMap<String, String>,
     mut projects: Vec<ToolEdgeProjectAccess>,
-) -> Result<Vec<ToolEdgeProjectAccess>> {
+) -> Vec<ToolEdgeProjectAccess> {
     for plan in plans {
-        let governed = records_provider.code_source_locality_governed(&plan.project_id);
-        if !governed {
-            continue;
-        }
         let Some(access) = plan.access.as_ref() else {
             continue;
         };
-        if access.local.is_some() {
-            anyhow::bail!(
-                "governed collected project {} retained a LocalProjectWalk lease",
-                plan.project_id
-            );
+        if access.local.is_some()
+            || !matches!(
+                plan.effective,
+                super::writer_actor::EffectiveSource::Collected { .. }
+            )
+        {
+            continue;
         }
-        if !matches!(
-            plan.effective,
-            super::writer_actor::EffectiveSource::Collected { .. }
-        ) {
-            anyhow::bail!(
-                "governed code-source project {} has no active collected generation",
-                plan.project_id
-            );
-        }
-        let transcript_namespace = transcript_namespaces
-            .get(&plan.project_id)
-            .context("governed attached project has no transcript namespace")?;
+        let Some(transcript_namespace) = transcript_namespaces.get(&plan.project_id) else {
+            continue;
+        };
         projects.push(ToolEdgeProjectAccess::collected(
             &plan.project_id,
             std::path::PathBuf::from(transcript_namespace),
         ));
     }
-    Ok(projects)
+    projects
 }
 
 /// Gate + dispatch for one scheduled reindex tick. The cheap speculative
@@ -528,11 +522,10 @@ pub(super) fn execute_reindex_pass(
         })
         .collect();
     let tool_edges = ToolEdgeContext::with_project_access(tool_edge_project_access(
-        records_provider,
         &plans,
         &unavailable_record_project_paths,
         local_tool_edge_access,
-    )?);
+    ));
 
     let transcript_phase = Instant::now();
     index_transcripts_via_adapters(

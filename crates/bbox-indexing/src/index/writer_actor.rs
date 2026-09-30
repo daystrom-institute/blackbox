@@ -3630,6 +3630,80 @@ mod tests {
         assert_eq!(local.denied, 0);
     }
 
+    /// A collected project whose checkout this daemon cannot walk still
+    /// attributes transcripts: its attachment path is a lexical namespace.
+    /// An attached project with neither a collected generation nor a local
+    /// lease, and a catalog project with no attachment, get no attribution.
+    #[test]
+    fn collected_projects_attribute_transcripts_without_a_local_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let index = test_index(&root);
+        let fixture = collected_fixture(&root);
+        let collected = "collected-project";
+        install_outgoing_collected_state(
+            &root,
+            &fixture.store,
+            collected,
+            &fixture.generation_id,
+            &fixture.descriptor,
+        );
+        let mut uncollected = attached_record("uncollected-project", None);
+        uncollected.canonical_path = "/unavailable/remote/other".into();
+        let broker = Arc::new(CheckoutAccessBroker::new(
+            Arc::new(crate::checkout_access::DenyCheckoutAccess),
+            crate::checkout_access::CheckoutAccessObservations::in_memory(),
+        ));
+        let records_provider: Arc<dyn ProjectRecordsProvider> =
+            Arc::new(FixedRecordsProvider(vec![
+                attached_record(collected, Some("repo-family")),
+                uncollected,
+            ]));
+        let plans = plan_project_sources(
+            &index.reindex_config(),
+            &records_provider,
+            &broker,
+            None,
+            ProjectLeasePurpose::Reindex,
+            &HashMap::new(),
+            &std::collections::BTreeSet::new(),
+        )
+        .unwrap();
+        let namespaces = plans
+            .iter()
+            .filter_map(|plan| {
+                let access = plan.access.as_ref()?;
+                access.local.is_none().then(|| {
+                    (
+                        plan.project_id.clone(),
+                        access.project.canonical_path.clone(),
+                    )
+                })
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(namespaces.len(), 2, "both attached projects lack a lease");
+
+        let context = bbox_corpus_index::index::tool_edges::ToolEdgeContext::with_project_access(
+            super::super::reindex::tool_edge_project_access(&plans, &namespaces, Vec::new()),
+        );
+        assert_eq!(
+            context.base_project_id_for_cwd("/unavailable/remote/project/crates"),
+            Some(collected.to_string())
+        );
+        assert_eq!(
+            context.base_project_id_for_cwd("/unavailable/remote/other"),
+            None
+        );
+
+        // A catalog project with no attachment has no namespace at all.
+        let empty = super::super::reindex::tool_edge_project_access(
+            &plans,
+            &std::collections::BTreeMap::new(),
+            Vec::new(),
+        );
+        assert!(empty.is_empty());
+    }
+
     /// Phase 3 plan section 6 item 2 (governing section 11, closing F5): the
     /// collected activation transaction opens no Git and acquires NO
     /// checkout lease of any kind. Under a deny-all broker the stage still
