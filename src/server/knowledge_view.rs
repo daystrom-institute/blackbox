@@ -2514,7 +2514,7 @@ fn knowledge_entry_from_accepted(
         _ => record.content.clone(),
     };
     Some(KnowledgeEntry {
-        render_placement: Default::default(),
+        render_placement: record.render_placement,
         id: record.id.as_str().to_string(),
         title: record.title.clone(),
         content,
@@ -2767,6 +2767,10 @@ mod tests {
         let entry = knowledge_entry_from_accepted(&decision, &project, now)
             .expect("an active version-1 row is an entry");
         assert_eq!(entry.category, Category::Convention);
+        assert!(
+            entry.render_placement.is_inline(),
+            "a row normalized before placement was carried renders inline"
+        );
         assert_eq!(
             entry.content,
             "the commitment\n\nRationale: the recorded reason"

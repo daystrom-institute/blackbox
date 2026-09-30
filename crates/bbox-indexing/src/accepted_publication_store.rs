@@ -19,7 +19,9 @@ use bbox_corpus_core::json_store::{
 };
 use bbox_corpus_core::project_catalog::{AttachmentId, ProjectId};
 use bbox_gaps::gaps::{BlockingLevel, GapImpact, GapKind, GapNote, GapResolution};
-use bbox_knowledge::knowledge::{Category, KnowledgeEntry, Priority, Scope, StoredKnowledgeEntry};
+use bbox_knowledge::knowledge::{
+    Category, KnowledgeEntry, Priority, RenderPlacement, Scope, StoredKnowledgeEntry,
+};
 use bbox_knowledge_source::validate_publication_generation_id;
 use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -424,6 +426,11 @@ pub struct AcceptedKnowledgeEntryV1 {
     pub status: AcceptedKnowledgeStatusV1,
     pub approval: AcceptedKnowledgeApprovalV1,
     pub render: bool,
+    /// Where the renderer places the entry. Omitted when inline, so a record
+    /// normalized before placement was carried decodes as inline and its
+    /// canonical encoding, and therefore its record hash, is unchanged.
+    #[serde(default, skip_serializing_if = "RenderPlacement::is_inline")]
+    pub render_placement: RenderPlacement,
     pub decay: bool,
     pub review_at: Option<String>,
     pub supersedes: Option<String>,
@@ -1048,6 +1055,7 @@ pub(crate) fn normalize_knowledge_entry_v1(
         status: AcceptedKnowledgeStatusV1::Active,
         approval: AcceptedKnowledgeApprovalV1::UserConfirmed,
         render: entry.render,
+        render_placement: entry.render_placement,
         decay: true,
         review_at: None,
         supersedes: None,
@@ -3939,6 +3947,60 @@ mod tests {
         assert!(legacy.variants.is_empty() && legacy.links.is_empty());
         assert_eq!(legacy.rationale, None);
         assert_eq!(legacy.supersedes, None);
+    }
+
+    /// A satellite placement in the committed entry file survives
+    /// normalization and the generation round trip, and an inline record
+    /// omits the field so records normalized before placement was carried
+    /// keep their hash.
+    #[test]
+    fn render_placement_survives_normalization_and_inline_records_keep_their_hash() {
+        let mut satellite = knowledge("knowledge-satellite");
+        satellite.render_placement = RenderPlacement::Satellite {
+            topic: bbox_knowledge::knowledge::GuidanceTopic::Build,
+        };
+        let mut input = build_input();
+        input.knowledge = vec![
+            knowledge_source("knowledge-a", ".bbox/knowledge/knowledge-a.json"),
+            AcceptedKnowledgeSourceV1 {
+                repository_relative_filename: ".bbox/knowledge/knowledge-satellite.json"
+                    .to_string(),
+                source_bytes: serde_json::to_vec(&satellite).unwrap(),
+            },
+        ];
+        let prepared =
+            prepare_accepted_publication_v1(input, &AcceptedPublicationLimits::default()).unwrap();
+        let decoded = decode_generation_v1(
+            &prepared.generation_bytes,
+            &AcceptedPublicationLimits::default(),
+        )
+        .unwrap();
+        let record = |id: &str| {
+            decoded.normalized_knowledge[&PublicationRecordId::parse(id.to_string()).unwrap()]
+                .clone()
+        };
+        assert_eq!(
+            record("knowledge-satellite").render_placement,
+            satellite.render_placement
+        );
+        let inline = record("knowledge-a");
+        assert!(inline.render_placement.is_inline());
+        let encoded = serde_json::to_value(&inline).unwrap();
+        assert!(encoded.get("render_placement").is_none());
+
+        // A record written before the field existed is byte-identical to the
+        // inline encoding, so it decodes as inline and its manifest hash
+        // still verifies.
+        let legacy: AcceptedKnowledgeEntryV1 = serde_json::from_value(encoded).unwrap();
+        assert_eq!(legacy, inline);
+        assert_eq!(
+            canonical_json_hash(&legacy, "legacy record").unwrap(),
+            decoded.knowledge_file_manifest[&NormalizedRepoRelativeFilename::parse(
+                ".bbox/knowledge/knowledge-a.json"
+            )
+            .unwrap()]
+                .normalized_record_sha256
+        );
     }
 
     #[test]

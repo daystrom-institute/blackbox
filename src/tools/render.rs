@@ -1242,6 +1242,100 @@ mod catalog_render_tests {
         );
     }
 
+    /// Rendering the published view places a satellite entry in its topic
+    /// guidance file, exactly as rendering the checkout view does, rather
+    /// than inlining it into the provider file.
+    #[tokio::test]
+    async fn published_view_render_keeps_satellite_placement() {
+        let fixture = CatalogFixture::new();
+        let scope = CatalogFixture::scope(".");
+        fixture.add_published_project(PROJECT, &scope);
+        let mut satellite = render_entry();
+        satellite.id = "render-satellite-entry".into();
+        satellite.title = "Satellite build rule".into();
+        satellite.content = "PUBLISHED_SATELLITE_MARKER".into();
+        satellite.render_placement = bbox_knowledge::knowledge::RenderPlacement::Satellite {
+            topic: bbox_knowledge::knowledge::GuidanceTopic::Build,
+        };
+        fixture.install_publication(
+            PROJECT,
+            &scope,
+            COMMIT_ONE,
+            &[render_entry(), satellite],
+            &[],
+        );
+        let server = fixture.server();
+        let workspace_id = bro_core::WorkspaceId::parse("e".repeat(32)).unwrap();
+        assert!(
+            server
+                .session_workspace_binding
+                .set(Some(std::sync::Arc::new(
+                    crate::server::knowledge_source::WorkspaceBindingGrant {
+                        task_id: "render-satellite-task".into(),
+                        session_id: "render-satellite-session".into(),
+                        project_id: PROJECT.into(),
+                        scope: scope.clone(),
+                        workspace_id: workspace_id.clone(),
+                        expires_unix_secs: u64::MAX,
+                    },
+                )))
+                .is_ok()
+        );
+        let fetched = fetch_render_plan_for_test(
+            &server,
+            RenderParams {
+                provider: Some("claude".into()),
+                project: Some(BOUND_WORKSPACE_RENDER_SELECTOR.into()),
+                scope: Some("project".into()),
+                dry_run: Some(false),
+                global_plan: None,
+                provisional: Some("published".into()),
+                operation: None,
+                scope_project: None,
+                locality: None,
+            },
+        )
+        .await;
+        assert_eq!(fetched.plan.view, ProjectRenderViewV1::Published);
+        let local = tempfile::tempdir().unwrap();
+        let local_root = local.path().canonicalize().unwrap();
+        bbox_knowledge::knowledge::execute_project_render_plan(
+            &fetched.plan,
+            &local_root,
+            &scope,
+            workspace_id.as_str(),
+        )
+        .unwrap();
+
+        let provider = std::fs::read_to_string(local_root.join("CLAUDE.md")).unwrap();
+        assert!(
+            provider.contains("DAEMON_RENDER_LOCALITY_MARKER"),
+            "{provider}"
+        );
+        assert!(
+            !provider.contains("PUBLISHED_SATELLITE_MARKER"),
+            "a satellite entry must not render inline: {provider}"
+        );
+        let guidance = local_root.join(".bbox/guidance");
+        let satellites: Vec<std::path::PathBuf> = std::fs::read_dir(&guidance)
+            .unwrap()
+            .flat_map(|dir| std::fs::read_dir(dir.unwrap().path()).unwrap())
+            .map(|file| file.unwrap().path())
+            .collect();
+        let build = satellites
+            .iter()
+            .find(|path| {
+                path.file_name()
+                    .is_some_and(|name| name == "claude-build.md")
+            })
+            .unwrap_or_else(|| panic!("no build satellite among {satellites:?}"));
+        assert!(
+            std::fs::read_to_string(build)
+                .unwrap()
+                .contains("PUBLISHED_SATELLITE_MARKER")
+        );
+    }
+
     #[tokio::test]
     async fn a_delayed_older_harness_completion_never_replaces_newer_evidence() {
         use bbox_knowledge::knowledge::ProjectRenderDispositionV1;
