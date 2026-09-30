@@ -287,6 +287,12 @@ Removed:
 - **`bbox_storage_migrate_legacy_edges`** with its extraction planner and
   apply path, and startup recovery of pending edge migrations. The explicit
   and observed lanes are retired at startup (graph family below).
+- **Resolver compatibility-lane counters** (`resolver_compat.rs`), with
+  their doctor section. The version-1 selector pass-throughs they counted
+  keep their behavior on the bridge. The records-provider degradation and
+  catalog carrier paired-read findings that section also carried report in
+  the `projects` section. A `resolver-compat-observations.json` left in the
+  daemon state directory is inert.
 
 Kept, each with the condition that gates its removal:
 
@@ -295,7 +301,6 @@ Kept, each with the condition that gates its removal:
   verify with no stale rows and every project covered.
 - **Code-source locality and render locality cutovers**: a completion
   verify on every live deployment; read-only inspection cannot confirm it.
-- **`resolver_compat.rs`**: no recorded compatibility-lane hits.
 - **`bridge_parity.rs`**: bridge mode stops being the fresh-state path.
 - **Migration inventories** in the edge sidecar, corpus index and vectors:
   genesis, backfill and retirement read them.

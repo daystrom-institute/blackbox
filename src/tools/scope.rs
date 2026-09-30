@@ -91,10 +91,6 @@ impl BlackboxServer {
                 // Version-1 compatibility lane (plan §4.3): unregistered
                 // selectors become durable raw scope keys on the bridge.
                 // Catalog mode fails closed below instead.
-                self.state.resolver_compat.record(
-                    "resolve_project_write",
-                    crate::server::resolver_compat::CompatLane::UnregisteredWritePassThrough,
-                );
                 return Ok(ProjectWriteResolution {
                     durable_scope: raw.to_owned(),
                     project_id: None,
@@ -118,10 +114,6 @@ impl BlackboxServer {
             {
                 // Engine/broker drift can only be racing lifecycle mutation;
                 // the bridge keeps today's pass-through outcome for it.
-                self.state.resolver_compat.record(
-                    "resolve_project_write",
-                    crate::server::resolver_compat::CompatLane::UnregisteredWritePassThrough,
-                );
                 return Ok(ProjectWriteResolution {
                     durable_scope: raw.to_owned(),
                     project_id: None,
@@ -258,14 +250,9 @@ impl BlackboxServer {
 
     /// Hybrid/graph-search project filter resolution (phase-2 §9.2 B2):
     /// engine first; the version-1 arm preserves the eight-hex id
-    /// pass-through and the deterministic path-hash fallback as tagged
-    /// compatibility lanes; the catalog arm never mints identity.
-    pub(crate) fn resolve_hybrid_project_filter(
-        &self,
-        surface: &'static str,
-        raw: Option<&str>,
-    ) -> Option<String> {
-        use crate::server::resolver_compat::CompatLane;
+    /// pass-through and the deterministic path-hash fallback; the catalog
+    /// arm never mints identity.
+    pub(crate) fn resolve_hybrid_project_filter(&self, raw: Option<&str>) -> Option<String> {
         let raw = raw?.trim();
         if raw.is_empty() {
             return None;
@@ -279,18 +266,9 @@ impl BlackboxServer {
             return None;
         }
         if raw.len() == 8 && raw.chars().all(|c| c.is_ascii_hexdigit()) {
-            self.state
-                .resolver_compat
-                .record(surface, CompatLane::EightHexPassThrough);
             return Some(raw.to_lowercase());
         }
-        let minted = bbox_corpus_core::entity_ref::project_id_for_path(raw).ok();
-        if minted.is_some() {
-            self.state
-                .resolver_compat
-                .record(surface, CompatLane::PathHashFallback);
-        }
-        minted
+        bbox_corpus_core::entity_ref::project_id_for_path(raw).ok()
     }
 
     /// Tolerant managed-checkout aliasing for store adapters that keep raw
@@ -488,16 +466,18 @@ mod tests {
             assert_eq!(checkout.checkout_project_dir, base_str);
         }
 
-        // Unregistered absolute path: raw pass-through with no id, and the
-        // compatibility counter fires.
+        // Unregistered absolute path: raw pass-through with no id.
         let stranger_str = fx.stranger.to_str().unwrap();
         let resolution = fx.server.resolve_project_write(stranger_str).unwrap();
         assert_eq!(resolution.durable_scope, stranger_str);
         assert_eq!(resolution.project_id, None);
-        let counters = fx.server.state.resolver_compat.snapshot();
         assert!(
-            counters.surfaces["resolve_project_write"]["unregistered_write_pass_through"].count
-                >= 1
+            !fx.server
+                .state
+                .store_dir
+                .join("resolver-compat-observations.json")
+                .exists(),
+            "a pass-through records no compatibility counter"
         );
 
         // Non-path substring selector: same pass-through lane.
@@ -579,53 +559,36 @@ mod tests {
         ] {
             assert_eq!(
                 fx.server
-                    .resolve_hybrid_project_filter("test_surface", Some(selector))
+                    .resolve_hybrid_project_filter(Some(selector))
                     .as_deref(),
                 Some(fx.record.project_id.as_str()),
                 "selector {selector}"
             );
         }
-        // Bare eight-hex pass-through (tagged).
+        // Bare eight-hex pass-through.
         assert_eq!(
             fx.server
-                .resolve_hybrid_project_filter("test_surface", Some("ABCD1234"))
+                .resolve_hybrid_project_filter(Some("ABCD1234"))
                 .as_deref(),
             Some("abcd1234")
         );
-        // Unregistered path mints the deterministic hash id (tagged).
+        // Unregistered path mints the deterministic hash id.
         let stranger_str = fx.stranger.to_str().unwrap();
         let expected = bbox_corpus_core::entity_ref::project_id_for_path(stranger_str).unwrap();
         assert_eq!(
             fx.server
-                .resolve_hybrid_project_filter("test_surface", Some(stranger_str))
+                .resolve_hybrid_project_filter(Some(stranger_str))
                 .as_deref(),
             Some(expected.as_str())
         );
         // Unknown non-path selectors resolve to nothing; blanks are None.
         assert_eq!(
             fx.server
-                .resolve_hybrid_project_filter("test_surface", Some("not-an-alias")),
+                .resolve_hybrid_project_filter(Some("not-an-alias")),
             None
         );
-        assert_eq!(
-            fx.server
-                .resolve_hybrid_project_filter("test_surface", Some("  ")),
-            None
-        );
-        assert_eq!(
-            fx.server
-                .resolve_hybrid_project_filter("test_surface", None),
-            None
-        );
-        let counters = fx.server.state.resolver_compat.snapshot();
-        assert_eq!(
-            counters.surfaces["test_surface"]["eight_hex_pass_through"].count,
-            1
-        );
-        assert_eq!(
-            counters.surfaces["test_surface"]["path_hash_fallback"].count,
-            1
-        );
+        assert_eq!(fx.server.resolve_hybrid_project_filter(Some("  ")), None);
+        assert_eq!(fx.server.resolve_hybrid_project_filter(None), None);
     }
 
     /// Filter-class identity arm (gap-40ab1102): id, alias, registered path,

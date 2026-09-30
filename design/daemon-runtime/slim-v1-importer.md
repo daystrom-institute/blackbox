@@ -97,7 +97,8 @@ lists them explicitly:
 | Store | Class | Reason |
 |---|---|---|
 | `B/checkout-registry.json` | keep | discovery index, opened in both modes |
-| `B/checkout-access-observations.json`, `knowledge-transport-observations.json`, `render-locality-observations.json`, `resolver-compat-observations.json`, `render-operations/` | keep | opened in both modes; observation state, not identity |
+| `B/checkout-access-observations.json`, `knowledge-transport-observations.json`, `render-locality-observations.json`, `render-operations/` | keep | opened in both modes; observation state, not identity |
+| `B/resolver-compat-observations.json` | archive | written by earlier bridge boots; no current binary opens it |
 | `S/code-sources/` | archive | bridge activations are keyed by v1 id with no catalog binding; catalog mode re-creates the directory and re-collects from attached checkouts (UNVERIFIED: catalog-mode open accepts a `LegacyLocal` project with no activation; `add --legacy-local` projects imply it does) |
 | `publisher-refs.json` (in `S` or `B`; the runtime reads one and reindex writes the other) | archive | pins bind published scopes; every imported project is `LegacyLocal`, and publication re-pins after `promote` |
 | `accepted-publications/` | archive | same reason |

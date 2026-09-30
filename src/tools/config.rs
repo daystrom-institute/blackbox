@@ -43,12 +43,9 @@ impl BlackboxServer {
                                 "error.project_attachment_required: project '{raw}' has no active checkout attachment to carry MCP project scope"
                             ),
                         },
-                        Err(_) if self.state.project_authority.is_bridge() => {
-                            self.state.resolver_compat.record(
-                                "bro_mcp",
-                                crate::server::resolver_compat::CompatLane::UnregisteredWritePassThrough,
-                            );
-                        }
+                        // The bridge keeps an unregistered selector as the
+                        // raw project scope.
+                        Err(_) if self.state.project_authority.is_bridge() => {}
                         Err(error) => return Err(error),
                     }
                 }

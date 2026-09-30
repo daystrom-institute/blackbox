@@ -916,9 +916,6 @@ pub(super) fn open_shared_state(
         records_provider,
         checkout_registry,
         checkout_access_observations,
-        resolver_compat: crate::server::resolver_compat::ResolverCompatObservations::open(
-            store_dir.join("resolver-compat-observations.json"),
-        ),
         checkout_access,
         knowledge_transport_observations,
         render_locality_observations,

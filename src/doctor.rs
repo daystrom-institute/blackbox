@@ -248,7 +248,6 @@ pub(crate) fn run(server: &crate::server::BlackboxServer) -> anyhow::Result<Doct
     if state.project_authority.catalog_store().is_some() {
         sections.push(locality_cutovers_section(state));
     }
-    sections.push(resolver_compat_section(state));
     // Catalog-only project health (plan section 8, P5-G). Each section is
     // observational: it reports what the catalog, the accepted pointer, and
     // the runtime's published observations already say, and never counts an
@@ -288,7 +287,6 @@ pub(crate) fn section_names(state: &crate::server::state::SharedState) -> Vec<&'
     if catalog {
         names.extend(["knowledge_transport", "locality_cutovers"]);
     }
-    names.push("resolver_compat");
     if catalog {
         names.extend([
             "accepted_publication",
@@ -336,7 +334,6 @@ pub(crate) fn run_section(
         "snapshots" => snapshots_section(state),
         "projects" => projects_section(state),
         "locality_cutovers" => locality_cutovers_section(state),
-        "resolver_compat" => resolver_compat_section(state),
         "accepted_publication"
         | "publisher_binding"
         | "overlay_baseline"
@@ -1090,48 +1087,6 @@ fn locality_cutover_findings(
     )));
 }
 
-/// Resolver compatibility-lane counters (phase-2 §9.2): the per-surface
-/// observations the Phase 6 compatibility cut consumes. Also surfaces the
-/// records-provider's most recent degradation (stale projection serving,
-/// omitted rows) so a silently-thinned catalog projection is visible.
-fn resolver_compat_section(state: &crate::server::state::SharedState) -> SectionReport {
-    let snapshot = state.resolver_compat.snapshot();
-    let mut findings = Vec::new();
-    if let Some(degradation) = state.records_provider.last_degradation() {
-        findings.push(Finding::info(format!(
-            "records provider degradation: {degradation}"
-        )));
-    }
-    // The paired read that repository carriers depend on. A persistent
-    // epoch disagreement leaves carriers at their last-good set rather than
-    // encoding a moving Selected target, so it is a real degradation an
-    // operator must see rather than a transient the runtime absorbs.
-    if let Err(error) = crate::server::repo_io::CatalogBaseTargets::read_consistent_for_state(state)
-    {
-        findings.push(Finding::warn(format!(
-            "catalog carrier paired read unavailable: {error:#}"
-        )));
-    }
-    if snapshot.sequence == 0 {
-        findings.push(Finding::info(
-            "no resolver compatibility lane has fired yet",
-        ));
-    } else {
-        for (surface, lanes) in &snapshot.surfaces {
-            for (lane, counter) in lanes {
-                findings.push(Finding::info(format!(
-                    "{surface}: {lane} fired {} time(s), last at unix {}",
-                    counter.count, counter.last_unix_secs,
-                )));
-            }
-        }
-    }
-    SectionReport {
-        section: "resolver_compat",
-        findings,
-    }
-}
-
 /// Git-history activations the background lane dead-lettered because the
 /// producer grant table refuses their repository. The dead letter is the
 /// durable record; it disappears when the grant resolves, the source stops
@@ -1867,6 +1822,23 @@ fn projects_section(state: &crate::server::state::SharedState) -> SectionReport 
             Finding::ok(format!("{present} registered project(s), all present"))
         });
     }
+    // A records provider that served a stale projection or omitted rows
+    // reports it here, so a silently thinned catalog projection is visible.
+    if let Some(degradation) = state.records_provider.last_degradation() {
+        findings.push(Finding::info(format!(
+            "records provider degradation: {degradation}"
+        )));
+    }
+    // The paired read that repository carriers depend on. A persistent
+    // epoch disagreement leaves carriers at their last-good set rather than
+    // encoding a moving Selected target, so it is a real degradation an
+    // operator must see rather than a transient the runtime absorbs.
+    if let Err(error) = crate::server::repo_io::CatalogBaseTargets::read_consistent_for_state(state)
+    {
+        findings.push(Finding::warn(format!(
+            "catalog carrier paired read unavailable: {error:#}"
+        )));
+    }
     SectionReport {
         section: "projects",
         findings,
@@ -2277,7 +2249,6 @@ mod tests {
                 "snapshots",
                 "projects",
                 "checkout_access",
-                "resolver_compat",
                 "memories",
                 "attention"
             ]
@@ -2316,6 +2287,11 @@ mod tests {
         assert!(
             bridge_only.to_string().contains("Unknown section"),
             "catalog section must be refused in bridge mode: {bridge_only}"
+        );
+        let retired = run_section(&server, "resolver_compat").unwrap_err();
+        assert!(
+            retired.to_string().contains("Unknown section"),
+            "the resolver compatibility section is retired: {retired}"
         );
         let unknown = run_section(&server, "not-a-section").unwrap_err();
         assert!(

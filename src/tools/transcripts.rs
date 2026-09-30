@@ -299,8 +299,7 @@ impl BlackboxServer {
         let server = self.clone();
         Self::run_blocking_with_structured("bbox_hybrid_search", move || {
             let mut p = p;
-            p.resolved_project_id =
-                server.resolve_hybrid_project_filter("bbox_hybrid_search", p.project.as_deref());
+            p.resolved_project_id = server.resolve_hybrid_project_filter(p.project.as_deref());
             // Fast path: read-lock the index to check emptiness. Only escalate
             // to a write lock if we actually need to build_index. The previous
             // unconditional write lock blocked every search behind the

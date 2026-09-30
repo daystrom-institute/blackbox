@@ -37,7 +37,6 @@ pub mod progress;
 pub(crate) mod render_operations;
 pub(crate) mod render_owner;
 pub(crate) mod repo_io;
-pub(crate) mod resolver_compat;
 pub mod response;
 mod restore;
 pub mod routes;

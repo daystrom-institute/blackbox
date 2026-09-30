@@ -164,34 +164,20 @@ impl ServerHandler for BlackboxServer {
                 Some(raw) => {
                     let server = self.clone();
                     let resolved = tokio::task::spawn_blocking(move || {
-                    match server.resolve_project_filter(&raw) {
-                        Some(resolution) => match resolution
-                            .store_key()
-                            .or(resolution.project_id())
-                            .map(str::to_owned)
-                        {
-                            Some(resolved) => resolved,
-                            None => {
-                                server.state.resolver_compat.record(
-                                    "mcp_wire_head",
-                                    crate::server::resolver_compat::CompatLane::UnregisteredLiteralFilter,
-                                );
-                                raw
-                            }
-                        },
-                        None => {
-                            server.state.resolver_compat.record(
-                                "mcp_wire_head",
-                                crate::server::resolver_compat::CompatLane::UnregisteredLiteralFilter,
-                            );
-                            raw
-                        }
-                    }
-                })
-                .await
-                .map_err(|e| {
-                    ErrorData::internal_error(format!("project resolution failed: {e}"), None)
-                })?;
+                        server
+                            .resolve_project_filter(&raw)
+                            .and_then(|resolution| {
+                                resolution
+                                    .store_key()
+                                    .or(resolution.project_id())
+                                    .map(str::to_owned)
+                            })
+                            .unwrap_or(raw)
+                    })
+                    .await
+                    .map_err(|e| {
+                        ErrorData::internal_error(format!("project resolution failed: {e}"), None)
+                    })?;
                     Some(resolved)
                 }
                 None => None,

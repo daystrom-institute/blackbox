@@ -128,9 +128,6 @@ pub(crate) struct SharedState {
     /// remain owned by the consumer being migrated.
     pub(crate) checkout_access_observations:
         bbox_indexing::checkout_access::CheckoutAccessObservations,
-    /// Per-surface resolver compatibility-lane counters (phase-2 §9.2):
-    /// the observations the Phase 6 compatibility cut consumes.
-    pub(crate) resolver_compat: crate::server::resolver_compat::ResolverCompatObservations,
     /// Single daemon-owned checkout authority. Every checkout consumer reuses
     /// this broker so counters and authority state cannot diverge per call.
     pub(crate) checkout_access: Arc<bbox_indexing::checkout_access::CheckoutAccessBroker>,
@@ -754,9 +751,6 @@ impl SharedState {
             records_provider,
             checkout_registry,
             checkout_access_observations,
-            resolver_compat: crate::server::resolver_compat::ResolverCompatObservations::open(
-                store_dir.join("resolver-compat-observations.json"),
-            ),
             checkout_access,
             knowledge_transport_observations:
                 bbox_indexing::knowledge_transport_observations::KnowledgeTransportObservationsV1::in_memory(),

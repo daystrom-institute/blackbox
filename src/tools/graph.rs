@@ -497,16 +497,9 @@ impl BlackboxServer {
     ) -> CallToolResult {
         let server = self.clone();
         Self::run_blocking("bbox_edge_compact", move || {
-            // §9.2 B3: raw sidecar ids stay a tagged v1 compatibility lane;
-            // the catalog arm fails closed on ids the catalog does not know.
-            if server.state.project_authority.is_bridge() {
-                if server.resolve_project_selection(&p.project_id).is_err() {
-                    server.state.resolver_compat.record(
-                        "bbox_edge_compact",
-                        crate::server::resolver_compat::CompatLane::RawSidecarId,
-                    );
-                }
-            } else {
+            // §9.2 B3: the bridge accepts raw sidecar ids; the catalog arm
+            // fails closed on ids the catalog does not know.
+            if !server.state.project_authority.is_bridge() {
                 server.validate_project_selection(&p.project_id)?;
             }
             let edges_dir = crate::server::edge_sidecar_dir(&server.state);

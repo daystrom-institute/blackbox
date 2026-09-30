@@ -52,22 +52,12 @@ impl BlackboxServer {
 
             // Filter-class engine resolution (phase-2 §9.2 B6): a resolving
             // selector narrows by identity; a miss keeps the literal
-            // pass-through (tagged v1 compatibility, and the catalog-mode
-            // literal-filter semantics).
+            // pass-through (the literal-filter semantics).
             let project_filter: Option<String> = p.project.as_ref().map(|project| {
-                match server
+                server
                     .resolve_project_filter(project)
                     .and_then(|resolution| resolution.project_id().map(str::to_owned))
-                {
-                    Some(project_id) => project_id,
-                    None => {
-                        server.state.resolver_compat.record(
-                            "bbox_storage_health",
-                            crate::server::resolver_compat::CompatLane::UnregisteredLiteralFilter,
-                        );
-                        project.clone()
-                    }
-                }
+                    .unwrap_or_else(|| project.clone())
             });
 
             let include_files = p.include_files.unwrap_or(false);
