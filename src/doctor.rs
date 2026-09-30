@@ -459,6 +459,12 @@ fn accepted_publication_section(
                 ),
                 publisher_status_call(project),
             ),
+            // A connector or legacy-local project with no attachment can
+            // never accept a candidate: no published scope, no producer.
+            "missing" if !has_publication_lane(status) => Finding::info(format!(
+                "project {project} has no accepted publication lane (no published scope and \
+                 no attached checkout)"
+            )),
             "missing" => Finding::info(format!(
                 "project {project} has no accepted publication pointer; its first valid \
                  candidate from the owning producer establishes one"
@@ -489,6 +495,16 @@ fn accepted_publication_section(
         section: "accepted_publication",
         findings,
     }
+}
+
+/// Whether a project can ever hold an accepted publication: it needs a
+/// published catalog scope or an attached checkout.
+fn has_publication_lane(status: &crate::server::state::ProjectRuntimeStatus) -> bool {
+    status.catalog_scope.is_some()
+        || status
+            .attachments
+            .iter()
+            .any(|attachment| attachment.status == "attached")
 }
 
 /// Which attachment each pointer names and whether an advance can run.
@@ -876,20 +892,13 @@ fn knowledge_transport_section(
         })
         .map(|counter| counter.count)
         .sum::<u64>();
-    let degraded_count = observations
-        .counters
-        .iter()
-        .filter(|counter| {
+    findings.extend(degraded_transport_finding(
+        observations.counters.iter().filter(|counter| {
             covered_ids.contains(counter.project_id.as_str())
                 && counter.outcome == KnowledgeTransportOutcomeV1::Degraded
-        })
-        .map(|counter| counter.count)
-        .sum::<u64>();
-    if degraded_count > 0 {
-        findings.push(Finding::warn(format!(
-            "covered knowledge transport recorded {degraded_count} degraded operation(s); local fallback remained closed"
-        )));
-    }
+        }),
+        unix_now_secs(),
+    ));
 
     if current > 0 {
         findings.push(Finding::ok(format!(
@@ -905,6 +914,56 @@ fn knowledge_transport_section(
         section: "knowledge_transport",
         findings,
     }
+}
+
+/// A degraded knowledge transport counter that advanced within this window
+/// is current degradation; older counters are lifetime history.
+const KNOWLEDGE_TRANSPORT_DEGRADED_RECENT_SECS: u64 = 24 * 3_600;
+
+/// Classify covered degraded knowledge transport counters. Counters are
+/// lifetime totals, so only a counter that advanced within the recent window
+/// warns; the lifetime total is reported as info otherwise.
+fn degraded_transport_finding<'a>(
+    degraded: impl Iterator<
+        Item = &'a bbox_indexing::knowledge_transport_observations::KnowledgeTransportOperationCounterV1,
+    >,
+    now_unix_secs: u64,
+) -> Option<Finding> {
+    let mut lifetime = 0u64;
+    let mut latest: Option<
+        &bbox_indexing::knowledge_transport_observations::KnowledgeTransportOperationCounterV1,
+    > = None;
+    let mut recent_counters = 0usize;
+    for counter in degraded {
+        lifetime += counter.count;
+        if now_unix_secs.saturating_sub(counter.last_unix_secs)
+            <= KNOWLEDGE_TRANSPORT_DEGRADED_RECENT_SECS
+        {
+            recent_counters += 1;
+        }
+        if latest.is_none_or(|current| counter.last_unix_secs > current.last_unix_secs) {
+            latest = Some(counter);
+        }
+    }
+    let latest = latest?;
+    let latest_age_hours = now_unix_secs.saturating_sub(latest.last_unix_secs) / 3_600;
+    let latest_label = format!(
+        "latest {} {} {latest_age_hours}h ago",
+        latest.project_id,
+        serde_json::to_value(latest.operation)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .unwrap_or_else(|| "operation".into()),
+    );
+    Some(if recent_counters > 0 {
+        Finding::warn(format!(
+            "covered knowledge transport recorded degraded operations in the last 24h across {recent_counters} project operation(s) ({latest_label}; {lifetime} lifetime); local fallback remained closed"
+        ))
+    } else {
+        Finding::info(format!(
+            "covered knowledge transport recorded no degraded operation in the last 24h ({lifetime} lifetime, {latest_label})"
+        ))
+    })
 }
 
 /// One offline locality cutover's loaded authority, reduced to what the
@@ -1124,9 +1183,63 @@ fn history_activation_deadletter_findings(
         .collect()
 }
 
+/// Catalog projects with no code-source lane by design: no attached
+/// checkout and no code-source producer assignment. Empty when the catalog is
+/// unavailable, so nothing is downgraded on missing evidence.
+fn projects_without_code_source_lane(
+    state: &crate::server::state::SharedState,
+) -> std::collections::BTreeSet<String> {
+    use bbox_corpus_core::project_catalog::AttachmentStatus;
+
+    let Some(snapshot) = state
+        .project_authority
+        .catalog_store()
+        .and_then(|store| store.snapshot().ok())
+    else {
+        return std::collections::BTreeSet::new();
+    };
+    let assigned = state
+        .code_sources
+        .producer_auth()
+        .assignment_map()
+        .into_values()
+        .map(|(project_id, _producer)| project_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    let attached = snapshot
+        .attachments()
+        .attachments
+        .values()
+        .filter(|attachment| attachment.status == AttachmentStatus::Attached)
+        .map(|attachment| attachment.project_id.as_str().to_string())
+        .collect::<std::collections::BTreeSet<_>>();
+    snapshot
+        .catalog()
+        .projects
+        .keys()
+        .map(|project_id| project_id.as_str().to_string())
+        .filter(|project_id| !assigned.contains(project_id) && !attached.contains(project_id))
+        .collect()
+}
+
+/// `source_unavailable` is a fault only for a project that has a code-source
+/// lane. A project with neither an attachment nor a producer assignment has
+/// no source by design.
+fn source_unavailable_finding(project_id: &str, diagnostic: &str, has_lane: bool) -> Finding {
+    if !has_lane {
+        return Finding::info(format!(
+            "project `{project_id}` has no code-source lane (no attached checkout and no code-source producer assignment); code search does not cover it"
+        ));
+    }
+    Finding::warn(format!(
+        "project `{project_id}` has no usable code source this pass: {diagnostic}"
+    ))
+    .with_next("attach a checkout, or publish a collected generation, to give the project a source")
+}
+
 fn code_sources_section(state: &crate::server::state::SharedState) -> SectionReport {
     let store = state.code_sources.store();
     let mut findings = Vec::new();
+    let without_lane = projects_without_code_source_lane(state);
     match store.health_records() {
         Ok(records) => {
             for record in records {
@@ -1164,12 +1277,10 @@ fn code_sources_section(state: &crate::server::state::SharedState) -> SectionRep
                     // ONE action each admits, and so `empty_root_refused`
                     // reads as the deliberate refusal it is rather than as an
                     // unexplained warning.
-                    "source_unavailable" => Finding::warn(format!(
-                        "project `{}` has no usable code source this pass: {}",
-                        record.project_id, record.diagnostic
-                    ))
-                    .with_next(
-                        "attach a checkout, or publish a collected generation, to give the project a source",
+                    "source_unavailable" => source_unavailable_finding(
+                        &record.project_id,
+                        &record.diagnostic,
+                        !without_lane.contains(&record.project_id),
                     ),
                     "empty_root_refused" => Finding::action(
                         format!(
@@ -1662,43 +1773,13 @@ fn vectors_section(_state: &crate::server::state::SharedState) -> SectionReport 
                     "vector connectivity diagnostics unavailable: {err:#}"
                 ))),
                 Some(Ok(report)) => {
-                    for unavailable in report.unavailable {
-                        findings.push(Finding::warn(format!(
-                            "vector connectivity unknown for {}: {}",
-                            unavailable.route,
-                            unavailable.reason.as_str()
-                        )));
-                    }
-                    let mut checked = 0usize;
-                    for metrics in report.partitions.into_values() {
-                        let Some(hnsw) = metrics.hnsw else {
-                            continue;
-                        };
-                        checked += 1;
-                        if hnsw.connectivity_breach(bbox_vectors::NOTIFY_CONNECTIVITY_RATIO) {
-                            findings.push(Finding::action(
-                                format!(
-                                    "vector connectivity degraded for {}: {:.2}% zero-in-degree",
-                                    metrics.route,
-                                    hnsw.connectivity_risk_ratio() * 100.0
-                                ),
-                                format!(
-                                    "daily connectivity maintenance will attempt repair; inspect {} for current diagnostics",
-                                    ops_call("bbox_embed_status", "{}")
-                                ),
-                            ));
-                        }
-                    }
-                    if checked > 0
-                        && !findings.iter().any(|finding| {
-                            finding.message.starts_with("vector connectivity degraded")
-                                || finding.message.starts_with("vector connectivity unknown")
-                        })
-                    {
-                        findings.push(Finding::ok(format!(
-                            "HNSW connectivity diagnostics healthy across {checked} partition(s)"
-                        )));
-                    }
+                    let observations =
+                        bbox_vectors::try_connectivity_observations().unwrap_or_default();
+                    findings.extend(vector_connectivity_findings(
+                        report,
+                        &observations,
+                        unix_now_secs(),
+                    ));
                 }
             }
         }
@@ -1707,6 +1788,112 @@ fn vectors_section(_state: &crate::server::state::SharedState) -> SectionReport 
         section: "vectors",
         findings,
     }
+}
+
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// How long a daily-maintenance connectivity measurement stands in for a
+/// bounded doctor diagnostic that did not complete: one maintenance interval
+/// plus slack.
+const VECTOR_CONNECTIVITY_OBSERVATION_MAX_AGE_SECS: u64 = 48 * 3_600;
+
+/// Classify one bounded connectivity diagnostic. A measured breach is an
+/// action. A diagnostic that did not complete (deadline or lock contention)
+/// is not evidence of a fault: it reports the daily maintenance measurement
+/// when a recent one exists, and info otherwise.
+fn vector_connectivity_findings(
+    report: bbox_vectors::VectorDiagnosticsReport,
+    observations: &std::collections::BTreeMap<String, bbox_vectors::ConnectivityObservation>,
+    now_unix_secs: u64,
+) -> Vec<Finding> {
+    use bbox_vectors::VectorDiagnosticUnavailableReason as Reason;
+
+    let repair_next = || {
+        format!(
+            "daily connectivity maintenance will attempt repair; inspect {} for current diagnostics",
+            ops_call("bbox_embed_status", "{}")
+        )
+    };
+    let mut findings = Vec::new();
+    let mut degraded = false;
+    for unavailable in report.unavailable {
+        let route = unavailable.route;
+        let reason = unavailable.reason.as_str();
+        if !matches!(unavailable.reason, Reason::DeadlineExceeded | Reason::Busy) {
+            findings.push(Finding::warn(format!(
+                "vector connectivity unknown for {route}: {reason}"
+            )));
+            continue;
+        }
+        let recent = observations.get(&route).filter(|observation| {
+            now_unix_secs.saturating_sub(observation.observed_unix_secs)
+                <= VECTOR_CONNECTIVITY_OBSERVATION_MAX_AGE_SECS
+        });
+        findings.push(match recent {
+            Some(observation) => {
+                let age_hours =
+                    now_unix_secs.saturating_sub(observation.observed_unix_secs) / 3_600;
+                let measured = format!(
+                    "{:.2}% zero-in-degree when daily maintenance measured it {age_hours}h ago",
+                    observation.zero_in_degree_ratio * 100.0
+                );
+                if observation.breach && !observation.repaired {
+                    degraded = true;
+                    Finding::action(
+                        format!(
+                            "vector connectivity degraded for {route}: {measured}; this pass's bounded diagnostic did not complete ({reason})"
+                        ),
+                        repair_next(),
+                    )
+                } else if observation.repaired {
+                    Finding::info(format!(
+                        "vector connectivity for {route} was rebuilt by daily maintenance {age_hours}h ago; this pass's bounded diagnostic did not complete ({reason})"
+                    ))
+                } else {
+                    Finding::info(format!(
+                        "vector connectivity for {route}: {measured}; this pass's bounded diagnostic did not complete ({reason})"
+                    ))
+                }
+            }
+            None => Finding::info(format!(
+                "vector connectivity unknown for {route}: bounded diagnostic did not complete ({reason}); not evidence of a fault"
+            )),
+        });
+    }
+    let mut checked = 0usize;
+    for metrics in report.partitions.into_values() {
+        let Some(hnsw) = metrics.hnsw else {
+            continue;
+        };
+        checked += 1;
+        if hnsw.connectivity_breach(bbox_vectors::NOTIFY_CONNECTIVITY_RATIO) {
+            degraded = true;
+            findings.push(Finding::action(
+                format!(
+                    "vector connectivity degraded for {}: {:.2}% zero-in-degree",
+                    metrics.route,
+                    hnsw.connectivity_risk_ratio() * 100.0
+                ),
+                repair_next(),
+            ));
+        }
+    }
+    if checked > 0
+        && !degraded
+        && findings
+            .iter()
+            .all(|finding| finding.level <= FindingLevel::Info)
+    {
+        findings.push(Finding::ok(format!(
+            "HNSW connectivity diagnostics healthy across {checked} partition(s)"
+        )));
+    }
+    findings
 }
 
 /// Snapshot and Git overlay health. The edge sidecar manifest is the
@@ -2456,6 +2643,218 @@ mod tests {
         assert!(summary.contains("next: bbox_reembed"), "{summary}");
         assert!(summary.contains("ok: daemon"), "{summary}");
     }
+
+    fn unavailable(
+        route: &str,
+        reason: bbox_vectors::VectorDiagnosticUnavailableReason,
+    ) -> bbox_vectors::VectorDiagnosticUnavailable {
+        bbox_vectors::VectorDiagnosticUnavailable {
+            route: route.into(),
+            reason,
+        }
+    }
+
+    fn healthy_partition(route: &str) -> bbox_vectors::PartitionMetrics {
+        bbox_vectors::PartitionMetrics {
+            route: route.into(),
+            state: bbox_vectors::PartitionState::Active { dims: 2 },
+            dims: 2,
+            wal_records: 0,
+            active_count: 1_000,
+            deleted_count: 0,
+            deleted_ratio: 0.0,
+            hnsw_rebuilds: 0,
+            hnsw: Some(bbox_vectors::HnswMetricsSerde {
+                total_nodes: 1_000,
+                active_nodes: 1_000,
+                deleted_nodes: 0,
+                dimensions: 2,
+                max_level: 1,
+                entry_point: Some(0),
+                neighbor_refs: 16_000,
+                avg_neighbor_degree: 16.0,
+                layer_distribution: vec![1_000],
+                disconnected_nodes: 0,
+                zero_in_degree_nodes: 0,
+            }),
+        }
+    }
+
+    /// A bounded diagnostic that ran out of time measured nothing: info, and
+    /// the measured healthy partition still reports ok.
+    #[test]
+    fn vector_diagnostic_deadline_is_info_not_warn() {
+        use bbox_vectors::VectorDiagnosticUnavailableReason as Reason;
+
+        let mut report = bbox_vectors::VectorDiagnosticsReport::default();
+        report
+            .partitions
+            .insert("small".into(), healthy_partition("small"));
+        report.unavailable = vec![
+            unavailable("large", Reason::DeadlineExceeded),
+            unavailable("busy", Reason::Busy),
+        ];
+        let findings =
+            vector_connectivity_findings(report, &std::collections::BTreeMap::new(), 1_000_000);
+        let levels = findings
+            .iter()
+            .map(|finding| (finding.level, finding.message.as_str()))
+            .collect::<Vec<_>>();
+        assert!(
+            findings
+                .iter()
+                .filter(
+                    |finding| finding.message.contains("large") || finding.message.contains("busy")
+                )
+                .all(|finding| finding.level == FindingLevel::Info),
+            "{levels:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.level == FindingLevel::Ok
+                    && finding.message.contains("across 1 partition")),
+            "{levels:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .all(|finding| finding.level <= FindingLevel::Info),
+            "{levels:?}"
+        );
+    }
+
+    /// A missing graph is observed state, not an incomplete diagnostic.
+    #[test]
+    fn vector_missing_graph_still_warns() {
+        let report = bbox_vectors::VectorDiagnosticsReport {
+            unavailable: vec![unavailable(
+                "graphless",
+                bbox_vectors::VectorDiagnosticUnavailableReason::MissingGraph,
+            )],
+            ..Default::default()
+        };
+        let findings =
+            vector_connectivity_findings(report, &std::collections::BTreeMap::new(), 1_000_000);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].level, FindingLevel::Warn);
+    }
+
+    /// A recent daily-maintenance measurement stands in for an incomplete
+    /// diagnostic: a measured breach is an action, a healthy or repaired
+    /// measurement is info, and a stale one is ignored.
+    #[test]
+    fn vector_diagnostic_deadline_prefers_recent_maintenance_measurement() {
+        use bbox_vectors::{ConnectivityObservation, VectorDiagnosticUnavailableReason as Reason};
+
+        let now = 10_000_000;
+        let observation = |hours_ago: u64, breach: bool, repaired: bool| ConnectivityObservation {
+            observed_unix_secs: now - hours_ago * 3_600,
+            zero_in_degree_ratio: if breach { 0.08 } else { 0.001 },
+            breach,
+            repaired,
+        };
+        let observations = [
+            ("breached".to_string(), observation(3, true, false)),
+            ("healthy".to_string(), observation(3, false, false)),
+            ("repaired".to_string(), observation(3, true, true)),
+            ("stale".to_string(), observation(72, true, false)),
+        ]
+        .into_iter()
+        .collect::<std::collections::BTreeMap<_, _>>();
+        let report = bbox_vectors::VectorDiagnosticsReport {
+            unavailable: ["breached", "healthy", "repaired", "stale"]
+                .into_iter()
+                .map(|route| unavailable(route, Reason::DeadlineExceeded))
+                .collect(),
+            ..Default::default()
+        };
+        let findings = vector_connectivity_findings(report, &observations, now);
+        let level_of = |route: &str| {
+            findings
+                .iter()
+                .find(|finding| finding.message.contains(&format!(" {route}")))
+                .map(|finding| (finding.level, finding.message.clone()))
+                .unwrap_or_else(|| panic!("{route} reported: {findings:?}"))
+        };
+        let (level, message) = level_of("breached");
+        assert_eq!(level, FindingLevel::Action, "{message}");
+        assert!(message.contains("8.00% zero-in-degree"), "{message}");
+        assert!(message.contains("3h ago"), "{message}");
+        assert_eq!(level_of("healthy").0, FindingLevel::Info);
+        let (level, message) = level_of("repaired");
+        assert_eq!(level, FindingLevel::Info, "{message}");
+        assert!(message.contains("rebuilt"), "{message}");
+        let (level, message) = level_of("stale");
+        assert_eq!(level, FindingLevel::Info, "{message}");
+        assert!(message.contains("unknown"), "{message}");
+    }
+
+    fn degraded_counter(
+        project_id: &str,
+        count: u64,
+        last_unix_secs: u64,
+    ) -> bbox_indexing::knowledge_transport_observations::KnowledgeTransportOperationCounterV1 {
+        use bbox_indexing::knowledge_transport_observations::{
+            KnowledgeTransportOperationCounterV1, KnowledgeTransportOperationV1,
+            KnowledgeTransportOutcomeV1,
+        };
+        KnowledgeTransportOperationCounterV1 {
+            project_id: project_id.into(),
+            operation: KnowledgeTransportOperationV1::ProvisionalAllKnowledge,
+            outcome: KnowledgeTransportOutcomeV1::Degraded,
+            count,
+            first_sequence: 1,
+            last_sequence: count,
+            last_unix_secs,
+        }
+    }
+
+    /// Degraded counters are lifetime totals: only one that advanced within
+    /// the last day warns; old ones report the lifetime total as info.
+    #[test]
+    fn degraded_knowledge_transport_warns_only_on_recent_counters() {
+        let now = 1_790_782_254;
+        let old = [
+            degraded_counter("p_old_a", 800, now - 50 * 86_400),
+            degraded_counter("p_old_b", 400, now - 10 * 86_400),
+        ];
+        let finding = degraded_transport_finding(old.iter(), now).expect("finding");
+        assert_eq!(finding.level, FindingLevel::Info, "{}", finding.message);
+        assert!(
+            finding.message.contains("1200 lifetime"),
+            "{}",
+            finding.message
+        );
+        assert!(finding.message.contains("p_old_b"), "{}", finding.message);
+
+        let mut mixed = old.to_vec();
+        mixed.push(degraded_counter("p_recent", 39, now - 2 * 3_600));
+        let finding = degraded_transport_finding(mixed.iter(), now).expect("finding");
+        assert_eq!(finding.level, FindingLevel::Warn, "{}", finding.message);
+        assert!(finding.message.contains("p_recent"), "{}", finding.message);
+        assert!(
+            finding.message.contains("1239 lifetime"),
+            "{}",
+            finding.message
+        );
+
+        assert!(degraded_transport_finding(std::iter::empty(), now).is_none());
+    }
+
+    /// No code-source lane by design is info; a project that has a lane and
+    /// no source is still a warning with the remedy.
+    #[test]
+    fn source_unavailable_warns_only_for_projects_with_a_code_source_lane() {
+        let diagnostic = "project has no attached checkout and no active collected generation";
+        let without_lane = source_unavailable_finding("p_remote", diagnostic, false);
+        assert_eq!(without_lane.level, FindingLevel::Info);
+        assert!(without_lane.next.is_none());
+        assert!(without_lane.message.contains("no code-source lane"));
+        let with_lane = source_unavailable_finding("p_collected", diagnostic, true);
+        assert_eq!(with_lane.level, FindingLevel::Warn);
+        assert!(with_lane.next.is_some());
+    }
 }
 
 #[cfg(test)]
@@ -3188,6 +3587,65 @@ mod catalog_health_tests {
             text.contains(&format!(
                 "project {PROJECT} is render locality governed, but its producer assignment changed after the cutover"
             )),
+            "{text}"
+        );
+    }
+
+    /// Only a project with neither an attached checkout nor a code-source
+    /// producer assignment lacks a code-source lane.
+    #[test]
+    fn code_source_lane_requires_an_attachment_or_a_producer_assignment() {
+        crate::init_system_memory_for_tests();
+        let fixture = CatalogFixture::new();
+        fixture.add_published_project(PROJECT, &CatalogFixture::scope("."));
+        fixture.add_published_project(OTHER_PROJECT, &CatalogFixture::scope("other"));
+        let server = locality_server(
+            &fixture,
+            &[],
+            &[(OTHER_PROJECT, CatalogFixture::scope("other"))],
+        );
+        let without_lane = projects_without_code_source_lane(&server.state);
+        assert!(without_lane.contains(PROJECT), "{without_lane:?}");
+        assert!(!without_lane.contains(OTHER_PROJECT), "{without_lane:?}");
+    }
+
+    /// A project that can never accept a candidate (no published scope, no
+    /// attachment) reports its missing pointer as having no lane, not as
+    /// waiting for the owning producer.
+    #[test]
+    fn accepted_missing_without_a_publication_lane_is_reported_as_by_design() {
+        crate::init_system_memory_for_tests();
+        let fixture = CatalogFixture::new();
+        fixture.add_published_project(PROJECT, &CatalogFixture::scope("."));
+        let published = status(&fixture.server());
+        assert_eq!(published.accepted.state, "missing");
+        let mut connector = published.clone();
+        connector.project_id = "p_connector".into();
+        connector.catalog_scope = None;
+        connector.attachments.clear();
+
+        let section = accepted_publication_section(&[published, connector]);
+        let text = section
+            .findings
+            .iter()
+            .map(|finding| format!("{:?} {}", finding.level, finding.message))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            section
+                .findings
+                .iter()
+                .all(|finding| finding.level == FindingLevel::Info),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "project {PROJECT} has no accepted publication pointer; its first valid"
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains("project p_connector has no accepted publication lane"),
             "{text}"
         );
     }

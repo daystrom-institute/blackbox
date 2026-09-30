@@ -390,6 +390,19 @@ pub fn try_diagnostics_bounded(
     try_global().map(|store| store.diagnostics_bounded(routes, timeout))
 }
 
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or_default()
+}
+
+/// Daily-maintenance connectivity measurements from the installed global
+/// store; `None` during cold-start warmup.
+pub fn try_connectivity_observations() -> Option<BTreeMap<String, ConnectivityObservation>> {
+    try_global().map(|store| store.connectivity_observations())
+}
+
 /// Partition lifecycle inventory against the installed global store.
 /// Degrades to Ok(None) during cold-start warmup (same contract as
 /// `try_metrics`).
@@ -442,6 +455,21 @@ pub struct VectorStore {
     root: PathBuf,
     partitions: RwLock<BTreeMap<String, Arc<RwLock<Partition>>>>,
     maintenance: Mutex<()>,
+    connectivity_observations: Mutex<BTreeMap<String, ConnectivityObservation>>,
+}
+
+/// The last connectivity measurement the daily maintenance pass completed for
+/// one route. Process-local: a restart forgets it until the next pass.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ConnectivityObservation {
+    pub observed_unix_secs: u64,
+    /// `zero_in_degree_nodes / active_nodes` at measurement time.
+    pub zero_in_degree_ratio: f32,
+    /// The measurement crossed [`NOTIFY_CONNECTIVITY_RATIO`].
+    pub breach: bool,
+    /// The same pass rebuilt this route's graph after measuring it, so the
+    /// recorded ratio predates the repair.
+    pub repaired: bool,
 }
 
 impl VectorStore {
@@ -453,6 +481,7 @@ impl VectorStore {
             root,
             partitions: RwLock::new(BTreeMap::new()),
             maintenance: Mutex::new(()),
+            connectivity_observations: Mutex::new(BTreeMap::new()),
         };
         store.load_existing_partitions()?;
         Ok(store)
@@ -471,6 +500,7 @@ impl VectorStore {
             root,
             partitions: RwLock::new(BTreeMap::new()),
             maintenance: Mutex::new(()),
+            connectivity_observations: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -830,8 +860,18 @@ impl VectorStore {
                 break;
             }
             let report = self.diagnostics_bounded(chunk, remaining)?;
+            let observed_unix_secs = unix_now_secs();
             for (route, metrics) in report.partitions {
                 if let Some(hnsw) = metrics.hnsw {
+                    self.connectivity_observations.lock().insert(
+                        route.clone(),
+                        ConnectivityObservation {
+                            observed_unix_secs,
+                            zero_in_degree_ratio: hnsw.connectivity_risk_ratio(),
+                            breach: hnsw.connectivity_breach(NOTIFY_CONNECTIVITY_RATIO),
+                            repaired: false,
+                        },
+                    );
                     if hnsw.connectivity_breach(COMPACT_CONNECTIVITY_RATIO) {
                         candidates.push((route, hnsw.connectivity_risk_ratio()));
                     } else if hnsw.connectivity_breach(NOTIFY_CONNECTIVITY_RATIO) {
@@ -852,6 +892,9 @@ impl VectorStore {
         let Some(stats) = self.rebuild_partition(&route, &partition)? else {
             return Ok(Vec::new());
         };
+        if let Some(observation) = self.connectivity_observations.lock().get_mut(&route) {
+            observation.repaired = true;
+        }
         Ok(vec![RouteCompactionStats {
             route,
             before_wal_records: stats.before_wal_records,
@@ -860,6 +903,12 @@ impl VectorStore {
             after_slab_entries: stats.after_slab_entries,
             elapsed_ms: started.elapsed().as_millis(),
         }])
+    }
+
+    /// Last connectivity measurement per route from the daily maintenance
+    /// pass.
+    pub fn connectivity_observations(&self) -> BTreeMap<String, ConnectivityObservation> {
+        self.connectivity_observations.lock().clone()
     }
 
     pub fn partition_count(&self) -> usize {
@@ -2849,6 +2898,24 @@ mod tests {
                 .unwrap()
         );
         assert!(!reopened.contains_active("route", "old", "h1").unwrap());
+    }
+
+    #[test]
+    fn connectivity_maintenance_records_each_measured_route() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let store = VectorStore::open(&root).unwrap();
+        assert!(store.connectivity_observations().is_empty());
+        store.upsert("route", "a", "h1", vec![1.0, 0.0]).unwrap();
+        store.upsert("route", "b", "h2", vec![0.0, 1.0]).unwrap();
+        store.maintain_connectivity().unwrap();
+        let observations = store.connectivity_observations();
+        let observation = observations.get("route").expect("route measured");
+        assert!(observation.observed_unix_secs > 0);
+        assert!(
+            !observation.breach && !observation.repaired,
+            "two nodes sit below the connectivity guard: {observation:?}"
+        );
     }
 
     #[test]
