@@ -257,10 +257,14 @@ impl BlackboxServer {
                         }
                         crate::server::render_owner::RenderOwnerSelection::None => {}
                     }
-                    if server
-                        .state
-                        .render_locality_cutover
-                        .transport_governed(&project_id)
+                    // With no owner, the daemon's own render write lease is
+                    // the compatibility lane, and a daemon without checkout
+                    // authority never takes it.
+                    if !server.state.checkout_access.holds_checkout_authority()
+                        || server
+                            .state
+                            .render_locality_cutover
+                            .transport_governed(&project_id)
                     {
                         anyhow::bail!(crate::server::render_owner::owner_required_message(
                             &project_id,
@@ -1074,6 +1078,36 @@ mod catalog_render_tests {
             .map(|operation| operation.granted)
             .sum();
         assert_eq!(granted, 0, "a refused render must open no checkout");
+    }
+
+    /// With no checkout owner, a daemon without checkout authority refuses
+    /// the project render without taking, or even attempting, its own render
+    /// write lease.
+    #[tokio::test]
+    async fn render_without_checkout_authority_takes_no_daemon_write_lease() {
+        let fixture = CatalogFixture::new();
+        fixture.add_published_project(PROJECT, &CatalogFixture::scope("."));
+        let server = fixture.server_without_checkout_authority();
+
+        let result = server
+            .bbox_render(Parameters(RenderParams {
+                project: Some(PROJECT.into()),
+                scope: Some("project".into()),
+                provisional: Some("published".into()),
+                ..Default::default()
+            }))
+            .await;
+
+        assert!(is_error(&result), "{}", text(&result));
+        assert!(text(&result).contains("error.render_locality_required"));
+        assert!(
+            !text(&result).contains("daemon checkout access"),
+            "no lease was attempted, so there is no broker detail: {}",
+            text(&result)
+        );
+        let health = server.state.checkout_access.health();
+        assert_eq!(health.sequence, 0);
+        assert!(health.counters.is_empty());
     }
 
     #[tokio::test]

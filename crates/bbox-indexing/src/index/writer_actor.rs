@@ -868,11 +868,19 @@ fn acquire_leases_for_record(
     // project-record, and knowledge lanes, so the acquisition set stays
     // exactly today's (bridge parity; leases are a property of attachment,
     // not of effective source).
+    let is_collected = collected.contains_key(&project.project_id);
     let needs_local = !code_source_locality_governed
-        && (!collected.contains_key(&project.project_id)
-            || purpose == ProjectLeasePurpose::Reindex);
+        && (!is_collected || purpose == ProjectLeasePurpose::Reindex);
     let (local, local_denial) = if !needs_local {
         (None, None)
+    } else if !broker.holds_checkout_authority() {
+        // No walk is attempted. A collected project is served by its
+        // generation as if it needed no lease; any other project reports why
+        // it has no source.
+        (
+            None,
+            (!is_collected).then(|| crate::checkout_access::NO_CHECKOUT_AUTHORITY.to_string()),
+        )
     } else {
         match broker.acquire(access_request(
             &project.project_id,
@@ -3702,6 +3710,76 @@ mod tests {
             Vec::new(),
         );
         assert!(empty.is_empty());
+    }
+
+    /// A daemon without checkout authority plans no local walk: a collected
+    /// project is served by its generation with no lease and no denial, an
+    /// uncollected one reports why it has no source, and the broker records
+    /// no observation for any kind.
+    #[test]
+    fn no_checkout_authority_plans_no_local_walk() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let index = test_index(&root);
+        let fixture = collected_fixture(&root);
+        let collected = "collected-project";
+        install_outgoing_collected_state(
+            &root,
+            &fixture.store,
+            collected,
+            &fixture.generation_id,
+            &fixture.descriptor,
+        );
+        let mut uncollected = attached_record("uncollected-project", Some("other-family"));
+        uncollected.canonical_path = "/unavailable/remote/other".into();
+        let broker = Arc::new(
+            CheckoutAccessBroker::new(
+                Arc::new(crate::checkout_access::DenyCheckoutAccess),
+                crate::checkout_access::CheckoutAccessObservations::in_memory(),
+            )
+            .without_checkout_authority(),
+        );
+        let records_provider: Arc<dyn ProjectRecordsProvider> =
+            Arc::new(FixedRecordsProvider(vec![
+                attached_record(collected, Some("repo-family")),
+                uncollected,
+            ]));
+        for purpose in [
+            ProjectLeasePurpose::Reindex,
+            ProjectLeasePurpose::SpeculativeScan,
+        ] {
+            let plans = plan_project_sources(
+                &index.reindex_config(),
+                &records_provider,
+                &broker,
+                None,
+                purpose,
+                &HashMap::new(),
+                &std::collections::BTreeSet::new(),
+            )
+            .unwrap();
+            let plan = |id: &str| plans.iter().find(|plan| plan.project_id == id).unwrap();
+            let collected_access = plan(collected).access.as_ref().unwrap();
+            assert!(matches!(
+                plan(collected).effective,
+                EffectiveSource::Collected { .. }
+            ));
+            assert!(collected_access.local.is_none());
+            assert_eq!(collected_access.local_denial, None);
+            let other = plan("uncollected-project");
+            assert!(other.access.as_ref().unwrap().local.is_none());
+            assert_eq!(
+                other.effective,
+                EffectiveSource::Unavailable {
+                    reason: UnavailableReason::LocalWalkDenied(
+                        crate::checkout_access::NO_CHECKOUT_AUTHORITY.to_string()
+                    ),
+                }
+            );
+        }
+        let health = broker.health();
+        assert_eq!(health.sequence, 0);
+        assert!(health.counters.is_empty());
     }
 
     /// Phase 3 plan section 6 item 2 (governing section 11, closing F5): the

@@ -33,6 +33,18 @@ fleetd_worker_home = "/home/on-agent-host"
 fleetd_worker_bro_home = "/state/on-agent-host/bro"
 ```
 
+The full daemon holds no checkout: every project path its attachment records
+name lives on a checkout host. Declare that so it never attempts a
+checkout-backed fallback:
+
+```toml
+[daemon]
+no_checkout_authority = true
+```
+
+or set `BLACKBOX_NO_CHECKOUT_AUTHORITY=true` in the pod environment. See
+[checkout authority](../../docs/operations.md#checkout-authority).
+
 The egress Service is expected to be a Tailscale operator `ExternalName`
 Service targeting the agent machine. fleetd must bind its tailnet address with
 the explicit non-loopback grant. Plain non-loopback TCP is unsupported.

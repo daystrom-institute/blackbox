@@ -412,13 +412,22 @@ pub(super) fn open_shared_state(
             )
         }
     };
-    let checkout_access = Arc::new(
-        bbox_indexing::checkout_access::CheckoutAccessBroker::new_with_lifecycle_writer_wait(
-            access_authority,
-            checkout_access_observations.clone(),
-            std::time::Duration::from_millis(cfg.daemon.checkout_lifecycle_writer_wait_ms),
-        ),
-    );
+    let checkout_access = {
+        let broker =
+            bbox_indexing::checkout_access::CheckoutAccessBroker::new_with_lifecycle_writer_wait(
+                access_authority,
+                checkout_access_observations.clone(),
+                std::time::Duration::from_millis(cfg.daemon.checkout_lifecycle_writer_wait_ms),
+            );
+        if cfg.daemon.no_checkout_authority {
+            tracing::info!(
+                "Checkout authority: none (daemon.no_checkout_authority); checkout access is refused before resolution"
+            );
+            Arc::new(broker.without_checkout_authority())
+        } else {
+            Arc::new(broker)
+        }
+    };
     let checkout_policy = bbox_indexing::checkout_access::CheckoutAccessPolicyChain::new()
         .with_policy(
             super::knowledge_source::KnowledgeTransportCheckoutPolicy::new(

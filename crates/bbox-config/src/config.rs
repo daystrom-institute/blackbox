@@ -334,6 +334,13 @@ struct RawDaemonConfig {
     /// off-host daemon's state root.
     #[serde(default)]
     pub fleetd_worker_bro_home: Option<PathBuf>,
+    /// Declares that this daemon holds no checkout: no project path it
+    /// records is a directory it may read or write. Checkout access is
+    /// refused before any attachment is resolved, so the daemon never walks
+    /// a project, cuts back to a local source, takes a render write lease,
+    /// or probes an attachment. Off by default.
+    #[serde(default)]
+    pub no_checkout_authority: bool,
 }
 
 /// Which executor turns a resolved spawn spec into a supervised worker.
@@ -606,6 +613,8 @@ pub struct DaemonConfig {
     pub fleetd_token_file: Option<PathBuf>,
     pub fleetd_worker_home: Option<PathBuf>,
     pub fleetd_worker_bro_home: Option<PathBuf>,
+    /// The daemon holds no checkout; see `[daemon] no_checkout_authority`.
+    pub no_checkout_authority: bool,
 }
 
 /// Index configuration
@@ -1108,6 +1117,7 @@ impl Config {
                 fleetd_token_file: None,
                 fleetd_worker_home: None,
                 fleetd_worker_bro_home: None,
+                no_checkout_authority: false,
             },
             index: RawIndexConfig {
                 reindex_interval_secs: default_index_reindex_interval_secs(),
@@ -1152,6 +1162,16 @@ impl Config {
                 memory_dir: None,
             },
         }
+    }
+}
+
+/// A boolean env override: `true`/`1`/`yes`/`on` or `false`/`0`/`no`/`off`,
+/// case-insensitive. Anything else is no override.
+fn parse_env_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Some(true),
+        "false" | "0" | "no" | "off" => Some(false),
+        _ => None,
     }
 }
 
@@ -1249,6 +1269,14 @@ fn apply_explicit_env(raw: RawConfig) -> RawConfig {
         && !path.trim().is_empty()
     {
         raw.daemon.fleetd_worker_bro_home = Some(PathBuf::from(path));
+    }
+
+    // no_checkout_authority: an unrecognized value is ignored, like the
+    // executor, rather than silently selecting either mode.
+    if let Ok(value) = std::env::var("BLACKBOX_NO_CHECKOUT_AUTHORITY")
+        && let Some(no_checkout_authority) = parse_env_bool(&value)
+    {
+        raw.daemon.no_checkout_authority = no_checkout_authority;
     }
 
     // poller_min_interval_secs
@@ -1484,6 +1512,7 @@ pub fn load_with(options: LoadOptions) -> Result<Config> {
             fleetd_token_file,
             fleetd_worker_home,
             fleetd_worker_bro_home,
+            no_checkout_authority: raw.daemon.no_checkout_authority,
         },
         index: IndexConfig {
             reindex_interval_secs: raw.index.reindex_interval_secs,
@@ -2259,6 +2288,7 @@ mod tests {
         assert_eq!(config.daemon.fleetd_token_file, None);
         assert_eq!(config.daemon.fleetd_worker_home, None);
         assert_eq!(config.daemon.fleetd_worker_bro_home, None);
+        assert!(!config.daemon.no_checkout_authority);
 
         assert_eq!(config.index.reindex_interval_secs, 120);
 
@@ -2551,6 +2581,52 @@ port = 7300
 
         let config = load().unwrap();
         assert_eq!(config.daemon.port, 7400);
+    }
+
+    #[test]
+    fn no_checkout_authority_reads_config_and_env() {
+        let _guard = bbox_util::util::test_env_lock();
+
+        let dir = tempdir().unwrap();
+        let home = dir.path();
+        unsafe {
+            env::set_var("HOME", home);
+            env::set_var("XDG_CONFIG_HOME", home.join(".config"));
+            env::set_var("XDG_DATA_HOME", home.join(".local/share"));
+            env::set_var("XDG_STATE_HOME", home.join(".local/state"));
+            env::remove_var("BLACKBOX_CONFIG");
+            env::remove_var("BLACKBOX_NO_CHECKOUT_AUTHORITY");
+        }
+        let config_dir = home.join(".config").join("blackbox");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("config.toml");
+
+        // Absent key and absent env: the daemon holds checkout authority.
+        assert!(!load().unwrap().daemon.no_checkout_authority);
+
+        std::fs::write(&config_path, "[daemon]\nno_checkout_authority = true\n").unwrap();
+        assert!(load().unwrap().daemon.no_checkout_authority);
+
+        // The env override wins in both directions; an unrecognized value
+        // leaves the configured setting.
+        unsafe {
+            env::set_var("BLACKBOX_NO_CHECKOUT_AUTHORITY", "false");
+        }
+        assert!(!load().unwrap().daemon.no_checkout_authority);
+        unsafe {
+            env::set_var("BLACKBOX_NO_CHECKOUT_AUTHORITY", "maybe");
+        }
+        assert!(load().unwrap().daemon.no_checkout_authority);
+        std::fs::write(&config_path, "[daemon]\n").unwrap();
+        for value in ["true", "1", "YES", " on "] {
+            unsafe {
+                env::set_var("BLACKBOX_NO_CHECKOUT_AUTHORITY", value);
+            }
+            assert!(load().unwrap().daemon.no_checkout_authority, "{value}");
+        }
+        unsafe {
+            env::remove_var("BLACKBOX_NO_CHECKOUT_AUTHORITY");
+        }
     }
 
     #[test]

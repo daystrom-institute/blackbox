@@ -2962,6 +2962,20 @@ pub(crate) mod catalog_fixture {
             )))
         }
 
+        /// A server declared to hold no checkout
+        /// (`daemon.no_checkout_authority`), over the same durable bytes.
+        pub(crate) fn server_without_checkout_authority(&self) -> BlackboxServer {
+            let mut state = SharedState::for_test_catalog(&self.root, &self.catalog_projects_path);
+            state.checkout_access = Arc::new(
+                bbox_indexing::checkout_access::CheckoutAccessBroker::new(
+                    Arc::new(bbox_indexing::checkout_access::DenyCheckoutAccess),
+                    bbox_indexing::checkout_access::CheckoutAccessObservations::in_memory(),
+                )
+                .without_checkout_authority(),
+            );
+            BlackboxServer::new(Arc::new(state))
+        }
+
         pub(crate) fn server_with_render_locality_cutover(
             &self,
             project_id: &str,

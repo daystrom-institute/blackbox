@@ -2433,6 +2433,10 @@ pub(crate) fn spawn_reconciler(state: &Arc<SharedState>, runtime_handle: tokio::
                     );
                     action = gate_completion_reentry(action, &event.origins);
                     action = gate_transient_deadline(action, persisted.as_ref(), unix_now());
+                    action = gate_checkout_authority(
+                        action,
+                        state_for_task.checkout_access.holds_checkout_authority(),
+                    );
 
                     tracing::debug!(
                         project_id = %project_id,
@@ -3287,6 +3291,16 @@ fn schedule_cutback(
     project_id: String,
     guard: Option<GuardHandle>,
 ) {
+    // Local cutback reads the checkout; a daemon without checkout authority
+    // keeps the collected generation instead of retrying a walk it cannot
+    // make.
+    if !state.checkout_access.holds_checkout_authority() {
+        tracing::info!(
+            project_id,
+            "code-source local cutback skipped: the daemon holds no checkout"
+        );
+        return;
+    }
     if !state.code_sources.begin_activation(&project_id) {
         return;
     }
@@ -4043,6 +4057,9 @@ fn probe_ladder_raw(
         CheckoutAccessIntent, CheckoutAccessKind, CheckoutAccessRequest, CheckoutAccessSourceLane,
         CheckoutAttachmentSelector,
     };
+    if !checkout_access.holds_checkout_authority() {
+        return LadderResult::None;
+    }
     // Determine the expected scope from the activation record's
     // published_scope, not from the auth-table assignment (which is not
     // available pre-bind in the same form).
@@ -4068,6 +4085,7 @@ fn probe_ladder_raw(
             match error.code {
                 Code::AttachmentNotFound
                 | Code::ObservationUnavailable
+                | Code::NoCheckoutAuthority
                 | Code::DeniedByTestProbe => LadderResult::None,
                 Code::ScopeMismatch
                 | Code::CapabilityDenied
@@ -5286,6 +5304,10 @@ fn probe_ladder(state: &Arc<SharedState>, project_id: &str) -> LadderResult {
         CheckoutAccessIntent, CheckoutAccessKind, CheckoutAccessRequest, CheckoutAccessSourceLane,
         CheckoutAttachmentSelector,
     };
+    // A daemon without checkout authority has no attachment to select.
+    if !state.checkout_access.holds_checkout_authority() {
+        return LadderResult::None;
+    }
     // Derive scope from the activation record's published_scope, not
     // from current auth-table assignments. When an assignment is removed
     // (desired=Local cutback), the auth table no longer has the scope,
@@ -5314,6 +5336,7 @@ fn probe_ladder(state: &Arc<SharedState>, project_id: &str) -> LadderResult {
             match error.code {
                 Code::AttachmentNotFound
                 | Code::ObservationUnavailable
+                | Code::NoCheckoutAuthority
                 | Code::DeniedByTestProbe => LadderResult::None,
                 Code::ScopeMismatch
                 | Code::CapabilityDenied
@@ -5475,6 +5498,18 @@ fn evaluate_reduction_for_event(
                 }
             }
         }
+    }
+}
+
+/// A daemon without checkout authority never cuts back to a local source. A
+/// cutback the reduction table would attempt is recorded as structural (no
+/// local attachment) instead, and the collected generation stays effective.
+fn gate_checkout_authority(action: ReducerAction, checkout_authority: bool) -> ReducerAction {
+    match action {
+        ReducerAction::AttemptCutback | ReducerAction::ReattemptCutback if !checkout_authority => {
+            ReducerAction::PersistStructural(CutbackReason::NoLocalAttachment)
+        }
+        action => action,
     }
 }
 
@@ -5722,7 +5757,8 @@ fn classify_checkout_error(error: &CheckoutAccessError) -> CutbackAttemptOutcome
         Code::AttachmentNotFound
         | Code::ObservationUnavailable
         | Code::KnowledgeTransportAuthoritative
-        | Code::CodeSourceTransportAuthoritative => {
+        | Code::CodeSourceTransportAuthoritative
+        | Code::NoCheckoutAuthority => {
             CutbackAttemptOutcome::Structural(CutbackReason::NoLocalAttachment)
         }
         Code::ScopeMismatch => CutbackAttemptOutcome::Structural(CutbackReason::ScopeMismatch),
@@ -7736,6 +7772,143 @@ mod tests {
             }),
             CheckoutAccessObservations::in_memory(),
         )
+    }
+
+    fn no_authority_ladder_fixture(
+        root: &Path,
+    ) -> (CodeSourceStore, CheckoutAccessCandidate, &'static str) {
+        let project_id = "p_00000000000000000000000000000c01";
+        let scope = PublishedScope::try_new("no-authority-repo", ".").unwrap();
+        let store = CodeSourceStore::open_with_mode(
+            root.join("code-sources"),
+            StoreLimits::default(),
+            RuntimeRecordMode::CatalogV2,
+        )
+        .unwrap();
+        let generation_id = "a".repeat(64);
+        store
+            .save_activation_v2(&ActivationRecordV2 {
+                version: bbox_code_source_store::MIGRATION_STORE_VERSION,
+                project_id: ProjectId::parse(project_id).unwrap(),
+                published_scope: scope.clone(),
+                generation_id: generation_id.clone(),
+                selector: crate::index::project_files::collected_materialization_selector(
+                    project_id,
+                    &generation_id,
+                ),
+                snapshot_id: format!("collected-{}", "f".repeat(32)),
+                document_count: 0,
+                entity_inventory_sha256: "e".repeat(64),
+                current_chunk_targets: BTreeMap::new(),
+                activated_unix_secs: 100,
+                cutback_pending: false,
+                cutback: None,
+                diagnostic: None,
+            })
+            .unwrap();
+        let (_, mut candidate) = snapshot_project(root, project_id, &scope);
+        candidate.capabilities = BTreeSet::from([CheckoutAccessKind::LocalProjectWalk]);
+        (store, candidate, project_id)
+    }
+
+    /// The attachment ladder a checkout-holding daemon selects is never
+    /// probed on a daemon without checkout authority: the probe selects
+    /// nothing and the broker records no observation.
+    #[test]
+    fn no_checkout_authority_skips_the_attachment_ladder_probe() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let (store, candidate, project_id) = no_authority_ladder_fixture(&root);
+
+        let holding = snapshot_broker(vec![candidate.clone()]);
+        assert_eq!(
+            probe_ladder_raw(&store, &holding, project_id),
+            LadderResult::Selected
+        );
+
+        let broker = snapshot_broker(vec![candidate]).without_checkout_authority();
+        assert_eq!(
+            probe_ladder_raw(&store, &broker, project_id),
+            LadderResult::None
+        );
+        let health = broker.health();
+        assert_eq!(health.sequence, 0);
+        assert!(health.counters.is_empty());
+    }
+
+    /// The reduction table's cutback attempts become a structural record on
+    /// a daemon without checkout authority; every other action is unchanged.
+    #[test]
+    fn no_checkout_authority_turns_cutback_attempts_into_structural_records() {
+        let cutbacks = || {
+            [
+                ReducerAction::AttemptCutback,
+                ReducerAction::ReattemptCutback,
+            ]
+        };
+        for (action, expected) in cutbacks().into_iter().zip(cutbacks()) {
+            assert_eq!(gate_checkout_authority(action, true), expected);
+        }
+        for action in cutbacks() {
+            assert_eq!(
+                gate_checkout_authority(action, false),
+                ReducerAction::PersistStructural(CutbackReason::NoLocalAttachment)
+            );
+        }
+        let others = || {
+            [
+                ReducerAction::NoOp,
+                ReducerAction::CancelCutback,
+                ReducerAction::Activate,
+                ReducerAction::Retire,
+                ReducerAction::PersistStructural(CutbackReason::ScopeMismatch),
+            ]
+        };
+        for (action, expected) in others().into_iter().zip(others()) {
+            assert_eq!(gate_checkout_authority(action, false), expected);
+        }
+        // A persisted transient cutback reattempts through the table; the
+        // gate is what keeps a checkout-less daemon from retrying it.
+        let transient = CutbackStateV2::Transient {
+            attempt: 1,
+            error_class: CutbackErrorClass::WriterContention,
+            deadline_unix_secs: 0,
+        };
+        let action = evaluate_reduction_for_event(
+            DesiredAssignment::Local,
+            EffectiveSource::Collected,
+            Some(&transient),
+            LadderResult::None,
+            false,
+            &BTreeSet::from([ReconcileOrigin::StartupRecovery]),
+        );
+        assert_eq!(action, ReducerAction::ReattemptCutback);
+        assert_eq!(
+            gate_checkout_authority(action, false),
+            ReducerAction::PersistStructural(CutbackReason::NoLocalAttachment)
+        );
+    }
+
+    /// Bridge-mode local cutback never starts on a daemon without checkout
+    /// authority: it spawns no worker (this test has no runtime to spawn on)
+    /// and leaves the project free for its next activation.
+    #[test]
+    fn no_checkout_authority_never_schedules_a_local_cutback() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let mut state = SharedState::for_test(&root);
+        state.checkout_access = Arc::new(
+            CheckoutAccessBroker::new(
+                Arc::new(bbox_indexing::checkout_access::DenyCheckoutAccess),
+                CheckoutAccessObservations::in_memory(),
+            )
+            .without_checkout_authority(),
+        );
+        let state = Arc::new(state);
+        let scope = PublishedScope::try_new("no-authority-repo", ".").unwrap();
+        schedule_cutback(state.clone(), scope, "bridge-project".into(), None);
+        assert!(state.code_sources.begin_activation("bridge-project"));
+        assert_eq!(state.checkout_access.health().sequence, 0);
     }
 
     fn assert_snapshot_rejected(

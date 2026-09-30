@@ -382,6 +382,7 @@ pub enum CheckoutAccessErrorCode {
     LifecycleBusy,
     KnowledgeTransportAuthoritative,
     CodeSourceTransportAuthoritative,
+    NoCheckoutAuthority,
     DeniedByTestProbe,
     ObservationUnavailable,
 }
@@ -405,6 +406,7 @@ impl CheckoutAccessErrorCode {
             Self::LifecycleBusy => "lifecycle_busy",
             Self::KnowledgeTransportAuthoritative => "knowledge_transport_authoritative",
             Self::CodeSourceTransportAuthoritative => "code_source_transport_authoritative",
+            Self::NoCheckoutAuthority => "no_checkout_authority",
             Self::DeniedByTestProbe => "denied_by_test_probe",
             Self::ObservationUnavailable => "observation_unavailable",
         }
@@ -657,7 +659,13 @@ pub struct CheckoutAccessBroker {
     observations: CheckoutAccessObservations,
     lifecycle_gate: Arc<CheckoutLifecycleGate>,
     lifecycle_writer_wait: Duration,
+    /// False on a daemon declared to hold no checkout. Every request is then
+    /// refused before policy, authority resolution, and observation.
+    checkout_authority: bool,
 }
+
+/// Diagnostic for every checkout request on a daemon that holds no checkout.
+pub const NO_CHECKOUT_AUTHORITY: &str = "error.no_checkout_authority: this daemon holds no checkout (daemon.no_checkout_authority), so it never reads or writes a project checkout";
 
 impl CheckoutAccessBroker {
     pub fn new(
@@ -678,7 +686,22 @@ impl CheckoutAccessBroker {
             observations,
             lifecycle_gate: Arc::new(CheckoutLifecycleGate::default()),
             lifecycle_writer_wait,
+            checkout_authority: true,
         }
+    }
+
+    /// Declare that this daemon holds no checkout. Set once, before the
+    /// broker is shared.
+    pub fn without_checkout_authority(mut self) -> Self {
+        self.checkout_authority = false;
+        self
+    }
+
+    /// Whether this daemon may read or write a project checkout at all.
+    /// Callers with a checkout-backed fallback check this before attempting
+    /// it, so a daemon without checkouts never starts one.
+    pub fn holds_checkout_authority(&self) -> bool {
+        self.checkout_authority
     }
 
     pub fn acquire(
@@ -748,6 +771,12 @@ impl CheckoutAccessBroker {
         &self,
         request: &CheckoutAccessRequest,
     ) -> std::result::Result<(), CheckoutAccessError> {
+        if !self.checkout_authority {
+            return Err(CheckoutAccessError::new(
+                CheckoutAccessErrorCode::NoCheckoutAuthority,
+                NO_CHECKOUT_AUTHORITY,
+            ));
+        }
         match self.policy.read().as_ref() {
             Some(policy) => policy.authorize(request),
             None => Ok(()),
@@ -2676,6 +2705,46 @@ mod tests {
         assert_eq!(health.sequence, 0);
         assert!(health.counters.is_empty());
         assert!(health.target_counters.is_empty());
+    }
+
+    #[test]
+    fn no_checkout_authority_refuses_every_kind_before_authority_and_observation() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("project")).unwrap();
+        for kind in CheckoutAccessKind::ALL {
+            // The authority would grant this kind: the refusal comes first.
+            let observations = CheckoutAccessObservations::in_memory();
+            let broker =
+                CheckoutAccessBroker::new(Arc::new(authority(&root, kind)), observations.clone())
+                    .without_checkout_authority();
+            assert!(!broker.holds_checkout_authority());
+            for intent in [CheckoutAccessIntent::Read, CheckoutAccessIntent::Write] {
+                let error = broker.acquire(request(kind, intent)).unwrap_err();
+                assert_eq!(
+                    error.code,
+                    CheckoutAccessErrorCode::NoCheckoutAuthority,
+                    "{kind:?}"
+                );
+                assert_eq!(error.diagnostic, NO_CHECKOUT_AUTHORITY);
+            }
+            let health = broker.health();
+            assert_eq!(health.sequence, 0, "{kind:?}");
+            assert!(health.counters.is_empty(), "{kind:?}");
+            assert!(health.target_counters.is_empty(), "{kind:?}");
+        }
+
+        let holding = CheckoutAccessBroker::new(
+            Arc::new(authority(&root, CheckoutAccessKind::LocalProjectWalk)),
+            CheckoutAccessObservations::in_memory(),
+        );
+        assert!(holding.holds_checkout_authority());
+        holding
+            .acquire(request(
+                CheckoutAccessKind::LocalProjectWalk,
+                CheckoutAccessIntent::Read,
+            ))
+            .unwrap();
     }
 
     #[test]

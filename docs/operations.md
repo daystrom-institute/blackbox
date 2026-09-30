@@ -135,6 +135,38 @@ See `docs/index-embedding-internals.md` (Visual routes) for details.
 Default port: `7264` (HTTP MCP + `/tail` + `/roster`). Override with
 `BBOX_PORT` environment variable.
 
+### Checkout authority
+
+A daemon that holds no project checkout (the containerized corpus daemon,
+whose attachment records name paths on checkout hosts) declares it:
+
+```toml
+[daemon]
+no_checkout_authority = true
+```
+
+`BLACKBOX_NO_CHECKOUT_AUTHORITY=true` (or `1`, `yes`, `on`; `false`, `0`,
+`no`, `off` to turn it off) overrides the config key; any other value is
+ignored. The default is off: the daemon may read and write the checkouts its
+attachments name. The setting is read at startup.
+
+With it on, the checkout broker refuses every checkout access with
+`error.no_checkout_authority` before resolving an attachment, so no access
+counter moves, and the daemon never attempts a checkout-backed fallback:
+
+- no daemon-side project walk: a collected project is served by its active
+  generation, and an attached project with no collected generation records
+  a `source_unavailable` health row naming `error.no_checkout_authority`;
+- no local cutback: a project that loses its producer assignment keeps its
+  last collected generation, and the reconciler records a structural
+  `no_local_attachment` state instead of attempting or retrying a cutback;
+- no reconciler attachment probe;
+- no daemon render write lease: a project render with no checkout owner is
+  refused with the owner-required message.
+
+Transcript attribution is unaffected: every collected project is attributed
+from its attachment path without reading the checkout.
+
 ### Local dev daemon
 
 A local daemon for live validation runs from its own binary path, port and
