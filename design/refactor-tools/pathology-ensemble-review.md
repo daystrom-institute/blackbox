@@ -1,7 +1,7 @@
 ---
 title: "Pathology Ensemble Review"
 kind: design
-lifecycle: proposed
+lifecycle: archived
 corpus: blackbox-design
 topic:
   - refactor-tools
@@ -14,7 +14,7 @@ tags:
   - architecture
 date: 2026-05-30
 updated: 2026-05-31
-status: "partial: five-dimension lens brofiles, validators and panel teamplates installed for all four flows (arch+perf x java+rust); the caller composes the review rounds."
+status: "archived; the pathology flows it reviews handed off to the removed phase decomposer"
 brief: "Replace the single-actor pathologist in the pathology flows with a heterogeneous review ensemble: five orthogonal review dimensions projected per language into lens instances, plus an independent validator. Deliberation follows bridgecrew — the validator traces each claim and refutes false positives (excluded from the plan), debate is conflict-triggered, and unresolved disagreement survives into the plan as contradictions requiring human judgment, not a consensus gate."
 ---
 

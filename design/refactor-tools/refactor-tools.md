@@ -29,15 +29,6 @@ refactor atoms.
 - [AST-Grounded Restructure Execution Plan](restructure-ast.md)
 - [Refactor Surface Benchmark](refactor-restructure-benchmark.md)
 
-## Diagnosis
-
-- [Architecture Pathology](arch-pathology.md) — diagnosis workflow that emits
-  a reviewable refactor plan-doc, consumed by phase-decompose for execution.
-- [Performance Pathology](perf-pathology.md) — sibling diagnosis workflow
-  for performance and efficiency smells. Reuses the arch-pathology machinery
-  with cost-dimension axis, multi-source evidence, baseline measurements,
-  and delta-based acceptance.
-
 ## Refactor Atoms
 
 - [Refactor Agents](refactor-agents.md)
@@ -53,3 +44,10 @@ refactor atoms.
   Hover) for macro probes, refactor plan-shaping, and LLM due-diligence.
 - [Elixir Refactor Tools](elixir/elixir-refactor-tools.md)
 - [C# Refactor Tools](csharp/csharp-refactor-tools.md)
+
+## Archived
+
+- [Architecture Pathology](arch-pathology.md) (archived)
+- [Performance Pathology](perf-pathology.md) (archived)
+- [Pathology Ensemble Review](pathology-ensemble-review.md) (archived)
+- [Rust Architecture Pathology](rust/rust-arch-pathology.md) (archived)

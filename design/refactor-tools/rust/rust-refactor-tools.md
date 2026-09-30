@@ -25,10 +25,13 @@ LSP-backed and compiler-backed operations explicit about their semantic grade.
 - [Rust Refactor Gap Inventory](rust-refactor-gap-inventory.md)
 - [Rust Isolate Surface](rust-isolate-surface.md) - the rust.* cell bindings
   for the bro-harness isolate, curated from the retiring v1 catalog.
-- [Rust Architecture Pathology](rust-arch-pathology.md)
 
 ## Crosscuts
 
 - [Refactor Tools](../refactor-tools.md)
 - [Refactor Agents](../refactor-agents.md)
 - [Atom Capability Runtime](../../orchestration/atoms/atom-capability-runtime.md)
+
+## Archived
+
+- [Rust Architecture Pathology](rust-arch-pathology.md) (archived)

@@ -1,7 +1,7 @@
 ---
 title: "Rust Architecture Pathology"
 kind: design
-lifecycle: partial
+lifecycle: archived
 corpus: blackbox-design
 topic:
   - refactor-tools
@@ -14,7 +14,7 @@ tags:
   - pathology
 date: 2026-05-20
 updated: 2026-05-30
-status: "partial — full V0 shipped (arch-pathology-rust workflow + 12 V0 atoms + brofile + operator docs); post-v0 deferred atoms remain"
+status: "archived; its plan hand-off targeted the removed phase decomposer"
 brief: "Rust pathology workflow: identify Rust-specific bad-code architecture, then emit correction plans that map to Rust refactor atoms, cargo validation, and PD remediation."
 ---
 

@@ -1,7 +1,7 @@
 ---
 title: "Performance Pathology"
 kind: design
-lifecycle: partial
+lifecycle: archived
 corpus: blackbox-design
 topic:
   - refactor-tools
@@ -11,7 +11,7 @@ tags:
   - pathology
 date: 2026-05-16
 updated: 2026-05-30
-status: "partial — v0 shipped (perf-pathology workflow + 6 detector atoms + performance-pathologist brofile + plan-emission ops + operator docs)"
+status: "archived; its plan hand-off targeted the removed phase decomposer"
 brief: "Sibling to Architecture Pathology: scout performance smells, validate and cluster the evidence, then emit a reviewed performance correction plan for phase-decompose remediation."
 ---
 
