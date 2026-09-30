@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -621,6 +621,42 @@ struct EmbedQueueInner {
     /// unchanged chunk's stored vector across code-source snapshot re-mints
     /// instead of re-embedding the whole project through the provider.
     snapshot_reuse: super::snapshot_reuse::SnapshotReuseIndex,
+    /// Text routes (bucket names) whose document enqueues are dropped before
+    /// any route, dedup, or provider work (`DISABLED_ROUTES_ENV`).
+    disabled_routes: RwLock<BTreeSet<String>>,
+}
+
+/// Comma-separated text routes (`git_message`, `code`, ...) whose document
+/// embeddings are switched off: every enqueue on such a route is skipped, so
+/// no source (index-time hook, history publication, residue sweep, manual
+/// re-embed) can reach its provider. Query embedding is unaffected.
+pub const DISABLED_ROUTES_ENV: &str = "BLACKBOX_EMBED_DISABLED_ROUTES";
+
+fn disabled_routes_from_env() -> BTreeSet<String> {
+    let Ok(raw) = std::env::var(DISABLED_ROUTES_ENV) else {
+        return BTreeSet::new();
+    };
+    parse_disabled_routes(&raw)
+}
+
+fn parse_disabled_routes(raw: &str) -> BTreeSet<String> {
+    let mut routes = BTreeSet::new();
+    for route in raw
+        .split(',')
+        .map(str::trim)
+        .filter(|route| !route.is_empty())
+    {
+        if Bucket::ALL.iter().any(|bucket| bucket.as_str() == route) {
+            routes.insert(route.to_string());
+        } else {
+            tracing::warn!(
+                route,
+                env = DISABLED_ROUTES_ENV,
+                "ignoring unknown embedding route in the disabled-route list"
+            );
+        }
+    }
+    routes
 }
 
 struct ResolvedRoute {
@@ -695,6 +731,27 @@ impl EmbedQueueHandle {
     }
 
     fn start_default_with_optional_store(
+        vector_store: Option<Arc<bbox_vectors::VectorStore>>,
+    ) -> Self {
+        let handle = Self::start_router_with_optional_store(vector_store);
+        let disabled = disabled_routes_from_env();
+        if !disabled.is_empty() {
+            tracing::info!(
+                routes = ?disabled,
+                env = DISABLED_ROUTES_ENV,
+                "embedding routes disabled: their document enqueues never reach a provider"
+            );
+        }
+        handle.set_disabled_routes(disabled);
+        handle
+    }
+
+    /// Replace the set of text routes whose document enqueues are skipped.
+    pub fn set_disabled_routes(&self, routes: BTreeSet<String>) {
+        *self.inner.disabled_routes.write() = routes;
+    }
+
+    fn start_router_with_optional_store(
         vector_store: Option<Arc<bbox_vectors::VectorStore>>,
     ) -> Self {
         match EmbeddingRouter::load_default() {
@@ -783,6 +840,20 @@ impl EmbedQueueHandle {
     /// durable `capped_count` instead of being silently discarded
     /// (gap-7323e96c).
     pub fn enqueue_outcome(&self, request: EmbedRequest) -> EnqueueOutcome {
+        if request.visual_kind.is_none()
+            && self
+                .inner
+                .disabled_routes
+                .read()
+                .contains(request.bucket.as_str())
+        {
+            tracing::debug!(
+                route = request.bucket.as_str(),
+                entity_id = %request.entity_id,
+                "embedding enqueue skipped: route is disabled"
+            );
+            return EnqueueOutcome::Skipped;
+        }
         let resolved = match self.resolve_route(&request) {
             Ok(resolved) => resolved,
             Err(err) => {
@@ -1151,6 +1222,7 @@ impl EmbedQueueHandle {
                 retry_backoff: DEFAULT_RETRY_BACKOFF,
                 max_queue_depth: std::sync::atomic::AtomicU64::new(MAX_ROUTE_QUEUE_DEPTH),
                 snapshot_reuse: super::snapshot_reuse::SnapshotReuseIndex::default(),
+                disabled_routes: RwLock::new(BTreeSet::new()),
             }),
         }
     }
@@ -1222,6 +1294,7 @@ impl EmbedQueueHandle {
                 retry_backoff,
                 max_queue_depth: std::sync::atomic::AtomicU64::new(MAX_ROUTE_QUEUE_DEPTH),
                 snapshot_reuse: super::snapshot_reuse::SnapshotReuseIndex::default(),
+                disabled_routes: RwLock::new(BTreeSet::new()),
             }),
         }
     }
@@ -2180,6 +2253,39 @@ mod tests {
         assert_eq!(status.indexed_count, 1);
         assert_eq!(status.queue_depth, 0);
         assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        queue.shutdown();
+    }
+
+    #[tokio::test]
+    async fn disabled_route_enqueues_never_reach_the_provider() {
+        let provider = Arc::new(MockProvider::ok());
+        let queue = EmbedQueueHandle::from_providers_for_test(
+            vec![
+                ("git_message", provider.clone()),
+                ("knowledge", provider.clone()),
+            ],
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+        );
+        queue.set_disabled_routes(parse_disabled_routes(" git_message, not_a_route ,"));
+        assert_eq!(
+            queue.enqueue_outcome(request(Bucket::GitMessage, "commit-a", "h1")),
+            EnqueueOutcome::Skipped
+        );
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(queue.status().routes["git_message"].queue_depth, 0);
+
+        // Other routes keep embedding.
+        assert!(queue.enqueue(request(Bucket::Knowledge, "entry-a", "h1")));
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+
+        // Clearing the switch restores the route.
+        queue.set_disabled_routes(BTreeSet::new());
+        assert!(queue.enqueue(request(Bucket::GitMessage, "commit-a", "h1")));
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
         queue.shutdown();
     }
 

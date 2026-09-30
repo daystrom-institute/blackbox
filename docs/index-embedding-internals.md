@@ -209,6 +209,15 @@ pairs must derive the same compatibility family or config load fails.
 Stored corpus content embeds with `input_type=document`; live queries
 embed with `input_type=query`.
 
+The live embed queue drains to the provider on its own; the residue
+sweeper (`BLACKBOX_EMBED_SWEEP_INTERVAL_SECS`, `0` disables it) only
+refills missed work. To switch document embedding off for a text route,
+set `BLACKBOX_EMBED_DISABLED_ROUTES` in the daemon environment to a
+comma-separated list of route names (for example `git_message`): every
+enqueue on a listed route is skipped before any provider work, whatever
+its source (index-time hook, history publication, sweep, `bbox_reembed`).
+Query embedding is unaffected. Unknown names are logged and ignored.
+
 ### Visual routes (opt-in)
 
 Visual retrieval (images, PDF figures) is a separate, chunk-kind-keyed
