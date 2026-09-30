@@ -27,6 +27,68 @@ use super::{ProjectAuthority, SharedState};
 thread_local! {
     static ACTIVATION_FAILURE_POINT: std::cell::RefCell<Option<&'static str>> =
         const { std::cell::RefCell::new(None) };
+    static LAST_LANE_PUBLICATION: std::cell::RefCell<
+        Option<bbox_indexing::index::writer_actor::HistoryLanePublicationV1>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn take_last_lane_publication()
+-> Option<bbox_indexing::index::writer_actor::HistoryLanePublicationV1> {
+    LAST_LANE_PUBLICATION.with(|last| last.borrow_mut().take())
+}
+
+fn record_lane_publication(_lane: &bbox_indexing::index::writer_actor::HistoryLanePublicationV1) {
+    #[cfg(test)]
+    LAST_LANE_PUBLICATION.with(|last| *last.borrow_mut() = Some(*_lane));
+}
+
+/// The owner every row of a repository's commit lane is published under:
+/// the display member (lowest member id) and its catalog display name, or
+/// the namespace when that member has no catalog entry. Activation and every
+/// durability proof derive it here, so an owner change reads as a lane that
+/// no longer matches and is republished.
+fn history_commit_owner(
+    catalog: &bbox_corpus_core::project_catalog::CatalogSnapshotV2,
+    group: &bbox_indexing::index::consolidated_history::RepoHistoryIngestGroupV1,
+) -> bbox_indexing::index::schema_replacement::CommitDocumentOwnerV1 {
+    let project_display = group
+        .display_member()
+        .and_then(|id| ProjectId::parse(id.to_string()).ok())
+        .and_then(|id| catalog.projects.get(&id))
+        .map(|project| project.display_name.clone())
+        .unwrap_or_else(|| group.primary_namespace.as_str().to_string());
+    bbox_indexing::index::schema_replacement::CommitDocumentOwnerV1 {
+        project_id: group.display_member().map(str::to_string),
+        project_display,
+    }
+}
+
+/// Key of the committed-activation validation cache: the journal checksum
+/// plus the lane owner its durability proof checked, so an owner change (a
+/// catalog rename or membership change) misses the cache and re-runs the
+/// full proof instead of waiting for an unrelated index commit.
+fn activation_validation_key(
+    catalog: &bbox_corpus_core::project_catalog::CatalogSnapshotV2,
+    journal: &HistoryActivationJournalV1,
+) -> String {
+    match committed_history_owner(catalog, &journal.repo_history_id)
+        .and_then(|owner| Ok(serde_json::to_vec(&owner)?))
+    {
+        Ok(owner) => format!("{}:{}", journal.checksum_sha256, sha256(&owner)),
+        Err(_) => journal.checksum_sha256.clone(),
+    }
+}
+
+fn committed_history_owner(
+    catalog: &bbox_corpus_core::project_catalog::CatalogSnapshotV2,
+    repo_history_id: &RepoHistoryId,
+) -> Result<bbox_indexing::index::schema_replacement::CommitDocumentOwnerV1> {
+    let group = bbox_indexing::index::consolidated_history::plan_repo_history_ingest(catalog)
+        .into_iter()
+        .find(|group| &group.repo_history_id == repo_history_id)
+        .ok_or_else(|| anyhow!("repo-history group has no published member to own its lane"))?;
+    Ok(history_commit_owner(catalog, &group))
 }
 
 #[cfg(test)]
@@ -135,7 +197,12 @@ pub(crate) fn recover_prebind(
                 source_store.verify_activation_source_pin(journal).is_ok()
                     && activation_metadata_current(&catalog, &auth, &manifest, journal)
                     && verify_durable_publications(
-                        index_path, &searcher, fields, &edges_dir, journal,
+                        index_path,
+                        &searcher,
+                        fields,
+                        &edges_dir,
+                        catalog.catalog(),
+                        journal,
                     )
                     .is_ok()
             });
@@ -145,7 +212,7 @@ pub(crate) fn recover_prebind(
                 .expect("current journal was present");
             git_sources.mark_activation_validated(
                 repo_history_id.as_str(),
-                &journal.checksum_sha256,
+                &activation_validation_key(catalog.catalog(), &journal),
                 searcher.generation().generation_id(),
             );
             continue;
@@ -396,9 +463,15 @@ pub(crate) fn activate_source(state: &Arc<SharedState>, source_generation_id: &s
         && existing.stage == HistoryActivationStageV1::Committed
     {
         let searcher_generation = state.idx.read().searcher().generation().generation_id();
+        let validation_key = state
+            .project_authority
+            .catalog_store()
+            .ok_or_else(|| anyhow!("typed Git history requires catalog authority"))?
+            .snapshot()
+            .map(|catalog| activation_validation_key(catalog.catalog(), &existing))?;
         let cached = state.git_sources.activation_was_validated(
             existing.repo_history_id.as_str(),
-            &existing.checksum_sha256,
+            &validation_key,
             searcher_generation,
         );
         // Durability (are the committed publications still intact?) and
@@ -419,7 +492,7 @@ pub(crate) fn activate_source(state: &Arc<SharedState>, source_generation_id: &s
         if current {
             state.git_sources.mark_activation_validated(
                 existing.repo_history_id.as_str(),
-                &existing.checksum_sha256,
+                &validation_key,
                 searcher_generation,
             );
             let already_active = source_store
@@ -460,7 +533,7 @@ pub(crate) fn activate_source(state: &Arc<SharedState>, source_generation_id: &s
             return supersede(&source_store, existing, error);
         }
         if verify_committed_publications(state, &existing).is_ok() {
-            return finish_activation(state, &source_store, &grant, existing);
+            return finish_activation(state, &source_store, &grant, existing, None);
         }
     }
     let source = source_store
@@ -674,6 +747,7 @@ pub(crate) fn activate_source(state: &Arc<SharedState>, source_generation_id: &s
         .stage
         .is_at_least(HistoryActivationStageV1::CommitViewPublished)
         && verify_committed_publications(state, &journal).is_ok();
+    let mut lane_publication = None;
     if !publications_current {
         let (searcher, fields) = {
             let index = state.idx.read();
@@ -714,18 +788,9 @@ pub(crate) fn activate_source(state: &Arc<SharedState>, source_generation_id: &s
             GitHistorySourceStateV1::Publishing,
             None,
         );
-        let display_member = group
-            .display_member()
-            .and_then(|id| ProjectId::parse(id.to_string()).ok())
-            .and_then(|id| pinned.catalog().projects.get(&id))
-            .map(|project| project.display_name.clone())
-            .unwrap_or_else(|| source.primary_namespace.as_str().to_string());
         let publication = state.index_writer.publish_history_generation(
             generation,
-            bbox_indexing::index::schema_replacement::CommitDocumentOwnerV1 {
-                project_id: group.display_member().map(str::to_string),
-                project_display: display_member,
-            },
+            history_commit_owner(pinned.catalog(), &group),
             edges,
             journal
                 .overlays
@@ -738,6 +803,8 @@ pub(crate) fn activate_source(state: &Arc<SharedState>, source_generation_id: &s
         {
             anyhow::bail!("published commit view disagrees with the activation journal");
         }
+        record_lane_publication(&publication.lane);
+        lane_publication = Some(publication.lane);
         inject_activation_failure("commit-view-published")?;
         journal.commit_view_commitment = Some(publication.commit_view_commitment);
         for overlay in &mut journal.overlays {
@@ -764,14 +831,23 @@ pub(crate) fn activate_source(state: &Arc<SharedState>, source_generation_id: &s
     }
     verify_committed_publications(state, &journal)?;
 
-    finish_activation(state, &source_store, &grant, journal)
+    finish_activation(
+        state,
+        &source_store,
+        &grant,
+        journal,
+        lane_publication.as_ref(),
+    )
 }
 
+/// `lane` is this run's commit-lane publication, `None` when the run
+/// recovered an already-published lane and wrote nothing to it.
 fn finish_activation(
     state: &Arc<SharedState>,
     source_store: &bbox_git_source_store::GitSourceStore,
     grant: &super::producer_auth::RepoTransportGrant,
     mut journal: HistoryActivationJournalV1,
+    lane: Option<&bbox_indexing::index::writer_actor::HistoryLanePublicationV1>,
 ) -> Result<()> {
     if let Err(error) = recheck_plan_after_catalog_advance(state, &journal) {
         return supersede(source_store, journal, error);
@@ -846,9 +922,15 @@ fn finish_activation(
     }
     inject_activation_failure("committed")?;
     verify_committed_activation(state, &journal)?;
+    let validation_key = state
+        .project_authority
+        .catalog_store()
+        .ok_or_else(|| anyhow!("catalog authority disappeared"))?
+        .snapshot()
+        .map(|catalog| activation_validation_key(catalog.catalog(), &journal))?;
     state.git_sources.mark_activation_validated(
         journal.repo_history_id.as_str(),
-        &journal.checksum_sha256,
+        &validation_key,
         state.idx.read().searcher().generation().generation_id(),
     );
     source_store.set_history_source_state(
@@ -869,6 +951,13 @@ fn finish_activation(
         p3_generation = %journal.planned_p3_generation_id,
         overlays = journal.overlays.len(),
         staged_for_recutover = staged,
+        lane_mode = lane.map_or("recovered", |lane| lane.mode.as_str()),
+        lane_added = lane.map_or(0, |lane| lane.added),
+        lane_rewritten = lane.map_or(0, |lane| lane.rewritten),
+        lane_removed = lane.map_or(0, |lane| lane.removed),
+        lane_unchanged = lane.map_or(0, |lane| lane.unchanged),
+        vectors_enqueued = lane.map_or(0, |lane| lane.vectors_enqueued),
+        vectors_verified = lane.map_or(0, |lane| lane.vectors_verified),
         "typed Git-history activation committed"
     );
     Ok(())
@@ -996,6 +1085,12 @@ pub(crate) fn reconcile_transport_currency(
             }));
     }
     clear_transport_overlays_for_repo(state, repo_history_id)?;
+    // The cleared repository re-activates against the moved code selectors
+    // now rather than on the worker's next periodic seed, so history is
+    // hidden for one activation instead of up to a full tick.
+    if let Some(source) = source_store.current_ready_source_id(repo_history_id)? {
+        state.git_sources.enqueue_activation(source);
+    }
     Ok(false)
 }
 
@@ -1327,7 +1422,19 @@ fn verify_committed_publications(
             index.index_path().to_path_buf(),
         )
     };
-    verify_durable_publications(&index_path, &searcher, fields, &edges_dir(state), journal)
+    let catalog = state
+        .project_authority
+        .catalog_store()
+        .ok_or_else(|| anyhow!("typed Git history requires catalog authority"))?
+        .snapshot()?;
+    verify_durable_publications(
+        &index_path,
+        &searcher,
+        fields,
+        &edges_dir(state),
+        catalog.catalog(),
+        journal,
+    )
 }
 
 fn verify_durable_publications(
@@ -1335,6 +1442,7 @@ fn verify_durable_publications(
     searcher: &tantivy::Searcher,
     fields: bbox_corpus_index::index::FieldHandles,
     edges_dir: &std::path::Path,
+    catalog: &bbox_corpus_core::project_catalog::CatalogSnapshotV2,
     journal: &HistoryActivationJournalV1,
 ) -> Result<()> {
     let generation_store =
@@ -1361,10 +1469,12 @@ fn verify_durable_publications(
     {
         anyhow::bail!("durable P3 generation disagrees with its activation journal");
     }
-    bbox_indexing::index::history_transport::verify_history_commit_view(
+    let owner = committed_history_owner(catalog, &journal.repo_history_id)?;
+    bbox_indexing::index::history_transport::verify_history_commit_lane(
         searcher,
         fields,
         &generation,
+        &owner,
     )
     .map_err(|error| anyhow!("{error}"))?;
     verify_overlay_receipts(edges_dir, journal)
@@ -1652,21 +1762,57 @@ mod tests {
         scope: bbox_corpus_core::identity::PublishedScope,
         head: &str,
     ) -> String {
+        install_code_generation(state, project_id, scope, head, &[])
+    }
+
+    /// Install and activate a collected code generation. Distinct `files` at
+    /// the same `head` model a working-tree-only change.
+    fn install_code_generation(
+        state: &Arc<SharedState>,
+        project_id: &str,
+        scope: bbox_corpus_core::identity::PublishedScope,
+        head: &str,
+        files: &[(&str, &[u8])],
+    ) -> String {
+        let entries = files
+            .iter()
+            .map(|(path, bytes)| bbox_code_source::ManifestEntry {
+                relative_path: (*path).into(),
+                content_sha256: hex::encode(Sha256::digest(bytes)),
+                size: bytes.len() as u64,
+            })
+            .collect::<Vec<_>>();
         let descriptor = GenerationDescriptor {
             schema_version: SCHEMA_VERSION,
             walker_policy_version: WALKER_POLICY_VERSION.into(),
             scope: scope.clone(),
             head_commit: head.to_string(),
-            dirty_fingerprint: dirty_fingerprint(head, &[]),
-            manifest_sha256: manifest_sha256(&[]),
-            file_count: 0,
-            logical_bytes: 0,
+            dirty_fingerprint: dirty_fingerprint(head, &entries),
+            manifest_sha256: manifest_sha256(&entries),
+            file_count: entries.len() as u64,
+            logical_bytes: files.iter().map(|(_, bytes)| bytes.len() as u64).sum(),
         };
         let store = state.code_sources.store();
         let upload = store.begin_upload("producer-a", descriptor).unwrap();
+        if !entries.is_empty() {
+            store
+                .put_manifest_page("producer-a", &upload.upload_id, 0, &entries)
+                .unwrap();
+        }
         store
             .complete_manifest("producer-a", &upload.upload_id)
             .unwrap();
+        for (entry, (_, bytes)) in entries.iter().zip(files) {
+            store
+                .install_blob(
+                    "producer-a",
+                    &upload.upload_id,
+                    &entry.content_sha256,
+                    entry.size,
+                    std::io::Cursor::new(bytes.to_vec()),
+                )
+                .unwrap();
+        }
         let generation = store
             .finalize_upload("producer-a", &upload.upload_id)
             .unwrap();
@@ -1879,6 +2025,146 @@ mod tests {
             BTreeMap::from([(root_project.to_string(), generation_two)]),
             "the journal deliberately keeps the selectors it committed with"
         );
+    }
+
+    #[test]
+    fn working_tree_drift_republishes_the_overlay_without_rewriting_the_lane() {
+        use bbox_indexing::index::writer_actor::HistoryLanePublicationModeV1::Diff;
+        let fixture = CatalogFixture::new();
+        let root_scope = CatalogFixture::scope(".");
+        let root_project = "p_drift_root";
+        fixture.add_published_project(root_project, &root_scope);
+        let history = RepoHistoryId::parse("rh_00000000000000000000000000000003").unwrap();
+        let namespace = CommitNamespace::parse("repo_example").unwrap();
+        let epoch = fixture.epoch();
+        fixture
+            .store()
+            .transact(epoch, |catalog, _| {
+                catalog.repo_histories.insert(
+                    history.clone(),
+                    RepoHistoryRecord {
+                        repo_history_id: history.clone(),
+                        membership_generation: 0,
+                        authority: RepoHistoryAuthority::Recorded(
+                            RecordedRepoAuthority::parse("repo_example").unwrap(),
+                        ),
+                        primary_namespace: namespace.clone(),
+                        compatibility_namespaces: Default::default(),
+                        materialization: RepoHistoryMaterialization::NotBuilt,
+                    },
+                );
+                catalog
+                    .projects
+                    .get_mut(&ProjectId::parse(root_project).unwrap())
+                    .unwrap()
+                    .repo_history = Some(history.clone());
+                Ok(())
+            })
+            .unwrap();
+        let state = fixture.server().state;
+        let catalog = fixture.store().snapshot().unwrap();
+        state
+            .code_sources
+            .install_auth_for_test(Arc::new(ProducerAuthRuntime::for_test_catalog(
+                vec![(
+                    bro_rpc::ServiceToken::parse("7".repeat(64)).unwrap(),
+                    ProducerGrant {
+                        producer_id: "producer-a".into(),
+                        projects: BTreeMap::from([(root_scope.clone(), root_project.to_string())]),
+                    },
+                )],
+                catalog.catalog(),
+            )));
+        let activations = state.git_sources.take_activation_receiver().unwrap();
+        let head = "1".repeat(40);
+        install_empty_code_generation(&state, root_project, root_scope.clone(), &head);
+        let source =
+            install_history_source(&state, &history, &namespace, root_scope.clone(), &head);
+        activate_source(&state, &source).unwrap();
+        let first = take_last_lane_publication().unwrap();
+        assert_eq!(first.mode, Diff);
+        assert_eq!((first.added, first.unchanged), (1, 0));
+
+        // Same HEAD, new working tree: the code selector moves, the overlay
+        // is cleared, and the repository re-activates promptly.
+        let drifted = install_code_generation(
+            &state,
+            root_project,
+            root_scope.clone(),
+            &head,
+            &[("member/lib.rs", b"pub fn drifted() {}\n")],
+        );
+        assert!(!reconcile_transport_currency(&state, root_project).unwrap());
+        assert!(
+            bbox_edge_sidecar::snapshot::selected_git_overlays(&edges_dir(&state))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            activations.try_iter().collect::<Vec<_>>(),
+            vec![source.clone()],
+            "clearing a repository's overlays must enqueue its re-activation"
+        );
+        activate_source(&state, &source).unwrap();
+        let republished = take_last_lane_publication().unwrap();
+        assert_eq!(republished.mode, Diff);
+        assert_eq!(
+            (
+                republished.added,
+                republished.rewritten,
+                republished.removed,
+                republished.unchanged,
+                republished.vectors_enqueued,
+                republished.vectors_verified,
+            ),
+            (0, 0, 0, 1, 0, 0),
+            "working-tree-only drift writes no lane row and enqueues nothing"
+        );
+        let journal = state
+            .git_sources
+            .store()
+            .read_activation_journal(&history)
+            .unwrap()
+            .unwrap();
+        assert_eq!(journal.stage, HistoryActivationStageV1::Committed);
+        assert_eq!(
+            journal.code_selectors,
+            BTreeMap::from([(root_project.to_string(), drifted)])
+        );
+        assert_eq!(journal.overlays.len(), 1);
+        assert_eq!(
+            bbox_edge_sidecar::snapshot::selected_git_overlays(&edges_dir(&state))
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // An owner change (the display member's name) fails the durability
+        // proof and republishes every row under the new owner.
+        let catalog_store = state.project_authority.catalog_store().unwrap();
+        let epoch = catalog_store.snapshot().unwrap().epoch();
+        catalog_store
+            .transact(epoch, |catalog, _| {
+                catalog
+                    .projects
+                    .get_mut(&ProjectId::parse(root_project).unwrap())
+                    .unwrap()
+                    .display_name = "renamed-drift-root".into();
+                Ok(())
+            })
+            .unwrap();
+        assert!(verify_committed_publications(&state, &journal).is_err());
+        activate_source(&state, &source).unwrap();
+        let renamed = take_last_lane_publication().unwrap();
+        assert_eq!(renamed.mode, Diff);
+        assert_eq!((renamed.rewritten, renamed.unchanged), (1, 0));
+        let journal = state
+            .git_sources
+            .store()
+            .read_activation_journal(&history)
+            .unwrap()
+            .unwrap();
+        verify_committed_publications(&state, &journal).unwrap();
     }
 
     #[test]

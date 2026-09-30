@@ -36,10 +36,11 @@ pub(crate) struct GitSourceRuntime {
     store: Arc<GitSourceStore>,
     activation_tx: std::sync::mpsc::SyncSender<String>,
     activation_rx: std::sync::Mutex<Option<std::sync::mpsc::Receiver<String>>>,
-    /// Repo id -> `(activation-journal checksum, Tantivy searcher generation)`
-    /// proven against the exact commit lane and durable snapshot receipts.
-    /// Redrive reuses the proof only while both authorities are unchanged;
-    /// any index commit forces a fresh exact-view probe.
+    /// Repo id -> `(validation key, Tantivy searcher generation)` proven
+    /// against the exact commit lane and durable snapshot receipts. The key
+    /// binds the activation-journal checksum and the lane owner the proof
+    /// checked. Redrive reuses the proof only while both are unchanged; any
+    /// index commit or owner change forces a fresh exact-view probe.
     validated_activations: parking_lot::Mutex<std::collections::BTreeMap<String, (String, u64)>>,
 }
 
@@ -96,26 +97,24 @@ impl GitSourceRuntime {
     pub(crate) fn activation_was_validated(
         &self,
         repo_history_id: &str,
-        journal_checksum: &str,
+        validation_key: &str,
         searcher_generation: u64,
     ) -> bool {
         self.validated_activations
             .lock()
             .get(repo_history_id)
-            .is_some_and(|current| {
-                current.0 == journal_checksum && current.1 == searcher_generation
-            })
+            .is_some_and(|current| current.0 == validation_key && current.1 == searcher_generation)
     }
 
     pub(crate) fn mark_activation_validated(
         &self,
         repo_history_id: &str,
-        journal_checksum: &str,
+        validation_key: &str,
         searcher_generation: u64,
     ) {
         self.validated_activations.lock().insert(
             repo_history_id.to_string(),
-            (journal_checksum.to_string(), searcher_generation),
+            (validation_key.to_string(), searcher_generation),
         );
     }
 
