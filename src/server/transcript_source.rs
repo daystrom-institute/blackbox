@@ -301,7 +301,6 @@ mod tests {
                 &[],
                 state.project_authority.catalog_store().cloned(),
                 state.checkout_access.clone(),
-                state.code_source_locality_cutover.clone(),
                 &state.producer_claims.read().records_snapshot(),
             )
             .unwrap(),

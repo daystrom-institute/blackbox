@@ -293,10 +293,10 @@ pub(super) fn open_shared_state(
         bbox_indexing::knowledge_transport_observations::KnowledgeTransportObservationsV1::open(
             store_dir.join("knowledge-transport-observations.json"),
         )?;
-    let render_locality_observations =
-        bbox_indexing::render_locality_observations::RenderLocalityObservationsV1::open(
-            store_dir.join("render-locality-observations.json"),
-        )?;
+    // The retired locality cutovers leave their markers and evidence behind;
+    // archive them once, before anything else reads the state root.
+    archive_retired_locality_state_at_startup(&cfg.paths.state_dir, &store_dir);
+    let render_issuances = bbox_indexing::render_issuances::RenderIssuancesV1::new();
     let render_operations = Arc::new(super::render_operations::RenderOperationRuntime::open(
         &store_dir.join("render-operations"),
     )?);
@@ -330,35 +330,6 @@ pub(super) fn open_shared_state(
             .map_err(|error| anyhow::anyhow!("knowledge transport cutover startup gate: {error}"))?
         } else {
             bbox_indexing::knowledge_transport_cutover::KnowledgeTransportCutoverRuntimeV1::default(
-            )
-        },
-    );
-    let render_locality_cutover = Arc::new(
-        if matches!(
-            store_probe,
-            bbox_indexing::project_catalog_store::ProjectStoreProbe::CatalogV2
-        ) {
-            bbox_indexing::render_locality_cutover::RenderLocalityCutoverRuntimeV1::open(
-                &cfg.paths.state_dir,
-            )
-            .map_err(|error| anyhow::anyhow!("render locality cutover startup gate: {error}"))?
-        } else {
-            bbox_indexing::render_locality_cutover::RenderLocalityCutoverRuntimeV1::default()
-        },
-    );
-    let code_source_locality_cutover = Arc::new(
-        if matches!(
-            store_probe,
-            bbox_indexing::project_catalog_store::ProjectStoreProbe::CatalogV2
-        ) {
-            bbox_indexing::code_source_locality_cutover::CodeSourceLocalityCutoverRuntimeV1::open(
-                &cfg.paths.state_dir,
-            )
-            .map_err(|error| {
-                anyhow::anyhow!("code-source locality cutover startup gate: {error}")
-            })?
-        } else {
-            bbox_indexing::code_source_locality_cutover::CodeSourceLocalityCutoverRuntimeV1::default(
             )
         },
     );
@@ -403,10 +374,9 @@ pub(super) fn open_shared_state(
                     ),
                 ),
                 Arc::new(
-                    bbox_indexing::catalog_records::CatalogProjectRecordsProvider::new_with_transport_cutovers(
+                    bbox_indexing::catalog_records::CatalogProjectRecordsProvider::new_with_git_transport_cutover(
                         store,
                         git_transport_cutover.clone(),
-                        code_source_locality_cutover.clone(),
                     ),
                 ),
             )
@@ -433,10 +403,7 @@ pub(super) fn open_shared_state(
             super::knowledge_source::KnowledgeTransportCheckoutPolicy::new(
                 knowledge_transport_cutover.clone(),
             ),
-        )
-        .with_policy(super::code_source::CodeSourceLocalityCheckoutPolicy::new(
-            code_source_locality_cutover.clone(),
-        ));
+        );
     checkout_access
         .install_policy(Arc::new(checkout_policy))
         .map_err(anyhow::Error::new)?;
@@ -729,7 +696,6 @@ pub(super) fn open_shared_state(
         &records_provider.records_snapshot().records,
         catalog_store.clone(),
         checkout_access.clone(),
-        code_source_locality_cutover.clone(),
         &producer_claims_store.read().records_snapshot(),
     )?);
     // Opened beside the code lane and unconditionally: the store is a
@@ -743,14 +709,6 @@ pub(super) fn open_shared_state(
     let conversation_sources = Arc::new(
         super::conversation_source::ConversationSourceRuntime::open(&cfg)?,
     );
-    if let Some(catalog_store) = catalog_store.as_ref() {
-        code_source_locality_cutover.verify_live(
-            catalog_store,
-            &cfg,
-            code_sources.store().as_ref(),
-            &projects_path,
-        )?;
-    }
     let git_sources = Arc::new(super::git_source::GitSourceRuntime::open(&cfg)?);
     let knowledge_sources = Arc::new(super::knowledge_source::KnowledgeSourceRuntime::open(&cfg)?);
 
@@ -927,7 +885,7 @@ pub(super) fn open_shared_state(
         checkout_access_observations,
         checkout_access,
         knowledge_transport_observations,
-        render_locality_observations,
+        render_issuances,
         // Publisher refs define authority and cannot be reconstructed from
         // checkout discovery without silently moving published truth. Keep
         // corrupt pins fail-closed even though the checkout census below is a
@@ -957,8 +915,6 @@ pub(super) fn open_shared_state(
         knowledge_sources,
         git_transport_cutover,
         knowledge_transport_cutover,
-        render_locality_cutover,
-        code_source_locality_cutover,
         reconciler_shutdown: parking_lot::RwLock::new(Arc::new(
             std::sync::atomic::AtomicBool::new(false),
         )),
@@ -1065,6 +1021,37 @@ pub(super) fn open_shared_state(
         bind_host,
         bind_is_loopback,
     })
+}
+
+/// Pre-bind archive of the retired locality cutover markers and evidence.
+/// Nothing reads those files, so a failure to move them is logged and never
+/// holds the daemon down; the next start retries whatever is left.
+fn archive_retired_locality_state_at_startup(
+    state_dir: &Path,
+    bro_home: &Path,
+) -> Option<bbox_indexing::locality_cutover_retirement::LocalityCutoverRetirement> {
+    let label = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    match bbox_indexing::locality_cutover_retirement::archive_retired_locality_state(
+        state_dir, bro_home, &label,
+    ) {
+        Ok(retirement) => {
+            if let Some(archive_dir) = &retirement.archive_dir {
+                tracing::info!(
+                    archive_dir = %archive_dir.display(),
+                    files = ?retirement.archived,
+                    "archived retired locality cutover state"
+                );
+            }
+            Some(retirement)
+        }
+        Err(error) => {
+            tracing::warn!(
+                error = %format!("{error:#}"),
+                "archiving retired locality cutover state failed; the files stay inert in place"
+            );
+            None
+        }
+    }
 }
 
 /// Pre-bind removal of edge families no reader consumes.
@@ -1239,6 +1226,70 @@ fn refresh_history_reference_manifest(
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    /// Startup archives a legacy-shaped locality cutover state root once:
+    /// markers (including one that no longer parses), a kept receipt, and
+    /// both evidence stores leave their live paths for one archive directory,
+    /// other cutover markers stay, and the next start finds nothing.
+    #[test]
+    fn startup_archives_retired_locality_state_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = temp.path().canonicalize().unwrap().join("state");
+        let bro_home = state_dir.join("bro");
+        std::fs::create_dir_all(&bro_home).unwrap();
+        let retired = [
+            "render-locality-cutover-marker.json",
+            "code-source-locality-cutover-marker.json",
+            "code-source-locality-cutover-receipt.json",
+            "blame-locality-cutover-marker.json",
+            "code-source-locality-observations.json",
+        ];
+        for name in retired {
+            std::fs::write(state_dir.join(name), b"{ not json").unwrap();
+        }
+        std::fs::write(bro_home.join("render-locality-observations.json"), b"{}").unwrap();
+        std::fs::write(
+            state_dir.join("knowledge-transport-cutover-marker.json"),
+            b"{}",
+        )
+        .unwrap();
+
+        let first = archive_retired_locality_state_at_startup(&state_dir, &bro_home).unwrap();
+        let archive = first.archive_dir.unwrap();
+        assert!(archive.starts_with(state_dir.join("cutover-artifacts")));
+        assert_eq!(first.archived.len(), retired.len() + 1);
+        for name in retired {
+            assert!(!state_dir.join(name).exists(), "{name}");
+            assert!(archive.join(name).is_file(), "{name}");
+        }
+        assert!(archive.join("render-locality-observations.json").is_file());
+        assert!(
+            state_dir
+                .join("knowledge-transport-cutover-marker.json")
+                .is_file()
+        );
+
+        let second = archive_retired_locality_state_at_startup(&state_dir, &bro_home).unwrap();
+        assert_eq!(second.archive_dir, None);
+        assert_eq!(
+            std::fs::read_dir(state_dir.join("cutover-artifacts"))
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+
+    /// A never-provisioned state root has nothing to archive and gains no
+    /// archive directory.
+    #[test]
+    fn startup_archive_creates_nothing_on_a_never_provisioned_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = temp.path().canonicalize().unwrap().join("state");
+        let result =
+            archive_retired_locality_state_at_startup(&state_dir, &state_dir.join("bro")).unwrap();
+        assert_eq!(result.archive_dir, None);
+        assert!(!state_dir.exists());
+    }
 
     /// The startup retirement is the daemon's pass over a real edge root: a
     /// store carrying the transcript-edge split lanes, the managed project

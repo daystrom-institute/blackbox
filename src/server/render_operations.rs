@@ -503,33 +503,6 @@ impl RenderOperationRuntime {
             .cloned()
     }
 
-    /// Run `record` only if the operation is still the newest render of its
-    /// checkout scope known to this daemon: its `sequence` is the newest
-    /// issued for the project, and no bound-workspace render of the scope
-    /// issued after `issued_at_ms` has completed, whether or not that render
-    /// produced evidence. Operation creation and workspace completion wait
-    /// while it runs, so neither can land between the check and the effect.
-    pub(crate) fn while_newest_render<T>(
-        &self,
-        project_id: &str,
-        scope: &PublishedScope,
-        sequence: u64,
-        issued_at_ms: u64,
-        record: impl FnOnce() -> Result<T>,
-    ) -> Result<Option<T>> {
-        let state = self.state.lock();
-        if state.index.sequences.get(project_id) != Some(&sequence)
-            || state
-                .index
-                .newer_workspace_render(project_id, scope, issued_at_ms)
-        {
-            return Ok(None);
-        }
-        let result = record().map(Some);
-        drop(state);
-        result
-    }
-
     /// The newest issued sequence for a project.
     pub(crate) fn latest_sequence(&self, project_id: &str) -> Option<u64> {
         self.state.lock().index.sequences.get(project_id).copied()

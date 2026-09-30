@@ -59,7 +59,7 @@ Pass `project` (the working dir) and `scope`:
 
 - `scope="project"` (default) → the gap is **repo-owned**: one file per gap under `<project>/.bbox/gaps/gap-<8hex>.json`, committed and travelling with the checkout.
 
-On a transport-governed (locality-cutover) estate the daemon holds no checkout authority, so a project-scoped `bbox_gap` does not write the file directly: it validates, mints the id, dedupes against the served view, and enqueues the exact committed-file bytes for the checkout-owner collector, which applies them within one collector cycle. The tool response says where the file lands; commit it with your change to publish. The same backchannel carries `bbox_gap_update` / `bbox_gap_resolve` and project-scoped knowledge writes (`bbox_learn` / `bbox_forget`).
+For a project the knowledge transport cutover covers, the daemon holds no checkout authority, so a project-scoped `bbox_gap` does not write the file directly: it validates, mints the id, dedupes against the served view, and enqueues the exact committed-file bytes for the checkout-owner collector, which applies them within one collector cycle. The tool response says where the file lands; commit it with your change to publish. The same backchannel carries `bbox_gap_update` / `bbox_gap_resolve` and project-scoped knowledge writes (`bbox_learn` / `bbox_forget`).
 - `scope="global"` → cross-project substrate gaps that aren't about the current repo land in the central host store.
 
 ## Advisory vocabularies

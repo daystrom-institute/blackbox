@@ -1,7 +1,7 @@
 ---
 title: "Code-source locality cutover: collected authority, no checkout fallback"
 kind: design
-lifecycle: partial
+lifecycle: archived
 corpus: blackbox-design
 topic:
   - daemon-runtime
@@ -13,12 +13,11 @@ brief: "Make a verified collected generation authoritative for selected Publishe
 
 # Code-source locality cutover
 
-> **Status: implemented and workspace test-verified as of 2026-08-09.** The
-> checked-in code contains the evidence store, offline cutover, startup and
-> reload fences, pre-broker refusal, collected transcript attribution, and
-> recovery tests. Applying a production marker remains an operator-authorized
-> ceremony. Bridge, uncovered, and `LegacyLocal` projects remain outside this
-> cutover.
+> **Status: archived.** No daemon loads the code-source locality marker or
+> records its evidence. Collected transcript attribution applies to every
+> collected project, and a daemon that holds no checkout declares
+> `daemon.no_checkout_authority` instead (see
+> [operations](../../docs/operations.md#checkout-authority)).
 
 ## 0. Outcome
 

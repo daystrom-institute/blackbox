@@ -300,7 +300,10 @@ project.
 Removing or changing an assignment starts an explicit local cutback. The last
 collected generation remains active until a complete local generation stages
 successfully. A failed cutback is reported as `cutback_pending`; it never
-silently falls back to partial local data.
+silently falls back to partial local data. A daemon declared without checkout
+authority (`daemon.no_checkout_authority`) never cuts back: the last collected
+generation stays active and the project records a structural
+`no_local_attachment` cutback state.
 
 Staleness also preserves the last good collected generation. Restore the
 producer and publish again, or perform a deliberate configuration cutback.

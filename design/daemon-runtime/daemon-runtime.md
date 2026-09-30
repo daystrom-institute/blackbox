@@ -25,7 +25,6 @@ all of that work.
 - [Health-probe starvation during code-source ingest](healthz-ingest-starvation.md)
 - [Locality-first decomposition: the checkout plane and the corpus plane](locality-first-decomposition.md)
 - [Distributed code-source collector implementation plan](distributed-code-source-collector-impl.md)
-- [Code-source locality cutover: collected authority, no checkout fallback](code-source-locality-cutover-impl.md)
 - [Durable corpus project catalog implementation plan](durable-project-catalog-impl.md)
 - [Durable project catalog Phase 1 implementation plan](durable-project-catalog-phase1-impl.md)
 - [Durable project catalog Phase 2 implementation plan](durable-project-catalog-phase2-impl.md)
@@ -36,3 +35,7 @@ all of that work.
 - [Slim v1 project catalog importer](slim-v1-importer.md)
 - [Typed Git-history transport implementation plan](git-history-provenance-transport-impl.md)
 - [Candidate acceptance: the configured ref is the only gate](publisher-auto-advance.md)
+
+## Archived
+
+- [Code-source locality cutover: collected authority, no checkout fallback](code-source-locality-cutover-impl.md) (archived)

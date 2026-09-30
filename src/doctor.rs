@@ -243,11 +243,6 @@ pub(crate) fn run(server: &crate::server::BlackboxServer) -> anyhow::Result<Doct
             observations,
         ));
     }
-    // Locality markers load only under catalog authority, so bridge reports
-    // omit the section rather than render a cutover that cannot exist.
-    if state.project_authority.catalog_store().is_some() {
-        sections.push(locality_cutovers_section(state));
-    }
     // Catalog-only project health (plan section 8, P5-G). Each section is
     // observational: it reports what the catalog, the accepted pointer, and
     // the runtime's published observations already say, and never counts an
@@ -285,7 +280,7 @@ pub(crate) fn section_names(state: &crate::server::state::SharedState) -> Vec<&'
         "checkout_access",
     ];
     if catalog {
-        names.extend(["knowledge_transport", "locality_cutovers"]);
+        names.push("knowledge_transport");
     }
     if catalog {
         names.extend([
@@ -333,7 +328,6 @@ pub(crate) fn run_section(
         "vectors" => vectors_section(state),
         "snapshots" => snapshots_section(state),
         "projects" => projects_section(state),
-        "locality_cutovers" => locality_cutovers_section(state),
         "accepted_publication"
         | "publisher_binding"
         | "overlay_baseline"
@@ -964,186 +958,6 @@ fn degraded_transport_finding<'a>(
             "covered knowledge transport recorded no degraded operation in the last 24h ({lifetime} lifetime, {latest_label})"
         ))
     })
-}
-
-/// One offline locality cutover's loaded authority, reduced to what the
-/// `locality_cutovers` section classifies.
-struct LocalityCutoverView<'a> {
-    label: &'static str,
-    command: &'static str,
-    /// What the runtime still enforces for a governed row whose live
-    /// authority no longer matches the marker.
-    drift_consequence: &'static str,
-    /// `(checksum_sha256, applied_at, catalog_epoch)` of the loaded marker.
-    marker: Option<(&'a str, &'a str, u64)>,
-    rows: Vec<(
-        &'a bbox_corpus_core::project_catalog::ProjectId,
-        &'a bbox_corpus_core::identity::PublishedScope,
-        &'a str,
-    )>,
-}
-
-/// Completion state of the offline code-source and render locality
-/// cutovers. Both markers are checksummed and validated before the listener
-/// binds, and an invalid marker refuses startup, so a running daemon holds
-/// either no marker (not run) or a validated one. Governed rows are
-/// classified against the in-memory catalog and producer assignments; a row
-/// whose live authority drifted keeps local fallback closed. The section
-/// reads only state the daemon already holds.
-fn locality_cutovers_section(state: &crate::server::state::SharedState) -> SectionReport {
-    let catalog = state
-        .project_authority
-        .catalog_store()
-        .ok_or_else(|| "catalog store unavailable".to_string())
-        .and_then(|store| store.snapshot().map_err(|error| format!("{error:#}")));
-    let assignments = state.code_sources.producer_auth().assignment_map();
-    let code = state.code_source_locality_cutover.as_ref();
-    let render = state.render_locality_cutover.as_ref();
-    let views = [
-        LocalityCutoverView {
-            label: "code-source locality",
-            command: "code-source-locality-cutover",
-            drift_consequence: "daemon startup verification refuses this row",
-            marker: code.marker_identity().map(|marker| {
-                (
-                    marker.checksum_sha256.as_str(),
-                    marker.applied_at.as_str(),
-                    marker.catalog_epoch,
-                )
-            }),
-            rows: code
-                .rows()
-                .map(|row| (&row.project_id, &row.scope, row.producer_id.as_str()))
-                .collect(),
-        },
-        LocalityCutoverView {
-            label: "render locality",
-            command: "render-locality-cutover",
-            drift_consequence: "unbound project renders stay refused",
-            marker: render.marker_identity().map(|marker| {
-                (
-                    marker.checksum_sha256.as_str(),
-                    marker.applied_at.as_str(),
-                    marker.catalog_epoch,
-                )
-            }),
-            rows: render
-                .rows()
-                .map(|row| (&row.project_id, &row.scope, row.producer_id.as_str()))
-                .collect(),
-        },
-    ];
-    let catalog = catalog.as_ref().map(|snapshot| snapshot.catalog().as_ref());
-    let mut findings = Vec::new();
-    for view in &views {
-        locality_cutover_findings(view, catalog, &assignments, &mut findings);
-    }
-    SectionReport {
-        section: "locality_cutovers",
-        findings,
-    }
-}
-
-fn locality_cutover_findings(
-    view: &LocalityCutoverView<'_>,
-    catalog: Result<&bbox_corpus_core::project_catalog::CatalogSnapshotV2, &String>,
-    assignments: &std::collections::BTreeMap<
-        bbox_corpus_core::identity::PublishedScope,
-        (String, String),
-    >,
-    findings: &mut Vec<Finding>,
-) {
-    use bbox_corpus_core::project_catalog::ProjectScope;
-
-    let label = view.label;
-    let published = |catalog: &bbox_corpus_core::project_catalog::CatalogSnapshotV2| {
-        catalog
-            .projects
-            .iter()
-            .filter(|(_, project)| matches!(project.scope, ProjectScope::Published(_)))
-            .map(|(project_id, _)| project_id.clone())
-            .collect::<Vec<_>>()
-    };
-    let Some((checksum, applied_at, catalog_epoch)) = view.marker else {
-        findings.push(Finding::info(match catalog {
-            Ok(catalog) => match published(catalog).len() {
-                0 => format!(
-                    "{label} cutover has not run: no marker is loaded and the catalog has no Published projects"
-                ),
-                count => format!(
-                    "{label} cutover has not run: no marker is loaded and all {count} Published project(s) remain uncovered"
-                ),
-            },
-            Err(error) => format!(
-                "{label} cutover has not run: no marker is loaded (Published project coverage unavailable: {error})"
-            ),
-        }));
-        return;
-    };
-    let catalog = match catalog {
-        Ok(catalog) => catalog,
-        Err(error) => {
-            findings.push(Finding::blocked(format!(
-                "{label} cutover marker {checksum} governs {} project(s), but live catalog classification failed: {error}",
-                view.rows.len()
-            )));
-            return;
-        }
-    };
-    let verify = format!(
-        "blackbox project-catalog {} --preflight --configured --report <report.json>",
-        view.command
-    );
-    let mut current = 0usize;
-    for (project_id, scope, producer_id) in &view.rows {
-        let Some(project) = catalog.projects.get(*project_id) else {
-            findings.push(Finding::info(format!(
-                "{label} cutover row for project {project_id} outlives its retired project and governs nothing"
-            )));
-            continue;
-        };
-        let drift = if project.scope != ProjectScope::Published((*scope).clone()) {
-            Some("its Published scope changed")
-        } else {
-            match assignments.get(*scope) {
-                None => Some("no producer is assigned to its scope"),
-                Some((assigned_project, assigned_producer))
-                    if assigned_project != project_id.as_str()
-                        || assigned_producer.as_str() != *producer_id =>
-                {
-                    Some("its producer assignment changed")
-                }
-                Some(_) => None,
-            }
-        };
-        match drift {
-            Some(drift) => findings.push(Finding::action(
-                format!(
-                    "project {project_id} is {label} governed, but {drift} after the cutover; local fallback stays closed and {}",
-                    view.drift_consequence
-                ),
-                verify.clone(),
-            )),
-            None => current += 1,
-        }
-    }
-    let covered = view
-        .rows
-        .iter()
-        .map(|(project_id, _, _)| *project_id)
-        .collect::<std::collections::BTreeSet<_>>();
-    for project_id in published(catalog)
-        .iter()
-        .filter(|project_id| !covered.contains(project_id))
-    {
-        findings.push(Finding::info(format!(
-            "Published project {project_id} is not covered by the {label} cutover"
-        )));
-    }
-    findings.push(Finding::ok(format!(
-        "{label} cutover completed: marker {checksum} applied {applied_at} at catalog epoch {catalog_epoch} governs {} project(s), {current} current",
-        view.rows.len()
-    )));
 }
 
 /// Git-history activations the background lane dead-lettered because the
@@ -3260,335 +3074,77 @@ mod catalog_health_tests {
     const OTHER_PROJECT: &str = "p_health_other";
     const PRODUCER: &str = "producer-health";
 
-    /// A catalog server whose locality runtimes govern `governed` and whose
-    /// producer table assigns `assigned` scopes to `PRODUCER`.
-    fn locality_server(
+    /// A catalog server whose producer table assigns `assigned` scopes to
+    /// `PRODUCER`.
+    fn assigned_server(
         fixture: &CatalogFixture,
-        governed: &[(&str, bbox_corpus_core::identity::PublishedScope)],
         assigned: &[(&str, bbox_corpus_core::identity::PublishedScope)],
     ) -> crate::server::BlackboxServer {
         use crate::server::producer_auth::{ProducerAuthRuntime, ProducerGrant};
-        use bbox_indexing::code_source_locality_cutover::CodeSourceLocalityCutoverRuntimeV1;
-        use bbox_indexing::render_locality_cutover::RenderLocalityCutoverRuntimeV1;
 
-        let mut state = crate::server::state::SharedState::for_test_catalog(
+        let state = crate::server::state::SharedState::for_test_catalog(
             fixture.root(),
             &fixture.root().join("catalog").join("projects.json"),
         );
-        if !governed.is_empty() {
-            let rows = governed
-                .iter()
-                .map(|(project_id, scope)| (*project_id, scope.clone(), PRODUCER))
-                .collect::<Vec<_>>();
-            state.code_source_locality_cutover = std::sync::Arc::new(
-                CodeSourceLocalityCutoverRuntimeV1::governed_rows_for_test(&rows),
-            );
-            state.render_locality_cutover = std::sync::Arc::new(
-                RenderLocalityCutoverRuntimeV1::governed_rows_for_test(&rows),
-            );
-        }
-        if !assigned.is_empty() {
-            let token = bro_rpc::ServiceToken::parse("f".repeat(64)).unwrap();
-            state
-                .code_sources
-                .install_auth_for_test(std::sync::Arc::new(ProducerAuthRuntime::for_test(
-                    true,
-                    false,
-                    vec![(
-                        token,
-                        ProducerGrant {
-                            producer_id: PRODUCER.into(),
-                            projects: assigned
-                                .iter()
-                                .map(|(project_id, scope)| (scope.clone(), project_id.to_string()))
-                                .collect(),
-                        },
-                    )],
-                )));
-        }
+        let token = bro_rpc::ServiceToken::parse("f".repeat(64)).unwrap();
+        state
+            .code_sources
+            .install_auth_for_test(std::sync::Arc::new(ProducerAuthRuntime::for_test(
+                true,
+                false,
+                vec![(
+                    token,
+                    ProducerGrant {
+                        producer_id: PRODUCER.into(),
+                        projects: assigned
+                            .iter()
+                            .map(|(project_id, scope)| (scope.clone(), project_id.to_string()))
+                            .collect(),
+                    },
+                )],
+            )));
         crate::server::BlackboxServer::new(std::sync::Arc::new(state))
     }
 
-    fn locality_findings(report: &DoctorReport) -> Vec<(FindingLevel, String, Option<String>)> {
-        section(report, "locality_cutovers")
-            .findings
-            .iter()
-            .map(|finding| (finding.level, finding.message.clone(), finding.next.clone()))
-            .collect()
-    }
-
-    /// A catalog that never ran either cutover and holds no Published
-    /// project reports both as not run; bridge mode omits and refuses the
-    /// section because no locality marker can load there.
+    /// The locality cutovers are retired: neither a catalog daemon (with
+    /// legacy marker files still in its state root) nor a bridge daemon
+    /// reports a locality section, and asking for one is refused.
     #[test]
-    fn locality_cutovers_absent_on_a_never_provisioned_catalog_and_in_bridge_mode() {
+    fn doctor_has_no_locality_section() {
         crate::init_system_memory_for_tests();
         let fixture = CatalogFixture::new();
-        let server = fixture.server();
-        assert!(section_names(&server.state).contains(&"locality_cutovers"));
-        let report = run(&server).unwrap();
-        assert_eq!(
-            locality_findings(&report),
-            vec![
-                (
-                    FindingLevel::Info,
-                    "code-source locality cutover has not run: no marker is loaded and the catalog has no Published projects".to_string(),
-                    None,
-                ),
-                (
-                    FindingLevel::Info,
-                    "render locality cutover has not run: no marker is loaded and the catalog has no Published projects".to_string(),
-                    None,
-                ),
-            ]
-        );
-        let focused = run_section(&server, "locality_cutovers").unwrap();
-        assert_eq!(focused.sections.len(), 1);
-        assert_eq!(locality_findings(&focused), locality_findings(&report));
+        fixture.add_published_project(PROJECT, &CatalogFixture::scope("."));
+        for name in [
+            "render-locality-cutover-marker.json",
+            "code-source-locality-cutover-marker.json",
+        ] {
+            std::fs::write(fixture.root().join(name), b"{ not json").unwrap();
+        }
+        let catalog = fixture.server();
 
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
         let bridge = crate::server::BlackboxServer::new(std::sync::Arc::new(
             crate::server::state::SharedState::for_test(&root),
         ));
-        assert!(
-            run(&bridge)
-                .unwrap()
-                .sections
-                .iter()
-                .all(|section| section.section != "locality_cutovers")
-        );
-        let refused = run_section(&bridge, "locality_cutovers").unwrap_err();
-        assert!(refused.to_string().contains("Unknown section"), "{refused}");
-    }
-
-    #[test]
-    fn locality_cutovers_not_run_counts_uncovered_published_projects() {
-        crate::init_system_memory_for_tests();
-        let fixture = CatalogFixture::new();
-        fixture.add_published_project(PROJECT, &CatalogFixture::scope("."));
-        fixture.add_published_project(OTHER_PROJECT, &CatalogFixture::scope("other"));
-        let report = run(&fixture.server()).unwrap();
-        let findings = locality_findings(&report);
-        assert_eq!(findings.len(), 2, "{findings:?}");
-        for (label, finding) in ["code-source locality", "render locality"]
-            .iter()
-            .zip(&findings)
-        {
-            assert_eq!(finding.0, FindingLevel::Info);
-            assert_eq!(
-                finding.1,
-                format!(
-                    "{label} cutover has not run: no marker is loaded and all 2 Published project(s) remain uncovered"
-                )
+        for server in [&catalog, &bridge] {
+            assert!(
+                !section_names(&server.state)
+                    .iter()
+                    .any(|name| name.contains("locality")),
+                "{:?}",
+                section_names(&server.state)
             );
+            let report = run(server).unwrap();
+            assert!(
+                report
+                    .sections
+                    .iter()
+                    .all(|section| !section.section.contains("locality"))
+            );
+            let refused = run_section(server, "locality_cutovers").unwrap_err();
+            assert!(refused.to_string().contains("Unknown section"), "{refused}");
         }
-        assert_eq!(
-            section(&report, "locality_cutovers").worst(),
-            FindingLevel::Info
-        );
-    }
-
-    /// Completed markers report their receipt identity and covered count,
-    /// and name each Published project the cut left uncovered.
-    #[test]
-    fn locality_cutovers_completed_reports_marker_identity_and_uncovered_projects() {
-        crate::init_system_memory_for_tests();
-        let fixture = CatalogFixture::new();
-        let scope = CatalogFixture::scope(".");
-        fixture.add_published_project(PROJECT, &scope);
-        fixture.add_published_project(OTHER_PROJECT, &CatalogFixture::scope("other"));
-        let server = locality_server(
-            &fixture,
-            &[(PROJECT, scope.clone())],
-            &[(PROJECT, scope.clone())],
-        );
-        let code_checksum = server
-            .state
-            .code_source_locality_cutover
-            .marker_identity()
-            .unwrap()
-            .checksum_sha256
-            .clone();
-        let render_checksum = server
-            .state
-            .render_locality_cutover
-            .marker_identity()
-            .unwrap()
-            .checksum_sha256
-            .clone();
-
-        let report = run(&server).unwrap();
-        assert_eq!(
-            locality_findings(&report),
-            vec![
-                (
-                    FindingLevel::Info,
-                    format!(
-                        "Published project {OTHER_PROJECT} is not covered by the code-source locality cutover"
-                    ),
-                    None,
-                ),
-                (
-                    FindingLevel::Ok,
-                    format!(
-                        "code-source locality cutover completed: marker {code_checksum} applied 2026-01-01T00:00:00Z at catalog epoch 1 governs 1 project(s), 1 current"
-                    ),
-                    None,
-                ),
-                (
-                    FindingLevel::Info,
-                    format!(
-                        "Published project {OTHER_PROJECT} is not covered by the render locality cutover"
-                    ),
-                    None,
-                ),
-                (
-                    FindingLevel::Ok,
-                    format!(
-                        "render locality cutover completed: marker {render_checksum} applied 2026-01-01T00:00:00Z at catalog epoch 1 governs 1 project(s), 1 current"
-                    ),
-                    None,
-                ),
-            ]
-        );
-        assert_eq!(
-            section(&report, "locality_cutovers").worst(),
-            FindingLevel::Info
-        );
-
-        // Every Published project covered: the section is healthy.
-        let covered = locality_server(
-            &fixture,
-            &[
-                (PROJECT, scope.clone()),
-                (OTHER_PROJECT, CatalogFixture::scope("other")),
-            ],
-            &[
-                (PROJECT, scope.clone()),
-                (OTHER_PROJECT, CatalogFixture::scope("other")),
-            ],
-        );
-        let report = run(&covered).unwrap();
-        assert_eq!(
-            section(&report, "locality_cutovers").worst(),
-            FindingLevel::Ok
-        );
-        assert!(messages(&report, "locality_cutovers").contains("governs 2 project(s), 2 current"));
-    }
-
-    /// Loaded rows that no longer verify against live authority: a migrated
-    /// scope, a missing producer assignment, and a retired project.
-    #[test]
-    fn locality_cutovers_report_rows_that_no_longer_verify() {
-        crate::init_system_memory_for_tests();
-        let fixture = CatalogFixture::new();
-        let scope = CatalogFixture::scope(".");
-        let other_scope = CatalogFixture::scope("other");
-        fixture.add_published_project(PROJECT, &scope);
-        fixture.add_published_project(OTHER_PROJECT, &other_scope);
-        fixture.migrate_project_scope(PROJECT, &CatalogFixture::scope("moved"));
-        let server = locality_server(
-            &fixture,
-            &[
-                (PROJECT, scope.clone()),
-                (OTHER_PROJECT, other_scope.clone()),
-                ("p_health_retired", CatalogFixture::scope("retired")),
-            ],
-            &[(PROJECT, scope.clone())],
-        );
-
-        let report = run(&server).unwrap();
-        let findings = locality_findings(&report);
-        let expect = |label: &str, command: &str, consequence: &str| {
-            let verify = Some(format!(
-                "blackbox project-catalog {command} --preflight --configured --report <report.json>"
-            ));
-            vec![
-                (
-                    FindingLevel::Action,
-                    format!(
-                        "project {PROJECT} is {label} governed, but its Published scope changed after the cutover; local fallback stays closed and {consequence}"
-                    ),
-                    verify.clone(),
-                ),
-                (
-                    FindingLevel::Action,
-                    format!(
-                        "project {OTHER_PROJECT} is {label} governed, but no producer is assigned to its scope after the cutover; local fallback stays closed and {consequence}"
-                    ),
-                    verify,
-                ),
-                (
-                    FindingLevel::Info,
-                    format!(
-                        "{label} cutover row for project p_health_retired outlives its retired project and governs nothing"
-                    ),
-                    None,
-                ),
-            ]
-        };
-        let mut expected = expect(
-            "code-source locality",
-            "code-source-locality-cutover",
-            "daemon startup verification refuses this row",
-        );
-        expected.push((
-            FindingLevel::Ok,
-            format!(
-                "code-source locality cutover completed: marker {} applied 2026-01-01T00:00:00Z at catalog epoch 1 governs 3 project(s), 0 current",
-                server.state.code_source_locality_cutover.marker_identity().unwrap().checksum_sha256
-            ),
-            None,
-        ));
-        expected.extend(expect(
-            "render locality",
-            "render-locality-cutover",
-            "unbound project renders stay refused",
-        ));
-        expected.push((
-            FindingLevel::Ok,
-            format!(
-                "render locality cutover completed: marker {} applied 2026-01-01T00:00:00Z at catalog epoch 1 governs 3 project(s), 0 current",
-                server.state.render_locality_cutover.marker_identity().unwrap().checksum_sha256
-            ),
-            None,
-        ));
-        assert_eq!(findings, expected);
-        assert_eq!(
-            section(&report, "locality_cutovers").worst(),
-            FindingLevel::Action
-        );
-    }
-
-    /// A drifted producer assignment is distinct from a removed one.
-    #[test]
-    fn locality_cutovers_report_producer_assignment_drift() {
-        crate::init_system_memory_for_tests();
-        let fixture = CatalogFixture::new();
-        let scope = CatalogFixture::scope(".");
-        fixture.add_published_project(PROJECT, &scope);
-        fixture.add_published_project(OTHER_PROJECT, &CatalogFixture::scope("other"));
-        // The governed scope is now granted to a different project.
-        let server = locality_server(
-            &fixture,
-            &[(PROJECT, scope.clone())],
-            &[(OTHER_PROJECT, scope.clone())],
-        );
-        let report = run(&server).unwrap();
-        let text = messages(&report, "locality_cutovers");
-        assert!(
-            text.contains(&format!(
-                "project {PROJECT} is code-source locality governed, but its producer assignment changed after the cutover"
-            )),
-            "{text}"
-        );
-        assert!(
-            text.contains(&format!(
-                "project {PROJECT} is render locality governed, but its producer assignment changed after the cutover"
-            )),
-            "{text}"
-        );
     }
 
     /// Only a project with neither an attached checkout nor a code-source
@@ -3599,11 +3155,7 @@ mod catalog_health_tests {
         let fixture = CatalogFixture::new();
         fixture.add_published_project(PROJECT, &CatalogFixture::scope("."));
         fixture.add_published_project(OTHER_PROJECT, &CatalogFixture::scope("other"));
-        let server = locality_server(
-            &fixture,
-            &[],
-            &[(OTHER_PROJECT, CatalogFixture::scope("other"))],
-        );
+        let server = assigned_server(&fixture, &[(OTHER_PROJECT, CatalogFixture::scope("other"))]);
         let without_lane = projects_without_code_source_lane(&server.state);
         assert!(without_lane.contains(PROJECT), "{without_lane:?}");
         assert!(!without_lane.contains(OTHER_PROJECT), "{without_lane:?}");

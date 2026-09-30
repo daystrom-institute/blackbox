@@ -389,17 +389,14 @@ impl BlackboxServer {
         &self,
         record: &RenderOperationRecord,
         request: &OwnerPlanRequest<'_>,
-    ) -> Result<(RenderCompletionValidation, Option<ProjectRenderPlanV1>)> {
+    ) -> Result<RenderCompletionValidation> {
         let owner = match self.render_owner_for(&record.project_id)? {
             RenderOwnerSelection::Owner(owner) if owner.producer_id == record.producer_id => owner,
             _ => {
-                return Ok((
-                    RenderCompletionValidation::Stale {
-                        reason: "the checkout owner's authority changed after the plan was issued"
-                            .into(),
-                    },
-                    None,
-                ));
+                return Ok(RenderCompletionValidation::Stale {
+                    reason: "the checkout owner's authority changed after the plan was issued"
+                        .into(),
+                });
             }
         };
         let authority = ProjectRenderProducerAuthorityV1 {
@@ -410,15 +407,11 @@ impl BlackboxServer {
         };
         let (plan, _) = self.owner_render_plan(&owner, request, authority)?;
         if plan.transport_sha256()? != record.plan_sha256 {
-            return Ok((
-                RenderCompletionValidation::Stale {
-                    reason: "project knowledge or visibility changed after the plan was issued"
-                        .into(),
-                },
-                None,
-            ));
+            return Ok(RenderCompletionValidation::Stale {
+                reason: "project knowledge or visibility changed after the plan was issued".into(),
+            });
         }
-        Ok((RenderCompletionValidation::Current, Some(plan)))
+        Ok(RenderCompletionValidation::Current)
     }
 
     fn owner_render_response(
@@ -491,33 +484,8 @@ impl BlackboxServer {
                     RenderCompletionValidation::Unverified
                     | RenderCompletionValidation::Current => {
                         match self.revalidate_owner_completion(record, request) {
-                            Ok((checked, current_plan)) => {
+                            Ok(checked) => {
                                 if *validation == RenderCompletionValidation::Unverified {
-                                    // The current plan is byte-identical to
-                                    // the one the owner applied, so it
-                                    // proves the receipt. Only the newest
-                                    // render of the checkout scope, by any
-                                    // applier, is evidence, checked while no
-                                    // newer render can be issued or complete.
-                                    if let Some(plan) = current_plan
-                                        && !*late
-                                    {
-                                        runtime.while_newest_render(
-                                            &record.project_id,
-                                            &record.scope,
-                                            record.sequence,
-                                            record.issued_at_ms,
-                                            || {
-                                                self.state
-                                                    .render_locality_observations
-                                                    .record_completed(
-                                                        &plan,
-                                                        receipt,
-                                                        record.issued_at_ms,
-                                                    )
-                                            },
-                                        )?;
-                                    }
                                     runtime
                                         .set_validation(&record.operation_id, checked.clone())?;
                                     (checked.clone(), Some(checked))

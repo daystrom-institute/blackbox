@@ -97,12 +97,14 @@ lists them explicitly:
 | Store | Class | Reason |
 |---|---|---|
 | `B/checkout-registry.json` | keep | discovery index, opened in both modes |
-| `B/checkout-access-observations.json`, `knowledge-transport-observations.json`, `render-locality-observations.json`, `render-operations/` | keep | opened in both modes; observation state, not identity |
+| `B/checkout-access-observations.json`, `knowledge-transport-observations.json`, `render-operations/` | keep | opened in both modes; observation state, not identity |
+| `B/render-locality-observations.json` | archive | retired locality cutover evidence; no current binary opens it |
 | `B/resolver-compat-observations.json` | archive | written by earlier bridge boots; no current binary opens it |
 | `S/code-sources/` | archive | bridge activations are keyed by v1 id with no catalog binding; catalog mode re-creates the directory and re-collects from attached checkouts (UNVERIFIED: catalog-mode open accepts a `LegacyLocal` project with no activation; `add --legacy-local` projects imply it does) |
 | `publisher-refs.json` (in `S` or `B`; the runtime reads one and reindex writes the other) | archive | pins bind published scopes; every imported project is `LegacyLocal`, and publication re-pins after `promote` |
 | `accepted-publications/` | archive | same reason |
 | cutover markers and receipts (`*-cutover-marker.json`) | archive | cannot be produced without a catalog; a stray one is leftover state from a removed catalog |
+| `S/render-locality-cutover-*`, `S/code-source-locality-cutover-*`, `S/blame-locality-cutover-*`, `S/code-source-locality-observations.json` | archive | retired locality cutover markers, receipts and evidence; no current binary reads them, and daemon startup moves them into `S/cutover-artifacts/retired-locality-<timestamp>/` |
 | `aliases` field inside v1 `projects.json` records | converted | carried into `operator_aliases` |
 | `.bbox/local/checkout-id` markers inside checkouts | reused | an existing marker id is reused for the attachment rather than minted again |
 

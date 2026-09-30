@@ -30,8 +30,7 @@
 //!   record. Nothing here rewrites the manifest for this shape.
 //! - Crash between 3 and 4: journal and manifest agree on N, but N is not
 //!   `Active`. That is the completed activation whose state flip was lost, and
-//!   `code_source_locality_cutover` already tolerates it on exactly that
-//!   agreement.
+//!   the relationship chain accepts it on exactly that agreement.
 //!
 //! Because the state flip is written LAST, an `Active` generation is proof
 //! that its manifest write was issued and returned. An `Active` generation
@@ -53,14 +52,14 @@
 //! Every interleaving therefore has a defined outcome, and none of them is a
 //! crash loop.
 //!
-//! # Three readers, two stores
+//! # Two readers, two stores
 //!
 //! The relationship chain (`validate_relationship_chain`, link 5) is NOT a
-//! third store. It is a third READER that re-derives the same journal-versus-
-//! manifest comparison independently, alongside this module's boot evidence
-//! loop and the locality cutover's live re-verification. All three compare the
-//! same two durable owners, so a tear presents to all three, and a tolerance
-//! rule taught to only one of them just moves the crash loop downstream.
+//! third store. It is a second READER that re-derives the same journal-versus-
+//! manifest comparison independently of this module's classification. Both
+//! compare the same two durable owners, so a tear presents to both, and a
+//! tolerance rule taught to only one of them just moves the crash loop
+//! downstream.
 //!
 //! That makes ORDER a correctness property of the boot sequence, not a
 //! detail. `reconcile_workspace_manifests_from_activations` runs in the

@@ -1209,10 +1209,6 @@ impl BlackboxServer {
             .state
             .knowledge_transport_cutover
             .covers_project_str(project_id)
-            || self
-                .state
-                .code_source_locality_cutover
-                .transport_governed(project_id)
         {
             anyhow::bail!(
                 "error.project_admin_locality_required: {operation} requires checkout-owner evidence that this MCP operation cannot obtain for a transport-owned project. No catalog or checkout changes were made. Use bbox_project_catalog_get to inspect identity and attachments. Collector onboarding supports source enrollment; it does not implement relocation, attached scope migration, or central knowledge ejection."

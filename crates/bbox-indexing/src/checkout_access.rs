@@ -381,7 +381,6 @@ pub enum CheckoutAccessErrorCode {
     WriteIntentRequired,
     LifecycleBusy,
     KnowledgeTransportAuthoritative,
-    CodeSourceTransportAuthoritative,
     NoCheckoutAuthority,
     DeniedByTestProbe,
     ObservationUnavailable,
@@ -405,7 +404,6 @@ impl CheckoutAccessErrorCode {
             Self::WriteIntentRequired => "write_intent_required",
             Self::LifecycleBusy => "lifecycle_busy",
             Self::KnowledgeTransportAuthoritative => "knowledge_transport_authoritative",
-            Self::CodeSourceTransportAuthoritative => "code_source_transport_authoritative",
             Self::NoCheckoutAuthority => "no_checkout_authority",
             Self::DeniedByTestProbe => "denied_by_test_probe",
             Self::ObservationUnavailable => "observation_unavailable",
@@ -2060,8 +2058,8 @@ mod tests {
         ) -> std::result::Result<(), CheckoutAccessError> {
             if request.kind == CheckoutAccessKind::LocalProjectWalk {
                 return Err(CheckoutAccessError::new(
-                    CheckoutAccessErrorCode::CodeSourceTransportAuthoritative,
-                    "strict code-source transport owns this project",
+                    CheckoutAccessErrorCode::CapabilityDenied,
+                    "a second policy refuses this kind",
                 ));
             }
             Ok(())
@@ -2748,7 +2746,7 @@ mod tests {
     }
 
     #[test]
-    fn policy_chain_installs_once_and_enforces_both_transport_cutovers() {
+    fn policy_chain_installs_once_and_enforces_every_policy() {
         let broker = CheckoutAccessBroker::new(
             Arc::new(DenyCheckoutAccess),
             CheckoutAccessObservations::in_memory(),
@@ -2775,10 +2773,7 @@ mod tests {
                 CheckoutAccessIntent::Read,
             ))
             .unwrap_err();
-        assert_eq!(
-            code.code,
-            CheckoutAccessErrorCode::CodeSourceTransportAuthoritative
-        );
+        assert_eq!(code.code, CheckoutAccessErrorCode::CapabilityDenied);
 
         let health = broker.health();
         assert_eq!(health.sequence, 0);

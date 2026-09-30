@@ -13,7 +13,7 @@ use bbox_corpus_core::identity::PublishedScope;
 use bbox_project_render::execute::execute_project_render_plan_as;
 use bbox_project_render::transport::{
     ExpectedRenderAuthority, PROJECT_RENDER_TRANSPORT_VERSION, ProjectRenderDispositionV1,
-    ProjectRenderPlanAssemblerV1, ProjectRenderReceiptV1, ProjectRenderViewV1,
+    ProjectRenderPlanAssemblerV1, ProjectRenderReceiptV1,
 };
 use bbox_project_render::wire::{
     RENDER_LANE_SCHEMA_VERSION, RenderLanePollRequestV1, RenderOperationDeliveryV1,
@@ -89,11 +89,10 @@ impl OwnerFixture {
         &self.roots[scope]
     }
 
-    /// A server whose producer grant maps both scopes to the owner. The
-    /// covered project is under the render cutover marker; neither has a
-    /// daemon checkout.
+    /// A server whose producer grant maps both scopes to the owner; neither
+    /// project has a daemon checkout.
     fn server(&self) -> BlackboxServer {
-        let server = self.fixture.server_with_render_locality_cutover(COVERED);
+        let server = self.fixture.server();
         self.install_grant(&server, PRODUCER, true);
         server
     }
@@ -319,14 +318,6 @@ async fn unbound_callers_render_covered_and_uncovered_remote_projects_through_th
         }
     }
     assert_eq!(leases(&server), 0, "no daemon checkout was opened");
-    let observations = server.state.render_locality_observations.snapshot();
-    assert_eq!(observations.completions.len(), 2);
-    assert!(
-        observations
-            .completions
-            .iter()
-            .all(|completion| completion.view == ProjectRenderViewV1::Published)
-    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -535,8 +526,8 @@ async fn owner_failures_refuse_with_setup_and_never_open_a_daemon_checkout() {
     let (uncovered, covered) = scopes();
 
     // No grant covers either project: the refusal names the setup, never a
-    // session type, and the governed project never reaches a lease.
-    let unowned = owner.fixture.server_with_render_locality_cutover(COVERED);
+    // session type, and no daemon checkout is opened.
+    let unowned = owner.fixture.server();
     for project in [UNCOVERED, COVERED] {
         let result = unowned
             .bbox_render(Parameters(project_params(project)))
@@ -723,15 +714,6 @@ async fn knowledge_changed_before_completion_is_reported_stale_not_converged() {
     );
     assert_eq!(recovered["status"], "render_stale");
     assert_eq!(recovered["current"], false);
-    assert!(
-        changed
-            .state
-            .render_locality_observations
-            .snapshot()
-            .completions
-            .is_empty(),
-        "a stale completion is never recorded as convergence"
-    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -805,14 +787,6 @@ async fn an_incomplete_all_written_receipt_is_never_completion_evidence() {
             .await,
     );
     assert_eq!(recovered["status"], "render_partial");
-    assert!(
-        server
-            .state
-            .render_locality_observations
-            .snapshot()
-            .completions
-            .is_empty()
-    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -871,10 +845,9 @@ async fn recovery_rechecks_present_validity_of_a_validated_receipt() {
 }
 
 /// Operation A completes but is not validated until after a newer operation
-/// B records its evidence. Validating A later must not replace B's evidence
-/// with A's historical counters.
+/// B completes. Validating A later reports it as historical, never current.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_delayed_validation_of_an_older_operation_never_replaces_newer_evidence() {
+async fn a_delayed_validation_of_an_older_operation_is_historical() {
     let owner = OwnerFixture::new();
     let (scope, _) = scopes();
     let server = owner.server();
@@ -890,18 +863,9 @@ async fn a_delayed_validation_of_an_older_operation_never_replaces_newer_evidenc
     );
     let first = pending["operation_id"].as_str().unwrap().to_string();
     apply_one(&server, &owner.roots, |_| {}).unwrap();
-    assert!(
-        server
-            .state
-            .render_locality_observations
-            .snapshot()
-            .completions
-            .is_empty(),
-        "A has completed but has not been validated yet"
-    );
 
     // The owner makes one provider file handwritten; B renders the same
-    // knowledge and records that refusal.
+    // knowledge and refuses that file.
     std::fs::write(owner.root(&scope).join("AGENTS.md"), "hand-authored\n").unwrap();
     server
         .state
@@ -909,9 +873,6 @@ async fn a_delayed_validation_of_an_older_operation_never_replaces_newer_evidenc
         .set_wait_timeout_for_test(Duration::from_secs(10));
     let newer = render_with_owner(&server, &owner, project_params(UNCOVERED)).await;
     assert_eq!(newer["current"], true);
-    let evidence = server.state.render_locality_observations.snapshot();
-    assert_eq!(evidence.completions.len(), 1);
-    assert_eq!(evidence.completions[0].refused_count, 1);
 
     let recovered = parse(
         &server
@@ -923,11 +884,6 @@ async fn a_delayed_validation_of_an_older_operation_never_replaces_newer_evidenc
             .await,
     );
     assert_eq!(recovered["current"], false);
-    assert_eq!(
-        server.state.render_locality_observations.snapshot(),
-        evidence,
-        "historical completion never replaces newer evidence"
-    );
 }
 
 /// Supersession stops delivery; it says nothing about what an owner already
@@ -1179,18 +1135,9 @@ async fn an_incomplete_newer_harness_render_keeps_an_owner_receipt_out_of_eviden
         receipt.incomplete = true;
     })
     .await;
-    assert_eq!(completed["evidence_recorded"], false);
+    assert_eq!(completed["status"], "render_locality_complete");
 
     let recovered = recover(&server, &first).await;
     assert_eq!(recovered["status"], "render_complete");
     assert_eq!(recovered["current"], false, "{recovered}");
-    assert!(
-        server
-            .state
-            .render_locality_observations
-            .snapshot()
-            .completions
-            .is_empty(),
-        "a receipt made historical by a newer render is never evidence"
-    );
 }

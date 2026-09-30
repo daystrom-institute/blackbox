@@ -293,14 +293,24 @@ Removed:
   catalog carrier paired-read findings that section also carried report in
   the `projects` section. A `resolver-compat-observations.json` left in the
   daemon state directory is inert.
+- **Code-source locality and render locality cutovers**: their offline
+  ceremonies, marker runtimes, startup and reload assignment fences, the
+  code-source relocation and scope-migration refusal over MCP, the
+  code-source startup and full-rebuild evidence, the persisted render
+  completion evidence, and the doctor `locality_cutovers` section. Projects
+  follow normal ownership: a render goes to the checkout owner first, and a
+  checkout-backed fallback happens only on a daemon with checkout authority
+  (`daemon.no_checkout_authority` unset). Every collected project gets
+  lexical transcript attribution. The first start archives the render,
+  code-source and blame locality markers, any receipt beside them, and both
+  evidence stores into `cutover-artifacts/retired-locality-<timestamp>/`
+  under the state directory; nothing reads them.
 
 Kept, each with the condition that gates its removal:
 
 - **Git transport cutover**: a Published repo covered by the cutover.
 - **Knowledge transport cutover** and its legacy compatibility lane: a
   verify with no stale rows and every project covered.
-- **Code-source locality and render locality cutovers**: a completion
-  verify on every live deployment; read-only inspection cannot confirm it.
 - **`bridge_parity.rs`**: bridge mode stops being the fresh-state path.
 - **Migration inventories** in the edge sidecar, corpus index and vectors:
   genesis, backfill and retirement read them.

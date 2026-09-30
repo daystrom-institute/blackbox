@@ -163,12 +163,12 @@ impl BlackboxServer {
                     // The issuance rides outside the plan bytes so the plan
                     // digest stays stable; the harness passes it to the
                     // checkout freshness fence and echoes it on completion,
-                    // where it orders the completion evidence.
+                    // where it orders the completed render.
                     if offset == 0 {
                         let issued_at_ms = bbox_project_render::execute::issue_render_ms();
                         server
                             .state
-                            .render_locality_observations
+                            .render_issuances
                             .note_workspace_issuance(&chunk.plan_sha256, issued_at_ms);
                         chunk.issued_at_ms = Some(issued_at_ms);
                     }
@@ -189,22 +189,14 @@ impl BlackboxServer {
                         );
                     }
                     receipt.validate_against(&current)?;
-                    // Evidence is ordered by the plan's issuance. A
-                    // completion whose issuance this daemon cannot confirm
-                    // (absent, unknown, or from before a restart) is
-                    // accepted but never recorded, so a delayed older
-                    // completion cannot replace a newer render's evidence.
-                    // An incomplete receipt is never recorded either.
-                    let observations = &server.state.render_locality_observations;
+                    // A completion is ordered by the plan's issuance only
+                    // when this daemon confirms it issued that plan; an
+                    // absent, unknown, or pre-restart issuance is accepted
+                    // and ordered after every issued render.
+                    let issuances = &server.state.render_issuances;
                     let confirmed = issued_at_ms.filter(|issued_at_ms| {
-                        observations.issued_workspace_plan(&plan_sha256, *issued_at_ms)
+                        issuances.issued_workspace_plan(&plan_sha256, *issued_at_ms)
                     });
-                    let recorded = match confirmed {
-                        Some(issued_at_ms) => {
-                            observations.record_completed(&current, &receipt, issued_at_ms)?
-                        }
-                        None => None,
-                    };
                     // A render that may have written makes older owner
                     // receipts of this checkout scope historical. Without a
                     // confirmed issuance it is ordered after every issued
@@ -218,7 +210,6 @@ impl BlackboxServer {
                     }
                     return Ok(serde_json::to_string_pretty(&serde_json::json!({
                         "status": "render_locality_complete",
-                        "evidence_recorded": recorded.is_some(),
                         "diagnostics": current.diagnostics,
                     }))?);
                 }
@@ -247,7 +238,7 @@ impl BlackboxServer {
                     // The checkout owner applies the project half whenever
                     // one covers the project. A daemon checkout lease is
                     // only the compatibility lane for a project no owner
-                    // covers, and never for one the cutover governs.
+                    // covers.
                     match server.render_owner_for(&project_id)? {
                         crate::server::render_owner::RenderOwnerSelection::Owner(owner) => {
                             return server.owner_project_render(&p, owner, &handle);
@@ -257,15 +248,9 @@ impl BlackboxServer {
                         }
                         crate::server::render_owner::RenderOwnerSelection::None => {}
                     }
-                    // With no owner, the daemon's own render write lease is
-                    // the compatibility lane, and a daemon without checkout
-                    // authority never takes it.
-                    if !server.state.checkout_access.holds_checkout_authority()
-                        || server
-                            .state
-                            .render_locality_cutover
-                            .transport_governed(&project_id)
-                    {
+                    // A daemon without checkout authority never takes that
+                    // lease.
+                    if !server.state.checkout_access.holds_checkout_authority() {
                         anyhow::bail!(crate::server::render_owner::owner_required_message(
                             &project_id,
                             None,
@@ -1111,27 +1096,6 @@ mod catalog_render_tests {
     }
 
     #[tokio::test]
-    async fn covered_project_render_refuses_before_daemon_checkout_access() {
-        let fixture = CatalogFixture::new();
-        fixture.add_published_project(PROJECT, &CatalogFixture::scope("."));
-        let server = fixture.server_with_render_locality_cutover(PROJECT);
-        let before = server.state.checkout_access.health().sequence;
-
-        let result = server
-            .bbox_render(Parameters(RenderParams {
-                project: Some(PROJECT.into()),
-                scope: Some("project".into()),
-                provisional: Some("published".into()),
-                ..Default::default()
-            }))
-            .await;
-
-        assert!(is_error(&result), "{}", text(&result));
-        assert!(text(&result).contains("error.render_locality_required"));
-        assert_eq!(server.state.checkout_access.health().sequence, before);
-    }
-
-    #[tokio::test]
     async fn bound_project_render_plan_and_completion_open_no_daemon_checkout() {
         let fixture = CatalogFixture::new();
         let scope = CatalogFixture::scope(".");
@@ -1226,13 +1190,9 @@ mod catalog_render_tests {
             .await;
         assert!(!is_error(&completed), "{}", text(&completed));
         assert_eq!(server.state.checkout_access.health().sequence, before);
-        let observations = server.state.render_locality_observations.snapshot();
-        assert_eq!(observations.completions.len(), 1);
-        assert_eq!(observations.completions[0].project_id, PROJECT);
-        let recorded_sequence = observations.sequence;
 
-        // An incomplete receipt from the bound harness is accepted but never
-        // becomes completion evidence, even with every output written.
+        // An incomplete receipt from the bound harness is accepted too, and
+        // still opens no daemon checkout.
         let incomplete = bbox_knowledge::knowledge::execute_project_render_plan(
             &plan,
             &local_root,
@@ -1261,19 +1221,7 @@ mod catalog_render_tests {
             }))
             .await;
         assert!(!is_error(&completed), "{}", text(&completed));
-        assert!(text(&completed).contains("\"evidence_recorded\": false"));
-        assert_eq!(
-            server
-                .state
-                .render_locality_observations
-                .snapshot()
-                .sequence,
-            recorded_sequence
-        );
-        assert_eq!(
-            observations.completions[0].view,
-            ProjectRenderViewV1::Published
-        );
+        assert_eq!(server.state.checkout_access.health().sequence, before);
     }
 
     /// Rendering the published view places a satellite entry in its topic
@@ -1371,7 +1319,7 @@ mod catalog_render_tests {
     }
 
     #[tokio::test]
-    async fn a_delayed_older_harness_completion_never_replaces_newer_evidence() {
+    async fn a_delayed_older_harness_completion_never_reorders_a_newer_render() {
         use bbox_knowledge::knowledge::ProjectRenderDispositionV1;
 
         let fixture = CatalogFixture::new();
@@ -1454,15 +1402,14 @@ mod catalog_render_tests {
             )))
             .await;
         assert!(!is_error(&completed), "{}", text(&completed));
-        assert!(text(&completed).contains("\"evidence_recorded\": true"));
-        let evidence = server.state.render_locality_observations.snapshot();
-        assert_eq!(evidence.completions.len(), 1);
-        assert_eq!(evidence.completions[0].refused_count, 1);
-        assert_eq!(evidence.completions[0].written_count, 0);
-        assert_eq!(evidence.completions[0].issued_at_ms, newer.issued_at_ms);
+        let older_ms = older.issued_at_ms.unwrap();
+        let newer_ms = newer.issued_at_ms.unwrap();
+        let operations = &server.state.render_operations;
+        assert!(operations.newer_workspace_render(PROJECT, &scope, older_ms));
+        assert!(!operations.newer_workspace_render(PROJECT, &scope, newer_ms));
 
         // A's completion arrives last. It is acknowledged, but it is
-        // historical and never replaces B's refusal evidence.
+        // historical: B stays the newest render of the checkout scope.
         let delayed = server
             .bbox_render(Parameters(complete(
                 &older.plan_sha256,
@@ -1471,14 +1418,11 @@ mod catalog_render_tests {
             )))
             .await;
         assert!(!is_error(&delayed), "{}", text(&delayed));
-        assert!(text(&delayed).contains("\"evidence_recorded\": false"));
-        assert_eq!(
-            server.state.render_locality_observations.snapshot(),
-            evidence
-        );
+        assert!(!operations.newer_workspace_render(PROJECT, &scope, newer_ms));
 
-        // Nor can A's receipt claim a newer issuance: without an issuance,
-        // or with one this daemon never issued, a completion is not evidence.
+        // A completion without an issuance, or with one this daemon never
+        // issued, cannot be ordered, so it counts as newer than every issued
+        // render of the scope.
         let unissued = newer.issued_at_ms.map(|issued_at_ms| issued_at_ms + 1);
         for issued_at_ms in [None, unissued] {
             let unordered = server
@@ -1489,12 +1433,8 @@ mod catalog_render_tests {
                 )))
                 .await;
             assert!(!is_error(&unordered), "{}", text(&unordered));
-            assert!(text(&unordered).contains("\"evidence_recorded\": false"));
         }
-        assert_eq!(
-            server.state.render_locality_observations.snapshot(),
-            evidence
-        );
+        assert!(operations.newer_workspace_render(PROJECT, &scope, newer_ms));
     }
 
     #[tokio::test]

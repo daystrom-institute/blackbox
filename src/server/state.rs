@@ -136,10 +136,9 @@ pub(crate) struct SharedState {
     /// proves the remote result matched its overlap reference.
     pub(crate) knowledge_transport_observations:
         bbox_indexing::knowledge_transport_observations::KnowledgeTransportObservationsV1,
-    /// Durable exact-receipt evidence for checkout-owned project renders,
-    /// keyed by project and explicit published/own/all view.
-    pub(crate) render_locality_observations:
-        bbox_indexing::render_locality_observations::RenderLocalityObservationsV1,
+    /// Bound-workspace render plans this daemon issued; a confirmed issuance
+    /// orders the completion against owner renders of the same checkout.
+    pub(crate) render_issuances: bbox_indexing::render_issuances::RenderIssuancesV1,
     /// Host-local symbolic branch pins defining published truth per scope.
     pub(crate) publisher_refs: RwLock<bbox_indexing::publisher::PublisherRefStore>,
     /// Session-authorized provisional snapshots keyed by scope and checkout.
@@ -226,15 +225,6 @@ pub(crate) struct SharedState {
     /// monotonic no-fallback boundary even while it is pending re-cutover.
     pub(crate) knowledge_transport_cutover:
         Arc<bbox_indexing::knowledge_transport_cutover::KnowledgeTransportCutoverRuntimeV1>,
-    /// Strict per-project render locality authority. A checksummed marker row
-    /// prevents any unbound daemon project-render adapter from reacquiring a
-    /// checkout after the measured cut.
-    pub(crate) render_locality_cutover:
-        Arc<bbox_indexing::render_locality_cutover::RenderLocalityCutoverRuntimeV1>,
-    /// Strict per-project collected-source authority. A checksummed marker
-    /// closes LocalProjectWalk and removes local cutback as a valid fallback.
-    pub(crate) code_source_locality_cutover:
-        Arc<bbox_indexing::code_source_locality_cutover::CodeSourceLocalityCutoverRuntimeV1>,
     /// Shutdown flag for the cutback reconciler background task (P4-D).
     /// `None` in bridge mode (no reconciler spawned).
     pub(crate) reconciler_shutdown: parking_lot::RwLock<Arc<std::sync::atomic::AtomicBool>>,
@@ -754,8 +744,7 @@ impl SharedState {
             checkout_access,
             knowledge_transport_observations:
                 bbox_indexing::knowledge_transport_observations::KnowledgeTransportObservationsV1::in_memory(),
-            render_locality_observations:
-                bbox_indexing::render_locality_observations::RenderLocalityObservationsV1::in_memory(),
+            render_issuances: bbox_indexing::render_issuances::RenderIssuancesV1::new(),
             publisher_refs: RwLock::new(
                 bbox_indexing::publisher::PublisherRefStore::open(
                     store_dir.join("publisher-refs.json"),
@@ -798,12 +787,6 @@ impl SharedState {
             ),
             knowledge_transport_cutover: Arc::new(
                 bbox_indexing::knowledge_transport_cutover::KnowledgeTransportCutoverRuntimeV1::default(),
-            ),
-            render_locality_cutover: Arc::new(
-                bbox_indexing::render_locality_cutover::RenderLocalityCutoverRuntimeV1::default(),
-            ),
-            code_source_locality_cutover: Arc::new(
-                bbox_indexing::code_source_locality_cutover::CodeSourceLocalityCutoverRuntimeV1::default(),
             ),
             reconciler_shutdown: parking_lot::RwLock::new(Arc::new(
                 std::sync::atomic::AtomicBool::new(false),
@@ -2972,19 +2955,6 @@ pub(crate) mod catalog_fixture {
                     bbox_indexing::checkout_access::CheckoutAccessObservations::in_memory(),
                 )
                 .without_checkout_authority(),
-            );
-            BlackboxServer::new(Arc::new(state))
-        }
-
-        pub(crate) fn server_with_render_locality_cutover(
-            &self,
-            project_id: &str,
-        ) -> BlackboxServer {
-            let mut state = SharedState::for_test_catalog(&self.root, &self.catalog_projects_path);
-            state.render_locality_cutover = Arc::new(
-                bbox_indexing::render_locality_cutover::RenderLocalityCutoverRuntimeV1::governed_for_test(
-                    project_id,
-                ),
             );
             BlackboxServer::new(Arc::new(state))
         }

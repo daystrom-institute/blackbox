@@ -202,6 +202,7 @@ state dir so it never touches the deployed daemon's state. See
     ├── vectors/                 ← REBUILD (bbox_reembed per route)
     ├── edges/                   ← REBUILD (next reindex)
     ├── git_meta/                ← REBUILD (next reindex)
+    ├── cutover-artifacts/       ← archive (retired cutover state; nothing reads it)
     ├── backups/                 ← skip
     └── logs/                    ← skip
 
@@ -259,175 +260,26 @@ listed under the report's `dropped_rows` with reason
 make the report non-clean. Back up the state directory's cutover marker and receipt with the
 catalog authority.
 
-### Project render locality overlap and cutover
+### Locality cutover state
 
-Generate positive controls through a live managed bro workspace bound to each
-Published project selected for cutover. Invoke the public tool with
-`scope="project"`, no provider filter, and each explicit view. Running `own`
-last leaves the checkout in its normal session view:
+Render and code-source locality have no ceremony and no marker. A project
+render goes to the project's checkout owner first; a checkout-backed
+fallback (a daemon render write lease, a daemon-side project walk, a local
+cutback, an attachment probe) happens only on a daemon with checkout
+authority (see [Checkout authority](#checkout-authority)). Producer
+assignment changes never fail startup or config reload, and relocation and
+scope migration over MCP are refused only for knowledge-transport covered
+projects.
 
-```text
-bbox_render(project="/bound/project", scope="project", provisional="published")
-bbox_render(project="/bound/project", scope="project", provisional="all")
-bbox_render(project="/bound/project", scope="project", provisional="own")
-```
-
-Each call must complete the harness-local write of all three generated
-provider files without a hand-authored-file refusal. The daemon persists the
-exact path-free receipt after independently recomputing every projection hash.
-The absolute checkout path remains inside the harness. Global render is not
-part of this ceremony. Large knowledge snapshots are transported as
-SHA-256-pinned bounded pages; a generic MCP `response_too_large` envelope is a
-render-transport defect, not an acceptable positive control.
-
-Preflight may run while the daemon is live. It requires explicit catalog
-project IDs, successful all-provider non-dry-run completions for
-`published`/`own`/`all`, and one unique configured producer per scope. It
-captures the exact catalog, producer assignment, completions, and
-project-specific `RenderFileProvider` checkout counters. The quiet window has
-a hard minimum of 300 seconds.
-
-```bash
-blackbox project-catalog render-locality-cutover --preflight --configured \
-  --report /absolute/path/render-locality-report.json \
-  --project-id p_00000000000000000000000000000001
-```
-
-Leave normal managed render traffic running for the declared quiet window.
-Any selected project's daemon-side `RenderFileProvider` checkout attempt, or a
-change to its completion, producer assignment, or catalog authority, makes
-apply refuse and requires a new preflight/window.
-
-Apply and verify are offline catalog operations. Obtain explicit operator
-authorization and stop only the named daemon before running them. Apply takes
-its exact project set from the reviewed report.
-
-```bash
-blackbox project-catalog render-locality-cutover --apply --configured \
-  --report /absolute/path/render-locality-report.json
-
-blackbox project-catalog render-locality-cutover --verify --configured
-```
-
-The installed `render-locality-cutover-marker.json` is checksummed and loaded
-before the listener binds; corrupt bytes fail startup. A covered Published
-project must render through a managed checkout owner. An unbound call refuses
-before the daemon checkout broker, and loss of source or binding authority
-never reopens fallback. Bridge, uncovered, and `LegacyLocal` project renders
-remain explicit compatibility lanes. A code deployment alone does not apply a
-production marker.
-
-The ceremony is re-runnable against an installed marker. Preflight then
-accepts an empty `--project-id` set, carries every predecessor row whose
-project is still in the catalog under `carried_forward_rows` with the
-evidence its original apply accepted, lists rows whose project left the
-catalog under `dropped_rows` with reason `project_absent_from_catalog`, and
-proves only the selected projects. `uncovered_projects` names the Published
-catalog projects the next marker would still not cover. The report binds the
-predecessor checksum as `predecessor_marker_checksum`; apply refuses when the
-installed marker or its carried and dropped rows changed after preflight,
-waits out the quiet window only when the report proves a project, and
-supersedes the marker with the carried and proved rows. When no row remains,
-apply removes the marker, the receipt status is `retired`, and verify refuses
-because no marker exists. The marker format is unchanged, so a daemon without
-re-run support loads the successor.
-
-`bbox_doctor(section="locality_cutovers")` reports both locality cutovers from
-the markers the daemon loaded at startup. A daemon with no marker reports the
-cutover as not run with its uncovered Published project count. A loaded marker
-reports its checksum (the receipt's `marker_checksum_sha256`), apply time,
-catalog epoch, and governed and current row counts, and names each Published
-project it leaves uncovered. A governed row whose live catalog scope or
-producer assignment no longer matches the marker is an `action` finding that
-points at a fresh `--preflight`; a row whose project was retired is informational
-and the next re-run drops it.
-An invalid marker never reaches doctor because it refuses startup. The section
-is catalog-only and absent in bridge mode.
-
-### Collected code-source locality cutover
-
-This cutover makes one current collected generation authoritative and closes
-`LocalProjectWalk` plus local cutback for explicitly selected Published
-projects. It does not convert bridge, uncovered, or `LegacyLocal` projects.
-
-First deploy the candidate binary without a code-source locality marker and
-start the selected daemon. Startup records `StartupRecovery` evidence only
-after the current v2 activation and workspace manifest agree. While that daemon
-is live, run one successful full corpus rebuild:
-
-```text
-bbox_reindex(full=true)
-```
-
-The successful commit records `FullRebuild` evidence for the exact same
-generation. Run this control before preflight because an unmarked full rebuild
-may still use the compatibility local-walk lane for transcript attribution.
-Confirm the selected project remains searchable and its code-source health is
-current before continuing.
-
-Preflight requires an explicit project set, a unique configured producer for
-each published scope, a healthy current v2 activation, both exact recovery
-controls, and workspace-manifest agreement. It captures the current catalog,
-assignment, generation, evidence, and project-specific `LocalProjectWalk`
-counters. The quiet window has a hard minimum of 300 seconds.
-
-```bash
-blackbox project-catalog code-source-locality-cutover --preflight --configured \
-  --report /absolute/path/code-source-locality-report.json \
-  --project-id p_00000000000000000000000000000001
-```
-
-Leave normal traffic running for the declared window. Any selected project's
-new daemon-side `LocalProjectWalk` observation, catalog change, producer drift,
-generation change, or recovery-evidence change makes apply refuse. Run a new
-preflight after correcting the cause.
-
-Apply and verify are offline catalog operations. Obtain explicit operator
-authorization and stop only the named daemon before running them. Apply takes
-the exact project set from the reviewed report.
-
-```bash
-blackbox project-catalog code-source-locality-cutover --apply --configured \
-  --report /absolute/path/code-source-locality-report.json
-
-blackbox project-catalog code-source-locality-cutover --verify --configured
-```
-
-The installed `code-source-locality-cutover-marker.json` is checksummed and
-loaded before the listener binds. Corrupt bytes, assignment removal, published
-scope drift, or generation drift fail closed. Config reload validates the
-governed assignment before swapping the live table. The checkout broker refuses
-`LocalProjectWalk` before authority resolution or observation, and the indexer
-resolves transcript project stamps and file-tool edges from verified immutable
-generation blobs instead of checkout bytes.
-
-After the authorized daemon restarts, run a second full rebuild and validate
-search, graph, embeddings, and code-source health. This post-marker rebuild must
-leave every selected project's `LocalProjectWalk` target counters unchanged.
-Stop and investigate if offline verify then reports `changed after cutover`.
-A code deployment alone does not apply a production marker.
-The daemon's completion state for this marker appears in
-`bbox_doctor(section="locality_cutovers")`, described under the render
-locality cutover above.
-
-The ceremony is re-runnable against an installed marker. Preflight then
-accepts an empty `--project-id` set, carries every predecessor row whose
-project is still in the catalog under `carried_forward_rows` with the
-recovery evidence its original apply accepted, lists rows whose project left
-the catalog under `dropped_rows` with reason `project_absent_from_catalog`,
-and proves only the selected projects. A carried row must still pass the
-governed-row checks daemon startup applies (catalog scope, producer
-assignment, current generation from the same authority), or preflight and
-apply refuse. `uncovered_projects` names the Published catalog projects the
-next marker would still not cover. The report binds the predecessor checksum
-as `predecessor_marker_checksum`; apply refuses when the installed marker or
-its carried and dropped rows changed after preflight, waits out the quiet
-window only when the report proves a project, and supersedes the marker with
-the carried and proved rows. When no row remains, apply removes the marker,
-the receipt status is `retired`, and verify refuses because no marker exists.
-The marker format is unchanged, so a daemon without re-run support loads the
-successor. No component reads or writes `blame-locality-cutover-marker.json`;
-the ceremony leaves that file untouched.
+Daemon startup moves any `render-locality-cutover*`,
+`code-source-locality-cutover*` or `blame-locality-cutover*` file (markers
+and any receipt kept beside them) and `code-source-locality-observations.json`
+from the state directory, and `render-locality-observations.json` from the
+bro home, into a new
+`<state_dir>/cutover-artifacts/retired-locality-<UTC timestamp>/` directory.
+Nothing reads or deletes the archive. A start that finds none of those files
+creates nothing. A move that fails is logged and retried at the next start;
+it never holds the daemon down.
 
 ### After a daemon upgrade (no schema change)
 

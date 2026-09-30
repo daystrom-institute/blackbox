@@ -497,41 +497,6 @@ pub(crate) struct CodeSourceRuntime {
     /// and this generation form the cutback authority fence.
     assignment_revision: std::sync::atomic::AtomicU64,
     retirement_coordinator: Arc<RetirementCoordinator>,
-    code_source_locality_cutover:
-        Arc<bbox_indexing::code_source_locality_cutover::CodeSourceLocalityCutoverRuntimeV1>,
-}
-
-pub(crate) struct CodeSourceLocalityCheckoutPolicy {
-    cutover: Arc<bbox_indexing::code_source_locality_cutover::CodeSourceLocalityCutoverRuntimeV1>,
-}
-
-impl CodeSourceLocalityCheckoutPolicy {
-    pub(crate) fn new(
-        cutover: Arc<
-            bbox_indexing::code_source_locality_cutover::CodeSourceLocalityCutoverRuntimeV1,
-        >,
-    ) -> Self {
-        Self { cutover }
-    }
-}
-
-impl bbox_indexing::checkout_access::CheckoutAccessPolicy for CodeSourceLocalityCheckoutPolicy {
-    fn authorize(
-        &self,
-        request: &bbox_indexing::checkout_access::CheckoutAccessRequest,
-    ) -> std::result::Result<(), bbox_indexing::checkout_access::CheckoutAccessError> {
-        use bbox_indexing::checkout_access::{CheckoutAccessError, CheckoutAccessErrorCode};
-
-        if request.kind == CheckoutAccessKind::LocalProjectWalk
-            && self.cutover.transport_governed(&request.project_id)
-        {
-            return Err(CheckoutAccessError::new(
-                CheckoutAccessErrorCode::CodeSourceTransportAuthoritative,
-                "error.code_source_transport_authoritative: LocalProjectWalk is closed by the code-source locality cutover",
-            ));
-        }
-        Ok(())
-    }
 }
 
 #[derive(Default)]
@@ -546,9 +511,6 @@ impl CodeSourceRuntime {
         projects: &[ProjectRecord],
         catalog_store: Option<Arc<bbox_indexing::project_catalog_store::ProjectCatalogStore>>,
         checkout_access: Arc<CheckoutAccessBroker>,
-        code_source_locality_cutover: Arc<
-            bbox_indexing::code_source_locality_cutover::CodeSourceLocalityCutoverRuntimeV1,
-        >,
         claims: &ProducerClaimStore,
     ) -> Result<Self> {
         let transition_guards = Arc::new(TransitionGuardMap::new(BTreeMap::new()));
@@ -565,11 +527,6 @@ impl CodeSourceRuntime {
             &checkout_access,
             claims,
         )?);
-        let catalog_projects = catalog_project_ids(catalog_store.as_deref())?;
-        code_source_locality_cutover
-            .verify_assignments_with_catalog(&assignment_map(&snapshot), |project_id| {
-                catalog_projects_contains(&catalog_projects, project_id)
-            })?;
         Ok(Self {
             snapshot: parking_lot::RwLock::new(snapshot),
             activating_projects: parking_lot::Mutex::new(BTreeMap::new()),
@@ -579,7 +536,6 @@ impl CodeSourceRuntime {
             reconciler,
             assignment_revision: std::sync::atomic::AtomicU64::new(1),
             retirement_coordinator: Arc::new(RetirementCoordinator::new()),
-            code_source_locality_cutover,
         })
     }
 
@@ -598,11 +554,6 @@ impl CodeSourceRuntime {
             &self.checkout_access,
             claims,
         )?);
-        let catalog_projects = catalog_project_ids(self.catalog_store.as_deref())?;
-        self.code_source_locality_cutover
-            .verify_assignments_with_catalog(&assignment_map(&replacement), |project_id| {
-                catalog_projects_contains(&catalog_projects, project_id)
-            })?;
         replacement.store.update_limits(store_limits(config))?;
         let old_assignments = assignment_map(&previous);
         let new_assignments = assignment_map(&replacement);
@@ -645,9 +596,6 @@ impl CodeSourceRuntime {
             reconciler: None,
             assignment_revision: std::sync::atomic::AtomicU64::new(1),
             retirement_coordinator: Arc::new(RetirementCoordinator::new()),
-            code_source_locality_cutover: Arc::new(
-                bbox_indexing::code_source_locality_cutover::CodeSourceLocalityCutoverRuntimeV1::default(),
-            ),
         }
     }
 
@@ -686,9 +634,6 @@ impl CodeSourceRuntime {
             reconciler,
             assignment_revision: std::sync::atomic::AtomicU64::new(1),
             retirement_coordinator: Arc::new(RetirementCoordinator::new()),
-            code_source_locality_cutover: Arc::new(
-                bbox_indexing::code_source_locality_cutover::CodeSourceLocalityCutoverRuntimeV1::default(),
-            ),
         }
     }
 
@@ -783,35 +728,6 @@ impl bbox_indexing::index::ProducerAssignmentSource for CodeSourceRuntime {
 
 fn assignment_map(snapshot: &CodeSourceSnapshot) -> BTreeMap<PublishedScope, (String, String)> {
     snapshot.auth.assignment_map()
-}
-
-/// Catalog project-id set for governance verification; `None` (bridge mode)
-/// treats every governed row as live, preserving the strict behavior.
-fn catalog_project_ids(
-    catalog_store: Option<&bbox_indexing::project_catalog_store::ProjectCatalogStore>,
-) -> Result<Option<std::collections::BTreeSet<String>>> {
-    let Some(store) = catalog_store else {
-        return Ok(None);
-    };
-    let snapshot = store.snapshot()?;
-    Ok(Some(
-        snapshot
-            .catalog()
-            .projects
-            .keys()
-            .map(|project_id| project_id.as_str().to_string())
-            .collect(),
-    ))
-}
-
-fn catalog_projects_contains(
-    catalog_projects: &Option<std::collections::BTreeSet<String>>,
-    project_id: &str,
-) -> bool {
-    match catalog_projects {
-        Some(projects) => projects.contains(project_id),
-        None => true,
-    }
 }
 
 fn build_snapshot(
@@ -1845,12 +1761,6 @@ fn enqueue_current_transition(
 }
 
 fn schedule_cutback_if_owner_changed(state: Arc<SharedState>, project_id: String) {
-    if state
-        .code_source_locality_cutover
-        .transport_governed(&project_id)
-    {
-        return;
-    }
     let store = state.code_sources.store();
     let Some(activation) = store.load_activation_mixed(&project_id).ok().flatten() else {
         return;
@@ -2362,14 +2272,7 @@ pub(crate) fn spawn_reconciler(state: &Arc<SharedState>, runtime_handle: tokio::
                     let persisted = activation
                         .as_ref()
                         .and_then(|record| record.cutback().cloned());
-                    let ladder = if state_for_task
-                        .code_source_locality_cutover
-                        .transport_governed(&project_id)
-                    {
-                        LadderResult::None
-                    } else {
-                        probe_ladder(&state_for_task, &project_id)
-                    };
+                    let ladder = probe_ladder(&state_for_task, &project_id);
 
                     // Evaluate open-bridge predicate (section 9.3).
                     let effective_gen = activation
@@ -4834,17 +4737,6 @@ pub(crate) fn pre_bind_catalog_recovery(
         &pending_first_republish,
     )
     .context("pre-bind: validating active workspace materializations")?;
-    let locality_observations =
-        bbox_indexing::code_source_locality_observations::CodeSourceLocalityObservationsV1::open(
-            bbox_indexing::code_source_locality_observations::observation_path_from_code_source_root(
-                store.root(),
-            )?,
-        )?;
-    locality_observations.record_verified_activations(
-        store,
-        projects_path,
-        bbox_indexing::code_source_locality_observations::CodeSourceLocalityEvidenceKindV1::StartupRecovery,
-    )?;
 
     // Step 7: detect incomplete retirement journals.
     detect_incomplete_retirement_journal(bro_home)
@@ -5353,12 +5245,6 @@ fn probe_ladder(state: &Arc<SharedState>, project_id: &str) -> LadderResult {
 
 /// Determine the desired assignment for a project from auth-table state.
 fn determine_desired_assignment(state: &Arc<SharedState>, project_id: &str) -> DesiredAssignment {
-    if state
-        .code_source_locality_cutover
-        .transport_governed(project_id)
-    {
-        return DesiredAssignment::Collected;
-    }
     let assigned = state
         .code_sources
         .assignments()
@@ -5757,7 +5643,6 @@ fn classify_checkout_error(error: &CheckoutAccessError) -> CutbackAttemptOutcome
         Code::AttachmentNotFound
         | Code::ObservationUnavailable
         | Code::KnowledgeTransportAuthoritative
-        | Code::CodeSourceTransportAuthoritative
         | Code::NoCheckoutAuthority => {
             CutbackAttemptOutcome::Structural(CutbackReason::NoLocalAttachment)
         }
@@ -7583,47 +7468,12 @@ mod tests {
         }
     }
 
+    /// A state root that still holds a code-source locality marker naming a
+    /// project and its producer does not govern anything: the runtime opens
+    /// with a different producer for that scope, and a reload that removes
+    /// the assignment swaps the table instead of failing closed.
     #[test]
-    fn governed_code_source_refuses_local_walk_before_observation() {
-        let project_id = "p_00000000000000000000000000000001";
-        let observations = CheckoutAccessObservations::in_memory();
-        let broker = CheckoutAccessBroker::new(
-            Arc::new(bbox_indexing::checkout_access::DenyCheckoutAccess),
-            observations,
-        );
-        broker
-            .install_policy(Arc::new(CodeSourceLocalityCheckoutPolicy::new(Arc::new(
-                bbox_indexing::code_source_locality_cutover::CodeSourceLocalityCutoverRuntimeV1::governed_for_test(
-                    project_id,
-                ),
-            ))))
-            .unwrap();
-        let error = broker
-            .acquire(CheckoutAccessRequest {
-                project_id: project_id.into(),
-                attachment: CheckoutAttachmentSelector::Selected,
-                expected_scope: None,
-                kind: CheckoutAccessKind::LocalProjectWalk,
-                intent: CheckoutAccessIntent::Read,
-                source_lane: CheckoutAccessSourceLane::LegacyProjectRecord,
-            })
-            .unwrap_err();
-        assert_eq!(
-            error.code,
-            CheckoutAccessErrorCode::CodeSourceTransportAuthoritative
-        );
-        let local = broker
-            .health()
-            .operations
-            .into_iter()
-            .find(|operation| operation.kind == CheckoutAccessKind::LocalProjectWalk)
-            .unwrap();
-        assert_eq!(local.granted, 0);
-        assert_eq!(local.denied, 0);
-    }
-
-    #[test]
-    fn governed_code_source_reload_refuses_assignment_removal_before_swap() {
+    fn producer_assignment_changes_never_fail_open_or_reload() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
         let state_dir = root.join("state");
@@ -7634,6 +7484,31 @@ mod tests {
         let mut config = crate::config::load().unwrap();
         let project_id = "p_00000000000000000000000000000001";
         let scope = PublishedScope::try_new("test", ".").unwrap();
+        // A legacy-shaped marker governing the project under producer
+        // "retired-producer" and a marker whose bytes no longer parse.
+        fs::write(
+            state_dir.join("code-source-locality-cutover-marker.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "applied_at": "2026-09-29T17:40:00Z",
+                "report_sha256": "a".repeat(64),
+                "catalog_epoch": 1,
+                "catalog_sha256": "b".repeat(64),
+                "rows": [{
+                    "project_id": project_id,
+                    "scope": {"repo_id": "test", "root": "."},
+                    "producer_id": "retired-producer",
+                }],
+                "checksum_sha256": "c".repeat(64),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            state_dir.join("render-locality-cutover-marker.json"),
+            b"{ not json",
+        )
+        .unwrap();
         let token_file = root.join("producer-token");
         write_service_token(&token_file, 'a');
         config.code_collection.enabled = true;
@@ -7658,14 +7533,13 @@ mod tests {
             &[],
             Some(catalog),
             broker,
-            Arc::new(
-                bbox_indexing::code_source_locality_cutover::CodeSourceLocalityCutoverRuntimeV1::governed_for_test(
-                    project_id,
-                ),
-            ),
             &ProducerClaimStore::default(),
         )
         .unwrap();
+        assert_eq!(
+            runtime.producer_auth().assignment_map().get(&scope),
+            Some(&(project_id.to_string(), "producer".to_string()))
+        );
         let original_revision = runtime
             .assignment_revision
             .load(std::sync::atomic::Ordering::Acquire);
@@ -7673,23 +7547,21 @@ mod tests {
         let mut removed = config;
         removed.code_collection.enabled = false;
         removed.code_collection.producers.clear();
-        let error = runtime
+        let transitions = runtime
             .reload(&removed, &[], &ProducerClaimStore::default())
-            .err()
-            .expect("assignment removal must fail closed");
+            .unwrap();
 
-        assert!(format!("{error:#}").contains("must retain producer"));
         assert_eq!(
+            transitions.cutbacks,
+            vec![(scope.clone(), project_id.to_string())]
+        );
+        assert!(
             runtime
                 .assignment_revision
-                .load(std::sync::atomic::Ordering::Acquire),
-            original_revision
+                .load(std::sync::atomic::Ordering::Acquire)
+                > original_revision
         );
-        assert_eq!(
-            runtime.producer_auth().assignment_map().get(&scope),
-            Some(&(project_id.to_string(), "producer".to_string())),
-            "the rejected replacement must not swap the live assignment table"
-        );
+        assert_eq!(runtime.producer_auth().assignment_map().get(&scope), None);
     }
 
     fn empty_generation_descriptor(scope: PublishedScope, head: &str) -> GenerationDescriptor {
@@ -8883,7 +8755,6 @@ mod tests {
                 &[],
                 state.project_authority.catalog_store().cloned(),
                 state.checkout_access.clone(),
-                state.code_source_locality_cutover.clone(),
                 &state.producer_claims.read().records_snapshot(),
             )
             .unwrap(),
@@ -10387,17 +10258,8 @@ mod tests {
             Arc::new(bbox_indexing::checkout_access::DenyCheckoutAccess),
             CheckoutAccessObservations::in_memory(),
         ));
-        let runtime = CodeSourceRuntime::open(
-            &config,
-            &[],
-            Some(catalog),
-            broker,
-            Arc::new(
-                bbox_indexing::code_source_locality_cutover::CodeSourceLocalityCutoverRuntimeV1::default(),
-            ),
-            &claims,
-        )
-        .unwrap();
+        let runtime =
+            CodeSourceRuntime::open(&config, &[], Some(catalog), broker, &claims).unwrap();
 
         assert_eq!(
             runtime.producer_auth().assignment_map().get(&scope),

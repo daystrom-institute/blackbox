@@ -4,9 +4,7 @@
 
 pub mod accepted_publication_runtime;
 pub mod accepted_publication_store;
-pub mod code_source_locality_cutover;
 pub mod code_source_locality_manifest;
-pub mod code_source_locality_observations;
 // Test-only accepted-publication installation. `#[cfg(test)]` does not cross
 // crate boundaries, so downstream tests enable `test-support` through a
 // dev-dependency feature. Off by default: no production build carries it.
@@ -21,6 +19,7 @@ pub mod git_transport_cutover;
 pub mod index;
 pub mod knowledge_transport_cutover;
 pub mod knowledge_transport_observations;
+pub mod locality_cutover_retirement;
 pub mod project_catalog_admin;
 pub mod project_catalog_backfill;
 pub mod project_catalog_genesis;
@@ -38,5 +37,4 @@ pub mod project_graph_view;
 pub mod project_resolver;
 pub mod projects;
 pub mod publisher;
-pub mod render_locality_cutover;
-pub mod render_locality_observations;
+pub mod render_issuances;

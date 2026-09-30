@@ -262,17 +262,13 @@ sidecar, the same file class the checkout-mutation lane already delivers.
   admitted as pending onboarding: excluded from every publication lane and
   accepted only by the onboard route. Bridge-mode resolution fails closed.
   A claimed scope with no project is admitted the same way.
-- **Marker verify vs. crash-wedged staging.** The code-source locality
-  startup verify accepts a covered project wedged at `StagingIndex` when the
-  workspace manifest and activation journal agree that staging completed;
-  any other non-Active state refuses.
 
 ## 9. Marker interaction
 
-A newly onboarded project is not covered by any locality marker. It renders
-through the named compatibility lanes until an operator runs the relevant
-cutover ceremony for it. Knowledge transport coverage classifies it
-uncovered; nothing fails open.
+A newly onboarded project is not covered by any transport marker. It renders
+through its checkout-owner collector once that collector polls the render
+lane. Knowledge and Git transport coverage classify it uncovered until an
+operator runs the relevant cutover ceremony for it; nothing fails open.
 
 ## 10. Non-goals
 

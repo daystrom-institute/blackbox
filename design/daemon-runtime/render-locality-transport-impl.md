@@ -13,10 +13,10 @@ brief: "Keep bbox_render model-facing while moving project-file writes into the 
 
 # Project render locality
 
-> **Status:** the bound-harness route, the checkout-owner collector route, and
-> the strict per-project cutover are implemented. This document claims no
-> production marker. Bridge and `LegacyLocal` project renders, and catalog
-> projects no owner covers, keep their named compatibility adapter.
+> **Status:** the bound-harness route and the checkout-owner collector route
+> are implemented. Bridge and `LegacyLocal` project renders, and catalog
+> projects no owner covers, keep their named compatibility adapter, which a
+> daemon without checkout authority never takes.
 
 ## 0. Outcome
 
@@ -39,8 +39,8 @@ In both lanes:
 3. the applier returns projection hashes, byte counts, local `PROJECT.md`
    presence, and per-output dispositions, never a checkout root or file body;
    and
-4. the daemon validates every receipt field against the plan and records
-   durable completion evidence without acquiring a checkout.
+4. the daemon validates every receipt field against the plan without
+   acquiring a checkout.
 
 Global rendering remains daemon/operator-host local. For `scope=both`, the
 daemon performs the global half first, then the owner performs the project
@@ -57,8 +57,9 @@ global half issues no project operation.
   `bbox-knowledge` re-exports its types and renders through it.
 - `src/tools/render.rs` routes the call: a live workspace binding uses the
   locality exchange; otherwise a catalog project with a checkout owner goes
-  to `src/server/render_owner.rs`, and only a project no owner covers (and
-  the cutover does not govern) reaches the compatibility checkout lease.
+  to `src/server/render_owner.rs`, and only a project no owner covers, on a
+  daemon that holds checkout authority, reaches the compatibility checkout
+  lease.
 - `src/server/render_owner.rs` selects the owner, builds the plan under
   producer authority, waits a bounded time for the owner, revalidates the
   receipt, and serves explicit recovery of an earlier operation.
@@ -72,14 +73,9 @@ global half issues no project operation.
   `bbox_render` capability in a live managed workspace. It strips any
   caller-supplied transport field, keeps an absolute project path local, and
   delegates global-only calls unchanged.
-- `crates/bbox-indexing/src/render_locality_observations.rs` persists the
-  latest exact completion for each project and `published`/`own`/`all` view.
-  Only identity, counts, dispositions, and receipt checksums are durable.
-- `crates/bbox-indexing/src/render_locality_cutover.rs` requires successful
-  all-provider non-dry-run completions for every view, unique producer
-  assignment, stable catalog authority, and an unchanged project-specific
-  `RenderFileProvider` checkout baseline for at least 300 seconds. It then
-  writes a checksummed marker that startup loads fail-closed.
+- `crates/bbox-indexing/src/render_issuances.rs` remembers, in memory and
+  bounded, the workspace plans this daemon issued, so a workspace completion
+  can be ordered by its plan's issuance.
 
 ## 2. Fixed contracts
 
@@ -115,7 +111,7 @@ Satellites are content-addressed `.bbox/guidance/<generation>/<provider>-<topic>
 files. Unknown or path-shaped provider names fail before a target is joined.
 Existing hand-authored provider files retain the established refusal
 behavior; generated provider files are replaced. The receipt records each
-disposition, and a refusal cannot satisfy the positive-control cutover gate.
+disposition.
 
 ### RL-D3: view semantics are explicit and pinned
 
@@ -123,7 +119,7 @@ A workspace plan defaults to `own`. A collector-applied plan keeps the
 caller's existing visibility: without checkout context it defaults to
 `published`, `own` still requires authoritative checkout context, and `all`
 keeps its semantics. The collector's working-tree knowledge is never
-substituted for the selected view, and no workspace binding is invented. The selected view is part of the plan and completion evidence. Tests
+substituted for the selected view, and no workspace binding is invented. The selected view is part of the plan and the receipt. Tests
 prove published excludes provisional variants, own replaces the logical row
 with the bound workspace variant, and all carries published plus every valid
 provisional variant under the existing degradation rules.
@@ -145,20 +141,15 @@ bytes, or impossible dispositions before recording completion.
 The user-facing result stays local because it includes the local path. Only
 the receipt crosses back to the daemon.
 
-### RL-D5: cutover is measured and per project
+### RL-D5: the daemon writes a checkout only with checkout authority
 
-Offline preflight accepts an explicit Published-project set. For each row it
-requires the latest successful all-provider, non-dry-run, no-refusal receipt
-for all three views and captures the exact `RenderFileProvider` target
-counters. Apply waits at least five minutes and refuses changed catalog bytes,
-producer assignment, completion evidence, or checkout counter. The marker is
-checksummed; corrupt bytes fail daemon startup.
-
-After the marker is loaded, an unbound render for a covered project resolves
-stable identity and completes through its checkout owner, or refuses before
-the checkout broker when no owner covers it. A managed bound call already
-requires locality transport. Losing the producer, binding, source, or receipt
-never reopens the daemon adapter.
+An unbound render of a catalog project resolves stable identity and completes
+through its checkout owner whenever one covers it. With no owner, the daemon's
+own `RenderFileProvider` write lease is the compatibility adapter, and only a
+daemon that holds checkout authority takes it. A daemon declared with
+`daemon.no_checkout_authority` refuses before the checkout broker with the
+owner-required message, so no checkout access is attempted or counted. A
+managed bound call always requires locality transport.
 
 ### RL-D6: owner authority is the scope grant
 
@@ -211,16 +202,16 @@ recovery arguments; `bbox_render(project, operation)` retrieves that
 operation's recorded outcome and never re-applies it. Completion is reported
 as current only when the owner and the rebuilt plan still match the issued
 plan and no newer operation exists for the project; otherwise the receipt is
-reported as stale or historical and no completion evidence is recorded. The
+reported as stale or historical. The
 validation that held at completion is kept as history; present validity is
 rechecked on every response, so a receipt stops being current when knowledge
 or owner authority changes even if no newer render was issued. An incomplete
-receipt, from either applier, is accepted but never recorded as completion
-evidence, so it cannot satisfy the cutover gate. Completion evidence also
-records the applied plan's issuance: a completion of an older plan never
-replaces newer evidence for the same project and view, and a collector
-operation is recorded only while it is still the project's newest operation. A
-fresh render with unchanged knowledge still starts a new operation, so it
+receipt, from either applier, is accepted and reported as incomplete. A
+bound-workspace completion that may have written makes older owner receipts
+of its checkout scope historical: it is ordered by its plan's issuance when
+this daemon remembers issuing that plan, and after every issued render
+otherwise, so a delayed older completion never makes a newer render
+historical. A fresh render with unchanged knowledge still starts a new operation, so it
 re-observes `PROJECT.md` and restores deleted generated outputs. Operation
 state survives daemon and collector restarts.
 
@@ -270,7 +261,7 @@ fence.
 ## 3. Compatibility and parity
 
 Catalog compatibility render remains available only for projects no checkout
-owner covers and the cutover does not govern, and is gated directly on
+owner covers, on a daemon that holds checkout authority, and is gated directly on
 `render_output`; it no longer takes an unrelated
 `repo_mutation` capability. Accepted catalog rows render by stable project id
 rather than disappearing behind the historical path-only filter. Bridge
@@ -284,11 +275,11 @@ The test gates cover:
 - published/own/all plan contents;
 - exact candidate-tree check parity;
 - zero daemon checkout observations for plan and completion;
-- positive uncovered catalog compatibility;
-- checksummed marker, mandatory quiet window, changed-counter refusal, runtime
-  projection, and covered pre-broker refusal;
-- owner completion from an unbound caller for covered and uncovered projects
-  with zero daemon checkout observations;
+- positive catalog compatibility for a project no owner covers;
+- pre-broker refusal, with zero checkout observations, on a daemon without
+  checkout authority;
+- owner completion from an unbound caller with zero daemon checkout
+  observations;
 - owner selection by grant, and each distinct owner refusal;
 - operation timeout and recovery, daemon and collector restart, lost
   acknowledgment, duplicate results, supersession, stale completion, and
@@ -302,12 +293,9 @@ The test gates cover:
 - No second renderer in the harness or the collector.
 - No collapse of published/own/all into a working-tree-only approximation.
 - No movement of global render authority into a remote workspace.
-- No production marker merely because the code and tests landed.
 - No implicit retirement of bridge, uncovered, or `LegacyLocal` adapters.
 
 ## 5. Parent-plan effect
 
-Project render is no longer a remaining checkout reach-in for explicitly
-marked Published projects. The collected project-source successor is now
-implemented in
-[code-source-locality-cutover-impl.md](code-source-locality-cutover-impl.md).
+Project render is not a checkout reach-in for any project a checkout owner
+covers, nor for any project on a daemon without checkout authority.
