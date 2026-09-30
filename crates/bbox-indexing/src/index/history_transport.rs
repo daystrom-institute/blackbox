@@ -155,25 +155,7 @@ pub fn verify_history_commit_view(
         generation
             .validate()
             .map_err(|error| anyhow::anyhow!("{error}"))?;
-        let query = BooleanQuery::new(vec![
-            (
-                Occur::Must,
-                Box::new(TermQuery::new(
-                    Term::from_field_text(
-                        fields.repo_id,
-                        generation.manifest.body.namespace.as_str(),
-                    ),
-                    IndexRecordOption::Basic,
-                )),
-            ),
-            (
-                Occur::Must,
-                Box::new(TermQuery::new(
-                    Term::from_field_text(fields.doc_type, "commit"),
-                    IndexRecordOption::Basic,
-                )),
-            ),
-        ]);
+        let query = history_commit_lane_query(fields, generation.manifest.body.namespace.as_str());
         let addresses = searcher.search(&query, &DocSetCollector)?;
         let mut actual = Vec::with_capacity(addresses.len());
         for address in addresses {
@@ -227,6 +209,161 @@ pub fn verify_history_commit_view(
                 generation.commit_documents.len(),
                 actual.len()
             );
+        }
+        Ok(())
+    };
+    verify().map_err(|error| {
+        HistoryMaterializerError::new(
+            "error.history_transport_commit_view_mismatch",
+            error.to_string(),
+        )
+    })
+}
+
+/// Digest of every STORED field value of one Tantivy document, independent of
+/// field order. Two documents with equal digests are physically identical for
+/// every stored field, owner fields (`project`, `project_id`, `file_path`)
+/// included, which is what lets a publication skip rewriting them.
+pub type StoredRowDigest = [u8; 32];
+
+fn stored_row_digest(
+    schema: &tantivy::schema::Schema,
+    document: &tantivy::TantivyDocument,
+) -> anyhow::Result<StoredRowDigest> {
+    use sha2::{Digest, Sha256};
+    let mut entries = Vec::new();
+    for field_value in document.field_values() {
+        if !schema.get_field_entry(field_value.field()).is_stored() {
+            continue;
+        }
+        entries.push((
+            field_value.field().field_id(),
+            serde_json::to_string(field_value.value())?,
+        ));
+    }
+    entries.sort();
+    let mut hasher = Sha256::new();
+    for (field_id, value) in entries {
+        hasher.update(field_id.to_be_bytes());
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value.as_bytes());
+    }
+    Ok(hasher.finalize().into())
+}
+
+/// The stored digest a commit row must carry once published under `owner`.
+pub fn expected_commit_row_digest(
+    schema: &tantivy::schema::Schema,
+    fields: bbox_corpus_index::index::FieldHandles,
+    row: &HistoryCommitDocumentV1,
+    owner: &bbox_corpus_index::index::schema_replacement::CommitDocumentOwnerV1,
+) -> anyhow::Result<StoredRowDigest> {
+    let document =
+        bbox_corpus_index::index::schema_replacement::build_commit_doc_from_row(row, owner, fields);
+    stored_row_digest(schema, &document)
+}
+
+/// Every committed document of one `(repo_id, doc_type=commit)` lane, keyed
+/// by entity id. Duplicates are kept so a caller can see and repair them.
+#[derive(Debug, Default)]
+pub struct HistoryCommitLaneV1 {
+    pub rows: BTreeMap<String, Vec<StoredRowDigest>>,
+    /// Lane documents without an entity id. No per-row delete term reaches
+    /// them, so only a whole-lane replacement can remove them.
+    pub anonymous: u64,
+    pub total: u64,
+}
+
+pub fn history_commit_lane_query(
+    fields: bbox_corpus_index::index::FieldHandles,
+    namespace: &str,
+) -> BooleanQuery {
+    BooleanQuery::new(vec![
+        (
+            Occur::Must,
+            Box::new(TermQuery::new(
+                Term::from_field_text(fields.repo_id, namespace),
+                IndexRecordOption::Basic,
+            )),
+        ),
+        (
+            Occur::Must,
+            Box::new(TermQuery::new(
+                Term::from_field_text(fields.doc_type, "commit"),
+                IndexRecordOption::Basic,
+            )),
+        ),
+    ])
+}
+
+/// Read one namespace's committed commit lane as stored-row digests.
+pub fn read_history_commit_lane(
+    searcher: &tantivy::Searcher,
+    fields: bbox_corpus_index::index::FieldHandles,
+    namespace: &str,
+) -> anyhow::Result<HistoryCommitLaneV1> {
+    let schema = searcher.schema();
+    let addresses = searcher.search(
+        &history_commit_lane_query(fields, namespace),
+        &DocSetCollector,
+    )?;
+    let mut lane = HistoryCommitLaneV1::default();
+    for address in addresses {
+        let document = searcher.doc::<tantivy::TantivyDocument>(address)?;
+        lane.total += 1;
+        let entity_id = bbox_corpus_index::index::first_text(&document, fields.entity_id);
+        if entity_id.is_empty() {
+            lane.anonymous += 1;
+            continue;
+        }
+        lane.rows
+            .entry(entity_id)
+            .or_default()
+            .push(stored_row_digest(schema, &document)?);
+    }
+    Ok(lane)
+}
+
+/// Prove the committed lane is exactly `generation` as published under
+/// `owner`: every planned row present once with every stored field equal,
+/// owner fields included, and nothing else in the lane.
+pub fn verify_history_commit_lane(
+    searcher: &tantivy::Searcher,
+    fields: bbox_corpus_index::index::FieldHandles,
+    generation: &HistoryGenerationRecordV1,
+    owner: &bbox_corpus_index::index::schema_replacement::CommitDocumentOwnerV1,
+) -> HistoryMaterializerResult<()> {
+    let verify = || -> anyhow::Result<()> {
+        generation
+            .validate()
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let lane = read_history_commit_lane(
+            searcher,
+            fields,
+            generation.manifest.body.namespace.as_str(),
+        )?;
+        let expected_count = generation.commit_documents.len() as u64;
+        if lane.anonymous != 0 || lane.total != expected_count {
+            anyhow::bail!(
+                "Tantivy namespace does not equal generation {} (expected {} rows, found {}, \
+                 {} without an entity id)",
+                generation.id,
+                expected_count,
+                lane.total,
+                lane.anonymous
+            );
+        }
+        let schema = searcher.schema();
+        for row in &generation.commit_documents {
+            let expected = expected_commit_row_digest(schema, fields, row, owner)?;
+            if lane.rows.get(&row.entity_id).map(Vec::as_slice) != Some(&[expected][..]) {
+                anyhow::bail!(
+                    "Tantivy namespace does not equal generation {}: commit row {} is missing, \
+                     duplicated, or carries different stored fields",
+                    generation.id,
+                    row.entity_id
+                );
+            }
         }
         Ok(())
     };

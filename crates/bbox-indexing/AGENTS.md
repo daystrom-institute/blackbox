@@ -30,10 +30,16 @@
   caller classes: pre-replacement/Phase-6 materialization, live checkout
   refresh, and verified typed-producer refresh. A producer activation may
   prepare the builder's exact future id for its journal, but cannot encode or
-  publish a generation through another path. Publication replaces the whole
-  `(repo_id, doc_type=commit)` lane before re-emitting, because a complete
-  force-pushed source can remove commits that entity-only upsert would strand;
-  `repo_id` alone is forbidden because code chunks share it.
+  publish a generation through another path. Publication reconciles the
+  whole `(repo_id, doc_type=commit)` lane against the complete generation:
+  rows are compared on every stored field (owner fields included), only new or
+  differing rows are written, and every lane row absent from the generation is
+  deleted, because a complete force-pushed source can remove commits that
+  entity-only upsert would strand. The committed lane is then verified in full
+  and falls back to whole-lane replacement on any mismatch; `repo_id` alone is
+  forbidden as a delete key because code chunks share it. Unchanged rows are
+  never re-enqueued for embedding; new or rewritten rows are enqueued only
+  when no active vector covers their exact content.
 - Typed history publication requires exact equality between the projects with
   materialized edge rows and the projects with snapshot ids. The writer actor
   must not commit edges for a project without staging and finalizing that same

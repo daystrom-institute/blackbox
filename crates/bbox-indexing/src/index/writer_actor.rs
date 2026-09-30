@@ -29,7 +29,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use tantivy::collector::{Count, TopDocs};
-use tantivy::query::{BooleanQuery, Occur, TermQuery};
+use tantivy::query::TermQuery;
 use tantivy::schema::{IndexRecordOption, Term};
 use tantivy::{Index, IndexReader, IndexWriter};
 
@@ -260,6 +260,44 @@ pub struct HistoryPublicationResultV1 {
     pub commit_document_count: u64,
     pub commit_view_commitment: String,
     pub overlay_file_commitments: std::collections::BTreeMap<String, String>,
+    pub lane: HistoryLanePublicationV1,
+}
+
+/// How a history publication changed its `(repo_id, doc_type=commit)` lane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryLanePublicationModeV1 {
+    /// Only rows that differ from the committed lane were written or deleted.
+    Diff,
+    /// The whole lane was deleted and every planned row re-emitted.
+    Full,
+}
+
+impl HistoryLanePublicationModeV1 {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Diff => "diff",
+            Self::Full => "full",
+        }
+    }
+}
+
+/// Lane write accounting for one history publication. `added` counts planned
+/// entity ids absent from the prior lane, `rewritten` present ones whose
+/// stored row differed (an owner change rewrites every row), `removed` prior
+/// ids absent from the plan, `unchanged` rows left untouched. A full
+/// replacement reports every planned row as added and every prior row as
+/// removed. `vectors_enqueued` counts commit messages handed to the embed
+/// queue; `vectors_verified` those skipped because an active vector already
+/// covers them. Unchanged rows are never probed or enqueued.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HistoryLanePublicationV1 {
+    pub mode: HistoryLanePublicationModeV1,
+    pub added: u64,
+    pub rewritten: u64,
+    pub removed: u64,
+    pub unchanged: u64,
+    pub vectors_enqueued: u64,
+    pub vectors_verified: u64,
 }
 
 type PostCommitHook = Arc<dyn Fn(tantivy::Searcher) + Send + Sync>;
@@ -2305,41 +2343,37 @@ fn run_history_generation_publication(
     }
     let edges_dir =
         bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(&ctx.config.projects_path);
+    let namespace = generation.manifest.body.namespace.as_str();
+    let schema = ctx.index.schema();
+    let expected = generation
+        .commit_documents
+        .iter()
+        .map(|row| {
+            super::history_transport::expected_commit_row_digest(&schema, ctx.fields, row, owner)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    // This generation is the COMPLETE active commit view for its namespace.
+    // The committed lane is diffed against it row by row (every stored field,
+    // owner fields included): only new or differing rows are written and
+    // rows absent from the plan are deleted, so a force-push removal is a set
+    // difference. A lane this diff cannot address row by row is replaced
+    // whole, exactly as before the diff existed.
+    let plan = match latest_committed_searcher(&ctx.index).and_then(|searcher| {
+        super::history_transport::read_history_commit_lane(&searcher, ctx.fields, namespace)
+    }) {
+        Ok(lane) => plan_history_lane(&lane, &generation.commit_documents, &expected),
+        Err(error) => {
+            tracing::warn!(
+                namespace,
+                error = %error,
+                "history lane could not be read for a diff; replacing it whole"
+            );
+            HistoryLanePlan::full(&generation.commit_documents, 0)
+        }
+    };
     let mut writer = create_writer(&ctx.index, WRITER_HEAP_REINDEX)?;
     writer.set_merge_policy(Box::new(conservative_log_merge_policy()));
-    // This generation is the COMPLETE active commit view for its namespace.
-    // A force-push can legitimately remove commits, so delete the
-    // `(repo_id, doc_type=commit)` lane before re-emitting the exact
-    // generation inventory; deleting `repo_id` alone would also erase live
-    // code chunks from that repository.
-    writer.delete_query(Box::new(BooleanQuery::new(vec![
-        (
-            Occur::Must,
-            Box::new(TermQuery::new(
-                Term::from_field_text(
-                    ctx.fields.repo_id,
-                    generation.manifest.body.namespace.as_str(),
-                ),
-                IndexRecordOption::Basic,
-            )),
-        ),
-        (
-            Occur::Must,
-            Box::new(TermQuery::new(
-                Term::from_field_text(ctx.fields.doc_type, "commit"),
-                IndexRecordOption::Basic,
-            )),
-        ),
-    ])))?;
-    let written = bbox_corpus_index::index::schema_replacement::reemit_commit_documents(
-        &writer,
-        ctx.fields,
-        &generation.commit_documents,
-        owner,
-    )?;
-    for input in &generation.vector_inputs {
-        super::embed_hook::emit_git_message(&input.entity_id, &input.content_hash, &input.message);
-    }
+    apply_history_lane_plan(&writer, ctx.fields, generation, owner, &plan)?;
 
     let mut publications: Vec<(String, super::project_files::PublicationResult)> = Vec::new();
     let staging_attempt = (|| -> Result<()> {
@@ -2391,12 +2425,9 @@ fn run_history_generation_publication(
             prior_payload.as_deref(),
             &current,
         )?;
-        let mut prepared = writer.prepare_commit()?;
+        inject_history_publication_failure(namespace, "before-commit")?;
         let payload = commitments.join(",");
-        if !payload.is_empty() {
-            prepared.set_payload(&payload);
-        }
-        prepared.commit()?;
+        commit_with_payload(&mut writer, &payload)?;
         Ok(payload)
     })();
     let commit_payload = match commit_attempt {
@@ -2425,6 +2456,58 @@ fn run_history_generation_publication(
     for handle in &handles {
         bbox_edge_sidecar::snapshot::finalize_snapshot_publication(handle)?;
     }
+    // The whole committed lane, owner fields included, must equal the
+    // generation before anything is exposed. A diff that did not converge is
+    // replaced whole under the same receipt payload; a full replacement that
+    // still disagrees fails the publication.
+    let verify_lane = || -> Result<()> {
+        super::history_transport::verify_history_commit_lane(
+            &latest_committed_searcher(&ctx.index)?,
+            ctx.fields,
+            generation,
+            owner,
+        )
+        .map_err(|error| anyhow!("{error}"))
+    };
+    let mut lane = plan.accounting();
+    if let Err(error) = verify_lane() {
+        if plan.mode == HistoryLanePublicationModeV1::Full {
+            return Err(error.context("history lane replacement did not verify"));
+        }
+        tracing::warn!(
+            namespace,
+            error = %error,
+            "history lane diff did not verify; replacing the lane whole"
+        );
+        let full = HistoryLanePlan::full(&generation.commit_documents, plan.prior_total);
+        apply_history_lane_plan(&writer, ctx.fields, generation, owner, &full)?;
+        commit_with_payload(&mut writer, &commit_payload)?;
+        verify_lane().context("history lane replacement did not verify")?;
+        lane = HistoryLanePublicationV1 {
+            mode: HistoryLanePublicationModeV1::Full,
+            ..full.accounting()
+        };
+    }
+    // Vector work follows the diff, never the whole generation: an unchanged
+    // row is neither probed nor enqueued. A new or rewritten row is enqueued
+    // only when no active vector already covers its exact content.
+    for input in &generation.vector_inputs {
+        if !plan.upserted_ids.contains(input.entity_id.as_str()) {
+            continue;
+        }
+        match super::embed_hook::git_message_vector_is_active(&input.entity_id, &input.content_hash)
+        {
+            Some(true) => lane.vectors_verified += 1,
+            Some(false) | None => {
+                super::embed_hook::emit_git_message(
+                    &input.entity_id,
+                    &input.content_hash,
+                    &input.message,
+                );
+                lane.vectors_enqueued += 1;
+            }
+        }
+    }
     let overlay_file_commitments = publications
         .iter()
         .map(|(project_id, _)| {
@@ -2446,14 +2529,201 @@ fn run_history_generation_publication(
     )?;
     post_commit(ctx);
     Ok(HistoryPublicationResultV1 {
-        commit_document_count: written,
+        commit_document_count: generation.commit_documents.len() as u64,
         commit_view_commitment: generation
             .manifest
             .body
             .commit_document_commitment_sha256
             .clone(),
         overlay_file_commitments,
+        lane,
     })
+}
+
+/// A searcher over the latest commit, independent of the shared reader, so a
+/// publication can read and verify its lane before `post_commit` reloads the
+/// reader everyone else searches.
+fn latest_committed_searcher(index: &Index) -> Result<tantivy::Searcher> {
+    let reader: IndexReader = index
+        .reader_builder()
+        .reload_policy(tantivy::ReloadPolicy::Manual)
+        .try_into()?;
+    Ok(reader.searcher())
+}
+
+fn commit_with_payload(writer: &mut IndexWriter, payload: &str) -> Result<()> {
+    let mut prepared = writer.prepare_commit()?;
+    if !payload.is_empty() {
+        prepared.set_payload(payload);
+    }
+    prepared.commit()?;
+    Ok(())
+}
+
+/// Planned writes for one history lane publication.
+struct HistoryLanePlan {
+    mode: HistoryLanePublicationModeV1,
+    /// Indices into the generation's `commit_documents` to (re)write.
+    upserts: Vec<usize>,
+    upserted_ids: std::collections::BTreeSet<String>,
+    removals: Vec<String>,
+    /// Documents in the lane before this publication.
+    prior_total: u64,
+    added: u64,
+    rewritten: u64,
+    unchanged: u64,
+    removed: u64,
+}
+
+impl HistoryLanePlan {
+    fn full(
+        rows: &[bbox_corpus_index::index::history_generations::HistoryCommitDocumentV1],
+        prior_total: u64,
+    ) -> Self {
+        Self {
+            mode: HistoryLanePublicationModeV1::Full,
+            upserts: (0..rows.len()).collect(),
+            upserted_ids: rows.iter().map(|row| row.entity_id.clone()).collect(),
+            removals: Vec::new(),
+            prior_total,
+            added: rows.len() as u64,
+            rewritten: 0,
+            unchanged: 0,
+            removed: prior_total,
+        }
+    }
+
+    fn accounting(&self) -> HistoryLanePublicationV1 {
+        HistoryLanePublicationV1 {
+            mode: self.mode,
+            added: self.added,
+            rewritten: self.rewritten,
+            removed: self.removed,
+            unchanged: self.unchanged,
+            vectors_enqueued: 0,
+            vectors_verified: 0,
+        }
+    }
+}
+
+/// Diff the committed lane against the planned rows. A lane holding a
+/// document no entity-id delete term can reach is planned as a whole-lane
+/// replacement.
+fn plan_history_lane(
+    lane: &super::history_transport::HistoryCommitLaneV1,
+    rows: &[bbox_corpus_index::index::history_generations::HistoryCommitDocumentV1],
+    expected: &[super::history_transport::StoredRowDigest],
+) -> HistoryLanePlan {
+    if lane.anonymous != 0 {
+        return HistoryLanePlan::full(rows, lane.total);
+    }
+    let mut plan = HistoryLanePlan {
+        mode: HistoryLanePublicationModeV1::Diff,
+        upserts: Vec::new(),
+        upserted_ids: Default::default(),
+        removals: Vec::new(),
+        prior_total: lane.total,
+        added: 0,
+        rewritten: 0,
+        unchanged: 0,
+        removed: 0,
+    };
+    let mut planned = std::collections::BTreeSet::new();
+    for (index, (row, digest)) in rows.iter().zip(expected).enumerate() {
+        planned.insert(row.entity_id.as_str());
+        match lane.rows.get(&row.entity_id) {
+            Some(stored) if stored.as_slice() == std::slice::from_ref(digest) => {
+                plan.unchanged += 1;
+                continue;
+            }
+            Some(_) => plan.rewritten += 1,
+            None => plan.added += 1,
+        }
+        plan.upserts.push(index);
+        plan.upserted_ids.insert(row.entity_id.clone());
+    }
+    plan.removals = lane
+        .rows
+        .keys()
+        .filter(|entity_id| !planned.contains(entity_id.as_str()))
+        .cloned()
+        .collect();
+    plan.removed = plan.removals.len() as u64;
+    plan
+}
+
+// executes inside the IndexWriterActor pass (sanctioned single-writer).
+#[allow(clippy::disallowed_methods)]
+fn apply_history_lane_plan(
+    writer: &IndexWriter,
+    fields: FieldHandles,
+    generation: &bbox_corpus_index::index::history_generations::HistoryGenerationRecordV1,
+    owner: &bbox_corpus_index::index::schema_replacement::CommitDocumentOwnerV1,
+    plan: &HistoryLanePlan,
+) -> Result<()> {
+    let namespace = generation.manifest.body.namespace.as_str();
+    if plan.mode == HistoryLanePublicationModeV1::Full {
+        // `repo_id` alone is forbidden: code chunks share it.
+        writer.delete_query(Box::new(
+            super::history_transport::history_commit_lane_query(fields, namespace),
+        ))?;
+    }
+    for entity_id in &plan.removals {
+        writer.delete_term(Term::from_field_text(fields.entity_id, entity_id));
+    }
+    let mut skip_one = plan.mode == HistoryLanePublicationModeV1::Diff
+        && history_publication_failure_armed(namespace, "diff-skips-a-row");
+    for &index in &plan.upserts {
+        let row = &generation.commit_documents[index];
+        writer.delete_term(Term::from_field_text(fields.entity_id, &row.entity_id));
+        if std::mem::take(&mut skip_one) {
+            continue;
+        }
+        writer.add_document(
+            bbox_corpus_index::index::schema_replacement::build_commit_doc_from_row(
+                row, owner, fields,
+            ),
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+static HISTORY_PUBLICATION_FAILURE: parking_lot::Mutex<Option<(String, &'static str)>> =
+    parking_lot::Mutex::new(None);
+
+/// Arm a one-shot publication failpoint for one namespace. The actor runs on
+/// its own thread, so the arm is process-wide and keyed by namespace.
+#[cfg(test)]
+fn set_history_publication_failure(namespace: &str, point: &'static str) {
+    *HISTORY_PUBLICATION_FAILURE.lock() = Some((namespace.to_string(), point));
+}
+
+#[cfg(test)]
+fn history_publication_failure_armed(namespace: &str, point: &'static str) -> bool {
+    let mut armed = HISTORY_PUBLICATION_FAILURE.lock();
+    if armed
+        .as_ref()
+        .is_some_and(|(armed_namespace, armed_point)| {
+            armed_namespace == namespace && *armed_point == point
+        })
+    {
+        *armed = None;
+        return true;
+    }
+    false
+}
+
+#[cfg(not(test))]
+fn history_publication_failure_armed(_namespace: &str, _point: &'static str) -> bool {
+    false
+}
+
+fn inject_history_publication_failure(namespace: &str, point: &'static str) -> Result<()> {
+    if history_publication_failure_armed(namespace, point) {
+        anyhow::bail!("injected history publication failure at {point}");
+    }
+    Ok(())
 }
 
 fn run_selector_retirement(ctx: &ActorCtx, selector: &str) -> Result<u64> {
@@ -3120,6 +3390,325 @@ mod tests {
             1,
             "exact Git replacement must not delete code documents sharing the repo id"
         );
+    }
+
+    /// One namespace, one actor, and a generation builder over it.
+    struct HistoryLaneFixture {
+        _directory: tempfile::TempDir,
+        root: std::path::PathBuf,
+        transcript: TranscriptIndex,
+        actor: IndexWriterActor,
+        namespace: bbox_corpus_core::project_catalog::CommitNamespace,
+    }
+
+    impl HistoryLaneFixture {
+        fn new(namespace: &str) -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().canonicalize().unwrap();
+            let transcript = test_index(&root);
+            let actor = IndexWriterActor::spawn_for(&transcript);
+            Self {
+                _directory: directory,
+                root,
+                transcript,
+                actor,
+                namespace: bbox_corpus_core::project_catalog::CommitNamespace::parse(namespace)
+                    .unwrap(),
+            }
+        }
+
+        fn commit(seed: char, message: &str) -> bbox_corpus_core::git::GitCommit {
+            bbox_corpus_core::git::GitCommit {
+                sha: seed.to_string().repeat(40),
+                parent_shas: vec![],
+                author_name: "A".into(),
+                author_email: "a@example.invalid".into(),
+                message: message.into(),
+            }
+        }
+
+        fn generation(
+            &self,
+            commits: &[bbox_corpus_core::git::GitCommit],
+        ) -> bbox_corpus_index::index::history_generations::HistoryGenerationRecordV1 {
+            use bbox_corpus_index::index::history_generations::{
+                HistoryGenerationInputV1, HistoryGenerationOwnerV1, HistoryGenerationStore,
+                generation_rows_for_commit, live_schema_evidence,
+            };
+            let mut documents = Vec::new();
+            let mut vectors = Vec::new();
+            for commit in commits {
+                let (document, vector) =
+                    generation_rows_for_commit(commit, self.namespace.as_str());
+                documents.push(document);
+                vectors.push(vector);
+            }
+            let (schema_version, schema_fingerprint) = live_schema_evidence().unwrap();
+            HistoryGenerationStore::open_for_index(&self.root.join("idx"))
+                .unwrap()
+                .create_or_open(HistoryGenerationInputV1 {
+                    namespace: self.namespace.clone(),
+                    owner: HistoryGenerationOwnerV1::Owned {
+                        repo_history_id: bbox_corpus_core::project_catalog::RepoHistoryId::parse(
+                            "rh_00000000000000000000000000000009",
+                        )
+                        .unwrap(),
+                    },
+                    commit_documents: documents,
+                    vector_inputs: vectors,
+                    truncated_message_count: 0,
+                    source_schema_version: schema_version,
+                    source_schema_fingerprint_sha256: schema_fingerprint,
+                    source_index_fingerprint_sha256: "test-lane-diff".into(),
+                })
+                .unwrap()
+        }
+
+        fn owner(
+            display: &str,
+        ) -> bbox_corpus_index::index::schema_replacement::CommitDocumentOwnerV1 {
+            bbox_corpus_index::index::schema_replacement::CommitDocumentOwnerV1 {
+                project_id: Some("p_lane_owner".into()),
+                project_display: display.into(),
+            }
+        }
+
+        fn publish(
+            &self,
+            generation: &bbox_corpus_index::index::history_generations::HistoryGenerationRecordV1,
+            owner: &bbox_corpus_index::index::schema_replacement::CommitDocumentOwnerV1,
+        ) -> Result<HistoryPublicationResultV1> {
+            self.actor.publish_history_generation(
+                generation.clone(),
+                owner.clone(),
+                Default::default(),
+                Default::default(),
+            )
+        }
+
+        fn verify(
+            &self,
+            generation: &bbox_corpus_index::index::history_generations::HistoryGenerationRecordV1,
+            owner: &bbox_corpus_index::index::schema_replacement::CommitDocumentOwnerV1,
+        ) -> std::result::Result<(), String> {
+            self.transcript.reader_reload_for_test();
+            super::super::history_transport::verify_history_commit_lane(
+                &self.transcript.searcher(),
+                self.transcript.field_handles(),
+                generation,
+                owner,
+            )
+            .map_err(|error| error.to_string())
+        }
+
+        fn deleted_docs(&self) -> u32 {
+            self.transcript.reader_reload_for_test();
+            self.transcript
+                .searcher()
+                .segment_readers()
+                .iter()
+                .map(|segment| segment.num_deleted_docs())
+                .sum()
+        }
+
+        fn entity_count(&self, entity_id: &str) -> usize {
+            self.transcript.reader_reload_for_test();
+            let query = TermQuery::new(
+                Term::from_field_text(self.transcript.field_handles().entity_id, entity_id),
+                IndexRecordOption::Basic,
+            );
+            self.transcript.searcher().search(&query, &Count).unwrap()
+        }
+    }
+
+    fn lane(
+        mode: HistoryLanePublicationModeV1,
+        added: u64,
+        rewritten: u64,
+        removed: u64,
+        unchanged: u64,
+    ) -> (HistoryLanePublicationModeV1, u64, u64, u64, u64) {
+        (mode, added, rewritten, removed, unchanged)
+    }
+
+    fn lane_of(
+        result: &HistoryPublicationResultV1,
+    ) -> (HistoryLanePublicationModeV1, u64, u64, u64, u64) {
+        (
+            result.lane.mode,
+            result.lane.added,
+            result.lane.rewritten,
+            result.lane.removed,
+            result.lane.unchanged,
+        )
+    }
+
+    #[test]
+    fn history_lane_diff_writes_only_changed_rows_and_enqueues_only_new_commits() {
+        use HistoryLanePublicationModeV1::Diff;
+        let fixture = HistoryLaneFixture::new("repo-lane-diff");
+        let owner = HistoryLaneFixture::owner("alpha");
+        let one = HistoryLaneFixture::commit('1', "one");
+        let two = HistoryLaneFixture::commit('2', "two");
+        let three = HistoryLaneFixture::commit('3', "three");
+
+        // Absent lane: every row is new.
+        let g0 = fixture.generation(&[one.clone(), two.clone()]);
+        let first = fixture.publish(&g0, &owner).unwrap();
+        assert_eq!(lane_of(&first), lane(Diff, 2, 0, 0, 0));
+        assert_eq!(first.lane.vectors_enqueued, 2);
+        assert_eq!(first.commit_document_count, 2);
+        fixture.verify(&g0, &owner).unwrap();
+
+        // Republishing the same generation (working-tree-only drift) writes
+        // no lane row and enqueues nothing.
+        let deleted_before = fixture.deleted_docs();
+        let again = fixture.publish(&g0, &owner).unwrap();
+        assert_eq!(lane_of(&again), lane(Diff, 0, 0, 0, 2));
+        assert_eq!(again.lane.vectors_enqueued, 0);
+        assert_eq!(again.lane.vectors_verified, 0);
+        assert_eq!(again.commit_document_count, 2);
+        assert_eq!(
+            again.commit_view_commitment,
+            g0.manifest.body.commit_document_commitment_sha256
+        );
+        assert_eq!(
+            fixture.deleted_docs(),
+            deleted_before,
+            "an unchanged republish must not delete or rewrite any row"
+        );
+        fixture.verify(&g0, &owner).unwrap();
+
+        // One new commit is one add and one enqueue.
+        let g1 = fixture.generation(&[one.clone(), two.clone(), three.clone()]);
+        let added = fixture.publish(&g1, &owner).unwrap();
+        assert_eq!(lane_of(&added), lane(Diff, 1, 0, 0, 2));
+        assert_eq!(added.lane.vectors_enqueued, 1);
+        fixture.verify(&g1, &owner).unwrap();
+
+        // A force-push that drops a commit removes exactly that row.
+        let g2 = fixture.generation(&[two.clone(), three.clone()]);
+        let removed = fixture.publish(&g2, &owner).unwrap();
+        assert_eq!(lane_of(&removed), lane(Diff, 0, 0, 1, 2));
+        assert_eq!(removed.lane.vectors_enqueued, 0);
+        let dropped =
+            super::super::git_history::commit_entity_id(fixture.namespace.as_str(), &one.sha);
+        assert_eq!(
+            fixture.entity_count(&dropped),
+            0,
+            "a force-pushed commit must leave the lane"
+        );
+        fixture.verify(&g2, &owner).unwrap();
+
+        // An owner change rewrites every row; content is unchanged, so only
+        // the coverage probe decides vector work.
+        let renamed = HistoryLaneFixture::owner("renamed");
+        assert!(fixture.verify(&g2, &renamed).is_err());
+        let rewritten = fixture.publish(&g2, &renamed).unwrap();
+        assert_eq!(lane_of(&rewritten), lane(Diff, 0, 2, 0, 0));
+        assert_eq!(
+            rewritten.lane.vectors_enqueued + rewritten.lane.vectors_verified,
+            2
+        );
+        fixture.verify(&g2, &renamed).unwrap();
+        assert!(
+            fixture.verify(&g2, &owner).is_err(),
+            "lane verification must check owner fields"
+        );
+    }
+
+    #[test]
+    fn history_lane_diff_rewrites_a_legacy_shaped_lane_and_replaces_an_unaddressable_one() {
+        use HistoryLanePublicationModeV1::{Diff, Full};
+        let fixture = HistoryLaneFixture::new("repo-lane-legacy");
+        let owner = HistoryLaneFixture::owner("alpha");
+        let one = HistoryLaneFixture::commit('1', "one");
+        let two = HistoryLaneFixture::commit('2', "two");
+        let fields = fixture.transcript.field_handles();
+        {
+            // Legacy consolidated rows: `file_path` is the namespace and no
+            // `project_id` is stored, so every row differs from the plan.
+            let index = fixture.transcript.index_handle();
+            let mut writer = index.writer(15_000_000).unwrap();
+            for commit in [&one, &two] {
+                writer
+                    .add_document(super::super::git_history::build_commit_doc(
+                        commit,
+                        fixture.namespace.as_str(),
+                        fixture.namespace.as_str(),
+                        "legacy",
+                        fields,
+                    ))
+                    .unwrap();
+            }
+            writer.commit().unwrap();
+        }
+        let g0 = fixture.generation(&[one.clone(), two.clone()]);
+        assert!(fixture.verify(&g0, &owner).is_err());
+        let legacy = fixture.publish(&g0, &owner).unwrap();
+        assert_eq!(lane_of(&legacy), lane(Diff, 0, 2, 0, 0));
+        fixture.verify(&g0, &owner).unwrap();
+
+        // A lane row without an entity id cannot be removed by a row delete,
+        // so the lane is replaced whole.
+        {
+            let index = fixture.transcript.index_handle();
+            let mut writer = index.writer(15_000_000).unwrap();
+            let mut orphan = tantivy::TantivyDocument::default();
+            orphan.add_text(fields.doc_type, "commit");
+            orphan.add_text(fields.repo_id, fixture.namespace.as_str());
+            orphan.add_text(fields.content, "orphaned lane row");
+            writer.add_document(orphan).unwrap();
+            writer.commit().unwrap();
+        }
+        assert!(fixture.verify(&g0, &owner).is_err());
+        let replaced = fixture.publish(&g0, &owner).unwrap();
+        assert_eq!(lane_of(&replaced), lane(Full, 2, 0, 3, 0));
+        fixture.verify(&g0, &owner).unwrap();
+    }
+
+    #[test]
+    fn history_lane_diff_that_does_not_verify_falls_back_to_full_replacement() {
+        use HistoryLanePublicationModeV1::Full;
+        let fixture = HistoryLaneFixture::new("repo-lane-fallback");
+        let owner = HistoryLaneFixture::owner("alpha");
+        let one = HistoryLaneFixture::commit('1', "one");
+        let two = HistoryLaneFixture::commit('2', "two");
+        let g0 = fixture.generation(std::slice::from_ref(&one));
+        fixture.publish(&g0, &owner).unwrap();
+
+        let g1 = fixture.generation(&[one, two]);
+        set_history_publication_failure(fixture.namespace.as_str(), "diff-skips-a-row");
+        let result = fixture.publish(&g1, &owner).unwrap();
+        assert_eq!(result.lane.mode, Full);
+        assert_eq!(result.lane.added, 2);
+        assert_eq!(result.lane.removed, 1);
+        assert_eq!(
+            result.lane.vectors_enqueued, 1,
+            "the fallback keeps the diff's vector scope: only the new commit"
+        );
+        fixture.verify(&g1, &owner).unwrap();
+    }
+
+    #[test]
+    fn history_lane_crash_before_commit_keeps_the_prior_lane_and_the_next_publish_converges() {
+        use HistoryLanePublicationModeV1::Diff;
+        let fixture = HistoryLaneFixture::new("repo-lane-crash");
+        let owner = HistoryLaneFixture::owner("alpha");
+        let one = HistoryLaneFixture::commit('1', "one");
+        let two = HistoryLaneFixture::commit('2', "two");
+        let g0 = fixture.generation(std::slice::from_ref(&one));
+        fixture.publish(&g0, &owner).unwrap();
+
+        let g1 = fixture.generation(&[one, two]);
+        set_history_publication_failure(fixture.namespace.as_str(), "before-commit");
+        let error = fixture.publish(&g1, &owner).unwrap_err().to_string();
+        assert!(error.contains("before-commit"), "{error}");
+        fixture.verify(&g0, &owner).unwrap();
+
+        let converged = fixture.publish(&g1, &owner).unwrap();
+        assert_eq!(lane_of(&converged), lane(Diff, 1, 0, 0, 1));
+        fixture.verify(&g1, &owner).unwrap();
     }
 
     #[test]
