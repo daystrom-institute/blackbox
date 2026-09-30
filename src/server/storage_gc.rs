@@ -6,12 +6,12 @@ use crate::storage_health;
 const DEFAULT_STORAGE_GC_INTERVAL_SECS: u64 = 6 * 60 * 60;
 const DEFAULT_STORAGE_GC_INITIAL_DELAY_SECS: u64 = 5;
 
-/// Age floor for the maintenance pass's inactive-snapshot pruning. The
+/// Age limit for the maintenance pass's inactive-snapshot pruning. The
 /// interactive `bbox_storage_gc` default (14d) let per-commit snapshot churn
 /// accumulate ~24GB in one heavy week (145 generations, one per HEAD commit)
-/// before anything aged out. Snapshot reuse value lives in the keep-recent
-/// retention (3/workspace + 10/repo), which still applies regardless of this
-/// floor; 2 days of extra age protection covers branch-switch round-trips.
+/// before anything aged out. Within the limit the keep-recent retention
+/// (3/workspace + 10/repo) protects branch-switch reuse; past it only the
+/// per-workspace keep-recent count survives as rollback headroom.
 const DEFAULT_SNAPSHOT_MAX_AGE_DAYS: u64 = 2;
 
 pub(crate) fn storage_gc_interval_from_env() -> std::time::Duration {
@@ -32,8 +32,8 @@ fn storage_gc_initial_delay_from_env() -> std::time::Duration {
 }
 
 /// `BLACKBOX_STORAGE_GC_SNAPSHOT_MAX_AGE_DAYS` overrides the maintenance
-/// pass's snapshot age floor. `0` disables age-based retention entirely
-/// (keep-recent rules still protect the newest snapshots).
+/// pass's snapshot age limit. `0` disables age-based retention entirely
+/// (the per-workspace keep-recent count still protects the newest snapshots).
 fn snapshot_max_age_days_from_env() -> u64 {
     std::env::var("BLACKBOX_STORAGE_GC_SNAPSHOT_MAX_AGE_DAYS")
         .ok()

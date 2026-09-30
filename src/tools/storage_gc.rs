@@ -65,12 +65,12 @@ pub(crate) struct StorageGcParams {
     /// never deleted solely to satisfy this cap. Default 2 GiB.
     #[serde(default = "default_backup_cap")]
     pub max_backup_total_bytes: Option<u64>,
-    /// Number of recent inactive snapshot directories retained per workspace.
-    /// Default 3.
+    /// Number of recent inactive snapshot directories retained per workspace,
+    /// at any age (rollback headroom). Default 3.
     #[serde(default = "default_keep_recent_workspace")]
     pub keep_recent_snapshots_per_workspace: u64,
-    /// Number of recent inactive snapshot directories retained per repo.
-    /// Default 10.
+    /// Number of recent inactive snapshot directories retained per repo while
+    /// under the age limit. Default 10.
     #[serde(default = "default_keep_recent_repo")]
     pub keep_recent_snapshots_per_repo: u64,
     /// Grace window after branch switches before inactive snapshots can prune.

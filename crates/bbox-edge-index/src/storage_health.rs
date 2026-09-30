@@ -552,6 +552,11 @@ struct ProjectStorageFacts {
     manifest_projects: HashSet<String>,
     dangling_projects: HashSet<String>,
     repo_by_project: HashMap<String, String>,
+    /// Snapshot and overlay directory names each workspace manifest selects.
+    /// The manifest index is the scan-time authority for the active view;
+    /// this keeps a manifest-selected directory out of GC even when the index
+    /// has not caught up with it.
+    selected_by_project: HashMap<String, HashSet<String>>,
 }
 
 impl ProjectStorageFacts {
@@ -596,6 +601,19 @@ fn collect_project_storage_facts(edges_dir: &Path) -> Result<ProjectStorageFacts
         }
         let manifest = bbox_edge_sidecar::manifest::WorkspaceManifest::read_from(&manifest_path)?;
         facts.manifest_projects.insert(manifest.project_id.clone());
+        let selected = manifest
+            .active_snapshot_id
+            .iter()
+            .chain(manifest.active_dirty_overlay_id.iter())
+            .cloned()
+            .collect::<HashSet<_>>();
+        if !selected.is_empty() {
+            facts
+                .selected_by_project
+                .entry(manifest.project_id.clone())
+                .or_default()
+                .extend(selected);
+        }
         if let Some(repo_id) = manifest.repo_id {
             facts
                 .repo_by_project
@@ -1681,6 +1699,30 @@ fn plan_snapshot_gc(
         let Some((project_id, snapshot_dir)) = inactive_snapshot_key(&file.path) else {
             continue;
         };
+        let manifest_selected = Path::new(&snapshot_dir)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                project_facts
+                    .selected_by_project
+                    .get(&project_id)
+                    .is_some_and(|selected| selected.contains(name))
+            });
+        if manifest_selected {
+            candidates.push(GcCandidate {
+                path: file.path.clone(),
+                root_relative_path: None,
+                planned_device: None,
+                planned_inode: None,
+                planned_mtime_secs: None,
+                kind: file.kind,
+                bytes: file.bytes,
+                project_id: file.project_id.clone(),
+                rule: "snapshot_retained_manifest_selected".to_string(),
+                deletable: false,
+            });
+            continue;
+        }
         let repo_id = project_facts
             .repo_by_project
             .get(&project_id)
@@ -1735,6 +1777,11 @@ fn plan_snapshot_gc(
     // count/byte budgets. Recent workspace/repo and grace rules are retention
     // priorities, not budget exemptions: an exemption here made the 16 GiB
     // setting cosmetic while the ten-recent repo floor retained ~50 GiB.
+    //
+    // Past the age limit only the per-workspace keep-recent count survives:
+    // it is the rollback headroom. The repo floor is a reuse cache for
+    // branch hopping inside the age window; letting it outrank age kept every
+    // aged snapshot of a workspace whose total stayed under the budgets.
     let mut by_workspace: HashMap<&str, Vec<(&String, &DirAgg)>> = HashMap::new();
     for (dir, agg) in &dirs {
         by_workspace
@@ -1749,6 +1796,9 @@ fn plan_snapshot_gc(
         let mut count_used: u64 = 0;
         let mut bytes_used: u64 = 0;
         for (dir, agg) in entries {
+            let past_age = policy
+                .max_age_days
+                .is_some_and(|max_days| agg.age_secs >= max_days * 86400);
             let floor_reason = None
                 .or_else(|| {
                     retain_by_workspace
@@ -1756,8 +1806,7 @@ fn plan_snapshot_gc(
                         .then(|| "snapshot_retained_recent_workspace".to_string())
                 })
                 .or_else(|| {
-                    retain_by_repo
-                        .contains(dir)
+                    (!past_age && retain_by_repo.contains(dir))
                         .then(|| "snapshot_retained_recent_repo".to_string())
                 })
                 .or_else(|| {
@@ -1801,10 +1850,7 @@ fn plan_snapshot_gc(
                 continue;
             }
 
-            let under_age = policy
-                .max_age_days
-                .is_some_and(|max_days| agg.age_secs < max_days * 86400);
-            if !under_age {
+            if past_age || policy.max_age_days.is_none() {
                 dir_fate.insert(
                     dir.clone(),
                     (
@@ -3133,6 +3179,299 @@ mod tests {
                 .count(),
             8,
             "the ten-recent repo priority must not bypass the ceiling"
+        );
+    }
+
+    /// Age every member of a snapshot tree to `days` before now.
+    fn age_snapshot_tree(edges_dir: &Path, project_id: &str, snapshot_id: &str, days: u64) {
+        let dir = bbox_edge_sidecar::manifest::materialized_dir(edges_dir)
+            .join("workspace")
+            .join(project_id)
+            .join("snapshots")
+            .join(snapshot_id);
+        let when = std::time::SystemTime::now() - std::time::Duration::from_secs(days * 86_400);
+        for entry in fs::read_dir(&dir).unwrap() {
+            filetime::set_file_mtime(
+                entry.unwrap().path(),
+                filetime::FileTime::from_system_time(when),
+            )
+            .unwrap();
+        }
+    }
+
+    fn write_aged_snapshot(edges_dir: &Path, project_id: &str, snapshot_id: &str, days: u64) {
+        write_snapshot_jsonl(edges_dir, project_id, snapshot_id);
+        age_snapshot_tree(edges_dir, project_id, snapshot_id, days);
+    }
+
+    /// The maintenance pass's policy: defaults with the 2-day age limit.
+    fn maintenance_snapshot_plan(
+        edges_dir: &Path,
+        registered: &HashSet<String>,
+    ) -> Vec<GcCandidate> {
+        let mut policy = GcPolicy::default();
+        policy.materialized_snapshots.max_age_days = Some(2);
+        plan_gc_with_policy(
+            edges_dir,
+            registered,
+            &GcParams {
+                dry_run: true,
+                project_filter: None,
+                prune_backups: false,
+                prune_orphans: false,
+                prune_temps: false,
+                prune_inactive_snapshots: true,
+                max_backup_age_days: None,
+                keep_newest_backup_per_source: 1,
+            },
+            &policy,
+        )
+        .unwrap()
+    }
+
+    fn snapshot_fate(
+        candidates: &[GcCandidate],
+        project_id: &str,
+        snapshot_id: &str,
+    ) -> Option<(bool, String)> {
+        let suffix = format!("workspace/{project_id}/snapshots/{snapshot_id}");
+        candidates
+            .iter()
+            .find(|candidate| candidate.path.ends_with(&suffix))
+            .map(|candidate| (candidate.deletable, candidate.rule.clone()))
+    }
+
+    /// Production shape: one workspace whose active snapshot is a fresh
+    /// collected generation and nine inactive `nongit-*` snapshots from weeks
+    /// ago, together far under the per-workspace count and byte budgets. The
+    /// repo keep-recent count (10) used to outrank the age limit and keep all
+    /// nine; only the per-workspace rollback headroom survives now.
+    #[test]
+    fn aged_inactive_snapshots_under_budget_are_collected_beyond_rollback_headroom() {
+        let dir = tempfile::tempdir().unwrap();
+        let edges_dir = dir.path().join("edges");
+        fs::create_dir_all(&edges_dir).unwrap();
+
+        write_aged_snapshot(&edges_dir, "ws1", "collected-active", 0);
+        let nongit = (0..9)
+            .map(|index| format!("nongit-{index:02}"))
+            .collect::<Vec<_>>();
+        for (index, id) in nongit.iter().enumerate() {
+            // nongit-00 is the newest; each later one is an hour older.
+            write_snapshot_jsonl(&edges_dir, "ws1", id);
+            let when = std::time::SystemTime::now()
+                - std::time::Duration::from_secs(52 * 86_400 + index as u64 * 3_600);
+            let member = bbox_edge_sidecar::manifest::materialized_dir(&edges_dir)
+                .join("workspace/ws1/snapshots")
+                .join(id)
+                .join("project.jsonl");
+            filetime::set_file_mtime(&member, filetime::FileTime::from_system_time(when)).unwrap();
+        }
+        write_workspace_manifest(
+            &edges_dir,
+            "ws1",
+            Some("repo1"),
+            Some(dir.path()),
+            "collected-active",
+        );
+        write_manifest_index(&edges_dir, "ws1", "collected-active");
+
+        let registered: HashSet<String> = ["ws1".to_string()].into_iter().collect();
+        let candidates = maintenance_snapshot_plan(&edges_dir, &registered);
+
+        assert_eq!(
+            snapshot_fate(&candidates, "ws1", "collected-active"),
+            None,
+            "the active snapshot is never a candidate"
+        );
+        for id in &nongit[..3] {
+            let (deletable, rule) = snapshot_fate(&candidates, "ws1", id).expect("candidate");
+            assert!(!deletable, "{id} is rollback headroom: {rule}");
+            assert_eq!(rule, "snapshot_retained_recent_workspace");
+        }
+        for id in &nongit[3..] {
+            let (deletable, rule) = snapshot_fate(&candidates, "ws1", id).expect("candidate");
+            assert!(
+                deletable,
+                "{id} is past the age limit beyond headroom: {rule}"
+            );
+            assert!(rule.starts_with("snapshot_prunable("), "{id}: {rule}");
+        }
+
+        let (deleted, errors) = apply_gc(&edges_dir, &candidates);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(deleted.len(), 6);
+        let snapshots = bbox_edge_sidecar::manifest::materialized_dir(&edges_dir)
+            .join("workspace/ws1/snapshots");
+        assert!(snapshots.join("collected-active/project.jsonl").is_file());
+        for id in &nongit[..3] {
+            assert!(snapshots.join(id).is_dir(), "{id} must survive");
+        }
+        for id in &nongit[3..] {
+            assert!(!snapshots.join(id).exists(), "{id} must be reclaimed");
+        }
+    }
+
+    /// Within the age limit the repo keep-recent count still keeps
+    /// branch-switch reuse beyond the per-workspace headroom.
+    #[test]
+    fn repo_keep_recent_still_protects_snapshots_inside_the_age_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let edges_dir = dir.path().join("edges");
+        fs::create_dir_all(&edges_dir).unwrap();
+
+        write_aged_snapshot(&edges_dir, "ws1", "head-active", 0);
+        for index in 0..5 {
+            write_aged_snapshot(&edges_dir, "ws1", &format!("head-{index}"), 1);
+        }
+        write_workspace_manifest(
+            &edges_dir,
+            "ws1",
+            Some("repo1"),
+            Some(dir.path()),
+            "head-active",
+        );
+        write_manifest_index(&edges_dir, "ws1", "head-active");
+
+        let registered: HashSet<String> = ["ws1".to_string()].into_iter().collect();
+        let candidates = maintenance_snapshot_plan(&edges_dir, &registered);
+        let inactive = candidates
+            .iter()
+            .filter(|candidate| candidate.kind == FileKind::InactiveSnapshot)
+            .collect::<Vec<_>>();
+        assert_eq!(inactive.len(), 5);
+        assert!(
+            inactive.iter().all(|candidate| !candidate.deletable),
+            "young snapshots stay: {inactive:?}"
+        );
+    }
+
+    /// A never-provisioned workspace: its manifest selects no snapshot and the
+    /// manifest index has no entry for it, so every snapshot is inactive. The
+    /// rollback headroom survives and the aged rest is collected.
+    #[test]
+    fn never_provisioned_workspace_ages_out_beyond_rollback_headroom() {
+        let dir = tempfile::tempdir().unwrap();
+        let edges_dir = dir.path().join("edges");
+        fs::create_dir_all(&edges_dir).unwrap();
+
+        write_aged_snapshot(&edges_dir, "ws-live", "head-active", 0);
+        write_workspace_manifest(
+            &edges_dir,
+            "ws-live",
+            Some("repo1"),
+            Some(dir.path()),
+            "head-active",
+        );
+        write_manifest_index(&edges_dir, "ws-live", "head-active");
+        for (index, days) in [10, 11, 12, 13, 14].into_iter().enumerate() {
+            write_aged_snapshot(&edges_dir, "ws-never", &format!("nongit-{index}"), days);
+        }
+        write_aged_snapshot(&edges_dir, "ws-never", "nongit-young", 0);
+        bbox_edge_sidecar::manifest::WorkspaceManifest::write_to(
+            &edges_dir,
+            &bbox_edge_sidecar::manifest::WorkspaceManifest {
+                version: 1,
+                project_id: "ws-never".to_string(),
+                repo_id: None,
+                canonical_path: Some(dir.path().display().to_string()),
+                git_common_dir: None,
+                git_worktree_dir: None,
+                branch: None,
+                head_sha: None,
+                dirty: false,
+                dirty_fingerprint: None,
+                active_snapshot_id: None,
+                active_dirty_overlay_id: None,
+                updated_at: None,
+            },
+        )
+        .unwrap();
+
+        let registered: HashSet<String> = ["ws-live".to_string()].into_iter().collect();
+        let candidates = maintenance_snapshot_plan(&edges_dir, &registered);
+
+        assert_eq!(snapshot_fate(&candidates, "ws-live", "head-active"), None);
+        let (young_deletable, _) =
+            snapshot_fate(&candidates, "ws-never", "nongit-young").expect("young");
+        assert!(!young_deletable);
+        for index in 0..2 {
+            let (deletable, rule) =
+                snapshot_fate(&candidates, "ws-never", &format!("nongit-{index}"))
+                    .expect("candidate");
+            assert!(!deletable, "headroom: {rule}");
+        }
+        for index in 2..5 {
+            let (deletable, rule) =
+                snapshot_fate(&candidates, "ws-never", &format!("nongit-{index}"))
+                    .expect("candidate");
+            assert!(deletable, "aged beyond headroom: {rule}");
+        }
+    }
+
+    /// An orphaned workspace: its checkout path is gone, it is not registered,
+    /// and the manifest index no longer names it. Its own manifest still
+    /// selects a snapshot, which is never collected; aged inactive snapshots
+    /// beyond the headroom are.
+    #[test]
+    fn orphaned_workspace_keeps_its_manifest_selected_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let edges_dir = dir.path().join("edges");
+        fs::create_dir_all(&edges_dir).unwrap();
+
+        write_aged_snapshot(&edges_dir, "ws-live", "head-active", 0);
+        write_workspace_manifest(
+            &edges_dir,
+            "ws-live",
+            Some("repo1"),
+            Some(dir.path()),
+            "head-active",
+        );
+        write_manifest_index(&edges_dir, "ws-live", "head-active");
+
+        write_aged_snapshot(&edges_dir, "ws-orphan", "head-selected", 40);
+        for index in 0..5 {
+            write_aged_snapshot(
+                &edges_dir,
+                "ws-orphan",
+                &format!("head-{index}"),
+                30 + index,
+            );
+        }
+        write_workspace_manifest(
+            &edges_dir,
+            "ws-orphan",
+            Some("repo1"),
+            Some(&dir.path().join("gone")),
+            "head-selected",
+        );
+
+        let registered: HashSet<String> = ["ws-live".to_string()].into_iter().collect();
+        let candidates = maintenance_snapshot_plan(&edges_dir, &registered);
+
+        let (selected_deletable, selected_rule) =
+            snapshot_fate(&candidates, "ws-orphan", "head-selected").expect("selected");
+        assert!(!selected_deletable);
+        assert_eq!(selected_rule, "snapshot_retained_manifest_selected");
+        for index in 0..3 {
+            let (deletable, rule) =
+                snapshot_fate(&candidates, "ws-orphan", &format!("head-{index}"))
+                    .expect("candidate");
+            assert!(!deletable, "headroom: {rule}");
+        }
+        for index in 3..5 {
+            let (deletable, rule) =
+                snapshot_fate(&candidates, "ws-orphan", &format!("head-{index}"))
+                    .expect("candidate");
+            assert!(deletable, "aged beyond headroom: {rule}");
+        }
+
+        let (_deleted, errors) = apply_gc(&edges_dir, &candidates);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(
+            bbox_edge_sidecar::manifest::materialized_dir(&edges_dir)
+                .join("workspace/ws-orphan/snapshots/head-selected/project.jsonl")
+                .is_file()
         );
     }
 
