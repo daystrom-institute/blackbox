@@ -31,9 +31,13 @@ use bbox_corpus_core::project_record::{
 
 use crate::project_catalog_store::ProjectCatalogStore;
 
+/// Answers whether producer transport currently owns a project's repository
+/// history; see [`CatalogProjectRecordsProvider::install_history_transport_owner`].
+pub type HistoryTransportOwner = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
 pub struct CatalogProjectRecordsProvider {
     store: Arc<ProjectCatalogStore>,
-    git_transport_cutover: Arc<crate::git_transport_cutover::GitTransportCutoverRuntimeV1>,
+    history_transport_owner: std::sync::OnceLock<HistoryTransportOwner>,
     cache: parking_lot::Mutex<Option<ProjectRecordsSnapshot>>,
     /// Most recent degradation (stale-cache serving, cross-validation
     /// failure, omitted rows), surfaced through doctor/health.
@@ -42,22 +46,21 @@ pub struct CatalogProjectRecordsProvider {
 
 impl CatalogProjectRecordsProvider {
     pub fn new(store: Arc<ProjectCatalogStore>) -> Self {
-        Self::new_with_git_transport_cutover(
-            store,
-            Arc::new(crate::git_transport_cutover::GitTransportCutoverRuntimeV1::default()),
-        )
-    }
-
-    pub fn new_with_git_transport_cutover(
-        store: Arc<ProjectCatalogStore>,
-        git_transport_cutover: Arc<crate::git_transport_cutover::GitTransportCutoverRuntimeV1>,
-    ) -> Self {
         Self {
             store,
-            git_transport_cutover,
+            history_transport_owner: std::sync::OnceLock::new(),
             cache: parking_lot::Mutex::new(None),
             degradation: parking_lot::Mutex::new(None),
         }
+    }
+
+    /// Install the daemon's journal-currency rule, which needs the typed
+    /// history store and producer grants this crate does not hold. The
+    /// daemon installs it once, before the first reindex pass; until then no
+    /// repository counts as transport-owned. Returns false when an owner was
+    /// already installed.
+    pub fn install_history_transport_owner(&self, owner: HistoryTransportOwner) -> bool {
+        self.history_transport_owner.set(owner).is_ok()
     }
 }
 
@@ -160,30 +163,10 @@ impl ProjectRecordsProvider for CatalogProjectRecordsProvider {
         snapshot
     }
 
-    fn git_history_transport_governed(&self, project_id: &str) -> bool {
-        if self.git_transport_cutover.marker().is_none() {
-            return false;
-        }
-        let Ok(state) = self.store.snapshot() else {
-            // A selected marker proves that some catalog history is governed.
-            // If the catalog cannot map this attached compatibility row back
-            // to its repository, suppressing the speculative lease is the
-            // only fail-closed answer.
-            return true;
-        };
-        let Ok(project_id) = bbox_corpus_core::project_catalog::ProjectId::parse(project_id) else {
-            return true;
-        };
-        let Some(project) = state.catalog().projects.get(&project_id) else {
-            return true;
-        };
-        matches!(
-            project.scope,
-            bbox_corpus_core::project_catalog::ProjectScope::Published(_)
-        ) && project
-            .repo_history
-            .as_ref()
-            .is_some_and(|repo_history_id| self.git_transport_cutover.covers_repo(repo_history_id))
+    fn git_history_transport_owned(&self, project_id: &str) -> bool {
+        self.history_transport_owner
+            .get()
+            .is_some_and(|owner| owner(project_id))
     }
 
     /// Catalog derivation of the planning identity map (Phase 3 plan

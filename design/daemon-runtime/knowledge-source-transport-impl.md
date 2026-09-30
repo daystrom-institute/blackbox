@@ -105,9 +105,9 @@ The provisional semantic core is also mostly source-neutral:
 - `bbox-code-collector` is the thin checkout owner. It already verifies a
   configured committed scope, refuses redirects and unsafe remote HTTP, and
   captures code and Git history without linking index/store crates. It is the initial producer binary for this contract.
-- GH-G makes typed Git transport authoritative for covered repositories. Its
-  marker and observation taxonomy are a pattern, not a marker to overload:
-  knowledge is project-scoped and has separate publication/provisional gates.
+- Typed Git transport owns a repository's history while its committed
+  activation journal is current. Knowledge is project-scoped and has separate
+  publication/provisional gates, so it keeps its own marker.
 
 ### 1.4 Missing primitive, correcting the older design ledger
 

@@ -692,7 +692,7 @@ pub(super) fn plan_project_sources(
                 record,
                 &collected,
                 purpose,
-                records_provider.git_history_transport_governed(project_id),
+                records_provider.git_history_transport_owned(project_id),
             )?),
             None => None,
         };
@@ -869,7 +869,7 @@ fn acquire_leases_for_record(
     project: ProjectRecord,
     collected: &std::collections::BTreeMap<String, super::project_files::ActiveCollectedSource>,
     purpose: ProjectLeasePurpose,
-    git_history_transport_governed: bool,
+    git_history_transport_owned: bool,
 ) -> Result<LeasedProjectAccess> {
     let (publisher_config, expected_scope, publisher_config_denial) = match broker
         .recorded_project_scope(&project.project_id)
@@ -926,7 +926,7 @@ fn acquire_leases_for_record(
             Err(error) => (None, Some(error.to_string())),
         }
     };
-    let (git, git_denial) = if project.is_git_repo && !git_history_transport_governed {
+    let (git, git_denial) = if project.is_git_repo && !git_history_transport_owned {
         match broker.acquire(access_request(
             &project.project_id,
             expected_scope.clone(),
@@ -5375,7 +5375,7 @@ mod source_planning_tests {
     struct PlanningProvider {
         snapshot: ProjectRecordsSnapshot,
         identities: BTreeMap<String, CodeProjectIdentity>,
-        git_transport_governed: BTreeSet<String>,
+        history_transport_owned: BTreeSet<String>,
     }
 
     impl ProjectRecordsProvider for PlanningProvider {
@@ -5387,8 +5387,8 @@ mod source_planning_tests {
             self.identities.clone()
         }
 
-        fn git_history_transport_governed(&self, project_id: &str) -> bool {
-            self.git_transport_governed.contains(project_id)
+        fn git_history_transport_owned(&self, project_id: &str) -> bool {
+            self.history_transport_owned.contains(project_id)
         }
     }
 
@@ -5507,13 +5507,13 @@ mod source_planning_tests {
         records: Vec<ProjectRecord>,
         corpus_ids: &[&str],
     ) -> Arc<dyn ProjectRecordsProvider> {
-        provider_with_git_transport_governed(records, corpus_ids, &[])
+        provider_with_history_transport_owned(records, corpus_ids, &[])
     }
 
-    fn provider_with_git_transport_governed(
+    fn provider_with_history_transport_owned(
         records: Vec<ProjectRecord>,
         corpus_ids: &[&str],
-        governed: &[&str],
+        owned: &[&str],
     ) -> Arc<dyn ProjectRecordsProvider> {
         Arc::new(PlanningProvider {
             snapshot: ProjectRecordsSnapshot {
@@ -5528,7 +5528,7 @@ mod source_planning_tests {
                 .iter()
                 .map(|id| ((*id).to_string(), identity(id)))
                 .collect(),
-            git_transport_governed: governed
+            history_transport_owned: owned
                 .iter()
                 .map(|project_id| (*project_id).to_string())
                 .collect(),
@@ -5698,13 +5698,13 @@ mod source_planning_tests {
     }
 
     #[test]
-    fn transport_governed_reindex_never_attempts_a_git_history_lease() {
+    fn transport_owned_reindex_never_attempts_a_git_history_lease() {
         let fixture = fixture();
-        let mut record = fixture.attach("covered", &[("lib.rs", "fn main() {}\n")]);
+        let mut record = fixture.attach("transport-owned", &[("lib.rs", "fn main() {}\n")]);
         record.is_git_repo = true;
         record.repo_id = Some("repo-family".to_string());
         let id = record.project_id.clone();
-        let provider = provider_with_git_transport_governed(vec![record], &[&id], &[&id]);
+        let provider = provider_with_history_transport_owned(vec![record], &[&id], &[&id]);
 
         let plans = plan(&fixture, &provider, None, &HashMap::new(), &BTreeSet::new());
         let access = find(&plans, &id).access.as_ref().unwrap();
@@ -6215,7 +6215,7 @@ mod source_planning_tests {
                 authority_epoch: 1,
             },
             identities: BTreeMap::new(),
-            git_transport_governed: BTreeSet::new(),
+            history_transport_owned: BTreeSet::new(),
         });
         let plans = plan(&fixture, &provider, None, &HashMap::new(), &BTreeSet::new());
         assert!(matches!(

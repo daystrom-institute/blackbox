@@ -1,7 +1,7 @@
 ---
 title: "Typed Git-history transport implementation plan"
 kind: design
-lifecycle: partial
+lifecycle: archived
 corpus: blackbox-design
 topic:
   - daemon-runtime
@@ -17,27 +17,15 @@ Transport substrate: [`distributed-code-source-collector-impl.md`](../../../../.
 History dependencies: [`durable-project-catalog-phase3-impl.md`](../../../../../design/daemon-runtime/durable-project-catalog-phase3-impl.md) and [`durable-project-catalog-phase6-impl.md`](../../../../../design/daemon-runtime/durable-project-catalog-phase6-impl.md).
 Decision authority: [`DECISION_LEDGER.md`](../../../../../DECISION_LEDGER.md). This plan uses slice-local decisions `GH-FD-*`; D-043 records GH-C's certified P3-F caller-list and selector-source amendment.
 
-> **Implementation status (2026-08-08).** The caller/owner map was rebaselined
-> against current `beta/blackbox-v2`. GH-A is implemented: code and Git lanes
-> share one producer credential snapshot, whole-repository grants are derived
-> from catalog membership, and `bbox-git-source` owns the dependency-clean
-> wire contract. GH-B intake through durable `ready` is implemented: bounded
-> authenticated routes, resumable immutable storage, exact-HEAD stable Git
-> capture, canonical fragments, shallow refusal, and independent collector
-> backoff. GH-B lifecycle maintenance is implemented: background-only upload expiry, generation
-> retention, explicit future-materializer roots, grace-delayed CAS reclamation,
-> the SHA-1/SHA-256 and graph/path/fragment fixture matrix, and an isolated
-> FreshV2 daemon-plus-collector rehearsal all pass. GH-C is implemented:
-> verified producer sources use the canonical P3 builder, repo-level commit
-> views and exact snapshot receipts publish under a monotonic recovery
-> journal, monorepo selectors swap atomically through the typed
-> `ProducerTransport` arm, startup re-proves only selected producer views, and
-> loss of grant/code/source currency clears those arms before eligible
-> pre-marker attachment refresh resumes. The strict remote-only smoke covers
-> every action-ahead crash point, grant loss/restoration, code-ahead mismatch,
-> matching republish, force-push replacement, and source retirement. GH-F
-> overlap parity and GH-G strict cutover are implemented; the governing
-> section 19 all-adapter gate remains intentionally open.
+> **Status: archived.** Typed Git-history transport (GH-A through GH-C) is
+> the live design. The GH-F overlap parity gate and the GH-G strict cutover
+> (marker, receipt, checkout parity proof, and the `git-transport-cutover` and
+> `git-transport-checkout-parity` subcommands) are retired: no daemon loads
+> them, and the first start archives any left in the state directory. History
+> ownership follows the journal-currency rule described in
+> [the collector guide](../../docs/code-source-collector.md#git-history-ownership):
+> a repository whose committed activation journal is current is
+> transport-owned, and no other writer touches its history.
 
 ## 1. Required outcome
 At this slice's exit gate, proved against strict catalog state after Phases 3 through 6 have landed:

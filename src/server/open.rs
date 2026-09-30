@@ -293,9 +293,10 @@ pub(super) fn open_shared_state(
         bbox_indexing::knowledge_transport_observations::KnowledgeTransportObservationsV1::open(
             store_dir.join("knowledge-transport-observations.json"),
         )?;
-    // The retired locality cutovers leave their markers and evidence behind;
-    // archive them once, before anything else reads the state root.
-    archive_retired_locality_state_at_startup(&cfg.paths.state_dir, &store_dir);
+    // The retired cutovers leave their markers, receipts, proofs, and
+    // evidence behind; archive them once, before anything else reads the
+    // state root.
+    archive_retired_cutover_state_at_startup(&cfg.paths.state_dir, &store_dir);
     let render_issuances = bbox_indexing::render_issuances::RenderIssuancesV1::new();
     let render_operations = Arc::new(super::render_operations::RenderOperationRuntime::open(
         &store_dir.join("render-operations"),
@@ -305,20 +306,10 @@ pub(super) fn open_shared_state(
     let mut projects_store: Option<Arc<RwLock<ProjectRegistry>>> = None;
     let mut catalog_store: Option<Arc<bbox_indexing::project_catalog_store::ProjectCatalogStore>> =
         None;
+    let mut catalog_records_provider: Option<
+        Arc<bbox_indexing::catalog_records::CatalogProjectRecordsProvider>,
+    > = None;
     let mut projects_needs_persist = false;
-    let git_transport_cutover = Arc::new(
-        if matches!(
-            store_probe,
-            bbox_indexing::project_catalog_store::ProjectStoreProbe::CatalogV2
-        ) {
-            bbox_indexing::git_transport_cutover::GitTransportCutoverRuntimeV1::open(
-                &cfg.paths.state_dir,
-            )
-            .map_err(|error| anyhow::anyhow!("Git transport cutover startup gate: {error}"))?
-        } else {
-            bbox_indexing::git_transport_cutover::GitTransportCutoverRuntimeV1::default()
-        },
-    );
     let knowledge_transport_cutover = Arc::new(
         if matches!(
             store_probe,
@@ -367,18 +358,15 @@ pub(super) fn open_shared_state(
             );
             tracing::info!("Project authority: durable catalog (v2)");
             catalog_store = Some(store.clone());
+            let provider = Arc::new(
+                bbox_indexing::catalog_records::CatalogProjectRecordsProvider::new(store.clone()),
+            );
+            catalog_records_provider = Some(provider.clone());
             (
                 Arc::new(
-                    bbox_indexing::checkout_access_v2::V2CatalogCheckoutAccessAuthority::new(
-                        store.clone(),
-                    ),
+                    bbox_indexing::checkout_access_v2::V2CatalogCheckoutAccessAuthority::new(store),
                 ),
-                Arc::new(
-                    bbox_indexing::catalog_records::CatalogProjectRecordsProvider::new_with_git_transport_cutover(
-                        store,
-                        git_transport_cutover.clone(),
-                    ),
-                ),
+                provider,
             )
         }
     };
@@ -823,7 +811,6 @@ pub(super) fn open_shared_state(
         &project_authority,
         &code_sources,
         &git_sources,
-        &git_transport_cutover,
         &idx,
         &index_path,
     )?;
@@ -834,6 +821,21 @@ pub(super) fn open_shared_state(
     // and `needs_reindex` does not track them). The `.bbox/knowledge` watcher
     // sets it on live changes; the same `Arc` is stored in `SharedState`.
     let reindex_dirty = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    // The journal-currency rule decides which repositories producer
+    // transport owns, so the reindex pass takes no checkout Git-history lease
+    // for them. Installed before the first pass.
+    if let (Some(provider), Some(store)) = (&catalog_records_provider, &catalog_store) {
+        provider.install_history_transport_owner(
+            super::history_activation::history_transport_owner(
+                store.clone(),
+                code_sources.clone(),
+                git_sources.clone(),
+                bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(
+                    &idx.reindex_config().projects_path,
+                ),
+            ),
+        );
+    }
     spawn_reindex_thread(&cfg, &idx, index_writer.clone(), reindex_dirty.clone());
 
     let bind_host = cfg.daemon.bind.clone();
@@ -852,8 +854,6 @@ pub(super) fn open_shared_state(
             &bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(
                 &idx.reindex_config().projects_path,
             ),
-            &git_transport_cutover,
-            &code_sources,
         ),
     };
     // Phase 3 plan section 10 item 4: the derived repo-history reference
@@ -913,7 +913,6 @@ pub(super) fn open_shared_state(
         conversation_sources,
         git_sources,
         knowledge_sources,
-        git_transport_cutover,
         knowledge_transport_cutover,
         reconciler_shutdown: parking_lot::RwLock::new(Arc::new(
             std::sync::atomic::AtomicBool::new(false),
@@ -1023,35 +1022,41 @@ pub(super) fn open_shared_state(
     })
 }
 
-/// Pre-bind archive of the retired locality cutover markers and evidence.
-/// Nothing reads those files, so a failure to move them is logged and never
-/// holds the daemon down; the next start retries whatever is left.
-fn archive_retired_locality_state_at_startup(
+/// Pre-bind archive of every retired cutover's markers, receipts, proofs,
+/// and evidence. Nothing reads those files, so a failure to move them is
+/// logged and never holds the daemon down; the next start retries whatever
+/// is left.
+fn archive_retired_cutover_state_at_startup(
     state_dir: &Path,
     bro_home: &Path,
-) -> Option<bbox_indexing::locality_cutover_retirement::LocalityCutoverRetirement> {
+) -> Vec<bbox_indexing::cutover_retirement::CutoverRetirement> {
     let label = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
-    match bbox_indexing::locality_cutover_retirement::archive_retired_locality_state(
-        state_dir, bro_home, &label,
-    ) {
-        Ok(retirement) => {
-            if let Some(archive_dir) = &retirement.archive_dir {
-                tracing::info!(
-                    archive_dir = %archive_dir.display(),
-                    files = ?retirement.archived,
-                    "archived retired locality cutover state"
+    let mut retirements = Vec::new();
+    for cutover in bbox_indexing::cutover_retirement::RETIRED_CUTOVERS {
+        match bbox_indexing::cutover_retirement::archive_retired_cutover_state(
+            cutover, state_dir, bro_home, &label,
+        ) {
+            Ok(retirement) => {
+                if let Some(archive_dir) = &retirement.archive_dir {
+                    tracing::info!(
+                        cutover = cutover.name,
+                        archive_dir = %archive_dir.display(),
+                        files = ?retirement.archived,
+                        "archived retired cutover state"
+                    );
+                }
+                retirements.push(retirement);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    cutover = cutover.name,
+                    error = %format!("{error:#}"),
+                    "archiving retired cutover state failed; the files stay inert in place"
                 );
             }
-            Some(retirement)
-        }
-        Err(error) => {
-            tracing::warn!(
-                error = %format!("{error:#}"),
-                "archiving retired locality cutover state failed; the files stay inert in place"
-            );
-            None
         }
     }
+    retirements
 }
 
 /// Pre-bind removal of edge families no reader consumes.
@@ -1227,24 +1232,31 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
-    /// Startup archives a legacy-shaped locality cutover state root once:
-    /// markers (including one that no longer parses), a kept receipt, and
-    /// both evidence stores leave their live paths for one archive directory,
-    /// other cutover markers stay, and the next start finds nothing.
+    /// Startup archives a legacy-shaped cutover state root once: the
+    /// locality markers (including one that no longer parses), a kept
+    /// receipt, both locality evidence stores, and the Git transport marker,
+    /// receipt, and checkout parity proof leave their live paths for one
+    /// archive directory per cutover. The knowledge transport marker stays,
+    /// and the next start finds nothing.
     #[test]
-    fn startup_archives_retired_locality_state_once() {
+    fn startup_archives_retired_cutover_state_once() {
         let temp = tempfile::tempdir().unwrap();
         let state_dir = temp.path().canonicalize().unwrap().join("state");
         let bro_home = state_dir.join("bro");
         std::fs::create_dir_all(&bro_home).unwrap();
-        let retired = [
+        let locality = [
             "render-locality-cutover-marker.json",
             "code-source-locality-cutover-marker.json",
             "code-source-locality-cutover-receipt.json",
             "blame-locality-cutover-marker.json",
             "code-source-locality-observations.json",
         ];
-        for name in retired {
+        let git = [
+            "git-transport-checkout-parity-proof.json",
+            "git-transport-cutover-marker.json",
+            "git-transport-cutover-receipt.json",
+        ];
+        for name in locality.iter().chain(&git) {
             std::fs::write(state_dir.join(name), b"{ not json").unwrap();
         }
         std::fs::write(bro_home.join("render-locality-observations.json"), b"{}").unwrap();
@@ -1254,28 +1266,51 @@ mod tests {
         )
         .unwrap();
 
-        let first = archive_retired_locality_state_at_startup(&state_dir, &bro_home).unwrap();
-        let archive = first.archive_dir.unwrap();
-        assert!(archive.starts_with(state_dir.join("cutover-artifacts")));
-        assert_eq!(first.archived.len(), retired.len() + 1);
-        for name in retired {
+        let first = archive_retired_cutover_state_at_startup(&state_dir, &bro_home);
+        assert_eq!(first.len(), 2);
+        let locality_archive = first[0].archive_dir.clone().unwrap();
+        let git_archive = first[1].archive_dir.clone().unwrap();
+        assert!(locality_archive.starts_with(state_dir.join("cutover-artifacts")));
+        assert!(
+            git_archive
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("retired-git-transport-")
+        );
+        assert_eq!(first[0].archived.len(), locality.len() + 1);
+        assert_eq!(first[1].archived, git);
+        for name in locality {
             assert!(!state_dir.join(name).exists(), "{name}");
-            assert!(archive.join(name).is_file(), "{name}");
+            assert!(locality_archive.join(name).is_file(), "{name}");
         }
-        assert!(archive.join("render-locality-observations.json").is_file());
+        for name in git {
+            assert!(!state_dir.join(name).exists(), "{name}");
+            assert!(git_archive.join(name).is_file(), "{name}");
+        }
+        assert!(
+            locality_archive
+                .join("render-locality-observations.json")
+                .is_file()
+        );
         assert!(
             state_dir
                 .join("knowledge-transport-cutover-marker.json")
                 .is_file()
         );
 
-        let second = archive_retired_locality_state_at_startup(&state_dir, &bro_home).unwrap();
-        assert_eq!(second.archive_dir, None);
+        let second = archive_retired_cutover_state_at_startup(&state_dir, &bro_home);
+        assert!(
+            second
+                .iter()
+                .all(|retirement| retirement.archive_dir.is_none())
+        );
         assert_eq!(
             std::fs::read_dir(state_dir.join("cutover-artifacts"))
                 .unwrap()
                 .count(),
-            1
+            2
         );
     }
 
@@ -1285,9 +1320,12 @@ mod tests {
     fn startup_archive_creates_nothing_on_a_never_provisioned_root() {
         let temp = tempfile::tempdir().unwrap();
         let state_dir = temp.path().canonicalize().unwrap().join("state");
-        let result =
-            archive_retired_locality_state_at_startup(&state_dir, &state_dir.join("bro")).unwrap();
-        assert_eq!(result.archive_dir, None);
+        let result = archive_retired_cutover_state_at_startup(&state_dir, &state_dir.join("bro"));
+        assert!(
+            result
+                .iter()
+                .all(|retirement| retirement.archive_dir.is_none())
+        );
         assert!(!state_dir.exists());
     }
 

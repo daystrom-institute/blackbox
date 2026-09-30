@@ -18,9 +18,8 @@
 //! discriminant, so "indistinguishable from a migrated store" is not an
 //! available shape, and every downstream consumer already branches on it:
 //! sweep planning exempts a fresh origin from marker-driven exclusions,
-//! rebuild planning reads no predecessor fingerprint from it, backfill scopes
-//! itself to migrated origins, and the Git transport parity proof classifies
-//! it `VacuousFreshV2`. The six inventory lanes have no durable representation
+//! rebuild planning reads no predecessor fingerprint from it, and backfill
+//! scopes itself to migrated origins. The six inventory lanes have no durable representation
 //! in the catalog pair at all: they are migration EVIDENCE about legacy owner
 //! stores, retained in the marker and immutable assets, which a fresh origin
 //! legitimately has none of.

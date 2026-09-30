@@ -254,11 +254,8 @@ Deleted:
 
 The Git-source contract, store and HTTP routes carry Git history only; the
 store removes its provenance trees on open, and collector enrollment files
-that carry the provenance key keep loading. The Git transport cutover
-captures no provenance evidence: its marker rows name their members
-explicitly, and rows written earlier name them through the provenance map
-keys. The project-catalog inventory reads provenance notes through a local
-capture.
+that carry the provenance key keep loading. The project-catalog inventory
+reads provenance notes through a local capture.
 
 "Which sessions touched this file" is answerable through transcript search
 on the path.
@@ -305,10 +302,21 @@ Removed:
   code-source and blame locality markers, any receipt beside them, and both
   evidence stores into `cutover-artifacts/retired-locality-<timestamp>/`
   under the state directory; nothing reads them.
+- **Git transport cutover**: the `git-transport-cutover` and
+  `git-transport-checkout-parity` ceremonies and the P3 parity gate, the
+  marker runtime and its startup fence, per-repository coverage gating of
+  overlay visibility, activation, startup recovery and the reindex lease,
+  staged re-cutover evidence, and the doctor's coverage wording. A Published
+  repository is transport-owned while its committed activation journal is
+  current (grant commitment, materialization and code selectors still
+  match); only then does it skip the checkout Git-history lease and the
+  fallback walk. The first start archives the marker, its receipt and the
+  checkout parity proof into
+  `cutover-artifacts/retired-git-transport-<timestamp>/`; nothing reads
+  them.
 
 Kept, each with the condition that gates its removal:
 
-- **Git transport cutover**: a Published repo covered by the cutover.
 - **Knowledge transport cutover** and its legacy compatibility lane: a
   verify with no stale rows and every project covered.
 - **`bridge_parity.rs`**: bridge mode stops being the fresh-state path.

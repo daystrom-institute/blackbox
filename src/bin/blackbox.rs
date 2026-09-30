@@ -12,11 +12,6 @@ use bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotLimitsV1;
 use bbox_corpus_index::index::history_generations::HistoryScanLimitsV1;
 use bbox_corpus_index::index::migration_inventory as corpus_inventory;
 
-use bbox_indexing::git_transport_cutover::{
-    GitTransportCheckoutParityAcceptanceRequestV1, GitTransportCutoverApplyRequestV1,
-    GitTransportCutoverError, GitTransportCutoverPreflightRequestV1,
-    GitTransportCutoverVerifyRequestV1, ProjectCatalogGitTransportCutoverFacadeV1,
-};
 use bbox_indexing::knowledge_transport_cutover::{
     KnowledgeTransportCutoverApplyRequestV1, KnowledgeTransportCutoverError,
     KnowledgeTransportCutoverPreflightRequestV1, KnowledgeTransportCutoverVerifyRequestV1,
@@ -153,10 +148,6 @@ enum ProjectCatalogCommand {
     DurableBackfill(DurableBackfillArgs),
     /// Replace the on-disk index with the path-free schema.
     PathFreeRebuild(PathFreeRebuildArgs),
-    /// Inventory and prove Git history/provenance transport overlap parity.
-    GitTransportCutover(GitTransportCutoverArgs),
-    /// Accept an externally reproduced checkout-history parity proof offline.
-    GitTransportCheckoutParity(GitTransportCheckoutParityArgs),
     /// Prove knowledge parity and install strict remote-only authority.
     KnowledgeTransportCutover(KnowledgeTransportCutoverArgs),
     /// Create a catalog project by authoritative scope or as legacy-local.
@@ -399,48 +390,6 @@ struct ConfigArgs {
         .multiple(false)
         .args(["preflight", "apply", "verify"])
 ))]
-struct GitTransportCutoverArgs {
-    /// Capture configured state and emit reviewed cutover artifacts.
-    #[arg(long)]
-    preflight: bool,
-    /// Atomically install the exact reviewed cutover marker while offline.
-    #[arg(long)]
-    apply: bool,
-    /// Verify and receipt the atomically selected current marker while offline.
-    #[arg(long)]
-    verify: bool,
-    /// Reviewable coverage and parity report output.
-    #[arg(long, value_name = "PATH")]
-    report: Option<PathBuf>,
-    /// Canonical empty-or-explicit resolution artifact.
-    #[arg(long, value_name = "PATH")]
-    resolution: Option<PathBuf>,
-    /// Select the configured catalog for offline apply or verify.
-    #[arg(long)]
-    configured: bool,
-    #[command(flatten)]
-    config: ConfigArgs,
-}
-
-#[derive(Debug, Args)]
-struct GitTransportCheckoutParityArgs {
-    /// Canonical path-free proof reproduced through the checkout history adapter.
-    #[arg(long, value_name = "PATH")]
-    proof: PathBuf,
-    /// Select the configured catalog and require its offline lifetime claim.
-    #[arg(long)]
-    configured: bool,
-    #[command(flatten)]
-    config: ConfigArgs,
-}
-
-#[derive(Debug, Args)]
-#[command(group(
-    ArgGroup::new("mode")
-        .required(true)
-        .multiple(false)
-        .args(["preflight", "apply", "verify"])
-))]
 struct KnowledgeTransportCutoverArgs {
     /// Capture configured state and emit reviewed cutover artifacts.
     #[arg(long)]
@@ -620,12 +569,6 @@ impl From<ProjectCatalogStoreError> for CommandFailure {
     }
 }
 
-impl From<GitTransportCutoverError> for CommandFailure {
-    fn from(error: GitTransportCutoverError) -> Self {
-        Self::new(error.code, error.message)
-    }
-}
-
 impl From<KnowledgeTransportCutoverError> for CommandFailure {
     fn from(error: KnowledgeTransportCutoverError) -> Self {
         Self::new(error.code, error.message)
@@ -718,18 +661,6 @@ fn command_name(cli: &Cli) -> &'static str {
             command: ProjectCatalogCommand::PathFreeRebuild(_),
         }) => "project_catalog_path_free_rebuild_verify",
         TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
-            command: ProjectCatalogCommand::GitTransportCutover(args),
-        }) if args.preflight => "project_catalog_git_transport_cutover_preflight",
-        TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
-            command: ProjectCatalogCommand::GitTransportCutover(args),
-        }) if args.apply => "project_catalog_git_transport_cutover_apply",
-        TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
-            command: ProjectCatalogCommand::GitTransportCutover(_),
-        }) => "project_catalog_git_transport_cutover_verify",
-        TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
-            command: ProjectCatalogCommand::GitTransportCheckoutParity(_),
-        }) => "project_catalog_git_transport_checkout_parity_accept",
-        TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
             command: ProjectCatalogCommand::KnowledgeTransportCutover(args),
         }) if args.preflight => "project_catalog_knowledge_transport_cutover_preflight",
         TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
@@ -802,12 +733,6 @@ fn execute(cli: Cli) -> Result<serde_json::Value, CommandFailure> {
         TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
             command: ProjectCatalogCommand::PathFreeRebuild(args),
         }) => execute_path_free_rebuild(args),
-        TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
-            command: ProjectCatalogCommand::GitTransportCutover(args),
-        }) => execute_git_transport_cutover(args),
-        TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
-            command: ProjectCatalogCommand::GitTransportCheckoutParity(args),
-        }) => execute_git_transport_checkout_parity(args),
         TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
             command: ProjectCatalogCommand::KnowledgeTransportCutover(args),
         }) => execute_knowledge_transport_cutover(args),
@@ -1178,129 +1103,6 @@ fn offline_timestamp() -> String {
         .map(|elapsed| elapsed.as_secs())
         .unwrap_or_default();
     format!("unix:{seconds}")
-}
-
-fn execute_git_transport_checkout_parity(
-    args: GitTransportCheckoutParityArgs,
-) -> Result<serde_json::Value, CommandFailure> {
-    if !args.configured {
-        return Err(cli_arguments(
-            "git-transport-checkout-parity requires --configured",
-        ));
-    }
-    let config = load_config(args.config.config)?;
-    let layout = ProjectCatalogMigrationResolvedLayoutV1::from_config(
-        &config,
-        ProjectCatalogMigrationLayoutOverridesV1 {
-            projects_path: args.config.projects_path,
-            state_dir: args.config.state_dir,
-        },
-    )?;
-    let _claim = acquire_admin_lifetime_claim(layout.projects_path())?;
-    let receipt = ProjectCatalogGitTransportCutoverFacadeV1::accept_checkout_parity(
-        GitTransportCheckoutParityAcceptanceRequestV1 {
-            layout,
-            config,
-            proof_path: args.proof,
-            accepted_at: offline_timestamp(),
-        },
-    )?;
-    serialize_result(&receipt)
-}
-
-fn execute_git_transport_cutover(
-    args: GitTransportCutoverArgs,
-) -> Result<serde_json::Value, CommandFailure> {
-    let mode = match (args.preflight, args.apply, args.verify) {
-        (true, false, false) => NewVerbModeV1::Preflight,
-        (false, true, false) => NewVerbModeV1::Apply,
-        (false, false, true) => NewVerbModeV1::Verify,
-        _ => {
-            return Err(cli_arguments(
-                "git-transport-cutover requires exactly one mode: --preflight, --apply, or --verify",
-            ));
-        }
-    };
-    let artifacts = match mode {
-        NewVerbModeV1::Preflight | NewVerbModeV1::Apply => {
-            let (Some(report), Some(resolution)) = (args.report, args.resolution) else {
-                return Err(cli_arguments(
-                    "git-transport-cutover --preflight and --apply require both --report and --resolution",
-                ));
-            };
-            Some((report, resolution))
-        }
-        NewVerbModeV1::Verify => {
-            if args.report.is_some() || args.resolution.is_some() {
-                return Err(cli_arguments(
-                    "git-transport-cutover --verify takes no report or resolution artifacts",
-                ));
-            }
-            None
-        }
-    };
-    match mode {
-        NewVerbModeV1::Preflight if args.configured => {
-            return Err(cli_arguments(
-                "git-transport-cutover --preflight already captures configured state and does not accept --configured",
-            ));
-        }
-        NewVerbModeV1::Apply | NewVerbModeV1::Verify if !args.configured => {
-            return Err(cli_arguments(
-                "git-transport-cutover --apply and --verify require --configured",
-            ));
-        }
-        _ => {}
-    }
-    let config = load_config(args.config.config)?;
-    let layout = ProjectCatalogMigrationResolvedLayoutV1::from_config(
-        &config,
-        ProjectCatalogMigrationLayoutOverridesV1 {
-            projects_path: args.config.projects_path,
-            state_dir: args.config.state_dir,
-        },
-    )?;
-    match mode {
-        NewVerbModeV1::Preflight => {
-            let (report_path, resolution_path) =
-                artifacts.expect("preflight artifacts resolved above");
-            let receipt = ProjectCatalogGitTransportCutoverFacadeV1::preflight(
-                GitTransportCutoverPreflightRequestV1 {
-                    layout,
-                    config,
-                    report_path,
-                    resolution_path,
-                    generated_at: offline_timestamp(),
-                },
-            )?;
-            serialize_result(&receipt)
-        }
-        NewVerbModeV1::Apply => {
-            let (report_path, resolution_path) = artifacts.expect("apply artifacts resolved above");
-            let _claim = acquire_admin_lifetime_claim(layout.projects_path())?;
-            let receipt = ProjectCatalogGitTransportCutoverFacadeV1::apply(
-                GitTransportCutoverApplyRequestV1 {
-                    layout,
-                    config,
-                    report_path,
-                    resolution_path,
-                    applied_at: offline_timestamp(),
-                },
-            )?;
-            serialize_result(&receipt)
-        }
-        NewVerbModeV1::Verify => {
-            let _claim = acquire_admin_lifetime_claim(layout.projects_path())?;
-            let receipt = ProjectCatalogGitTransportCutoverFacadeV1::verify(
-                GitTransportCutoverVerifyRequestV1 {
-                    layout,
-                    config,
-                    verified_at: offline_timestamp(),
-                },
-            )?;
-            serialize_result(&receipt)
-        }
-    }
 }
 
 fn execute_knowledge_transport_cutover(
@@ -1817,36 +1619,6 @@ mod tests {
 
     #[test]
     fn parser_selects_each_documented_command() {
-        let git_transport_checkout_parity = Cli::try_parse_from([
-            "blackbox",
-            "project-catalog",
-            "git-transport-checkout-parity",
-            "--proof",
-            "/tmp/git-transport-checkout-parity.json",
-            "--configured",
-        ])
-        .unwrap();
-        assert_eq!(
-            command_name(&git_transport_checkout_parity),
-            "project_catalog_git_transport_checkout_parity_accept"
-        );
-
-        let git_transport_cutover = Cli::try_parse_from([
-            "blackbox",
-            "project-catalog",
-            "git-transport-cutover",
-            "--preflight",
-            "--report",
-            "/tmp/git-transport-report.json",
-            "--resolution",
-            "/tmp/git-transport-resolution.json",
-        ])
-        .unwrap();
-        assert_eq!(
-            command_name(&git_transport_cutover),
-            "project_catalog_git_transport_cutover_preflight"
-        );
-
         let knowledge_transport_cutover = Cli::try_parse_from([
             "blackbox",
             "project-catalog",

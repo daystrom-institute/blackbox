@@ -105,6 +105,7 @@ lists them explicitly:
 | `accepted-publications/` | archive | same reason |
 | cutover markers and receipts (`*-cutover-marker.json`) | archive | cannot be produced without a catalog; a stray one is leftover state from a removed catalog |
 | `S/render-locality-cutover-*`, `S/code-source-locality-cutover-*`, `S/blame-locality-cutover-*`, `S/code-source-locality-observations.json` | archive | retired locality cutover markers, receipts and evidence; no current binary reads them, and daemon startup moves them into `S/cutover-artifacts/retired-locality-<timestamp>/` |
+| `S/git-transport-cutover-*`, `S/git-transport-checkout-parity-*` | archive | retired Git transport cutover marker, receipt and checkout parity proof; no current binary reads them, and daemon startup moves them into `S/cutover-artifacts/retired-git-transport-<timestamp>/` |
 | `aliases` field inside v1 `projects.json` records | converted | carried into `operator_aliases` |
 | `.bbox/local/checkout-id` markers inside checkouts | reused | an existing marker id is reused for the attachment rather than minted again |
 

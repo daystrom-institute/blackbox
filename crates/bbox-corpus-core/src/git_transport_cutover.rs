@@ -1,8 +1,9 @@
 //! Pure whole-repository transport grant derivation.
 //!
-//! Runtime authentication and offline cutover preflight must make the same
-//! all-published-members decision from the same catalog bytes. This module is
-//! deliberately free of credentials, filesystem access, and server state.
+//! Runtime authentication and the typed history activation journal's grant
+//! commitment must make the same all-published-members decision from the same
+//! catalog bytes. This module is deliberately free of credentials, filesystem
+//! access, and server state.
 
 use std::collections::{BTreeMap, BTreeSet};
 

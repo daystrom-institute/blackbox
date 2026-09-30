@@ -15,11 +15,11 @@ brief: "Split the system on LOCALITY (checkout-coupled vs shared/append-only), n
 # Locality-first decomposition: the checkout plane and the corpus plane
 
 > **Status: partial; current-HEAD inventory reverified 2026-08-09.** Durable
-> project identity, the single-host knowledge seam, fleetd, authenticated
-> Git-history transport, GH-F overlap proof, and GH-G strict cutover are
-> implemented. Covered published repositories do not fall back to daemon-side
-> Git leases; bridge, uncovered,
-> and `LegacyLocal` adapters remain intentionally scoped. KT-A through KT-F are
+> project identity, the single-host knowledge seam, fleetd, and authenticated
+> Git-history transport are implemented. A published repository whose
+> committed history journal is current is transport-owned and takes no
+> daemon-side Git lease; the Git transport cutover is retired, and bridge and
+> `LegacyLocal` adapters remain intentionally scoped. KT-A through KT-F are
 > implemented: authenticated committed and provisional knowledge sources,
 > harness-local mutation, durable remote `own`/`all`, measured overlap, and an
 > offline strict-cutover marker. For an operator-cutover covered Published row,
@@ -198,7 +198,7 @@ path-free durable identity does not by itself make the operation local.
 | Project-scope render | Managed harnesses keep the public `bbox_render` tool but transport a bounded, path-free authorized knowledge snapshot and invoke the shared `bbox-knowledge` renderer inside their own bound checkout. The canonical plan is SHA-256-pinned and paged as bounded byte chunks below the generic MCP response cap; completion returns the plan hash plus receipt, and the daemon recomputes both the current plan and every projection before accepting it. An unbound call for a project a checkout-owner collector covers completes through that collector. Global render stays daemon/operator-host local; bridge, `LegacyLocal`, and projects no owner covers retain the compatibility adapter, which a daemon without checkout authority never takes. | A harness binding links the same `bbox-knowledge` renderer and writes only inside its own checkout. It obtains the pinned published/global inputs and explicit provisional view from the corpus. Global render remains operator-host local. | Complete in code for every project a checkout owner covers, and for every project on a daemon without checkout authority. Bridge and `LegacyLocal` retirement remain separate. |
 | Project source indexing | Authenticated collection, immutable generations, activation, and recovery are implemented. An active collected generation is the effective source, and a collected project the pass does not walk gets transcript project/tool-edge attribution lexically from its attachment path. A daemon without checkout authority refuses `LocalProjectWalk` before observation, records a structural state instead of cutting back to a local source, and never probes an attachment. | Checkout owners walk, hash, and ship raw capped bytes; the corpus chunks and indexes them. Every intended project uses an active collected source. No daemon source rung opens a checkout. | Complete in code on a daemon without checkout authority. Intended-project coverage and explicit migration or retirement of bridge and `LegacyLocal` projects remain operator work. |
 | Repo-owned `.bbox/` read and mutation path | KT-A through KT-F are implemented. Authenticated committed candidates and leased provisional workspaces feed the existing accepted and overlay models; managed project mutation runs in the harness; remote `own`/`all` survives restart. For an operator-cutover covered Published row, the marker closes daemon watcher refresh plus local read/write/schema-marker acquisition with no fallback. Non-vacuous publisher and watcher probes prove the covered route performs no checkout-broker operation. Shared local bodies remain only for bridge, uncovered, and `LegacyLocal` lanes. | A harness reads and mutates its own branch state directly. Published and deliberately shared provisional inputs reach the corpus through the authenticated checkout-source contract; corpus coordination, validation, promotion, and indexing remain central. | Complete for covered Published rows. Bridge, uncovered, and `LegacyLocal` retirement remains separately authorized. |
-| Git history ingest | Authenticated complete reachable-history capture, resumable intake, certified P3 materialization, producer overlays, health, recovery, GC, rebuild, overlap proof, and GH-G strict cutover are implemented. Covered published repositories use producer state only and record no post-boundary `GitHistory` lease. The local refresh adapter remains only for named uncovered, bridge, and `LegacyLocal` categories. | The scope-authorized producer owns Git acquisition for covered published projects; corpus-side generation publication, selectors, indexing, and graph construction stay central. | Complete for GH-G-covered published projects. Later retirement must preserve the named surviving categories until their own gates. |
+| Git history ingest | Authenticated complete reachable-history capture, resumable intake, certified P3 materialization, producer overlays, health, recovery, GC, and rebuild are implemented. A published repository whose committed activation journal is current is transport-owned: it uses producer state only and takes no `GitHistory` lease. The local refresh adapter serves a repository with no current journal on a daemon with checkout authority, plus the bridge and `LegacyLocal` categories. | The scope-authorized producer owns Git acquisition for transport-owned published repositories; corpus-side generation publication, selectors, indexing, and graph construction stay central. | Complete for published repositories with a current journal. Later retirement must preserve the named surviving categories until their own gates. |
 
 The rebaseline result is therefore:
 
@@ -207,10 +207,11 @@ The rebaseline result is therefore:
   operator-cutover covered Published row, accepted and selected provisional
   source is remote and restart-durable, and local watcher/read/write fallback
   is closed.
-- **Complete for covered published repositories:** typed Git-history
-  acquisition/publication through GH-G strict cutover. Runtime
-  classification closes local fallback and retains only the named bridge,
-  uncovered, and `LegacyLocal` categories.
+- **Complete for transport-owned published repositories:** typed Git-history
+  acquisition/publication. The journal-currency rule closes local fallback
+  for a repository whose committed journal is current and leaves the local
+  adapter to the other published repositories and the bridge and
+  `LegacyLocal` categories.
 - **Complete for owner-covered project render:** hash-pinned, bounded-page
   plan/receipt transport, checkout-owned shared rendering, fixed-target confinement, explicit
   published/own/all views, and candidate-gate parity are live; a daemon
@@ -422,9 +423,9 @@ monolith:
 
 The executable dependency map from this rebaseline is:
 
-1. **Typed Git-history checkout-source contract: complete through GH-G.**
-   GH-F overlap/parity and the separately gated GH-G strict cutover are
-   implemented and closed out. The historical authority remains
+1. **Typed Git-history checkout-source contract: complete.**
+   Ownership follows the journal-currency rule; the overlap/parity gate and
+   strict cutover are retired. The historical authority remains
    [git-history-provenance-transport-impl.md](git-history-provenance-transport-impl.md),
    whose current owner/caller inventory records the landed contract. It supplies
    complete and incremental Git history without granting callers arbitrary

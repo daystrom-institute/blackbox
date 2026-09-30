@@ -146,7 +146,7 @@ Non-goals:
 - No change to P3 generation identity, the single-constructor rule (`G11-X`,
   P3-F), the rebuild manifest, or history GC ownership (GC gains one root
   KIND and a corrected tombstone rule, but no new owner).
-- No change to the cutover marker's authority model, grants, or the
+- No change to the journal-currency ownership rule, grants, or the
   producer trust boundary.
 - No per-commit EDGE cost claim (section 1); this design bounds how often
   sidecars change. Incremental edge segments or stable file-target
@@ -475,8 +475,8 @@ tombstoning now, as part of this design:
 - Commitment-exact recovery: no probe ever trusts a delta record; deltas are
   a publication strategy, commitments and complete plans remain the truth.
 - Single P3 constructor, single rebuild manifest, GC ownership (one new root
-  KIND and a corrected tombstone subtraction, same owner), cutover marker
-  authority, grant model: untouched.
+  KIND and a corrected tombstone subtraction, same owner), journal-currency
+  ownership, grant model: untouched.
 - The journal store contract (`save_activation_journal`, immutable
   projection, terminal rules): byte-untouched; evolution lives in the
   sibling ledger.

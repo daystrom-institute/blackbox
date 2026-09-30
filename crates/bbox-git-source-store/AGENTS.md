@@ -1,6 +1,6 @@
 # Typed Git-source store invariants
 
-- The store owns resumable history upload sessions, immutable manifests, content-addressed canonical records, ready source generations, and generation lookup. It does not own HTTP, Git execution, catalog authority, index publication, or transport cutover.
+- The store owns resumable history upload sessions, immutable manifests, content-addressed canonical records, ready source generations, and generation lookup. It does not own HTTP, Git execution, catalog authority, index publication, or history ownership.
 - Top-level trees outside that layout are not store members; `open` removes them.
 - Every upload and generation lookup is producer- and repo-authority-bound by server-derived ids. Caller-supplied project ids never enter this store.
 - Manifest completion is immutable. Replayed pages and generations succeed only when their exact bytes match; conflicts fail closed.

@@ -163,6 +163,9 @@ counter moves, and the daemon never attempts a checkout-backed fallback:
 - no reconciler attachment probe;
 - no daemon render write lease: a project render with no checkout owner is
   refused with the owner-required message.
+- no Git-history checkout walk: a repository whose history is not
+  transport-owned records the `history_unavailable_no_attachment` history
+  state, which doctor reports as information.
 
 Transcript attribution is unaffected: every collected project is attributed
 from its attachment path without reading the checkout.
@@ -280,6 +283,19 @@ bro home, into a new
 Nothing reads or deletes the archive. A start that finds none of those files
 creates nothing. A move that fails is logged and retried at the next start;
 it never holds the daemon down.
+
+### Git transport cutover state
+
+Git history has no cutover ceremony and no marker. A Published repository is
+transport-owned while its committed activation journal is current, and only
+then; see
+[Git-history ownership](code-source-collector.md#git-history-ownership).
+Daemon startup moves any `git-transport-cutover*` or
+`git-transport-checkout-parity*` file (the marker, its receipt, the checkout
+parity proof, and any backup kept beside them) from the state directory into
+a new `<state_dir>/cutover-artifacts/retired-git-transport-<UTC timestamp>/`
+directory, under the same rules as the locality archive. Reviewed reports
+already under `cutover-artifacts/` stay where they are.
 
 ### After a daemon upgrade (no schema change)
 

@@ -388,11 +388,13 @@ pub trait ProjectRecordsProvider: Send + Sync {
         false
     }
 
-    /// Whether a durable producer-transport cutover row closes checkout Git
-    /// history for this project. Bridge and offline providers retain the
-    /// default `false`; catalog runtime providers override it from their
-    /// checksummed marker and live project-to-repository binding.
-    fn git_history_transport_governed(&self, _project_id: &str) -> bool {
+    /// Whether producer transport currently owns this project's repository
+    /// history: its committed activation journal is current, so the reindex
+    /// pass takes no checkout Git-history lease and the repository keeps one
+    /// history writer. Bridge and offline providers retain the default
+    /// `false`; the catalog runtime provider answers from the daemon's
+    /// journal-currency rule.
+    fn git_history_transport_owned(&self, _project_id: &str) -> bool {
         false
     }
 

@@ -62,6 +62,14 @@
   rows. Code-source activations publish a complete view directly. The view's
   Git overlay selectors are the Git source GC roots, so maintenance protects
   exactly the sources they name.
+- Git history has one writer per repository: producer transport owns it
+  exactly while the repository's committed activation journal is current
+  (`history_activation::transport_owns_project_history`). The reindex
+  Git-history lease and the post-activation checkout walk both ask that
+  rule; no marker or receipt takes part. Anything that can move a grant,
+  membership or code selector without a code activation must reconcile
+  journal currency (clear the stale overlays) or the local lane and the
+  stale overlay will both claim the history.
 - Before bind, a one-time pass removes the retired edge families and stamps
   a store-level marker; later starts cost one stat.
 - Raw `?project=` remains a surface/filter selector only. Managed-workspace

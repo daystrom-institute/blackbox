@@ -3319,8 +3319,6 @@ pub(crate) fn republish_code_read_view(state: &Arc<SharedState>) -> Result<()> {
             git_overlays: super::state::read_git_overlays_for_view(
                 &state.project_authority,
                 &edges_dir,
-                &state.git_transport_cutover,
-                &state.code_sources,
             ),
         });
         Ok(())
@@ -3580,35 +3578,38 @@ fn stage_git_current_overlay_after_activation(
             "Git-history transport currency could not be proved; attachment refresh remains eligible"
         ),
     }
-    match state.git_transport_governs_project(project_id) {
-        Ok(true) => {
-            if let Err(error) = store.record_health_failure(
-                project_id,
-                bbox_indexing::index::history_health::HISTORY_UNAVAILABLE_NO_TRANSPORT_CODE,
-                "Git transport coverage is authoritative and no current producer overlay is available; checkout fallback is closed",
-            ) {
-                tracing::warn!(
-                    project_id,
-                    error = %error,
-                    "failed to persist the no-transport history record"
-                );
-            }
-            return;
-        }
+    // The journal-currency rule: a repository whose committed journal is
+    // current is owned by producer transport, so no checkout walk writes a
+    // second copy of its history even when this member has no overlay.
+    match super::history_activation::state_transport_owns_project_history(state, project_id) {
+        Ok(true) => return,
         Ok(false) => {}
         Err(error) => {
             tracing::warn!(
                 project_id,
-                %error,
-                "Git transport coverage could not be classified; refusing checkout fallback"
-            );
-            let _ = store.record_health_failure(
-                project_id,
-                bbox_indexing::index::history_health::HISTORY_UNAVAILABLE_NO_TRANSPORT_CODE,
-                "Git transport coverage classification failed; checkout fallback is closed",
+                error = %format!("{error:#}"),
+                "Git-history transport ownership could not be proved; skipping the checkout walk this pass"
             );
             return;
         }
+    }
+    if !state.checkout_access.holds_checkout_authority() {
+        // A daemon with no checkout authority never walks a checkout: history
+        // arrives only through producer transport. That is a structural
+        // steady state, not a Git fault.
+        if let Err(error) = store.record_health_failure(
+            project_id,
+            bbox_indexing::index::history_health::HISTORY_UNAVAILABLE_NO_ATTACHMENT_CODE,
+            "this daemon holds no checkout authority; repository history arrives only through producer transport",
+        ) {
+            tracing::warn!(
+                project_id,
+                error = %error,
+                "failed to persist the no-attachment history record"
+            );
+        }
+        let _ = store.clear_health_failure(project_id, "git_history_unavailable");
+        return;
     }
     let record = state
         .records_provider
@@ -5858,8 +5859,6 @@ fn cutback_to_local_single_attempt(
                 git_overlays: super::state::read_git_overlays_for_view(
                     &state.project_authority,
                     &edges_dir,
-                    &state.git_transport_cutover,
-                    &state.code_sources,
                 ),
             });
             Ok(())
@@ -6202,8 +6201,6 @@ fn cutback_to_local(
                 git_overlays: super::state::read_git_overlays_for_view(
                     &state.project_authority,
                     &edges_dir,
-                    &state.git_transport_cutover,
-                    &state.code_sources,
                 ),
             });
             Ok(())
@@ -6616,8 +6613,6 @@ fn activate_desired_loop(
                     git_overlays: super::state::read_git_overlays_for_view(
                         &state.project_authority,
                         &edges_dir,
-                        &state.git_transport_cutover,
-                        &state.code_sources,
                     ),
                 });
                 Ok(())
@@ -9883,17 +9878,18 @@ mod tests {
         assert!(!store.retirement_pending(&collected_selector).unwrap());
     }
 
-    /// A collected generation stays activated when Git is entirely
-    /// unavailable (Phase 3 plan section 6 items 2 and 3, closing F5).
-    ///
-    /// Before this milestone a Git problem during collected staging failed
-    /// the whole activation and looped on backoff. Now the transaction never
-    /// opens Git: the generation publishes first, and the post-activation
-    /// overlay records `git_history_unavailable` and leaves everything else
-    /// exactly as the activation left it.
-    #[allow(clippy::await_holding_lock)]
-    #[tokio::test(flavor = "current_thread")]
-    async fn collected_generation_activates_when_git_is_unavailable() {
+    struct GitStarvedActivation {
+        _directory: tempfile::TempDir,
+        _env: crate::util::TestEnvGuard,
+        state: Arc<SharedState>,
+        project_id: String,
+        generation_id: String,
+    }
+
+    /// Activate one collected generation through a daemon whose checkout
+    /// broker is `broker`, so the post-activation Git overlay sees only what
+    /// that broker admits.
+    async fn activate_collected_with_broker(broker: CheckoutAccessBroker) -> GitStarvedActivation {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
         let state_dir = root.join("state");
@@ -9917,13 +9913,10 @@ mod tests {
 
         let mut state = SharedState::for_test(&state_dir);
         state.store_dir = state_dir.join("bro");
-        // Deny every checkout lease AFTER the index writer took its own
-        // handle, so staging still runs and only the post-activation Git
-        // overlay is starved.
-        state.checkout_access = Arc::new(CheckoutAccessBroker::new(
-            Arc::new(bbox_indexing::checkout_access::DenyCheckoutAccess),
-            CheckoutAccessObservations::in_memory(),
-        ));
+        // Replace the broker AFTER the index writer took its own handle, so
+        // staging still runs and only the post-activation Git overlay is
+        // starved.
+        state.checkout_access = Arc::new(broker);
         let state = Arc::new(state);
         let project = state
             .project_authority
@@ -9978,48 +9971,107 @@ mod tests {
         activate_desired_loop(&state, &scope, &project.project_id)
             .expect("an unavailable Git must not fail a valid collected activation");
         state.index_writer.flush_blocking().unwrap();
+        GitStarvedActivation {
+            _directory: directory,
+            _env: env,
+            state,
+            project_id: project.project_id,
+            generation_id: ready.generation_id,
+        }
+    }
+
+    /// A collected generation stays activated when Git is entirely
+    /// unavailable (Phase 3 plan section 6 items 2 and 3, closing F5).
+    ///
+    /// Before this milestone a Git problem during collected staging failed
+    /// the whole activation and looped on backoff. Now the transaction never
+    /// opens Git: the generation publishes first, and the post-activation
+    /// overlay records `git_history_unavailable` and leaves everything else
+    /// exactly as the activation left it.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn collected_generation_activates_when_git_is_unavailable() {
+        let activation = activate_collected_with_broker(CheckoutAccessBroker::new(
+            Arc::new(bbox_indexing::checkout_access::DenyCheckoutAccess),
+            CheckoutAccessObservations::in_memory(),
+        ))
+        .await;
+        let state = &activation.state;
+        let store = state.code_sources.store();
+        let project_id = &activation.project_id;
+        let ready_generation_id = &activation.generation_id;
 
         let collected_selector = crate::index::project_files::collected_materialization_selector(
-            &project.project_id,
-            &ready.generation_id,
+            project_id,
+            ready_generation_id,
         );
         assert_eq!(
-            state
-                .code_read_view
-                .read()
-                .active_selectors
-                .get(&project.project_id),
+            state.code_read_view.read().active_selectors.get(project_id),
             Some(&collected_selector),
             "the generation must be active despite the Git failure"
         );
         assert_eq!(
             store
-                .load_activation(&project.project_id)
+                .load_activation(project_id)
                 .unwrap()
                 .as_ref()
                 .map(|activation| activation.generation_id.as_str()),
-            Some(ready.generation_id.as_str())
+            Some(ready_generation_id.as_str())
         );
         assert!(
             store.health_records().unwrap().iter().any(|record| {
-                record.project_id == project.project_id && record.code == "git_history_unavailable"
+                record.project_id == *project_id && record.code == "git_history_unavailable"
             }),
             "the degraded Git overlay must be recorded as health, not as a failure"
         );
         // The activation transaction stages no Git member at all now; the
         // overlay owns that file and never got to write it.
-        let edges_dir = crate::server::edge_sidecar_dir(&state);
-        let snapshot_id = bbox_edge_sidecar::snapshot::collected_snapshot_id(
-            &project.project_id,
-            &ready.generation_id,
-        );
-        let snapshot_dir = bbox_edge_sidecar::snapshot::snapshot_dir(
-            &edges_dir,
-            &project.project_id,
-            &snapshot_id,
-        );
+        let edges_dir = crate::server::edge_sidecar_dir(state);
+        let snapshot_id =
+            bbox_edge_sidecar::snapshot::collected_snapshot_id(project_id, ready_generation_id);
+        let snapshot_dir =
+            bbox_edge_sidecar::snapshot::snapshot_dir(&edges_dir, project_id, &snapshot_id);
         assert!(snapshot_dir.join("project.jsonl").is_file());
         assert!(!snapshot_dir.join("git-current.jsonl").exists());
+    }
+
+    /// A daemon with no checkout authority never walks a checkout after a
+    /// collected activation: it records the structural no-attachment history
+    /// state, not a Git fault.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn collected_activation_without_checkout_authority_records_no_attachment() {
+        let activation = activate_collected_with_broker(
+            CheckoutAccessBroker::new(
+                Arc::new(bbox_indexing::checkout_access::DenyCheckoutAccess),
+                CheckoutAccessObservations::in_memory(),
+            )
+            .without_checkout_authority(),
+        )
+        .await;
+        let records = activation
+            .state
+            .code_sources
+            .store()
+            .health_records()
+            .unwrap()
+            .into_iter()
+            .filter(|record| record.project_id == activation.project_id)
+            .collect::<Vec<_>>();
+        assert!(
+            records.iter().any(|record| {
+                record.code
+                    == bbox_indexing::index::history_health::HISTORY_UNAVAILABLE_NO_ATTACHMENT_CODE
+                    && record.diagnostic.contains("no checkout authority")
+            }),
+            "{records:?}"
+        );
+        assert!(
+            records
+                .iter()
+                .all(|record| record.code != "git_history_unavailable"),
+            "{records:?}"
+        );
     }
 
     fn catalog_grant_store(

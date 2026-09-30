@@ -237,55 +237,31 @@ previous snapshot active. Changes to `server_url`, `token_file`, or
 `trusted_encrypted_network` are logged but retain their active values until the
 collector restarts.
 
-## FreshV2 cutover rehearsal
+## Git-history ownership
 
-The GH-F overlap gate has a throwaway, full-path rehearsal that starts from a
-fresh catalog, publishes code and complete Git history, restarts the isolated
-daemon, and runs the offline cutover preflight. Build the three debug binaries first, then run:
+A Published repository's history has one writer at a time, decided by the
+journal-currency rule: the repository is transport-owned while its committed
+activation journal is current, meaning the catalog materialization, the
+producer grant commitment, the members' code selectors, and the selected
+producer overlays all still match that journal. No marker, receipt, or proof
+takes part.
 
-```sh
-BBOX_GIT_CUTOVER_SMOKE_ROOT="$(mktemp -d /tmp/bbox-ghf-smoke.XXXXXX)" \
-  scripts/git-transport-cutover-smoke.sh all
-```
+- A transport-owned repository's producer overlays are served, and they are
+  Git garbage-collection roots. The reindex pass takes no checkout
+  Git-history lease for it, and a collected activation does not walk a
+  checkout for it.
+- A journal that stops being current (a grant, membership, or code selector
+  change) loses its overlays at the next code activation, configuration
+  reload, or daemon start, and its current ready source re-activates when the
+  grant still admits it.
+- A repository with no current journal is refreshed by the local lane on a
+  daemon that holds checkout authority. A daemon with
+  `daemon.no_checkout_authority` walks no checkout and records the
+  `history_unavailable_no_attachment` history state instead.
 
-The script leaves its review artifacts under the throwaway root and always
-stops its daemon before preflight and exit.
-
-## Git transport cutover
-
-`blackbox project-catalog git-transport-cutover` runs `--preflight`, then
-`--apply --configured`, then `--verify --configured`. Preflight and apply both
-run with the daemon stopped: apply refuses unless the checkout-access
-observation baseline, the activation journals, and the catalog still match what
-preflight captured, and a running daemon moves all three.
-
-A Granted repository that no predecessor marker row covers and whose capture
-cannot prove current transport evidence (for example, no committed activation
-journal at the current grant, or no Git source store at all) is reported with
-status `deferred_uncovered` and its `defects` as the reason. It gets no marker
-row, stays uncovered with its pre-cutover checkout adapter, and does not make
-the report non-clean. Apply recaptures every deferred repository and refuses
-the reviewed report if its evidence changed, including when it became provable;
-rerun preflight to propose it. A repository a predecessor row covers that fails
-capture is still `refused` and blocks apply.
-
-A predecessor row whose repository history no longer exists in the catalog
-(reason `repo_history_absent_from_catalog`) or has no Published member (reason
-`no_published_member`) is listed under the report's `dropped_rows` and omitted
-from the new marker; it does not make the report non-clean. Apply recomputes
-the carried and dropped rows against the current predecessor and catalog and
-refuses a report whose rows differ. Every other predecessor row that the report
-does not replace is carried forward unchanged.
-
-A covered row that goes stale (`coverage_stale_pending_recutover`) while its
-repository is still Granted to one producer keeps accepting history: activation
-commits its journal and writes the producer overlays as staged evidence. The
-row still governs the repository, so reads, the code read view, and the edge
-index hide those overlays and checkout fallback stays closed; startup recovery
-and code activation keep them while they still prove current. The next
-preflight proposes the repository from that evidence and apply replaces its
-row. A covered repository that is not Granted (producer removed or blocked
-assignment) publishes no new history until a new cutover.
+The first start of a daemon archives any `git-transport-cutover*` or
+`git-transport-checkout-parity*` file left in the state directory into
+`cutover-artifacts/retired-git-transport-<timestamp>/`. Nothing reads them.
 
 Remote plain HTTP is rejected and redirects are disabled. Loopback HTTP is
 accepted for local smoke tests.

@@ -1,10 +1,11 @@
-//! One-time archive of the retired locality cutover state.
+//! One-time archive of retired cutover state.
 //!
-//! The render and code-source locality cutovers are retired: no daemon loads
-//! their markers or records their evidence, and the blame marker never had a
-//! reader. A state directory that ran either ceremony still holds those files,
-//! so the first start of a daemon that no longer reads them moves them into
-//! `<state_dir>/cutover-artifacts/retired-locality-<label>/`, where they stay
+//! The render and code-source locality cutovers and the Git transport cutover
+//! are retired: no daemon loads their markers, receipts, proofs, or evidence.
+//! A state directory that ran one of those ceremonies still holds the files,
+//! so the first start of a daemon that no longer reads them moves each
+//! cutover's files into its own
+//! `<state_dir>/cutover-artifacts/<archive prefix><label>/`, where they stay
 //! for the operator. Nothing is deleted, parsed, or read back.
 //!
 //! The pass is idempotent: an archived file has left its live location, so a
@@ -23,26 +24,52 @@ use anyhow::{Context, Result};
 /// Directory under the state directory that holds archived cutover state.
 pub const CUTOVER_ARTIFACTS_DIR: &str = "cutover-artifacts";
 
-/// Prefix of each archive directory under [`CUTOVER_ARTIFACTS_DIR`].
-pub const RETIRED_LOCALITY_ARCHIVE_PREFIX: &str = "retired-locality-";
+/// The files one retired cutover left behind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetiredCutover {
+    /// Operator-facing name, for logs.
+    pub name: &'static str,
+    /// Prefix of each archive directory under [`CUTOVER_ARTIFACTS_DIR`].
+    pub archive_prefix: &'static str,
+    /// State-directory entries whose name starts with one of these are
+    /// retired ceremony state: the installed markers and any receipt, proof,
+    /// backup, or report the operator kept beside them.
+    pub state_prefixes: &'static [&'static str],
+    /// State-directory files that only the retired cutover read.
+    pub state_files: &'static [&'static str],
+    /// Bro-home files that only the retired cutover read.
+    pub bro_home_files: &'static [&'static str],
+}
 
-/// State-directory entries whose name starts with one of these are retired
-/// ceremony state: the installed markers and any receipt or report the
-/// operator kept beside them.
-pub const RETIRED_STATE_PREFIXES: &[&str] = &[
-    "render-locality-cutover",
-    "code-source-locality-cutover",
-    "blame-locality-cutover",
-];
+/// The render, code-source, and blame locality cutovers.
+pub const RETIRED_LOCALITY_CUTOVERS: RetiredCutover = RetiredCutover {
+    name: "locality",
+    archive_prefix: "retired-locality-",
+    state_prefixes: &[
+        "render-locality-cutover",
+        "code-source-locality-cutover",
+        "blame-locality-cutover",
+    ],
+    state_files: &["code-source-locality-observations.json"],
+    bro_home_files: &["render-locality-observations.json"],
+};
 
-/// State-directory files that only the retired cutovers read.
-pub const RETIRED_STATE_FILES: &[&str] = &["code-source-locality-observations.json"];
+/// The Git transport cutover: its marker, receipt, checkout parity proof,
+/// and any backup of them the operator kept in the state directory.
+pub const RETIRED_GIT_TRANSPORT_CUTOVER: RetiredCutover = RetiredCutover {
+    name: "Git transport",
+    archive_prefix: "retired-git-transport-",
+    state_prefixes: &["git-transport-cutover", "git-transport-checkout-parity"],
+    state_files: &[],
+    bro_home_files: &[],
+};
 
-/// Bro-home files that only the retired cutovers read.
-pub const RETIRED_BRO_HOME_FILES: &[&str] = &["render-locality-observations.json"];
+/// Every retired cutover, in the order a start archives them.
+pub const RETIRED_CUTOVERS: &[RetiredCutover] =
+    &[RETIRED_LOCALITY_CUTOVERS, RETIRED_GIT_TRANSPORT_CUTOVER];
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct LocalityCutoverRetirement {
+pub struct CutoverRetirement {
     /// The archive directory this pass created; `None` when nothing was
     /// found.
     pub archive_dir: Option<PathBuf>,
@@ -50,34 +77,35 @@ pub struct LocalityCutoverRetirement {
     pub archived: Vec<String>,
 }
 
-/// Move every retired locality cutover file under `state_dir` and `bro_home`
-/// into a new `retired-locality-<label>` archive directory.
+/// Move every file `cutover` left under `state_dir` and `bro_home` into a new
+/// `<archive prefix><label>` archive directory.
 ///
 /// `label` names the archive (the caller passes a UTC timestamp). An absent
 /// `state_dir` or `bro_home` holds nothing to archive.
 // Startup migration path; runs before the listener binds, off any tokio
 // worker.
 #[allow(clippy::disallowed_methods)]
-pub fn archive_retired_locality_state(
+pub fn archive_retired_cutover_state(
+    cutover: &RetiredCutover,
     state_dir: &Path,
     bro_home: &Path,
     label: &str,
-) -> Result<LocalityCutoverRetirement> {
-    let mut found = retired_state_entries(state_dir)?;
-    for name in RETIRED_BRO_HOME_FILES {
+) -> Result<CutoverRetirement> {
+    let mut found = retired_state_entries(cutover, state_dir)?;
+    for name in cutover.bro_home_files {
         let path = bro_home.join(name);
         if exists_without_following(&path)? {
             found.push(((*name).to_string(), path));
         }
     }
     if found.is_empty() {
-        return Ok(LocalityCutoverRetirement::default());
+        return Ok(CutoverRetirement::default());
     }
     found.sort();
 
     let artifacts = state_dir.join(CUTOVER_ARTIFACTS_DIR);
     fs::create_dir_all(&artifacts).with_context(|| format!("creating {}", artifacts.display()))?;
-    let archive_dir = create_fresh_archive_dir(&artifacts, label)?;
+    let archive_dir = create_fresh_archive_dir(&artifacts, cutover.archive_prefix, label)?;
     let mut archived = Vec::with_capacity(found.len());
     for (name, source) in found {
         let target = archive_dir.join(&name);
@@ -88,14 +116,17 @@ pub fn archive_retired_locality_state(
     }
     sync_directory(&archive_dir)?;
     sync_directory(&artifacts)?;
-    Ok(LocalityCutoverRetirement {
+    Ok(CutoverRetirement {
         archive_dir: Some(archive_dir),
         archived,
     })
 }
 
 #[allow(clippy::disallowed_methods)]
-fn retired_state_entries(state_dir: &Path) -> Result<Vec<(String, PathBuf)>> {
+fn retired_state_entries(
+    cutover: &RetiredCutover,
+    state_dir: &Path,
+) -> Result<Vec<(String, PathBuf)>> {
     let entries = match fs::read_dir(state_dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
@@ -109,10 +140,11 @@ fn retired_state_entries(state_dir: &Path) -> Result<Vec<(String, PathBuf)>> {
         let Some(name) = entry.file_name().to_str().map(str::to_string) else {
             continue;
         };
-        let retired = RETIRED_STATE_PREFIXES
+        let retired = cutover
+            .state_prefixes
             .iter()
             .any(|prefix| name.starts_with(prefix))
-            || RETIRED_STATE_FILES.contains(&name.as_str());
+            || cutover.state_files.contains(&name.as_str());
         if retired {
             found.push((name, entry.path()));
         }
@@ -129,12 +161,12 @@ fn exists_without_following(path: &Path) -> Result<bool> {
 }
 
 #[allow(clippy::disallowed_methods)]
-fn create_fresh_archive_dir(artifacts: &Path, label: &str) -> Result<PathBuf> {
+fn create_fresh_archive_dir(artifacts: &Path, prefix: &str, label: &str) -> Result<PathBuf> {
     for attempt in 0..1_000u32 {
         let name = if attempt == 0 {
-            format!("{RETIRED_LOCALITY_ARCHIVE_PREFIX}{label}")
+            format!("{prefix}{label}")
         } else {
-            format!("{RETIRED_LOCALITY_ARCHIVE_PREFIX}{label}-{attempt}")
+            format!("{prefix}{label}-{attempt}")
         };
         let path = artifacts.join(name);
         match fs::create_dir(&path) {
@@ -146,7 +178,7 @@ fn create_fresh_archive_dir(artifacts: &Path, label: &str) -> Result<PathBuf> {
         }
     }
     anyhow::bail!(
-        "no free retired-locality archive directory name for label {label} under {}",
+        "no free {prefix} archive directory name for label {label} under {}",
         artifacts.display()
     )
 }
@@ -208,6 +240,14 @@ mod tests {
         "projects.json",
     ];
 
+    fn archive_locality(state: &Path, bro: &Path, label: &str) -> Result<CutoverRetirement> {
+        archive_retired_cutover_state(&RETIRED_LOCALITY_CUTOVERS, state, bro, label)
+    }
+
+    fn archive_git(state: &Path, bro: &Path, label: &str) -> Result<CutoverRetirement> {
+        archive_retired_cutover_state(&RETIRED_GIT_TRANSPORT_CUTOVER, state, bro, label)
+    }
+
     struct Fixture {
         _temp: tempfile::TempDir,
         state: PathBuf,
@@ -242,8 +282,8 @@ mod tests {
         for name in LIVE_FILES {
             fs::write(fixture.state.join(name), b"{}").unwrap();
         }
-        let result = archive_retired_locality_state(&fixture.state, &fixture.bro, "t").unwrap();
-        assert_eq!(result, LocalityCutoverRetirement::default());
+        let result = archive_locality(&fixture.state, &fixture.bro, "t").unwrap();
+        assert_eq!(result, CutoverRetirement::default());
         assert!(!fixture.state.join(CUTOVER_ARTIFACTS_DIR).exists());
         for name in LIVE_FILES {
             assert!(fixture.state.join(name).is_file(), "{name}");
@@ -251,8 +291,8 @@ mod tests {
 
         // An absent state root and bro home hold nothing either.
         let missing = fixture.state.join("missing");
-        let result = archive_retired_locality_state(&missing, &missing.join("bro"), "t").unwrap();
-        assert_eq!(result, LocalityCutoverRetirement::default());
+        let result = archive_locality(&missing, &missing.join("bro"), "t").unwrap();
+        assert_eq!(result, CutoverRetirement::default());
         assert!(!missing.exists());
     }
 
@@ -283,9 +323,7 @@ mod tests {
             fs::write(fixture.state.join(name), b"{}").unwrap();
         }
 
-        let first =
-            archive_retired_locality_state(&fixture.state, &fixture.bro, "20260930T000000Z")
-                .unwrap();
+        let first = archive_locality(&fixture.state, &fixture.bro, "20260930T000000Z").unwrap();
         let archive = first.archive_dir.clone().unwrap();
         assert_eq!(
             archive,
@@ -295,7 +333,7 @@ mod tests {
         );
         let mut expected = LEGACY_FILES
             .iter()
-            .chain(RETIRED_BRO_HOME_FILES)
+            .chain(RETIRED_LOCALITY_CUTOVERS.bro_home_files)
             .map(|name| name.to_string())
             .collect::<Vec<_>>();
         expected.sort();
@@ -326,10 +364,8 @@ mod tests {
             assert!(fixture.state.join(name).is_file(), "{name}");
         }
 
-        let second =
-            archive_retired_locality_state(&fixture.state, &fixture.bro, "20260930T000000Z")
-                .unwrap();
-        assert_eq!(second, LocalityCutoverRetirement::default());
+        let second = archive_locality(&fixture.state, &fixture.bro, "20260930T000000Z").unwrap();
+        assert_eq!(second, CutoverRetirement::default());
         assert_eq!(
             archive_contents(&fixture.state.join(CUTOVER_ARTIFACTS_DIR)),
             ["retired-locality-20260930T000000Z"]
@@ -344,12 +380,12 @@ mod tests {
         let fixture = fixture();
         let marker = "code-source-locality-cutover-marker.json";
         fs::write(fixture.state.join(marker), b"first").unwrap();
-        let first = archive_retired_locality_state(&fixture.state, &fixture.bro, "same")
+        let first = archive_locality(&fixture.state, &fixture.bro, "same")
             .unwrap()
             .archive_dir
             .unwrap();
         fs::write(fixture.state.join(marker), b"second").unwrap();
-        let second = archive_retired_locality_state(&fixture.state, &fixture.bro, "same")
+        let second = archive_locality(&fixture.state, &fixture.bro, "same")
             .unwrap()
             .archive_dir
             .unwrap();
@@ -368,7 +404,7 @@ mod tests {
         fs::write(&target, b"target").unwrap();
         let link = fixture.state.join("render-locality-cutover-marker.json");
         std::os::unix::fs::symlink(&target, &link).unwrap();
-        let archive = archive_retired_locality_state(&fixture.state, &fixture.bro, "t")
+        let archive = archive_locality(&fixture.state, &fixture.bro, "t")
             .unwrap()
             .archive_dir
             .unwrap();
@@ -381,5 +417,129 @@ mod tests {
         );
         assert!(fs::symlink_metadata(&link).is_err());
         assert_eq!(fs::read(&target).unwrap(), b"target");
+    }
+
+    const GIT_LEGACY_FILES: &[&str] = &[
+        "git-transport-cutover-marker.json",
+        "git-transport-cutover-receipt.json",
+        "git-transport-checkout-parity-proof.json",
+        "git-transport-cutover-marker.json.bak",
+    ];
+
+    /// A Git transport state root (marker, receipt, parity proof, and an
+    /// operator backup) moves byte-for-byte into its own archive. The
+    /// knowledge transport marker, the catalog, and reviewed reports already
+    /// under `cutover-artifacts/` stay where they are, and the next pass
+    /// finds nothing.
+    #[test]
+    fn git_transport_state_is_archived_once_byte_for_byte() {
+        let fixture = fixture();
+        for name in GIT_LEGACY_FILES {
+            fs::write(fixture.state.join(name), format!("{name} bytes")).unwrap();
+        }
+        // A marker whose receipt no longer matches is archived as bytes.
+        fs::write(
+            fixture.state.join("git-transport-cutover-receipt.json"),
+            b"{ not json",
+        )
+        .unwrap();
+        let report = fixture
+            .state
+            .join(CUTOVER_ARTIFACTS_DIR)
+            .join("git-20260930/report.json");
+        fs::create_dir_all(report.parent().unwrap()).unwrap();
+        fs::write(&report, b"report").unwrap();
+        for name in ["knowledge-transport-cutover-marker.json", "projects.json"] {
+            fs::write(fixture.state.join(name), b"{}").unwrap();
+        }
+
+        let first = archive_git(&fixture.state, &fixture.bro, "20260930T000000Z").unwrap();
+        let archive = first.archive_dir.clone().unwrap();
+        assert_eq!(
+            archive,
+            fixture
+                .state
+                .join("cutover-artifacts/retired-git-transport-20260930T000000Z")
+        );
+        let mut expected = GIT_LEGACY_FILES
+            .iter()
+            .map(|name| name.to_string())
+            .collect::<Vec<_>>();
+        expected.sort();
+        assert_eq!(first.archived, expected);
+        assert_eq!(archive_contents(&archive), expected);
+        for name in GIT_LEGACY_FILES {
+            assert!(!fixture.state.join(name).exists(), "{name} left in place");
+        }
+        assert_eq!(
+            fs::read(archive.join("git-transport-cutover-receipt.json")).unwrap(),
+            b"{ not json"
+        );
+        assert_eq!(
+            fs::read(archive.join("git-transport-checkout-parity-proof.json")).unwrap(),
+            b"git-transport-checkout-parity-proof.json bytes"
+        );
+        assert_eq!(fs::read(&report).unwrap(), b"report");
+        for name in ["knowledge-transport-cutover-marker.json", "projects.json"] {
+            assert!(fixture.state.join(name).is_file(), "{name}");
+        }
+
+        let second = archive_git(&fixture.state, &fixture.bro, "20260930T000000Z").unwrap();
+        assert_eq!(second, CutoverRetirement::default());
+        assert_eq!(
+            archive_contents(&fixture.state.join(CUTOVER_ARTIFACTS_DIR)),
+            ["git-20260930", "retired-git-transport-20260930T000000Z"]
+        );
+    }
+
+    #[test]
+    fn never_provisioned_git_transport_state_archives_nothing() {
+        let fixture = fixture();
+        fs::write(fixture.state.join("projects.json"), b"{}").unwrap();
+        let result = archive_git(&fixture.state, &fixture.bro, "t").unwrap();
+        assert_eq!(result, CutoverRetirement::default());
+        assert!(!fixture.state.join(CUTOVER_ARTIFACTS_DIR).exists());
+    }
+
+    /// Each retired cutover archives into its own directory, and neither
+    /// pass takes the other's files.
+    #[test]
+    fn each_retired_cutover_archives_only_its_own_files() {
+        let fixture = fixture();
+        fs::write(
+            fixture.state.join("render-locality-cutover-marker.json"),
+            b"render",
+        )
+        .unwrap();
+        fs::write(
+            fixture.state.join("git-transport-cutover-marker.json"),
+            b"git",
+        )
+        .unwrap();
+        let mut archives = Vec::new();
+        for cutover in RETIRED_CUTOVERS {
+            archives.push(
+                archive_retired_cutover_state(cutover, &fixture.state, &fixture.bro, "t").unwrap(),
+            );
+        }
+        assert_eq!(
+            archives[0].archived,
+            ["render-locality-cutover-marker.json"]
+        );
+        assert_eq!(archives[1].archived, ["git-transport-cutover-marker.json"]);
+        assert!(
+            archives[0]
+                .archive_dir
+                .as_ref()
+                .unwrap()
+                .ends_with("retired-locality-t")
+        );
+        assert!(
+            archives[1]
+                .archive_dir
+                .as_ref()
+                .unwrap()
+                .ends_with("retired-git-transport-t")
+        );
     }
 }

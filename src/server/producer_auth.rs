@@ -682,7 +682,7 @@ impl ProducerAuthRuntime {
     }
 
     /// The exact scope -> producer projection consumed by repository-wide
-    /// transport grant commitments and cutover row classification. This is
+    /// transport grant commitments. This is
     /// deliberately distinct from `assignments`, whose value is the resolved
     /// project id used by code-source planning.
     pub(crate) fn repo_assignment_producers(&self) -> BTreeMap<PublishedScope, String> {

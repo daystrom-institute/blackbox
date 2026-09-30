@@ -42,10 +42,10 @@ fn spawn_config_reload_handler(shared: Arc<SharedState>) {
 }
 
 /// Install one validated configuration replacement and republish the pinned
-/// read view before any asynchronous source transition can begin. Producer
-/// assignment removal is cutover authority, so readers must stop seeing a
-/// covered producer overlay at this installation boundary rather than waiting
-/// for the cutback reconciler.
+/// read view before any asynchronous source transition can begin. A producer
+/// assignment change can leave a committed history journal no longer current,
+/// so readers stop seeing its producer overlay at this installation boundary
+/// rather than waiting for the cutback reconciler.
 #[cfg(any(unix, test))]
 async fn install_config_reload(
     shared: &Arc<SharedState>,
@@ -98,10 +98,18 @@ async fn install_config_reload(
     }
     drop(old_cfg);
     *shared.config.write() = new_cfg;
+    // A reload can move producer grants, so a committed journal may stop
+    // being current without any code activation to reconcile it.
+    if let Err(error) = super::history_activation::clear_noncurrent_transport_overlays(shared) {
+        tracing::error!(
+            error = %format!("{error:#}"),
+            "SIGHUP Git-history transport currency reconcile failed after auth reload"
+        );
+    }
     if let Err(error) = super::code_source::republish_code_read_view(shared) {
         tracing::error!(
             %error,
-            "SIGHUP cutover authority republish failed after auth reload"
+            "SIGHUP code read view republish failed after auth reload"
         );
     }
     Some(transitions)
@@ -210,31 +218,22 @@ fn flush_vectors_with_timeout() {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
     use std::fs;
     use std::sync::Arc;
 
     use bbox_config::config::CodeCollectionProducerConfig;
     use bbox_corpus_core::git_overlay::{GitOverlaySelector, GitOverlaySourceV1};
-    use bbox_corpus_core::git_transport_cutover::{
-        RepoTransportGrantState, derive_repo_transport_grants,
-    };
     use bbox_corpus_core::identity::PublishedScope;
     use bbox_corpus_core::project_catalog::{
         CommitNamespace, CorpusProject, ProjectId, ProjectScope, RecordedRepoAuthority,
         RepoHistoryAuthority, RepoHistoryId, RepoHistoryMaterialization, RepoHistoryRecord,
     };
     use bbox_edge_sidecar::manifest::{ManifestIndex, WorkspaceIndexEntry};
-    use bbox_indexing::git_transport_cutover::{
-        GitTransportCutoverMarkerV1, GitTransportCutoverRuntimeV1, GitTransportRuntimeCoverageV1,
-        PredictedGitTransportCutoverRowV1,
-    };
-    use bbox_indexing::project_catalog_inventory::Sha256ValueV1;
 
     use super::*;
 
     #[tokio::test]
-    async fn config_reload_revokes_covered_producer_overlay_before_transition_dispatch() {
+    async fn config_reload_revokes_a_producer_overlay_whose_journal_is_not_current() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
         let state_dir = root.join("state");
@@ -248,7 +247,7 @@ mod tests {
 
         let project_id = ProjectId::parse("p_0000000000000000000000000000cf11").unwrap();
         let repo_history_id = RepoHistoryId::parse("rh_0000000000000000000000000000cf11").unwrap();
-        let scope = PublishedScope::try_new("reload-cutover", ".").unwrap();
+        let scope = PublishedScope::try_new("reload-journal", ".").unwrap();
         let catalog_store =
             bbox_indexing::project_catalog_store::ProjectCatalogStore::initialize_empty(
                 &catalog_path,
@@ -263,9 +262,9 @@ mod tests {
                         repo_history_id: repo_history_id.clone(),
                         membership_generation: 0,
                         authority: RepoHistoryAuthority::Recorded(
-                            RecordedRepoAuthority::parse("reload-cutover").unwrap(),
+                            RecordedRepoAuthority::parse("reload-journal").unwrap(),
                         ),
-                        primary_namespace: CommitNamespace::parse("reload-cutover").unwrap(),
+                        primary_namespace: CommitNamespace::parse("reload-journal").unwrap(),
                         compatibility_namespaces: Default::default(),
                         materialization: RepoHistoryMaterialization::NotBuilt,
                     },
@@ -277,7 +276,7 @@ mod tests {
                         scope: ProjectScope::Published(scope.clone()),
                         operator_aliases: Default::default(),
                         nominated_aliases: Default::default(),
-                        display_name: "Reload cutover fixture".to_string(),
+                        display_name: "Reload journal fixture".to_string(),
                         created_at: "unix:1".to_string(),
                         registered_at_compat: None,
                         repo_history: Some(repo_history_id.clone()),
@@ -321,42 +320,7 @@ mod tests {
         );
         *state.config.write() = initial_cfg.clone();
 
-        let catalog = authority_store.snapshot().unwrap();
-        let assignments = BTreeMap::from([(scope.clone(), "producer-a".to_string())]);
-        let projection = derive_repo_transport_grants(catalog.catalog(), &assignments);
-        let RepoTransportGrantState::Granted { grant } = &projection.grants[&repo_history_id]
-        else {
-            panic!("fixture grant must be complete")
-        };
         let p3_generation_id = format!("rhg_{}", "b".repeat(64));
-        let marker = GitTransportCutoverMarkerV1 {
-            version: 1,
-            applied_at: "unix:2".to_string(),
-            report_artifact_hash: Sha256ValueV1::digest(b"report"),
-            resolution_artifact_hash: Sha256ValueV1::digest(b"resolution"),
-            predecessor_marker_checksum: None,
-            predecessor_catalog_epoch: catalog.epoch(),
-            inventory_hash: Sha256ValueV1::digest(b"inventory"),
-            aggregate_grant_hash: Sha256ValueV1::digest(b"grants"),
-            zero_prepared_history_journals: true,
-            zero_prepared_provenance_journals: true,
-            rows: vec![PredictedGitTransportCutoverRowV1 {
-                repo_history_id: repo_history_id.clone(),
-                grant_commitment: grant.commitment.clone(),
-                membership_generation: 1,
-                source_generation_id: "source-one".to_string(),
-                p3_generation_id: p3_generation_id.clone(),
-                history_parity_commitment: Sha256ValueV1::digest(b"history"),
-                members: std::collections::BTreeSet::from([project_id.clone()]),
-                provenance_import_generations: BTreeMap::new(),
-                provenance_export_generations: BTreeMap::new(),
-                provenance_parity_commitments: BTreeMap::new(),
-                capability_baselines: Vec::new(),
-            }],
-            checksum_sha256: Sha256ValueV1::digest(b"checksum"),
-        };
-        state.git_transport_cutover =
-            Arc::new(GitTransportCutoverRuntimeV1::from_marker(Some(marker)));
 
         let overlay = GitOverlaySelector {
             project_id: project_id.as_str().to_string(),
@@ -367,7 +331,7 @@ mod tests {
                 source_generation_id: "source-one".to_string(),
             },
             repo_head: "c".repeat(40),
-            commit_namespace: "reload-cutover".to_string(),
+            commit_namespace: "reload-journal".to_string(),
             overlay_generation: 1,
         };
         let mut manifest = ManifestIndex::new();
@@ -396,7 +360,7 @@ mod tests {
                 .read()
                 .git_overlays
                 .contains_key(project_id.as_str()),
-            "the current covered producer overlay must be visible before reload"
+            "the producer overlay must be visible before reload"
         );
 
         let mut removed_cfg = initial_cfg;
@@ -414,19 +378,13 @@ mod tests {
                 .repo_assignment_producers()
                 .is_empty()
         );
-        assert_eq!(
-            state
-                .git_transport_coverage_for_project(project_id.as_str())
-                .unwrap(),
-            Some(GitTransportRuntimeCoverageV1::CoveredProducerRemoved)
-        );
         assert!(
             !state
                 .code_read_view
                 .read()
                 .git_overlays
                 .contains_key(project_id.as_str()),
-            "reload must revoke the covered producer overlay before transitions are dispatched"
+            "reload must revoke a producer overlay with no current journal before transitions are dispatched"
         );
     }
 }

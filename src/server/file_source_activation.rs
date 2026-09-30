@@ -614,8 +614,6 @@ fn publish_derived_manifest(
                 git_overlays: super::state::read_git_overlays_for_view(
                     &state.project_authority,
                     &edges_dir,
-                    &state.git_transport_cutover,
-                    &state.code_sources,
                 ),
             });
             Ok(())
