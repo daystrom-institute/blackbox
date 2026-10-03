@@ -201,13 +201,10 @@ impl OpenAiResponsesTransport {
         body: &Value,
         lite: bool,
     ) -> Result<reqwest::Response> {
-        let resp = super::http::send_with_retry(label, || {
-            self.apply_wire_headers(self.http.post(&self.http_endpoint), lite)
-                .json(body)
-                .send()
-        })
-        .await
-        .context("responses request")?;
+        let request = self
+            .apply_wire_headers(self.http.post(&self.http_endpoint), lite)
+            .json(body);
+        let resp = self.send_retry_request(label, request).await?;
         if resp.status() != reqwest::StatusCode::UNAUTHORIZED
             || !matches!(self.state.auth, Auth::ChatGpt { .. })
         {
@@ -221,13 +218,31 @@ impl OpenAiResponsesTransport {
             access_token: fresh.access_token,
             account_id: fresh.account_id,
         };
-        super::http::send_with_retry(label, || {
-            self.apply_wire_headers(self.http.post(&self.http_endpoint), lite)
-                .json(body)
-                .send()
-        })
+        let request = self
+            .apply_wire_headers(self.http.post(&self.http_endpoint), lite)
+            .json(body);
+        self.send_retry_request(label, request)
+            .await
+            .context("responses request (after token refresh)")
+    }
+
+    async fn send_retry_request(
+        &mut self,
+        label: &str,
+        request: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response> {
+        super::http::send_with_retry_observed(
+            label,
+            || {
+                request
+                    .try_clone()
+                    .expect("buffered Responses request")
+                    .send()
+            },
+            |advice| self.state.defer_retry_until(advice),
+        )
         .await
-        .context("responses request (after token refresh)")
+        .context("responses request")
     }
 
     /// Sleep out any server retry advice carried over from an earlier
@@ -415,13 +430,13 @@ impl OpenAiResponsesTransport {
     /// One-shot summarization using an already fitted request (always HTTP).
     async fn summarize_text(&mut self, body: Value) -> Result<String> {
         self.honor_pending_retry_advice().await;
-        let resp = super::http::send_with_retry("openai-responses/compact", || {
-            self.apply_headers(self.http.post(&self.http_endpoint))
-                .json(&body)
-                .send()
-        })
-        .await
-        .context("responses compaction request")?;
+        let request = self
+            .apply_headers(self.http.post(&self.http_endpoint))
+            .json(&body);
+        let resp = self
+            .send_retry_request("openai-responses/compact", request)
+            .await
+            .context("responses compaction request")?;
         let status = resp.status();
         self.state
             .defer_retry_until(RetryAfter::from_headers(resp.headers()));
@@ -620,13 +635,13 @@ impl OpenAiResponsesTransport {
             limit,
         )?;
         self.honor_pending_retry_advice().await;
-        let resp = super::http::send_with_retry("openai-responses/compact", || {
-            self.apply_headers_accept(self.http.post(&url), "application/json")
-                .json(&body)
-                .send()
-        })
-        .await
-        .context("responses public compaction request")?;
+        let request = self
+            .apply_headers_accept(self.http.post(&url), "application/json")
+            .json(&body);
+        let resp = self
+            .send_retry_request("openai-responses/compact", request)
+            .await
+            .context("responses public compaction request")?;
         let status = resp.status();
         self.state
             .defer_retry_until(RetryAfter::from_headers(resp.headers()));

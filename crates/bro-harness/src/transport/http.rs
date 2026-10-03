@@ -223,12 +223,28 @@ where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = reqwest::Result<reqwest::Response>>,
 {
+    send_with_retry_observed(label, make, |_| {}).await
+}
+
+/// Publish response deadlines before any body read or retry wait so callers
+/// can retain server advice when the request future is cancelled.
+pub async fn send_with_retry_observed<F, Fut, O>(
+    label: &str,
+    make: F,
+    mut observe: O,
+) -> reqwest::Result<reqwest::Response>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = reqwest::Result<reqwest::Response>>,
+    O: FnMut(Option<RetryAfter>),
+{
     let max = max_retries();
     let mut attempt = 0u32;
     loop {
         attempt += 1;
         match make().await {
             Ok(resp) => {
+                observe(RetryAfter::from_headers(resp.headers()));
                 let status = resp.status();
                 if status.is_success() || !status_retryable(status) || attempt > max {
                     return Ok(resp);

@@ -945,3 +945,37 @@ async fn inline_compaction_honors_and_preserves_retry_advice() {
     );
     assert_eq!(server.await.unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn cancelled_http_status_retry_retains_advice_for_every_responses_path() {
+    for route in ["sampling", "inline", "public"] {
+        let body = json!({"error":{"code":"rate_limit_exceeded"}}).to_string();
+        let response = format!(
+            "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 3600\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let (url, server) = raw_http_server(vec![response], 1).await;
+        let mut tx = transport(url, false, None);
+        let before = tx.snapshot();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            match route {
+                "sampling" => tx
+                    .send_with_auth_recovery("fixture", &json!({}), false)
+                    .await
+                    .map(|_| ()),
+                "inline" => tx.summarize_text(json!({})).await.map(|_| ()),
+                "public" => tx.public_compact(&opts()).await.map(|_| ()),
+                _ => unreachable!(),
+            }
+        })
+        .await;
+        assert!(result.is_err(), "{route}: request must wait for advice");
+        assert!(
+            tx.state.pending_retry_advice().unwrap().remaining_delay()
+                > std::time::Duration::from_secs(3500),
+            "{route}: cancelling the wait must retain its deadline"
+        );
+        assert_eq!(tx.snapshot(), before, "{route}");
+        assert_eq!(server.await.unwrap().len(), 1, "{route}");
+    }
+}
