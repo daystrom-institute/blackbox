@@ -500,6 +500,7 @@ impl Tool for EditsCreateFile {
         let result = self.0.with_set(&params.es, |set| {
             if set.creates.iter().any(|c| c.path == params.path)
                 || set.files.contains_key(&params.path)
+                || set.deletes.iter().any(|d| d.path == params.path)
             {
                 return Err(format!(
                     "EditSet `{}` already touches {}",
@@ -517,6 +518,172 @@ impl Tool for EditsCreateFile {
             Err(e) => err(format!("edits.createFile: {e}")),
         }
     }
+}
+
+/// Most files one `edits.createFiles` call may queue.
+pub const MAX_CREATE_FILES_BATCH_ENTRIES: usize = 1024;
+/// Most UTF-8 path bytes, summed over the batch, one `edits.createFiles` call
+/// may queue. Also bounds the collision diagnostic, which names paths only.
+pub const MAX_CREATE_FILES_BATCH_PATH_BYTES: usize = 256 * 1024;
+/// Most UTF-8 content bytes, summed over the batch, one `edits.createFiles`
+/// call may queue.
+pub const MAX_CREATE_FILES_BATCH_CONTENT_BYTES: usize = 32 * 1024 * 1024;
+
+const CREATE_FILES_SHAPE: &str = "{ es: string, files: { path: string, content: string }[] }";
+
+/// Decode `edits.createFiles` input without echoing values: serde's
+/// type-mismatch errors quote the offending string, which here would be file
+/// content. Entry count is bounded before any entry is decoded; byte totals
+/// are bounded before anything reaches the store.
+fn decode_create_files(input: Value) -> Result<(String, Vec<CreateFile>), String> {
+    let bad = |detail: String| format!("bad input, expected {CREATE_FILES_SHAPE}; {detail}");
+    let mut input = normalize_algebra_input(input);
+    let Some(object) = input.as_object_mut() else {
+        return Err(bad("input is not an object".to_string()));
+    };
+    let es = match object.remove("es") {
+        Some(Value::String(es)) => es,
+        _ => return Err(bad("`es` is missing or not a string".to_string())),
+    };
+    let entries = match object.remove("files") {
+        Some(Value::Array(entries)) => entries,
+        _ => return Err(bad("`files` is missing or not an array".to_string())),
+    };
+    if entries.len() > MAX_CREATE_FILES_BATCH_ENTRIES {
+        return Err(format!(
+            "batch of {} files exceeds the limit of {MAX_CREATE_FILES_BATCH_ENTRIES} files per call; nothing queued. Split the files across several createFiles calls.",
+            entries.len()
+        ));
+    }
+    let mut files = Vec::with_capacity(entries.len());
+    let (mut path_bytes, mut content_bytes) = (0usize, 0usize);
+    for (index, entry) in entries.into_iter().enumerate() {
+        let Value::Object(mut entry) = entry else {
+            return Err(bad(format!("files[{index}] is not an object")));
+        };
+        let Some(Value::String(path)) = entry.remove("path") else {
+            return Err(bad(format!(
+                "files[{index}].path is missing or not a string"
+            )));
+        };
+        let Some(Value::String(content)) = entry.remove("content") else {
+            return Err(bad(format!(
+                "files[{index}].content is missing or not a string"
+            )));
+        };
+        path_bytes += path.len();
+        content_bytes += content.len();
+        files.push(CreateFile { path, content });
+    }
+    if path_bytes > MAX_CREATE_FILES_BATCH_PATH_BYTES {
+        return Err(format!(
+            "batch path bytes ({path_bytes}) exceed the limit of {MAX_CREATE_FILES_BATCH_PATH_BYTES} per call; nothing queued. Split the files across several createFiles calls."
+        ));
+    }
+    if content_bytes > MAX_CREATE_FILES_BATCH_CONTENT_BYTES {
+        return Err(format!(
+            "batch content bytes ({content_bytes}) exceed the limit of {MAX_CREATE_FILES_BATCH_CONTENT_BYTES} per call; nothing queued. Split the files across several createFiles calls."
+        ));
+    }
+    Ok((es, files))
+}
+
+/// `edits.createFiles`: queue creation of several new files as one
+/// all-or-nothing batch.
+pub struct EditsCreateFiles(pub Arc<EditStore>);
+
+#[async_trait]
+impl Tool for EditsCreateFiles {
+    fn name(&self) -> &str {
+        "edits.createFiles"
+    }
+    fn description(&self) -> &str {
+        "Queue creation of several new files in one all-or-nothing call (pure; builds, never writes). If any path is already created, edited, or deleted in the EditSet, or repeats within the batch, the whole batch is refused with every offending path named and nothing is queued. Limits per call: 1024 files, 262144 UTF-8 path bytes, 33554432 UTF-8 content bytes (split larger batches across calls). An empty batch is a no-op. Apply bounces with `create_exists` if a path exists at apply time."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "es": { "type": "string", "description": "EditSet id from edits.begin." },
+                "files": {
+                    "type": "array",
+                    "maxItems": MAX_CREATE_FILES_BATCH_ENTRIES,
+                    "description": format!(
+                        "Files to create, e.g. a transform's `creates` array. At most {MAX_CREATE_FILES_BATCH_ENTRIES} entries, {MAX_CREATE_FILES_BATCH_PATH_BYTES} UTF-8 path bytes, and {MAX_CREATE_FILES_BATCH_CONTENT_BYTES} UTF-8 content bytes per call."
+                    ),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string", "description": "Path that must not yet exist. Relative paths resolve against the session worktree root; absolute paths are accepted as-is." },
+                            "content": { "type": "string" }
+                        },
+                        "required": ["path", "content"]
+                    }
+                }
+            },
+            "required": ["es", "files"]
+        })
+    }
+    fn namespace_binding(&self) -> Option<(String, String)> {
+        Some(("edits".to_string(), "createFiles".to_string()))
+    }
+    async fn call(&self, input: Value, _cx: &ToolCx) -> ToolResult {
+        let (es, files) = match decode_create_files(input) {
+            Ok(decoded) => decoded,
+            Err(e) => return err(format!("edits.createFiles: {e}")),
+        };
+        // Validation and append share one store critical section, so a
+        // refused batch leaves the set exactly as it was and two overlapping
+        // batches cannot interleave.
+        let result = self.0.with_set(&es, |set| {
+            let offending = create_batch_collisions(set, &files);
+            if !offending.is_empty() {
+                return Err(format!(
+                    "EditSet `{es}` refused the whole batch, nothing queued; {} offending path(s): {}",
+                    offending.len(),
+                    offending.join(", ")
+                ));
+            }
+            set.creates.extend(files);
+            Ok(set.creates.len())
+        });
+        match result {
+            Ok(creates) => ToolResult::Json(json!({ "es": es, "creates": creates })),
+            Err(e) => err(format!("edits.createFiles: {e}")),
+        }
+    }
+}
+
+/// Every batch path that collides with the set or repeats within the batch,
+/// once each in input order, labelled with the reason. Paths compare as the
+/// supplied strings, like the single-file builders.
+fn create_batch_collisions(set: &EditSetState, files: &[CreateFile]) -> Vec<String> {
+    use std::collections::BTreeSet;
+    let created: BTreeSet<&str> = set.creates.iter().map(|c| c.path.as_str()).collect();
+    let deleted: BTreeSet<&str> = set.deletes.iter().map(|d| d.path.as_str()).collect();
+    let mut seen = BTreeSet::new();
+    let mut reported = BTreeSet::new();
+    let mut offending = Vec::new();
+    for file in files {
+        let path = file.path.as_str();
+        let reason = if created.contains(path) {
+            Some("already created")
+        } else if set.files.contains_key(path) {
+            Some("already edited")
+        } else if deleted.contains(path) {
+            Some("already deleted")
+        } else if !seen.insert(path) {
+            Some("repeated in this batch")
+        } else {
+            None
+        };
+        if let Some(reason) = reason
+            && reported.insert(path)
+        {
+            offending.push(format!("{path} ({reason})"));
+        }
+    }
+    offending
 }
 
 /// `edits.deleteFile` — queue deletion of an existing file.
@@ -1176,6 +1343,7 @@ pub fn tools(store: Arc<EditStore>, ledger: Arc<ProvenanceLedger>) -> Vec<Arc<dy
         Arc::new(EditsInsertBefore(Arc::clone(&store))) as Arc<dyn Tool>,
         Arc::new(EditsDelete(Arc::clone(&store))) as Arc<dyn Tool>,
         Arc::new(EditsCreateFile(Arc::clone(&store))) as Arc<dyn Tool>,
+        Arc::new(EditsCreateFiles(Arc::clone(&store))) as Arc<dyn Tool>,
         Arc::new(EditsDeleteFile(Arc::clone(&store))) as Arc<dyn Tool>,
         Arc::new(EditsMerge(Arc::clone(&store), ledger)) as Arc<dyn Tool>,
         Arc::new(EditsApply(store)) as Arc<dyn Tool>,
@@ -1652,6 +1820,666 @@ mod tests {
         );
     }
 
+    // ---- edits.createFiles: all-or-nothing batch creates ----
+
+    async fn begin_es(store: &Arc<EditStore>, cx: &ToolCx) -> String {
+        json_of(EditsBegin(store.clone()).call(json!({}), cx).await)
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    async fn create_files(store: &Arc<EditStore>, cx: &ToolCx, input: Value) -> ToolResult {
+        EditsCreateFiles(store.clone()).call(input, cx).await
+    }
+
+    fn batch(paths: &[&str]) -> Value {
+        Value::Array(
+            paths
+                .iter()
+                .map(|path| json!({ "path": path, "content": format!("SECRET-BODY {path}\n") }))
+                .collect(),
+        )
+    }
+
+    /// Every queued entry of a set, as comparable strings.
+    fn set_state(store: &EditStore, es: &str) -> Vec<String> {
+        let set = store.snapshot(es).unwrap();
+        set.creates
+            .iter()
+            .map(|c| format!("create {} {}", c.path, c.content))
+            .chain(
+                set.files
+                    .iter()
+                    .map(|(file, accum)| format!("edit {file} {}", accum.edits.len())),
+            )
+            .chain(set.deletes.iter().map(|d| format!("delete {}", d.path)))
+            .collect()
+    }
+
+    fn error_of(result: ToolResult) -> String {
+        match result {
+            ToolResult::Error(e) => e,
+            other => panic!("expected error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_files_queues_batch_without_writing_then_applies_syntax_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (store, cx) = set_up(&root);
+        let es = begin_es(&store, &cx).await;
+        json_of(
+            EditsCreateFile(store.clone())
+                .call(
+                    json!({ "es": es, "path": "first.txt", "content": "first\n" }),
+                    &cx,
+                )
+                .await,
+        );
+        let queued = json_of(
+            create_files(
+                &store,
+                &cx,
+                json!({ "es": es, "files": [
+                    { "path": "a.txt", "content": "a\n" },
+                    { "path": "nested/dir/b.txt", "content": "b\n" },
+                    { "path": "c.rs", "content": "pub fn c() {}\n" }
+                ] }),
+            )
+            .await,
+        );
+        assert_eq!(queued, json!({ "es": es, "creates": 4 }));
+        for path in ["first.txt", "a.txt", "nested/dir/b.txt", "c.rs"] {
+            assert!(!root.join(path).exists(), "queueing wrote {path}");
+        }
+
+        let result = json_of(
+            EditsApply(store.clone())
+                .call(json!({ "es": es }), &cx)
+                .await,
+        );
+        assert_eq!(result["applied"], true, "{result}");
+        assert_eq!(result["semantic_status"], "syntax_only", "{result}");
+        assert_eq!(result["lineage"]["syntax_only"], 4, "{result}");
+        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "a\n");
+        assert_eq!(
+            std::fs::read_to_string(root.join("nested/dir/b.txt")).unwrap(),
+            "b\n"
+        );
+        assert!(root.join("first.txt").exists() && root.join("c.rs").exists());
+        assert!(store.snapshot(&es).is_err(), "success consumes the set");
+    }
+
+    #[tokio::test]
+    async fn create_files_collision_refuses_whole_batch_and_preserves_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (store, cx) = set_up(&root);
+        let (_, beta) = beta_span(&root, &cx).await;
+        let es = begin_es(&store, &cx).await;
+        json_of(
+            EditsCreateFile(store.clone())
+                .call(
+                    json!({ "es": es, "path": "made.txt", "content": "made\n" }),
+                    &cx,
+                )
+                .await,
+        );
+        json_of(
+            EditsDelete(store.clone())
+                .call(json!({ "es": es, "span": beta["span"] }), &cx)
+                .await,
+        );
+        json_of(
+            EditsDeleteFile(store.clone())
+                .call(
+                    json!({ "es": es, "path": "gone.txt", "contentSha256": sha256_hex(b"gone\n") }),
+                    &cx,
+                )
+                .await,
+        );
+        let before = set_state(&store, &es);
+
+        let cases: [(&[&str], &[&str]); 5] = [
+            (&["ok.txt", "made.txt"], &["made.txt (already created)"]),
+            (&["ok.txt", "probe.rs"], &["probe.rs (already edited)"]),
+            (&["ok.txt", "gone.txt"], &["gone.txt (already deleted)"]),
+            (
+                &["ok.txt", "dup.txt", "dup.txt"],
+                &["dup.txt (repeated in this batch)"],
+            ),
+            (
+                &[
+                    "made.txt", "ok.txt", "probe.rs", "gone.txt", "x.txt", "x.txt",
+                ],
+                &[
+                    "made.txt (already created)",
+                    "probe.rs (already edited)",
+                    "gone.txt (already deleted)",
+                    "x.txt (repeated in this batch)",
+                ],
+            ),
+        ];
+        for (paths, offending) in cases {
+            let error = error_of(
+                create_files(&store, &cx, json!({ "es": es, "files": batch(paths) })).await,
+            );
+            assert!(error.contains("nothing queued"), "{error}");
+            assert!(
+                error.contains(&format!("{} offending path(s)", offending.len())),
+                "{error}"
+            );
+            for expected in offending {
+                assert!(error.contains(expected), "{expected} missing from {error}");
+            }
+            assert!(!error.contains("ok.txt"), "{error}");
+            assert!(!error.contains("SECRET-BODY"), "{error}");
+            assert_eq!(set_state(&store, &es), before, "refusal changed the set");
+        }
+
+        // Malformed final entries refuse the batch without echoing values.
+        for last in [
+            json!({ "path": "bad.txt" }),
+            json!({ "path": "bad.txt", "content": 7 }),
+            json!({ "content": "SECRET-BODY no path" }),
+            json!("SECRET-BODY bare string"),
+        ] {
+            let mut files = batch(&["ok.txt", "ok2.txt"]);
+            files.as_array_mut().unwrap().push(last);
+            let error =
+                error_of(create_files(&store, &cx, json!({ "es": es, "files": files })).await);
+            assert!(error.contains("files[2]"), "{error}");
+            assert!(!error.contains("SECRET-BODY"), "{error}");
+            assert_eq!(
+                set_state(&store, &es),
+                before,
+                "malformed batch changed the set"
+            );
+        }
+        for input in [
+            json!({ "es": es }),
+            json!({ "es": es, "files": "SECRET-BODY" }),
+            json!({ "files": [] }),
+        ] {
+            let error = error_of(create_files(&store, &cx, input).await);
+            assert!(error.contains("bad input"), "{error}");
+            assert!(!error.contains("SECRET-BODY"), "{error}");
+        }
+        assert_eq!(set_state(&store, &es), before);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_create_files_admit_whole_batches_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (store, cx) = set_up(&root);
+        for round in 0..64 {
+            let es = begin_es(&store, &cx).await;
+            let first = vec![format!("a{round}.txt"), "shared.txt".to_string()];
+            let second = vec!["shared.txt".to_string(), format!("b{round}.txt")];
+            let spawn = |paths: Vec<String>| {
+                let (store, cx, es) = (store.clone(), cx.clone(), es.clone());
+                tokio::spawn(async move {
+                    let files: Vec<Value> = paths
+                        .iter()
+                        .map(|p| json!({ "path": p, "content": "x" }))
+                        .collect();
+                    create_files(&store, &cx, json!({ "es": es, "files": files })).await
+                })
+            };
+            let (left, right) = tokio::join!(spawn(first.clone()), spawn(second.clone()));
+            let (left, right) = (left.unwrap(), right.unwrap());
+            assert_ne!(left.is_error(), right.is_error(), "{left:?} / {right:?}");
+            let admitted = if left.is_error() { &second } else { &first };
+            let queued: Vec<String> = store
+                .snapshot(&es)
+                .unwrap()
+                .creates
+                .iter()
+                .map(|c| c.path.clone())
+                .collect();
+            assert_eq!(&queued, admitted, "round {round} left a partial batch");
+        }
+
+        // Independent batches both keep their entries.
+        let es = begin_es(&store, &cx).await;
+        let spawn = |path: &'static str| {
+            let (store, cx, es) = (store.clone(), cx.clone(), es.clone());
+            tokio::spawn(async move {
+                create_files(
+                    &store,
+                    &cx,
+                    json!({ "es": es, "files": [{ "path": path, "content": "x" }] }),
+                )
+                .await
+            })
+        };
+        let (left, right) = tokio::join!(spawn("left.txt"), spawn("right.txt"));
+        assert!(!left.unwrap().is_error());
+        assert!(!right.unwrap().is_error());
+        let mut queued: Vec<String> = store
+            .snapshot(&es)
+            .unwrap()
+            .creates
+            .iter()
+            .map(|c| c.path.clone())
+            .collect();
+        queued.sort();
+        assert_eq!(queued, ["left.txt", "right.txt"]);
+    }
+
+    #[tokio::test]
+    async fn empty_create_files_batch_is_a_no_op_for_live_sets_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (store, cx) = set_up(&root);
+        let es = begin_es(&store, &cx).await;
+        let fresh = json_of(create_files(&store, &cx, json!({ "es": es, "files": [] })).await);
+        assert_eq!(fresh, json!({ "es": es, "creates": 0 }));
+        json_of(
+            create_files(
+                &store,
+                &cx,
+                json!({ "es": { "es": es }, "files": [{ "path": "kept.txt", "content": "kept\n" }] }),
+            )
+            .await,
+        );
+        let before = set_state(&store, &es);
+        let again =
+            json_of(create_files(&store, &cx, json!({ "es": { "es": es }, "files": [] })).await);
+        assert_eq!(again, json!({ "es": es, "creates": 1 }));
+        assert_eq!(set_state(&store, &es), before);
+
+        let unknown =
+            error_of(create_files(&store, &cx, json!({ "es": "es-999", "files": [] })).await);
+        assert!(unknown.contains("unknown EditSet"), "{unknown}");
+        let applied = json_of(
+            EditsApply(store.clone())
+                .call(json!({ "es": es }), &cx)
+                .await,
+        );
+        assert_eq!(applied["applied"], true, "{applied}");
+        let consumed = error_of(create_files(&store, &cx, json!({ "es": es, "files": [] })).await);
+        assert!(consumed.contains("unknown EditSet"), "{consumed}");
+    }
+
+    #[tokio::test]
+    async fn create_file_refuses_a_queued_delete_and_keeps_other_behavior() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (store, cx) = set_up(&root);
+        let es = begin_es(&store, &cx).await;
+        json_of(
+            EditsDeleteFile(store.clone())
+                .call(
+                    json!({ "es": es, "path": "gone.txt", "contentSha256": sha256_hex(b"gone\n") }),
+                    &cx,
+                )
+                .await,
+        );
+        let before = set_state(&store, &es);
+        let error = error_of(
+            EditsCreateFile(store.clone())
+                .call(
+                    json!({ "es": es, "path": "gone.txt", "content": "new\n" }),
+                    &cx,
+                )
+                .await,
+        );
+        assert!(error.contains("already touches gone.txt"), "{error}");
+        assert_eq!(set_state(&store, &es), before);
+
+        let queued = json_of(
+            EditsCreateFile(store.clone())
+                .call(
+                    json!({ "es": { "es": es }, "path": "fresh.txt", "content": "new\n" }),
+                    &cx,
+                )
+                .await,
+        );
+        assert_eq!(queued, json!({ "es": es, "creates": 1 }));
+        let repeat = error_of(
+            EditsCreateFile(store.clone())
+                .call(
+                    json!({ "es": es, "path": "fresh.txt", "content": "again\n" }),
+                    &cx,
+                )
+                .await,
+        );
+        assert!(repeat.contains("already touches fresh.txt"), "{repeat}");
+    }
+
+    #[tokio::test]
+    async fn create_files_limits_hold_at_the_boundary_and_refuse_above_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (store, cx) = set_up(&root);
+
+        let entries = |count: usize| -> Value {
+            Value::Array(
+                (0..count)
+                    .map(|i| json!({ "path": format!("f{i}.txt"), "content": "" }))
+                    .collect(),
+            )
+        };
+        let es = begin_es(&store, &cx).await;
+        let at = json_of(
+            create_files(
+                &store,
+                &cx,
+                json!({ "es": es, "files": entries(MAX_CREATE_FILES_BATCH_ENTRIES) }),
+            )
+            .await,
+        );
+        assert_eq!(at["creates"], MAX_CREATE_FILES_BATCH_ENTRIES);
+        let es = begin_es(&store, &cx).await;
+        let error = error_of(
+            create_files(
+                &store,
+                &cx,
+                json!({ "es": es, "files": entries(MAX_CREATE_FILES_BATCH_ENTRIES + 1) }),
+            )
+            .await,
+        );
+        assert!(
+            error.contains(&MAX_CREATE_FILES_BATCH_ENTRIES.to_string()),
+            "{error}"
+        );
+        assert!(error.len() < 512, "{error}");
+        assert!(set_state(&store, &es).is_empty());
+
+        // Aggregate path bytes: 256 paths of 1 KiB is exactly the limit.
+        let long_paths = |extra: usize| -> Value {
+            Value::Array(
+                (0..256)
+                    .map(|i| {
+                        let pad = 1024 - 4 + if i == 255 { extra } else { 0 };
+                        json!({ "path": format!("{i:04}{}", "p".repeat(pad)), "content": "" })
+                    })
+                    .collect(),
+            )
+        };
+        assert_eq!(MAX_CREATE_FILES_BATCH_PATH_BYTES, 256 * 1024);
+        let es = begin_es(&store, &cx).await;
+        json_of(create_files(&store, &cx, json!({ "es": es, "files": long_paths(0) })).await);
+        let es = begin_es(&store, &cx).await;
+        let error =
+            error_of(create_files(&store, &cx, json!({ "es": es, "files": long_paths(1) })).await);
+        assert!(
+            error.contains(&MAX_CREATE_FILES_BATCH_PATH_BYTES.to_string()),
+            "{error}"
+        );
+        assert!(error.len() < 512 && !error.contains("pppp"), "{error}");
+        assert!(set_state(&store, &es).is_empty());
+
+        // Aggregate content bytes: two halves of the limit fit exactly.
+        let half = MAX_CREATE_FILES_BATCH_CONTENT_BYTES / 2;
+        let big = |extra: usize| -> Value {
+            json!([
+                { "path": "big1.txt", "content": "c".repeat(half) },
+                { "path": "big2.txt", "content": "c".repeat(half + extra) }
+            ])
+        };
+        let es = begin_es(&store, &cx).await;
+        json_of(create_files(&store, &cx, json!({ "es": es, "files": big(0) })).await);
+        let es = begin_es(&store, &cx).await;
+        let error = error_of(create_files(&store, &cx, json!({ "es": es, "files": big(1) })).await);
+        assert!(
+            error.contains(&MAX_CREATE_FILES_BATCH_CONTENT_BYTES.to_string()),
+            "{error}"
+        );
+        assert!(error.len() < 512 && !error.contains("cccc"), "{error}");
+        assert!(set_state(&store, &es).is_empty());
+    }
+
+    #[test]
+    fn create_files_limits_are_published_in_schema_description_and_declarations() {
+        let tool = EditsCreateFiles(Arc::new(EditStore::default()));
+        let schema = tool.input_schema();
+        assert_eq!(
+            schema["properties"]["files"]["maxItems"],
+            MAX_CREATE_FILES_BATCH_ENTRIES
+        );
+        let schema_text = schema["properties"]["files"]["description"]
+            .as_str()
+            .unwrap();
+        let declarations = namespace_description().declarations;
+        for limit in [
+            MAX_CREATE_FILES_BATCH_ENTRIES,
+            MAX_CREATE_FILES_BATCH_PATH_BYTES,
+            MAX_CREATE_FILES_BATCH_CONTENT_BYTES,
+        ] {
+            let limit = limit.to_string();
+            assert!(schema_text.contains(&limit), "{schema_text}");
+            assert!(
+                tool.description().contains(&limit),
+                "{}",
+                tool.description()
+            );
+            assert!(declarations.contains(&limit), "{declarations}");
+        }
+        assert!(declarations.contains(
+            "createFiles(args: { es: string; files: { path: string; content: string }[] }): Promise<{ es: string; creates: number }>;"
+        ));
+        assert_eq!(
+            tool.namespace_binding(),
+            Some(("edits".to_string(), "createFiles".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_destination_appearing_after_queue_bounces_then_retry_applies() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (store, cx) = set_up(&root);
+        let es = begin_es(&store, &cx).await;
+        json_of(
+            create_files(
+                &store,
+                &cx,
+                json!({ "es": es, "files": batch(&["a.txt", "b.txt"]) }),
+            )
+            .await,
+        );
+        std::fs::write(root.join("b.txt"), "external\n").unwrap();
+
+        let bounced = json_of(
+            EditsApply(store.clone())
+                .call(json!({ "es": es }), &cx)
+                .await,
+        );
+        assert_eq!(bounced["applied"], false, "{bounced}");
+        assert_eq!(bounced["findings"][0]["kind"], "create_exists", "{bounced}");
+        assert_eq!(bounced["findings"][0]["file"], "b.txt", "{bounced}");
+        assert!(!root.join("a.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(root.join("b.txt")).unwrap(),
+            "external\n"
+        );
+        assert_eq!(set_state(&store, &es).len(), 2, "bounce retains the set");
+
+        std::fs::remove_file(root.join("b.txt")).unwrap();
+        let applied = json_of(
+            EditsApply(store.clone())
+                .call(json!({ "es": es }), &cx)
+                .await,
+        );
+        assert_eq!(applied["applied"], true, "{applied}");
+        assert!(root.join("a.txt").exists() && root.join("b.txt").exists());
+        assert!(store.snapshot(&es).is_err());
+    }
+
+    #[tokio::test]
+    async fn equivalent_batch_spellings_bounce_without_clobbering() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (store, cx) = set_up(&root);
+        let es = begin_es(&store, &cx).await;
+        // Queue collisions compare supplied strings; both spellings queue.
+        let queued = json_of(
+            create_files(
+                &store,
+                &cx,
+                json!({ "es": es, "files": [
+                    { "path": "dup.txt", "content": "first\n" },
+                    { "path": "sub/../dup.txt", "content": "second\n" }
+                ] }),
+            )
+            .await,
+        );
+        assert_eq!(queued["creates"], 2);
+
+        let result = json_of(
+            EditsApply(store.clone())
+                .call(json!({ "es": es }), &cx)
+                .await,
+        );
+        assert_eq!(result["applied"], false, "{result}");
+        assert_eq!(result["rolled_back"], true, "{result}");
+        assert_eq!(result["findings"][0]["kind"], "create_exists", "{result}");
+        assert_eq!(result["findings"][0]["file"], "sub/../dup.txt", "{result}");
+        assert!(
+            !root.join("dup.txt").exists(),
+            "rollback removes the first create"
+        );
+        assert!(store.snapshot(&es).is_ok());
+
+        // A pre-existing destination keeps its bytes under either spelling.
+        std::fs::write(root.join("dup.txt"), "original\n").unwrap();
+        let es = begin_es(&store, &cx).await;
+        json_of(
+            create_files(
+                &store,
+                &cx,
+                json!({ "es": es, "files": [{ "path": "sub/../dup.txt", "content": "clobber\n" }] }),
+            )
+            .await,
+        );
+        let result = json_of(
+            EditsApply(store.clone())
+                .call(json!({ "es": es }), &cx)
+                .await,
+        );
+        assert_eq!(result["applied"], false, "{result}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("dup.txt")).unwrap(),
+            "original\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_parse_failure_restores_edits_and_deletes_and_removes_new_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (store, cx) = set_up(&root);
+        std::fs::write(root.join("other.rs"), "pub fn other() {}\n").unwrap();
+        let (_, beta) = beta_span(&root, &cx).await;
+        let es = begin_es(&store, &cx).await;
+        json_of(
+            EditsReplace(store.clone())
+                .call(
+                    json!({ "es": es, "span": beta["span"], "text": "pub fn beta() -> u8 {\n    9\n}" }),
+                    &cx,
+                )
+                .await,
+        );
+        json_of(
+            EditsDeleteFile(store.clone())
+                .call(
+                    json!({ "es": es, "path": "other.rs", "contentSha256": sha256_hex(b"pub fn other() {}\n") }),
+                    &cx,
+                )
+                .await,
+        );
+        json_of(
+            create_files(
+                &store,
+                &cx,
+                json!({ "es": es, "files": [
+                    { "path": "good.rs", "content": "pub fn good() {}\n" },
+                    { "path": "new/broken.rs", "content": "pub fn broken( {\n" }
+                ] }),
+            )
+            .await,
+        );
+
+        let result = json_of(
+            EditsApply(store.clone())
+                .call(json!({ "es": es }), &cx)
+                .await,
+        );
+        assert_eq!(result["applied"], false, "{result}");
+        assert_eq!(result["rolled_back"], true, "{result}");
+        assert_eq!(
+            result["findings"][0]["kind"], "parse_error_after_apply",
+            "{result}"
+        );
+        assert_eq!(result["findings"][0]["file"], "new/broken.rs", "{result}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("probe.rs")).unwrap(),
+            FIXTURE
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("other.rs")).unwrap(),
+            "pub fn other() {}\n"
+        );
+        assert!(!root.join("good.rs").exists());
+        assert!(!root.join("new/broken.rs").exists());
+        assert!(store.snapshot(&es).is_ok(), "bounce retains the set");
+    }
+
+    #[tokio::test]
+    async fn batch_creates_pass_the_apply_instruction_barrier() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("child")).unwrap();
+        std::fs::write(root.join("child/AGENTS.md"), "Read before creating files.").unwrap();
+        let policy = Arc::new(crate::project_doc::ScopedProjectDocs::new(
+            root.clone(),
+            None,
+        ));
+        let mut cx = cx_in(&root);
+        cx.instruction_generation = 1;
+        cx.instruction_policy = Some(policy.clone());
+        let store = Arc::new(EditStore::default());
+        let es = begin_es(&store, &cx).await;
+        json_of(
+            create_files(
+                &store,
+                &cx,
+                json!({ "es": es, "files": [
+                    { "path": "top.txt", "content": "top\n" },
+                    { "path": "child/new.txt", "content": "created\n" }
+                ] }),
+            )
+            .await,
+        );
+        let tool = EditsApply(store.clone());
+        let input = json!({ "es": es, "validations": [] });
+        let result = tool.call(input.clone(), &cx).await;
+        assert!(
+            matches!(result, ToolResult::Error(ref error) if error.contains("instructions_required")),
+            "{result:?}"
+        );
+        assert!(!root.join("top.txt").exists());
+        assert!(!root.join("child/new.txt").exists());
+        assert_eq!(set_state(&store, &es).len(), 2);
+
+        let pending = policy.pending_batch(2).unwrap();
+        policy.acknowledge(&pending);
+        cx.instruction_generation = 2;
+        let result = json_of(tool.call(input, &cx).await);
+        assert_eq!(result["applied"], true, "{result}");
+        assert_eq!(
+            std::fs::read(root.join("child/new.txt")).unwrap(),
+            b"created\n"
+        );
+        assert!(root.join("top.txt").exists());
+        assert!(store.snapshot(&es).is_err());
+    }
+
     // ---- Provenance ledger lineage (cell-dsl §4) ----
 
     use super::super::ledger::{AuthorityTier, ProvenanceLedger};
@@ -1897,7 +2725,7 @@ mod tests {
 pub fn namespace_description() -> bro_code_mode::ToolNamespaceDescription {
     bro_code_mode::ToolNamespaceDescription {
         name: "edits".to_string(),
-        description: "The edit algebra and its apply choke point — the ONLY mutation path for source edits; prefer it over file_write/shell for span-shaped changes. Build: begin() → replace/insertBefore/insertAfter/delete (consume hash-anchored Spans from code.*) / createFile / deleteFile / merge (fold lsp.rename changes in) → apply(). NO confirm flag: a clean EditSet applies; detected conditions bounce with `applied: false` and findings [{kind, file, detail, resolution_hint}] (kinds: stale_span, stale_delete, invalid_edits, create_exists, parse_error_after_apply, write_failed, delete_failed) — repair by re-deriving fresh facts, rebuilding the edits, and applying again. Writes are atomic with snapshot/rollback; tree_sitter_no_errors validation runs by default and rolls back broken syntax. All spans for one file must carry the SAME content_sha256 (one read generation). After a successful apply every Span minted before it is stale — re-derive facts before further edits. Run `cargo check`/tests via shell AFTER a successful apply; apply itself only guarantees parseability. semantic_status is lineage-computed host-side at apply (weakest link): edits merged UNMODIFIED from an authority like lsp.rename keep lsp_verified; cell-authored edits, createFile/deleteFile entries, and any hand-rewritten change floor at syntax_only; compiler-suggested edits (rust.fixRound verbatim MachineApplicable suggestions) keep compiler_suggested. Provenance is recognized by content, not claimed — writing a status into a value does nothing."
+        description: "The edit algebra and its apply choke point — the ONLY mutation path for source edits; prefer it over file_write/shell for span-shaped changes. Build: begin() → replace/insertBefore/insertAfter/delete (consume hash-anchored Spans from code.*) / createFile / createFiles (a transform's whole `creates` array in one all-or-nothing call) / deleteFile / merge (fold lsp.rename changes in) → apply(). NO confirm flag: a clean EditSet applies; detected conditions bounce with `applied: false` and findings [{kind, file, detail, resolution_hint}] (kinds: stale_span, stale_delete, invalid_edits, create_exists, parse_error_after_apply, write_failed, delete_failed) — repair by re-deriving fresh facts, rebuilding the edits, and applying again. Writes are atomic with snapshot/rollback; tree_sitter_no_errors validation runs by default and rolls back broken syntax. All spans for one file must carry the SAME content_sha256 (one read generation). After a successful apply every Span minted before it is stale — re-derive facts before further edits. Run `cargo check`/tests via shell AFTER a successful apply; apply itself only guarantees parseability. semantic_status is lineage-computed host-side at apply (weakest link): edits merged UNMODIFIED from an authority like lsp.rename keep lsp_verified; cell-authored edits, createFile/createFiles/deleteFile entries, and any hand-rewritten change floor at syntax_only; compiler-suggested edits (rust.fixRound verbatim MachineApplicable suggestions) keep compiler_suggested. Provenance is recognized by content, not claimed — writing a status into a value does nothing."
             .to_string(),
         declarations: r#"type Finding = { kind: "stale_span" | "stale_delete" | "invalid_edits" | "create_exists" | "parse_error_after_apply" | "write_failed" | "delete_failed"; file: string; detail: string; resolution_hint: string };
 	type SemanticStatus = "lsp_verified" | "compiler_suggested" | "syntax_only";  // lineage-computed weakest link, recomputed host-side at apply; cell-supplied claims are ignored
@@ -1919,6 +2747,8 @@ pub fn namespace_description() -> bro_code_mode::ToolNamespaceDescription {
   delete(args: { es: string; span: Span }): Promise<{ es: string; file: string; edit_count: number }>;
   /** Queue creation of a new file (pure; never writes; bounces if it exists at apply). */
   createFile(args: { es: string; path: string; content: string }): Promise<{ es: string; creates: number }>;
+  /** Queue several new files in one all-or-nothing call (pure; never writes). If any path is already created, edited, or deleted in the set, or repeats within the batch, the whole batch is refused naming every offending path and nothing is queued. Limits per call: 1024 files, 262144 UTF-8 path bytes, 33554432 UTF-8 content bytes. An empty batch is a no-op. `creates` is the set's total. Feed a transform's `creates` array directly. */
+  createFiles(args: { es: string; files: { path: string; content: string }[] }): Promise<{ es: string; creates: number }>;
   /** Queue deletion of an existing file, hash-guarded like a Span edit (pure; never writes; bounces if it changed or disappeared). */
   deleteFile(args: { es: string; path: string; contentSha256: string }): Promise<{ es: string; deletes: number }>;
   /** Fold span-shaped changes (e.g. lsp.rename().changes) into the set — server-authored edits join the same artifact (pure; never writes). `ledgered` counts changes the provenance ledger recognized as host-issued (they keep their authority tier at apply; unrecognized changes floor at syntax_only). */

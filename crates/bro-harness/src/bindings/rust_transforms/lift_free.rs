@@ -40,7 +40,7 @@ impl Tool for RustLiftToFree {
     }
 
     fn description(&self) -> &str {
-        "Lift selected Rust inherent impl methods that do not depend on instance state into free functions. Preserves explicit lifetimes and reports per-method refusals. NEVER writes: returns {changes, creates, findings} for edits.merge/createFile."
+        "Lift selected Rust inherent impl methods that do not depend on instance state into free functions. Preserves explicit lifetimes and reports per-method refusals. NEVER writes: returns {changes, creates, findings} for edits.merge/createFiles."
     }
 
     fn input_schema(&self) -> Value {

@@ -3028,7 +3028,7 @@ impl Tool for JavaMoveClass {
         "java.moveClass"
     }
     fn description(&self) -> &str {
-        "Move one Java source file to a target package through JDTLS java/getMoveDestinations + java/move. Creates the relocated file from server-authored moved-file edits, returns server-authored external changes, and returns a hash-guarded delete for the source file. Pure; apply via edits.createFile/deleteFile/merge/apply. Fails closed if JDTLS is unavailable or does not return moved-file package edits."
+        "Move one Java source file to a target package through JDTLS java/getMoveDestinations + java/move. Creates the relocated file from server-authored moved-file edits, returns server-authored external changes, and returns a hash-guarded delete for the source file. Pure; apply via edits.createFiles/deleteFile/merge/apply. Fails closed if JDTLS is unavailable or does not return moved-file package edits."
     }
     fn input_schema(&self) -> Value {
         json!({
@@ -11371,7 +11371,7 @@ PARAMS
 RETURNS { title, changes, creates, findings, dependency_projection, preview_only,
           would_change_files, would_create_files, fixme_count, provenance }
   changes:  hash-anchored {span, new_text}[] → edits.merge
-  creates:  {path, content}[]               → edits.createFile (one call each)
+  creates:  {path, content}[]               → edits.createFiles (one all-or-nothing call)
   dependency_projection: compact pre-apply summary of which captured fields will become target
                           constructor params under the selected wiring. For the container-owned
                           strategies (external_injection / constructor_injection),
@@ -11411,9 +11411,9 @@ RECIPE (one cell; locals do NOT survive across cells — store() anything you ne
                                       methods: ["price", "discount"], wrappers: true });
   store("xc", { findings: r.findings, files: r.creates.map(c => c.path) });  // survives cell death
   const es = await edits.begin();
-  for (const c of r.creates) await edits.createFile({ es, path: c.path, content: c.content });
-  await edits.merge({ es, changes: r.changes });
-  const applied = await edits.apply({ es });   // tree-sitter validates both files; bounces roll back
+  if (r.creates.length) await edits.createFiles({ es, files: r.creates });   // all-or-nothing batch
+  if (r.changes.length) await edits.merge({ es, changes: r.changes });
+  const applied = (r.creates.length || r.changes.length) ? await edits.apply({ es }) : null;   // tree-sitter validates both files; bounces roll back
   // then compile-gate via shell (e.g. ./gradlew :module:compileJava) and report"#;
 
 const EXTRACT_METHOD_CODE_BLOCK_CONTRACT: &str = r#"java.extractMethodCodeBlock — extract one contiguous Java code block into a helper method.
@@ -11556,7 +11556,7 @@ PARAMS
 
 RETURNS { title, changes, creates, deletes, findings, preview_only,
           would_change_files, would_create_files, would_delete_files, provenance }
-  creates: {path, content}[] for edits.createFile
+  creates: {path, content}[] for edits.createFiles
   deletes: {path, content_sha256}[] for edits.deleteFile
   changes: JDTLS-authored external edits for edits.merge
 
@@ -11566,10 +11566,10 @@ RECIPE
     targetPackage: "com.acme.new"
   });
   const es = await edits.begin();
-  for (const c of r.creates) await edits.createFile({ es, path: c.path, content: c.content });
+  if (r.creates.length) await edits.createFiles({ es, files: r.creates });
   for (const d of r.deletes) await edits.deleteFile({ es, path: d.path, contentSha256: d.content_sha256 });
   if (r.changes.length) await edits.merge({ es, changes: r.changes });
-  await edits.apply({ es });
+  if (r.creates.length || r.deletes.length || r.changes.length) await edits.apply({ es });
 "#;
 
 const MOVE_PACKAGE_CONTRACT: &str = r#"java.movePackage — move every file declaring one package to another package.
@@ -11599,10 +11599,10 @@ RECIPE
     targetPackage: "com.acme.new"
   });
   const es = await edits.begin();
-  for (const c of r.creates) await edits.createFile({ es, path: c.path, content: c.content });
+  if (r.creates.length) await edits.createFiles({ es, files: r.creates });
   for (const d of r.deletes) await edits.deleteFile({ es, path: d.path, contentSha256: d.content_sha256 });
   if (r.changes.length) await edits.merge({ es, changes: r.changes });
-  await edits.apply({ es });
+  if (r.creates.length || r.deletes.length || r.changes.length) await edits.apply({ es });
 "#;
 
 const PULL_UP_PREVIEW_CONTRACT: &str = r#"java.pullUpPreview - preview selectable pull-up / extract-interface members.
@@ -11631,7 +11631,7 @@ WHAT IT DOES
   Consumes preview-issued memberRefs, re-runs the preview, refuses stale refs or
   blocked selections, creates a new interface or abstract class, adds
   implements/extends to the concrete source, widens selected source methods to
-  public, and returns {changes, creates, findings} for edits.merge/createFile.
+  public, and returns {changes, creates, findings} for edits.merge/createFiles.
 
 PARAMS
   file: string
@@ -11650,9 +11650,9 @@ RECIPE
   const refs = pv.candidates.filter(c => !c.blockers.length).map(c => c.ref);
   const r = await java.extractInterface({ file, target, typeName: "ServiceApi", memberRefs: refs });
   const es = await edits.begin();
-  for (const c of r.creates) await edits.createFile({ es, path: c.path, content: c.content });
+  if (r.creates.length) await edits.createFiles({ es, files: r.creates });
   if (r.changes.length) await edits.merge({ es, changes: r.changes });
-  await edits.apply({ es });
+  if (r.creates.length || r.changes.length) await edits.apply({ es });
 "#;
 
 const PULL_UP_MEMBERS_CONTRACT: &str = r#"java.pullUpMembers - apply java.pullUpPreview refs into an existing target type.
@@ -13762,13 +13762,13 @@ declare const java: {
   describe(args: { transform: string }): Promise<{ contract: string }>;
   /** Preflight a java.extractClass seam: overloads, field closure, external callers, residual references, nest access breaks, DI wireability. One cell instead of previewOnly loops. If ready:true, skip previewOnly → extractClass + apply. */
   extractClassPreviewPlan(args: { file: string; methods: string[]; moveFields?: string[]; className?: string }): Promise<{ file: string; methods: string[]; overloads: Record<string, string[]>; overloads_resolved: boolean; resolved_methods: string[]; field_closure: Record<string, string[]>; augmented_move_fields: string[]; augmented_fields_differ: boolean; external_callers: Record<string, string[]>; has_external_callers: boolean; non_injectable_mutable: string[]; internal_helper_deps: Record<string, string[]>; residual_references: JavaResidualReferenceFinding[]; nest_access_breaks: JavaNestAccessBreakFinding[]; wiring_recommendation: "external_injection" | "own_construction"; ready: boolean; blockers: string[]; provenance: "syntax_only" }>;
-  /** Extract methods/fields into a new delegate class. changes → edits.merge, creates → edits.createFile, then edits.apply. Pass wrappers: true to keep delegating stubs on the source (REQUIRED when callers outside the file use the moved methods — survey first). `wiring` auto-selects (Guice/DI source → external_injection, AOP-interceptable) — leave unset. Refusals are errors naming the exact fix. */
+  /** Extract methods/fields into a new delegate class. changes → edits.merge, creates → edits.createFiles, then edits.apply. Pass wrappers: true to keep delegating stubs on the source (REQUIRED when callers outside the file use the moved methods — survey first). `wiring` auto-selects (Guice/DI source → external_injection, AOP-interceptable) — leave unset. Refusals are errors naming the exact fix. */
   extractClass(args: { file: string; target: string; delegateField: string; methods: string[]; moveFields?: string[]; className?: string; wiring?: "own_construction" | "external_injection" | "none"; wrappers?: boolean; previewOnly?: boolean }): Promise<JavaTransformResult>;
   /** Extract one exact contiguous code block into a helper method. Run analysis.methodRegions first for contiguity/live-out gates. changes → edits.merge. Refuses mutated captures and non-local control flow. Multiple live-outs refuse by default; pass resultRecord:true only when they are real top-level outputs with explicit types. */
   extractMethodCodeBlock(args: { file: string; oldText: string; methodName: string; className?: string; visibility?: "private" | "package-private" | "protected" | "public"; newText?: string; parameters?: Array<{ type: string; name: string }>; arguments?: string[]; returnType?: string; returnVar?: string; resultRecord?: boolean; resultRecordName?: string; resultRecordVar?: string; previewOnly?: boolean }): Promise<JavaExtractMethodResult>;
   /** Rename one Java simple symbol across declaration/reference sites. Does not rename files; inspect file_rename_advisory for public type renames. */
   renameSymbol(args: { oldName: string; newName: string; file?: string; itemKinds?: string[]; previewOnly?: boolean }): Promise<JavaRenameResult>;
-  /** Move one Java source file to another package. Apply creates with edits.createFile, deletes with edits.deleteFile, and changes with edits.merge. */
+  /** Move one Java source file to another package. Apply creates with edits.createFiles, deletes with edits.deleteFile, and changes with edits.merge. */
   moveClass(args: { file: string; targetPackage: string; targetFile?: string; className?: string; previewOnly?: boolean }): Promise<JavaMoveResult>;
   /** Move every Java file declaring oldPackage to targetPackage. Optional files narrows and validates the set. */
   movePackage(args: { oldPackage: string; targetPackage: string; files?: string[]; previewOnly?: boolean }): Promise<JavaMoveResult>;

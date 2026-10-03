@@ -88,7 +88,7 @@ impl Tool for RustOrganizeImports {
         "rust.organizeImports"
     }
     fn description(&self) -> &str {
-        "Minimize Rust wildcard imports (mode=\"minimize\", default): rewrite resolvable `use foo::*;` into explicit `use foo::{A, B};` for directly-referenced names. NEVER writes: returns {changes, creates, findings} for edits.merge/createFile. mode=\"organize\" (rust-analyzer source.organizeImports) lands with lsp.assist (phase 2)."
+        "Minimize Rust wildcard imports (mode=\"minimize\", default): rewrite resolvable `use foo::*;` into explicit `use foo::{A, B};` for directly-referenced names. NEVER writes: returns {changes, creates, findings} for edits.merge/createFiles. mode=\"organize\" (rust-analyzer source.organizeImports) lands with lsp.assist (phase 2)."
     }
     fn input_schema(&self) -> Value {
         json!({
