@@ -2674,8 +2674,8 @@ mod tests {
     async fn remote_fixture(
         timeout_ms: u64,
         resources_capable: bool,
-        /// Hang resource listings and reads: no reply is ever sent, so the
-        /// bounded deadline or a cancellation is the only outcome.
+        // Hang resource listings and reads: no reply is ever sent, so the
+        // bounded deadline or a cancellation is the only outcome.
         hang: bool,
     ) -> RemoteFixture {
         let (client, server) = tokio::io::duplex(16 * 1024);
