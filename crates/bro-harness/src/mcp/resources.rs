@@ -878,7 +878,7 @@ impl Tool for ListResourcesTool {
                                 );
                             }
                         }
-                        let (entries, mut receipt) = self.project_page(items);
+                        let (mut entries, mut receipt) = self.project_page(items);
                         if offset > entries.len() {
                             return error_envelope(
                                 "mcp_stale_resource_page",
@@ -952,7 +952,8 @@ impl Tool for ListResourcesTool {
                     );
                 }
                 let mut pages = Vec::with_capacity(capable.len());
-                for server in capable {
+                for (index, server) in capable.iter().enumerate() {
+                    let server = server.clone();
                     let backend = self.shared.admitted[&server].clone();
                     match self
                         .list_server(&backend, &server, None, &cx.cancellation)
@@ -990,10 +991,27 @@ impl Tool for ListResourcesTool {
                         }
                         // Fan-out never buries an uncertain outcome or a
                         // pre-dispatch cancellation in a completed-looking
-                        // receipt: the envelope must be this call's own
-                        // result.
-                        Err(ListFailure::Uncertain(envelope)) => return envelope,
-                        Err(ListFailure::NotSent(envelope)) => return envelope,
+                        // receipt: the envelope is this call's own result,
+                        // carrying the observed completed server pages (and
+                        // only those) under structuredContent.fanoutReceipt.
+                        Err(ListFailure::Uncertain(envelope)) => {
+                            return fanout_error_envelope(
+                                envelope,
+                                &server,
+                                pages,
+                                capable[index + 1..].to_vec(),
+                                budget,
+                            );
+                        }
+                        Err(ListFailure::NotSent(envelope)) => {
+                            return fanout_error_envelope(
+                                envelope,
+                                &server,
+                                pages,
+                                capable[index + 1..].to_vec(),
+                                budget,
+                            );
+                        }
                         Err(ListFailure::Explicit(ToolResult::Error(envelope))) => {
                             pages.push(json!({
                                 "server":server,
@@ -1006,6 +1024,60 @@ impl Tool for ListResourcesTool {
                 bound_listing_fanout(pages, budget)
             }
         }
+    }
+}
+
+/// Build the fan-out failure result: the failing envelope stays the call's
+/// own top-level outcome (code, guidance text, uncertain-completion fields),
+/// while the server pages observed before the failure ride along under
+/// `structuredContent.fanoutReceipt` with the failing and never-attempted
+/// server names. Receipts are bounded by the same page budget; whole
+/// completed pages are dropped from the tail with an explicit omitted count
+/// when they do not fit, and the receipt is dropped entirely if even the
+/// bare envelope cannot fit. Only observed outcomes are described.
+fn fanout_error_envelope(
+    failure: ToolResult,
+    failing_server: &str,
+    completed: Vec<Value>,
+    unattempted: Vec<String>,
+    budget: usize,
+) -> ToolResult {
+    let (raw, _) = failure.into_content();
+    let base: Value = serde_json::from_str(&raw).unwrap_or_else(|_| {
+        json!({
+            "content":[{"type":"text","text":raw}],
+            "structuredContent":{"code":"mcp_resource_call_failed"},
+            "isError":true
+        })
+    });
+    let total = completed.len();
+    let mut kept = total;
+    loop {
+        let mut envelope = base.clone();
+        if envelope.get("structuredContent").is_none() {
+            envelope["structuredContent"] = json!({});
+        }
+        envelope["isError"] = json!(true);
+        let mut receipt = json!({
+            "failure_code": envelope["structuredContent"]["code"].clone(),
+            "failed_server": failing_server,
+            "unattempted_servers": unattempted.clone(),
+        });
+        receipt["completed_servers"] = Value::Array(completed[..kept].to_vec());
+        if kept < total {
+            receipt["omitted_receipts"] = json!(total - kept);
+            receipt["note"] = json!("Completed server receipts trimmed to fit the result budget.");
+        }
+        envelope["structuredContent"]["fanoutReceipt"] = receipt;
+        if serde_json::to_string(&envelope).unwrap_or_default().len() <= budget {
+            return ToolResult::Error(envelope.to_string());
+        }
+        if kept == 0 {
+            // Even without receipts the envelope exceeds the budget; return
+            // the failure unchanged rather than truncating its guidance.
+            return ToolResult::Error(base.to_string());
+        }
+        kept -= 1;
     }
 }
 
@@ -2134,7 +2206,7 @@ mod tests {
         let fixture = remote_fixture(5000, true, false).await;
         let tools = remote_tools(fixture.connection.clone());
         let directory = tempfile::tempdir().unwrap();
-        let cancelled_cx = cx(directory.path().canonicalize().unwrap(), 0);
+        let cancelled_cx = self::cx(directory.path().canonicalize().unwrap(), 0);
         cancelled_cx.cancellation.cancel();
         let (code, _) = error_code(
             tools[0]
@@ -2168,7 +2240,7 @@ mod tests {
         );
         let tools = resource_helper_tools(state, &ToolFilter::default());
         let directory = tempfile::tempdir().unwrap();
-        let cancelled_cx = cx(directory.path().canonicalize().unwrap(), 0);
+        let cancelled_cx = self::cx(directory.path().canonicalize().unwrap(), 0);
         cancelled_cx.cancellation.cancel();
         let (code, value) = error_code(tools[0].clone().call(json!({}), &cancelled_cx).await);
         assert_eq!(code, "mcp_cancelled_before_dispatch");
@@ -2177,6 +2249,160 @@ mod tests {
             "cancellation must not render as a completed listing"
         );
         close_remote(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn fanout_failure_preserves_completed_server_receipts() {
+        // Cancellation mid-fanout: the first server completed, the second was
+        // refused pre-dispatch, the third was never invoked. The call stays an
+        // error with its own code while the observed completion rides along.
+        let notsent = remote_fixture(5000, true, false).await;
+        let never = remote_fixture(5000, true, false).await;
+        let mut state = McpResourceState::default();
+        state.admitted.insert(
+            "a-local".into(),
+            McpBackend::InProcess(Arc::new(ResourceOnly::new().0)),
+        );
+        state.admitted.insert(
+            "b-remote".into(),
+            McpBackend::Remote(notsent.connection.clone()),
+        );
+        state.admitted.insert(
+            "c-remote".into(),
+            McpBackend::Remote(never.connection.clone()),
+        );
+        let tools = resource_helper_tools(state, &ToolFilter::default());
+        let directory = tempfile::tempdir().unwrap();
+        let cancelled_cx = self::cx(directory.path().canonicalize().unwrap(), 0);
+        cancelled_cx.cancellation.cancel();
+        let (code, value) = error_code(tools[0].clone().call(json!({}), &cancelled_cx).await);
+        assert_eq!(code, "mcp_cancelled_before_dispatch");
+        assert!(value.get("servers").is_none());
+        let receipt = &value["structuredContent"]["fanoutReceipt"];
+        assert_eq!(receipt["failure_code"], "mcp_cancelled_before_dispatch");
+        assert_eq!(receipt["failed_server"], "b-remote");
+        assert_eq!(receipt["unattempted_servers"], json!(["c-remote"]));
+        let completed = receipt["completed_servers"].as_array().unwrap();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0]["server"], "a-local");
+        assert_eq!(completed[0]["resources"].as_array().unwrap().len(), 2);
+        for fixture in [&notsent, &never] {
+            let requests = fixture.requests.lock().unwrap();
+            assert!(
+                requests
+                    .iter()
+                    .all(|request| request["method"] != "resources/list"),
+                "refused and unattempted servers must not be dialed"
+            );
+        }
+        close_remote(notsent).await;
+        close_remote(never).await;
+
+        // Uncertainty after a completed server: the same known receipt rides
+        // with the uncertain envelope's own code, server, and guidance text.
+        let hanging = remote_fixture(20, true, true).await;
+        let never = remote_fixture(5000, true, false).await;
+        let mut state = McpResourceState::default();
+        state.admitted.insert(
+            "a-local".into(),
+            McpBackend::InProcess(Arc::new(ResourceOnly::new().0)),
+        );
+        state.admitted.insert(
+            "b-hang".into(),
+            McpBackend::Remote(hanging.connection.clone()),
+        );
+        state.admitted.insert(
+            "c-never".into(),
+            McpBackend::Remote(never.connection.clone()),
+        );
+        let tools = resource_helper_tools(state, &ToolFilter::default());
+        let cx = temp_cx(0);
+        let (code, value) = error_code(tools[0].clone().call(json!({}), &cx).await);
+        assert_eq!(code, "mcp_remote_outcome_unknown");
+        // The uncertain envelope keeps its own server identity (the fixture's
+        // connection name); the receipt names the fan-out slot that failed.
+        assert_eq!(value["structuredContent"]["server"], "fixture");
+        assert_eq!(value["structuredContent"]["operation"], "resources/list");
+        assert!(
+            value["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("Do not retry")
+        );
+        let receipt = &value["structuredContent"]["fanoutReceipt"];
+        assert_eq!(receipt["failure_code"], "mcp_remote_outcome_unknown");
+        assert_eq!(receipt["failed_server"], "b-hang");
+        assert_eq!(receipt["unattempted_servers"], json!(["c-never"]));
+        assert_eq!(receipt["completed_servers"][0]["server"], "a-local");
+        {
+            let requests = never.requests.lock().unwrap();
+            assert!(
+                requests
+                    .iter()
+                    .all(|request| request["method"] != "resources/list")
+            );
+        }
+        close_remote(hanging).await;
+        close_remote(never).await;
+
+        // Bounded receipts: oversized completed pages are dropped with an
+        // explicit omitted count instead of overflowing the result budget.
+        struct Chatty;
+        #[async_trait]
+        impl McpSurface for Chatty {
+            async fn list_tools(&self) -> Result<Vec<crate::mcp::McpToolSpec>> {
+                Ok(vec![])
+            }
+            async fn call_tool(&self, _: &str, _: Value) -> Result<ToolResult> {
+                bail!("no tools")
+            }
+            fn resources_supported(&self) -> bool {
+                true
+            }
+            async fn list_resources(&self, _: Option<String>) -> Result<ResourcePage> {
+                Ok(ResourcePage {
+                    items: (0..30)
+                        .map(|index| {
+                            resource(&format!("memo:/c-{index:02}"), &format!("c-{index:02}"))
+                        })
+                        .collect(),
+                    next_cursor: None,
+                })
+            }
+            async fn read_resource(&self, _: &str) -> Result<Vec<Value>> {
+                bail!("no such resource")
+            }
+        }
+        let refused = remote_fixture(5000, true, false).await;
+        let mut state = McpResourceState::default();
+        state
+            .admitted
+            .insert("a-big".into(), McpBackend::InProcess(Arc::new(Chatty)));
+        state
+            .admitted
+            .insert("b-big".into(), McpBackend::InProcess(Arc::new(Chatty)));
+        state.admitted.insert(
+            "z-remote".into(),
+            McpBackend::Remote(refused.connection.clone()),
+        );
+        let tools = resource_helper_tools(state, &ToolFilter::default());
+        let directory = tempfile::tempdir().unwrap();
+        let cancelled_cx = self::cx(directory.path().canonicalize().unwrap(), 700);
+        cancelled_cx.cancellation.cancel();
+        let result = tools[0].clone().call(json!({}), &cancelled_cx).await;
+        let (content, is_error) = result.into_content();
+        assert!(is_error);
+        let value: Value = serde_json::from_str(&content).unwrap();
+        assert!(content.len() <= 700, "{}", content.len());
+        assert_eq!(
+            value["structuredContent"]["code"],
+            "mcp_cancelled_before_dispatch"
+        );
+        let receipt = &value["structuredContent"]["fanoutReceipt"];
+        let omitted = receipt["omitted_receipts"].as_u64().unwrap();
+        let kept = receipt["completed_servers"].as_array().unwrap().len() as u64;
+        assert_eq!(kept + omitted, 2, "every completed page is kept or counted");
+        close_remote(refused).await;
     }
 
     #[tokio::test]
@@ -2448,7 +2674,9 @@ mod tests {
     async fn remote_fixture(
         timeout_ms: u64,
         resources_capable: bool,
-        hang_reads: bool,
+        /// Hang resource listings and reads: no reply is ever sent, so the
+        /// bounded deadline or a cancellation is the only outcome.
+        hang: bool,
     ) -> RemoteFixture {
         let (client, server) = tokio::io::duplex(16 * 1024);
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -2477,22 +2705,27 @@ mod tests {
                         })
                     }
                     "tools/list" => json!({"tools":[]}),
-                    "resources/list" => match request["params"]["cursor"].as_str() {
-                        None => json!({"resources":[
+                    "resources/list" => {
+                        if hang {
+                            continue;
+                        }
+                        match request["params"]["cursor"].as_str() {
+                            None => json!({"resources":[
                             {"uri":"memo:/alpha","name":"alpha","description":"Alpha","mimeType":"text/plain"},
                             {"uri":"memo:/beta","name":"beta","description":"Beta","mimeType":"text/plain"}
                         ], "nextCursor":"page2"}),
-                        Some("page2") => json!({"resources":[
-                            {"uri":"memo:/gamma","name":"gamma","description":"Gamma","mimeType":"text/plain"}
-                        ]}),
-                        Some(other) => panic!("unexpected cursor {other}"),
-                    },
+                            Some("page2") => json!({"resources":[
+                                {"uri":"memo:/gamma","name":"gamma","description":"Gamma","mimeType":"text/plain"}
+                            ]}),
+                            Some(other) => panic!("unexpected cursor {other}"),
+                        }
+                    }
                     "resources/templates/list" => json!({"resourceTemplates":[
                         {"uriTemplate":"memo:/{topic}","name":"topic","mimeType":"text/plain"}
                     ]}),
                     "resources/read" => {
                         started_signal.notify_one();
-                        if hang_reads {
+                        if hang {
                             continue;
                         }
                         match request["params"]["uri"].as_str() {
