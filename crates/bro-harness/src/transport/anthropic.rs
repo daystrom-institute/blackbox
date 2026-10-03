@@ -30,6 +30,12 @@ pub struct AnthropicTransport {
     /// [`Transport::take_interrupted_usage`] (default trait impl returns
     /// zeros for transports that don't track segment state).
     last_segment_usage: Usage,
+    /// Usage reported by out-of-band compaction summarize responses, drained
+    /// by [`Transport::take_compaction_usage`] after `compact()` returns.
+    /// Compaction is not a `run_turn`: these tokens never appear in a turn
+    /// result, and they must never touch `last_segment_usage` (inference
+    /// occupancy only). Accumulated whether or not the summary validates.
+    pending_compaction_usage: Usage,
 }
 
 enum Auth {
@@ -60,6 +66,7 @@ impl AnthropicTransport {
             version,
             messages: Vec::new(),
             last_segment_usage: Usage::default(),
+            pending_compaction_usage: Usage::default(),
         })
     }
 
@@ -199,7 +206,7 @@ impl AnthropicTransport {
     /// One-shot, non-streaming summarization over `transcript`. Does NOT touch
     /// the conversation buffer — the caller swaps the buffer afterward.
     async fn summarize_text(
-        &self,
+        &mut self,
         transcript: &str,
         instruction: &str,
         max_tokens: u32,
@@ -233,10 +240,26 @@ impl AnthropicTransport {
         .context("compaction summarize request")?;
         let status = resp.status();
         let text = resp.text().await.context("read summarize body")?;
+        let parsed = serde_json::from_str::<Value>(&text);
+        if let Ok(value) = &parsed {
+            self.pending_compaction_usage.add(&Usage {
+                input_tokens: value["usage"]["input_tokens"]
+                    .as_u64()
+                    .or_else(|| value["usage"]["prompt_tokens"].as_u64())
+                    .unwrap_or(0),
+                output_tokens: value["usage"]["output_tokens"].as_u64().unwrap_or(0),
+                cached_input_tokens: value["usage"]["cache_read_input_tokens"]
+                    .as_u64()
+                    .unwrap_or(0),
+                cache_creation_input_tokens: value["usage"]["cache_creation_input_tokens"]
+                    .as_u64()
+                    .unwrap_or(0),
+            });
+        }
         if !status.is_success() {
             anyhow::bail!("anthropic compact {status}: {text}");
         }
-        let v: Value = serde_json::from_str(&text).context("parse summarize response")?;
+        let v = parsed.context("parse summarize response")?;
         let out = v["content"]
             .as_array()
             .into_iter()
@@ -1170,6 +1193,10 @@ impl Transport for AnthropicTransport {
         std::mem::take(&mut self.last_segment_usage)
     }
 
+    fn take_compaction_usage(&mut self) -> Usage {
+        std::mem::take(&mut self.pending_compaction_usage)
+    }
+
     async fn compact(
         &mut self,
         params: super::CompactionParams,
@@ -1445,6 +1472,7 @@ mod tests {
             version: "2023-06-01".into(),
             messages: vec![json!({"role": "user", "content": "hi"})],
             last_segment_usage: Usage::default(),
+            pending_compaction_usage: Usage::default(),
         }
     }
     fn opts(system: SystemPrompt) -> TurnOpts {
@@ -1485,6 +1513,7 @@ mod tests {
             version: "2023-06-01".into(),
             messages: Vec::new(),
             last_segment_usage: Usage::default(),
+            pending_compaction_usage: Usage::default(),
         };
         tx.push_user_text("synthetic fixture");
         let result = tx
@@ -2429,6 +2458,7 @@ mod tests {
             version: "2023-06-01".into(),
             messages: Vec::new(),
             last_segment_usage: Usage::default(),
+            pending_compaction_usage: Usage::default(),
         };
         tx.push_user_text("hi");
 
@@ -2502,6 +2532,7 @@ mod tests {
             version: "2023-06-01".into(),
             messages: Vec::new(),
             last_segment_usage: Usage::default(),
+            pending_compaction_usage: Usage::default(),
         };
         tx.push_user_text("hi");
 
@@ -2594,6 +2625,7 @@ mod tests {
             version: "2023-06-01".into(),
             messages: Vec::new(),
             last_segment_usage: Usage::default(),
+            pending_compaction_usage: Usage::default(),
         };
         tx.push_user_text("hi");
 
@@ -2694,6 +2726,7 @@ mod tests {
             version: "2023-06-01".into(),
             messages: Vec::new(),
             last_segment_usage: Usage::default(),
+            pending_compaction_usage: Usage::default(),
         };
         tx.push_user_text("hi");
         let result = tokio::time::timeout(
@@ -2796,6 +2829,7 @@ mod tests {
             version: "2023-06-01".into(),
             messages: Vec::new(),
             last_segment_usage: Usage::default(),
+            pending_compaction_usage: Usage::default(),
         };
         tx.push_user_text("hi");
 
@@ -3062,5 +3096,95 @@ mod tests {
             );
         })
         .await;
+    }
+    #[tokio::test]
+    async fn inline_compaction_accounts_usage_on_success_and_failure_once() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for (summary, reported_usage, status) in [
+            ("<summary>retained work</summary>", true, "200 OK"),
+            ("", true, "200 OK"),
+            ("", true, "400 Bad Request"),
+            ("<summary>retained work</summary>", false, "200 OK"),
+        ] {
+            let mut payload = json!({"content":[{"type":"text","text":summary}]});
+            if reported_usage {
+                payload["usage"] = json!({"input_tokens":11,"output_tokens":7,"cache_read_input_tokens":5,"cache_creation_input_tokens":3});
+            }
+            let body = payload.to_string();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                loop {
+                    let mut chunk = [0; 4096];
+                    let read = socket.read(&mut chunk).await.unwrap();
+                    assert_ne!(read, 0);
+                    bytes.extend_from_slice(&chunk[..read]);
+                    if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                        let header = std::str::from_utf8(&bytes[..end]).unwrap();
+                        let length = header
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap();
+                        if bytes.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            });
+            let mut tx = transport();
+            tx.base_url = format!("http://{address}");
+            tx.messages = (0..6)
+                .map(|index| {
+                    json!({
+                        "role":if index % 2 == 0 {"user"} else {"assistant"},
+                        "content":format!("turn {index}")
+                    })
+                })
+                .collect();
+            let before = tx.snapshot();
+            let result = tx
+                .compact(
+                    super::super::CompactionParams {
+                        keep_tail: 2,
+                        summary_max_tokens: 64,
+                        tool_render_cap: 2000,
+                    },
+                    "summarize",
+                    &[],
+                    &opts(SystemPrompt::default()),
+                )
+                .await;
+            server.await.unwrap();
+            if summary.is_empty() {
+                assert!(result.is_err());
+                assert_eq!(tx.snapshot(), before, "failed summary preserves history");
+            } else {
+                assert_eq!(result.unwrap().as_deref(), Some("retained work"));
+                assert_ne!(tx.snapshot(), before);
+            }
+            let expected = if reported_usage {
+                Usage {
+                    input_tokens: 11,
+                    output_tokens: 7,
+                    cached_input_tokens: 5,
+                    cache_creation_input_tokens: 3,
+                }
+            } else {
+                Usage::default()
+            };
+            assert_eq!(tx.take_compaction_usage(), expected);
+            assert_eq!(tx.take_compaction_usage(), Usage::default());
+        }
     }
 }

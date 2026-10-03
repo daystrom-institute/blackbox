@@ -579,13 +579,21 @@ fn bound_listing(
         receipt.apply(&mut payload);
         let serialized = serde_json::to_string(&payload).unwrap_or_default().len();
         if serialized <= budget || entries.is_empty() {
-            return if serialized <= budget {
-                ToolResult::Json(payload)
-            } else {
-                ToolResult::Error(format!(
+            if serialized > budget {
+                return ToolResult::Error(format!(
                     "MCP resource listing exceeds the {budget}-byte result budget before any entry fits"
-                ))
-            };
+                ));
+            }
+            // A page that trims to zero entries would emit a resume cursor at
+            // the current offset forever; refuse instead of stalling the
+            // traversal. A genuinely empty upstream page (total == 0) still
+            // returns normally.
+            if entries.is_empty() && receipt.total > receipt.malformed {
+                return ToolResult::Error(format!(
+                    "MCP resource listing exceeds the {budget}-byte result budget before any entry fits"
+                ));
+            }
+            return ToolResult::Json(payload);
         }
         entries.pop();
     }
@@ -1751,7 +1759,10 @@ mod tests {
         let names: Vec<_> = loaded.tools.iter().map(|t| t.name()).collect();
         assert_eq!(names, vec!["mcp__kept__probe"]);
 
-        // A namespace allow admits the helpers.
+        // A namespace allow admits the server's tools but not the helpers:
+        // the allow-list is exclusive per tool name, and a precise tool
+        // grant never widens into resource authority. The helpers must be
+        // allowed by their own names.
         let namespace_allow = ToolFilter::from_csv(None, Some("mcp__kept__*"));
         let loaded = load_mcp_tools_from_config(
             &config(vec![in_process("kept", Arc::new(ToolOnly))]),
@@ -1760,15 +1771,18 @@ mod tests {
         .await
         .unwrap();
         let names: Vec<_> = loaded.tools.iter().map(|t| t.name()).collect();
-        assert_eq!(
-            names,
-            vec![
-                "mcp__kept__probe",
-                "list_mcp_resources",
-                "list_mcp_resource_templates",
-                "read_mcp_resource"
-            ]
-        );
+        assert_eq!(names, vec!["mcp__kept__probe"]);
+
+        // Naming a helper in the allow-list admits exactly that helper.
+        let helper_allow = ToolFilter::from_csv(None, Some("mcp__kept__*,read_mcp_resource"));
+        let loaded = load_mcp_tools_from_config(
+            &config(vec![in_process("kept", Arc::new(ToolOnly))]),
+            &helper_allow,
+        )
+        .await
+        .unwrap();
+        let names: Vec<_> = loaded.tools.iter().map(|t| t.name()).collect();
+        assert_eq!(names, vec!["mcp__kept__probe", "read_mcp_resource"]);
 
         // A whole-server deny keeps the server out of resource reach even
         // though its tools were otherwise admissible.
@@ -2011,7 +2025,7 @@ mod tests {
         .await
         .unwrap();
         let list = loaded.tools[0].clone();
-        let tight = temp_cx(500);
+        let tight = temp_cx(900);
         let first = parse_json(list.call(json!({"server":"mutating"}), &tight).await);
         assert_eq!(first["truncated"], true);
         let resume = first["nextCursor"].as_str().unwrap().to_owned();
@@ -2048,7 +2062,11 @@ mod tests {
             }
             async fn list_resources(&self, cursor: Option<String>) -> Result<ResourcePage> {
                 match cursor.as_deref() {
-                    None => {
+                    None => Ok(ResourcePage {
+                        items: vec![json!({"uri":"not-a-uri", "name":"broken"})],
+                        next_cursor: Some("mixed".into()),
+                    }),
+                    Some("mixed") => {
                         let mut items = vec![json!({
                             "uri":"not-a-uri", "name":"broken", "mimeType":"text/plain"
                         })];
@@ -2085,7 +2103,7 @@ mod tests {
         .await
         .unwrap();
         let list = loaded.tools[0].clone();
-        let cx = temp_cx(450);
+        let cx = temp_cx(700);
         let mut seen: Vec<String> = Vec::new();
         let mut cursor: Option<String> = None;
         let mut malformed_pages = 0;
@@ -2116,7 +2134,7 @@ mod tests {
             seen, expected,
             "malformed rows must be omitted without blocking or duplicating traversal"
         );
-        assert!(malformed_pages >= 1, "the malformed row must be counted");
+        assert!(malformed_pages >= 2, "the malformed row must be counted");
     }
 
     #[tokio::test]
@@ -2998,12 +3016,14 @@ mod tests {
             ToolResult::Json(value) => value,
             other => panic!("expected search JSON: {:?}", other.into_content()),
         };
-        let loaded_names: Vec<_> = found["tools"]
+        let mut loaded_names: Vec<_> = found["tools"]
             .as_array()
             .unwrap()
             .iter()
             .filter_map(|tool| tool["name"].as_str())
             .collect();
+        // Discovery ranking order is not a contract here; membership is.
+        loaded_names.sort_unstable();
         assert_eq!(
             loaded_names,
             vec!["list_mcp_resources", "read_mcp_resource"]
