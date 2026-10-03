@@ -24,12 +24,27 @@ pub struct ModelLimits {
     pub auto_compact_token_limit: Option<u64>,
     /// Percent of the window inference may use (codex default 95).
     pub effective_context_window_percent: u64,
+    /// Opaque compaction-compatibility hash (codex `comp_hash`): models that
+    /// publish different hashes cannot read each other's encrypted reasoning
+    /// and compaction items. Absent means unknown, which never forces a
+    /// transition compaction on its own.
+    pub comp_hash: Option<String>,
 }
 
 impl ModelLimits {
     /// codex `resolved_context_window`.
     pub fn target_window(&self) -> Option<u64> {
         self.context_window.or(self.max_context_window)
+    }
+
+    /// codex `usable_context_window`: the share of the target window inputs
+    /// may occupy after the model's configured headroom (codex default 95
+    /// percent). This is the hard fitting boundary, deliberately above the
+    /// 90 percent auto-compaction limit.
+    pub fn usable_context_window(&self) -> Option<u64> {
+        self.target_window().map(|window| {
+            window.saturating_mul(self.effective_context_window_percent.clamp(0, 100)) / 100
+        })
     }
 
     /// codex `auto_compact_token_limit`: 90% of the target window, capped by
@@ -61,6 +76,7 @@ pub(super) fn parse_catalog(value: &Value) -> Vec<ModelLimits> {
                 effective_context_window_percent: model["effective_context_window_percent"]
                     .as_u64()
                     .unwrap_or(95),
+                comp_hash: model["comp_hash"].as_str().map(str::to_owned),
             })
         })
         .collect()
@@ -170,9 +186,13 @@ mod tests {
     fn catalog() -> Value {
         json!({"models":[
             {"slug":"gpt-6-astra","context_window":272000,"max_context_window":872000,
-             "auto_compact_token_limit":null,"effective_context_window_percent":95},
-            {"slug":"capped","context_window":400000,"auto_compact_token_limit":250000},
+             "auto_compact_token_limit":null,"effective_context_window_percent":95,
+             "comp_hash":"family-a"},
+            {"slug":"capped","context_window":400000,"auto_compact_token_limit":250000,
+             "comp_hash":"family-a"},
             {"slug":"max-only","max_context_window":1000000},
+            {"slug":"clamped","context_window":100000,"effective_context_window_percent":130,
+             "comp_hash":"family-b"},
             {"slug":"","context_window":1},
             {"context_window":2}
         ]})
@@ -181,15 +201,27 @@ mod tests {
     #[test]
     fn parse_keeps_named_models_and_derives_codex_limits() {
         let models = parse_catalog(&catalog());
-        assert_eq!(models.len(), 3);
+        assert_eq!(models.len(), 4);
         let astra = &models[0];
         assert_eq!(astra.target_window(), Some(272_000));
         assert_eq!(astra.auto_compact_limit(), Some(244_800));
+        assert_eq!(astra.usable_context_window(), Some(258_400));
         assert_eq!(astra.max_context_window, Some(872_000));
         assert_eq!(astra.effective_context_window_percent, 95);
+        assert_eq!(astra.comp_hash.as_deref(), Some("family-a"));
         assert_eq!(models[1].auto_compact_limit(), Some(250_000));
+        // Same comp hash family: a transition between these never forces a
+        // compaction on compatibility grounds.
+        assert_eq!(models[1].comp_hash.as_deref(), Some("family-a"));
+        assert_eq!(models[1].usable_context_window(), Some(380_000));
         assert_eq!(models[2].target_window(), Some(1_000_000));
         assert_eq!(models[2].auto_compact_limit(), Some(900_000));
+        assert_eq!(models[2].usable_context_window(), Some(950_000));
+        assert_eq!(models[2].comp_hash, None);
+        // Out-of-range percents clamp instead of over- or under-shooting the
+        // window; the hash is a plain opaque string.
+        assert_eq!(models[3].usable_context_window(), Some(100_000));
+        assert_eq!(models[3].comp_hash.as_deref(), Some("family-b"));
     }
 
     #[test]
@@ -213,7 +245,7 @@ mod tests {
         .unwrap();
         let cache = cached_catalog(&root, CACHE_MAX_AGE).await.unwrap();
         assert_eq!(client_version(Some(&cache)), "0.154.0");
-        assert_eq!(parse_catalog(&cache).len(), 3);
+        assert_eq!(parse_catalog(&cache).len(), 4);
         assert!(cached_catalog(&root, Duration::ZERO).await.is_none());
         assert_eq!(
             std::fs::read_to_string(root.join("models_cache.json"))
