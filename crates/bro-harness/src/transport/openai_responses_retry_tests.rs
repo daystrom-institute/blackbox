@@ -990,7 +990,11 @@ async fn http_steer_drain_eof_before_output_never_replays() {
     token.cancel();
     tx.set_step_preemption(Some(token));
     let before = tx.snapshot();
-    let error = tx.run_turn_http(&[], &opts(), &NoSink).await.unwrap_err();
+    let error = tx
+        .run_turn_http(&[], &opts(), &NoSink)
+        .await
+        .err()
+        .expect("unfinished drain must fail");
     assert!(
         error
             .downcast_ref::<crate::transport::FailedTurnObservation>()
