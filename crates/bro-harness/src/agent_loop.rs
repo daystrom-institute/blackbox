@@ -1774,13 +1774,7 @@ impl Session {
                            "from":self.base_opts.model, "to":model, "projected_tokens":projected}),
                 );
                 let summary = self
-                    .tx
-                    .compact(
-                        self.compaction.params(),
-                        crate::compaction::COMPACTION_INSTRUCTION,
-                        &tools,
-                        &opts,
-                    )
+                    .compact_history(&tools, &opts)
                     .await
                     .context("compact with previous model before model change")?
                     .context("history cannot be compacted before model change")?;
@@ -1880,6 +1874,26 @@ impl Session {
         );
     }
 
+    /// Compaction can consume provider tokens even when replacement validation
+    /// fails. Drain that usage once, keeping inference occupancy independent.
+    async fn compact_history(
+        &mut self,
+        tools: &[transport::ToolSpec],
+        opts: &TurnOpts,
+    ) -> Result<Option<String>> {
+        let result = self
+            .tx
+            .compact(
+                self.compaction.params(),
+                crate::compaction::COMPACTION_INSTRUCTION,
+                tools,
+                opts,
+            )
+            .await;
+        self.total_usage.add(&self.tx.take_compaction_usage());
+        result
+    }
+
     fn reset_compaction_context(&mut self) {
         self.compaction_failures = 0;
         self.compaction_retry_after_turn = 0;
@@ -1908,16 +1922,7 @@ impl Session {
             self.emitter.session_id(),
             json!({"reason": "manual"}),
         );
-        match self
-            .tx
-            .compact(
-                self.compaction.params(),
-                crate::compaction::COMPACTION_INSTRUCTION,
-                &tool_specs,
-                &opts,
-            )
-            .await?
-        {
+        match self.compact_history(&tool_specs, &opts).await? {
             Some(summary) => {
                 self.emitter
                     .compact_boundary("manual", self.last_prompt_tokens, summary.len());
@@ -2093,6 +2098,7 @@ impl Session {
                     } else {
                         0
                     });
+                let over_usable = self.usable_window.is_some_and(|usable| projected > usable);
                 if !proactive_checked {
                     proactive_checked = true;
                     // The auto-compaction threshold (catalog 90 percent,
@@ -2102,7 +2108,10 @@ impl Session {
                     let over_threshold = self
                         .compact_threshold
                         .is_some_and(|threshold| projected > threshold);
-                    if over_threshold {
+                    // The hard boundary below owns an oversized request. Do
+                    // not spend an automatic attempt and then immediately
+                    // repeat the same failed compaction as a safety attempt.
+                    if over_threshold && !over_usable {
                         if self.turns < self.compaction_retry_after_turn {
                             tracing::debug!(
                                 retry_after_turn = self.compaction_retry_after_turn,
@@ -2114,16 +2123,7 @@ impl Session {
                                 self.emitter.session_id(),
                                 json!({"reason":"auto", "projected_tokens":projected}),
                             );
-                            match self
-                                .tx
-                                .compact(
-                                    self.compaction.params(),
-                                    crate::compaction::COMPACTION_INSTRUCTION,
-                                    &tool_specs,
-                                    &opts,
-                                )
-                                .await
-                            {
+                            match self.compact_history(&tool_specs, &opts).await {
                                 Ok(Some(summary)) => {
                                     self.emitter
                                         .compact_boundary("auto", projected, summary.len());
@@ -2144,9 +2144,7 @@ impl Session {
                 // finds nothing compactible, or leaves the estimate over the
                 // boundary, the turn fails with the source history preserved
                 // instead of re-sending the same oversized request.
-                if self.compaction.enabled()
-                    && self.usable_window.is_some_and(|usable| projected > usable)
-                {
+                if self.compaction.enabled() && over_usable {
                     if usable_compacted {
                         anyhow::bail!(
                             "projected request still exceeds the model's usable context window \
@@ -2161,16 +2159,7 @@ impl Session {
                         json!({"reason":"auto", "usable_boundary":true,
                                "projected_tokens":projected}),
                     );
-                    match self
-                        .tx
-                        .compact(
-                            self.compaction.params(),
-                            crate::compaction::COMPACTION_INSTRUCTION,
-                            &tool_specs,
-                            &opts,
-                        )
-                        .await
-                    {
+                    match self.compact_history(&tool_specs, &opts).await {
                         Ok(Some(summary)) => {
                             self.emitter
                                 .compact_boundary("auto", projected, summary.len());
@@ -2243,16 +2232,7 @@ impl Session {
                             self.emitter.session_id(),
                             json!({"reason": "overflow"}),
                         );
-                        match self
-                            .tx
-                            .compact(
-                                self.compaction.params(),
-                                crate::compaction::COMPACTION_INSTRUCTION,
-                                &tool_specs,
-                                &opts,
-                            )
-                            .await
-                        {
+                        match self.compact_history(&tool_specs, &opts).await {
                             Ok(Some(summary)) => {
                                 self.emitter.compact_boundary(
                                     "overflow",
@@ -3628,6 +3608,7 @@ fn env_u64(key: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     mod budget;
+    mod compaction_usage;
     use super::*;
 
     #[test]
@@ -3754,6 +3735,7 @@ mod tests {
         started: Arc<AtomicUsize>,
         completed: Arc<AtomicUsize>,
         compact_calls: Arc<AtomicUsize>,
+        compact_usage: Arc<Mutex<Usage>>,
         compact_block: Arc<std::sync::atomic::AtomicBool>,
         compact_gate: Arc<Notify>,
         compact_fail: Arc<std::sync::atomic::AtomicBool>,
@@ -3979,6 +3961,10 @@ mod tests {
                 .clone()
                 .filter(|limits| limits.slug == model)
         }
+        fn take_compaction_usage(&mut self) -> Usage {
+            std::mem::take(&mut *self.shared.compact_usage.lock().unwrap())
+        }
+
         async fn compact(
             &mut self,
             _params: transport::CompactionParams,
