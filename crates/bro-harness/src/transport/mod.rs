@@ -496,8 +496,8 @@ pub trait Transport: Send {
     /// Materialize provider-owned context before request budgeting. Return the
     /// estimated tokens newly appended to history, excluding unchanged context.
     /// The subsequent run_turn must observe the same prepared state.
-    fn prepare_request_context(&mut self, _opts: &TurnOpts) -> u64 {
-        0
+    fn prepare_request_context(&mut self, _tools: &[ToolSpec], _opts: &TurnOpts) -> Result<u64> {
+        Ok(0)
     }
 
     async fn run_turn(

@@ -1753,7 +1753,7 @@ impl Session {
                 ),
                 ..self.base_opts.clone()
             };
-            let added = self.tx.prepare_request_context(&opts);
+            let added = self.tx.prepare_request_context(&tools, &opts)?;
             self.pending_input_estimate = self.pending_input_estimate.saturating_add(added);
             let projected = self.projected_request_tokens(&tools, &opts);
             let downshift_limit = next_window.map(|window| {
@@ -1792,7 +1792,7 @@ impl Session {
                     ),
                     ..self.base_opts.clone()
                 };
-                let added = self.tx.prepare_request_context(&destination_opts);
+                let added = self.tx.prepare_request_context(&tools, &destination_opts)?;
                 self.pending_input_estimate = self.pending_input_estimate.saturating_add(added);
                 let projected = self.projected_request_tokens(&tools, &destination_opts);
                 if window_shrinks {
@@ -2078,7 +2078,7 @@ impl Session {
                     system: sys,
                     ..self.base_opts.clone()
                 };
-                let added = self.tx.prepare_request_context(&opts);
+                let added = self.tx.prepare_request_context(&tool_specs, &opts)?;
                 self.pending_input_estimate = self.pending_input_estimate.saturating_add(added);
                 let estimate = crate::context::budget::RequestEstimate::new(
                     &self.tx.snapshot(),

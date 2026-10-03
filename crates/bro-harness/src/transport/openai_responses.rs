@@ -706,16 +706,20 @@ impl Transport for OpenAiResponsesTransport {
         "openai-responses"
     }
 
-    fn prepare_request_context(&mut self, opts: &TurnOpts) -> u64 {
+    fn prepare_request_context(
+        &mut self,
+        _tools: &[super::ToolSpec],
+        opts: &TurnOpts,
+    ) -> Result<u64> {
         let before = self.state.input.len();
         self.state.sync_ambient(opts.system.ambient_text());
         if self.state.input.len() == before {
-            return 0;
+            return Ok(0);
         }
-        self.state.input[before..]
+        Ok(self.state.input[before..]
             .iter()
             .map(|item| crate::context::budget::text_tokens(&item.to_string()))
-            .fold(0u64, u64::saturating_add)
+            .fold(0u64, u64::saturating_add))
     }
 
     fn set_session_id(&mut self, id: String) {
@@ -1004,16 +1008,16 @@ mod budget_tests {
             service_tier: None,
         };
         opts.system.ambient = Some("catalog A ".repeat(100));
-        let first = tx.prepare_request_context(&opts);
+        let first = tx.prepare_request_context(&[], &opts).unwrap();
         assert!(first > 0);
-        assert_eq!(tx.prepare_request_context(&opts), 0);
+        assert_eq!(tx.prepare_request_context(&[], &opts).unwrap(), 0);
         let before = crate::context::budget::RequestEstimate::new(&tx.snapshot(), &[], &opts);
         opts.system.ambient = Some("catalog B ".repeat(100));
-        let added = tx.prepare_request_context(&opts);
+        let added = tx.prepare_request_context(&[], &opts).unwrap();
         assert_eq!(added, first);
         let after = crate::context::budget::RequestEstimate::new(&tx.snapshot(), &[], &opts);
         assert_eq!(before.overhead_tokens, after.overhead_tokens);
         assert!(after.history_tokens > before.history_tokens);
-        assert_eq!(tx.prepare_request_context(&opts), 0);
+        assert_eq!(tx.prepare_request_context(&[], &opts).unwrap(), 0);
     }
 }

@@ -795,7 +795,7 @@ async fn usable_window_refusal_never_sends_the_oversized_request() {
         let before = session.tx.snapshot();
         let (_cancel_tx, cancel_rx) = watch::channel(false);
         let error = session
-            .user_turn("task", cancel_rx, Arc::new(StdMutex::new(VecDeque::new())))
+            .user_turn("task", cancel_rx, MidTurnInputs::new())
             .await
             .unwrap_err();
         assert!(
@@ -817,11 +817,7 @@ async fn usable_window_refusal_never_sends_the_oversized_request() {
         shared.compact_noop.store(true, Ordering::SeqCst);
         let (_cancel_tx, cancel_rx) = watch::channel(false);
         let error = session
-            .user_turn(
-                &"x".repeat(40),
-                cancel_rx,
-                Arc::new(StdMutex::new(VecDeque::new())),
-            )
+            .user_turn(&"x".repeat(40), cancel_rx, MidTurnInputs::new())
             .await
             .unwrap_err();
         assert!(
@@ -838,11 +834,7 @@ async fn usable_window_refusal_never_sends_the_oversized_request() {
         session.usable_window = Some(2);
         let (_cancel_tx, cancel_rx) = watch::channel(false);
         let error = session
-            .user_turn(
-                &"x".repeat(40),
-                cancel_rx,
-                Arc::new(StdMutex::new(VecDeque::new())),
-            )
+            .user_turn(&"x".repeat(40), cancel_rx, MidTurnInputs::new())
             .await
             .unwrap_err();
         assert!(format!("{error:#}").contains("still exceeds"), "{error:#}");

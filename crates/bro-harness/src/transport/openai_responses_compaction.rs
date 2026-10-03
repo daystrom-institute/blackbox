@@ -274,11 +274,11 @@ const REMOTE_TRIMMED_OUTPUT: &str = "Output exceeded the available model context
 /// resolution. The caller must build the policy under the same environment
 /// this resolution runs in.
 pub(super) fn remote_compaction_limit(
-    limits: Option<&super::ModelLimits>,
+    limits: Option<&crate::transport::ModelLimits>,
     policy: &crate::compaction::CompactionPolicy,
     model: &str,
 ) -> Option<u64> {
-    if super::session_var("BRO_HARNESS_COMPACTION_CONFIG").is_some() {
+    if crate::transport::session_var("BRO_HARNESS_COMPACTION_CONFIG").is_some() {
         return policy.context_window(model);
     }
     limits

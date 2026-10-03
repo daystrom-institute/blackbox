@@ -242,7 +242,7 @@ mod tests {
                 + json_tokens(&body["tools"][0])
                 + 4
         );
-        assert!(tokens * 4 < serde_json::to_vec(&body).unwrap().len());
+        assert!(tokens * 4 < serde_json::to_vec(&body).unwrap().len() as u64);
     }
 
     #[test]

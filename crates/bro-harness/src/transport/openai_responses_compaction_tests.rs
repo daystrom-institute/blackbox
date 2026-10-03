@@ -502,7 +502,7 @@ fn fit_remote_input_trims_only_trailing_output_groups() {
 #[tokio::test]
 async fn remote_compaction_limit_prefers_catalog_usable_window_and_honors_overrides() {
     let policy = crate::compaction::CompactionPolicy::from_env();
-    let limits = super::super::ModelLimits {
+    let limits = crate::transport::ModelLimits {
         slug: "gpt-5.5".into(),
         context_window: Some(200_000),
         max_context_window: Some(600_000),
