@@ -3,7 +3,10 @@
 
 use super::*;
 use rmcp::RoleClient;
-use rmcp::model::{CallToolRequest, ServerResult};
+use rmcp::model::{
+    CallToolRequest, ClientRequest, ListResourceTemplatesRequest, ListResourcesRequest,
+    PaginatedRequestParams, ReadResourceRequest, ReadResourceRequestParams, ServerResult,
+};
 use rmcp::service::{PeerRequestOptions, RunningService, ServiceError};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -34,6 +37,7 @@ pub(super) struct ServerConn {
     tool_timeout: Duration,
     uncertain: Mutex<Option<UncertainReason>>,
     quarantined: CancellationToken,
+    resources: bool,
 }
 
 impl ServerConn {
@@ -42,17 +46,33 @@ impl ServerConn {
         server: String,
         tool_timeout_ms: u64,
     ) -> Self {
+        let resources = running
+            .peer()
+            .peer_info()
+            .is_some_and(|info| info.capabilities.resources.is_some());
         Self {
             running,
             server,
             tool_timeout: Duration::from_millis(tool_timeout_ms),
             uncertain: Mutex::new(None),
             quarantined: CancellationToken::new(),
+            resources,
         }
     }
 
     pub(super) async fn list_tools(&self) -> anyhow::Result<Vec<rmcp::model::Tool>> {
         Ok(self.running.peer().list_all_tools().await?)
+    }
+
+    /// Whether the server declared the MCP resources capability at initialize.
+    pub(super) fn resources_supported(&self) -> bool {
+        self.resources
+    }
+
+    /// Cancel the underlying service. Test/close hook: mirrors what dropping
+    /// the last handle does, but observably.
+    pub(super) fn shutdown(&self) {
+        self.running.cancellation_token().cancel();
     }
 
     pub(super) fn uncertain_outcome(&self) -> Option<String> {
@@ -204,6 +224,250 @@ impl ServerConn {
             Ok(Ok(()))
         );
         self.uncertain_result(&tool, reason, cancellation_requested, protocol_error)
+    }
+}
+
+/// Failure modes of a read-only resource RPC (`resources/list`,
+/// `resources/templates/list`, `resources/read`).
+pub(super) enum ResourceRpcError {
+    /// The request was never dispatched (cancelled pre-send or an already
+    /// quarantined connection refused it).
+    NotSent(String),
+    /// The server returned a terminal JSON-RPC error or an unusable result.
+    /// Unlike `tools/call`, a received terminal response proves this read-only
+    /// operation completed with a known outcome, so the connection is not
+    /// quarantined and the failure surfaces as an explicit error.
+    Server {
+        message: String,
+        protocol_error: Value,
+    },
+    /// Remote completion is unknown (deadline, cancellation while waiting,
+    /// transport loss). The connection is quarantined and the envelope is
+    /// the call's result.
+    Uncertain(ToolResult),
+}
+
+impl ServerConn {
+    async fn resource_request(
+        &self,
+        operation: &'static str,
+        request: ClientRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<ServerResult, ResourceRpcError> {
+        if self.quarantined.is_cancelled() {
+            return Err(ResourceRpcError::Uncertain(self.uncertain_resource_result(
+                operation,
+                UncertainReason::Quarantined,
+                false,
+                None,
+            )));
+        }
+        if cancellation.is_cancelled() {
+            return Err(ResourceRpcError::NotSent(format!(
+                "MCP resource operation {operation} cancelled before remote dispatch; this call was not sent"
+            )));
+        }
+        let deadline = tokio::time::Instant::now() + self.tool_timeout;
+        let sent = tokio::select! {
+            biased;
+            _ = self.quarantined.cancelled() => Err(UncertainReason::ConnectionLost),
+            _ = cancellation.cancelled() => Err(UncertainReason::CancelledWait),
+            _ = tokio::time::sleep_until(deadline) => Err(UncertainReason::Deadline),
+            result = self.running.peer().send_cancellable_request(
+                request,
+                PeerRequestOptions::no_options(),
+            ) => result.map_err(|_| UncertainReason::ConnectionLost),
+        };
+        let mut handle = match sent {
+            Ok(handle) => handle,
+            Err(reason) => {
+                self.quarantine(reason);
+                return Err(ResourceRpcError::Uncertain(
+                    self.uncertain_resource_result(operation, reason, false, None),
+                ));
+            }
+        };
+        let response = tokio::select! {
+            biased;
+            response = &mut handle.rx => Some(response.unwrap_or(Err(ServiceError::TransportClosed))),
+            _ = cancellation.cancelled() => None,
+            _ = self.quarantined.cancelled() => None,
+            _ = tokio::time::sleep_until(deadline) => None,
+        };
+        let response_received = response.is_some();
+        if let Some(Err(ServiceError::McpError(error))) = &response {
+            // A received terminal response proves this read-only operation
+            // completed (rejected before execution, or failed after it); the
+            // outcome is known either way, so no quarantine applies.
+            return Err(ResourceRpcError::Server {
+                message: error.message.to_string(),
+                protocol_error: serde_json::json!(error),
+            });
+        }
+        if let Some(Ok(result)) = response {
+            return Ok(result);
+        }
+        let reason = if response_received {
+            UncertainReason::ConnectionLost
+        } else if cancellation.is_cancelled() {
+            UncertainReason::CancelledWait
+        } else if self.quarantined.is_cancelled() {
+            UncertainReason::Quarantined
+        } else {
+            UncertainReason::Deadline
+        };
+        let reason = if matches!(reason, UncertainReason::Quarantined) {
+            UncertainReason::ConnectionLost
+        } else {
+            reason
+        };
+        self.quarantine(reason);
+        let cancellation_requested = matches!(
+            tokio::time::timeout(
+                Duration::from_millis(250),
+                handle.cancel(Some(
+                    "harness stopped waiting; remote completion unknown".into()
+                ))
+            )
+            .await,
+            Ok(Ok(()))
+        );
+        Err(ResourceRpcError::Uncertain(self.uncertain_resource_result(
+            operation,
+            reason,
+            cancellation_requested,
+            None,
+        )))
+    }
+
+    fn uncertain_resource_result(
+        &self,
+        operation: &str,
+        reason: UncertainReason,
+        cancellation_requested: bool,
+        protocol_error: Option<Value>,
+    ) -> ToolResult {
+        let not_started = matches!(reason, UncertainReason::Quarantined);
+        let text = if not_started {
+            "This call was not sent: the MCP server connection is quarantined after an earlier call with unknown completion. Do not retry until the operator reconciles the remote effects. A fresh session alone does not establish whether the earlier call ran."
+        } else {
+            "Remote resource completion is unknown. A cancellation notification cannot prove that the server stopped or that no effects occurred. The server connection is quarantined. Do not retry until the operator reconciles the remote effects."
+        };
+        ToolResult::Error(serde_json::json!({
+            "content":[{"type":"text","text":text}],
+            "structuredContent":{
+                "code":if not_started {"mcp_server_quarantined"} else {"mcp_remote_outcome_unknown"},
+                "server":self.server, "operation":operation, "reason":reason.label(),
+                "completion":if not_started {"not_started"} else {"unknown"},
+                "prior_completion_unknown":not_started,
+                "server_quarantined":true, "retry_safe":false,
+                "cancellation_requested":cancellation_requested,
+                "remote_stop_confirmed":false,
+                "protocol_error":protocol_error
+            },
+            "isError":true
+        }).to_string())
+    }
+
+    fn page_items(result: ServerResult) -> Result<(Vec<Value>, Option<String>), String> {
+        let (items, next_cursor) = match result {
+            ServerResult::ListResourcesResult(page) => (page.resources, page.next_cursor),
+            ServerResult::ListResourceTemplatesResult(page) => {
+                (page.resource_templates, page.next_cursor)
+            }
+            _ => {
+                return Err(
+                    "server returned an unexpected result variant for the resource listing".into(),
+                );
+            }
+        };
+        let mut entries = Vec::with_capacity(items.len());
+        for item in items {
+            let mut value = serde_json::to_value(item)
+                .map_err(|error| format!("resource serialization failed: {error}"))?;
+            if let Some(object) = value.as_object_mut() {
+                object.remove("_meta");
+            }
+            entries.push(value);
+        }
+        Ok((entries, next_cursor))
+    }
+
+    pub(super) async fn list_resources(
+        &self,
+        cursor: Option<String>,
+        cancellation: &CancellationToken,
+    ) -> Result<(Vec<Value>, Option<String>), ResourceRpcError> {
+        let params = PaginatedRequestParams::default().with_cursor(cursor);
+        let request: ClientRequest = ListResourcesRequest::with_param(params).into();
+        self.resource_rpc("resources/list", request, cancellation, Self::page_items)
+            .await
+    }
+
+    pub(super) async fn list_resource_templates(
+        &self,
+        cursor: Option<String>,
+        cancellation: &CancellationToken,
+    ) -> Result<(Vec<Value>, Option<String>), ResourceRpcError> {
+        let params = PaginatedRequestParams::default().with_cursor(cursor);
+        let request: ClientRequest = ListResourceTemplatesRequest::with_param(params).into();
+        self.resource_rpc(
+            "resources/templates/list",
+            request,
+            cancellation,
+            Self::page_items,
+        )
+        .await
+    }
+
+    pub(super) async fn read_resource(
+        &self,
+        uri: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<Value>, ResourceRpcError> {
+        let request: ClientRequest =
+            ReadResourceRequest::new(ReadResourceRequestParams::new(uri.to_owned())).into();
+        self.resource_rpc(
+            "resources/read",
+            request,
+            cancellation,
+            |result| match result {
+                ServerResult::ReadResourceResult(page) => {
+                    let mut contents = Vec::with_capacity(page.contents.len());
+                    for content in page.contents {
+                        let mut value = serde_json::to_value(content).map_err(|error| {
+                            format!("resource content serialization failed: {error}")
+                        })?;
+                        if let Some(object) = value.as_object_mut() {
+                            object.remove("_meta");
+                        }
+                        contents.push(value);
+                    }
+                    Ok(contents)
+                }
+                _ => Err("server returned an unexpected result variant for resources/read".into()),
+            },
+        )
+        .await
+    }
+
+    async fn resource_rpc<T>(
+        &self,
+        operation: &'static str,
+        request: ClientRequest,
+        cancellation: &CancellationToken,
+        project: fn(ServerResult) -> Result<T, String>,
+    ) -> Result<T, ResourceRpcError> {
+        match self
+            .resource_request(operation, request, cancellation)
+            .await
+        {
+            Ok(result) => project(result).map_err(|message| ResourceRpcError::Server {
+                message: format!("{operation} failed: {message}"),
+                protocol_error: Value::Null,
+            }),
+            Err(error) => Err(error),
+        }
     }
 }
 
