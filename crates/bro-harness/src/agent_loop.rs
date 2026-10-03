@@ -6830,11 +6830,18 @@ mod tests {
             .unwrap()
             .step_preemption()
             .expect("rearm must not leave the slot cleared by the old guard");
+        // Behavioural independence, not identity: cancelling the previous
+        // step's token must leave the newly armed token live, and the armed
+        // watcher must still cancel that token on freshly queued input.
+        first.cancel();
         assert!(
-            !tokio_util::sync::CancellationToken::ptr_eq(&first, &second),
-            "rearm must install a fresh token"
+            !second.is_cancelled(),
+            "the previous step's cancellation must not preempt the rearmed step"
         );
-        assert!(!second.is_cancelled());
+        inputs.push_back("rearm steer".to_string());
+        tokio::time::timeout(std::time::Duration::from_secs(2), second.cancelled())
+            .await
+            .expect("queued input must cancel the rearmed step's token");
         drop(slot);
         assert!(
             session
@@ -6853,6 +6860,9 @@ mod tests {
     #[tokio::test]
     async fn mid_turn_input_preempts_code_mode_exec_and_is_delivered_once_in_order() {
         use std::time::Duration;
+        // The nested tool implements bro_tools::Tool, so its result type is
+        // bro_tools::ToolResult, not the transport's identically named type.
+        use bro_tools::ToolResult;
 
         struct GatedMutation {
             started: tokio::sync::Semaphore,

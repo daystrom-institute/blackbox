@@ -914,8 +914,7 @@ mod tests {
             ),
         )
         .await
-        .expect("input queued before the wait must preempt it")
-        .unwrap();
+        .expect("input queued before the wait must preempt it");
         assert!(
             result
                 .into_content()
