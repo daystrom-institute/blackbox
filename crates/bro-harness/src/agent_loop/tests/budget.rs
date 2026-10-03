@@ -170,6 +170,7 @@ fn limits_for(slug: &str, comp_hash: Option<&str>) -> transport::ModelLimits {
         auto_compact_token_limit: None,
         effective_context_window_percent: 95,
         comp_hash: comp_hash.map(str::to_owned),
+        use_responses_lite: false,
     }
 }
 
