@@ -473,7 +473,7 @@ impl WsChannel {
             // were already handled above with their own semantics.
             if let Some(ev) = failure_event.as_ref() {
                 let data = ev.to_string();
-                let code = super::responses_common::stream_error_code(ev, &data);
+                let code = super::responses_common::stream_error_code(ev);
                 let message = super::responses_common::stream_error_message(ev, &data);
                 if let super::responses_common::StreamFailure::Retryable {
                     error,
@@ -807,7 +807,6 @@ mod tests {
         events: Vec<String>,
         expected_requests: usize,
     ) -> (String, tokio::task::JoinHandle<usize>) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let task = tokio::spawn(async move {
@@ -886,7 +885,7 @@ mod tests {
                     "quota is not a context-window rejection"
                 );
             }
-            other => panic!("quota failure must propagate as an API error"),
+            _ => panic!("quota failure must propagate as an API error"),
         }
     }
 
@@ -922,7 +921,7 @@ mod tests {
                     "pure rejection stays bare for loop recovery"
                 );
             }
-            other => panic!("rejection must be an API error"),
+            _ => panic!("rejection must be an API error"),
         }
     }
 }

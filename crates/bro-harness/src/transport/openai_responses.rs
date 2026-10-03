@@ -329,7 +329,7 @@ impl OpenAiResponsesTransport {
                 && let Some(ev) = failure_event.as_ref()
             {
                 let data = ev.to_string();
-                let code = responses_common::stream_error_code(ev, &data);
+                let code = responses_common::stream_error_code(ev);
                 let message = responses_common::stream_error_message(ev, &data);
                 if let responses_common::StreamFailure::Retryable { error, advice } =
                     responses_common::classify_stream_failure(code, message, events.advice)
@@ -492,7 +492,7 @@ impl OpenAiResponsesTransport {
                 && matches!(ev["type"].as_str(), Some("response.failed" | "error"))
             {
                 let data = ev.to_string();
-                let code = responses_common::stream_error_code(ev, &data);
+                let code = responses_common::stream_error_code(ev);
                 let message = responses_common::stream_error_message(ev, &data);
                 if let responses_common::StreamFailure::Retryable { error, advice } =
                     responses_common::classify_stream_failure(code, message, events.advice)

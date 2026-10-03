@@ -97,9 +97,8 @@ pub fn terminal_failure_code(code: &str) -> bool {
 /// HTTP error classifier, so a quota/policy envelope cannot retry just
 /// because it spells its code in the `type` field.
 pub fn json_error_code(body: &str) -> Option<String> {
-    let error = serde_json::from_str::<serde_json::Value>(body)
-        .ok()?
-        .get("error")?;
+    let parsed = serde_json::from_str::<serde_json::Value>(body).ok()?;
+    let error = parsed.get("error")?;
     if let Some(code) = error.get("code").and_then(|code| code.as_str()) {
         return Some(code.to_string());
     }

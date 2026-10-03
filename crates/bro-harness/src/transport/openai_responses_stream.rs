@@ -175,11 +175,11 @@ pub(super) async fn collect_json_body(
     loop {
         let chunk = tokio::time::timeout(idle, stream.next())
             .await
-            .map_err(|_| anyhow::anyhow!("responses JSON body idle timeout"))?
-            .transpose()
-            .map_err(anyhow::Error::new)?
-            .context("read responses JSON body chunk")?;
-        let Some(chunk) = chunk else { break };
+            .map_err(|_| anyhow::anyhow!("responses JSON body idle timeout"))?;
+        let Some(chunk) = chunk else {
+            break;
+        };
+        let chunk = chunk.context("read responses JSON body chunk")?;
         if body.len() + chunk.len() > max_bytes {
             anyhow::bail!("responses JSON body exceeded the {max_bytes} byte budget");
         }

@@ -1157,7 +1157,7 @@ pub(super) fn in_band_retry_after(ev: &Value) -> Option<super::http::RetryAfter>
 }
 
 /// The machine-readable code of a streamed failure event.
-pub(super) fn stream_error_code<'a>(ev: &'a Value, data: &'a str) -> &'a str {
+pub(super) fn stream_error_code<'a>(ev: &'a Value) -> &'a str {
     if ev["type"] == "response.failed" {
         &ev["response"]["error"]["code"]
     } else {
