@@ -435,8 +435,10 @@ impl OpenAiResponsesTransport {
             .push(json!({"type": "compaction_trigger"}));
         // Fit a copy: neither rejected requests nor invalid summaries may consume
         // the source history. Unknown model windows remain provider-validated.
-        let window = crate::compaction::CompactionPolicy::from_env().context_window(&opts.model);
-        let body = compaction::fit_input(body, window)?;
+        let policy = crate::compaction::CompactionPolicy::from_env();
+        let limits = self.model_limits(&opts.model);
+        let limit = compaction::remote_compaction_limit(limits.as_ref(), &policy, &opts.model);
+        let body = compaction::fit_remote_input(body, limit)?;
         let idle = super::http::stream_idle_timeout();
         let max = MAX_COMPACTION_STREAM_RETRIES;
         let mut attempt = 0u32;
@@ -570,10 +572,12 @@ impl OpenAiResponsesTransport {
     /// with the source history untouched.
     async fn public_compact(&mut self, opts: &TurnOpts) -> Result<Option<String>> {
         let url = format!("{}/compact", self.http_endpoint.trim_end_matches('/'));
-        let window = crate::compaction::CompactionPolicy::from_env().context_window(&opts.model);
-        let body = compaction::fit_input(
+        let policy = crate::compaction::CompactionPolicy::from_env();
+        let limits = self.model_limits(&opts.model);
+        let limit = compaction::remote_compaction_limit(limits.as_ref(), &policy, &opts.model);
+        let body = compaction::fit_remote_input(
             json!({"model": opts.model, "input": self.state.input}),
-            window,
+            limit,
         )?;
         self.honor_pending_retry_advice().await;
         let resp = super::http::send_with_retry("openai-responses/compact", || {

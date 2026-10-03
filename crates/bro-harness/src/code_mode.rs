@@ -184,6 +184,11 @@ struct CodeModeSurface {
     service: CodeModeService,
     catalog: Vec<ToolDefinition>,
     notifications: Arc<NotificationBuffer>,
+    /// Local addition (not vendored): the active sampling step's queued-input
+    /// preemption signal. `exec`/`wait` snapshot it at call admission so every
+    /// call dispatched in one model response observes input queued since that
+    /// request started, including input that arrived before the call itself.
+    step_preempt: Mutex<Option<CancellationToken>>,
 }
 
 impl CodeModeSurface {
@@ -197,6 +202,7 @@ impl CodeModeSurface {
             service: CodeModeService::with_delegate(delegate),
             catalog,
             notifications,
+            step_preempt: Mutex::new(None),
         }
     }
 
@@ -207,6 +213,14 @@ impl CodeModeSurface {
             .expect("code-mode notification buffer poisoned")
             .remove(cell_id.as_str())
             .unwrap_or_default()
+    }
+
+    /// Local addition (not vendored): snapshot of the armed step signal.
+    fn current_step_preemption(&self) -> Option<CancellationToken> {
+        self.step_preempt
+            .lock()
+            .expect("code-mode step preemption slot poisoned")
+            .clone()
     }
 }
 
@@ -289,6 +303,29 @@ impl CodeModeToolSession {
 
     pub fn tools(&self) -> Vec<Arc<dyn Tool>> {
         self.tools.clone()
+    }
+
+    /// Local addition (not vendored): arm or clear the current sampling step's
+    /// queued-input preemption signal.
+    ///
+    /// The agent loop arms one token per model request, after that request's
+    /// user input has been drained into the conversation, and clears it once
+    /// the response's tool calls have drained. `exec`/`wait` snapshot the armed
+    /// token at call admission, so every call in one response observes input
+    /// queued since the request started, while a later step's calls start from
+    /// a fresh token. Standalone callers that never arm a signal keep the
+    /// plain yield-window behavior.
+    pub fn set_step_preemption(&self, preempt: Option<CancellationToken>) {
+        *self
+            .surface
+            .step_preempt
+            .lock()
+            .expect("code-mode step preemption slot poisoned") = preempt;
+    }
+
+    /// Local addition (not vendored): the currently armed step signal, if any.
+    pub fn step_preemption(&self) -> Option<CancellationToken> {
+        self.surface.current_step_preemption()
     }
 
     pub async fn shutdown(&self) -> Result<(), String> {
@@ -382,6 +419,10 @@ impl Tool for ExecTool {
             Err(e) => return ToolResult::Error(format!("exec: {e}")),
         };
         let max_output_tokens = parsed.max_output_tokens;
+        // Local addition (not vendored): snapshot the armed step signal before
+        // admission so this call (and its siblings in the same response)
+        // preempt on input queued since the request started.
+        let step_preempt = self.surface.current_step_preemption();
         let request = ExecuteRequest {
             context_id: Some(cx.instruction_generation),
             tool_call_id: "exec".to_string(),
@@ -390,7 +431,12 @@ impl Tool for ExecTool {
             yield_time_ms: parsed.yield_time_ms,
             max_output_tokens: parsed.max_output_tokens,
         };
-        let started = match self.surface.service.execute(request).await {
+        let started = match self
+            .surface
+            .service
+            .execute_with_preempt(request, step_preempt)
+            .await
+        {
             Ok(s) => s,
             Err(e) => return ToolResult::Error(format!("exec failed: {e}")),
         };
@@ -491,6 +537,8 @@ impl Tool for WaitTool {
             .get("terminate")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        // Local addition (not vendored): same step snapshot as `exec` (above).
+        let step_preempt = self.surface.current_step_preemption();
         let outcome = if terminate || cx.cancellation.is_cancelled() {
             self.surface.service.terminate(cell_id).await
         } else {
@@ -498,10 +546,13 @@ impl Tool for WaitTool {
                 .get("yield_time_ms")
                 .and_then(Value::as_u64)
                 .unwrap_or(bro_code_mode::DEFAULT_WAIT_YIELD_TIME_MS);
-            let waiting = self.surface.service.wait(WaitRequest {
-                cell_id: cell_id.clone(),
-                yield_time_ms,
-            });
+            let waiting = self.surface.service.wait_with_preempt(
+                WaitRequest {
+                    cell_id: cell_id.clone(),
+                    yield_time_ms,
+                },
+                step_preempt,
+            );
             tokio::pin!(waiting);
             tokio::select! {
                 biased;
@@ -741,6 +792,215 @@ mod tests {
             .await;
         assert!(result.is_error());
         assert!(session.cancel_all().await.is_empty());
+    }
+
+    // Local addition: queued input preempts the active exec observation while
+    // its nested mutation is still running, then a wait in the same response
+    // observes the already-queued input; after the step is disarmed the next
+    // wait collects the terminal outcome exactly once.
+    #[tokio::test]
+    async fn stepped_preemption_yields_exec_then_wait_and_collects_once() {
+        let (session, mutation) = cancellation_fixture();
+        let (exec, wait) = {
+            let tools = session.tools();
+            (tools[0].clone(), tools[1].clone())
+        };
+        let step = CancellationToken::new();
+        session.set_step_preemption(Some(step.clone()));
+        let exec_task = {
+            let exec = exec.clone();
+            let cx = test_cx();
+            tokio::spawn(async move {
+                exec.call(
+                    json!({"source":"// @exec: {\"yield_time_ms\": 60000}\ntext(JSON.stringify(await tools.mutation({})));"}),
+                    &cx,
+                )
+                .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(2), mutation.started.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        // User input queues mid-response.
+        step.cancel();
+        let result = tokio::time::timeout(Duration::from_millis(500), exec_task)
+            .await
+            .expect("queued input must preempt the long exec window")
+            .unwrap();
+        let text = result.into_content().0;
+        assert!(text.contains("Script running with cell ID"), "{text}");
+        let cell_id = yielded_cell_id(&text);
+        assert!(
+            !mutation.finished.load(std::sync::atomic::Ordering::SeqCst),
+            "nested mutation must still be running when the observation yields"
+        );
+        // A later call in the same response observes the same queued input.
+        let wait_task = {
+            let wait = wait.clone();
+            let cx = test_cx();
+            let cell_id = cell_id.clone();
+            tokio::spawn(async move {
+                wait.call(json!({"cell_id": cell_id, "yield_time_ms": 60000}), &cx)
+                    .await
+            })
+        };
+        let result = tokio::time::timeout(Duration::from_millis(500), wait_task)
+            .await
+            .expect("already-queued input must preempt the wait too")
+            .unwrap();
+        assert!(
+            result
+                .into_content()
+                .0
+                .contains("Script running with cell ID")
+        );
+        assert!(!mutation.finished.load(std::sync::atomic::Ordering::SeqCst));
+        // Step boundary: disarm, finish the mutation, collect exactly once.
+        session.set_step_preemption(None);
+        mutation.release.add_permits(1);
+        let result = wait
+            .call(
+                json!({"cell_id": cell_id.clone(), "yield_time_ms": 5000}),
+                &test_cx(),
+            )
+            .await;
+        let text = result.into_content().0;
+        assert!(text.contains("Script completed"), "{text}");
+        assert!(text.contains("finished"), "{text}");
+        assert!(mutation.finished.load(std::sync::atomic::Ordering::SeqCst));
+        let result = wait
+            .call(json!({"cell_id": cell_id, "yield_time_ms": 10}), &test_cx())
+            .await;
+        assert!(
+            result.into_content().0.contains("not found"),
+            "terminal outcome must be observed exactly once"
+        );
+        session.shutdown().await.unwrap();
+    }
+
+    // Local addition: input queued before a later call is admitted still
+    // preempts that call (same-response steering of a wait that starts late).
+    #[tokio::test]
+    async fn queued_input_before_later_wait_preempts_immediately() {
+        let (session, mutation) = cancellation_fixture();
+        let (exec, wait) = {
+            let tools = session.tools();
+            (tools[0].clone(), tools[1].clone())
+        };
+        let result = exec
+            .call(
+                json!({"source":"// @exec: {\"yield_time_ms\": 20}\ntext(JSON.stringify(await tools.mutation({})));"}),
+                &test_cx(),
+            )
+            .await;
+        let text = result.into_content().0;
+        assert!(text.contains("Script running with cell ID"), "{text}");
+        let cell_id = yielded_cell_id(&text);
+        tokio::time::timeout(Duration::from_secs(2), mutation.started.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        let step = CancellationToken::new();
+        step.cancel();
+        session.set_step_preemption(Some(step));
+        let result = tokio::time::timeout(
+            Duration::from_millis(500),
+            wait.call(
+                json!({"cell_id": cell_id.clone(), "yield_time_ms": 60000}),
+                &test_cx(),
+            ),
+        )
+        .await
+        .expect("input queued before the wait must preempt it")
+        .unwrap();
+        assert!(
+            result
+                .into_content()
+                .0
+                .contains("Script running with cell ID")
+        );
+        session.set_step_preemption(None);
+        mutation.release.add_permits(1);
+        let result = wait
+            .call(
+                json!({"cell_id": cell_id, "yield_time_ms": 5000}),
+                &test_cx(),
+            )
+            .await;
+        assert!(
+            result.into_content().0.contains("Script completed"),
+            "disarmed wait must collect the terminal outcome"
+        );
+        session.shutdown().await.unwrap();
+    }
+
+    // Local addition: an armed-but-unfired step signal must not weaken the
+    // explicit interrupt path; interrupt still cancels, waits for the nested
+    // mutation to finish, and drains.
+    #[tokio::test]
+    async fn explicit_interrupt_still_cancels_and_drains_with_step_preemption_armed() {
+        let (session, mutation) = cancellation_fixture();
+        let step = CancellationToken::new();
+        session.set_step_preemption(Some(step.clone()));
+        let exec = session.tools()[0].clone();
+        let cx = test_cx();
+        let cancellation = cx.cancellation.clone();
+        let call = tokio::spawn(async move {
+            exec.call(
+                json!({"source":"// @exec: {\"yield_time_ms\": 60000}\nnotify('callback delivered'); text(JSON.stringify(await tools.mutation({})));"}),
+                &cx,
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), mutation.started.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        cancellation.cancel();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(
+            !call.is_finished(),
+            "interrupted exec must wait for actual mutation completion"
+        );
+        assert!(!step.is_cancelled());
+        mutation.release.add_permits(1);
+        let result = tokio::time::timeout(Duration::from_secs(2), call)
+            .await
+            .unwrap()
+            .unwrap();
+        let text = result.into_content().0;
+        assert!(text.contains("Script terminated"), "{text}");
+        assert!(text.contains("callback delivered"), "{text}");
+        assert!(session.cancel_all().await.is_empty());
+        session.shutdown().await.unwrap();
+    }
+
+    // Local addition: a completed outcome wins over a signal that fires late;
+    // the result is delivered once and the spent signal disturbs nothing.
+    #[tokio::test]
+    async fn completed_exec_outcome_survives_step_signal_fired_late() {
+        let (session, _) = cancellation_fixture();
+        let step = CancellationToken::new();
+        session.set_step_preemption(Some(step.clone()));
+        let result = session.tools()[0]
+            .call(json!({"source":"text('quick done');"}), &test_cx())
+            .await;
+        let text = result.into_content().0;
+        assert!(text.contains("Script completed"), "{text}");
+        assert!(text.contains("quick done"), "{text}");
+        step.cancel();
+        let result = session.tools()[1]
+            .call(json!({"cell_id":"1","yield_time_ms":10}), &test_cx())
+            .await;
+        assert!(
+            result.into_content().0.contains("not found"),
+            "completed cell must not be observable twice"
+        );
+        session.shutdown().await.unwrap();
     }
 
     #[test]

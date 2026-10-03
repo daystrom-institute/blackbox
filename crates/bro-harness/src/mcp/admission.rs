@@ -58,6 +58,7 @@ pub async fn load_mcp_tools_from_config_with_capability_aliases(
     let mut loaded = McpLoad::default();
     let mut canonical_names = HashSet::new();
     let mut javascript_names = HashSet::new();
+    let mut resources = resources::McpResourceState::default();
     for server in &config.servers {
         let policy = config
             .server_policies
@@ -82,6 +83,7 @@ pub async fn load_mcp_tools_from_config_with_capability_aliases(
                 if policy.required {
                     anyhow::bail!("required MCP server {} is {status}", server.name());
                 }
+                resources.unavailable.insert(server.name().to_owned());
                 loaded.readiness.push(McpServerReadiness {
                     server: server.name().to_owned(),
                     required: false,
@@ -94,6 +96,7 @@ pub async fn load_mcp_tools_from_config_with_capability_aliases(
                 continue;
             }
         };
+        let spec_count = specs.len();
         let mut local_names = HashSet::new();
         let before = loaded.tools.len();
         for spec in specs {
@@ -160,15 +163,44 @@ pub async fn load_mcp_tools_from_config_with_capability_aliases(
                 }));
             }
         }
+        let admitted_tool_count = loaded.tools.len() - before;
+        // Resource admission follows the allow/deny plane at server-namespace
+        // granularity: the sentinel `mcp__<server>__` matches the same
+        // `mcp__<server>__*` denies and namespace allows operators write, so
+        // the resource helpers cannot bypass the tool filter. Retention keeps
+        // servers with admitted tools and resource-only servers (zero declared
+        // tool specs) connected for the session; a server whose every tool was
+        // individually excluded keeps the pre-existing drop behavior.
+        let namespace = format!("mcp__{}__", server.name());
+        let namespace_permitted = filter.permits(&namespace);
+        if namespace_permitted && (admitted_tool_count > 0 || spec_count == 0) {
+            resources
+                .admitted
+                .insert(server.name().to_owned(), backend.clone());
+        } else if !namespace_permitted {
+            resources.excluded.insert(server.name().to_owned());
+        }
         loaded.readiness.push(McpServerReadiness {
             server: server.name().to_owned(),
             required: policy.required,
             status: "ready",
-            tool_count: loaded.tools.len() - before,
+            tool_count: admitted_tool_count,
             catalog: "fixed_for_session",
             remote_tool_timeout_ms: (!matches!(server, McpServerConfig::InProcess { .. }))
                 .then_some(policy.tool_timeout_ms),
         });
+    }
+    for tool in resources::resource_helper_tools(resources, filter) {
+        let name = tool.name().to_owned();
+        ensure!(
+            canonical_names.insert(name.clone()),
+            "MCP catalog has colliding canonical tool names"
+        );
+        ensure!(
+            javascript_names.insert(bro_code_mode::normalize_code_mode_identifier(&name)),
+            "MCP catalog has colliding JavaScript tool names"
+        );
+        loaded.tools.push(tool);
     }
     Ok(loaded)
 }
@@ -446,11 +478,17 @@ mod tests {
         let loaded = load_mcp_tools_from_config(&config, &ToolFilter::default())
             .await
             .unwrap();
-        assert_eq!(loaded.tools.len(), 2);
+        // Two server tools plus the three resource helpers admitted alongside
+        // the server's namespace.
+        assert_eq!(loaded.tools.len(), 5);
         assert!(loaded.tools[0].annotations().read_only);
         assert!(!loaded.tools[0].annotations().destructive);
         assert!(!loaded.tools[1].annotations().read_only);
         assert!(loaded.tools[1].annotations().destructive);
+        for helper in &loaded.tools[2..] {
+            assert!(helper.annotations().read_only);
+            assert!(!helper.annotations().destructive);
+        }
         assert!(loaded.tools[0].description().contains("Fixture title"));
         let output = loaded.tools[0].output_schema().unwrap();
         assert_eq!(
@@ -484,5 +522,27 @@ mod tests {
                 .tools
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn server_with_every_tool_excluded_keeps_preexisting_drop_behavior() {
+        // A server that declared tools but whose entire tool surface was
+        // excluded by policy keeps no resource admission: only servers with
+        // admitted tools or resource-only servers (zero declared specs) are
+        // retained for the helper surface.
+        let mut config = fixture(vec![spec("hidden")], false, false);
+        config.server_policies.insert(
+            "fixture".into(),
+            McpServerPolicy {
+                exclude_tools: vec!["hidden".into()],
+                ..Default::default()
+            },
+        );
+        let loaded = load_mcp_tools_from_config(&config, &ToolFilter::default())
+            .await
+            .unwrap();
+        assert!(loaded.tools.is_empty());
+        assert_eq!(loaded.readiness[0].status, "ready");
+        assert_eq!(loaded.readiness[0].tool_count, 0);
     }
 }

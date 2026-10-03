@@ -102,7 +102,7 @@ pub(crate) fn text_tokens(text: &str) -> u64 {
 /// decoded bytes less a fixed envelope, not the raw JSON length. Counting the
 /// raw bytes made long brodex sessions look 20 to 30 percent larger than the
 /// provider measured them.
-fn history_tokens(history: &Value) -> u64 {
+pub(crate) fn history_tokens(history: &Value) -> u64 {
     let Some(items) = history.as_array() else {
         return json_tokens(history);
     };
@@ -112,7 +112,12 @@ fn history_tokens(history: &Value) -> u64 {
         .fold(0u64, u64::saturating_add)
 }
 
-fn item_tokens(item: &Value) -> u64 {
+/// One native history or transport item in the shared accounting: encrypted
+/// reasoning and compaction payloads get codex's decoded-length discount,
+/// everything else is serialized bytes over four. Transport-side request
+/// fitting must use this same estimate so a history the loop considers inside
+/// the window is never rejected client-side for its raw JSON size.
+pub(crate) fn item_tokens(item: &Value) -> u64 {
     let encrypted = match item["type"].as_str() {
         Some("reasoning" | "compaction" | "compaction_summary") => {
             item["encrypted_content"].as_str()
@@ -133,7 +138,7 @@ fn encrypted_payload_tokens(encoded_len: usize) -> u64 {
         .div_ceil(4)
 }
 
-fn json_tokens(value: &Value) -> u64 {
+pub(crate) fn json_tokens(value: &Value) -> u64 {
     struct ByteCount(u64);
     impl std::io::Write for ByteCount {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -148,6 +153,34 @@ fn json_tokens(value: &Value) -> u64 {
     let mut count = ByteCount(0);
     serde_json::to_writer(&mut count, value).expect("JSON values serialize");
     count.0.div_ceil(4)
+}
+
+/// Estimated model-visible tokens for a rendered transport request body:
+/// native input items through the shared per-item history accounting
+/// (`item_tokens`, with the encrypted-payload discount), plus instructions,
+/// activated tool schemas, and a small framing allowance. The per-item
+/// history accounting is exactly what the loop's occupancy projections use;
+/// the overhead policy on top of it (instructions, schemas, framing) is this
+/// helper's own explicit choice, so callers comparing against loop estimates
+/// should count their overhead the same way. Deliberately excludes any
+/// output-token reservation; callers that must reserve output space do so
+/// explicitly.
+pub(crate) fn request_tokens(body: &Value) -> u64 {
+    let mut tokens = 16u64;
+    if let Some(input) = body.get("input").and_then(Value::as_array) {
+        for item in input {
+            tokens = tokens.saturating_add(item_tokens(item));
+        }
+    }
+    if let Some(instructions) = body.get("instructions").and_then(Value::as_str) {
+        tokens = tokens.saturating_add(text_tokens(instructions));
+    }
+    if let Some(tools) = body.get("tools").and_then(Value::as_array) {
+        for tool in tools {
+            tokens = tokens.saturating_add(json_tokens(tool)).saturating_add(4);
+        }
+    }
+    tokens
 }
 
 #[cfg(test)]
@@ -184,6 +217,32 @@ mod tests {
             history_tokens(&history),
             item_tokens(&history[0]) + item_tokens(&history[1])
         );
+    }
+
+    #[test]
+    fn request_tokens_shares_the_encrypted_discount_with_history_estimates() {
+        let body = json!({
+            "instructions": "x".repeat(4_000),
+            "tools": [{"type":"function", "name":"probe", "parameters":{"type":"object"}}],
+            "input": [
+                {"type":"reasoning", "encrypted_content":"A".repeat(80_000)},
+                {"type":"function_call_output", "call_id":"c", "output":"o".repeat(4_000)},
+                {"type":"compaction_trigger"}
+            ]
+        });
+        let tokens = request_tokens(&body);
+        // The encrypted payload is discounted to ~14.9K tokens, not the ~20K
+        // its raw JSON implies; every other part is counted at full length.
+        assert_eq!(
+            tokens,
+            16 + item_tokens(&body["input"][0])
+                + item_tokens(&body["input"][1])
+                + item_tokens(&body["input"][2])
+                + text_tokens(&body["instructions"].as_str().unwrap())
+                + json_tokens(&body["tools"][0])
+                + 4
+        );
+        assert!(tokens * 4 < serde_json::to_vec(&body).unwrap().len());
     }
 
     #[test]

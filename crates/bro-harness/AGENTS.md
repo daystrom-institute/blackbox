@@ -74,6 +74,12 @@ the daemon boundary contract is `design/bro-harness/harness-process-boundary.md`
   two differ by 3x on current models, so occupancy above 1.0 of the target is
   not a rejection. The table is the fallback; `BRO_HARNESS_COMPACTION_CONFIG`
   overrides both.
+- The catalog's effective usable window is the client fitting boundary. With
+  automatic compaction enabled, requests above that boundary require successful
+  compaction and a fresh estimate before inference, even during failure backoff.
+  Remote request fitting shares the encrypted-payload estimate with the loop,
+  trims only the trailing tool-output group on a copy, and stops once it fits.
+  Inline summarization reserves its own output budget separately.
 - The request-size estimate discounts encrypted reasoning and compaction
   payloads (decoded bytes less a fixed envelope, per codex); never count
   base64 as tokens.
@@ -97,6 +103,10 @@ the daemon boundary contract is `design/bro-harness/harness-process-boundary.md`
 - A smaller model is selected only after current context is accounted for and
   any required compaction succeeds using the previous model. Rejected controls
   still checkpoint cancellation outcomes and retain the previous selection.
+- Known, unequal catalog `comp_hash` values require previous-model compaction
+  independently of window size. Persist the hash with native history and check
+  it on resume, including an unchanged model name. Missing legacy hashes remain
+  unknown; unknown or equal hashes do not force compatibility compaction.
 
 - One `user_turn` = one model conversation turn, possibly many model steps
   (tool loop). Mid-turn operator inputs queue and are injected at the next
@@ -114,10 +124,17 @@ the daemon boundary contract is `design/bro-harness/harness-process-boundary.md`
 - Brodex compaction is server-side over the normal Responses stream (Codex
   `compact_remote_v2`): history plus a trailing `compaction_trigger` item,
   exactly one encrypted `compaction` item back, history rebuilt as the newest
-  user messages within the retained-token budget plus that item. There is no
-  unary compact endpoint any more; do not reintroduce one. A failed compaction
-  emits `compaction_failed` and the proactive trigger backs off exponentially;
-  it never fails the turn and never retries on every step.
+  user messages within the retained-token budget plus that item. Truncate the
+  boundary message's text to the remaining budget instead of dropping it.
+  ChatGPT OAuth must keep this streamed protocol. Public OpenAI API-key
+  compaction uses its separate standalone endpoint and retains the entire
+  returned window, including through normalization and resume. Unknown
+  compatible endpoints use inline summarization.
+- Compaction replaces history only after terminal success and structural
+  validation. Account observed compaction usage on success and failure without
+  treating it as measured inference occupancy. A failed compaction emits
+  `compaction_failed`; proactive failures below the usable boundary back off
+  exponentially. Failure to fit the usable boundary prevents inference.
 - Resume never refuses a snapshot for being behind its event log. The snapshot
   is the authority for model history; anything the log recorded after it
   (a cancelled or killed previous process) becomes a `CheckpointGap`: a
@@ -137,6 +154,11 @@ the daemon boundary contract is `design/bro-harness/harness-process-boundary.md`
   need schema details inside the search result itself. The ambient manifest is a
   bounded preview, not the full catalog — widening it reintroduces
   gap-a05b8afd's context noise.
+- MCP resource helpers use the session's admitted connections. Resource-only
+  servers remain connected; helper and server-namespace restrictions apply to
+  listing, template listing, and reading. Resource URIs are exact identities,
+  never display text to truncate. Bounded results disclose omissions and retain
+  usable continuation information when a listing spans multiple pages.
 
 ## Boundary invariants (compiler-enforced; don't negotiate)
 
@@ -174,6 +196,11 @@ the daemon boundary contract is `design/bro-harness/harness-process-boundary.md`
   WebSocket turns commit to `ResponsesState` only after a terminal event parses
   successfully; fallback full-replays from that pristine state. Do not add a
   second conversation buffer or commit partial WS state before parse success.
+- Server retry advice is a deadline shared across retries, transport fallback,
+  and later attempts. Cancelling a wait cannot clear an unexpired deadline.
+  Quota and policy failures remain terminal. Context-limit recovery requires a
+  rejection without output or provider effects; partial-turn observations must
+  remain terminal and observable.
 
 ## Cell bindings (`src/bindings/`)
 
