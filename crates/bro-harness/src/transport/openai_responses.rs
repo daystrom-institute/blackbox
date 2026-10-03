@@ -34,6 +34,10 @@ mod compaction;
 #[path = "openai_responses_retry_tests.rs"]
 mod retry_tests;
 
+#[cfg(test)]
+#[path = "openai_responses_lite_tests.rs"]
+mod lite_tests;
+
 /// Byte budget for one collected Responses stream. Turns stream deltas for a
 /// whole model step, so this stays generous while still bounding a runaway
 /// stream; remote compaction uses the tighter compaction budget below.
@@ -140,6 +144,29 @@ impl OpenAiResponsesTransport {
         remote_compaction_mode(&self.state.auth, &self.http_endpoint)
     }
 
+    /// Lite is a catalog capability of the ChatGPT backend, never an
+    /// assumption made for API-compatible endpoints.
+    fn responses_lite_for(&self, model: &str) -> bool {
+        matches!(self.state.auth, Auth::ChatGpt { .. })
+            && self
+                .catalog
+                .iter()
+                .any(|entry| entry.slug == model && entry.use_responses_lite)
+    }
+
+    fn apply_wire_headers(
+        &self,
+        rb: reqwest::RequestBuilder,
+        lite: bool,
+    ) -> reqwest::RequestBuilder {
+        let rb = self.apply_headers(rb);
+        if lite {
+            rb.header("x-openai-internal-codex-responses-lite", "true")
+        } else {
+            rb
+        }
+    }
+
     /// Attach the shared identity + auth headers plus HTTP-request specifics.
     fn apply_headers(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         self.apply_headers_accept(rb, "text/event-stream")
@@ -172,9 +199,10 @@ impl OpenAiResponsesTransport {
         &mut self,
         label: &str,
         body: &Value,
+        lite: bool,
     ) -> Result<reqwest::Response> {
         let resp = super::http::send_with_retry(label, || {
-            self.apply_headers(self.http.post(&self.http_endpoint))
+            self.apply_wire_headers(self.http.post(&self.http_endpoint), lite)
                 .json(body)
                 .send()
         })
@@ -194,7 +222,7 @@ impl OpenAiResponsesTransport {
             account_id: fresh.account_id,
         };
         super::http::send_with_retry(label, || {
-            self.apply_headers(self.http.post(&self.http_endpoint))
+            self.apply_wire_headers(self.http.post(&self.http_endpoint), lite)
                 .json(body)
                 .send()
         })
@@ -246,7 +274,11 @@ impl OpenAiResponsesTransport {
         'attempt: loop {
             attempt += 1;
             let resp = self
-                .send_with_auth_recovery("openai-responses", &body)
+                .send_with_auth_recovery(
+                    "openai-responses",
+                    &body,
+                    self.state.uses_responses_lite(),
+                )
                 .await?;
             let status = resp.status();
             if !status.is_success() {
@@ -431,7 +463,8 @@ impl OpenAiResponsesTransport {
         if self.state.input.len() < 2 {
             return Ok(None);
         }
-        let mut body = self.state.build_body(tools, opts);
+        let lite = self.responses_lite_for(&opts.model);
+        let mut body = self.state.preview_lite_body(tools, opts, lite)?;
         body["input"]
             .as_array_mut()
             .context("compaction request requires input array")?
@@ -450,7 +483,7 @@ impl OpenAiResponsesTransport {
         'attempt: loop {
             attempt += 1;
             let resp = self
-                .send_with_auth_recovery("openai-responses/compact", &body)
+                .send_with_auth_recovery("openai-responses/compact", &body, lite)
                 .await?;
             let status = resp.status();
             if !status.is_success() {
@@ -548,6 +581,7 @@ impl OpenAiResponsesTransport {
             rebuilt.push(summary_item);
             super::snapshot::validate_snapshot("openai-responses", &Value::Array(rebuilt.clone()))?;
             self.state.input = rebuilt;
+            self.state.reset_lite_baseline();
             // Locally rederived history: no provider-canonical prefix remains.
             self.state.protected_prefix = 0;
             self.state.normalize_for_prompt();
@@ -693,6 +727,7 @@ impl OpenAiResponsesTransport {
         super::snapshot::validate_snapshot("openai-responses", &snapshot)?;
         self.state.input = output;
         self.state.protected_prefix = output_len;
+        self.state.reset_lite_baseline();
         self.state.normalize_for_prompt();
         // The returned window no longer carries the persisted ambient manifest.
         self.state.ambient_hash = None;
@@ -711,18 +746,23 @@ impl Transport for OpenAiResponsesTransport {
 
     fn prepare_request_context(
         &mut self,
-        _tools: &[super::ToolSpec],
+        tools: &[super::ToolSpec],
         opts: &TurnOpts,
     ) -> Result<u64> {
+        let lite = self.responses_lite_for(&opts.model);
+        self.state.configure_responses_lite(lite);
+        let catalog_tokens = if lite {
+            self.state.sync_lite_catalog(tools, opts)?
+        } else {
+            0
+        };
         let before = self.state.input.len();
         self.state.sync_ambient(opts.system.ambient_text());
-        if self.state.input.len() == before {
-            return Ok(0);
-        }
-        Ok(self.state.input[before..]
+        let ambient_tokens = self.state.input[before..]
             .iter()
-            .map(|item| crate::context::budget::text_tokens(&item.to_string()))
-            .fold(0u64, u64::saturating_add))
+            .map(crate::context::budget::item_tokens)
+            .fold(0u64, u64::saturating_add);
+        Ok(catalog_tokens.saturating_add(ambient_tokens))
     }
 
     fn set_session_id(&mut self, id: String) {
@@ -761,7 +801,7 @@ impl Transport for OpenAiResponsesTransport {
         // Persist the ambient manifest into the buffer when it changed —
         // before either the WS or HTTP path builds its request from
         // `state.input`. Hash-gated: a no-op on the vast majority of turns.
-        self.state.sync_ambient(opts.system.ambient_text());
+        self.prepare_request_context(tools, opts)?;
         if let Some(ws) = self.ws.as_mut() {
             match ws.run(&mut self.state, tools, opts, sink).await {
                 WsOutcome::Done(out) => return Ok(out),
@@ -858,6 +898,7 @@ impl Transport for OpenAiResponsesTransport {
         }));
         rebuilt.extend_from_slice(&self.state.input[split..]);
         self.state.input = rebuilt;
+        self.state.reset_lite_baseline();
         // Locally rederived history: no provider-canonical prefix remains.
         self.state.protected_prefix = 0;
         // The rebuilt buffer no longer carries the persisted ambient manifest;
