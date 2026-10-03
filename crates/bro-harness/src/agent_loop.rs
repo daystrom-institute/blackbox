@@ -442,6 +442,25 @@ enum SessionControl {
     SetModel(String),
 }
 
+/// codex `comp_hash_changed`: both sides publish a compaction compatibility
+/// hash and they differ. A missing hash on either side carries no signal, so
+/// same-hash, unknown-next, and unknown-previous transitions never force
+/// compaction on compatibility grounds.
+fn comp_hash_incompatible(previous: Option<&str>, next: Option<&str>) -> bool {
+    previous
+        .zip(next)
+        .is_some_and(|(previous, next)| previous != next)
+}
+
+/// Tolerant side-cell decode for the persisted compaction-compatibility
+/// hash: absent (legacy snapshots), null, or non-string values decode to
+/// `None` (unknown), which never forces a transition compaction.
+fn restore_model_comp_hash(side: &Value) -> Option<String> {
+    side.get("model_comp_hash")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
 fn restore_pending_user_inputs(side: &Value) -> Result<VecDeque<String>> {
     let Some(value) = side.get("pending_user_inputs") else {
         return Ok(VecDeque::new());
@@ -793,6 +812,12 @@ struct ResolvedWindow {
     context_window: Option<u64>,
     compact_threshold: Option<u64>,
     max_context_window: Option<u64>,
+    /// Codex `usable_context_window`: the share of the target window inputs
+    /// may occupy (catalog `effective_context_window_percent`, default 95).
+    /// A hard safety boundary above the auto-compaction threshold, never a
+    /// replacement for it. For the fallback table the window itself is the
+    /// boundary: that number is already the client-managed target.
+    usable_window: Option<u64>,
 }
 
 /// The transport's backend catalog wins when it knows the model: codex's own
@@ -816,12 +841,14 @@ fn resolve_window(
                 .then(|| limits.auto_compact_limit())
                 .flatten(),
             max_context_window: limits.max_context_window,
+            usable_window: limits.usable_context_window(),
         };
     }
     ResolvedWindow {
         context_window: policy.context_window(model),
         compact_threshold: policy.threshold(model),
         max_context_window: None,
+        usable_window: policy.context_window(model),
     }
 }
 
@@ -879,6 +906,21 @@ struct Session {
     /// The backend's hard ceiling for the current model, when its catalog
     /// publishes one; `context_window` is the target the loop manages to.
     max_context_window: Option<u64>,
+    /// The hard input-fitting boundary for the current model (catalog
+    /// `effective_context_window_percent` of the target, default 95; the
+    /// table's own window on fallback). The proactive trigger stays the
+    /// auto-compaction threshold; this boundary catches projections that
+    /// would not fit the usable window at all.
+    usable_window: Option<u64>,
+    /// Compaction-compatibility hash of the model family the current native
+    /// history is produced under (catalog `comp_hash`), mirroring codex's
+    /// previous-turn-settings comparison. Persisted in the side cell
+    /// `model_comp_hash` so a resumed process compares the hash the history
+    /// was actually produced under, not a freshly fetched catalog entry.
+    /// Tracks the selected model's hash, known or unknown: a stale `Some`
+    /// from an older family must not outlive a selection under a model with
+    /// an unknown hash. `None` never forces a transition compaction.
+    model_comp_hash: Option<String>,
     /// Ordinary tool-result output limit in bytes (0 disables the limit).
     tool_result_cap: usize,
     store: SessionStore,
@@ -1438,6 +1480,16 @@ impl Session {
         let compact_threshold = window.compact_threshold;
         let context_window = window.context_window;
         let max_context_window = window.max_context_window;
+        let usable_window = window.usable_window;
+        // Fresh sessions track the initial model's catalog hash. Resumed
+        // sessions keep the persisted hash the history was actually produced
+        // under; a legacy snapshot without the cell decodes to unknown.
+        let model_comp_hash = if restored_snapshot {
+            restore_model_comp_hash(&prior_side)
+        } else {
+            tx.model_limits(&base_opts.model)
+                .and_then(|limits| limits.comp_hash)
+        };
 
         // Timestamp the session boundary in the sidecar log. Daemon-launched
         // workers receive the dispatch provider through
@@ -1515,6 +1567,8 @@ impl Session {
             compact_threshold,
             context_window,
             max_context_window,
+            usable_window,
+            model_comp_hash,
             tool_result_cap,
             strategy,
             dispatch,
@@ -1535,9 +1589,7 @@ impl Session {
             tail_nudge: None,
             output_schema,
         };
-        if let Some(previous_model) = restored_model
-            && previous_model != session.base_opts.model
-        {
+        if let Some(previous_model) = restored_model {
             let requested_model = session.base_opts.model.clone();
             session.base_opts.model = previous_model;
             let window = resolve_window(
@@ -1548,6 +1600,11 @@ impl Session {
             session.context_window = window.context_window;
             session.compact_threshold = window.compact_threshold;
             session.max_context_window = window.max_context_window;
+            session.usable_window = window.usable_window;
+            // The transition guard runs even when the requested model is the
+            // same slug: a catalog that rotated the model's compaction
+            // compatibility hash makes the persisted encrypted history
+            // unreadable just like a model change would.
             let transition = session.apply_control(&requested_model).await;
             // Startup compaction and cancellation observations must share the
             // checkpoint even if changing models is rejected.
@@ -1575,15 +1632,34 @@ impl Session {
         self.seq_counter.clone()
     }
 
-    /// Fit history with the previous model before committing a smaller model.
+    /// Fit history with the previous model before committing a model change.
+    /// Two independent forces require the previous-model compaction: a
+    /// shrinking window whose retained history would not fit, and a changed
+    /// compaction-compatibility hash, where the destination model cannot read
+    /// the previous family's encrypted reasoning and compaction items. The
+    /// hash guard also covers a resumed session on the same slug whose
+    /// catalog rotated the hash underneath the persisted history. Same hash
+    /// or unknown hashes (either side) never force compaction on their own.
+    /// A failed compaction or an unfittable result rejects the change with
+    /// the previous model, history, and budget checkpoint retained.
     async fn apply_control(&mut self, model: &str) -> Result<()> {
         let next = resolve_window(self.tx.as_ref(), &self.compaction, model);
         let next_window = next.context_window;
         let next_threshold = next.compact_threshold;
-        if model != self.base_opts.model
-            && let (Some(previous_window), Some(window)) = (self.context_window, next_window)
-            && previous_window > window
-        {
+        // The catalog hash comes straight from the transport: an operator
+        // compaction-config override replaces windows, not compatibility.
+        let next_comp_hash = self
+            .tx
+            .model_limits(model)
+            .and_then(|limits| limits.comp_hash);
+        let comp_hash_incompatible =
+            comp_hash_incompatible(self.model_comp_hash.as_deref(), next_comp_hash.as_deref());
+        let window_shrinks = model != self.base_opts.model
+            && matches!(
+                (self.context_window, next_window),
+                (Some(previous_window), Some(window)) if previous_window > window
+            );
+        if window_shrinks || comp_hash_incompatible {
             self.reg.validate_resume_tool_schemas()?;
             self.deliver_instruction_context().await?;
             self.prepare_context_for_user_turn();
@@ -1599,15 +1675,23 @@ impl Session {
             let added = self.tx.prepare_request_context(&opts);
             self.pending_input_estimate = self.pending_input_estimate.saturating_add(added);
             let projected = self.projected_request_tokens(&tools, &opts);
-            let limit = next_threshold
-                .unwrap_or(window)
-                .min(window.saturating_sub(u64::from(opts.max_tokens)));
-            if projected > limit {
+            let downshift_limit = next_window.map(|window| {
+                next_threshold
+                    .unwrap_or(window)
+                    .min(window.saturating_sub(u64::from(opts.max_tokens)))
+            });
+            // A differing compaction hash always recompacts, at any size; a
+            // window shrink only when the retained history would not fit.
+            if comp_hash_incompatible || projected > downshift_limit.unwrap_or(u64::MAX) {
                 self.drain_cancelled_work().await;
                 // Cancellation can add durable outcome observations to history.
                 let projected = self.projected_request_tokens(&tools, &opts);
-                self.event_log.append_milestone("compaction_start", self.emitter.session_id(),
-                    json!({"reason":"model_change", "from":self.base_opts.model, "to":model, "projected_tokens":projected}));
+                self.event_log.append_milestone(
+                    "compaction_start",
+                    self.emitter.session_id(),
+                    json!({"reason":"model_change", "comp_hash_changed":comp_hash_incompatible,
+                           "from":self.base_opts.model, "to":model, "projected_tokens":projected}),
+                );
                 let summary = self
                     .tx
                     .compact(
@@ -1617,8 +1701,8 @@ impl Session {
                         &opts,
                     )
                     .await
-                    .context("compact with previous model before downshift")?
-                    .context("history cannot be compacted before model downshift")?;
+                    .context("compact with previous model before model change")?
+                    .context("history cannot be compacted before model change")?;
                 self.emitter
                     .compact_boundary("model_change", projected, summary.len());
                 self.reset_compaction_context();
@@ -1635,10 +1719,24 @@ impl Session {
                 };
                 let added = self.tx.prepare_request_context(&destination_opts);
                 self.pending_input_estimate = self.pending_input_estimate.saturating_add(added);
-                anyhow::ensure!(
-                    self.projected_request_tokens(&tools, &destination_opts) <= limit,
-                    "compacted history still exceeds destination model budget; previous model retained"
-                );
+                let projected = self.projected_request_tokens(&tools, &destination_opts);
+                if window_shrinks {
+                    // Downshift: the destination budget keeps its historic
+                    // threshold-derived rejection.
+                    anyhow::ensure!(
+                        downshift_limit.is_none_or(|limit| projected <= limit),
+                        "compacted history still exceeds destination model budget; previous model retained"
+                    );
+                } else {
+                    // Hash-only transition at an equal or larger window: the
+                    // proactive threshold is a compaction trigger, not a fit
+                    // boundary. Only the usable window (catalog effective
+                    // percent) may reject here.
+                    anyhow::ensure!(
+                        next.usable_window.is_none_or(|usable| projected <= usable),
+                        "compacted history still exceeds the destination model's usable window; previous model retained"
+                    );
+                }
             }
         }
         if model != self.base_opts.model {
@@ -1648,10 +1746,20 @@ impl Session {
             self.pending_input_estimate = 0;
             self.last_request_overhead_tokens = 0;
         }
+        // The tracked hash always describes the model the history is next
+        // produced under, known or unknown, mirroring codex's
+        // previous-turn-settings comparison. A stale `Some` from an older
+        // family must not survive a completed selection under a model whose
+        // hash is unknown, or a later move to a third family would compare
+        // against a hash that no longer describes any retained item's
+        // producer. Rejected transitions return before this point, so a
+        // refused change keeps the previous model's hash.
+        self.model_comp_hash = next_comp_hash;
         self.base_opts.model = model.to_owned();
         self.compact_threshold = next_threshold;
         self.context_window = next_window;
         self.max_context_window = next.max_context_window;
+        self.usable_window = next.usable_window;
         tracing::info!(model, "set_model");
         Ok(())
     }
@@ -1835,6 +1943,10 @@ impl Session {
             // the whole turn instead of self-healing.
             let mut overflow_compacted = false;
             let mut proactive_checked = false;
+            // One hard-safety compaction per turn for the usable-window
+            // boundary; a second refusal would just re-send the same
+            // oversized estimate.
+            let mut usable_compacted = false;
             let out = 'attempt: loop {
                 self.deliver_instruction_context().await?;
                 if pending_prompt.is_some() || self.reference_context_item.is_none() {
@@ -1898,10 +2010,14 @@ impl Session {
                     });
                 if !proactive_checked {
                     proactive_checked = true;
-                    if self
+                    // The auto-compaction threshold (catalog 90 percent,
+                    // table ratio) stays the proactive trigger, failure
+                    // backoff included: below the usable window a missed
+                    // trigger is recoverable by the reactive overflow path.
+                    let over_threshold = self
                         .compact_threshold
-                        .is_some_and(|threshold| projected > threshold)
-                    {
+                        .is_some_and(|threshold| projected > threshold);
+                    if over_threshold {
                         if self.turns < self.compaction_retry_after_turn {
                             tracing::debug!(
                                 retry_after_turn = self.compaction_retry_after_turn,
@@ -1932,6 +2048,63 @@ impl Session {
                                 Ok(None) => {}
                                 Err(error) => self.note_compaction_failure("auto", &error),
                             }
+                        }
+                    }
+                }
+                // The usable window (catalog effective percent, default 95;
+                // the table's own window on fallback) is a hard fitting
+                // boundary checked on every attempt, and it does not obey the
+                // failure backoff: an inference whose estimate cannot fit the
+                // request is never sent. When the safety compaction fails,
+                // finds nothing compactible, or leaves the estimate over the
+                // boundary, the turn fails with the source history preserved
+                // instead of re-sending the same oversized request.
+                if self.compaction.enabled()
+                    && self.usable_window.is_some_and(|usable| projected > usable)
+                {
+                    if usable_compacted {
+                        anyhow::bail!(
+                            "projected request still exceeds the model's usable context window \
+                             ({} tokens over) after compaction; refusing to send, history preserved",
+                            projected.saturating_sub(self.usable_window.unwrap_or_default())
+                        );
+                    }
+                    usable_compacted = true;
+                    self.event_log.append_milestone(
+                        "compaction_start",
+                        self.emitter.session_id(),
+                        json!({"reason":"auto", "usable_boundary":true,
+                               "projected_tokens":projected}),
+                    );
+                    match self
+                        .tx
+                        .compact(
+                            self.compaction.params(),
+                            crate::compaction::COMPACTION_INSTRUCTION,
+                            &tool_specs,
+                            &opts,
+                        )
+                        .await
+                    {
+                        Ok(Some(summary)) => {
+                            self.emitter
+                                .compact_boundary("auto", projected, summary.len());
+                            self.reset_compaction_context();
+                            // Re-estimate against the rebuilt history; still
+                            // over the boundary and the turn fails above.
+                            continue 'attempt;
+                        }
+                        Ok(None) => anyhow::bail!(
+                            "projected request exceeds the model's usable context window and \
+                             there is nothing compactible; refusing to send, history preserved"
+                        ),
+                        Err(error) => {
+                            self.note_compaction_failure("auto", &error);
+                            anyhow::bail!(
+                                "projected request exceeds the model's usable context window \
+                                 and the safety compaction failed; refusing to send, history \
+                                 preserved: {error:#}"
+                            );
                         }
                     }
                 }
@@ -1998,7 +2171,7 @@ impl Session {
                                 self.reset_compaction_context();
                             }
                             // Nothing compactible, or compaction itself failed:
-                            // a retry would just re-overflow — surface the
+                            // a retry would just re-overflow: surface the
                             // original error.
                             Ok(None) => return Err(e),
                             Err(ce) => {
@@ -2949,6 +3122,10 @@ impl Session {
         };
         side["context_budget"] =
             serde_json::to_value(self.budget_checkpoint()).expect("budget checkpoint serializes");
+        side["model_comp_hash"] = match &self.model_comp_hash {
+            Some(hash) => json!(hash),
+            None => Value::Null,
+        };
         side["pending_user_inputs"] = json!(self.pending_user_inputs);
         side["todos"] = self
             .todos
@@ -3453,12 +3630,14 @@ mod tests {
         compact_block: Arc<std::sync::atomic::AtomicBool>,
         compact_gate: Arc<Notify>,
         compact_fail: Arc<std::sync::atomic::AtomicBool>,
+        /// When set, `compact` reports nothing compactible instead of failing.
+        compact_noop: Arc<std::sync::atomic::AtomicBool>,
         model_limits: Arc<Mutex<Option<transport::ModelLimits>>>,
         model_gate: Arc<Notify>,
         tool_started: Arc<AtomicUsize>,
         tool_gate: Arc<Notify>,
         /// Count of read-only probe calls that rendezvoused at the shared
-        /// barrier — only reaches 2 if the batch ran concurrently (phase 1).
+        /// barrier. Only reaches 2 if the batch ran concurrently (phase 1).
         rendezvous: Arc<AtomicUsize>,
         /// SystemPrompt observed by each run_turn call, for slot-routing
         /// assertions (volatile-lane ordering, stable composition).
@@ -3688,6 +3867,9 @@ mod tests {
                 !self.shared.compact_fail.load(Ordering::SeqCst),
                 "synthetic compaction failure"
             );
+            if self.shared.compact_noop.load(Ordering::SeqCst) {
+                return Ok(None);
+            }
             Ok(Some("summary".into()))
         }
     }
@@ -4226,6 +4408,8 @@ mod tests {
             compact_threshold: None,
             context_window: None,
             max_context_window: None,
+            usable_window: None,
+            model_comp_hash: None,
             tool_result_cap: 0,
             store: store.unwrap_or_else(SessionStore::temporary_for_test),
             event_log: Arc::new(EventLog::disabled()),
@@ -7367,17 +7551,21 @@ mod tests {
         assert_eq!(table.context_window, Some(272_000));
         assert_eq!(table.compact_threshold, Some(204_000));
         assert_eq!(table.max_context_window, None);
+        // Fallback arm: the table's window is itself the usable boundary.
+        assert_eq!(table.usable_window, Some(272_000));
         *shared.model_limits.lock().unwrap() = Some(transport::ModelLimits {
             slug: "gpt-6-astra".into(),
             context_window: Some(272_000),
             max_context_window: Some(872_000),
             auto_compact_token_limit: None,
             effective_context_window_percent: 95,
+            comp_hash: None,
         });
         let catalog = resolve_window(session.tx.as_ref(), &session.compaction, "gpt-6-astra");
         assert_eq!(catalog.context_window, Some(272_000));
         assert_eq!(catalog.compact_threshold, Some(244_800));
         assert_eq!(catalog.max_context_window, Some(872_000));
+        assert_eq!(catalog.usable_window, Some(258_400));
         // A model the catalog does not name still resolves from the table.
         let other = resolve_window(session.tx.as_ref(), &session.compaction, "gpt-5.5");
         assert_eq!(other, table);
