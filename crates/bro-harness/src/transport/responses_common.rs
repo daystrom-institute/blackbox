@@ -1394,8 +1394,8 @@ mod tests {
         s
     }
 
-    fn advice(delay: std::time::Duration) -> super::http::RetryAfter {
-        super::http::RetryAfter::from_delay(delay).expect("valid advice")
+    fn advice(delay: std::time::Duration) -> crate::transport::http::RetryAfter {
+        crate::transport::http::RetryAfter::from_delay(delay).expect("valid advice")
     }
 
     #[test]
