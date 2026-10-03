@@ -1056,6 +1056,7 @@ impl Drop for StagedUserInputs {
 /// and stops its queue watcher once the step's tool dispatch has drained (or
 /// the turn unwinds through an error, interrupt, or break).
 struct StepPreemptionGuard {
+    token: tokio_util::sync::CancellationToken,
     session: Option<crate::code_mode::CodeModeToolSession>,
     watcher: tokio::task::JoinHandle<()>,
 }
@@ -1947,7 +1948,20 @@ impl Session {
         cancel: watch::Receiver<bool>,
         mid_turn_inputs: MidTurnInputs,
     ) -> Result<()> {
-        let result = self.user_turn_inner(prompt, cancel, mid_turn_inputs).await;
+        let mut pending_prompt = Some(prompt);
+        let result = self
+            .user_turn_inner(prompt, cancel, mid_turn_inputs, &mut pending_prompt)
+            .await;
+        // An error before the sampling boundary must still preserve accepted input.
+        if let Some(prompt) = pending_prompt.take() {
+            self.prepare_context_for_user_turn();
+            self.event_log.append_event(&json!({
+                "type":"user", "session_id":self.session_id(),
+                "message":{"role":"user", "content":[{"type":"text", "text":prompt}]},
+            }));
+            self.append_user_text_raw(prompt);
+        }
+        self.tx.set_step_preemption(None);
         if let Err(error) = &result {
             self.drain_cancelled_work().await;
             if let Some(observation) = error.downcast_ref::<transport::FailedTurnObservation>() {
@@ -1965,10 +1979,10 @@ impl Session {
         prompt: &str,
         mut cancel: watch::Receiver<bool>,
         mid_turn_inputs: MidTurnInputs,
+        pending_prompt: &mut Option<&str>,
     ) -> Result<()> {
         self.reg.validate_resume_tool_schemas()?;
         self.cx.cancellation = tokio_util::sync::CancellationToken::new();
-        let mut pending_prompt = Some(prompt);
         let mut staged_inputs = StagedUserInputs {
             inputs: VecDeque::new(),
             source: mid_turn_inputs.clone(),
@@ -2210,6 +2224,8 @@ impl Session {
                 // mid-response, instead of holding the response hostage to
                 // their yield windows. A compaction retry re-arms fresh.
                 self.rearm_step_preemption(&mut step_preempt, &mid_turn_inputs);
+                self.tx
+                    .set_step_preemption(step_preempt.as_ref().map(|guard| guard.token.clone()));
                 let r = tokio::select! {
                     biased;
                     _ = cancel.changed() => {
@@ -2217,6 +2233,7 @@ impl Session {
                     }
                     r = self.tx.run_turn(&tool_specs, &opts, &self.emitter) => r,
                 };
+                self.tx.set_step_preemption(None);
                 match r {
                     Ok(out) => break 'attempt out,
                     Err(e)
@@ -2842,18 +2859,19 @@ impl Session {
         *slot = self.arm_step_preemption(inputs);
     }
 
-    /// Local addition: arm one sampling request's code-mode preemption signal
-    /// and start its queue watcher. Returns `None` when code mode is off (no
-    /// exec/wait calls exist to preempt). Dropping the guard disarms the
-    /// signal and stops the watcher, so an old cancellation cannot preempt a
-    /// later step's observations.
+    /// Arm one sampling request and its code-mode calls with the same input
+    /// signal. The watcher also runs without code mode so inference can yield.
+    /// Dropping the guard disarms code-mode observations and stops the watcher.
     fn arm_step_preemption(&self, inputs: &MidTurnInputs) -> Option<StepPreemptionGuard> {
-        let session = self.code_mode_session.clone()?;
+        let session = self.code_mode_session.clone();
         let preempt = tokio_util::sync::CancellationToken::new();
-        session.set_step_preemption(Some(preempt.clone()));
-        let watcher = tokio::spawn(watch_mid_turn_inputs(inputs.clone(), preempt));
+        if let Some(session) = &session {
+            session.set_step_preemption(Some(preempt.clone()));
+        }
+        let watcher = tokio::spawn(watch_mid_turn_inputs(inputs.clone(), preempt.clone()));
         Some(StepPreemptionGuard {
-            session: Some(session),
+            token: preempt,
+            session,
             watcher,
         })
     }
@@ -3609,6 +3627,7 @@ fn env_u64(key: &str) -> Option<u64> {
 mod tests {
     mod budget;
     mod compaction_usage;
+    mod inference_preemption;
     use super::*;
 
     #[test]
@@ -3710,6 +3729,7 @@ mod tests {
         Terminal(StopReason, String, Vec<transport::ToolCall>),
         HighUsageFollowUp,
         ContextOverflow,
+        AwaitPreemption,
         Failure,
         /// Return text immediately with a Responses-style follow-up signal.
         TextWithEndTurn(String, Option<bool>),
@@ -3736,6 +3756,7 @@ mod tests {
         completed: Arc<AtomicUsize>,
         compact_calls: Arc<AtomicUsize>,
         compact_usage: Arc<Mutex<Usage>>,
+        inference_preemption: Arc<Mutex<Option<tokio_util::sync::CancellationToken>>>,
         compact_block: Arc<std::sync::atomic::AtomicBool>,
         compact_gate: Arc<Notify>,
         compact_fail: Arc<std::sync::atomic::AtomicBool>,
@@ -3777,6 +3798,9 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(results);
+        }
+        fn set_step_preemption(&mut self, token: Option<tokio_util::sync::CancellationToken>) {
+            *self.shared.inference_preemption.lock().unwrap() = token;
         }
         async fn run_turn(
             &mut self,
@@ -3826,6 +3850,25 @@ mod tests {
                         ..Usage::default()
                     },
                 }),
+                MockTurn::AwaitPreemption => {
+                    let token = self
+                        .shared
+                        .inference_preemption
+                        .lock()
+                        .unwrap()
+                        .clone()
+                        .expect("armed inference");
+                    token.cancelled().await;
+                    Ok(transport::TurnOutput {
+                        observation_content: None,
+                        text: "retained partial reply".into(),
+                        thinking: String::new(),
+                        tool_calls: vec![],
+                        stop: StopReason::Done,
+                        end_turn: Some(false),
+                        usage: Usage::default(),
+                    })
+                }
                 MockTurn::Failure => anyhow::bail!("synthetic provider failure"),
                 MockTurn::Block => {
                     self.shared.model_gate.notified().await;

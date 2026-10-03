@@ -541,6 +541,17 @@ pub trait Transport: Send {
         Usage::default()
     }
 
+    /// Arm or disarm the queued-input preemption signal for the next sampling
+    /// step. The loop arms the same token it gives code-mode exec/wait
+    /// observation, immediately before `run_turn`; user input queued mid-step
+    /// cancels it. A preemptible transport ends the current sampling
+    /// observation promptly, preserves admitted output/effects and usage
+    /// exactly once, and returns a follow-up observation (`end_turn == false`)
+    /// rather than dispatching a blanket replay. Transports without a
+    /// preemptible wire keep the default no-op. Disarming (`None`) clears any
+    /// stored token so a spent signal never preempts a later request.
+    fn set_step_preemption(&mut self, _preempt: Option<tokio_util::sync::CancellationToken>) {}
+
     /// Drain usage accumulated by compaction requests. Compaction
     /// is not a `run_turn`, so its tokens never appear in a turn result, yet
     /// they were spent whether or not the compacted envelope validated. The

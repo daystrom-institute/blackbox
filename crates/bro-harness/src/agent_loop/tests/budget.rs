@@ -393,6 +393,7 @@ async fn failed_downshift_keeps_previous_model_history_and_budget_checkpoint() {
     session.pending_input_estimate = 20_000;
     session.last_request_overhead_tokens = 500;
     session.tx.push_user_text("DURABLE_PREVIOUS_HISTORY");
+    session.prepare_context_for_user_turn();
     let before = session.tx.snapshot();
     fail.store(true, Ordering::SeqCst);
     assert!(session.apply_control("gpt-5.5").await.is_err());
@@ -703,6 +704,7 @@ async fn changed_comp_hash_transition_failure_keeps_previous_model_and_history()
     session.usable_window = Some(380_000);
     session.model_comp_hash = Some("family-a".into());
     session.tx.push_user_text("DURABLE_PREVIOUS_HISTORY");
+    session.prepare_context_for_user_turn();
     let before = session.tx.snapshot();
     fail.store(true, Ordering::SeqCst);
     let error = session.apply_control("family-b-model").await.unwrap_err();
@@ -795,6 +797,11 @@ async fn usable_window_refusal_never_sends_the_oversized_request() {
         session.tx.restore(json!({"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"legacy ".repeat(30_000)}]}]}));
         session.usable_window = Some(5_000);
         fail.store(true, Ordering::SeqCst);
+        let log_dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(EventLog::at_path(log_dir.path().join("events.jsonl")));
+        session.event_log = log.clone();
+        session.emitter = Emitter::new("budget-failure".into()).with_event_log(log.clone());
+        session.prepare_context_for_user_turn();
         let before = session.tx.snapshot();
         let (_cancel_tx, cancel_rx) = watch::channel(false);
         let error = session
@@ -805,7 +812,26 @@ async fn usable_window_refusal_never_sends_the_oversized_request() {
             format!("{error:#}").contains("usable context window"),
             "{error:#}"
         );
-        assert_eq!(session.tx.snapshot(), before);
+        let after = session.tx.snapshot();
+        let previous = before["input"].as_array().unwrap();
+        let retained = after["input"].as_array().unwrap();
+        assert_eq!(&retained[..previous.len()], previous.as_slice());
+        assert_eq!(retained.len(), previous.len() + 1);
+        assert_eq!(retained.last().unwrap()["content"][0]["text"], "task");
+        let rows: Vec<Value> = std::fs::read_to_string(log.path())
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let user_events: Vec<_> = rows
+            .iter()
+            .filter(|row| row["event"]["type"] == "user")
+            .collect();
+        assert_eq!(user_events.len(), 1);
+        assert_eq!(
+            user_events[0]["event"]["message"]["content"][0]["text"],
+            "task"
+        );
         let events = boundaries.lock().unwrap();
         assert_eq!(
             events.iter().map(|event| event.kind).collect::<Vec<_>>(),
