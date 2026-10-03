@@ -13,8 +13,10 @@ use anyhow::{Context, Result};
 use bro_protocol::SERVICE_TIER_DEFAULT;
 use serde_json::{Value, json};
 use std::collections::HashSet;
+use uuid::Uuid;
 
 /// Auth material for a Responses request.
+#[derive(Clone)]
 pub(super) enum Auth {
     /// Standard OpenAI: `Authorization: Bearer <key>`.
     ApiKey(String),
@@ -28,6 +30,11 @@ pub(super) enum Auth {
 /// The conversation + identity state shared by the HTTP-SSE and WebSocket
 /// Responses transports. Owning this in one place lets the routing transport
 /// keep a single buffer across a WS→HTTP fallback (no two-buffer divergence).
+///
+/// `Clone` backs transactional previews: a compaction request prepares a
+/// copy, syncs its Lite catalog, and builds the body there, while the
+/// authoritative state (and its baseline) changes only on success.
+#[derive(Clone)]
 pub(super) struct ResponsesState {
     pub auth: Auth,
     /// Stable per-session id (codex `session-id` header + `prompt_cache_key`).
@@ -65,6 +72,15 @@ pub(super) struct ResponsesState {
     /// accumulates it on every observed terminal and the loop drains it via
     /// [`Transport::take_compaction_usage`] after `compact()` returns.
     compaction_usage: super::Usage,
+    /// Responses Lite capability for the active model (catalog
+    /// `use_responses_lite`). Switching it never rewrites authoritative
+    /// history: the normal wire filters Lite-only items per request.
+    pub responses_lite: bool,
+    /// Incremental tool-catalog baseline. `None` is absent (next sync
+    /// renders the full catalog); a restored baseline survives only while
+    /// its item chain stays retained. Compaction resets it via
+    /// [`Self::reset_lite_baseline`].
+    lite_baseline: Option<super::responses_lite::CatalogBaseline>,
 }
 
 impl ResponsesState {
@@ -79,6 +95,8 @@ impl ResponsesState {
             protected_prefix: 0,
             pending_retry_after: None,
             compaction_usage: super::Usage::default(),
+            responses_lite: false,
+            lite_baseline: None,
         }
     }
 
@@ -127,6 +145,93 @@ impl ResponsesState {
     /// Drain accumulated remote-compaction usage (resets the accumulator).
     pub(super) fn take_compaction_usage(&mut self) -> super::Usage {
         std::mem::take(&mut self.compaction_usage)
+    }
+
+    /// Enable or disable the Responses Lite request shape for this session.
+    /// Toggling never mutates authoritative history: Lite-only items stay in
+    /// the buffer and the ordinary wire filters them per request.
+    pub(super) fn configure_responses_lite(&mut self, enabled: bool) {
+        self.responses_lite = enabled;
+    }
+
+    /// Whether the active session speaks the Responses Lite shape (WS code
+    /// gates its Lite header and interrupt protocol on this).
+    pub(super) fn uses_responses_lite(&self) -> bool {
+        self.responses_lite
+    }
+
+    /// Drop the incremental catalog baseline so the next sync re-renders the
+    /// full catalog. Compaction (which rebuilds history) must reset it.
+    pub(super) fn reset_lite_baseline(&mut self) {
+        self.lite_baseline = None;
+    }
+
+    /// Sync the Lite tool catalog into authoritative history and return the
+    /// newly added estimate. The initial full render enters as a stable
+    /// prefix before the first user item (never inside the protected
+    /// prefix); later deltas append here, at the sampling boundary. The
+    /// baseline is committed in the same step as the insertion: an uncoupled
+    /// or cap-length chain re-renders the full catalog first.
+    pub(super) fn sync_lite_catalog(&mut self, tools: &[ToolSpec], opts: &TurnOpts) -> Result<u64> {
+        let declarations = lite_tool_declarations(tools, opts);
+        let catalog = super::responses_lite::LiteToolCatalog::new(&declarations)?;
+        let previous = match &self.lite_baseline {
+            Some(baseline)
+                if baseline.chain_len() < super::responses_lite::MAX_CHAIN_LINKS
+                    && baseline.is_coupled_to(&self.input) =>
+            {
+                super::responses_lite::PreviousCatalogState::Known(baseline)
+            }
+            Some(_) => super::responses_lite::PreviousCatalogState::Unknown,
+            None => super::responses_lite::PreviousCatalogState::Absent,
+        };
+        let full_render = !matches!(
+            previous,
+            super::responses_lite::PreviousCatalogState::Known(_)
+        );
+        let transition = catalog.render_diff(previous, &self.session_id);
+        let mut added_tokens = 0u64;
+        for item in &transition.items {
+            added_tokens = added_tokens.saturating_add(crate::context::budget::item_tokens(item));
+        }
+        if full_render && !transition.items.is_empty() {
+            // Stable prefix: before the first user item, and never inside the
+            // provider-canonical protected prefix.
+            let position = self
+                .input
+                .iter()
+                .position(|item| {
+                    item["type"].as_str().is_none_or(|kind| kind == "message")
+                        && item["role"].as_str() == Some("user")
+                })
+                .unwrap_or(self.input.len())
+                .max(self.protected_prefix);
+            for (offset, item) in transition.items.into_iter().enumerate() {
+                self.input.insert(position + offset, item);
+            }
+        } else {
+            self.input.extend(transition.items);
+        }
+        self.lite_baseline = Some(transition.baseline);
+        Ok(added_tokens)
+    }
+
+    /// Build a compaction request against a throwaway copy of this state:
+    /// the copy syncs its Lite catalog and builds the body, while the
+    /// authoritative buffer and baseline change only on success (the caller
+    /// then resets the baseline and re-syncs against the rebuilt history).
+    pub(super) fn preview_lite_body(
+        &self,
+        tools: &[ToolSpec],
+        opts: &TurnOpts,
+        enabled: bool,
+    ) -> Result<Value> {
+        let mut preview = self.clone();
+        preview.responses_lite = enabled;
+        if enabled {
+            preview.sync_lite_catalog(tools, opts)?;
+        }
+        Ok(preview.build_body(tools, opts))
     }
 
     /// Persist the ambient section into the buffer when it changed since the
@@ -201,6 +306,8 @@ impl ResponsesState {
             "input": self.input,
             "ambient_hash": self.ambient_hash,
             "protected_prefix": self.protected_prefix,
+            "responses_lite": self.responses_lite,
+            "lite_tools": self.lite_baseline.as_ref().map(|baseline| baseline.to_side()),
         })
     }
 
@@ -213,10 +320,29 @@ impl ResponsesState {
             self.custom_tool_call_ids = pending_custom_tool_call_ids(&self.input);
             self.ambient_hash = None;
             self.protected_prefix = 0;
+            self.responses_lite = false;
+            self.lite_baseline = None;
         } else if let Some(arr) = snapshot.get("input").and_then(Value::as_array) {
             self.input = arr.clone();
             self.custom_tool_call_ids = pending_custom_tool_call_ids(&self.input);
             self.ambient_hash = snapshot.get("ambient_hash").and_then(Value::as_u64);
+            self.responses_lite = snapshot
+                .get("responses_lite")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            self.lite_baseline = match super::responses_lite::CatalogBaseline::from_side(
+                snapshot.get("lite_tools").unwrap_or(&Value::Null),
+            ) {
+                // A restored baseline is trusted only while its whole item
+                // chain survived into the restored history; otherwise the
+                // next sync re-renders the full catalog.
+                super::responses_lite::BaselineRestore::Known(baseline)
+                    if baseline.is_coupled_to(&self.input) =>
+                {
+                    Some(baseline)
+                }
+                _ => None,
+            };
             // Defensive clamp: checkpoint validation rejects an over-long
             // prefix, so this only guards an unvalidated restore from
             // arithmetic surprises, never from data loss.
@@ -233,7 +359,19 @@ impl ResponsesState {
     }
 
     pub(super) fn build_body(&self, tools: &[ToolSpec], opts: &TurnOpts) -> Value {
-        build_body(&self.input, &self.session_id, tools, opts)
+        if self.responses_lite {
+            build_lite_body(&self.input, &self.session_id, opts)
+        } else {
+            // Lite-only items stay in the authoritative buffer across mode
+            // toggles; the ordinary wire never carries them.
+            let input = self
+                .input
+                .iter()
+                .filter(|item| item["type"].as_str() != Some("additional_tools"))
+                .cloned()
+                .collect::<Vec<_>>();
+            build_body(&input, &self.session_id, tools, opts)
+        }
     }
 
     pub(super) fn parse_sse(&mut self, sse: &str) -> Result<TurnOutput> {
@@ -418,6 +556,88 @@ fn responses_tool_definition(t: &ToolSpec) -> Value {
             "strict": false,
         })
     }
+}
+
+/// The wire-schema authority's rendered Lite declarations: the same flat
+/// function/custom definitions the ordinary Responses `tools` parameter
+/// would carry, plus the `web_search` builtin when enabled. Namespaces are
+/// supported by the diff helper; the harness catalog renders flat today.
+fn lite_tool_declarations(tools: &[ToolSpec], opts: &TurnOpts) -> Vec<Value> {
+    let mut declarations: Vec<Value> = tools.iter().map(responses_tool_definition).collect();
+    if opts.web_search {
+        declarations.push(json!({"type": "web_search"}));
+    }
+    declarations
+}
+
+/// Build the Responses Lite request body (pure; no I/O). Mirrors codex's
+/// `build_responses_request` Lite arm: no `tools` parameter (definitions
+/// travel as history-carried `additional_tools` items), an empty
+/// `instructions` field with the base+stable prompt re-entering as a
+/// request-only developer message carrying a stable uuid v5 id bound to the
+/// session and its canonical payload, `reasoning.context` `all_turns`, and
+/// `parallel_tool_calls` false. The message is never persisted into the
+/// buffer, so retries and resumed sessions reproduce it verbatim.
+pub(super) fn build_lite_body(input: &[Value], session_id: &str, opts: &TurnOpts) -> Value {
+    let mut input = input.to_vec();
+    let instructions = response_instructions(opts);
+    let session_namespace = Uuid::new_v5(&Uuid::NAMESPACE_OID, session_id.as_bytes());
+    let id = format!(
+        "msg_{}",
+        Uuid::new_v5(&session_namespace, instructions.as_bytes())
+    );
+    input.insert(
+        0,
+        json!({
+            "type": "message",
+            "id": id,
+            "role": "developer",
+            "content": [{"type": "input_text", "text": instructions}],
+        }),
+    );
+    if let Some(volatile) = opts.system.volatile_text() {
+        input.push(json!({
+            "type": "message",
+            "role": "developer",
+            "content": [{"type": "input_text", "text": volatile}],
+        }));
+    }
+    let mut body = json!({
+        "model": opts.model,
+        "input": input,
+        "instructions": "",
+        "tool_choice": "auto",
+        "parallel_tool_calls": false,
+        "stream": true,
+        "store": false,
+    });
+    // The `tools` parameter is intentionally omitted: definitions ride in
+    // history as `additional_tools` developer items.
+    if !session_id.is_empty() {
+        body["prompt_cache_key"] = json!(session_id);
+    }
+    if let Some(tier) = service_tier_for_request(opts.service_tier.as_deref()) {
+        body["service_tier"] = json!(tier);
+    }
+    if model_supports_reasoning(&opts.model) {
+        body["include"] = json!(["reasoning.encrypted_content"]);
+        // Lite keeps reasoning continuity across turns; effort and summary
+        // join when requested.
+        let mut reasoning = json!({"context": "all_turns"});
+        if let Some(effort) = &opts.effort {
+            reasoning["effort"] = json!(normalize_effort(effort));
+            if let Some(summary) = reasoning_summary() {
+                reasoning["summary"] = json!(summary);
+            }
+        }
+        body["reasoning"] = reasoning;
+    } else if opts.effort.is_some() {
+        tracing::warn!(
+            model = %opts.model,
+            "effort requested but model is not reasoning-capable; omitting reasoning"
+        );
+    }
+    body
 }
 
 fn response_instructions(opts: &TurnOpts) -> String {
@@ -2374,5 +2594,289 @@ mod tests {
             }
             _ => eprintln!("\n[probe 4] skipped: no output array in unary compact body"),
         }
+    }
+
+    fn lite_state() -> ResponsesState {
+        let mut s = state();
+        s.configure_responses_lite(true);
+        s
+    }
+
+    fn lite_opts(base: &str) -> TurnOpts {
+        let mut o = opts(SystemPrompt::default());
+        o.base_instructions = Some(BaseInstructions::new(base));
+        o
+    }
+
+    #[test]
+    fn lite_body_carries_codex_shape_and_stable_prefix_ids() {
+        let mut s = lite_state();
+        let tools = vec![function_spec("read"), function_spec("shell")];
+        let options = lite_opts("You are a coding agent.");
+        s.sync_lite_catalog(&tools, &options).unwrap();
+        let body = s.build_body(&tools, &options);
+        assert_eq!(body["instructions"], "");
+        assert!(
+            body.get("tools").is_none(),
+            "Lite omits the tools parameter; definitions ride in history"
+        );
+        assert_eq!(body["parallel_tool_calls"], false);
+        assert_eq!(body["reasoning"]["context"], "all_turns");
+        assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+        let input = body["input"].as_array().unwrap();
+        // Request-only base+stable prefix message leads with a stable id,
+        // then the history-carried definitions, then the user item.
+        assert_eq!(input[0]["role"], "developer");
+        let msg_id = input[0]["id"].as_str().unwrap();
+        assert!(msg_id.starts_with("msg_"), "{msg_id}");
+        assert_eq!(
+            input[0]["content"][0]["text"],
+            json!("You are a coding agent.")
+        );
+        assert_eq!(input[1]["type"], "additional_tools");
+        assert_eq!(input[1]["role"], "developer");
+        let at_id = input[1]["id"].as_str().unwrap();
+        assert!(at_id.starts_with("at_"), "{at_id}");
+        assert_eq!(input[1]["tools"].as_array().unwrap().len(), 2);
+        assert_eq!(input[2]["role"], "user");
+        // The prefix message is request-only: never persisted.
+        assert!(
+            s.input
+                .iter()
+                .all(|item| item["id"].as_str() != Some(msg_id)),
+            "the base-instructions message must not persist into the buffer"
+        );
+        // Stable identity across rebuilds.
+        let again = s.build_body(&tools, &options);
+        assert_eq!(again["input"][0]["id"], json!(msg_id));
+        assert_eq!(again["input"][1]["id"], json!(at_id));
+    }
+
+    #[test]
+    fn lite_catalog_initial_prefix_then_deltas_at_the_sampling_boundary() {
+        let mut s = lite_state();
+        let options = lite_opts("base");
+        let tools = vec![function_spec("read")];
+        let added = s.sync_lite_catalog(&tools, &options).unwrap();
+        assert!(added > 0);
+        // Initial definitions sit before the first user item.
+        let position = s
+            .input
+            .iter()
+            .position(|item| item["role"] == "user")
+            .unwrap();
+        assert_eq!(s.input[position - 1]["type"], "additional_tools");
+
+        // Unchanged catalog: nothing appended, nothing charged.
+        let added = s.sync_lite_catalog(&tools, &options).unwrap();
+        assert_eq!(added, 0);
+        assert_eq!(
+            s.input
+                .iter()
+                .filter(|item| item["type"] == "additional_tools")
+                .count(),
+            1
+        );
+
+        // A changed tool appends a delta at the end (sampling boundary),
+        // carrying only the changed declaration.
+        let changed = {
+            let mut spec = function_spec("read");
+            spec.description = "read files faster".into();
+            vec![spec]
+        };
+        let added = s.sync_lite_catalog(&changed, &options).unwrap();
+        assert!(added > 0);
+        let last = s.input.last().unwrap();
+        assert_eq!(last["type"], "additional_tools");
+        assert_eq!(last["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(last["tools"][0]["description"], json!("read files faster"));
+    }
+
+    #[test]
+    fn lite_restore_drops_an_uncoupled_baseline_and_re_renders_fully() {
+        let mut s = lite_state();
+        let options = lite_opts("base");
+        let tools = vec![function_spec("read")];
+        s.sync_lite_catalog(&tools, &options).unwrap();
+        let snapshot = s.snapshot();
+        // Simulate lost definition history: restore into a state whose input
+        // dropped the definitions item (a torn tail beyond the snapshot).
+        let mut truncated = snapshot.clone();
+        truncated["input"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|item| item["type"] != "additional_tools");
+        let mut restored = lite_state();
+        restored.restore(snapshot);
+        assert!(
+            restored.uses_responses_lite(),
+            "the capability flag survives resume"
+        );
+        let mut lost = lite_state();
+        lost.restore(truncated);
+        // The uncoupled baseline rebuilds: the next sync re-renders the full
+        // catalog before the first user item.
+        let before = lost.input.len();
+        lost.sync_lite_catalog(&tools, &options).unwrap();
+        assert_eq!(lost.input.len(), before + 1);
+        assert_eq!(
+            lost.input
+                .iter()
+                .position(|item| item["role"] == "user")
+                .unwrap(),
+            1,
+            "full re-render lands before the first user item"
+        );
+    }
+
+    #[test]
+    fn mode_toggle_filters_lite_items_per_request_only() {
+        let mut s = lite_state();
+        let options = lite_opts("base");
+        let tools = vec![function_spec("read")];
+        s.sync_lite_catalog(&tools, &options).unwrap();
+        let lite_items = s
+            .input
+            .iter()
+            .filter(|item| item["type"] == "additional_tools")
+            .count();
+        assert_eq!(lite_items, 1);
+
+        s.configure_responses_lite(false);
+        let body = s.build_body(&tools, &options);
+        assert!(
+            body["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item["type"] != "additional_tools"),
+            "the ordinary wire never carries Lite definitions items"
+        );
+        assert!(
+            body.get("tools").is_some(),
+            "the ordinary wire keeps its tools parameter"
+        );
+        // Authoritative history keeps the items across the toggle.
+        assert_eq!(
+            s.input
+                .iter()
+                .filter(|item| item["type"] == "additional_tools")
+                .count(),
+            1
+        );
+        s.configure_responses_lite(true);
+        let body = s.build_body(&tools, &options);
+        assert_eq!(
+            body["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|item| item["type"] == "additional_tools")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn preview_lite_body_prepares_a_copy_and_preserves_the_source() {
+        let mut s = lite_state();
+        let options = lite_opts("base");
+        let tools = vec![function_spec("read")];
+        let before = s.snapshot();
+        let body = s.preview_lite_body(&tools, &options, true).unwrap();
+        assert_eq!(
+            s.snapshot(),
+            before,
+            "a failed or previewed compaction must preserve the exact source state"
+        );
+        assert!(
+            body["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["type"] == "additional_tools")
+        );
+        // Deterministic preview: the same inputs produce the same body.
+        let again = s.preview_lite_body(&tools, &options, true).unwrap();
+        assert_eq!(body, again);
+        // A non-Lite preview keeps the ordinary wire.
+        let plain = s.preview_lite_body(&tools, &options, false).unwrap();
+        assert!(
+            plain["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item["type"] != "additional_tools")
+        );
+        assert!(plain.get("tools").is_some());
+    }
+
+    #[test]
+    fn reset_lite_baseline_forces_a_full_re_render_after_compaction() {
+        let mut s = lite_state();
+        let options = lite_opts("base");
+        let tools = vec![function_spec("read")];
+        s.sync_lite_catalog(&tools, &options).unwrap();
+        // Compaction rebuilt history without definition items.
+        s.input.retain(|item| item["type"] != "additional_tools");
+        s.reset_lite_baseline();
+        s.sync_lite_catalog(&tools, &options).unwrap();
+        assert_eq!(
+            s.input
+                .iter()
+                .filter(|item| item["type"] == "additional_tools")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn lite_full_render_never_lands_inside_the_protected_prefix() {
+        let mut s = lite_state();
+        s.protected_prefix = 1;
+        s.input.insert(
+            0,
+            json!({"type":"message", "role":"user", "content":"canonical window"}),
+        );
+        let options = lite_opts("base");
+        s.sync_lite_catalog(&[function_spec("read")], &options)
+            .unwrap();
+        let kinds: Vec<&str> = s
+            .input
+            .iter()
+            .map(|item| item["type"].as_str().unwrap_or("message"))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec!["message", "additional_tools", "message"],
+            "the canonical window stays first and untouched"
+        );
+    }
+
+    #[test]
+    fn web_search_joins_the_lite_catalog_as_a_builtin_declaration() {
+        let mut s = lite_state();
+        let mut options = lite_opts("base");
+        options.web_search = true;
+        s.sync_lite_catalog(&[function_spec("read")], &options)
+            .unwrap();
+        let defs = s
+            .input
+            .iter()
+            .find(|item| item["type"] == "additional_tools")
+            .unwrap();
+        let names: Vec<&str> = defs["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| {
+                tool["name"]
+                    .as_str()
+                    .or_else(|| tool["type"].as_str())
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(names, vec!["read", "web_search"]);
     }
 }

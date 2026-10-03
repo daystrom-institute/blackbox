@@ -23,6 +23,21 @@ pub(crate) fn validate_snapshot(transport: &str, snapshot: &Value) -> Result<()>
                     "Responses ambient_hash must be null or an unsigned integer"
                 );
             }
+            if let Some(lite) = object
+                .get("responses_lite")
+                .filter(|value| !value.is_null())
+            {
+                ensure!(
+                    lite.as_bool().is_some(),
+                    "Responses responses_lite must be null or a boolean"
+                );
+            }
+            if let Some(baseline) = object.get("lite_tools").filter(|value| !value.is_null()) {
+                ensure!(
+                    baseline.is_object(),
+                    "Responses lite_tools must be null or an object"
+                );
+            }
             let items = object
                 .get("input")
                 .and_then(Value::as_array)
@@ -265,6 +280,23 @@ fn validate_responses_item(item: &Value) -> Result<()> {
         }
         "compaction" | "compaction_summary" => {
             nonempty(item, "encrypted_content")?;
+        }
+        // Responses Lite catalog definitions: strictly developer-authored,
+        // identified, and an array of declaration objects. Anything looser
+        // would let a forged definitions item ride a resume.
+        "additional_tools" => {
+            role(item, &["developer"])?;
+            nonempty(item, "id")?;
+            let tools = item
+                .get("tools")
+                .and_then(Value::as_array)
+                .context("additional_tools requires a tools array")?;
+            for (index, tool) in tools.iter().enumerate() {
+                ensure!(
+                    tool.is_object(),
+                    "additional_tools declaration {index} must be an object"
+                );
+            }
         }
         // Native server tools and future opaque items must survive local resume.
         // We deliberately do not reconstruct or authorize them as client calls.

@@ -39,16 +39,43 @@ pub(crate) struct RequestEstimate {
 }
 
 impl RequestEstimate {
+    /// The fallback `instructions` text the Responses builder sends when base
+    /// and stable are both empty; charged so the Lite estimate matches the
+    /// request-only developer prefix message that actually ships.
+    const DEFAULT_INSTRUCTIONS: &str =
+        "You are a helpful coding assistant operating non-interactively.";
+
     /// Include the native history, current instructions and actual activated
     /// schemas. Counting serialized bytes avoids building another large JSON
     /// string; the four-byte heuristic is approximate, not a tokenizer promise.
+    ///
+    /// A prepared Responses Lite snapshot (`responses_lite: true`) carries the
+    /// tool definitions as history items, so activated schemas are excluded
+    /// here (charging both would double-count every request); the request-only
+    /// base+stable developer prefix message is overhead and stays charged. In
+    /// ordinary mode, history `additional_tools` items never ride the wire
+    /// (the builder filters them per request), so their cost is excluded too.
     pub(crate) fn new(snapshot: &Value, tools: &[ToolSpec], opts: &TurnOpts) -> Self {
+        let lite = snapshot.get("responses_lite").and_then(Value::as_bool) == Some(true);
         let history = snapshot.get("input").unwrap_or(snapshot);
-        let history_tokens = history_tokens(history);
+        let history_tokens = if lite {
+            history_tokens(history)
+        } else {
+            match history.as_array() {
+                Some(items) => items
+                    .iter()
+                    .filter(|item| item["type"].as_str() != Some("additional_tools"))
+                    .map(item_tokens)
+                    .fold(0u64, u64::saturating_add),
+                None => history_tokens(history),
+            }
+        };
         let mut overhead_tokens = 64u64;
-        for text in [
-            opts.base_instructions.as_ref().and_then(|base| base.text()),
-            opts.system.stable_text(),
+        let base = opts.base_instructions.as_ref().and_then(|base| base.text());
+        let stable = opts.system.stable_text();
+        let mut sections = [
+            base,
+            stable,
             // Responses materializes ambient context into input before this
             // estimate. Other transports carry it in their system parameter.
             if snapshot.get("ambient_hash").is_some() {
@@ -57,22 +84,25 @@ impl RequestEstimate {
                 opts.system.ambient_text()
             },
             opts.system.volatile_text(),
-        ]
-        .into_iter()
-        .flatten()
-        {
+        ];
+        if lite && base.is_none() && stable.is_none() {
+            sections[0] = Some(Self::DEFAULT_INSTRUCTIONS);
+        }
+        for text in sections.into_iter().flatten() {
             overhead_tokens = overhead_tokens.saturating_add(text_tokens(text));
         }
-        for tool in tools {
-            overhead_tokens = overhead_tokens
-                .saturating_add(text_tokens(&tool.name))
-                .saturating_add(text_tokens(&tool.description))
-                .saturating_add(json_tokens(&tool.schema))
-                .saturating_add(16);
-            if let Some(grammar) = &tool.grammar {
+        if !lite {
+            for tool in tools {
                 overhead_tokens = overhead_tokens
-                    .saturating_add(text_tokens(&grammar.syntax))
-                    .saturating_add(text_tokens(&grammar.definition));
+                    .saturating_add(text_tokens(&tool.name))
+                    .saturating_add(text_tokens(&tool.description))
+                    .saturating_add(json_tokens(&tool.schema))
+                    .saturating_add(16);
+                if let Some(grammar) = &tool.grammar {
+                    overhead_tokens = overhead_tokens
+                        .saturating_add(text_tokens(&grammar.syntax))
+                        .saturating_add(text_tokens(&grammar.definition));
+                }
             }
         }
         Self {
@@ -275,6 +305,58 @@ mod tests {
         ] {
             assert!(estimate.projected(&BudgetCheckpoint::restore(&saved)) > 80_000);
         }
+    }
+
+    #[test]
+    fn lite_snapshots_charge_base_prefix_once_and_never_double_charge_schemas() {
+        let schema = json!({"type":"object", "properties":{"q":{"type":"string"}}});
+        let definition = json!({
+            "type":"function", "name":"read", "description":"x".repeat(4_000),
+            "parameters": schema,
+        });
+        let input = json!([
+            {"type":"additional_tools", "id":"at_1", "role":"developer", "tools":[definition.clone()]},
+            {"type":"message", "role":"user", "content":[{"type":"input_text", "text":"task"}]},
+        ]);
+        let mut options = opts();
+        options.base_instructions =
+            Some(crate::transport::BaseInstructions::new(&"B ".repeat(4_000)));
+        let tool = ToolSpec {
+            name: "read".into(),
+            description: "x".repeat(4_000),
+            schema: schema.clone(),
+            grammar: None,
+        };
+
+        let history_tokens_total = item_tokens(&input[0]) + item_tokens(&input[1]);
+        // Lite: the definitions item is history; the schema is excluded from
+        // overhead; the request-only base prefix message stays charged.
+        let lite_snapshot = json!({"responses_lite": true, "input": input.clone()});
+        let lite = RequestEstimate::new(&lite_snapshot, std::slice::from_ref(&tool), &options);
+        assert_eq!(lite.history_tokens, history_tokens_total);
+        let base_tokens = text_tokens(&"B ".repeat(4_000));
+        assert_eq!(lite.overhead_tokens, 64 + base_tokens);
+        // No double charge: the schema bytes are counted exactly once.
+        assert!(lite.history_tokens >= json_tokens(&definition));
+        assert!(lite.overhead_tokens < base_tokens + json_tokens(&schema));
+
+        // Empty base and stable fall back to the default instructions text
+        // the Lite builder actually ships.
+        let bare = RequestEstimate::new(&lite_snapshot, &[], &opts());
+        assert_eq!(
+            bare.overhead_tokens,
+            64 + text_tokens(RequestEstimate::DEFAULT_INSTRUCTIONS)
+        );
+
+        // Ordinary mode: Lite-only history items never ride the wire, so
+        // their cost is excluded while the activated schemas are charged.
+        let ordinary_snapshot = json!({"responses_lite": false, "input": input});
+        let ordinary = RequestEstimate::new(&ordinary_snapshot, &[tool], &options);
+        assert_eq!(
+            ordinary.history_tokens,
+            item_tokens(&ordinary_snapshot["input"][1])
+        );
+        assert!(ordinary.overhead_tokens > lite.overhead_tokens);
     }
 
     #[test]
