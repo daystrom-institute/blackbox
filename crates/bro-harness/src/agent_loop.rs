@@ -227,7 +227,7 @@ async fn run_with_emitter(
             result
         } else {
             session
-                .user_turn(&prompt, cancel_rx, Arc::new(StdMutex::new(VecDeque::new())))
+                .user_turn(&prompt, cancel_rx, MidTurnInputs::new())
                 .await
         };
         session.pending_user_inputs = pending.clone();
@@ -707,14 +707,14 @@ async fn run_prompt_with_controls(
     if terminating {
         let _ = cancel_tx.send(true);
     }
-    let mid_turn_user_inputs = Arc::new(StdMutex::new(VecDeque::new()));
+    let mid_turn_inputs = MidTurnInputs::new();
     let turn_result = {
         let operation = async {
             if compact {
                 session.compact_manual().await
             } else {
                 session
-                    .user_turn(&prompt, cancel_rx, mid_turn_user_inputs.clone())
+                    .user_turn(&prompt, cancel_rx, mid_turn_inputs.clone())
                     .await
             }
         };
@@ -742,9 +742,7 @@ async fn run_prompt_with_controls(
                         }
                     }
                     Some(Input::User(prompt)) if compact || prompt.trim() == "/compact" => pending.push_back(prompt),
-                    Some(Input::User(prompt)) => {
-                        if let Ok(mut inputs) = mid_turn_user_inputs.lock() { inputs.push_back(prompt); }
-                    }
+                    Some(Input::User(prompt)) => mid_turn_inputs.push_back(prompt),
                     None => {
                         // EOF ends input admission; already accepted turns finish.
                         // Explicit interrupt requests own cancellation.
@@ -763,7 +761,7 @@ async fn run_prompt_with_controls(
             tracing::error!("turn failed: {error:#}");
         }
     }
-    if let Ok(mut inputs) = mid_turn_user_inputs.lock() {
+    if let Ok(mut inputs) = mid_turn_inputs.take_all() {
         while let Some(prompt) = inputs.pop_back() {
             pending.push_front(prompt);
         }
@@ -975,21 +973,71 @@ fn web_search_enabled() -> bool {
         .unwrap_or(true)
 }
 
+/// Local addition: mid-turn user-input mailbox shared by the stdin reader and
+/// the turn loop. Every push bumps the `activity` counter, so a per-step
+/// preemption watcher that subscribes BEFORE checking the queue can never miss
+/// an arrival. Queue semantics are unchanged: raw text, FIFO order, and
+/// rollback of unconsumed inputs to the front on failure.
+#[derive(Clone)]
+struct MidTurnInputs {
+    queue: Arc<StdMutex<VecDeque<String>>>,
+    activity: Arc<tokio::sync::watch::Sender<u64>>,
+}
+
+impl MidTurnInputs {
+    fn new() -> Self {
+        let (activity, _) = tokio::sync::watch::channel(0);
+        Self {
+            queue: Arc::new(StdMutex::new(VecDeque::new())),
+            activity: Arc::new(activity),
+        }
+    }
+
+    fn push_back(&self, prompt: String) {
+        let mut queue = self.queue.lock().unwrap_or_else(|error| error.into_inner());
+        queue.push_back(prompt);
+        drop(queue);
+        self.activity.send_modify(|version| *version += 1);
+    }
+
+    fn push_front(&self, prompt: String) {
+        let mut queue = self.queue.lock().unwrap_or_else(|error| error.into_inner());
+        queue.push_front(prompt);
+        drop(queue);
+        self.activity.send_modify(|version| *version += 1);
+    }
+
+    fn take_all(&self) -> Result<VecDeque<String>> {
+        let mut queue = self
+            .queue
+            .lock()
+            .map_err(|_| anyhow::anyhow!("input queue poisoned"))?;
+        Ok(std::mem::take(&mut *queue))
+    }
+
+    fn has_pending(&self) -> bool {
+        !self
+            .queue
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_empty()
+    }
+
+    fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.activity.subscribe()
+    }
+}
+
 /// Keep fresh steers outside history until compaction and request preparation
 /// finish. An error or cancellation returns unconsumed inputs to the owner queue.
 struct StagedUserInputs {
     inputs: VecDeque<String>,
-    source: Arc<StdMutex<VecDeque<String>>>,
+    source: MidTurnInputs,
 }
 
 impl StagedUserInputs {
     fn capture(&mut self) -> Result<Vec<String>> {
-        let captured = std::mem::take(
-            &mut *self
-                .source
-                .lock()
-                .map_err(|_| anyhow::anyhow!("input queue poisoned"))?,
-        );
+        let captured = self.source.take_all()?;
         let new_inputs = captured.iter().cloned().collect();
         self.inputs.extend(captured);
         Ok(new_inputs)
@@ -998,12 +1046,45 @@ impl StagedUserInputs {
 
 impl Drop for StagedUserInputs {
     fn drop(&mut self) {
-        let mut source = self
-            .source
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
         while let Some(input) = self.inputs.pop_back() {
-            source.push_front(input);
+            self.source.push_front(input);
+        }
+    }
+}
+
+/// Local addition: disarms one sampling step's queued-input preemption signal
+/// and stops its queue watcher once the step's tool dispatch has drained (or
+/// the turn unwinds through an error, interrupt, or break).
+struct StepPreemptionGuard {
+    session: Option<crate::code_mode::CodeModeToolSession>,
+    watcher: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for StepPreemptionGuard {
+    fn drop(&mut self) {
+        if let Some(session) = self.session.take() {
+            session.set_step_preemption(None);
+        }
+        self.watcher.abort();
+    }
+}
+
+/// Local addition: watch the mid-turn input queue for one sampling step.
+/// Subscribing before the first check means a push that races the check still
+/// wakes the watcher (no lost wakeup); the first queued input cancels the
+/// step's preemption token exactly once.
+async fn watch_mid_turn_inputs(
+    inputs: MidTurnInputs,
+    preempt: tokio_util::sync::CancellationToken,
+) {
+    let mut activity = inputs.subscribe();
+    loop {
+        if inputs.has_pending() {
+            preempt.cancel();
+            return;
+        }
+        if activity.changed().await.is_err() {
+            return;
         }
     }
 }
@@ -1859,11 +1940,9 @@ impl Session {
         &mut self,
         prompt: &str,
         cancel: watch::Receiver<bool>,
-        mid_turn_user_inputs: Arc<StdMutex<VecDeque<String>>>,
+        mid_turn_inputs: MidTurnInputs,
     ) -> Result<()> {
-        let result = self
-            .user_turn_inner(prompt, cancel, mid_turn_user_inputs)
-            .await;
+        let result = self.user_turn_inner(prompt, cancel, mid_turn_inputs).await;
         if let Err(error) = &result {
             self.drain_cancelled_work().await;
             if let Some(observation) = error.downcast_ref::<transport::FailedTurnObservation>() {
@@ -1880,14 +1959,14 @@ impl Session {
         &mut self,
         prompt: &str,
         mut cancel: watch::Receiver<bool>,
-        mid_turn_user_inputs: Arc<StdMutex<VecDeque<String>>>,
+        mid_turn_inputs: MidTurnInputs,
     ) -> Result<()> {
         self.reg.validate_resume_tool_schemas()?;
         self.cx.cancellation = tokio_util::sync::CancellationToken::new();
         let mut pending_prompt = Some(prompt);
         let mut staged_inputs = StagedUserInputs {
             inputs: VecDeque::new(),
-            source: mid_turn_user_inputs.clone(),
+            source: mid_turn_inputs.clone(),
         };
         self.observe_user_turn(prompt);
         let prompt_estimate = est_tokens(prompt);
@@ -1906,6 +1985,12 @@ impl Session {
         let mut last_model_stop: Option<StopReason> = None;
         let mut last_model_tool_call_count = 0usize;
         let mut last_tool_results: Vec<Value> = Vec::new();
+        // Local addition: one queued-input preemption signal per sampling
+        // request. Armed just before the request (after this step's staged
+        // input has been drained into the conversation) and dropped when the
+        // response's dispatch drains, so an old signal never preempts a later
+        // step's observations.
+        let mut step_preempt: Option<StepPreemptionGuard> = None;
 
         let break_reason = 'turn: loop {
             if !self.uncertain_remote_outcomes().is_empty() {
@@ -2130,6 +2215,12 @@ impl Session {
                 }
                 self.tx.normalize_for_prompt();
                 request_overhead_tokens = estimate.overhead_tokens;
+                // Local addition: arm this request's preemption signal so
+                // code-mode exec/wait calls dispatched for this response
+                // yield their live cells promptly when user input queues
+                // mid-response, instead of holding the response hostage to
+                // their yield windows. A compaction retry re-arms fresh.
+                self.rearm_step_preemption(&mut step_preempt, &mid_turn_inputs);
                 let r = tokio::select! {
                     biased;
                     _ = cancel.changed() => {
@@ -2462,6 +2553,11 @@ impl Session {
 
             interrupted |= *cancel.borrow();
 
+            // Local addition: this response's calls have drained, so its
+            // preemption signal is spent. The queued input it surfaced is
+            // captured into the next request, which arms a fresh token.
+            step_preempt = None;
+
             // Assemble results in tool-call order: bound oversized output, run
             // result hooks. Diagnostics are deferred to the single batch-boundary
             // pass below — the per-edit window-0 drain could not attribute edits
@@ -2749,6 +2845,37 @@ impl Session {
                 self.tail_nudge = Some(n.message);
             }
         }
+    }
+
+    /// Local addition: replace the armed step signal, dropping the previous
+    /// guard strictly BEFORE arming. A plain slot assignment drops the old
+    /// guard AFTER the new arm, and that guard's Drop clears the session
+    /// slot, wiping the freshly armed token; same-request retries (context
+    /// overflow, compaction) re-arm through here and must keep preemption
+    /// live for the retried response.
+    fn rearm_step_preemption(
+        &self,
+        slot: &mut Option<StepPreemptionGuard>,
+        inputs: &MidTurnInputs,
+    ) {
+        drop(slot.take());
+        *slot = self.arm_step_preemption(inputs);
+    }
+
+    /// Local addition: arm one sampling request's code-mode preemption signal
+    /// and start its queue watcher. Returns `None` when code mode is off (no
+    /// exec/wait calls exist to preempt). Dropping the guard disarms the
+    /// signal and stops the watcher, so an old cancellation cannot preempt a
+    /// later step's observations.
+    fn arm_step_preemption(&self, inputs: &MidTurnInputs) -> Option<StepPreemptionGuard> {
+        let session = self.code_mode_session.clone()?;
+        let preempt = tokio_util::sync::CancellationToken::new();
+        session.set_step_preemption(Some(preempt.clone()));
+        let watcher = tokio::spawn(watch_mid_turn_inputs(inputs.clone(), preempt));
+        Some(StepPreemptionGuard {
+            session: Some(session),
+            watcher,
+        })
     }
 
     /// Strategy-routed sections for the stable system slot. Codex-shaped:
@@ -4098,7 +4225,7 @@ mod tests {
         );
         let (_cancel_tx, cancel) = watch::channel(false);
         session
-            .user_turn("run fixture", cancel, Arc::new(Mutex::new(VecDeque::new())))
+            .user_turn("run fixture", cancel, MidTurnInputs::new())
             .await
             .unwrap();
         let batches = shared.pushed_tool_results.lock().unwrap();
@@ -4468,7 +4595,7 @@ mod tests {
     async fn run_user_turn(session: &mut Session, prompt: &str) {
         let (_cancel_tx, cancel_rx) = watch::channel(false);
         session
-            .user_turn(prompt, cancel_rx, Arc::new(StdMutex::new(VecDeque::new())))
+            .user_turn(prompt, cancel_rx, MidTurnInputs::new())
             .await
             .unwrap();
     }
@@ -4738,11 +4865,7 @@ mod tests {
             session.compact_threshold = Some(0);
             let (_cancel_tx, cancel_rx) = watch::channel(false);
             let result = session
-                .user_turn(
-                    "Report the checkpoint.",
-                    cancel_rx,
-                    Arc::new(StdMutex::new(VecDeque::new())),
-                )
+                .user_turn("Report the checkpoint.", cancel_rx, MidTurnInputs::new())
                 .await;
             assert_eq!(result.is_ok(), succeeds, "{case}");
             if succeeds {
@@ -5030,7 +5153,7 @@ mod tests {
                     session.user_turn(
                         "Perform the intended synthetic action.",
                         cancel_rx,
-                        Arc::new(StdMutex::new(VecDeque::new())),
+                        MidTurnInputs::new(),
                     ),
                 )
                 .await
@@ -5257,7 +5380,7 @@ mod tests {
                 session.user_turn(
                     "Report the checkpoint without searching the web.",
                     cancel_rx,
-                    Arc::new(StdMutex::new(VecDeque::new())),
+                    MidTurnInputs::new(),
                 ),
             )
             .await
@@ -5557,11 +5680,7 @@ mod tests {
                     session.retain_background_work = case != "one_shot";
                     let (_cancel_tx, cancel_rx) = watch::channel(false);
                     let result = session
-                        .user_turn(
-                            "finish",
-                            cancel_rx,
-                            Arc::new(StdMutex::new(VecDeque::new())),
-                        )
+                        .user_turn("finish", cancel_rx, MidTurnInputs::new())
                         .await;
                     assert_eq!(result.is_err(), case == "provider_failure");
                 } else {
@@ -5680,11 +5799,7 @@ mod tests {
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let run = async {
             session
-                .user_turn(
-                    "Mutate fixture",
-                    cancel_rx,
-                    Arc::new(StdMutex::new(VecDeque::new())),
-                )
+                .user_turn("Mutate fixture", cancel_rx, MidTurnInputs::new())
                 .await
                 .unwrap();
             done.store(true, Ordering::SeqCst);
@@ -5745,11 +5860,7 @@ mod tests {
         session.cx.root = root;
         let pending_read = install_dispatch_probes(&mut session);
         let (cancel_tx, cancel_rx) = watch::channel(false);
-        let turn = session.user_turn(
-            "read then write",
-            cancel_rx,
-            Arc::new(StdMutex::new(VecDeque::new())),
-        );
+        let turn = session.user_turn("read then write", cancel_rx, MidTurnInputs::new());
         let interrupt = async {
             pending_read.notified().await;
             cancel_tx.send(true).unwrap();
@@ -5783,11 +5894,7 @@ mod tests {
             }
             let (_cancel_tx, cancel_rx) = watch::channel(cancelled);
             session
-                .user_turn(
-                    "PRESERVE_ACCEPTED_INPUT",
-                    cancel_rx,
-                    Arc::new(StdMutex::new(VecDeque::new())),
-                )
+                .user_turn("PRESERVE_ACCEPTED_INPUT", cancel_rx, MidTurnInputs::new())
                 .await
                 .unwrap();
             assert_eq!(shared.started.load(Ordering::SeqCst), 0);
@@ -6702,6 +6809,242 @@ mod tests {
             &["alpha".to_string(), "beta".to_string()]
         );
         assert_eq!(shared.completed.load(Ordering::SeqCst), 2);
+    }
+
+    // Local addition: rearming the step signal must drop the previous guard
+    // BEFORE arming the next one. A plain slot assignment drops the old guard
+    // after the new arm, and that guard's Drop clears the freshly armed
+    // token, silently disabling preemption for the retried response.
+    #[tokio::test]
+    async fn rearm_step_preemption_replaces_the_signal_without_clearing_the_new_one() {
+        let (mut session, _) = mk_session(vec![]);
+        let code_mode = crate::code_mode::CodeModeToolSession::new(
+            &[],
+            Arc::new(crate::capabilities::HostTools::new(
+                vec![],
+                session.cx.clone(),
+            )),
+            crate::code_mode::CodeMode::Only,
+            &BTreeMap::new(),
+        );
+        session.code_mode_session = Some(code_mode);
+        let inputs = MidTurnInputs::new();
+        let mut slot = None;
+        session.rearm_step_preemption(&mut slot, &inputs);
+        let first = session
+            .code_mode_session
+            .as_ref()
+            .unwrap()
+            .step_preemption()
+            .expect("first arm must install a token");
+        session.rearm_step_preemption(&mut slot, &inputs);
+        let second = session
+            .code_mode_session
+            .as_ref()
+            .unwrap()
+            .step_preemption()
+            .expect("rearm must not leave the slot cleared by the old guard");
+        assert!(
+            !tokio_util::sync::CancellationToken::ptr_eq(&first, &second),
+            "rearm must install a fresh token"
+        );
+        assert!(!second.is_cancelled());
+        drop(slot);
+        assert!(
+            session
+                .code_mode_session
+                .as_ref()
+                .unwrap()
+                .step_preemption()
+                .is_none()
+        );
+    }
+
+    // Local addition: a steer arriving while a code-mode exec cell blocks on
+    // a nested mutation preempts the observation (the model receives the live
+    // cell handle instead of waiting out the yield window), and the steer is
+    // injected and logged exactly once, in order, for the next request.
+    #[tokio::test]
+    async fn mid_turn_input_preempts_code_mode_exec_and_is_delivered_once_in_order() {
+        use std::time::Duration;
+
+        struct GatedMutation {
+            started: tokio::sync::Semaphore,
+            release: tokio::sync::Semaphore,
+        }
+
+        #[async_trait]
+        impl bro_tools::Tool for GatedMutation {
+            fn name(&self) -> &str {
+                "mutation"
+            }
+            fn description(&self) -> &str {
+                "Controlled mutation fixture"
+            }
+            fn input_schema(&self) -> Value {
+                json!({"type":"object"})
+            }
+            async fn call(&self, _: Value, cx: &ToolCx) -> ToolResult {
+                self.started.add_permits(1);
+                tokio::select! {
+                    _ = self.release.acquire() => {}
+                    _ = cx.cancellation.cancelled() => {
+                        return ToolResult::Error("mutation cancelled".into());
+                    }
+                }
+                ToolResult::Json(json!({"mutation":"finished"}))
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let log = Arc::new(EventLog::at_path(root.join("events.jsonl")));
+        let (mut session, shared) = mk_session_with_store(
+            vec![
+                MockTurn::ToolCalls(vec![transport::ToolCall {
+                    id: "c-1".into(),
+                    name: "exec".into(),
+                    args: json!({"source":
+                        "// @exec: {\"yield_time_ms\": 60000}\ntext(JSON.stringify(await tools.mutation({})));"
+                    }),
+                }]),
+                MockTurn::ToolCalls(vec![transport::ToolCall {
+                    id: "c-2".into(),
+                    name: "exec".into(),
+                    args: json!({"source": "text('second cell done');"}),
+                }]),
+                MockTurn::Text("done".into()),
+            ],
+            Some(SessionStore::for_test(root.join("session.json"))),
+        );
+        let mutation = Arc::new(GatedMutation {
+            started: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        let callable: Vec<Arc<dyn Tool>> = vec![mutation.clone()];
+        let code_mode = crate::code_mode::CodeModeToolSession::new(
+            &callable,
+            Arc::new(crate::capabilities::HostTools::new(
+                callable.clone(),
+                session.cx.clone(),
+            )),
+            crate::code_mode::CodeMode::Only,
+            &BTreeMap::new(),
+        );
+        session.reg = Registry::new(
+            code_mode.tools(),
+            vec![],
+            &PinPolicy::default(),
+            &mcp::ToolFilter::default(),
+        )
+        .unwrap();
+        session.code_mode_session = Some(code_mode);
+        session.emitter = Emitter::new("test".into()).with_event_log(log.clone());
+        session.event_log = log.clone();
+
+        let inputs = MidTurnInputs::new();
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let turn_inputs = inputs.clone();
+        let turn = tokio::spawn(async move {
+            session
+                .user_turn("task prompt", cancel_rx, turn_inputs)
+                .await
+                .unwrap();
+        });
+        // The nested mutation is admitted: the exec call is blocked on it.
+        tokio::time::timeout(Duration::from_secs(5), mutation.started.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        // User input queues mid-response.
+        inputs.push_back("STEER MID TURN".to_string());
+        // The second request only starts after the first observation yielded
+        // and the steer was injected. Without preemption the exec holds its
+        // 60 s window and this timeout fails.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if shared.started.load(Ordering::SeqCst) >= 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("queued input must preempt the exec observation");
+        // Release the mutation so the yielded cell settles in the background.
+        mutation.release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(5), turn)
+            .await
+            .expect("turn must finish")
+            .unwrap();
+
+        // Model order: the steer reached exactly the second request, once.
+        let seen = shared.seen_users.lock().unwrap().clone();
+        assert_eq!(seen.len(), 3, "three model requests expected");
+        assert!(!seen[0].iter().any(|text| text.contains("STEER MID TURN")));
+        assert_eq!(
+            seen[1]
+                .iter()
+                .filter(|text| text.contains("STEER MID TURN"))
+                .count(),
+            1
+        );
+        // The first observation returned the live cell handle.
+        let results = shared.pushed_tool_results.lock().unwrap();
+        assert!(
+            results[0][0]
+                .content
+                .contains("Script running with cell ID"),
+            "{}",
+            results[0][0].content
+        );
+        drop(results);
+
+        // Event order: one steer user event, after the first assistant
+        // tool_use and before the second step's assistant event.
+        let flush = log.clone();
+        tokio::task::spawn_blocking(move || flush.flush_blocking())
+            .await
+            .unwrap();
+        let rows: Vec<Value> = std::fs::read_to_string(log.path())
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let steer_rows: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| {
+                row["event"]["type"] == "user"
+                    && row["event"]["message"]["content"]
+                        .to_string()
+                        .contains("STEER MID TURN")
+            })
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(steer_rows.len(), 1, "steer must be logged exactly once");
+        let assistant_rows: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row["event"]["type"] == "assistant")
+            .map(|(index, _)| index)
+            .collect();
+        assert!(assistant_rows.len() >= 2, "two tool steps expected");
+        assert!(
+            rows[assistant_rows[0]]["event"]["message"]["content"]
+                .to_string()
+                .contains("mutation"),
+            "first assistant step carries the exec tool_use"
+        );
+        assert!(
+            rows[assistant_rows[1]]["event"]["message"]["content"]
+                .to_string()
+                .contains("second cell done"),
+            "second assistant step carries the follow-up exec tool_use"
+        );
+        assert!(steer_rows[0] > assistant_rows[0]);
+        assert!(steer_rows[0] < assistant_rows[1]);
     }
 
     #[tokio::test]
@@ -7638,11 +7981,7 @@ mod tests {
             session.seq_counter(),
         );
         let (cancel_tx, cancel_rx) = watch::channel(false);
-        let turn = session.user_turn(
-            "read twice",
-            cancel_rx,
-            Arc::new(StdMutex::new(VecDeque::new())),
-        );
+        let turn = session.user_turn("read twice", cancel_rx, MidTurnInputs::new());
         let observe = async {
             pending_read.notified().await;
             // Step one completed and the loop checkpointed it before requesting
