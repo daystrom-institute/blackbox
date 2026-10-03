@@ -19,10 +19,13 @@
 //! outcome, so server-declared failures (unknown resource, internal read
 //! error) surface as explicit errors without quarantine.
 //!
-//! Output bounding never fabricates addresses or cursors: `uri`, `uriTemplate`,
-//! and `name` pass through exactly or the entry is omitted with an explicit
-//! reason; a locally trimmed listing forwards no server cursor, because the
-//! dropped entries would be permanently skipped.
+//! Output bounding never fabricates addresses: `uri`, `uriTemplate`, and
+//! `name` pass through exactly or the entry is omitted with an explicit
+//! reason. A locally trimmed page emits an opaque continuation cursor bound
+//! to its server and listing kind; resuming re-fetches the same upstream page
+//! (fingerprint-verified, refusing a changed page) and skips the returned
+//! prefix, and the server's own cursor surfaces only after the fetched page
+//! is exhausted, so no entry is skipped or duplicated.
 
 use super::remote::ResourceRpcError;
 use super::{McpBackend, ToolFilter};
@@ -66,6 +69,9 @@ pub(crate) struct McpResourceState {
     pub(crate) excluded: BTreeSet<String>,
     /// Configured servers that failed bounded startup (optional and sanitized).
     pub(crate) unavailable: BTreeSet<String>,
+    /// Configured servers whose namespace is permitted but which kept no
+    /// admitted surface (every declared tool was individually excluded).
+    pub(crate) unretained: BTreeSet<String>,
 }
 
 /// Build the resource helper tools admitted by `filter`. Returns an empty vec
@@ -109,6 +115,9 @@ enum ServerAccess {
     NotConfigured,
     ExcludedByPolicy,
     Unavailable,
+    /// Configured, namespace permitted, but no admitted tool or resource
+    /// surface survived (every declared tool was individually excluded).
+    NoSurface,
 }
 
 fn access(shared: &McpResourceState, server: &str) -> ServerAccess {
@@ -120,6 +129,9 @@ fn access(shared: &McpResourceState, server: &str) -> ServerAccess {
     }
     if shared.unavailable.contains(server) {
         return ServerAccess::Unavailable;
+    }
+    if shared.unretained.contains(server) {
+        return ServerAccess::NoSurface;
     }
     ServerAccess::NotConfigured
 }
@@ -198,7 +210,11 @@ fn valid_resource_uri(uri: &str) -> bool {
     if uri.chars().any(char::is_control) {
         return false;
     }
-    let scheme = uri.split(':').next().unwrap_or_default();
+    // An absolute URI requires a scheme delimiter; a bare word is never an
+    // address, even when the word itself looks like a valid scheme.
+    let Some((scheme, _rest)) = uri.split_once(':') else {
+        return false;
+    };
     scheme
         .chars()
         .next()
@@ -297,6 +313,207 @@ fn project_entry(entry: Value) -> (Option<Value>, EntryProjection) {
     (Some(Value::Object(object)), projection)
 }
 
+// ---------------------------------------------------------------------------
+// stateless continuation cursors
+// ---------------------------------------------------------------------------
+
+/// Opaque continuation envelope for helper-emitted listing cursors. Every
+/// `nextCursor` this helper surface emits uses this envelope, so a helper
+/// cursor can never be confused with a raw server cursor. The design is
+/// stateless: resuming within a locally trimmed page re-fetches the same
+/// upstream page (identified by the upstream cursor that produced it plus a
+/// page fingerprint) and skips the already-returned prefix; a changed upstream
+/// page refuses the cursor instead of silently skipping entries.
+mod continuation {
+    use super::error_envelope;
+    use base64::Engine as _;
+    use bro_tools::ToolResult;
+    use serde_json::Value;
+
+    const PREFIX: &str = "bbxr1.";
+    const VERSION: u8 = 1;
+    /// Bounded cursor input; anything longer is malformed rather than cached.
+    pub(super) const MAX_CURSOR_BYTES: usize = 8 * 1024;
+    /// Fingerprint text fields are bounded so a server cannot inflate the
+    /// cursor through them.
+    const FINGERPRINT_TEXT_BYTES: usize = 256;
+
+    /// Identity of one fetched upstream page, verified on resume.
+    #[derive(serde::Serialize, serde::Deserialize, PartialEq, Eq, Clone)]
+    pub(super) struct PageFingerprint {
+        /// Entry count.
+        n: usize,
+        /// Serialized page length in bytes.
+        b: usize,
+        /// FNV-1a 64 over the serialized page.
+        h: u64,
+        /// Bounded echo of the upstream next cursor (truncated).
+        t: Option<String>,
+    }
+
+    /// How to continue one listing.
+    #[derive(Clone)]
+    pub(super) enum Plan {
+        /// Resume at `offset` inside the page fetched with `upstream`
+        /// (None = first page), verified by `fingerprint`.
+        Resume {
+            upstream: Option<String>,
+            offset: usize,
+            fingerprint: PageFingerprint,
+        },
+        /// Fetch the next upstream page starting at this server cursor.
+        Upstream(String),
+    }
+
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct Envelope {
+        v: u8,
+        s: String,
+        k: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        r: Option<ResumeMark>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        u: Option<String>,
+    }
+
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct ResumeMark {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        c: Option<String>,
+        o: usize,
+        f: PageFingerprint,
+    }
+
+    fn malformed(detail: &str) -> ToolResult {
+        error_envelope(
+            "mcp_bad_input",
+            format!("malformed resource listing cursor: {detail}"),
+        )
+    }
+
+    pub(super) fn encode(server: &str, kind: &str, plan: &Plan) -> String {
+        let envelope = match plan {
+            Plan::Resume {
+                upstream,
+                offset,
+                fingerprint,
+            } => Envelope {
+                v: VERSION,
+                s: server.to_owned(),
+                k: kind.to_owned(),
+                r: Some(ResumeMark {
+                    c: upstream.clone(),
+                    o: *offset,
+                    f: fingerprint.clone(),
+                }),
+                u: None,
+            },
+            Plan::Upstream(upstream) => Envelope {
+                v: VERSION,
+                s: server.to_owned(),
+                k: kind.to_owned(),
+                r: None,
+                u: Some(upstream.clone()),
+            },
+        };
+        let json = serde_json::to_string(&envelope).unwrap_or_default();
+        format!(
+            "{PREFIX}{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json)
+        )
+    }
+
+    /// Decode a caller-supplied cursor against the requesting server and
+    /// listing kind. Binding, shape, version, and size are all explicit.
+    pub(super) fn decode(raw: &str, server: &str, kind: &str) -> Result<Plan, ToolResult> {
+        if raw.len() > MAX_CURSOR_BYTES {
+            return Err(malformed("exceeds the cursor size bound"));
+        }
+        let Some(encoded) = raw.strip_prefix(PREFIX) else {
+            return Err(malformed("unknown cursor format"));
+        };
+        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(encoded)
+            .map_err(|_| malformed("invalid cursor encoding"))?;
+        let envelope: Envelope =
+            serde_json::from_slice(&decoded).map_err(|_| malformed("invalid cursor body"))?;
+        if envelope.v != VERSION {
+            return Err(malformed("unsupported cursor version"));
+        }
+        if envelope.s != server {
+            return Err(error_envelope(
+                "mcp_bad_input",
+                format!(
+                    "cursor is bound to MCP server '{}'; request a fresh cursor from the '{}' listing",
+                    envelope.s, server
+                ),
+            ));
+        }
+        if envelope.k != kind {
+            return Err(error_envelope(
+                "mcp_bad_input",
+                format!(
+                    "cursor is bound to the '{}' listing; request a fresh cursor from the matching helper",
+                    envelope.k
+                ),
+            ));
+        }
+        match (envelope.r, envelope.u) {
+            (Some(mark), None) => Ok(Plan::Resume {
+                upstream: mark.c,
+                offset: mark.o,
+                fingerprint: mark.f,
+            }),
+            (None, Some(upstream)) => Ok(Plan::Upstream(upstream)),
+            _ => Err(malformed("cursor carries both or neither continuation")),
+        }
+    }
+
+    fn entry_address(item: &Value) -> Option<String> {
+        item.get("uri")
+            .or_else(|| item.get("uriTemplate"))
+            .and_then(Value::as_str)
+            .map(|text| {
+                let cut = text
+                    .char_indices()
+                    .map(|(index, _)| index)
+                    .take_while(|index| *index <= FINGERPRINT_TEXT_BYTES)
+                    .last()
+                    .unwrap_or(0);
+                text[..cut].to_owned()
+            })
+    }
+
+    fn fnv1a64(bytes: &[u8]) -> u64 {
+        bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
+    }
+
+    /// Fingerprint one raw fetched page (entries plus the upstream next
+    /// cursor). Bounded inputs only; never caches page content.
+    pub(super) fn page_fingerprint(
+        items: &[Value],
+        next_cursor: &Option<String>,
+    ) -> PageFingerprint {
+        let serialized = serde_json::to_string(items).unwrap_or_default();
+        PageFingerprint {
+            n: items.len(),
+            b: serialized.len(),
+            h: fnv1a64(serialized.as_bytes()),
+            t: next_cursor.as_deref().map(|cursor| {
+                let cut = cursor
+                    .char_indices()
+                    .map(|(index, _)| index)
+                    .take_while(|index| *index <= FINGERPRINT_TEXT_BYTES)
+                    .last()
+                    .unwrap_or(0);
+                cursor[..cut].to_owned()
+            }),
+        }
+    }
+}
+
 /// Receipt for one bounded listing.
 #[derive(Clone, Default)]
 struct ListingReceipt {
@@ -319,7 +536,7 @@ impl ListingReceipt {
                 object.insert("omitted".into(), json!(self.omitted_local));
                 object.insert(
                     "note".into(),
-                    json!("Trimmed to fit the result budget; cursor withheld because the dropped entries have no knowable server cursor."),
+                    json!("Trimmed to fit the result budget; continue with this page's nextCursor to resume after the returned entries."),
                 );
             }
             if self.malformed > 0 {
@@ -336,25 +553,28 @@ impl ListingReceipt {
 }
 
 /// Serialize a listing to a bounded page. Entries are dropped from the tail
-/// until the complete receipt (including all truncation metadata and the
-/// cursor decision) fits. The server cursor is forwarded only when the page
-/// was not locally trimmed, so dropped entries can never be skipped silently.
+/// until the complete receipt (including the cursor decision for that page
+/// size) fits. `next_cursor_for(returned)` supplies the continuation cursor
+/// for a given returned count, so locally trimmed pages hand back a resumable
+/// cursor instead of making the dropped entries unreachable.
 fn bound_listing(
     mut entries: Vec<Value>,
     mut receipt: ListingReceipt,
     envelope: Value,
-    next_cursor: Option<String>,
     field: &str,
     budget: usize,
+    next_cursor_for: impl Fn(usize) -> Option<String>,
 ) -> ToolResult {
+    let mut payload = envelope;
     loop {
-        let mut payload = envelope.clone();
         payload[field] = Value::Array(entries.clone());
         receipt.returned = entries.len();
         receipt.omitted_local = receipt.total.saturating_sub(entries.len());
-        let complete = receipt.omitted_local == 0 && receipt.malformed == 0;
-        if complete && next_cursor.is_some() {
-            payload["nextCursor"] = json!(next_cursor);
+        match next_cursor_for(entries.len()) {
+            Some(cursor) => payload["nextCursor"] = Value::String(cursor),
+            None => {
+                payload.as_object_mut().unwrap().remove("nextCursor");
+            }
         }
         receipt.apply(&mut payload);
         let serialized = serde_json::to_string(&payload).unwrap_or_default().len();
@@ -390,14 +610,22 @@ enum ListFailure {
     Explicit(ToolResult),
     /// Remote completion unknown; the whole call must return this envelope.
     Uncertain(ToolResult),
+    /// The request was never dispatched (session cancellation). Fan-out must
+    /// not bury it in a completed-looking receipt; the envelope is the call's
+    /// own result.
+    NotSent(ToolResult),
 }
 
 impl ListFailure {
     fn explicit(self) -> ToolResult {
         match self {
-            Self::Explicit(result) | Self::Uncertain(result) => result,
+            Self::Explicit(result) | Self::Uncertain(result) | Self::NotSent(result) => result,
         }
     }
+}
+
+fn not_sent_envelope(message: String) -> ToolResult {
+    error_envelope("mcp_cancelled_before_dispatch", message)
 }
 
 struct ListResourcesTool {
@@ -417,6 +645,15 @@ impl ListResourcesTool {
     fn field(&self) -> &'static str {
         if self.templates {
             "resourceTemplates"
+        } else {
+            "resources"
+        }
+    }
+
+    /// Continuation-cursor binding tag for the listing kind.
+    fn kind_tag(&self) -> &'static str {
+        if self.templates {
+            "templates"
         } else {
             "resources"
         }
@@ -448,7 +685,7 @@ impl ListResourcesTool {
                         Err(ListFailure::Uncertain(envelope))
                     }
                     Err(ResourceRpcError::NotSent(message)) => {
-                        Err(ListFailure::Explicit(ToolResult::Error(message)))
+                        Err(ListFailure::NotSent(not_sent_envelope(message)))
                     }
                     Err(ResourceRpcError::Server { message, .. }) => Err(ListFailure::Explicit(
                         resource_call_failed(server, operation, &message),
@@ -493,6 +730,12 @@ impl ListResourcesTool {
                 "mcp_server_unavailable",
                 format!("MCP server '{server}' is unavailable this session"),
             )),
+            ServerAccess::NoSurface => Err(error_envelope(
+                "mcp_server_no_surface",
+                format!(
+                    "MCP server '{server}' is configured but has no admitted tool or resource surface this session"
+                ),
+            )),
         }
     }
 
@@ -527,9 +770,9 @@ impl Tool for ListResourcesTool {
     }
     fn description(&self) -> &str {
         if self.templates {
-            "List resource templates exposed by admitted MCP servers. Templates are parameterized URI patterns (RFC 6570) for read-only server context; expand a template into a concrete URI, then read it with read_mcp_resource. Omit server to list the first page from every admitted server that declares the resources capability (servers without it are skipped); pass server with cursor to page one server's listing using the nextCursor from a previous untrimmed page. Only session-admitted servers are addressable; servers excluded by session tool policy are refused. Output is byte-bounded: a page trimmed to fit reports returned/omitted and forwards no cursor."
+            "List resource templates exposed by admitted MCP servers. Templates are parameterized URI patterns (RFC 6570) for read-only server context; expand a template into a concrete URI, then read it with read_mcp_resource. Omit server to list the first page from every admitted server that declares the resources capability (servers without it are skipped); pass server with cursor to page one server's listing using the nextCursor from a previous page. Cursors are bound to one server and listing kind; a page trimmed to fit the result budget emits a continuation cursor that resumes after the returned entries, the server's own cursor surfaces once a fetched page is exhausted, and a server page that changed under a continuation cursor fails explicitly. Only session-admitted servers are addressable; servers excluded by session tool policy are refused."
         } else {
-            "List resources exposed by admitted MCP servers. Resources are server-owned read-only context objects addressed by URI; prefer them over re-deriving the same data through tools. Omit server to list the first page from every admitted server that declares the resources capability (servers without it are skipped); pass server with cursor to page one server's listing using the nextCursor from a previous untrimmed page. Only session-admitted servers are addressable; servers excluded by session tool policy are refused. Output is byte-bounded: a page trimmed to fit reports returned/omitted and forwards no cursor."
+            "List resources exposed by admitted MCP servers. Resources are server-owned read-only context objects addressed by URI; prefer them over re-deriving the same data through tools. Omit server to list the first page from every admitted server that declares the resources capability (servers without it are skipped); pass server with cursor to page one server's listing using the nextCursor from a previous page. Cursors are bound to one server and listing kind; a page trimmed to fit the result budget emits a continuation cursor that resumes after the returned entries, the server's own cursor surfaces once a fetched page is exhausted, and a server page that changed under a continuation cursor fails explicitly. Only session-admitted servers are addressable; servers excluded by session tool policy are refused."
         }
     }
     fn input_schema(&self) -> Value {
@@ -602,20 +845,82 @@ impl Tool for ListResourcesTool {
                     Ok(backend) => backend,
                     Err(error) => return error,
                 };
+                // Decode the continuation plan before any dispatch: binding,
+                // kind, shape, and size errors are explicit and local.
+                let kind = self.kind_tag();
+                let plan = match cursor.as_deref() {
+                    None => None,
+                    Some(raw) => match continuation::decode(raw, &server, kind) {
+                        Ok(plan) => Some(plan),
+                        Err(error) => return error,
+                    },
+                };
+                let (upstream_cursor, offset, expected) = match plan {
+                    None => (None, 0, None),
+                    Some(continuation::Plan::Resume {
+                        upstream,
+                        offset,
+                        fingerprint,
+                    }) => (upstream, offset, Some(fingerprint)),
+                    Some(continuation::Plan::Upstream(cursor)) => (Some(cursor), 0, None),
+                };
                 match self
-                    .list_server(&backend, &server, cursor, &cx.cancellation)
+                    .list_server(&backend, &server, upstream_cursor.clone(), &cx.cancellation)
                     .await
                 {
                     Ok((items, next_cursor)) => {
-                        let (entries, receipt) = self.project_page(items);
-                        let envelope = json!({"server":server});
+                        let fingerprint = continuation::page_fingerprint(&items, &next_cursor);
+                        if let Some(expected) = expected {
+                            if expected != fingerprint {
+                                return error_envelope(
+                                    "mcp_stale_resource_page",
+                                    "the server's page changed under the continuation cursor; restart this listing from its first page".into(),
+                                );
+                            }
+                        }
+                        let (entries, mut receipt) = self.project_page(items);
+                        if offset > entries.len() {
+                            return error_envelope(
+                                "mcp_stale_resource_page",
+                                "continuation offset is out of range for the current page; restart this listing from its first page".into(),
+                            );
+                        }
+                        let window_total = entries.len() - offset;
+                        // The receipt covers this call's window; malformed
+                        // entries stay disclosed without inflating the total.
+                        receipt.total = window_total;
+                        let visible = entries.split_off(offset);
+                        let envelope = json!({"server":server, "pageOffset":offset});
+                        let resume_upstream = upstream_cursor.clone();
+                        let exhausted_cursor = next_cursor.clone();
+                        let server_for_cursor = server.clone();
                         bound_listing(
-                            entries,
+                            visible,
                             receipt,
                             envelope,
-                            next_cursor,
                             self.field(),
                             budget,
+                            move |returned| {
+                                if returned < window_total {
+                                    Some(continuation::encode(
+                                        &server_for_cursor,
+                                        kind,
+                                        &continuation::Plan::Resume {
+                                            upstream: resume_upstream.clone(),
+                                            offset: offset + returned,
+                                            fingerprint: fingerprint.clone(),
+                                        },
+                                    ))
+                                } else {
+                                    exhausted_cursor.as_ref().map(|upstream| {
+                                        continuation::encode(
+                                            &server_for_cursor,
+                                            kind,
+                                            &continuation::Plan::Upstream(upstream.clone()),
+                                        )
+                                    })
+                                }
+                            },
                         )
                     }
                     Err(failure) => failure.explicit(),
@@ -655,15 +960,26 @@ impl Tool for ListResourcesTool {
                     {
                         Ok((items, next_cursor)) => {
                             // Fan-out trims whole server groups only; each
-                            // surviving page is complete, so its server cursor
-                            // stays honest.
+                            // surviving page is complete, so its per-server
+                            // cursor is an upstream continuation envelope.
                             let (entries, receipt) = self.project_page(items);
                             let field = self.field();
+                            let kind = self.kind_tag();
+                            let cursor = next_cursor.as_ref().map(|upstream| {
+                                continuation::encode(
+                                    &server,
+                                    kind,
+                                    &continuation::Plan::Upstream(upstream.clone()),
+                                )
+                            });
                             let mut page = json!({
                                 "server":server,
-                                "nextCursor":next_cursor,
                             });
                             page[field] = Value::Array(entries);
+                            match cursor {
+                                Some(cursor) => page["nextCursor"] = Value::String(cursor),
+                                None => page["nextCursor"] = Value::Null,
+                            }
                             if receipt.malformed > 0 {
                                 page["omitted_malformed"] = json!(receipt.malformed);
                             }
@@ -672,10 +988,12 @@ impl Tool for ListResourcesTool {
                             }
                             pages.push(page);
                         }
-                        // Fan-out never buries an uncertain outcome: the
-                        // connection is quarantined and the envelope must be
-                        // this call's own result.
+                        // Fan-out never buries an uncertain outcome or a
+                        // pre-dispatch cancellation in a completed-looking
+                        // receipt: the envelope must be this call's own
+                        // result.
                         Err(ListFailure::Uncertain(envelope)) => return envelope,
+                        Err(ListFailure::NotSent(envelope)) => return envelope,
                         Err(ListFailure::Explicit(ToolResult::Error(envelope))) => {
                             pages.push(json!({
                                 "server":server,
@@ -839,6 +1157,14 @@ impl Tool for ReadResourceTool {
                     format!("MCP server '{server}' is unavailable this session"),
                 );
             }
+            ServerAccess::NoSurface => {
+                return error_envelope(
+                    "mcp_server_no_surface",
+                    format!(
+                        "MCP server '{server}' is configured but has no admitted tool or resource surface this session"
+                    ),
+                );
+            }
         };
         if !resources_supported(&backend) {
             return capability_absent_error(server);
@@ -848,7 +1174,7 @@ impl Tool for ReadResourceTool {
                 match connection.read_resource(uri, &cx.cancellation).await {
                     Ok(contents) => contents,
                     Err(ResourceRpcError::Uncertain(envelope)) => return envelope,
-                    Err(ResourceRpcError::NotSent(message)) => return ToolResult::Error(message),
+                    Err(ResourceRpcError::NotSent(message)) => return not_sent_envelope(message),
                     Err(ResourceRpcError::Server { message, .. }) => {
                         return resource_call_failed(server, "resources/read", &message);
                     }
@@ -874,13 +1200,14 @@ fn read_result(server: &str, uri: &str, contents: Vec<Value>, budget: usize) -> 
     let allowance = budget.saturating_sub(512) / contents.len().max(1);
     let mut projected: Vec<Value> = Vec::with_capacity(contents.len());
     let mut truncated = false;
+    let mut malformed = 0_usize;
     for content in contents {
         match project_content(content, allowance) {
             Some(value) => {
                 truncated |= value.get("textTruncated").and_then(Value::as_bool) == Some(true);
                 projected.push(value);
             }
-            None => truncated = true,
+            None => malformed += 1,
         }
     }
     let total = projected.len();
@@ -892,6 +1219,9 @@ fn read_result(server: &str, uri: &str, contents: Vec<Value>, budget: usize) -> 
         });
         if truncated {
             payload["truncated"] = json!(true);
+        }
+        if malformed > 0 {
+            payload["omitted_malformed"] = json!(malformed);
         }
         if projected.len() < total {
             payload["omittedContents"] = json!(total - projected.len());
@@ -924,17 +1254,11 @@ fn project_content(content: Value, text_allowance: usize) -> Option<Value> {
     if !valid_resource_uri(content_uri) {
         return None;
     }
-    // Binary payloads need native media transport; omit with the encoded byte
-    // count rather than feeding base64 into model text.
-    let mut binary = false;
-    if let Some(blob) = object.remove("blob") {
-        binary = true;
-        let encoded = blob.as_str().map(str::len).unwrap_or(0);
-        object.insert("omittedEncodedBytes".into(), json!(encoded));
-    }
-    // Retain only the known scalar fields; unknown server-controlled bulk
-    // (icons, extensions, ...) is dropped and disclosed by name.
-    let keep = ["uri", "mimeType", "text", "size"];
+    // Retain only the known scalar fields (plus `blob`, replaced below with
+    // its byte-count disclosure); unknown server-controlled bulk (icons,
+    // extensions, ...) is dropped and disclosed by name FIRST, so the fields
+    // this projection adds afterwards survive.
+    let keep = ["uri", "mimeType", "text", "size", "blob"];
     let keys: Vec<String> = object.keys().cloned().collect();
     let mut dropped = Vec::new();
     for key in keys {
@@ -943,6 +1267,15 @@ fn project_content(content: Value, text_allowance: usize) -> Option<Value> {
             dropped.push(key);
         }
     }
+    // Binary payloads need native media transport; omit with the encoded byte
+    // count rather than feeding base64 into model text.
+    let binary = if let Some(blob) = object.remove("blob") {
+        let encoded = blob.as_str().map(str::len).unwrap_or(0);
+        object.insert("omittedEncodedBytes".into(), json!(encoded));
+        true
+    } else {
+        false
+    };
     if let Some(text) = object.get("text").and_then(Value::as_str) {
         if text.len() > text_allowance {
             let cut = text
@@ -1191,14 +1524,34 @@ mod tests {
         let page = &fan["servers"][0];
         assert_eq!(page["server"], "fixture");
         assert_eq!(page["resources"].as_array().unwrap().len(), 2);
-        assert_eq!(page["nextCursor"], "page2");
+        // Fan-out pages hand back per-server continuation envelopes.
+        let fan_cursor = page["nextCursor"].as_str().unwrap().to_owned();
+        assert!(fan_cursor.starts_with("bbxr1."), "{fan_cursor}");
 
+        // The fan-out cursor threads into the single-server listing and
+        // reaches the same second page the server would have paged to.
         let second = parse_json(
-            list.call(json!({"server":"fixture","cursor":"page2"}), &cx)
+            list.call(json!({"server":"fixture","cursor":fan_cursor}), &cx)
                 .await,
         );
         assert_eq!(second["resources"].as_array().unwrap().len(), 1);
-        assert!(second.get("nextCursor").is_none() || second["nextCursor"].is_null());
+        assert_eq!(second["resources"][0]["uri"], "memo:/gamma");
+        assert!(
+            second.get("nextCursor").is_none(),
+            "a complete final page carries no cursor"
+        );
+
+        // A direct single-server listing pages through the same envelope
+        // cursors; the raw upstream cursor never crosses the boundary.
+        let first = parse_json(list.call(json!({"server":"fixture"}), &cx).await);
+        assert_eq!(first["resources"].as_array().unwrap().len(), 2);
+        let first_cursor = first["nextCursor"].as_str().unwrap().to_owned();
+        assert!(first_cursor.starts_with("bbxr1."), "{first_cursor}");
+        let second = parse_json(
+            list.call(json!({"server":"fixture","cursor":first_cursor}), &cx)
+                .await,
+        );
+        assert_eq!(second["resources"][0]["uri"], "memo:/gamma");
 
         let templates = loaded.tools[1].clone();
         let templ = parse_json(templates.call(json!({}), &cx).await);
@@ -1236,7 +1589,7 @@ mod tests {
         );
         assert_eq!(again["contents"][0]["text"], "alpha body");
         let logged = calls.lock().unwrap().clone();
-        assert_eq!(logged.len(), 5, "{logged:?}");
+        assert_eq!(logged.len(), 7, "{logged:?}");
     }
 
     #[tokio::test]
@@ -1415,20 +1768,290 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn outputs_are_bounded_without_fabricating_addresses_or_cursors() {
-        let (surface, _calls) = ResourceOnly::new();
+    async fn continuation_cursors_fail_explicitly_on_malformed_or_stale_use() {
         let loaded = load_mcp_tools_from_config(
-            &config(vec![in_process("fixture", Arc::new(surface))]),
+            &config(vec![in_process("fixture", Arc::new(ResourceOnly::new().0))]),
             &ToolFilter::default(),
         )
         .await
         .unwrap();
-        let read = loaded.tools[2].clone();
+        let list = loaded.tools[0].clone();
+        let templates = loaded.tools[1].clone();
+        let cx = temp_cx(0);
 
-        // Single-server trim: entries dropped, no misleading cursor.
-        struct ManyResources;
+        // Malformed cursors: unknown format, oversize, bad base64 body.
+        for raw in [
+            "nonsense".to_owned(),
+            format!("bbxr1.{}", "x".repeat(9_000)),
+            "bbxr1.!!!".to_owned(),
+        ] {
+            let (code, value) = error_code(
+                list.call(json!({"server":"fixture","cursor":raw}), &cx)
+                    .await,
+            );
+            assert_eq!(code, "mcp_bad_input", "{value}");
+            assert!(
+                value["structuredContent"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("malformed resource listing cursor")
+            );
+        }
+
+        // Wrong server binding.
+        let foreign = continuation::encode(
+            "other",
+            "resources",
+            &continuation::Plan::Upstream("page2".into()),
+        );
+        let (code, value) = error_code(
+            list.call(json!({"server":"fixture","cursor":foreign}), &cx)
+                .await,
+        );
+        assert_eq!(code, "mcp_bad_input");
+        assert!(
+            value["structuredContent"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("bound to MCP server 'other'")
+        );
+
+        // Wrong listing kind.
+        let wrong_kind = continuation::encode(
+            "fixture",
+            "templates",
+            &continuation::Plan::Upstream("page2".into()),
+        );
+        let (code, value) = error_code(
+            list.call(json!({"server":"fixture","cursor":wrong_kind}), &cx)
+                .await,
+        );
+        assert_eq!(code, "mcp_bad_input");
+        assert!(
+            value["structuredContent"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("bound to the 'templates' listing")
+        );
+
+        // An out-of-range resume offset is refused, not silently clamped.
+        let first_page = vec![
+            resource("memo:/alpha", "alpha"),
+            resource("memo:/beta", "beta"),
+        ];
+        let fingerprint = continuation::page_fingerprint(&first_page, &Some("page2".into()));
+        let forged = continuation::encode(
+            "fixture",
+            "resources",
+            &continuation::Plan::Resume {
+                upstream: None,
+                offset: 99,
+                fingerprint,
+            },
+        );
+        let (code, value) = error_code(
+            list.call(json!({"server":"fixture","cursor":forged}), &cx)
+                .await,
+        );
+        assert_eq!(code, "mcp_stale_resource_page");
+        assert!(
+            value["structuredContent"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("out of range")
+        );
+
+        // A resources-kind cursor cannot be consumed by the templates
+        // listing even when well-formed for the same server.
+        let resource_cursor = continuation::encode(
+            "fixture",
+            "resources",
+            &continuation::Plan::Upstream("page2".into()),
+        );
+        let (code, value) = error_code(
+            templates
+                .call(json!({"server":"fixture","cursor":resource_cursor}), &cx)
+                .await,
+        );
+        assert_eq!(code, "mcp_bad_input");
+        assert!(
+            value["structuredContent"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("bound to the 'resources' listing")
+        );
+    }
+
+    #[tokio::test]
+    async fn changed_upstream_page_refuses_continuation() {
+        /// First fetch returns the original page; every later fetch of the
+        /// same upstream cursor returns a mutated page.
+        struct MutatingPage {
+            fetches: std::sync::atomic::AtomicUsize,
+        }
         #[async_trait]
-        impl McpSurface for ManyResources {
+        impl McpSurface for MutatingPage {
+            async fn list_tools(&self) -> Result<Vec<crate::mcp::McpToolSpec>> {
+                Ok(vec![])
+            }
+            async fn call_tool(&self, _: &str, _: Value) -> Result<ToolResult> {
+                bail!("no tools")
+            }
+            fn resources_supported(&self) -> bool {
+                true
+            }
+            async fn list_resources(&self, _: Option<String>) -> Result<ResourcePage> {
+                let fetches = self
+                    .fetches
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let entry = |uri: &str, name: &str| json!({"uri":uri, "name":name, "description":"d".repeat(220), "mimeType":"text/plain"});
+                let items = if fetches == 0 {
+                    vec![
+                        entry("memo:/one", "one"),
+                        entry("memo:/two", "two"),
+                        entry("memo:/three", "three"),
+                    ]
+                } else {
+                    vec![
+                        entry("memo:/one", "one"),
+                        entry("memo:/mutated", "mutated"),
+                        entry("memo:/three", "three"),
+                    ]
+                };
+                Ok(ResourcePage {
+                    items,
+                    next_cursor: Some("page2".into()),
+                })
+            }
+            async fn read_resource(&self, _: &str) -> Result<Vec<Value>> {
+                bail!("no such resource")
+            }
+        }
+        let loaded = load_mcp_tools_from_config(
+            &config(vec![in_process(
+                "mutating",
+                Arc::new(MutatingPage {
+                    fetches: std::sync::atomic::AtomicUsize::new(0),
+                }),
+            )]),
+            &ToolFilter::default(),
+        )
+        .await
+        .unwrap();
+        let list = loaded.tools[0].clone();
+        let tight = temp_cx(500);
+        let first = parse_json(list.call(json!({"server":"mutating"}), &tight).await);
+        assert_eq!(first["truncated"], true);
+        let resume = first["nextCursor"].as_str().unwrap().to_owned();
+        assert!(resume.starts_with("bbxr1."), "{resume}");
+        let (code, value) = error_code(
+            list.call(json!({"server":"mutating","cursor":resume}), &tight)
+                .await,
+        );
+        assert_eq!(code, "mcp_stale_resource_page");
+        assert!(
+            value["structuredContent"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("changed under the continuation cursor")
+        );
+    }
+
+    #[tokio::test]
+    async fn persistent_malformed_rows_do_not_block_traversal() {
+        // A permanently malformed entry is omitted with a counted receipt on
+        // every page it appears on, but the continuation cursor keeps moving
+        // and the upstream page is still reachable: no traversal deadlock.
+        struct MalformedRow;
+        #[async_trait]
+        impl McpSurface for MalformedRow {
+            async fn list_tools(&self) -> Result<Vec<crate::mcp::McpToolSpec>> {
+                Ok(vec![])
+            }
+            async fn call_tool(&self, _: &str, _: Value) -> Result<ToolResult> {
+                bail!("no tools")
+            }
+            fn resources_supported(&self) -> bool {
+                true
+            }
+            async fn list_resources(&self, cursor: Option<String>) -> Result<ResourcePage> {
+                match cursor.as_deref() {
+                    None => {
+                        let mut items = vec![json!({
+                            "uri":"not-a-uri", "name":"broken", "mimeType":"text/plain"
+                        })];
+                        items.extend(
+                            (0..8)
+                                .map(|index| {
+                                    resource(
+                                        &format!("memo:/row-{index:02}"),
+                                        &format!("row-{index:02}"),
+                                    )
+                                })
+                                .collect::<Vec<_>>(),
+                        );
+                        Ok(ResourcePage {
+                            items,
+                            next_cursor: Some("page2".into()),
+                        })
+                    }
+                    Some("page2") => Ok(ResourcePage {
+                        items: vec![resource("memo:/row-08", "row-08")],
+                        next_cursor: None,
+                    }),
+                    Some(other) => bail!("unknown upstream cursor {other}"),
+                }
+            }
+            async fn read_resource(&self, _: &str) -> Result<Vec<Value>> {
+                bail!("no such resource")
+            }
+        }
+        let loaded = load_mcp_tools_from_config(
+            &config(vec![in_process("rows", Arc::new(MalformedRow))]),
+            &ToolFilter::default(),
+        )
+        .await
+        .unwrap();
+        let list = loaded.tools[0].clone();
+        let cx = temp_cx(450);
+        let mut seen: Vec<String> = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut malformed_pages = 0;
+        for _ in 0..20 {
+            let input = match cursor.clone() {
+                Some(cursor) => json!({"server":"rows","cursor":cursor}),
+                None => json!({"server":"rows"}),
+            };
+            let page = parse_json(list.call(input, &cx).await);
+            for entry in page["resources"].as_array().unwrap() {
+                seen.push(entry["uri"].as_str().unwrap().to_owned());
+            }
+            if page["omitted_malformed"]
+                .as_u64()
+                .is_some_and(|count| count > 0)
+            {
+                malformed_pages += 1;
+            }
+            cursor = page["nextCursor"].as_str().map(str::to_owned);
+            if cursor.is_none() {
+                break;
+            }
+        }
+        let expected: Vec<String> = (0..9)
+            .map(|index| format!("memo:/row-{index:02}"))
+            .collect();
+        assert_eq!(
+            seen, expected,
+            "malformed rows must be omitted without blocking or duplicating traversal"
+        );
+        assert!(malformed_pages >= 1, "the malformed row must be counted");
+    }
+
+    #[tokio::test]
+    async fn read_counts_malformed_contents_and_requires_absolute_uris() {
+        struct MixedContents;
+        #[async_trait]
+        impl McpSurface for MixedContents {
             async fn list_tools(&self) -> Result<Vec<crate::mcp::McpToolSpec>> {
                 Ok(vec![])
             }
@@ -1440,47 +2063,238 @@ mod tests {
             }
             async fn list_resources(&self, _: Option<String>) -> Result<ResourcePage> {
                 Ok(ResourcePage {
-                    items: (0..10)
-                        .map(|index| {
-                            resource(
-                                &format!("memo:/item-{index:02}"),
-                                &format!("item-{index:02}"),
-                            )
-                        })
-                        .collect(),
-                    next_cursor: Some("page2".into()),
+                    items: vec![],
+                    next_cursor: None,
                 })
+            }
+            async fn read_resource(&self, uri: &str) -> Result<Vec<Value>> {
+                match uri {
+                    "memo:/mixed" => Ok(vec![
+                        json!({"uri":"memo:/mixed","mimeType":"text/plain","text":"kept"}),
+                        json!({"uri":"no-scheme","mimeType":"text/plain","text":"dropped"}),
+                    ]),
+                    _ => bail!("no such resource"),
+                }
+            }
+        }
+        let loaded = load_mcp_tools_from_config(
+            &config(vec![in_process("mixed", Arc::new(MixedContents))]),
+            &ToolFilter::default(),
+        )
+        .await
+        .unwrap();
+        let read = loaded.tools[2].clone();
+        let cx = temp_cx(0);
+        let body = parse_json(
+            read.call(json!({"server":"mixed","uri":"memo:/mixed"}), &cx)
+                .await,
+        );
+        assert_eq!(body["contents"].as_array().unwrap().len(), 1);
+        assert_eq!(body["contents"][0]["text"], "kept");
+        assert_eq!(body["omitted_malformed"], 1);
+        // A scheme-looking word without a colon is not an address.
+        let (code, _) = error_code(
+            read.call(json!({"server":"mixed","uri":"mailto"}), &cx)
+                .await,
+        );
+        assert_eq!(code, "mcp_malformed_resource_uri");
+    }
+
+    #[tokio::test]
+    async fn unretained_and_cancelled_servers_fail_with_distinct_codes() {
+        // Namespace permitted but every tool individually excluded: the
+        // server is configured and distinguishable from unknown.
+        let mut mixed = config(vec![
+            in_process("live", Arc::new(ResourceOnly::new().0)),
+            in_process("shadow", Arc::new(ToolOnly)),
+        ]);
+        mixed.server_policies.insert(
+            "shadow".into(),
+            crate::mcp::McpServerPolicy {
+                exclude_tools: vec!["probe".into()],
+                ..Default::default()
+            },
+        );
+        let loaded = load_mcp_tools_from_config(&mixed, &ToolFilter::default())
+            .await
+            .unwrap();
+        let list = loaded.tools[0].clone();
+        let cx = temp_cx(0);
+        let (code, value) = error_code(list.call(json!({"server":"shadow"}), &cx).await);
+        assert_eq!(code, "mcp_server_no_surface");
+        assert!(
+            value["structuredContent"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("no admitted tool or resource surface")
+        );
+
+        // Pre-dispatch cancellation is its own classified outcome and is
+        // never buried in a fan-out receipt.
+        let fixture = remote_fixture(5000, true, false).await;
+        let tools = remote_tools(fixture.connection.clone());
+        let directory = tempfile::tempdir().unwrap();
+        let cancelled_cx = cx(directory.path().canonicalize().unwrap(), 0);
+        cancelled_cx.cancellation.cancel();
+        let (code, _) = error_code(
+            tools[0]
+                .clone()
+                .call(json!({"server":"fixture"}), &cancelled_cx)
+                .await,
+        );
+        assert_eq!(code, "mcp_cancelled_before_dispatch");
+        {
+            let requests = fixture.requests.lock().unwrap();
+            assert!(
+                requests
+                    .iter()
+                    .all(|request| request["method"] != "resources/list"),
+                "a cancelled call must not dispatch a resource RPC"
+            );
+        }
+        close_remote(fixture).await;
+
+        // Fan-out with a cancelled remote server returns the cancellation
+        // envelope as the call's own result, not a partial listing.
+        let fixture = remote_fixture(5000, true, false).await;
+        let mut state = McpResourceState::default();
+        state.admitted.insert(
+            "a-local".into(),
+            McpBackend::InProcess(Arc::new(ResourceOnly::new().0)),
+        );
+        state.admitted.insert(
+            "z-remote".into(),
+            McpBackend::Remote(fixture.connection.clone()),
+        );
+        let tools = resource_helper_tools(state, &ToolFilter::default());
+        let directory = tempfile::tempdir().unwrap();
+        let cancelled_cx = cx(directory.path().canonicalize().unwrap(), 0);
+        cancelled_cx.cancellation.cancel();
+        let (code, value) = error_code(tools[0].clone().call(json!({}), &cancelled_cx).await);
+        assert_eq!(code, "mcp_cancelled_before_dispatch");
+        assert!(
+            value.get("servers").is_none(),
+            "cancellation must not render as a completed listing"
+        );
+        close_remote(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn outputs_are_bounded_with_exact_addresses_and_resumable_cursors() {
+        let (surface, _calls) = ResourceOnly::new();
+        let loaded = load_mcp_tools_from_config(
+            &config(vec![in_process("fixture", Arc::new(surface))]),
+            &ToolFilter::default(),
+        )
+        .await
+        .unwrap();
+        let read = loaded.tools[2].clone();
+
+        // Single-server enumeration across bounded pages: one oversized
+        // upstream page must be enumerable exactly once through the
+        // continuation cursor, then hand over to the upstream cursor.
+        struct PagedResources;
+        #[async_trait]
+        impl McpSurface for PagedResources {
+            async fn list_tools(&self) -> Result<Vec<crate::mcp::McpToolSpec>> {
+                Ok(vec![])
+            }
+            async fn call_tool(&self, _: &str, _: Value) -> Result<ToolResult> {
+                bail!("no tools")
+            }
+            fn resources_supported(&self) -> bool {
+                true
+            }
+            async fn list_resources(&self, cursor: Option<String>) -> Result<ResourcePage> {
+                match cursor.as_deref() {
+                    None => Ok(ResourcePage {
+                        items: (0..10)
+                            .map(|index| {
+                                resource(
+                                    &format!("memo:/item-{index:02}"),
+                                    &format!("item-{index:02}"),
+                                )
+                            })
+                            .collect(),
+                        next_cursor: Some("page2".into()),
+                    }),
+                    Some("page2") => Ok(ResourcePage {
+                        items: vec![
+                            resource("memo:/item-10", "item-10"),
+                            resource("memo:/item-11", "item-11"),
+                        ],
+                        next_cursor: None,
+                    }),
+                    Some(other) => bail!("unknown upstream cursor {other}"),
+                }
             }
             async fn read_resource(&self, _: &str) -> Result<Vec<Value>> {
                 bail!("no such resource")
             }
         }
         let loaded_many = load_mcp_tools_from_config(
-            &config(vec![in_process("many", Arc::new(ManyResources))]),
+            &config(vec![in_process("many", Arc::new(PagedResources))]),
             &ToolFilter::default(),
         )
         .await
         .unwrap();
+        let list_many = loaded_many.tools[0].clone();
         let tight = temp_cx(500);
-        let trimmed = parse_json(
-            loaded_many.tools[0]
-                .clone()
-                .call(json!({"server":"many"}), &tight)
-                .await,
+
+        // Enumerate the whole catalog through the bounded helper pages.
+        let mut seen: Vec<String> = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut trimmed_pages = 0;
+        for _ in 0..20 {
+            let input = match cursor.clone() {
+                Some(cursor) => json!({"server":"many","cursor":cursor}),
+                None => json!({"server":"many"}),
+            };
+            let page = parse_json(list_many.call(input, &tight).await);
+            for entry in page["resources"].as_array().unwrap() {
+                seen.push(entry["uri"].as_str().unwrap().to_owned());
+            }
+            if page["truncated"].as_bool() == Some(true) {
+                trimmed_pages += 1;
+            }
+            assert!(
+                serde_json::to_string(&page).unwrap().len() <= 500,
+                "every page must respect the budget"
+            );
+            cursor = page["nextCursor"].as_str().map(str::to_owned);
+            if cursor.is_none() {
+                break;
+            }
+        }
+        let expected: Vec<String> = (0..12)
+            .map(|index| format!("memo:/item-{index:02}"))
+            .collect();
+        assert_eq!(
+            seen, expected,
+            "bounded enumeration must cover every entry exactly once in order"
         );
-        assert_eq!(trimmed["truncated"], true);
-        assert!(trimmed["omitted"].as_u64().unwrap() >= 1);
-        assert!(trimmed["returned"].as_u64().unwrap() >= 1);
-        assert!(trimmed.get("nextCursor").is_none());
-        assert!(serde_json::to_string(&trimmed).unwrap().len() <= 500);
-        // A full untrimmed page still forwards the server cursor.
+        assert!(
+            trimmed_pages >= 1,
+            "the fixture must actually exercise local trimming"
+        );
+
+        // A full untrimmed page still ends with a cursor that reaches page2.
         let full = parse_json(
             loaded_many.tools[0]
                 .clone()
                 .call(json!({"server":"many"}), &temp_cx(0))
                 .await,
         );
-        assert_eq!(full["nextCursor"], "page2");
+        let full_cursor = full["nextCursor"].as_str().unwrap().to_owned();
+        assert!(full_cursor.starts_with("bbxr1."), "{full_cursor}");
+        let upstream_page = parse_json(
+            loaded_many.tools[0]
+                .clone()
+                .call(json!({"server":"many","cursor":full_cursor}), &temp_cx(0))
+                .await,
+        );
+        assert_eq!(upstream_page["resources"].as_array().unwrap().len(), 2);
+        assert!(upstream_page.get("nextCursor").is_none());
 
         // Fan-out trim: whole server groups dropped and named.
         let loaded_two = load_mcp_tools_from_config(
@@ -1754,12 +2568,16 @@ mod tests {
 
         let page = parse_json(list.call(json!({"server":"fixture"}), &cx).await);
         assert_eq!(page["resources"].as_array().unwrap().len(), 2);
-        assert_eq!(page["nextCursor"], "page2");
+        // The remote page's continuation is the helper envelope, never the
+        // raw server cursor; threading it back reaches the second page.
+        let page_cursor = page["nextCursor"].as_str().unwrap().to_owned();
+        assert!(page_cursor.starts_with("bbxr1."), "{page_cursor}");
         let second = parse_json(
-            list.call(json!({"server":"fixture","cursor":"page2"}), &cx)
+            list.call(json!({"server":"fixture","cursor":page_cursor}), &cx)
                 .await,
         );
         assert_eq!(second["resources"].as_array().unwrap().len(), 1);
+        assert_eq!(second["resources"][0]["uri"], "memo:/gamma");
 
         let templ = parse_json(templates.call(json!({"server":"fixture"}), &cx).await);
         assert_eq!(

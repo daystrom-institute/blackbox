@@ -372,10 +372,10 @@ impl ServerConn {
     fn page_items(result: ServerResult) -> Result<(Vec<Value>, Option<String>), String> {
         let (entries, next_cursor) = match result {
             ServerResult::ListResourcesResult(page) => {
-                (serialize_entries(page.resources)?, page.next_cursor)
+                (Self::serialize_entries(page.resources)?, page.next_cursor)
             }
             ServerResult::ListResourceTemplatesResult(page) => (
-                serialize_entries(page.resource_templates)?,
+                Self::serialize_entries(page.resource_templates)?,
                 page.next_cursor,
             ),
             _ => {
