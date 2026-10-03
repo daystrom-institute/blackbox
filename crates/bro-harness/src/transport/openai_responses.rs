@@ -466,9 +466,9 @@ impl OpenAiResponsesTransport {
     /// an idle deadline and a byte budget, stopping at the first terminal
     /// event. Exactly one encrypted `compaction` item must come back;
     /// incomplete, failed or malformed envelopes are rejected. History is
-    /// rebuilt client-side the way codex does it: user messages retained
-    /// verbatim, newest first within a token budget, then the compaction
-    /// item. The request is a fitted copy, so source history is untouched
+    /// rebuilt from the newest user messages within a token budget, with
+    /// boundary text truncated as needed and chronological order preserved,
+    /// followed by the compaction item. The request is a fitted copy, so source history is untouched
     /// until a valid replacement exists. Usage observed on the terminal event
     /// is accumulated for `take_compaction_usage` whether or not validation
     /// succeeds: the tokens were spent. Returns the encrypted blob for the

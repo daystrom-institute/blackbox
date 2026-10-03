@@ -11,6 +11,20 @@ out explicitly under `Changed` or `Removed`.
 - Brodex accepts `gpt-6.1-sol`, `gpt-6-sol`, and `gpt-6-luna`, with each
   model's supported reasoning efforts and a context-window fallback when the
   backend catalog is unavailable.
+- bro-harness uses the model's usable context window for compaction fitting,
+  retains boundary user text, and checks compaction compatibility before model
+  changes. ChatGPT and public OpenAI API compaction use their respective
+  protocols; compatible providers fall back to inline summaries. Compaction
+  usage contributes to session totals, and failed compaction preserves accepted
+  user input.
+- Responses retries preserve server deadlines across cancellation and transport
+  fallback. Queued input can preempt inference and yield code-mode observations
+  while retaining running cells and completed outcomes.
+- MCP resource listing, template listing, and reads are available through
+  admitted session connections, including resource-only servers, with bounded
+  output, pagination, and configured access restrictions.
+- Models advertising Responses Lite receive incremental tool catalogs in
+  history, with catalog recovery across resume and compaction.
 - Workers that survive a daemon restart under fleetd are re-adopted at daemon
   startup instead of on the next dispatch, so their tasks read as running and
   resume ingesting from the durable cursor with no manual step. `bro_resume`
