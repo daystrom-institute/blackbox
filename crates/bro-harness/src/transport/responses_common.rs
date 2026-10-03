@@ -2875,7 +2875,7 @@ mod tests {
         let added = s.sync_lite_catalog(&[read.clone()], &options).unwrap();
         assert!(added > 0);
         assert_eq!(s.input.len(), stale_len + 1); // one item removed, two appended
-        let notice = s.input[s.input.len() - 2];
+        let notice = &s.input[s.input.len() - 2];
         assert_eq!(notice["role"], "developer");
         let text = notice["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("Tool definitions were reset"), "{text}");
@@ -2909,7 +2909,7 @@ mod tests {
         s.reset_lite_baseline();
         let added = s.sync_lite_catalog(&[], &options).unwrap();
         assert!(added > 0);
-        let last = s.input.last().unwrap();
+        let last = s.input.last().unwrap().clone();
         assert_eq!(last["role"], "developer");
         let text = last["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("no tools are currently available"), "{text}");
@@ -2917,7 +2917,7 @@ mod tests {
         // retained reset notice.
         let added = s.sync_lite_catalog(&[], &options).unwrap();
         assert_eq!(added, 0);
-        assert_eq!(s.input.last().unwrap(), last);
+        assert_eq!(s.input.last().unwrap(), &last);
     }
 
     #[test]

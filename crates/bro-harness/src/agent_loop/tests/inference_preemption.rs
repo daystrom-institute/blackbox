@@ -1,4 +1,5 @@
 use super::*;
+use std::time::Duration;
 
 #[tokio::test]
 async fn inference_steers_without_code_mode_preserve_fifo_and_clear_the_signal() {
