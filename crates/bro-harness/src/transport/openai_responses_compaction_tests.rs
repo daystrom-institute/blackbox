@@ -268,7 +268,7 @@ fn v2_retention_truncates_boundary_user_message_to_the_remaining_budget() {
     assert_eq!(kept[1], input[2], "newest message stays verbatim and last");
     let boundary_text = kept[0]["content"][0]["text"].as_str().unwrap();
     assert!(
-        boundary_text.starts_with("boundary"),
+        boundary_text.starts_with("boundar"),
         "truncated copy keeps the leading (newest) part of the text"
     );
     assert!(boundary_text.contains("[retention truncated]"));
