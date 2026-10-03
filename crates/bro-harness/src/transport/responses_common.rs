@@ -82,12 +82,19 @@ impl ResponsesState {
         }
     }
 
-    /// Remember server retry advice, keeping whichever pending deadline is
-    /// earliest. `None` (no advice) never clobbers a pending deadline.
+    /// Remember server retry advice. An expired pending deadline never masks
+    /// fresh advice (the server has moved on); among live deadlines the later
+    /// one wins, so no request can start before either window allows.
+    /// `None` (no advice) never clobbers a pending deadline.
     pub(super) fn defer_retry_until(&mut self, advice: Option<super::http::RetryAfter>) {
         let Some(advice) = advice else { return };
         self.pending_retry_after = Some(match self.pending_retry_after {
-            Some(pending) if pending.deadline() <= advice.deadline() => pending,
+            Some(pending)
+                if !pending.remaining_delay().is_zero()
+                    && pending.deadline() > advice.deadline() =>
+            {
+                pending
+            }
             _ => advice,
         });
     }
@@ -1385,6 +1392,53 @@ mod tests {
             "content": [{"type": "input_text", "text": "hi"}],
         })];
         s
+    }
+
+    fn advice(delay: std::time::Duration) -> super::http::RetryAfter {
+        super::http::RetryAfter::from_delay(delay).expect("valid advice")
+    }
+
+    #[test]
+    fn expired_advice_never_masks_a_fresh_deadline() {
+        // An earlier advice can elapse unobserved (its request never ran: the
+        // turn was cancelled mid-wait). A later failure then carries fresh
+        // advice that must still gate the next request.
+        let mut s = state();
+        s.defer_retry_until(Some(advice(std::time::Duration::ZERO)));
+        s.defer_retry_until(Some(advice(std::time::Duration::from_secs(3600))));
+        let pending = s.pending_retry_advice().expect("fresh advice survives");
+        assert!(
+            pending.remaining_delay() > std::time::Duration::from_secs(3500),
+            "an expired pending deadline must not discard a fresh, later one"
+        );
+        // None never clobbers the pending window.
+        s.defer_retry_until(None);
+        assert!(s.pending_retry_advice().is_some());
+        // An elapsed window clears once consumed.
+        let mut drained = state();
+        drained.defer_retry_until(Some(advice(std::time::Duration::ZERO)));
+        assert!(drained.take_elapsed_retry_advice().is_some());
+        assert!(drained.pending_retry_advice().is_none());
+    }
+
+    #[test]
+    fn live_advice_keeps_the_later_deadline() {
+        let mut s = state();
+        s.defer_retry_until(Some(advice(std::time::Duration::from_secs(60))));
+        s.defer_retry_until(Some(advice(std::time::Duration::from_secs(5))));
+        assert!(
+            s.pending_retry_advice().expect("pending").remaining_delay()
+                > std::time::Duration::from_secs(55),
+            "two live windows keep the more restrictive deadline"
+        );
+        // Reversed order converges on the same deadline.
+        let mut s = state();
+        s.defer_retry_until(Some(advice(std::time::Duration::from_secs(5))));
+        s.defer_retry_until(Some(advice(std::time::Duration::from_secs(60))));
+        assert!(
+            s.pending_retry_advice().expect("pending").remaining_delay()
+                > std::time::Duration::from_secs(55)
+        );
     }
     fn opts(system: SystemPrompt) -> TurnOpts {
         TurnOpts {

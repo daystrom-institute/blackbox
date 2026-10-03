@@ -446,13 +446,37 @@ async fn cancelled_advice_wait_keeps_the_remaining_window_pending() {
         pending.remaining_delay() > std::time::Duration::from_secs(3500),
         "the next attempt still waits out the true remainder"
     );
-    // An elapsed window is cleared; a pending one is preserved.
-    let elapsed = RetryAfter::from_delay(std::time::Duration::from_secs(0)).expect("advice");
-    tx.state.defer_retry_until(Some(elapsed));
-    assert!(tx.state.pending_retry_advice().is_some());
-    tx.honor_pending_retry_advice().await;
+    // An elapsed window no longer gates a later request, and it never masks a
+    // fresh, later deadline: the next attempt still cannot start before the
+    // fresh window even though an expired one sits in front of it.
+    let mut later = transport("http://127.0.0.1:1".into(), true, None);
+    later.state.defer_retry_until(Some(
+        RetryAfter::from_delay(std::time::Duration::ZERO).expect("advice"),
+    ));
+    later.state.defer_retry_until(Some(
+        RetryAfter::from_delay(std::time::Duration::from_secs(3600)).expect("advice"),
+    ));
+    tokio::select! {
+        _ = later.honor_pending_retry_advice() => panic!("an unexpired fresh window must gate"),
+        _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+    }
     assert!(
-        tx.state.pending_retry_advice().is_none(),
+        later
+            .state
+            .pending_retry_advice()
+            .expect("fresh deadline survives cancellation and the expired prefix")
+            .remaining_delay()
+            > std::time::Duration::from_secs(3500)
+    );
+
+    // With nothing but an elapsed window pending, the gate opens immediately.
+    let mut elapsed_only = transport("http://127.0.0.1:1".into(), true, None);
+    elapsed_only.state.defer_retry_until(Some(
+        RetryAfter::from_delay(std::time::Duration::ZERO).expect("advice"),
+    ));
+    elapsed_only.honor_pending_retry_advice().await;
+    assert!(
+        elapsed_only.state.pending_retry_advice().is_none(),
         "once elapsed the gate opens"
     );
 }
