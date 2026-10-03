@@ -414,6 +414,7 @@ impl OpenAiResponsesTransport {
 
     /// One-shot summarization using an already fitted request (always HTTP).
     async fn summarize_text(&mut self, body: Value) -> Result<String> {
+        self.honor_pending_retry_advice().await;
         let resp = super::http::send_with_retry("openai-responses/compact", || {
             self.apply_headers(self.http.post(&self.http_endpoint))
                 .json(&body)
@@ -422,6 +423,8 @@ impl OpenAiResponsesTransport {
         .await
         .context("responses compaction request")?;
         let status = resp.status();
+        self.state
+            .defer_retry_until(RetryAfter::from_headers(resp.headers()));
         if !status.is_success() {
             let t = resp.text().await.unwrap_or_default();
             anyhow::bail!("openai responses compact {status}: {t}");

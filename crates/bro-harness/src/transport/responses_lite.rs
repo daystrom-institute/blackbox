@@ -691,7 +691,10 @@ mod tests {
         assert_eq!(transition.items.len(), 1);
         let emitted = &transition.items[0]["tools"].as_array().unwrap();
         assert_eq!(emitted.len(), 1, "unchanged member is not repeated");
-        assert_eq!(emitted[0]["name"], "write");
+        assert_eq!(emitted[0]["name"], "functions");
+        let members = emitted[0]["tools"].as_array().unwrap();
+        assert_eq!(members.len(), 1, "unchanged member is not repeated");
+        assert_eq!(members[0]["name"], "write");
     }
 
     #[test]

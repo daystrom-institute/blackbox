@@ -338,7 +338,7 @@ mod tests {
         assert_eq!(lite.overhead_tokens, 64 + base_tokens);
         // No double charge: the schema bytes are counted exactly once.
         assert!(lite.history_tokens >= json_tokens(&definition));
-        assert!(lite.overhead_tokens < base_tokens + json_tokens(&schema));
+        assert!(lite.overhead_tokens < base_tokens + json_tokens(&definition));
 
         // Empty base and stable fall back to the default instructions text
         // the Lite builder actually ships.

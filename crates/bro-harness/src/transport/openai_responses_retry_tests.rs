@@ -907,3 +907,41 @@ async fn ws_fallback_honors_rejected_handshake_advice() {
         "the fallback consumed the handshake advice"
     );
 }
+
+#[tokio::test]
+async fn inline_compaction_honors_and_preserves_retry_advice() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut tx = transport(
+        format!("http://{}/responses", listener.local_addr().unwrap()),
+        false,
+        None,
+    );
+    tx.state
+        .defer_retry_until(RetryAfter::from_delay(std::time::Duration::from_secs(3600)));
+    let before = tx.snapshot();
+    tokio::select! {
+        _ = listener.accept() => panic!("inline compaction bypassed pending advice"),
+        _ = tx.summarize_text(json!({})) => panic!("advice must keep this request pending"),
+        _ = tokio::time::sleep(std::time::Duration::from_millis(25)) => {}
+    }
+    assert!(
+        tx.state.pending_retry_advice().unwrap().remaining_delay()
+            > std::time::Duration::from_secs(3500)
+    );
+    assert_eq!(tx.snapshot(), before);
+
+    // A terminal rejection still carries timing for the following request.
+    let body = json!({"error":{"code":"insufficient_quota"}}).to_string();
+    let response = format!(
+        "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 3600\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let (url, server) = raw_http_server(vec![response], 1).await;
+    let mut tx = transport(url, false, None);
+    assert!(tx.summarize_text(json!({})).await.is_err());
+    assert!(
+        tx.state.pending_retry_advice().unwrap().remaining_delay()
+            > std::time::Duration::from_secs(3500)
+    );
+    assert_eq!(server.await.unwrap().len(), 1);
+}

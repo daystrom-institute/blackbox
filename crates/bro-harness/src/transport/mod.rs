@@ -541,13 +541,13 @@ pub trait Transport: Send {
         Usage::default()
     }
 
-    /// Drain usage accumulated by server-side compaction requests. Compaction
+    /// Drain usage accumulated by compaction requests. Compaction
     /// is not a `run_turn`, so its tokens never appear in a turn result, yet
     /// they were spent whether or not the compacted envelope validated. The
     /// agent loop calls this after every `compact()` return (success and
-    /// failure) and adds it to the session accumulator. Default: no usage
-    /// (transports whose compaction is purely client-side summarize through
-    /// `run_turn`-shaped calls that already report usage).
+    /// failure) and adds it to the session accumulator. Transports that call
+    /// a provider for compaction must account reported usage here. The default
+    /// is zero for transports without a compaction implementation.
     fn take_compaction_usage(&mut self) -> Usage {
         Usage::default()
     }
