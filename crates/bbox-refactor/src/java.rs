@@ -3942,6 +3942,7 @@ pub(crate) use atom_plans::{
 pub(crate) use collapse_chain::plan_java_collapse_call_chain;
 use cross_file::{MovedStaticItem, compute_cross_file_static_caller_edits};
 pub(crate) use extract_class::plan_extract_java_class;
+pub use extract_code_block::JAVA_EXTRACT_CALL_SITE_ITEM_KIND;
 pub(crate) use extract_code_block::plan_extract_java_code_block_to_method;
 pub(crate) use extract_methods::plan_extract_java_methods;
 pub(crate) use inline_class::plan_inline_java_class;

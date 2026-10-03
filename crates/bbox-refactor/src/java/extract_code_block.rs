@@ -36,6 +36,19 @@
 //!   into a single return at the end of the range.
 //! - `old_text` doesn't match exactly once.
 //! - The matched range isn't inside any method or constructor body.
+//! - `error.selection_not_statement_aligned`: after trimming leading and
+//!   trailing whitespace and comments, the range does not start at the
+//!   start of a statement and end at the end of a statement of the same
+//!   block (or constructor body, or switch group). The refusal names the
+//!   line range of the smallest aligned run containing the selection and
+//!   of the largest aligned run inside it, when one exists.
+//!
+//! ## Call-site item
+//!
+//! The plan carries one `items` entry of kind
+//! `JAVA_EXTRACT_CALL_SITE_ITEM_KIND` whose byte range is exactly the
+//! call-site edit's range, with 1-based inclusive lines and a
+//! `statement_count=<n>` attribute.
 //!
 //! ## Operator overrides
 //!
@@ -54,6 +67,10 @@
 
 use super::scope::{ScopeTree, analyze_range};
 use super::*;
+
+/// `RefactorPlan.items` kind of the one item naming the call-site
+/// replacement span. Its attributes carry `statement_count=<n>`.
+pub const JAVA_EXTRACT_CALL_SITE_ITEM_KIND: &str = "java_extract_call_site";
 
 #[derive(Debug, Clone)]
 struct ResultRecordComponent {
@@ -129,6 +146,12 @@ pub(crate) fn plan_extract_java_code_block_to_method(p: &RefactorPlanParams) -> 
         .and_then(|n| n.utf8_text(parsed.source.as_bytes()).ok())
         .unwrap_or("(unnamed)")
         .to_string();
+    let statement_count = require_statement_aligned_selection(
+        enclosing_method,
+        &parsed.source,
+        region_start,
+        region_end,
+    )?;
 
     // -----------------------------------------------------------------
     // Scope analysis — the load-bearing inference.
@@ -490,7 +513,13 @@ pub(crate) fn plan_extract_java_code_block_to_method(p: &RefactorPlanParams) -> 
             new_text: None,
         }],
         validations: parse_validation_step_for_path(&source_path),
-        items: Vec::new(),
+        items: vec![call_site_item(
+            &parsed.source,
+            helper_name,
+            region_start,
+            region_end,
+            statement_count,
+        )],
         leftovers,
         captured_variables: Vec::new(),
         remaining_source_accessors: Vec::new(),
@@ -545,6 +574,295 @@ fn find_enclosing_method_node<'a>(
         }
     }
     None
+}
+
+/// Refuse a selection that is not a whole run of sibling statements.
+///
+/// Leading and trailing whitespace and comments are trimmed from the
+/// matched range; what remains must start at the start byte of a statement
+/// and end at the end byte of a statement that share one parent block,
+/// constructor body, or switch group. The range is contiguous, so every
+/// statement between the two is covered. Returns the statement count.
+fn require_statement_aligned_selection(
+    enclosing_method: Node<'_>,
+    source: &str,
+    region_start: usize,
+    region_end: usize,
+) -> Result<usize> {
+    let body = enclosing_method
+        .child_by_field_name("body")
+        .ok_or_else(|| anyhow!("enclosing method has no body"))?;
+    let comments = comment_ranges(body, source);
+    let (start, end) = trim_selection(source, &comments, region_start, region_end);
+    if let Some(count) = aligned_statement_count(body, start, end) {
+        return Ok(count);
+    }
+
+    let (hint_start, hint_end) = if start < end {
+        (start, end)
+    } else {
+        (region_start, region_end)
+    };
+    let mut message = format!(
+        "error.selection_not_statement_aligned: old_text ({}) does not start and end on \
+         statement boundaries of one block",
+        line_range_label(source, hint_start, hint_end)
+    );
+    if let Some(run) = smallest_run_containing(body, hint_start, hint_end) {
+        message.push_str(&format!(
+            "; smallest statement-aligned run containing it: {} ({})",
+            line_range_label(source, run.start, run.end),
+            statement_count_label(run.count)
+        ));
+    }
+    if let Some(run) = largest_run_inside(body, hint_start, hint_end) {
+        message.push_str(&format!(
+            "; largest statement-aligned run inside it: {} ({})",
+            line_range_label(source, run.start, run.end),
+            statement_count_label(run.count)
+        ));
+    }
+    message.push_str(
+        ". Rebuild old_text from whole statements of a single block (a half statement or a \
+         dangling brace is not extractable).",
+    );
+    bail!(message)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StatementRun {
+    start: usize,
+    end: usize,
+    count: usize,
+}
+
+fn is_statement_container(node: Node<'_>) -> bool {
+    matches!(
+        node.kind(),
+        "block" | "constructor_body" | "switch_block_statement_group"
+    )
+}
+
+fn is_comment_node(node: Node<'_>) -> bool {
+    matches!(node.kind(), "line_comment" | "block_comment")
+}
+
+/// Statements directly inside `container`: every named child except
+/// comments and switch labels.
+fn container_statements(container: Node<'_>) -> Vec<Node<'_>> {
+    let mut cursor = container.walk();
+    container
+        .named_children(&mut cursor)
+        .filter(|child| !is_comment_node(*child) && child.kind() != "switch_label")
+        .collect()
+}
+
+fn statement_containers(body: Node<'_>) -> Vec<Node<'_>> {
+    let mut out = Vec::new();
+    let mut stack = vec![body];
+    while let Some(node) = stack.pop() {
+        if is_statement_container(node) {
+            out.push(node);
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    out
+}
+
+/// Comment byte ranges inside `body`, each ending at its last
+/// non-whitespace byte.
+fn comment_ranges(body: Node<'_>, source: &str) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut stack = vec![body];
+    while let Some(node) = stack.pop() {
+        if is_comment_node(node) {
+            let start = node.start_byte();
+            let text = &source[start..node.end_byte()];
+            out.push((start, start + text.trim_end().len()));
+            continue;
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    out
+}
+
+fn trim_selection(
+    source: &str,
+    comments: &[(usize, usize)],
+    mut start: usize,
+    mut end: usize,
+) -> (usize, usize) {
+    let bytes = source.as_bytes();
+    loop {
+        while start < end && bytes[start].is_ascii_whitespace() {
+            start += 1;
+        }
+        match comments
+            .iter()
+            .find(|(c_start, c_end)| *c_start == start && *c_end <= end)
+        {
+            Some((_, c_end)) => start = *c_end,
+            None => break,
+        }
+    }
+    loop {
+        while end > start && bytes[end - 1].is_ascii_whitespace() {
+            end -= 1;
+        }
+        match comments
+            .iter()
+            .find(|(c_start, c_end)| *c_end == end && *c_start >= start)
+        {
+            Some((c_start, _)) => end = *c_start,
+            None => break,
+        }
+    }
+    (start, end)
+}
+
+/// The statement whose parent is a statement container and whose
+/// `boundary` byte (start or end) equals `byte`, found by walking up from
+/// the token at that position.
+fn statement_at_boundary(body: Node<'_>, byte: usize, at_start: bool) -> Option<Node<'_>> {
+    let (lo, hi) = if at_start {
+        (byte, byte + 1)
+    } else {
+        (byte.checked_sub(1)?, byte)
+    };
+    let mut node = body.descendant_for_byte_range(lo, hi)?;
+    loop {
+        let edge = if at_start {
+            node.start_byte()
+        } else {
+            node.end_byte()
+        };
+        if edge != byte || node.id() == body.id() {
+            return None;
+        }
+        let parent = node.parent()?;
+        if is_statement_container(parent)
+            && node.is_named()
+            && !is_comment_node(node)
+            && node.kind() != "switch_label"
+        {
+            return Some(node);
+        }
+        node = parent;
+    }
+}
+
+fn aligned_statement_count(body: Node<'_>, start: usize, end: usize) -> Option<usize> {
+    if start >= end {
+        return None;
+    }
+    let first = statement_at_boundary(body, start, true)?;
+    let last = statement_at_boundary(body, end, false)?;
+    let container = first.parent()?;
+    if last.parent()?.id() != container.id() {
+        return None;
+    }
+    let statements = container_statements(container);
+    let first_idx = statements.iter().position(|s| s.id() == first.id())?;
+    let last_idx = statements.iter().position(|s| s.id() == last.id())?;
+    (first_idx <= last_idx).then_some(last_idx - first_idx + 1)
+}
+
+/// The innermost run of sibling statements whose span contains
+/// `start..end`.
+fn smallest_run_containing(body: Node<'_>, start: usize, end: usize) -> Option<StatementRun> {
+    let mut node = Some(body.descendant_for_byte_range(start, end)?);
+    while let Some(current) = node {
+        if is_statement_container(current) {
+            let statements = container_statements(current);
+            let first = statements.iter().position(|s| s.end_byte() > start);
+            let last = statements.iter().rposition(|s| s.start_byte() < end);
+            if let (Some(first), Some(last)) = (first, last)
+                && first <= last
+                && statements[first].start_byte() <= start
+                && statements[last].end_byte() >= end
+            {
+                return Some(StatementRun {
+                    start: statements[first].start_byte(),
+                    end: statements[last].end_byte(),
+                    count: last - first + 1,
+                });
+            }
+        }
+        if current.id() == body.id() {
+            break;
+        }
+        node = current.parent();
+    }
+    None
+}
+
+/// The widest run of sibling statements lying entirely inside
+/// `start..end`.
+fn largest_run_inside(body: Node<'_>, start: usize, end: usize) -> Option<StatementRun> {
+    statement_containers(body)
+        .into_iter()
+        .filter_map(|container| {
+            let inside = container_statements(container)
+                .into_iter()
+                .filter(|s| s.start_byte() >= start && s.end_byte() <= end)
+                .collect::<Vec<_>>();
+            Some(StatementRun {
+                start: inside.first()?.start_byte(),
+                end: inside.last()?.end_byte(),
+                count: inside.len(),
+            })
+        })
+        .max_by_key(|run| (run.end - run.start, run.count))
+}
+
+/// 1-based inclusive line numbers of a non-empty byte range.
+fn line_span(source: &str, start: usize, end: usize) -> (usize, usize) {
+    let (start_line, _) = line_col(source, start);
+    let (end_line, _) = line_col(source, end.saturating_sub(1).max(start));
+    (start_line, end_line)
+}
+
+fn line_range_label(source: &str, start: usize, end: usize) -> String {
+    let (start_line, end_line) = line_span(source, start, end);
+    if start_line == end_line {
+        format!("line {start_line}")
+    } else {
+        format!("lines {start_line}-{end_line}")
+    }
+}
+
+fn statement_count_label(count: usize) -> String {
+    if count == 1 {
+        "1 statement".to_string()
+    } else {
+        format!("{count} statements")
+    }
+}
+
+/// Plan item naming the call-site replacement: its byte and 1-based
+/// inclusive line range, and the number of statements it replaces.
+fn call_site_item(
+    source: &str,
+    helper_name: &str,
+    region_start: usize,
+    region_end: usize,
+    statement_count: usize,
+) -> SyntaxItem {
+    let (line_start, line_end) = line_span(source, region_start, region_end);
+    SyntaxItem {
+        plan_local_id: format!("{JAVA_EXTRACT_CALL_SITE_ITEM_KIND}:{region_start}:{region_end}"),
+        kind: JAVA_EXTRACT_CALL_SITE_ITEM_KIND.to_string(),
+        name: Some(helper_name.to_string()),
+        byte_start: region_start,
+        byte_end: region_end,
+        leading_trivia_start: region_start,
+        trailing_trivia_end: region_end,
+        line_start,
+        line_end,
+        attributes: vec![format!("statement_count={statement_count}")],
+    }
 }
 
 fn java_class_name(class_node: Node<'_>, source: &str) -> Option<String> {
