@@ -75,7 +75,7 @@ impl LiteToolCatalog {
     pub(crate) fn new(definitions: &[Value]) -> Result<Self> {
         let mut entries = Vec::with_capacity(definitions.len());
         let mut hashes = BTreeMap::new();
-        let mut insert =
+        let insert =
             |hashes: &mut BTreeMap<String, String>, name: String, value: &Value| -> Result<()> {
                 let hash = definition_hash(value);
                 if hashes.insert(name.clone(), hash).is_some() {
@@ -430,7 +430,7 @@ mod tests {
         );
         let id = item["id"].as_str().unwrap().to_owned();
         assert!(id.starts_with("at_"), "{id}");
-        assert_eq!(transition.baseline.anchor_id.as_deref(), Some(&id));
+        assert_eq!(transition.baseline.anchor_id.as_deref(), Some(id.as_str()));
         assert_eq!(transition.baseline.hashes.len(), 2);
     }
 
@@ -457,7 +457,10 @@ mod tests {
         assert_eq!(tools[0]["name"], "search");
         let new_id = transition.items[0]["id"].as_str().unwrap().to_owned();
         assert_ne!(new_id, id, "changed payload gets a new identity");
-        assert_eq!(transition.baseline.anchor_id.as_deref(), Some(&new_id));
+        assert_eq!(
+            transition.baseline.anchor_id.as_deref(),
+            Some(new_id.as_str())
+        );
         assert_ne!(
             transition.baseline.hashes["search"],
             baseline.hashes["search"]
@@ -500,7 +503,8 @@ mod tests {
     #[test]
     fn namespace_member_change_renders_only_that_member() {
         let members = vec![tool("read", "files"), tool("write", "files")];
-        let original = LiteToolCatalog::new(&[namespace("functions", "Tools.", members)]).unwrap();
+        let original =
+            LiteToolCatalog::new(&[namespace("functions", "Tools.", members.clone())]).unwrap();
         let baseline = diff(&original, PreviousCatalogState::Absent).baseline;
         assert_eq!(baseline.hashes.len(), 3, "header plus two members");
 
@@ -516,11 +520,13 @@ mod tests {
     #[test]
     fn namespace_metadata_only_change_is_a_notice_without_members() {
         let members = vec![tool("read", "files")];
-        let original = LiteToolCatalog::new(&[namespace("functions", "Tools.", members)]).unwrap();
+        let original =
+            LiteToolCatalog::new(&[namespace("functions", "Tools.", members.clone())]).unwrap();
         let baseline = diff(&original, PreviousCatalogState::Absent).baseline;
 
         let updated =
-            LiteToolCatalog::new(&[namespace("functions", "Better tools.", members)]).unwrap();
+            LiteToolCatalog::new(&[namespace("functions", "Better tools.", members.clone())])
+                .unwrap();
         let transition = diff(&updated, PreviousCatalogState::Known(&baseline));
         assert_eq!(transition.items.len(), 1);
         assert_eq!(transition.items[0]["type"], "message");

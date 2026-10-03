@@ -878,7 +878,7 @@ impl Tool for ListResourcesTool {
                                 );
                             }
                         }
-                        let (entries, mut receipt) = self.project_page(items);
+                        let (mut entries, mut receipt) = self.project_page(items);
                         if offset > entries.len() {
                             return error_envelope(
                                 "mcp_stale_resource_page",
@@ -2134,7 +2134,7 @@ mod tests {
         let fixture = remote_fixture(5000, true, false).await;
         let tools = remote_tools(fixture.connection.clone());
         let directory = tempfile::tempdir().unwrap();
-        let cancelled_cx = cx(directory.path().canonicalize().unwrap(), 0);
+        let cancelled_cx = self::cx(directory.path().canonicalize().unwrap(), 0);
         cancelled_cx.cancellation.cancel();
         let (code, _) = error_code(
             tools[0]
@@ -2168,7 +2168,7 @@ mod tests {
         );
         let tools = resource_helper_tools(state, &ToolFilter::default());
         let directory = tempfile::tempdir().unwrap();
-        let cancelled_cx = cx(directory.path().canonicalize().unwrap(), 0);
+        let cancelled_cx = self::cx(directory.path().canonicalize().unwrap(), 0);
         cancelled_cx.cancellation.cancel();
         let (code, value) = error_code(tools[0].clone().call(json!({}), &cancelled_cx).await);
         assert_eq!(code, "mcp_cancelled_before_dispatch");
