@@ -192,7 +192,8 @@ async fn pure_http_rejection_is_typed_without_observation() {
     let error = tx
         .run_turn(&[], &opts(), &NoSink)
         .await
-        .expect_err("rejection must fail the turn");
+        .err()
+        .expect("rejection must fail the turn");
     let requests = server.await.unwrap();
     assert_eq!(requests.len(), 1);
     assert_eq!(
@@ -226,7 +227,8 @@ async fn pure_streamed_rejection_is_typed_without_observation() {
     let error = tx
         .run_turn(&[], &opts(), &NoSink)
         .await
-        .expect_err("rejection must fail the turn");
+        .err()
+        .expect("rejection must fail the turn");
     let requests = server.await.unwrap();
     assert_eq!(requests.len(), 1, "a rejection is never retried");
     assert_eq!(tx.snapshot(), before);
@@ -266,7 +268,8 @@ async fn ambiguous_rejection_after_output_wraps_observation_and_never_retries() 
         let error = tx
             .run_turn(&[], &opts(), &NoSink)
             .await
-            .expect_err("failure must fail the turn");
+            .err()
+            .expect("failure must fail the turn");
         let requests = server.await.unwrap();
         assert_eq!(requests.len(), 1, "no replay after observed effects");
         assert_eq!(tx.snapshot(), before);
@@ -315,7 +318,8 @@ async fn quota_and_unknown_in_band_failures_are_terminal() {
         let error = tx
             .run_turn(&[], &opts(), &NoSink)
             .await
-            .expect_err("terminal failure");
+            .err()
+            .expect("terminal failure");
         let requests = server.await.unwrap();
         assert_eq!(requests.len(), 1, "{code}: terminal failures never retry");
         assert_eq!(tx.snapshot(), before);
