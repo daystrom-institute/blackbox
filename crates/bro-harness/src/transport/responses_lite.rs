@@ -31,7 +31,7 @@
 
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use uuid::Uuid;
 
 /// Item type tag of the Responses Lite definitions item (codex
@@ -237,7 +237,61 @@ impl LiteToolCatalog {
             },
         }
     }
+
+    /// Authoritative re-baseline for recovery. When the previous baseline is
+    /// unusable (uncoupled, invalidated by compaction, or at the chain cap)
+    /// but retained history still carries catalog items, a fresh prefix would
+    /// be semantically overridden by the stale deltas and notices later in
+    /// the buffer: an old removal notice or delta would have the last word
+    /// over the current catalog. Recovery emits an explicit reset notice plus
+    /// the full current catalog at the sampling boundary, bound together as a
+    /// new chain, so the last statement about tools is always current. An
+    /// empty catalog emits the reset notice alone.
+    pub(crate) fn render_recovery(&self, session_id: &str) -> LiteCatalogTransition {
+        let mut items = Vec::new();
+        let mut chain = Vec::new();
+        let definitions = self
+            .entries
+            .iter()
+            .map(|entry| entry.definition.clone())
+            .collect::<Vec<_>>();
+        let (notice_text, has_definitions) = if definitions.is_empty() {
+            (RESET_NOTICE_EMPTY, false)
+        } else {
+            (RESET_NOTICE, true)
+        };
+        let notice = developer_notice(notice_text);
+        chain.push(ChainLink::Notice {
+            payload: payload_hash(&notice),
+        });
+        items.push(notice);
+        if has_definitions {
+            let id = additional_tools_id(session_id, &definitions);
+            chain.push(ChainLink::Definitions {
+                id: id.clone(),
+                payload: payload_hash(&Value::Array(definitions.clone())),
+            });
+            items.push(json!({
+                "type": ADDITIONAL_TOOLS,
+                "id": id,
+                "role": "developer",
+                "tools": definitions,
+            }));
+        }
+        LiteCatalogTransition {
+            items,
+            baseline: CatalogBaseline {
+                hashes: self.hashes.clone(),
+                chain,
+            },
+        }
+    }
 }
+
+/// Reset notice when a fresh full catalog follows retained stale items.
+const RESET_NOTICE: &str = "Tool definitions were reset. Earlier tool definitions, namespace instructions, and tool-removal notices in this conversation are superseded: the tools defined in the next item are the current available tools.";
+/// Reset notice when the current catalog is empty.
+const RESET_NOTICE_EMPTY: &str = "Tool definitions were reset. Earlier tool definitions, namespace instructions, and tool-removal notices in this conversation are superseded: no tools are currently available.";
 
 /// What is known about the previously model-visible catalog.
 #[derive(Clone, Copy)]
@@ -359,6 +413,26 @@ impl CatalogBaseline {
                     });
                 }
                 _ => return BaselineRestore::Unknown,
+            }
+        }
+        // Impossible forms are rejected rather than trusted: declarations
+        // without any retained-chain evidence would couple trivially and
+        // suppress every future declaration, and a notice-only chain cannot
+        // represent a nonempty catalog. Duplicated definitions identities
+        // are malformed for the same reason the live catalog rejects them.
+        if !hashes.is_empty()
+            && !chain
+                .iter()
+                .any(|link| matches!(link, ChainLink::Definitions { .. }))
+        {
+            return BaselineRestore::Unknown;
+        }
+        let mut definition_ids = HashSet::new();
+        for link in &chain {
+            if let ChainLink::Definitions { id, .. } = link
+                && !definition_ids.insert(id.clone())
+            {
+                return BaselineRestore::Unknown;
             }
         }
         BaselineRestore::Known(Self { hashes, chain })
@@ -836,6 +910,94 @@ mod tests {
             item.clone(),
             json!({"type":"message","role":"user","content":"task"}),
         ]));
+    }
+
+    #[test]
+    fn from_side_rejects_impossible_baseline_forms() {
+        let original = LiteToolCatalog::new(&[tool("read", "files")]).unwrap();
+        let first = diff(&original, PreviousCatalogState::Absent);
+        let side = first.baseline.to_side();
+
+        // A valid shape still restores.
+        assert!(matches!(
+            CatalogBaseline::from_side(&side),
+            BaselineRestore::Known(_)
+        ));
+
+        // Nonempty hashes with an empty chain: declarations without any
+        // retained-chain evidence would couple trivially and suppress every
+        // future declaration.
+        let mut orphan = side.clone();
+        orphan["chain"] = json!([]);
+        assert!(matches!(
+            CatalogBaseline::from_side(&orphan),
+            BaselineRestore::Unknown
+        ));
+
+        // Nonempty hashes with a notice-only chain: a notice never defines
+        // tools, so the map cannot describe the chain's catalog.
+        let mut notice_only = side.clone();
+        notice_only["chain"] = json!([{"kind": "notice", "payload": "p"}]);
+        assert!(matches!(
+            CatalogBaseline::from_side(&notice_only),
+            BaselineRestore::Unknown
+        ));
+
+        // Duplicated definitions identities in the chain are malformed.
+        let id = first.items[0]["id"].as_str().unwrap();
+        let payload = match &first.baseline.chain[0] {
+            ChainLink::Definitions { payload, .. } => payload.clone(),
+            _ => panic!("first link is the definitions item"),
+        };
+        let mut duplicated = side.clone();
+        duplicated["chain"] = json!([
+            {"kind": "definitions", "id": id, "payload": payload},
+            {"kind": "definitions", "id": id, "payload": payload},
+        ]);
+        assert!(matches!(
+            CatalogBaseline::from_side(&duplicated),
+            BaselineRestore::Unknown
+        ));
+    }
+
+    #[test]
+    fn render_recovery_states_the_current_catalog_last() {
+        let catalog = LiteToolCatalog::new(&[tool("read", "files")]).unwrap();
+        let transition = catalog.render_recovery("session-1");
+        assert_eq!(transition.items.len(), 2);
+        assert_eq!(transition.items[0]["role"], "developer");
+        let notice = notice_text(&transition.items[0]);
+        assert!(notice.contains("Tool definitions were reset"), "{notice}");
+        assert!(notice.contains("current available tools"), "{notice}");
+        let definitions = &transition.items[1];
+        assert_eq!(definitions["type"], "additional_tools");
+        assert_eq!(definitions["tools"].as_array().unwrap().len(), 1);
+        // The reset notice and the fresh definitions bind into one chain.
+        assert_eq!(transition.baseline.chain_len(), 2);
+        assert!(matches!(
+            transition.baseline.chain.first(),
+            Some(ChainLink::Notice { .. })
+        ));
+        assert!(transition.baseline.is_coupled_to(&transition.items));
+        assert_eq!(transition.baseline.hashes.len(), 1);
+        // Deterministic recovery identity for retries.
+        assert_eq!(
+            catalog.render_recovery("session-1").items[1]["id"],
+            definitions["id"]
+        );
+
+        // An empty current catalog still resets explicitly: the stale items
+        // are superseded and no tools are defined.
+        let empty = LiteToolCatalog::new(&[]).unwrap();
+        let transition = empty.render_recovery("session-1");
+        assert_eq!(transition.items.len(), 1);
+        let notice = notice_text(&transition.items[0]);
+        assert!(
+            notice.contains("no tools are currently available"),
+            "{notice}"
+        );
+        assert!(transition.baseline.is_empty());
+        assert!(transition.baseline.is_coupled_to(&transition.items));
     }
 
     #[test]
