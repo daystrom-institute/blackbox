@@ -285,6 +285,10 @@ impl OpenAiResponsesTransport {
         let idle = super::http::stream_idle_timeout();
         let max = super::http::max_retries();
         let mut attempt = 0u32;
+        // This sampling step's queued-input preemption signal. Racing the
+        // reads (not the request send) matches the reference: the request
+        // goes out, and the observation ends where the input arrived.
+        let preempt = self.state.step_preempt().cloned();
         self.honor_pending_retry_advice().await;
 
         'attempt: loop {
@@ -318,56 +322,64 @@ impl OpenAiResponsesTransport {
                 .map(str::to_string);
             let mut failure_event: Option<Value> = None;
             let mut text_started = false;
-            let mut events =
-                collect_events(resp, idle, STREAM_BYTE_BUDGET, request_id, |ev, trace| {
-                    match ev["type"].as_str().unwrap_or("") {
-                        "response.output_text.delta" => {
-                            if let Some(t) = ev["delta"].as_str()
-                                && !t.is_empty()
-                            {
-                                if !text_started {
-                                    sink.stream_event(json!({
-                                        "type": "content_block_start",
-                                        "index": 0,
-                                        "content_block": {"type": "text", "text": ""},
-                                    }));
-                                    text_started = true;
-                                }
+            let mut events = collect_events(
+                resp,
+                idle,
+                STREAM_BYTE_BUDGET,
+                request_id,
+                preempt.as_ref(),
+                super::http::preempt_drain_deadline(),
+                |ev, trace| match ev["type"].as_str().unwrap_or("") {
+                    "response.output_text.delta" => {
+                        if let Some(t) = ev["delta"].as_str()
+                            && !t.is_empty()
+                        {
+                            if !text_started {
                                 sink.stream_event(json!({
-                                    "type": "content_block_delta",
+                                    "type": "content_block_start",
                                     "index": 0,
-                                    "delta": {"type": "text_delta", "text": t},
+                                    "content_block": {"type": "text", "text": ""},
                                 }));
-                                trace.mark_emitted_text();
+                                text_started = true;
                             }
-                            EventFlow::Continue
+                            sink.stream_event(json!({
+                                "type": "content_block_delta",
+                                "index": 0,
+                                "delta": {"type": "text_delta", "text": t},
+                            }));
+                            trace.mark_emitted_text();
                         }
-                        "response.reasoning_summary_text.delta"
-                        | "response.reasoning_text.delta" => {
-                            if let Some(t) = ev["delta"].as_str()
-                                && !t.is_empty()
-                            {
-                                sink.stream_event(json!({
-                                    "type": "content_block_delta",
-                                    "index": 0,
-                                    "delta": {"type": "thinking_delta", "thinking": t},
-                                }));
-                            }
-                            EventFlow::Continue
-                        }
-                        "response.completed" | "response.incomplete" => {
-                            trace.mark_terminal_seen();
-                            EventFlow::Terminal
-                        }
-                        "response.failed" | "error" => {
-                            failure_event = Some(ev.clone());
-                            trace.mark_terminal_seen();
-                            EventFlow::Terminal
-                        }
-                        _ => EventFlow::Continue,
+                        EventFlow::Continue
                     }
-                })
-                .await;
+                    "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+                        if let Some(t) = ev["delta"].as_str()
+                            && !t.is_empty()
+                        {
+                            sink.stream_event(json!({
+                                "type": "content_block_delta",
+                                "index": 0,
+                                "delta": {"type": "thinking_delta", "thinking": t},
+                            }));
+                        }
+                        EventFlow::Continue
+                    }
+                    "response.completed" | "response.incomplete" => {
+                        trace.mark_terminal_seen();
+                        EventFlow::Terminal
+                    }
+                    "response.failed" | "error" => {
+                        failure_event = Some(ev.clone());
+                        trace.mark_terminal_seen();
+                        EventFlow::Terminal
+                    }
+                    _ => EventFlow::Continue,
+                },
+            )
+            .await;
+
+            if events.preempted {
+                self.state.consume_fired_step_preemption();
+            }
 
             // An in-band failure envelope is retryable only for transient
             // codes and only while nothing was emitted; the shared parser
@@ -394,7 +406,7 @@ impl OpenAiResponsesTransport {
                         .trace
                         .fault_context("responses HTTP-SSE", attempt, max_attempts);
                 self.state.defer_retry_until(events.advice);
-                if events.trace.replay_safe() && attempt <= max {
+                if !events.preempted && events.trace.replay_safe() && attempt <= max {
                     let wait = events
                         .advice
                         .map(RetryAfter::remaining_delay)
@@ -424,7 +436,12 @@ impl OpenAiResponsesTransport {
                 ));
             }
 
-            return self.state.parse_sse(&events.accum);
+            self.state.defer_retry_until(events.advice);
+            let mut out = self.state.parse_sse(&events.accum)?;
+            if events.preempted {
+                out.end_turn = Some(false);
+            }
+            return Ok(out);
         }
     }
 
@@ -497,6 +514,9 @@ impl OpenAiResponsesTransport {
         let idle = super::http::stream_idle_timeout();
         let max = MAX_COMPACTION_STREAM_RETRIES;
         let mut attempt = 0u32;
+        // Compaction is never preemptible by the inference signal: it holds
+        // no sampling observation, and its retries are governed by the
+        // bounded budget above.
         self.honor_pending_retry_advice().await;
 
         'attempt: loop {
@@ -515,21 +535,23 @@ impl OpenAiResponsesTransport {
             }
 
             let mut terminal_event: Option<Value> = None;
-            let mut events =
-                collect_events(resp, idle, COMPACTION_BYTE_BUDGET, None, |ev, trace| {
-                    match ev["type"].as_str().unwrap_or("") {
-                        "response.completed"
-                        | "response.incomplete"
-                        | "response.failed"
-                        | "error" => {
-                            terminal_event = Some(ev.clone());
-                            trace.mark_terminal_seen();
-                            EventFlow::Terminal
-                        }
-                        _ => EventFlow::Continue,
+            let mut events = collect_events(
+                resp,
+                idle,
+                COMPACTION_BYTE_BUDGET,
+                None,
+                None,
+                super::http::preempt_drain_deadline(),
+                |ev, trace| match ev["type"].as_str().unwrap_or("") {
+                    "response.completed" | "response.incomplete" | "response.failed" | "error" => {
+                        terminal_event = Some(ev.clone());
+                        trace.mark_terminal_seen();
+                        EventFlow::Terminal
                     }
-                })
-                .await;
+                    _ => EventFlow::Continue,
+                },
+            )
+            .await;
 
             // Account the terminal usage first: validation failures do not
             // unspend the tokens.
@@ -788,6 +810,10 @@ impl Transport for OpenAiResponsesTransport {
         self.state.session_id = id;
     }
 
+    fn set_step_preemption(&mut self, preempt: Option<tokio_util::sync::CancellationToken>) {
+        self.state.set_step_preemption(preempt);
+    }
+
     fn model_limits(&self, model: &str) -> Option<super::ModelLimits> {
         self.catalog
             .iter()
@@ -824,6 +850,7 @@ impl Transport for OpenAiResponsesTransport {
         if let Some(ws) = self.ws.as_mut() {
             match ws.run(&mut self.state, tools, opts, sink).await {
                 WsOutcome::Done(out) => return Ok(out),
+                WsOutcome::Preempted(out) => return Ok(out),
                 WsOutcome::Api(e) => return Err(e),
                 WsOutcome::Transport(e) => {
                     tracing::warn!(

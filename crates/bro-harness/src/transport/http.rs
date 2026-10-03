@@ -150,6 +150,19 @@ pub fn stream_idle_timeout() -> Duration {
     Duration::from_secs(secs)
 }
 
+/// Total deadline for draining a preempted stream after observed effects.
+/// Unlike the per-event idle timeout (which a chatty server keeps resetting),
+/// this bounds the whole drain from the moment preemption fired, so steering
+/// can never wait out an unbounded generation. Tunable:
+/// `BRO_HARNESS_PREEMPT_DRAIN_SECS` (default 60).
+pub fn preempt_drain_deadline() -> Duration {
+    let secs = std::env::var("BRO_HARNESS_PREEMPT_DRAIN_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60);
+    Duration::from_secs(secs)
+}
+
 pub fn max_retries() -> u32 {
     std::env::var("BRO_HARNESS_MAX_RETRIES")
         .ok()
@@ -454,10 +467,11 @@ mod tests {
         assert_eq!(resp.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
         let (rebuilt, text) = buffer_body(resp).await.unwrap();
         assert_eq!(rebuilt.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(
-            RetryAfter::from_headers(rebuilt.headers()).map(|advice| advice.remaining_delay()),
-            Some(Duration::from_secs(3))
-        );
+        let delay = RetryAfter::from_headers(rebuilt.headers())
+            .unwrap()
+            .remaining_delay();
+        assert!(delay <= Duration::from_secs(3));
+        assert!(delay > Duration::from_secs(2));
         assert_eq!(rebuilt.text().await.unwrap(), text);
         assert_eq!(
             json_error_code(&text).as_deref(),

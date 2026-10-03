@@ -637,7 +637,7 @@ async fn path_http_server(
 }
 
 #[tokio::test]
-async fn absent_public_compact_endpoint_falls_back_to_inline_summarization() {
+async fn absent_public_compact_endpoint_leaves_inline_summarization_available() {
     for status in ["404 Not Found", "405 Method Not Allowed"] {
         let inline_summary = sse(&[
             json!({"type":"response.output_text.delta","delta":"<analysis>scratch</analysis><summary>durable</summary>"}),
@@ -653,6 +653,7 @@ async fn absent_public_compact_endpoint_falls_back_to_inline_summarization() {
         )
         .await;
         let mut tx = transport(url, false, None);
+        assert!(tx.public_compact(&opts()).await.unwrap().is_none());
         let summary = tx
             .compact(params(), "compact", &[], &opts())
             .await
@@ -866,7 +867,8 @@ async fn ws_fallback_honors_rejected_handshake_advice() {
     let ws_address = ws_listener.local_addr().unwrap();
     let ws_server = tokio::spawn(async move {
         let mut handshakes = 0u32;
-        while let Ok((mut socket, _)) = ws_listener.accept().await {
+        for _ in 0..2 {
+            let (mut socket, _) = ws_listener.accept().await.unwrap();
             let mut request = Vec::new();
             let mut chunk = [0; 4096];
             loop {

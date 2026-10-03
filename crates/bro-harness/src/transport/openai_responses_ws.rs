@@ -33,6 +33,9 @@ use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
 
 /// The WebSocket Responses beta opt-in (codex `RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE`).
 const WS_BETA: &str = "responses_websockets=2026-02-06";
+/// Collection budget for one WebSocket turn. Bounds a chatty server during a
+/// preempt drain the same way the HTTP collector's budget does.
+const WS_STREAM_BYTE_BUDGET: usize = 64 * 1024 * 1024;
 const PREVIOUS_RESPONSE_NOT_FOUND: &str = "previous_response_not_found";
 const WEBSOCKET_CONNECTION_LIMIT_REACHED: &str = "websocket_connection_limit_reached";
 
@@ -43,6 +46,11 @@ type WsStream =
 pub(super) enum WsOutcome {
     /// Completed normally.
     Done(TurnOutput),
+    /// Queued input preempted the sampling: the admitted prefix is preserved
+    /// exactly once with a follow-up observation (`end_turn == false`), no
+    /// replay, and the connection state was invalidated where it could not be
+    /// drained. The routing transport returns it as a normal turn result.
+    Preempted(TurnOutput),
     /// A real API/protocol error (e.g. `response.failed`); propagate — HTTP would
     /// re-fail, so do NOT fall back.
     Api(anyhow::Error),
@@ -224,6 +232,9 @@ impl WsChannel {
         let cur_nonfields = nonfields_of(&full_body);
         let pre_len = state.input.len();
         let idle = super::http::stream_idle_timeout();
+        // This sampling step's queued-input preemption signal (armed by the
+        // loop immediately before the turn). Consumed once acted on.
+        let preempt = state.step_preempt().cloned();
 
         for attempt in 1..=2u32 {
             let reuse = self.conn.is_some();
@@ -241,6 +252,14 @@ impl WsChannel {
                 frame["previous_response_id"] = json!(pid);
             }
             frame["type"] = json!("response.create");
+            // Responses Lite negotiates its wire mode per request through
+            // client metadata (codex's ws_request_header_x_openai_internal_
+            // codex_responses_lite). Standard Responses sends nothing.
+            if state.uses_responses_lite() {
+                frame["client_metadata"] = json!({
+                    "ws_request_header_x_openai_internal_codex_responses_lite": "true",
+                });
+            }
             let frame_text = match serde_json::to_string(&frame) {
                 Ok(t) => t,
                 Err(e) => {
@@ -295,6 +314,17 @@ impl WsChannel {
             let mut trace = ResponsesStreamTrace::new(None);
             let mut text_started = false;
             let mut response_id: Option<String> = None;
+            // The id from `response.created`: an interrupt can only name a
+            // response the server has already created (reference contract).
+            let mut created_response_id: Option<String> = None;
+            // The interrupt frame was sent on this socket.
+            let mut interrupt_sent = false;
+            // Preemption acted: drain the socket to its terminal (reference
+            // steering keeps admitted work and the reusable connection),
+            // bounded by a total deadline so a chatty server cannot stretch
+            // the drain past the per-event idle resets.
+            let mut draining = false;
+            let mut drain_until: Option<tokio::time::Instant> = None;
             let mut stale_previous_response = false;
             let mut connection_limit_reached = false;
             let mut failure_event: Option<Value> = None;
@@ -303,15 +333,97 @@ impl WsChannel {
             let ws = self.conn.as_mut().expect("conn ensured");
 
             'consume: loop {
-                let next = match tokio::time::timeout(idle, ws.next()).await {
-                    Ok(next) => next,
-                    Err(_) => {
-                        fault = Some(anyhow::anyhow!(
-                            "websocket idle timeout (no event within idle window)"
-                        ));
-                        break 'consume;
+                let read_until = drain_until
+                    .map(|deadline| deadline.min(tokio::time::Instant::now() + idle))
+                    .unwrap_or_else(|| tokio::time::Instant::now() + idle);
+                if draining
+                    && let Some(id) = created_response_id.clone()
+                    && state.uses_responses_lite()
+                    && !interrupt_sent
+                {
+                    // Lite interrupts the active response by id as soon as the
+                    // id exists, including one that arrives after the drain
+                    // began; standard Responses never sends the message.
+                    let frame = json!({
+                        "type": "response.interrupt",
+                        "response_id": id,
+                        "mode": "discard_partial_items",
+                    });
+                    match tokio::time::timeout_at(
+                        read_until,
+                        ws.send(Message::Text(frame.to_string().into())),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            fault = Some(
+                                anyhow::Error::new(error)
+                                    .context("websocket send response.interrupt"),
+                            );
+                            break 'consume;
+                        }
+                        Err(_) => {
+                            fault = Some(anyhow::anyhow!(
+                                "websocket interrupt send deadline exceeded"
+                            ));
+                            break 'consume;
+                        }
                     }
+                    interrupt_sent = true;
+                }
+                let next = match preempt.as_ref().filter(|_| !draining) {
+                    Some(token) => {
+                        tokio::select! {
+                            biased;
+                            _ = token.cancelled(), if !trace.terminal_seen() => {
+                                // Reference steering: stop waiting for more
+                                // output, then drain this socket to its
+                                // terminal so admitted work resolves exactly
+                                // once and the connection stays reusable.
+                                state.consume_fired_step_preemption();
+                                draining = true;
+                                drain_until = Some(
+                                    tokio::time::Instant::now()
+                                        + super::http::preempt_drain_deadline(),
+                                );
+                                continue;
+                            }
+                            next = tokio::time::timeout_at(read_until, ws.next()) => match next {
+                                Ok(next) => next,
+                                Err(_) => {
+                                    fault = Some(anyhow::anyhow!(
+                                        "websocket idle timeout (no event within idle window)"
+                                    ));
+                                    break 'consume;
+                                }
+                            },
+                        }
+                    }
+                    None => match tokio::time::timeout_at(read_until, ws.next()).await {
+                        Ok(next) => next,
+                        Err(_) => {
+                            fault = Some(anyhow::anyhow!(
+                                "websocket idle timeout (no event within idle window)"
+                            ));
+                            break 'consume;
+                        }
+                    },
                 };
+                if let Some(deadline) = drain_until
+                    && tokio::time::Instant::now() >= deadline
+                {
+                    fault = Some(anyhow::anyhow!(
+                        "websocket preempt drain exceeded its total deadline"
+                    ));
+                    break 'consume;
+                }
+                if trace.bytes_consumed() > WS_STREAM_BYTE_BUDGET as u64 {
+                    fault = Some(anyhow::anyhow!(
+                        "websocket stream exceeded the {WS_STREAM_BYTE_BUDGET} byte collection budget"
+                    ));
+                    break 'consume;
+                }
                 let Some(msg) = next else { break 'consume };
                 let msg = match msg {
                     Ok(m) => m,
@@ -347,6 +459,11 @@ impl WsChannel {
                             failure_event = Some(ev.clone());
                             advice = advice
                                 .or_else(|| super::responses_common::in_band_retry_after(&ev));
+                        }
+                        if ev["type"] == "response.created"
+                            && let Some(id) = ev["response"]["id"].as_str()
+                        {
+                            created_response_id = Some(id.to_string());
                         }
                         match ev["type"].as_str().unwrap_or("") {
                             "response.output_text.delta" => {
@@ -394,8 +511,10 @@ impl WsChannel {
                         }
                     }
                     Message::Ping(payload) => {
-                        let ponged = ws.send(Message::Pong(payload)).await;
-                        if ponged.is_err() {
+                        let ponged =
+                            tokio::time::timeout_at(read_until, ws.send(Message::Pong(payload)))
+                                .await;
+                        if !matches!(ponged, Ok(Ok(()))) {
                             fault = Some(anyhow::anyhow!("websocket closed while ponging"));
                             break 'consume;
                         }
@@ -415,9 +534,23 @@ impl WsChannel {
                 ));
             }
 
+            state.defer_retry_until(advice);
+            if advice.is_some() {
+                self.retry_after = state.pending_retry_advice();
+            }
             if let Some(err) = fault {
                 self.reset();
                 let diagnostics = trace.fault_context("responses WebSocket", attempt, 2);
+                if draining {
+                    // Missing output does not prove that provider work was
+                    // absent. A failed steer drain never permits replay.
+                    return WsOutcome::Api(super::responses_common::responses_failure(
+                        err.context(format!(
+                            "websocket steer drain failed; connection invalidated; {diagnostics}"
+                        )),
+                        &accum,
+                    ));
+                }
                 if trace.replay_safe() && attempt < 2 {
                     tracing::warn!(
                         error = %err,
@@ -447,14 +580,19 @@ impl WsChannel {
                 };
             }
 
-            if connection_limit_reached && trace.replay_safe() {
+            if !draining && connection_limit_reached && trace.replay_safe() {
                 self.reset();
                 return WsOutcome::Transport(anyhow::anyhow!(
                     "Responses WebSocket connection limit reached; falling back to HTTP-SSE"
                 ));
             }
 
-            if stale_previous_response && trace.replay_safe() && prev_id.is_some() && attempt < 2 {
+            if !draining
+                && stale_previous_response
+                && trace.replay_safe()
+                && prev_id.is_some()
+                && attempt < 2
+            {
                 tracing::warn!(
                     diagnostics = %trace.fault_context("responses WebSocket", attempt, 2),
                     "Responses WebSocket previous_response_id was stale; retrying with full input"
@@ -482,7 +620,7 @@ impl WsChannel {
                 {
                     let diagnostics = trace.fault_context("responses WebSocket", attempt, 2);
                     self.reset();
-                    if attempt < 2 {
+                    if !draining && trace.replay_safe() && attempt < 2 {
                         tracing::warn!(
                             attempt,
                             error = %error,
@@ -492,7 +630,7 @@ impl WsChannel {
                         self.wait_for_retry_advice(server_advice).await;
                         continue;
                     }
-                    if trace.replay_safe() {
+                    if !draining && trace.replay_safe() {
                         self.retry_after = server_advice.or(self.retry_after);
                         return WsOutcome::Transport(
                             super::responses_common::responses_failure(
@@ -513,12 +651,17 @@ impl WsChannel {
             // API error (do not fall back); the buffer is left pristine (parse_sse
             // bails before appending), and the connection stays healthy for reuse.
             match state.parse_sse(&accum) {
-                Ok(out) => {
+                Ok(mut out) => {
                     self.last_full_input = Some(full_input);
                     self.last_items_added = state.input[pre_len..].to_vec();
                     self.last_response_id = response_id;
                     self.last_nonfields = Some(cur_nonfields);
-                    return WsOutcome::Done(out);
+                    return if draining {
+                        out.end_turn = Some(false);
+                        WsOutcome::Preempted(out)
+                    } else {
+                        WsOutcome::Done(out)
+                    };
                 }
                 Err(e) => {
                     self.reset();
@@ -760,6 +903,258 @@ mod tests {
             handshakes
         });
         (format!("ws://{address}/responses"), task)
+    }
+
+    /// A sink that cancels the step preemption token when the model starts
+    /// streaming, standing in for queued user input arriving mid-response.
+    struct CancelingSink {
+        token: std::sync::Arc<tokio_util::sync::CancellationToken>,
+        fired: std::sync::atomic::AtomicBool,
+    }
+
+    impl crate::transport::TurnSink for CancelingSink {
+        fn stream_event(&self, _event: Value) {
+            if !self.fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                self.token.cancel();
+            }
+        }
+    }
+
+    fn canceling_sink() -> (
+        std::sync::Arc<tokio_util::sync::CancellationToken>,
+        CancelingSink,
+    ) {
+        let token = std::sync::Arc::new(tokio_util::sync::CancellationToken::new());
+        (
+            token.clone(),
+            CancelingSink {
+                token,
+                fired: std::sync::atomic::AtomicBool::new(false),
+            },
+        )
+    }
+
+    /// Scripted turn server: reads the create frame (captured), sends
+    /// `response.created` plus a text delta, then waits up to `wait_interrupt`
+    /// for a second frame before finishing with the scripted terminal. The
+    /// initial delay keeps the stream silent so an already-fired signal wins
+    /// the first read deterministically. Returns the captured create frame and
+    /// any interrupt frame.
+    async fn scripted_preempt_server(
+        initial_delay_ms: u64,
+        wait_interrupt_ms: u64,
+        terminal: String,
+    ) -> (String, tokio::task::JoinHandle<(Value, Option<Value>)>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+            let create = ws.next().await.unwrap().unwrap();
+            let create: Value = match create {
+                Message::Text(text) => serde_json::from_str(&text).unwrap_or(Value::Null),
+                _ => Value::Null,
+            };
+            if initial_delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(initial_delay_ms)).await;
+            }
+            ws.send(Message::Text(
+                json!({"type":"response.created","response":{"id":"resp_interrupted"}})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+            ws.send(Message::Text(
+                json!({"type":"response.output_text.delta","delta":"partial"})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+            let interrupt = match tokio::time::timeout(
+                std::time::Duration::from_millis(wait_interrupt_ms),
+                ws.next(),
+            )
+            .await
+            {
+                Ok(Some(Ok(Message::Text(text)))) => {
+                    Some(serde_json::from_str(&text).unwrap_or(Value::Null))
+                }
+                _ => None,
+            };
+            let _ = ws.send(Message::Text(terminal.into())).await;
+            let _ = ws.close(None).await;
+            (create, interrupt)
+        });
+        (format!("ws://{address}/responses"), task)
+    }
+
+    fn interrupted_terminal() -> String {
+        json!({"type":"response.incomplete","response":{
+            "id":"resp_interrupted","status":"incomplete",
+            "incomplete_details":{"reason":"interrupted"},
+            "usage":{"input_tokens":30,"output_tokens":4,"input_tokens_details":{"cached_tokens":5}}
+        }})
+        .to_string()
+    }
+
+    fn completed_terminal() -> String {
+        json!({"type":"response.completed","response":{
+            "id":"resp_interrupted","status":"completed","output":[
+                {"type":"message","id":"msg_done","status":"completed","content":[{"type":"output_text","text":"partial"}]}
+            ],
+            "usage":{"input_tokens":10,"output_tokens":2}
+        }})
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn lite_preempt_interrupts_drains_terminal_and_keeps_the_connection() {
+        let (url, server) = scripted_preempt_server(0, 3000, interrupted_terminal()).await;
+        let mut ch = WsChannel::new(url);
+        let mut state = fresh_state();
+        state.configure_responses_lite(true);
+        let (token, sink) = canceling_sink();
+        state.set_step_preemption(Some((*token).clone()));
+        let before = state.input.clone();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            ch.run(&mut state, &[], &opts(), &sink),
+        )
+        .await
+        .expect("bounded");
+        let (create, interrupt) = server.await.unwrap();
+        let out = match outcome {
+            WsOutcome::Preempted(out) => out,
+            _ => panic!("drained interrupt must complete the turn"),
+        };
+        assert_eq!(
+            interrupt,
+            Some(json!({
+                "type": "response.interrupt",
+                "response_id": "resp_interrupted",
+                "mode": "discard_partial_items",
+            })),
+            "the create frame was {create}"
+        );
+        assert_eq!(out.end_turn, Some(false));
+        assert_eq!(out.usage.input_tokens, 25);
+        assert_eq!(out.usage.cached_input_tokens, 5);
+        assert_eq!(state.input, before, "a discarded stream stays unadmitted");
+        assert!(
+            ch.conn.is_some(),
+            "a drained interrupt keeps the connection for the follow-up"
+        );
+        assert_eq!(ch.last_response_id.as_deref(), Some("resp_interrupted"));
+    }
+
+    #[tokio::test]
+    async fn non_lite_preempt_drains_without_an_interrupt_and_keeps_the_connection() {
+        let (url, server) = scripted_preempt_server(0, 200, completed_terminal()).await;
+        let mut ch = WsChannel::new(url);
+        let mut state = fresh_state();
+        let (token, sink) = canceling_sink();
+        state.set_step_preemption(Some((*token).clone()));
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            ch.run(&mut state, &[], &opts(), &sink),
+        )
+        .await
+        .expect("bounded");
+        let (create, interrupt) = server.await.unwrap();
+        assert!(
+            interrupt.is_none(),
+            "no speculative protocol message on standard Responses: create {create}"
+        );
+        let out = match outcome {
+            WsOutcome::Preempted(out) => out,
+            _ => panic!("standard mode preempts without a protocol message"),
+        };
+        assert_eq!(out.end_turn, Some(false));
+        assert_eq!(out.text, "partial");
+        assert_eq!(out.usage.output_tokens, 2);
+        assert!(ch.conn.is_some(), "the connection remains usable");
+        assert!(
+            ch.last_full_input.is_some(),
+            "continuation baseline retained"
+        );
+    }
+
+    #[tokio::test]
+    async fn preempt_before_response_id_waits_for_id_then_interrupts() {
+        // Wait for the response identity before sending the Lite interrupt.
+        let (url, server) = scripted_preempt_server(300, 200, completed_terminal()).await;
+        let mut ch = WsChannel::new(url);
+        let mut state = fresh_state();
+        state.configure_responses_lite(true);
+        let token = tokio_util::sync::CancellationToken::new();
+        token.cancel();
+        state.set_step_preemption(Some(token));
+        struct QuietSink;
+        impl crate::transport::TurnSink for QuietSink {
+            fn stream_event(&self, _event: Value) {}
+        }
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            ch.run(&mut state, &[], &opts(), &QuietSink),
+        )
+        .await
+        .expect("bounded");
+        let (create, interrupt) = server.await.unwrap();
+        assert_eq!(
+            interrupt.unwrap()["response_id"],
+            "resp_interrupted",
+            "{create}"
+        );
+        match outcome {
+            WsOutcome::Preempted(out) => {
+                assert_eq!(out.end_turn, Some(false));
+                assert_eq!(out.text, "partial");
+            }
+            _ => panic!("an early signal must preempt"),
+        }
+        assert!(ch.conn.is_some());
+        assert!(
+            state.step_preempt().is_none(),
+            "the fired signal is consumed, not carried into the follow-up"
+        );
+    }
+
+    #[tokio::test]
+    async fn lite_metadata_rides_the_create_frame_only_in_lite_mode() {
+        for lite in [true, false] {
+            let (url, server) = scripted_preempt_server(0, 50, completed_terminal()).await;
+            let mut ch = WsChannel::new(url);
+            let mut state = fresh_state();
+            state.configure_responses_lite(lite);
+            struct QuietSink;
+            impl crate::transport::TurnSink for QuietSink {
+                fn stream_event(&self, _event: Value) {}
+            }
+            let outcome = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                ch.run(&mut state, &[], &opts(), &QuietSink),
+            )
+            .await
+            .expect("bounded");
+            let (create, _interrupt) = server.await.unwrap();
+            assert!(matches!(outcome, WsOutcome::Done(_)), "lite={lite}");
+            let metadata = &create["client_metadata"];
+            if lite {
+                assert_eq!(
+                    metadata["ws_request_header_x_openai_internal_codex_responses_lite"], "true",
+                    "lite must announce the wire mode: {create}"
+                );
+            } else {
+                assert!(
+                    metadata
+                        .get("ws_request_header_x_openai_internal_codex_responses_lite")
+                        .is_none(),
+                    "standard Responses sends no lite metadata: {create}"
+                );
+            }
+        }
     }
 
     #[tokio::test]

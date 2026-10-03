@@ -34,17 +34,25 @@ pub(super) struct StreamEvents {
     /// A transport/framing fault (idle timeout, read error, invalid line,
     /// missing terminal). `None` means the stream terminated cleanly.
     pub(super) fault: Option<anyhow::Error>,
+    /// Queued input started a bounded drain. The caller must never replay
+    /// this request, including when the drain fails before any output arrives.
+    pub(super) preempted: bool,
 }
 
 /// Consume `response` incrementally until the caller reports a terminal
 /// event, the stream ends, the `idle` deadline passes, or the accumulated
 /// byte budget (`max_bytes`) is exceeded. `on_event` sees every parsed event
 /// plus the shared trace and may stream deltas outward.
+///
+/// Queued input starts a drain to the terminal event under an absolute
+/// deadline. Receiving no output yet does not prove provider work is absent.
 pub(super) async fn collect_events<F>(
     response: reqwest::Response,
     idle: std::time::Duration,
     max_bytes: usize,
     request_id: Option<String>,
+    preempt: Option<&tokio_util::sync::CancellationToken>,
+    drain_deadline: std::time::Duration,
     mut on_event: F,
 ) -> StreamEvents
 where
@@ -63,17 +71,56 @@ where
     let mut accum = String::new();
     let mut advice = None;
     let mut fault: Option<anyhow::Error> = None;
+    let mut preempted = false;
+    let mut draining = false;
+    let mut drain_until: Option<tokio::time::Instant> = None;
 
     'consume: loop {
-        let next = match tokio::time::timeout(idle, stream.next()).await {
-            Ok(next) => next,
-            Err(_) => {
-                fault = Some(anyhow::anyhow!(
-                    "responses SSE idle timeout (no event within idle window)"
-                ));
-                break 'consume;
+        let read_until = drain_until
+            .map(|deadline| deadline.min(tokio::time::Instant::now() + idle))
+            .unwrap_or_else(|| tokio::time::Instant::now() + idle);
+        let next = match preempt.filter(|_| !draining) {
+            Some(token) => {
+                tokio::select! {
+                    biased;
+                    _ = token.cancelled(), if !trace.terminal_seen() => {
+                        preempted = true;
+                        draining = true;
+                        drain_until =
+                            Some(tokio::time::Instant::now() + drain_deadline);
+                        continue;
+                    }
+                    next = tokio::time::timeout_at(read_until, stream.next()) => match next {
+                        Ok(next) => next,
+                        Err(_) => {
+                            fault = Some(anyhow::anyhow!(
+                                "responses SSE idle timeout (no event within idle window)"
+                            ));
+                            break 'consume;
+                        }
+                    },
+                }
             }
+            None => match tokio::time::timeout_at(read_until, stream.next()).await {
+                Ok(next) => next,
+                Err(_) => {
+                    fault = Some(anyhow::anyhow!(if draining {
+                        "responses preempt drain exceeded its total deadline or idle window"
+                    } else {
+                        "responses SSE idle timeout (no event within idle window)"
+                    }));
+                    break 'consume;
+                }
+            },
         };
+        if let Some(deadline) = drain_until
+            && tokio::time::Instant::now() >= deadline
+        {
+            fault = Some(anyhow::anyhow!(
+                "responses preempt drain exceeded its total deadline"
+            ));
+            break 'consume;
+        }
         let Some(chunk) = next else { break 'consume };
         let chunk = match chunk {
             Ok(chunk) => chunk,
@@ -129,7 +176,11 @@ where
         }
     }
 
-    if fault.is_none() && !trace.terminal_seen() && !buf.iter().all(u8::is_ascii_whitespace) {
+    if fault.is_none()
+        && !preempted
+        && !trace.terminal_seen()
+        && !buf.iter().all(u8::is_ascii_whitespace)
+    {
         fault = Some(anyhow::anyhow!("unfinished Responses SSE line"));
     }
     if fault.is_none() && !trace.terminal_seen() {
@@ -143,6 +194,7 @@ where
         trace,
         advice,
         fault,
+        preempted,
     }
 }
 
@@ -212,7 +264,11 @@ mod tests {
                     break;
                 }
             }
-            socket.write_all(body.as_bytes()).await.unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
         });
         format!("http://{address}/responses")
     }
@@ -246,6 +302,8 @@ mod tests {
             std::time::Duration::from_secs(5),
             64 * 1024,
             None,
+            None,
+            std::time::Duration::from_secs(5),
             flow,
         )
         .await;
@@ -282,6 +340,8 @@ mod tests {
                 std::time::Duration::from_secs(5),
                 64 * 1024,
                 None,
+                None,
+                std::time::Duration::from_secs(5),
                 flow,
             )
             .await;
@@ -302,6 +362,8 @@ mod tests {
             std::time::Duration::from_secs(5),
             2048,
             None,
+            None,
+            std::time::Duration::from_secs(5),
             flow,
         )
         .await;
@@ -328,6 +390,8 @@ mod tests {
             std::time::Duration::from_secs(5),
             64 * 1024,
             None,
+            None,
+            std::time::Duration::from_secs(5),
             flow,
         )
         .await;
@@ -344,6 +408,90 @@ mod tests {
         let usage = terminal_usage(&json!({"type":"response.completed","response":{}}));
         assert_eq!(usage.input_tokens, 0);
         assert_eq!(usage.output_tokens, 0);
+    }
+
+    /// A server that keeps emitting delta events (resetting the idle timer)
+    /// and never sends a terminal, until its socket fails or the script ends.
+    async fn chatty_server() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut request = Vec::new();
+            let mut chunk = [0; 4096];
+            loop {
+                let count = match socket.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(count) => count,
+                };
+                request.extend_from_slice(&chunk[..count]);
+                if request.windows(4).any(|part| part == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n").await.unwrap();
+            for _ in 0..200 {
+                let event = format!(
+                    "data: {}\n\n",
+                    json!({"type":"response.output_text.delta","delta":"x"})
+                );
+                if socket.write_all(event.as_bytes()).await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        });
+        format!("http://{address}/responses")
+    }
+
+    #[tokio::test]
+    async fn preempt_before_output_still_drains_to_a_bounded_fault() {
+        let url = chatty_server().await;
+        let token = tokio_util::sync::CancellationToken::new();
+        token.cancel();
+        let events = collect_events(
+            post(&url).await,
+            std::time::Duration::from_secs(5),
+            64 * 1024,
+            None,
+            Some(&token),
+            std::time::Duration::from_millis(50),
+            flow,
+        )
+        .await;
+        assert!(events.preempted, "the fired signal preempts the first read");
+        assert!(events.fault.is_some(), "unfinished drain must fail");
+        assert!(!events.trace.terminal_seen());
+    }
+
+    #[tokio::test]
+    async fn preempt_drain_is_bounded_by_a_total_deadline_not_per_event_idle() {
+        // A chatty server resets the idle timer forever; the total drain
+        // deadline still bounds the wait after observed effects.
+        let url = chatty_server().await;
+        let token = tokio_util::sync::CancellationToken::new();
+        let delayed = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            delayed.cancel();
+        });
+        let events = collect_events(
+            post(&url).await,
+            std::time::Duration::from_secs(5),
+            64 * 1024,
+            None,
+            Some(&token),
+            std::time::Duration::from_millis(150),
+            flow,
+        )
+        .await;
+        assert!(events.preempted, "effects were observed, so it drains");
+        let fault = events
+            .fault
+            .expect("the total drain deadline must bound it");
+        assert!(fault.to_string().contains("total deadline"), "{fault:#}");
+        assert!(!events.trace.terminal_seen());
     }
 
     #[tokio::test]

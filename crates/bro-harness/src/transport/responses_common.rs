@@ -81,6 +81,8 @@ pub(super) struct ResponsesState {
     /// its item chain stays retained. Compaction resets it via
     /// [`Self::reset_lite_baseline`].
     lite_baseline: Option<super::responses_lite::CatalogBaseline>,
+    /// Queued-input signal for the current sampling step, never persisted.
+    step_preempt: Option<tokio_util::sync::CancellationToken>,
 }
 
 impl ResponsesState {
@@ -97,6 +99,7 @@ impl ResponsesState {
             compaction_usage: super::Usage::default(),
             responses_lite: false,
             lite_baseline: None,
+            step_preempt: None,
         }
     }
 
@@ -135,6 +138,32 @@ impl ResponsesState {
         } else {
             None
         }
+    }
+
+    /// Arm or disarm the current sampling step's preemption signal (see
+    /// [`Transport::set_step_preemption`]).
+    pub fn set_step_preemption(&mut self, preempt: Option<tokio_util::sync::CancellationToken>) {
+        self.step_preempt = preempt;
+    }
+
+    /// The armed preemption signal for the current sampling step, if any.
+    pub(super) fn step_preempt(&self) -> Option<&tokio_util::sync::CancellationToken> {
+        self.step_preempt.as_ref()
+    }
+
+    /// Consume the armed signal once it has fired, so the follow-up request
+    /// cannot be instantly preempted by the same spent token. Returns true
+    /// when a fired signal was consumed.
+    pub(super) fn consume_fired_step_preemption(&mut self) -> bool {
+        if self
+            .step_preempt
+            .as_ref()
+            .is_some_and(|token| token.is_cancelled())
+        {
+            self.step_preempt = None;
+            return true;
+        }
+        false
     }
 
     /// Record usage observed on a remote compaction stream.
@@ -833,6 +862,9 @@ fn parse_sse_validated(
     // streams, native calls. A rejection that arrives before any of these is
     // pure: nothing was emitted, so the loop may recover it.
     let mut observed_effects = false;
+    // Terminal reported a server-side interrupt: in-flight items were
+    // discarded by the provider and must not fail reconciliation.
+    let mut interrupted = false;
 
     for line in sse.lines() {
         let line = line.trim();
@@ -919,16 +951,26 @@ fn parse_sse_validated(
                     cache_creation_input_tokens: 0,
                 };
                 if incomplete {
-                    stop = StopReason::Length;
-                    // Otherwise-silent path: the model stopped short (e.g.
-                    // max_output_tokens, content filter). Surface the reason
-                    // so a spurious-stop turn is diagnosable from the log.
-                    tracing::warn!(
-                        reason = %r["incomplete_details"]["reason"]
-                            .as_str()
-                            .unwrap_or("unknown"),
-                        "responses turn incomplete; stopping short"
-                    );
+                    if r["incomplete_details"]["reason"].as_str() == Some("interrupted") {
+                        // Server-side interrupt (Lite `response.interrupt`
+                        // drain): the provider discarded its in-flight items
+                        // and finished the response with usage. Codex accepts
+                        // this as a normal follow-up turn, so surface
+                        // `end_turn: false` instead of a length stop.
+                        interrupted = true;
+                        end_turn = Some(false);
+                    } else {
+                        stop = StopReason::Length;
+                        // Otherwise-silent path: the model stopped short (e.g.
+                        // max_output_tokens, content filter). Surface the reason
+                        // so a spurious-stop turn is diagnosable from the log.
+                        tracing::warn!(
+                            reason = %r["incomplete_details"]["reason"]
+                                .as_str()
+                                .unwrap_or("unknown"),
+                            "responses turn incomplete; stopping short"
+                        );
+                    }
                 }
             }
             "response.failed" | "error" => {
@@ -969,6 +1011,12 @@ fn parse_sse_validated(
     }
 
     anyhow::ensure!(terminal, "Responses stream closed before terminal response");
+    if interrupted {
+        // The server discarded the still-open items and their argument
+        // streams; neither is admitted, so neither reconciles.
+        open_items.clear();
+        observed_call_items.clear();
+    }
     // The ChatGPT Responses stream can finish with output:[] after publishing
     // every item through output_item.done. That terminal is metadata-only, as
     // in Codex's OutputItemDone + Completed event contract. It cannot close an
@@ -1730,6 +1778,60 @@ mod tests {
             .iter()
             .map(|event| format!("data: {event}\n\n"))
             .collect()
+    }
+
+    #[test]
+    fn interrupted_incomplete_terminal_is_a_follow_up_turn_with_usage() {
+        // The server-side interrupt drain ends with response.incomplete
+        // reason interrupted: codex accepts it as a normal follow-up turn.
+        // The still-open reasoning item was discarded by the provider
+        // (mode discard_partial_items) and must not fail reconciliation.
+        let sse = response_events(&[
+            json!({"type":"response.created","response":{"id":"resp_interrupted"}}),
+            json!({"type":"response.output_item.added","output_index":0,"item":{
+                "id":"rs_open","type":"reasoning","summary":[]
+            }}),
+            json!({"type":"response.output_item.interrupted","response_id":"resp_interrupted","item_id":"rs_open","output_index":0}),
+            json!({"type":"response.function_call_arguments.delta","item_id":"fc_discarded","delta":"{}"}),
+            json!({"type":"response.incomplete","response":{
+                "id":"resp_interrupted","status":"incomplete",
+                "incomplete_details":{"reason":"interrupted"},
+                "usage":{"input_tokens":30,"output_tokens":4,"input_tokens_details":{"cached_tokens":5}}
+            }}),
+        ]);
+        let mut s = state();
+        let before = s.input.len();
+        let out = s.parse_sse(&sse).expect("interrupted terminal must parse");
+        assert_eq!(
+            out.end_turn,
+            Some(false),
+            "interrupt means continue sampling"
+        );
+        assert_eq!(
+            out.stop,
+            StopReason::Done,
+            "an interrupt is not a length stop"
+        );
+        assert_eq!(out.usage.input_tokens, 25);
+        assert_eq!(out.usage.cached_input_tokens, 5);
+        assert_eq!(out.usage.output_tokens, 4);
+        assert_eq!(
+            s.input.len(),
+            before,
+            "a discarded open item is not admitted"
+        );
+    }
+
+    #[test]
+    fn other_incomplete_reasons_keep_the_length_stop() {
+        let sse = response_events(&[json!({"type":"response.incomplete","response":{
+            "status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},
+            "output":[{"type":"message","status":"incomplete","content":[{"type":"output_text","text":"partial"}]}]
+        }})]);
+        let out = state().parse_sse(&sse).unwrap();
+        assert_eq!(out.stop, StopReason::Length);
+        assert_eq!(out.text, "partial");
+        assert_ne!(out.end_turn, Some(false));
     }
 
     #[test]
