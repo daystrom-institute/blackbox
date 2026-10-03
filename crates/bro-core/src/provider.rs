@@ -644,27 +644,40 @@ static KIMI_EFFORTS: &[EffortInfo] = &[
     },
 ];
 
-// Codex/Brodex model efforts are model-keyed (live-probed from codex CLI
-// 0.144.1 `~/.codex/models_cache.json`). The GPT-5.6 generation ships three
-// sibling tier variants — Sol (frontier), Terra (balanced), Luna (fast) —
-// distinguished purely by slug suffix, and introduces two new reasoning levels:
-//   - `max`   ("Maximum reasoning depth for the hardest problems")
-//   - `ultra` ("Maximum reasoning with automatic task delegation")
-// GPT-6 Astra shares the Sol/Terra effort set (Codex model catalog).
-// `ultra` is exposed by Astra/Sol/Terra but NOT Luna, and neither is exposed by the
-// pre-5.6 models. That per-model divergence is why effort validity is keyed on
-// `ModelInfo::efforts` rather than the flat provider list. Pre-5.6 models keep
-// the established `{minimal,low,medium,high,xhigh}` set (non-regressing).
+// Brodex uses the Codex/ChatGPT catalog's model-keyed effort levels, which
+// differ from the public API. Astra, Sol, and Terra expose `ultra`; Luna
+// stops at `max`. Pre-5.6 models keep their established effort set.
 const CODEX_PRE_56_EFFORTS: &[&str] = &["minimal", "low", "medium", "high", "xhigh"];
 const CODEX_ULTRA_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultra"];
-const CODEX_56_LUNA_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+const CODEX_LUNA_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 
 static CODEX_MODELS: &[ModelInfo] = &[
+    ModelInfo {
+        id: "gpt-6.1-sol",
+        description: "GPT-6.1 Sol: latest workhorse model for coding and everyday work",
+        default: false,
+        efforts: CODEX_ULTRA_EFFORTS,
+        default_effort: Some("low"),
+    },
     ModelInfo {
         id: "gpt-6-astra",
         description: "GPT-6 Astra: most capable model for complex, demanding work",
         default: false,
         efforts: CODEX_ULTRA_EFFORTS,
+        default_effort: Some("medium"),
+    },
+    ModelInfo {
+        id: "gpt-6-sol",
+        description: "GPT-6 Sol: previous generation workhorse model",
+        default: false,
+        efforts: CODEX_ULTRA_EFFORTS,
+        default_effort: Some("medium"),
+    },
+    ModelInfo {
+        id: "gpt-6-luna",
+        description: "GPT-6 Luna: fast and affordable model for easier tasks",
+        default: false,
+        efforts: CODEX_LUNA_EFFORTS,
         default_effort: Some("medium"),
     },
     ModelInfo {
@@ -685,7 +698,7 @@ static CODEX_MODELS: &[ModelInfo] = &[
         id: "gpt-5.6-luna",
         description: "GPT-5.6 Luna: fast and affordable agentic coding model (tier: fast; no `ultra`)",
         default: false,
-        efforts: CODEX_56_LUNA_EFFORTS,
+        efforts: CODEX_LUNA_EFFORTS,
         default_effort: Some("medium"),
     },
     ModelInfo {
@@ -923,13 +936,17 @@ mod tests {
     }
 
     #[test]
-    fn gpt_56_variants_are_catalogued_with_keyed_efforts() {
+    fn codex_variants_are_catalogued_with_keyed_efforts() {
         let models = Provider::Brodex.models();
         // Sol is the default codex model.
         let default_model = models.iter().find(|m| m.default).unwrap();
         assert_eq!(default_model.id, "gpt-5.6-sol");
+        assert_eq!(models.iter().filter(|m| m.default).count(), 1);
         for slug in [
+            "gpt-6.1-sol",
             "gpt-6-astra",
+            "gpt-6-sol",
+            "gpt-6-luna",
             "gpt-5.6-sol",
             "gpt-5.6-terra",
             "gpt-5.6-luna",
@@ -944,6 +961,16 @@ mod tests {
     #[test]
     fn ultra_is_model_keyed_sol_terra_yes_luna_no() {
         let p = Provider::Brodex;
+        for model in ["gpt-6.1-sol", "gpt-6-sol"] {
+            assert_eq!(
+                p.model_efforts(model),
+                ["low", "medium", "high", "xhigh", "max", "ultra"]
+            );
+        }
+        assert_eq!(
+            p.model_efforts("gpt-6-luna"),
+            ["low", "medium", "high", "xhigh", "max"]
+        );
         assert_eq!(
             p.model_efforts("gpt-6-astra"),
             ["low", "medium", "high", "xhigh", "max", "ultra"]
@@ -966,6 +993,16 @@ mod tests {
         assert!(!luna.iter().any(|e| e.id == "ultra"));
         assert_eq!(p.model_default_effort("gpt-5.6-sol"), Some("medium"));
         assert_eq!(p.model_default_effort("gpt-6-astra"), Some("medium"));
+        assert_eq!(p.model_default_effort("gpt-6.1-sol"), Some("low"));
+        assert_eq!(p.model_default_effort("gpt-6-sol"), Some("medium"));
+        assert_eq!(p.model_default_effort("gpt-6-luna"), Some("medium"));
+        let sol = p.model_effort_infos("gpt-6.1-sol");
+        assert!(sol.iter().any(|e| e.id == "ultra"));
+        assert!(
+            !p.model_effort_infos("gpt-6-luna")
+                .iter()
+                .any(|e| e.id == "ultra")
+        );
         assert_eq!(p.model_default_effort("gpt-5.3-codex-spark"), Some("high"));
     }
 

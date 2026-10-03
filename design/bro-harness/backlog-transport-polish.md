@@ -6,7 +6,7 @@ corpus: blackbox-design
 topic:
   - bro-harness
   - providers
-brief: "Residual transport/tool polish for the shipped bro-harness: MCP connection pooling, codex_auth retry wrapping, deferred-manifest token trimming, optional client-side web_search (Brave) fallback, server result normalization, structured output, namespace isolation, in-process executor, and RTK-style per-command output compaction. None are correctness gaps — the harness is live end-to-end; these are latency/cost/robustness/extensibility upgrades."
+brief: "Transport and model-facing tool work, including Responses retry deadlines, responsive steering, MCP resource access, and incremental tool catalogs."
 ---
 
 # bro-harness transport & tool polish (backlog)
@@ -18,8 +18,38 @@ brief: "Residual transport/tool polish for the shipped bro-harness: MCP connecti
 > retry/backoff/Retry-After, resume + wire-contract test) and item 2 (SSE
 > streaming on all three transports) are **done**; what follows is the residue.
 
-The harness is built and live-verified end-to-end. Nothing here is a correctness
-gap. These are independently pickup-able polish items; grab any one.
+## Codex transport and agent-loop adaptations
+
+- [ ] **Preserve Responses retry deadlines.** Carry server retry advice through
+  rejected WebSocket upgrades, stream retries, and HTTP fallback. Keep retries
+  bounded and distinguish transient failures from quota or policy failures.
+  **Acceptance:** no attempt starts before the advised deadline; permanent
+  failures remain terminal; fallback preserves authoritative history.
+- [ ] **Respond to input during inference and code-mode execution.** Add an
+  explicit input notification path so inference can be preempted and running
+  cells can yield without cancelling their work. Drain interrupted Responses
+  streams before reusing connection and continuation state when supported.
+  **Acceptance:** queued input reaches the next model step promptly, once and
+  in order; cell handles and completed tool outcomes survive; explicit interrupt
+  retains its cancellation semantics.
+- [ ] **Expose MCP resource helpers.** Provide resource listing, template
+  listing, and resource reads through the session's admitted MCP connections,
+  with code-mode discovery and invocation support.
+  **Acceptance:** resource-only servers work; pagination, bounded output,
+  configured access restrictions, and missing-server errors are explicit.
+- [ ] **Adopt incremental tool catalogs with Responses Lite.** Establish the
+  transport and model capability boundary before emitting history-carried tool
+  definitions. Preserve a stable initial catalog, append added or changed
+  definitions, and communicate removals and namespace instruction changes.
+  **Acceptance:** unchanged catalogs add no definitions; resume and compaction
+  preserve or rebuild the correct catalog baseline; ordinary Responses requests
+  retain their supported tool encoding.
+
+Implementation owners are `transport/openai_responses*`, `agent_loop.rs`,
+`code_mode.rs`, `mcp.rs`, and `registry.rs` under `crates/bro-harness/src/`.
+Reference mechanisms are Codex's `responses_retry.rs`, `session/turn.rs`,
+`tools/code_mode/`, `tools/spec_plan.rs`, and
+`context/world_state/top_level_tools.rs` under `codex-rs/core/src/`.
 
 ## Done-able now (low risk, clear shape)
 

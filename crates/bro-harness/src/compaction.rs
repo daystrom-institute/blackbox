@@ -235,6 +235,9 @@ fn default_entries() -> BTreeMap<String, Entry> {
         ("gpt-5.6-terra", 272_000, None),
         ("gpt-5.6-luna", 272_000, None),
         ("gpt-6-astra", 272_000, None),
+        ("gpt-6.1-sol", 272_000, None),
+        ("gpt-6-sol", 272_000, None),
+        ("gpt-6-luna", 272_000, None),
     ] {
         m.insert(
             k.into(),
@@ -342,6 +345,9 @@ mod tests {
             "gpt-5.6-terra",
             "gpt-5.6-luna",
             "gpt-6-astra",
+            "gpt-6.1-sol",
+            "gpt-6-sol",
+            "gpt-6-luna",
         ] {
             let window = p.context_window(model).unwrap();
             assert_eq!(window, 272_000);
@@ -536,6 +542,9 @@ mod tests {
             ("gpt-5.6-terra", 272_000),
             ("gpt-5.6-luna", 272_000),
             ("gpt-6-astra", 272_000),
+            ("gpt-6.1-sol", 272_000),
+            ("gpt-6-sol", 272_000),
+            ("gpt-6-luna", 272_000),
         ] {
             assert_eq!(
                 p.context_window(model),
