@@ -175,26 +175,56 @@ impl ResponsesState {
     pub(super) fn sync_lite_catalog(&mut self, tools: &[ToolSpec], opts: &TurnOpts) -> Result<u64> {
         let declarations = lite_tool_declarations(tools, opts);
         let catalog = super::responses_lite::LiteToolCatalog::new(&declarations)?;
-        let previous = match &self.lite_baseline {
+        // Retained catalog history (old definitions, deltas, or notices)
+        // decides the recovery shape: stale items later in the buffer would
+        // semantically override a fresh prefix, so recovery must have the
+        // last word at the sampling boundary instead.
+        let retained_catalog_history = self
+            .input
+            .iter()
+            .any(|item| item["type"].as_str() == Some("additional_tools"));
+        let (transition, first_catalog) = match &self.lite_baseline {
             Some(baseline)
                 if baseline.chain_len() < super::responses_lite::MAX_CHAIN_LINKS
                     && baseline.is_coupled_to(&self.input) =>
             {
-                super::responses_lite::PreviousCatalogState::Known(baseline)
+                (
+                    catalog.render_diff(
+                        super::responses_lite::PreviousCatalogState::Known(baseline),
+                        &self.session_id,
+                    ),
+                    false,
+                )
             }
-            Some(_) => super::responses_lite::PreviousCatalogState::Unknown,
-            None => super::responses_lite::PreviousCatalogState::Absent,
+            // Recovery: the baseline is unusable but stale catalog items are
+            // still retained (lost baseline, compaction that kept old
+            // definitions, or a chain at the cap). The current catalog, even
+            // empty, is re-stated authoritatively at the end.
+            Some(_) | None if retained_catalog_history => {
+                (catalog.render_recovery(&self.session_id), false)
+            }
+            // Unusable baseline over clean history: a genuinely fresh catalog
+            // enters as the stable prefix.
+            Some(_) => (
+                catalog.render_diff(
+                    super::responses_lite::PreviousCatalogState::Unknown,
+                    &self.session_id,
+                ),
+                true,
+            ),
+            None => (
+                catalog.render_diff(
+                    super::responses_lite::PreviousCatalogState::Absent,
+                    &self.session_id,
+                ),
+                true,
+            ),
         };
-        let full_render = !matches!(
-            previous,
-            super::responses_lite::PreviousCatalogState::Known(_)
-        );
-        let transition = catalog.render_diff(previous, &self.session_id);
         let mut added_tokens = 0u64;
         for item in &transition.items {
             added_tokens = added_tokens.saturating_add(crate::context::budget::item_tokens(item));
         }
-        if full_render && !transition.items.is_empty() {
+        if first_catalog && !transition.items.is_empty() {
             // Stable prefix: before the first user item, and never inside the
             // provider-canonical protected prefix.
             let position = self
@@ -2810,6 +2840,84 @@ mod tests {
                 .all(|item| item["type"] != "additional_tools")
         );
         assert!(plain.get("tools").is_some());
+    }
+
+    #[test]
+    fn lite_recovery_restates_the_current_catalog_after_stale_history() {
+        let mut s = lite_state();
+        let options = lite_opts("base");
+        let read = function_spec("read");
+        let faster = {
+            let mut spec = function_spec("read");
+            spec.description = "read files faster".into();
+            spec
+        };
+
+        // Build retained catalog history: initial definitions, a delta, and
+        // a removal notice for the re-added tool.
+        s.sync_lite_catalog(&[read.clone()], &options).unwrap();
+        s.sync_lite_catalog(&[faster.clone()], &options).unwrap();
+        s.sync_lite_catalog(&[], &options).unwrap();
+        let stale_len = s.input.len();
+
+        // Lose the baseline while the stale items stay retained (the chain's
+        // initial link was dropped from history, e.g. a torn tail).
+        s.input.remove(
+            s.input
+                .iter()
+                .position(|item| item["type"] == "additional_tools")
+                .unwrap(),
+        );
+
+        // Recovery with the original catalog re-stated: the reset notice and
+        // current definitions land at the sampling boundary, AFTER every
+        // stale delta and removal notice, so the old removal cannot override.
+        let added = s.sync_lite_catalog(&[read.clone()], &options).unwrap();
+        assert!(added > 0);
+        assert_eq!(s.input.len(), stale_len + 1); // one item removed, two appended
+        let notice = s.input[s.input.len() - 2];
+        assert_eq!(notice["role"], "developer");
+        let text = notice["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("Tool definitions were reset"), "{text}");
+        let current = s.input.last().unwrap();
+        assert_eq!(current["type"], "additional_tools");
+        assert_eq!(
+            current["tools"][0]["description"],
+            json!("read description"),
+            "the current catalog has the last word"
+        );
+        // Unchanged follow-up: nothing new, nothing charged.
+        let added = s.sync_lite_catalog(&[read], &options).unwrap();
+        assert_eq!(added, 0);
+        assert_eq!(s.input.len(), stale_len + 1);
+    }
+
+    #[test]
+    fn lite_recovery_with_empty_current_catalog_resets_without_definitions() {
+        let mut s = lite_state();
+        let options = lite_opts("base");
+        s.sync_lite_catalog(&[function_spec("read")], &options)
+            .unwrap();
+        assert!(
+            s.input
+                .iter()
+                .any(|item| item["type"] == "additional_tools")
+        );
+
+        // Compaction kept the old definitions and root reset the baseline:
+        // the empty current catalog must still supersede them explicitly.
+        s.reset_lite_baseline();
+        let added = s.sync_lite_catalog(&[], &options).unwrap();
+        assert!(added > 0);
+        let last = s.input.last().unwrap();
+        assert_eq!(last["role"], "developer");
+        let text = last["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("no tools are currently available"), "{text}");
+        // Unchanged follow-up: known-empty baseline couples through the
+        // retained reset notice.
+        let added = s.sync_lite_catalog(&[], &options).unwrap();
+        assert_eq!(added, 0);
+        assert_eq!(s.input.last().unwrap(), last);
     }
 
     #[test]
