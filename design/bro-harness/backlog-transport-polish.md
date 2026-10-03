@@ -20,24 +20,24 @@ brief: "Transport and model-facing tool work, including Responses retry deadline
 
 ## Codex transport and agent-loop adaptations
 
-- [ ] **Preserve Responses retry deadlines.** Carry server retry advice through
+- [x] **Preserve Responses retry deadlines.** Carry server retry advice through
   rejected WebSocket upgrades, stream retries, and HTTP fallback. Keep retries
   bounded and distinguish transient failures from quota or policy failures.
   **Acceptance:** no attempt starts before the advised deadline; permanent
   failures remain terminal; fallback preserves authoritative history.
-- [ ] **Respond to input during inference and code-mode execution.** Add an
+- [x] **Respond to input during inference and code-mode execution.** Add an
   explicit input notification path so inference can be preempted and running
   cells can yield without cancelling their work. Drain interrupted Responses
   streams before reusing connection and continuation state when supported.
   **Acceptance:** queued input reaches the next model step promptly, once and
   in order; cell handles and completed tool outcomes survive; explicit interrupt
   retains its cancellation semantics.
-- [ ] **Expose MCP resource helpers.** Provide resource listing, template
+- [x] **Expose MCP resource helpers.** Provide resource listing, template
   listing, and resource reads through the session's admitted MCP connections,
   with code-mode discovery and invocation support.
   **Acceptance:** resource-only servers work; pagination, bounded output,
   configured access restrictions, and missing-server errors are explicit.
-- [ ] **Adopt incremental tool catalogs with Responses Lite.** Establish the
+- [x] **Adopt incremental tool catalogs with Responses Lite.** Establish the
   transport and model capability boundary before emitting history-carried tool
   definitions. Preserve a stable initial catalog, append added or changed
   definitions, and communicate removals and namespace instruction changes.
@@ -53,31 +53,31 @@ Reference mechanisms are Codex's `responses_retry.rs`, `session/turn.rs`,
 
 ## Compaction correctness
 
-- [ ] **Use one request budget.** Resolve the effective usable window from the
+- [x] **Use one request budget.** Resolve the effective usable window from the
   model catalog or explicit policy, and use the encrypted-payload-aware history
   estimate for both proactive decisions and remote request fitting. Reserve
   inline summary output separately from remote compaction capacity.
   **Acceptance:** encrypted histories fit consistently; oversized tool output
   is trimmed on a copy; failed fitting preserves authoritative history.
-- [ ] **Retain the user-message boundary.** Preserve the newest user messages
+- [x] **Retain the user-message boundary.** Preserve the newest user messages
   within the retained-token budget, truncating the boundary message when needed.
   **Acceptance:** an oversized latest message cannot silently erase all retained
   user text; truncation preserves valid UTF-8 and ordering.
-- [ ] **Honor model compatibility.** Carry catalog compaction compatibility
+- [x] **Honor model compatibility.** Carry catalog compaction compatibility
   hashes through session checkpoints and model changes. Compact with the previous
   model when known hashes differ, as well as when the destination budget requires
   it. **Acceptance:** equal and unknown hashes avoid unnecessary compaction;
   failed transitions preserve the previous model and checkpointed history.
-- [ ] **Complete the remote stream lifecycle.** Apply idle deadlines and bounded
+- [x] **Complete the remote stream lifecycle.** Apply idle deadlines and bounded
   retries, preserve retry advice, account for compaction usage, and replace
   history only after terminal success and output validation.
   **Acceptance:** failed or incomplete streams leave history intact; cumulative
   usage includes compaction without replacing measured inference occupancy.
-- [ ] **Recover only replay-safe overflow rejections.** Allow compaction after a
+- [x] **Recover only replay-safe overflow rejections.** Allow compaction after a
   streamed context rejection that contains no admitted output or provider effects.
   **Acceptance:** HTTP and stream rejections recover consistently; ambiguous
   native effects and partial output remain terminal and observable.
-- [ ] **Select remote protocol by provider capability.** Keep ChatGPT's streamed
+- [x] **Select remote protocol by provider capability.** Keep ChatGPT's streamed
   trigger protocol distinct from the public standalone compact endpoint and its
   canonical output window. **Acceptance:** unsupported compatible providers use
   inline compaction; supported protocols preserve their respective output

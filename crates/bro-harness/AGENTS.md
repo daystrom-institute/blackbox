@@ -196,6 +196,12 @@ the daemon boundary contract is `design/bro-harness/harness-process-boundary.md`
   WebSocket turns commit to `ResponsesState` only after a terminal event parses
   successfully; fallback full-replays from that pristine state. Do not add a
   second conversation buffer or commit partial WS state before parse success.
+- Queued input shares one per-step signal between Responses inference and
+  code-mode observation. Inference drains accepted requests to a terminal under
+  an absolute deadline; a failed drain stays observable and never permits
+  replay. Lite interrupts after the response ID is known; ordinary Responses
+  drains without an interrupt frame. Compaction never consumes the steer signal.
+  Code-mode observation can yield while its cell continues running.
 - Server retry advice is a deadline shared across retries, transport fallback,
   and later attempts. Cancelling a wait cannot clear an unexpired deadline.
   Quota and policy failures remain terminal. Context-limit recovery requires a
