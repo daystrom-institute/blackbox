@@ -295,8 +295,10 @@ pub(super) fn remote_compaction_limit(
 /// size is never the verdict. Trimming mirrors codex's
 /// `trim_function_call_history_to_fit_context_window`: only trailing output
 /// groups are rewritten, newest first, with the synthetic trailing trigger
-/// skipped and the pass stopping at the first item that is not a tool
-/// output. Outputs behind later user or assistant messages stay verbatim.
+/// skipped, the pass stopping as soon as the running estimate fits (so a
+/// single sufficient replacement leaves older trailing outputs
+/// byte-identical) and at the first item that is not a tool output. Outputs
+/// behind later user or assistant messages stay verbatim.
 /// Protected content that still overflows is an error rather than a silent
 /// loss. `limit` is the already-resolved usable window: no further output
 /// reservation is subtracted, because the usable percentage already reserves
@@ -316,7 +318,13 @@ pub(super) fn fit_remote_input(mut body: Value, limit: Option<u64>) -> Result<Va
         .and_then(Value::as_array_mut)
         .context("remote compaction request requires input array")?;
     let mut rewritten = 0u64;
+    let mut running = initial;
     for item in items.iter_mut().rev() {
+        if running <= limit {
+            // One replacement was enough: keep the remaining trailing
+            // outputs byte-identical rather than trimming eagerly.
+            break;
+        }
         if item["type"].as_str() == Some("compaction_trigger") {
             // The synthetic trailing trigger is not history; skip, do not trim.
             continue;
@@ -329,18 +337,19 @@ pub(super) fn fit_remote_input(mut body: Value, limit: Option<u64>) -> Result<Va
             // behind it is protected context, not trimmable output.
             break;
         }
+        let before = crate::context::budget::item_tokens(item);
         let mut replacement = item.clone();
         replacement["output"] = Value::String(REMOTE_TRIMMED_OUTPUT.to_owned());
-        if crate::context::budget::item_tokens(&replacement)
-            >= crate::context::budget::item_tokens(item)
-        {
+        let after = crate::context::budget::item_tokens(&replacement);
+        if after >= before {
             // Already minimal; older trailing outputs may still help.
             continue;
         }
         *item = replacement;
         rewritten += 1;
+        running = running.saturating_sub(before).saturating_add(after);
     }
-    // Recompute from the full body instead of accumulating per-item deltas:
+    // Recompute from the full body instead of trusting the running estimate:
     // the shared estimator stays the single authority for the verdict.
     let final_tokens = crate::context::budget::request_tokens(&body);
     tracing::debug!(

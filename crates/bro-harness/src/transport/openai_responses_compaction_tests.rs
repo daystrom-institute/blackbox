@@ -418,6 +418,37 @@ fn fit_remote_input_trims_only_trailing_output_groups() {
     };
     assert!(one_trimmed < full, "fixture must need at least one trim");
 
+    // Two large trailing outputs where one replacement suffices: the newest
+    // is trimmed and the older trailing output stays byte-identical (no
+    // eager trimming past the point the estimate fits).
+    let two_trailing = json!({"instructions": "base", "input": [
+        {"type":"message", "role":"user", "content":[{"type":"input_text", "text":"old task"}]},
+        {"type":"function_call", "call_id":"a", "name":"read", "arguments":"{}"},
+        {"type":"function_call_output", "call_id":"a", "output":output},
+        {"type":"message", "role":"user", "content":[{"type":"input_text", "text":"boundary"}]},
+        {"type":"function_call", "call_id":"b", "name":"read", "arguments":"{}"},
+        {"type":"function_call_output", "call_id":"b", "output":output},
+        {"type":"function_call", "call_id":"c", "name":"read", "arguments":"{}"},
+        {"type":"function_call_output", "call_id":"c", "output":output},
+        {"type":"compaction_trigger"}
+    ]});
+    let one_c_trimmed = replace(&two_trailing, 7, REMOTE_TRIMMED_OUTPUT);
+    assert!(
+        crate::context::budget::request_tokens(&two_trailing) > one_c_trimmed,
+        "fixture must need the trim"
+    );
+    let fitted = fit_remote_input(two_trailing.clone(), Some(one_c_trimmed)).unwrap();
+    assert_eq!(fitted["input"][7]["output"], json!(REMOTE_TRIMMED_OUTPUT));
+    assert_eq!(
+        fitted["input"][5], two_trailing["input"][5],
+        "the second trailing output is untouched once one replacement fits"
+    );
+    assert_eq!(
+        crate::context::budget::request_tokens(&fitted),
+        one_c_trimmed,
+        "the authoritative full-body recheck equals the fixture limit"
+    );
+
     // Trimming the trailing output group suffices: fit succeeds, and the old
     // output behind the user/assistant boundary stays verbatim.
     let fitted = fit_remote_input(body.clone(), Some(one_trimmed)).unwrap();
