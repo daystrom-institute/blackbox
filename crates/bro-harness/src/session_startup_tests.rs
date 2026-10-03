@@ -537,7 +537,7 @@ async fn production_startup_instruction_timeout_warns_starts_and_gates_inference
     // No provider request while the strict boundary refresh cannot complete.
     let (_cancel, cancel_rx) = watch::channel(false);
     let error = session
-        .user_turn("task", cancel_rx, Arc::default())
+        .user_turn("task", cancel_rx, MidTurnInputs::new())
         .await
         .unwrap_err();
     let error = format!("{error:#}");
@@ -550,7 +550,7 @@ async fn production_startup_instruction_timeout_warns_starts_and_gates_inference
     fs.release();
     let (_cancel, cancel_rx) = watch::channel(false);
     let error = session
-        .user_turn("task", cancel_rx, Arc::default())
+        .user_turn("task", cancel_rx, MidTurnInputs::new())
         .await
         .unwrap_err();
     assert!(

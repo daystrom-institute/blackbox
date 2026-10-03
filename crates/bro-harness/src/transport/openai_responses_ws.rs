@@ -62,6 +62,11 @@ pub(super) struct WsChannel {
     /// hint in our design (we full-replay after any reconnect, so it is not a
     /// correctness mechanism), kept for codex parity.
     turn_state: Option<String>,
+    /// Retry advice from a rejected handshake (the upgrade rejection is an
+    /// HTTP response and may carry `Retry-After`) or an exhausted in-band WS
+    /// failure. Surfaced to the routing transport so the WS retry or the
+    /// HTTP fallback waits out the server's window instead of re-tripping it.
+    retry_after: Option<super::http::RetryAfter>,
 
     // --- incremental-input state (mirrors codex's last_request/last_response) ---
     last_full_input: Option<Vec<Value>>,
@@ -76,6 +81,7 @@ impl WsChannel {
             url,
             conn: None,
             turn_state: None,
+            retry_after: None,
             last_full_input: None,
             last_items_added: Vec::new(),
             last_response_id: None,
@@ -86,6 +92,12 @@ impl WsChannel {
     /// The captured `x-codex-turn-state`, for HTTP-fallback replay.
     pub(super) fn turn_state(&self) -> Option<&str> {
         self.turn_state.as_deref()
+    }
+
+    /// Retry advice captured from a rejected handshake or an exhausted
+    /// in-band WS failure, for the WS retry or the HTTP fallback to honor.
+    pub(super) fn retry_after(&self) -> Option<super::http::RetryAfter> {
+        self.retry_after
     }
 
     fn build_request(
@@ -114,14 +126,22 @@ impl WsChannel {
     }
 
     /// Open a connection, returning the stream and any `x-codex-turn-state` the
-    /// server stamped on the handshake response.
-    async fn connect(&self, state: &ResponsesState) -> Result<(WsStream, Option<String>)> {
+    /// server stamped on the handshake response. A rejected upgrade is an HTTP
+    /// response: its `Retry-After` is captured so the retry or the HTTP
+    /// fallback honors the server's window.
+    async fn connect(&mut self, state: &ResponsesState) -> Result<(WsStream, Option<String>)> {
         ensure_crypto_provider();
         let req = self.build_request(state)?;
         tracing::info!(url = %self.url, "connecting Responses WebSocket");
-        let (ws, resp) = tokio_tungstenite::connect_async(req)
-            .await
-            .context("websocket connect")?;
+        let (ws, resp) = match tokio_tungstenite::connect_async(req).await {
+            Ok(pair) => pair,
+            Err(e) => {
+                if let tokio_tungstenite::tungstenite::Error::Http(response) = &e {
+                    self.retry_after = super::http::RetryAfter::from_headers(response.headers());
+                }
+                return Err(anyhow::Error::new(e).context("websocket connect"));
+            }
+        };
         let turn_state = resp
             .headers()
             .get("x-codex-turn-state")
@@ -149,6 +169,23 @@ impl WsChannel {
     /// cached state.
     pub(super) fn invalidate(&mut self) {
         self.reset();
+    }
+
+    /// Sleep out retry advice before a re-dial: the freshest in-band advice
+    /// wins, else the handshake advice, else re-dial immediately (previous
+    /// behavior). Deadline-based, so elapsed advice costs nothing.
+    async fn wait_for_retry_advice(&self, in_band: Option<super::http::RetryAfter>) {
+        let Some(advice) = in_band.or(self.retry_after) else {
+            return;
+        };
+        let wait = advice.remaining_delay();
+        if !wait.is_zero() {
+            tracing::warn!(
+                wait_ms = wait.as_millis() as u64,
+                "honoring server retry advice before websocket retry"
+            );
+            super::http::sleep_until_retry(advice).await;
+        }
     }
 
     /// Incremental `input` delta vs. the server's known state, or `None` to
@@ -220,9 +257,13 @@ impl WsChannel {
                         if self.turn_state.is_none() && ts.is_some() {
                             self.turn_state = ts;
                         }
+                        // A successful handshake consumed the rejected one's
+                        // advice; keep none pending for a later fallback.
+                        self.retry_after = None;
                     }
                     Err(e) => {
                         if attempt < 2 {
+                            self.wait_for_retry_advice(None).await;
                             continue;
                         }
                         return WsOutcome::Transport(e);
@@ -241,6 +282,7 @@ impl WsChannel {
                 self.reset();
                 if attempt < 2 {
                     tracing::warn!(error = %e, "ws send failed (stale connection?); re-dialing");
+                    self.wait_for_retry_advice(None).await;
                     continue;
                 }
                 return WsOutcome::Transport(
@@ -255,6 +297,8 @@ impl WsChannel {
             let mut response_id: Option<String> = None;
             let mut stale_previous_response = false;
             let mut connection_limit_reached = false;
+            let mut failure_event: Option<Value> = None;
+            let mut advice: Option<super::http::RetryAfter> = None;
             let mut fault: Option<anyhow::Error> = None;
             let ws = self.conn.as_mut().expect("conn ensured");
 
@@ -298,6 +342,11 @@ impl WsChannel {
                         }
                         if is_ws_error_code(&ev, WEBSOCKET_CONNECTION_LIMIT_REACHED) {
                             connection_limit_reached = true;
+                        }
+                        if matches!(ev["type"].as_str(), Some("response.failed" | "error")) {
+                            failure_event = Some(ev.clone());
+                            advice = advice
+                                .or_else(|| super::responses_common::in_band_retry_after(&ev));
                         }
                         match ev["type"].as_str().unwrap_or("") {
                             "response.output_text.delta" => {
@@ -375,7 +424,13 @@ impl WsChannel {
                         diagnostics = %diagnostics,
                         "ws stream fault before output; re-dialing"
                     );
+                    self.wait_for_retry_advice(advice).await;
                     continue;
+                }
+                // Preserve the advice for the HTTP fallback before dropping
+                // the channel: it gates the fallback's first attempt.
+                if advice.is_some() {
+                    self.retry_after = advice.or(self.retry_after);
                 }
                 let error = super::responses_common::responses_failure(
                     err.context(if !trace.replay_safe() {
@@ -406,6 +461,52 @@ impl WsChannel {
                 );
                 self.clear_incremental_baseline();
                 continue;
+            }
+
+            // An in-band failure envelope retries within the WS budget for
+            // known-transient codes (overload, rate limit, slow down) while
+            // nothing was observed; once the WS budget is spent a replay-safe
+            // transient failure falls back to HTTP-SSE, which gets its own
+            // budget but still waits out the server advice. Quota, policy,
+            // auth, unrecognized and context-window codes stay API errors via
+            // the shared parser below. Connection-limit and stale-delta errors
+            // were already handled above with their own semantics.
+            if let Some(ev) = failure_event.as_ref() {
+                let data = ev.to_string();
+                let code = super::responses_common::stream_error_code(ev, &data);
+                let message = super::responses_common::stream_error_message(ev, &data);
+                if let super::responses_common::StreamFailure::Retryable {
+                    error,
+                    advice: server_advice,
+                } = super::responses_common::classify_stream_failure(code, message, advice)
+                {
+                    let diagnostics = trace.fault_context("responses WebSocket", attempt, 2);
+                    self.reset();
+                    if attempt < 2 {
+                        tracing::warn!(
+                            attempt,
+                            error = %error,
+                            diagnostics = %diagnostics,
+                            "Responses WebSocket transient stream failure; re-dialing"
+                        );
+                        self.wait_for_retry_advice(server_advice).await;
+                        continue;
+                    }
+                    if trace.replay_safe() {
+                        self.retry_after = server_advice.or(self.retry_after);
+                        return WsOutcome::Transport(
+                            super::responses_common::responses_failure(
+                                error.context(format!(
+                                    "Responses WebSocket transient failure exhausted; falling back to HTTP-SSE; {diagnostics}"
+                                )),
+                                &accum,
+                            ),
+                        );
+                    }
+                    return WsOutcome::Api(super::responses_common::responses_failure(
+                        error, &accum,
+                    ));
+                }
             }
 
             // Terminal event seen → authoritative parse. A `response.failed` is an
@@ -603,5 +704,225 @@ mod tests {
         };
         let outcome = ch.run(&mut state, &[], &opts, &NoSink).await;
         assert!(matches!(outcome, WsOutcome::Transport(_)));
+    }
+
+    fn opts() -> TurnOpts {
+        TurnOpts {
+            model: "gpt-5-codex".into(),
+            max_tokens: 16,
+            base_instructions: None,
+            system: crate::transport::SystemPrompt::default(),
+            effort: None,
+            web_search: false,
+            service_tier: None,
+        }
+    }
+
+    fn fresh_state() -> ResponsesState {
+        use crate::transport::responses_common::{Auth, ResponsesState};
+        let mut state = ResponsesState::new(Auth::ApiKey("fixture".into()));
+        state.push_user_text("synthetic fixture");
+        state
+    }
+
+    /// A raw TCP server that answers every WebSocket upgrade with an HTTP
+    /// rejection carrying `Retry-After`, never completing the handshake.
+    async fn rejecting_upgrade_server(
+        retry_after: &'static str,
+        expected_handshakes: u32,
+    ) -> (String, tokio::task::JoinHandle<u32>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let mut handshakes = 0u32;
+            while handshakes < expected_handshakes
+                && let Ok((mut socket, _)) = listener.accept().await
+            {
+                let mut request = Vec::new();
+                let mut chunk = [0; 4096];
+                loop {
+                    let count = match socket.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(count) => count,
+                    };
+                    request.extend_from_slice(&chunk[..count]);
+                    if request.windows(4).any(|part| part == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                handshakes += 1;
+                let response = format!(
+                    "HTTP/1.1 429 Too Many Requests\r\nRetry-After: {retry_after}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+            handshakes
+        });
+        (format!("ws://{address}/responses"), task)
+    }
+
+    #[tokio::test]
+    async fn rejected_handshake_advice_is_captured_and_budget_stays_bounded() {
+        // The upgrade rejection is an HTTP response: its Retry-After must be
+        // captured (so the retry and the HTTP fallback can honor it), the WS
+        // budget stays at two attempts, and the outcome is a Transport fault
+        // for the HTTP fallback.
+        let (url, server) = rejecting_upgrade_server("0", 2).await;
+        let mut ch = WsChannel::new(url);
+        let mut state = fresh_state();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            ch.run(&mut state, &[], &opts(), &NoSink),
+        )
+        .await
+        .expect("bounded ws budget");
+        let handshakes = server.await.unwrap();
+        assert!(matches!(outcome, WsOutcome::Transport(_)));
+        assert_eq!(handshakes, 2, "ws handshake budget is two attempts");
+        let advice = ch.retry_after().expect("handshake advice preserved");
+        // A zero-second advice is captured but never adds latency.
+        assert_eq!(advice.remaining_delay(), std::time::Duration::from_secs(0));
+    }
+
+    #[tokio::test]
+    async fn future_handshake_advice_keeps_a_remaining_window() {
+        // A future-dated advice is captured as a deadline at receipt, so the
+        // remaining window stays large no matter how often it is inspected.
+        let (url, server) = rejecting_upgrade_server("30", 1).await;
+        let mut ch = WsChannel::new(url);
+        let state = fresh_state();
+        assert!(ch.connect(&state).await.is_err(), "handshake is rejected");
+        let advice = ch.retry_after().expect("handshake advice captured");
+        assert!(advice.remaining_delay() > std::time::Duration::from_secs(25));
+        let again = ch.retry_after().expect("advice survives re-reads");
+        assert!(again.remaining_delay() > std::time::Duration::from_secs(25));
+        drop(server);
+    }
+
+    /// A WebSocket server that reads one request frame then sends `frames`
+    /// JSON events (one per text frame) and closes. Loops forever so every
+    /// re-dial is answered; returns how many request frames it consumed.
+    async fn error_event_server(
+        events: Vec<String>,
+        expected_requests: usize,
+    ) -> (String, tokio::task::JoinHandle<usize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let mut served = 0usize;
+            while served < expected_requests
+                && let Ok((socket, _)) = listener.accept().await
+            {
+                served += 1;
+                let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+                let _ = ws.next().await.unwrap().unwrap();
+                for event in &events {
+                    ws.send(Message::Text(event.clone())).await.unwrap();
+                }
+                ws.close(None).await.unwrap();
+            }
+            served
+        });
+        (format!("ws://{address}/responses"), task)
+    }
+
+    #[tokio::test]
+    async fn transient_in_band_failure_retries_once_then_falls_back() {
+        // server_is_overloaded with in-band advice: one bounded re-dial, then
+        // a replay-safe Transport outcome so HTTP-SSE takes over (with its
+        // own budget, still honoring the advice).
+        let (url, server) = error_event_server(
+            vec![
+                "{\"type\":\"error\",\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"busy\",\"headers\":{\"retry-after\":\"0\"}}}".to_string(),
+            ],
+            2,
+        )
+        .await;
+        let mut ch = WsChannel::new(url);
+        let mut state = fresh_state();
+        let before = state.input.clone();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            ch.run(&mut state, &[], &opts(), &NoSink),
+        )
+        .await
+        .expect("bounded ws budget");
+        let served = server.await.unwrap();
+        assert_eq!(served, 2, "one re-dial within the ws budget");
+        assert!(matches!(outcome, WsOutcome::Transport(_)));
+        assert_eq!(state.input, before, "ws never commits partial state");
+        assert!(
+            ch.retry_after().is_some(),
+            "in-band advice is surfaced to the HTTP fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn quota_in_band_failure_is_terminal_without_retry() {
+        let (url, server) = error_event_server(
+            vec![
+                "{\"type\":\"error\",\"error\":{\"code\":\"insufficient_quota\",\"message\":\"spent\"}}".to_string(),
+            ],
+            1,
+        )
+        .await;
+        let mut ch = WsChannel::new(url);
+        let mut state = fresh_state();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            ch.run(&mut state, &[], &opts(), &NoSink),
+        )
+        .await
+        .expect("bounded");
+        let served = server.await.unwrap();
+        assert_eq!(served, 1, "quota failures never retry");
+        match outcome {
+            WsOutcome::Api(error) => {
+                assert!(format!("{error:#}").contains("quota"));
+                assert!(
+                    !crate::transport::is_context_window_exceeded(&error),
+                    "quota is not a context-window rejection"
+                );
+            }
+            other => panic!("quota failure must propagate as an API error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn context_window_in_band_failure_stays_a_pure_api_error() {
+        let (url, server) = error_event_server(
+            vec![
+                "{\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"context_window_exceeded\",\"message\":\"too big\"}}}".to_string(),
+            ],
+            1,
+        )
+        .await;
+        let mut ch = WsChannel::new(url);
+        let mut state = fresh_state();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            ch.run(&mut state, &[], &opts(), &NoSink),
+        )
+        .await
+        .expect("bounded");
+        let served = server.await.unwrap();
+        assert_eq!(served, 1, "a rejection never retries");
+        match outcome {
+            WsOutcome::Api(error) => {
+                assert!(
+                    crate::transport::is_context_window_exceeded(&error),
+                    "typed cause must survive the ws path: {error:#}"
+                );
+                assert!(
+                    error
+                        .downcast_ref::<crate::transport::FailedTurnObservation>()
+                        .is_none(),
+                    "pure rejection stays bare for loop recovery"
+                );
+            }
+            other => panic!("rejection must be an API error"),
+        }
     }
 }

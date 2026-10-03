@@ -8,6 +8,9 @@ out explicitly under `Changed` or `Removed`.
 
 ## Unreleased
 
+- Brodex accepts `gpt-6.1-sol`, `gpt-6-sol`, and `gpt-6-luna`, with each
+  model's supported reasoning efforts and a context-window fallback when the
+  backend catalog is unavailable.
 - Workers that survive a daemon restart under fleetd are re-adopted at daemon
   startup instead of on the next dispatch, so their tasks read as running and
   resume ingesting from the durable cursor with no manual step. `bro_resume`

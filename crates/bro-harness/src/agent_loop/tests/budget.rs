@@ -429,11 +429,12 @@ async fn task_and_queued_steer_hooks_are_budgeted_in_the_first_request() {
         let (mut session, boundaries, _) = probe(vec![]);
         session.compact_threshold = Some(10_000);
         session.hooks = HookEngine::new(vec![Box::new(UserHook)], Default::default());
-        let inputs = Arc::new(Mutex::new(if queued {
-            VecDeque::from(["trigger".into()])
-        } else {
-            VecDeque::new()
-        }));
+        // Local addition: mechanical adaptation to the MidTurnInputs mailbox;
+        // a pre-queued steer keeps the same first-attempt capture semantics.
+        let inputs = MidTurnInputs::new();
+        if queued {
+            inputs.push_back("trigger".into());
+        }
         let (_sender, cancel) = watch::channel(false);
         session
             .user_turn(
@@ -534,7 +535,8 @@ async fn downshift_rejects_oversized_post_compaction_context_and_checkpoints_old
 
 #[tokio::test]
 async fn steer_arriving_during_tool_execution_survives_compaction_before_sampling() {
-    struct Enqueue(Arc<Mutex<VecDeque<String>>>);
+    // Local addition: mechanical adaptation to the MidTurnInputs mailbox.
+    struct Enqueue(MidTurnInputs);
     #[async_trait]
     impl Tool for Enqueue {
         fn name(&self) -> &str {
@@ -547,14 +549,11 @@ async fn steer_arriving_during_tool_execution_survives_compaction_before_samplin
             json!({"type":"object"})
         }
         async fn call(&self, _: Value, _: &ToolCx) -> bro_tools::ToolResult {
-            self.0
-                .lock()
-                .unwrap()
-                .push_back("FRESH_TOOL_TIME_STEER".into());
+            self.0.push_back("FRESH_TOOL_TIME_STEER".into());
             bro_tools::ToolResult::Json(json!({"ok":true}))
         }
     }
-    let inputs = Arc::new(Mutex::new(VecDeque::new()));
+    let inputs = MidTurnInputs::new();
     let (mut session, boundaries, fail) = probe(vec![]);
     session.tx = Box::new(BudgetTransport {
         history: vec![],

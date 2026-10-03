@@ -5,11 +5,11 @@
 //! Transport + call pattern mirror the daemon's own outbound client: streamable
 //! HTTP uses rmcp's reqwest transport, and stdio uses rmcp's `TokioChildProcess`.
 //! Connections are **persistent per server**: one connection is started when a
-//! server's tools are loaded and Arc-shared by every `McpTool` it produces, so a
-//! stateful server (e.g. `@playwright/mcp` holding a browser across calls) sees
-//! the same session on every call rather than a fresh subprocess per call.
-//! Dropping the last tool drops the connection; stdio children are reaped via
-//! `kill_on_drop(true)`.
+//! server is admitted and Arc-shared by every `McpTool` it produces plus, for
+//! servers reachable through the resource helpers, the shared resource state
+//! those helpers hold. A resource-only server (no tools) therefore keeps its
+//! connection for the whole session instead of being dropped when no
+//! `McpTool` retains it; stdio children are reaped via `kill_on_drop(true)`.
 //!
 //! Startup is bounded per server. Required failures abort session construction;
 //! optional failures publish sanitized readiness. Catalogs are fixed for the
@@ -31,6 +31,7 @@ use std::sync::Arc;
 mod admission;
 mod config;
 mod remote;
+mod resources;
 pub(crate) mod result;
 pub use admission::{
     McpLoad, McpServerReadiness, load_mcp_tools, load_mcp_tools_from_config,
@@ -38,6 +39,7 @@ pub use admission::{
 };
 pub use config::McpServerPolicy;
 use remote::ServerConn;
+pub use resources::ResourcePage;
 
 #[derive(Clone)]
 pub struct McpConfig {
@@ -108,6 +110,31 @@ pub trait McpSurface: Send + Sync {
     async fn list_tools(&self) -> anyhow::Result<Vec<McpToolSpec>>;
     /// Native host result, projected into the same MCP envelope as remote tools.
     async fn call_tool(&self, tool: &str, input: Value) -> anyhow::Result<ToolResult>;
+
+    /// Whether this surface exposes the MCP resources capability. Surfaces
+    /// that implement the resource methods below must also declare support
+    /// here; the resource helpers fail closed on an undeclared capability.
+    fn resources_supported(&self) -> bool {
+        false
+    }
+    /// One page of resources (`resources/list`). Items are raw MCP resource
+    /// JSON objects (`uri`, `name`, `description`, `mimeType`, ...).
+    async fn list_resources(&self, _cursor: Option<String>) -> anyhow::Result<ResourcePage> {
+        anyhow::bail!("in-process MCP server does not expose resources")
+    }
+    /// One page of resource templates (`resources/templates/list`). Items are
+    /// raw MCP resource template JSON objects (`uriTemplate`, `name`, ...).
+    async fn list_resource_templates(
+        &self,
+        _cursor: Option<String>,
+    ) -> anyhow::Result<ResourcePage> {
+        anyhow::bail!("in-process MCP server does not expose resources")
+    }
+    /// Read one resource (`resources/read`). Contents are raw MCP content
+    /// JSON objects (`uri`, `text`/`blob`, `mimeType`, ...).
+    async fn read_resource(&self, _uri: &str) -> anyhow::Result<Vec<Value>> {
+        anyhow::bail!("in-process MCP server does not expose resources")
+    }
 }
 
 fn capability_alias(call_name: &str) -> Option<&'static str> {
@@ -686,10 +713,20 @@ mod tests {
             .unwrap()
             .tools;
         let names: Vec<_> = tools.iter().map(|t| t.name()).collect();
-        assert_eq!(names, vec!["mcp__sdk__placed", "mcp__sdk__default_out"]);
+        assert_eq!(
+            names,
+            vec![
+                "mcp__sdk__placed",
+                "mcp__sdk__default_out",
+                "list_mcp_resources",
+                "list_mcp_resource_templates",
+                "read_mcp_resource"
+            ]
+        );
         assert!(
             tools
                 .iter()
+                .take(2)
                 .all(|tool| tool.description().contains(result::RESULT_GUIDANCE))
         );
 
@@ -697,7 +734,15 @@ mod tests {
         let in_names: Vec<_> = in_box.iter().map(|t| t.name()).collect();
         let out_names: Vec<_> = out_box.iter().map(|t| t.name()).collect();
         assert_eq!(in_names, vec!["mcp__sdk__placed"]);
-        assert_eq!(out_names, vec!["mcp__sdk__default_out"]);
+        assert_eq!(
+            out_names,
+            vec![
+                "mcp__sdk__default_out",
+                "list_mcp_resources",
+                "list_mcp_resource_templates",
+                "read_mcp_resource"
+            ]
+        );
     }
 
     struct CapabilitySurface;
@@ -759,6 +804,9 @@ mod tests {
                 "mcp__blackbox__bbox_hybrid_search",
                 "mcp__blackbox__external_action",
                 "mcp__blackbox__bbox_context",
+                "list_mcp_resources",
+                "list_mcp_resource_templates",
+                "read_mcp_resource",
             ]
         );
 

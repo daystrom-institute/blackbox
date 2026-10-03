@@ -25,6 +25,7 @@ pub mod codex_auth;
 pub mod http;
 pub mod openai_chat;
 pub mod openai_responses;
+mod openai_responses_stream;
 pub mod openai_responses_ws;
 pub mod responses_common;
 pub(crate) mod responses_lite;
@@ -537,6 +538,17 @@ pub trait Transport: Send {
     /// to return the most recent segment state and reset their internal
     /// accumulator.
     fn take_interrupted_usage(&mut self) -> Usage {
+        Usage::default()
+    }
+
+    /// Drain usage accumulated by server-side compaction requests. Compaction
+    /// is not a `run_turn`, so its tokens never appear in a turn result, yet
+    /// they were spent whether or not the compacted envelope validated. The
+    /// agent loop calls this after every `compact()` return (success and
+    /// failure) and adds it to the session accumulator. Default: no usage
+    /// (transports whose compaction is purely client-side summarize through
+    /// `run_turn`-shaped calls that already report usage).
+    fn take_compaction_usage(&mut self) -> Usage {
         Usage::default()
     }
 

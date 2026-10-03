@@ -574,7 +574,7 @@ async fn remote_compaction_failure_keeps_outputs_removed_from_request_copy() {
     let (url, request) = server(stream(&[]), "text/event-stream").await;
     let mut tx = transport(url, true);
     let mut input = oversized_input()["input"].as_array().unwrap().clone();
-    input[2]["output"] = json!("large output ".repeat(200_000));
+    input[4]["output"] = json!("large output ".repeat(200_000));
     tx.state.input = input;
     let before = tx.snapshot();
     assert!(
@@ -585,8 +585,9 @@ async fn remote_compaction_failure_keeps_outputs_removed_from_request_copy() {
     assert_eq!(tx.snapshot(), before);
     let sent = request.await.unwrap();
     assert_eq!(sent["input"][0], before["input"][0]);
-    assert_eq!(sent["input"][2]["output"], OMITTED_OUTPUT);
+    assert_eq!(sent["input"][4]["output"], REMOTE_TRIMMED_OUTPUT);
     assert_eq!(sent["input"][1], before["input"][1]);
+    assert_eq!(sent["input"][2], before["input"][2]);
     assert_eq!(sent["input"][3], before["input"][3]);
     assert_eq!(sent["input"][5], json!({"type":"compaction_trigger"}));
 }
