@@ -51,6 +51,42 @@ Reference mechanisms are Codex's `responses_retry.rs`, `session/turn.rs`,
 `tools/code_mode/`, `tools/spec_plan.rs`, and
 `context/world_state/top_level_tools.rs` under `codex-rs/core/src/`.
 
+## Compaction correctness
+
+- [ ] **Use one request budget.** Resolve the effective usable window from the
+  model catalog or explicit policy, and use the encrypted-payload-aware history
+  estimate for both proactive decisions and remote request fitting. Reserve
+  inline summary output separately from remote compaction capacity.
+  **Acceptance:** encrypted histories fit consistently; oversized tool output
+  is trimmed on a copy; failed fitting preserves authoritative history.
+- [ ] **Retain the user-message boundary.** Preserve the newest user messages
+  within the retained-token budget, truncating the boundary message when needed.
+  **Acceptance:** an oversized latest message cannot silently erase all retained
+  user text; truncation preserves valid UTF-8 and ordering.
+- [ ] **Honor model compatibility.** Carry catalog compaction compatibility
+  hashes through session checkpoints and model changes. Compact with the previous
+  model when known hashes differ, as well as when the destination budget requires
+  it. **Acceptance:** equal and unknown hashes avoid unnecessary compaction;
+  failed transitions preserve the previous model and checkpointed history.
+- [ ] **Complete the remote stream lifecycle.** Apply idle deadlines and bounded
+  retries, preserve retry advice, account for compaction usage, and replace
+  history only after terminal success and output validation.
+  **Acceptance:** failed or incomplete streams leave history intact; cumulative
+  usage includes compaction without replacing measured inference occupancy.
+- [ ] **Recover only replay-safe overflow rejections.** Allow compaction after a
+  streamed context rejection that contains no admitted output or provider effects.
+  **Acceptance:** HTTP and stream rejections recover consistently; ambiguous
+  native effects and partial output remain terminal and observable.
+- [ ] **Select remote protocol by provider capability.** Keep ChatGPT's streamed
+  trigger protocol distinct from the public standalone compact endpoint and its
+  canonical output window. **Acceptance:** unsupported compatible providers use
+  inline compaction; supported protocols preserve their respective output
+  contracts and authentication recovery.
+
+Reference mechanisms are `compact_remote_v2.rs`, `compact_remote_v2_attempt.rs`,
+`compact_remote_history.rs`, and `session/context_window.rs` under
+`codex-rs/core/src/`, plus provider capabilities and model catalog metadata.
+
 ## Done-able now (low risk, clear shape)
 
 - **MCP connection pooling.** Today `crates/bro-harness/src/mcp.rs` re-dials its
