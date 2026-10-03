@@ -370,17 +370,27 @@ impl ServerConn {
     }
 
     fn page_items(result: ServerResult) -> Result<(Vec<Value>, Option<String>), String> {
-        let (items, next_cursor) = match result {
-            ServerResult::ListResourcesResult(page) => (page.resources, page.next_cursor),
-            ServerResult::ListResourceTemplatesResult(page) => {
-                (page.resource_templates, page.next_cursor)
+        let (entries, next_cursor) = match result {
+            ServerResult::ListResourcesResult(page) => {
+                (serialize_entries(page.resources)?, page.next_cursor)
             }
+            ServerResult::ListResourceTemplatesResult(page) => (
+                serialize_entries(page.resource_templates)?,
+                page.next_cursor,
+            ),
             _ => {
                 return Err(
                     "server returned an unexpected result variant for the resource listing".into(),
                 );
             }
         };
+        Ok((entries, next_cursor))
+    }
+
+    /// Serialize one page's typed entries into raw JSON values, stripping the
+    /// protocol-private `_meta` from each entry. Each match arm calls this
+    /// with its own concrete item type before the results share a tuple type.
+    fn serialize_entries<T: serde::Serialize>(items: Vec<T>) -> Result<Vec<Value>, String> {
         let mut entries = Vec::with_capacity(items.len());
         for item in items {
             let mut value = serde_json::to_value(item)
@@ -390,7 +400,7 @@ impl ServerConn {
             }
             entries.push(value);
         }
-        Ok((entries, next_cursor))
+        Ok(entries)
     }
 
     pub(super) async fn list_resources(

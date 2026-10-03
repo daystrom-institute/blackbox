@@ -25,7 +25,7 @@
 //! dropped entries would be permanently skipped.
 
 use super::remote::ResourceRpcError;
-use super::{McpBackend, McpSurface, ToolFilter};
+use super::{McpBackend, ToolFilter};
 use async_trait::async_trait;
 use bro_tools::{Tool, ToolCx, ToolResult};
 use serde_json::{Value, json};
@@ -199,7 +199,10 @@ fn valid_resource_uri(uri: &str) -> bool {
         return false;
     }
     let scheme = uri.split(':').next().unwrap_or_default();
-    scheme.chars().next().is_some_and(char::is_ascii_alphabetic)
+    scheme
+        .chars()
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic())
         && scheme
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
@@ -339,7 +342,7 @@ impl ListingReceipt {
 fn bound_listing(
     mut entries: Vec<Value>,
     mut receipt: ListingReceipt,
-    mut envelope: Value,
+    envelope: Value,
     next_cursor: Option<String>,
     field: &str,
     budget: usize,
@@ -440,7 +443,7 @@ impl ListResourcesTool {
                     connection.list_resources(cursor, cancellation).await
                 };
                 match page {
-                    Ok(page) => Ok((page.items, page.next_cursor)),
+                    Ok(page) => Ok(page),
                     Err(ResourceRpcError::Uncertain(envelope)) => {
                         Err(ListFailure::Uncertain(envelope))
                     }
@@ -979,12 +982,15 @@ fn project_content(content: Value, text_allowance: usize) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mcp::{McpConfig, McpServerConfig, McpTool, load_mcp_tools_from_config};
+    use crate::mcp::{McpConfig, McpServerConfig, McpSurface, McpTool, load_mcp_tools_from_config};
     use anyhow::{Result, bail};
     use serde_json::json;
     use std::path::PathBuf;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
     use tokio::sync::Notify;
+
+    /// `().serve` for the duplex remote fixtures.
+    use rmcp::ServiceExt as _;
 
     fn cx(root: PathBuf, output_budget: usize) -> ToolCx {
         ToolCx {
