@@ -219,6 +219,18 @@ impl CodeModeService {
     }
 
     pub async fn execute(&self, request: ExecuteRequest) -> Result<StartedCell, String> {
+        self.execute_with_preempt(request, /*preempt*/ None).await
+    }
+
+    // Local addition (not vendored): preempt-aware execute. Cancelling
+    // `preempt` makes the cell's initial observation yield early so the host
+    // can consume newly queued input; the cell itself keeps running and a
+    // later wait still observes its terminal output exactly once.
+    pub async fn execute_with_preempt(
+        &self,
+        request: ExecuteRequest,
+        preempt: Option<CancellationToken>,
+    ) -> Result<StartedCell, String> {
         if self.inner.shutting_down.load(Ordering::Acquire) {
             return Err("code mode session is shutting down".to_string());
         }
@@ -231,6 +243,7 @@ impl CodeModeService {
             CellResponseSender::Runtime(response_tx),
             Some(initial_yield_time_ms),
             PendingRuntimeMode::Continue,
+            preempt,
         )
         .await?;
 
@@ -252,6 +265,7 @@ impl CodeModeService {
             CellResponseSender::ExecuteToPending(response_tx),
             /*initial_yield_time_ms*/ None,
             PendingRuntimeMode::PauseUntilResumed,
+            /*preempt*/ None,
         )
         .await?;
 
@@ -267,6 +281,7 @@ impl CodeModeService {
         initial_response_tx: CellResponseSender,
         initial_yield_time_ms: Option<u64>,
         pending_mode: PendingRuntimeMode,
+        preempt: Option<CancellationToken>,
     ) -> Result<(), String> {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (control_tx, control_rx) = mpsc::unbounded_channel();
@@ -307,6 +322,9 @@ impl CodeModeService {
                 pending_mode,
                 runtime_terminate_handle,
                 cancellation_token,
+                // Local addition (not vendored): queued-input preemption for
+                // this observation; consumed on first fire (see run_cell_control).
+                step_preempt: preempt,
             },
             event_rx,
             control_rx,
@@ -318,6 +336,18 @@ impl CodeModeService {
     }
 
     pub async fn wait(&self, request: WaitRequest) -> Result<WaitOutcome, String> {
+        self.wait_with_preempt(request, /*preempt*/ None).await
+    }
+
+    // Local addition (not vendored): preempt-aware wait. Cancelling `preempt`
+    // yields this wait's observation early while the cell keeps running; the
+    // signal replaces any earlier one so each observation preempts on its own
+    // step's input only.
+    pub async fn wait_with_preempt(
+        &self,
+        request: WaitRequest,
+        preempt: Option<CancellationToken>,
+    ) -> Result<WaitOutcome, String> {
         let WaitRequest {
             cell_id,
             yield_time_ms,
@@ -330,6 +360,7 @@ impl CodeModeService {
         let control_message = CellControlCommand::Poll {
             yield_time_ms,
             response_tx,
+            preempt,
         };
         if handle.control_tx.send(control_message).is_err() {
             return Ok(WaitOutcome::MissingCell(missing_cell_response(cell_id)));
@@ -479,6 +510,9 @@ enum CellControlCommand {
     Poll {
         yield_time_ms: u64,
         response_tx: oneshot::Sender<RuntimeResponse>,
+        // Local addition (not vendored): queued-input preemption for this
+        // observation; replaces the signal armed by the previous one.
+        preempt: Option<CancellationToken>,
     },
     PollToPending {
         response_tx: oneshot::Sender<ExecuteToPendingOutcome>,
@@ -507,6 +541,10 @@ struct CellControlContext {
     pending_mode: PendingRuntimeMode,
     runtime_terminate_handle: v8::IsolateHandle,
     cancellation_token: CancellationToken,
+    // Local addition (not vendored): queued-input preemption signal armed with
+    // the initial exec observation. Wait commands replace it; firing it once
+    // yields the active observation without stopping the cell.
+    step_preempt: Option<CancellationToken>,
 }
 
 fn missing_cell_response(cell_id: CellId) -> RuntimeResponse {
@@ -694,6 +732,7 @@ async fn run_cell_control(
         pending_mode,
         runtime_terminate_handle,
         cancellation_token,
+        step_preempt,
     } = context;
     let mut content_items = Vec::new();
     let mut pending_tool_call_ids = Vec::new();
@@ -712,6 +751,12 @@ async fn run_cell_control(
     // When a nested call returns before the cell yields, re-arm a fresh window
     // from tool-return so post-tool async work still gets a fair yield boundary.
     let mut yield_window_ms: Option<u64> = initial_yield_time_ms;
+    // Local addition (not vendored): queued-input preemption for the ACTIVE
+    // observation. Armed by the initial exec or a wait command; firing it once
+    // yields that observation without stopping the cell. A completion or a
+    // later command consumes it, so one input never preempts every future
+    // observation.
+    let mut step_preempt = step_preempt;
     let mut tool_call_tasks = JoinSet::new();
     let mut notification_tasks = JoinSet::new();
     let mut nested_outcomes = NestedOutcomeLog::default();
@@ -934,6 +979,7 @@ async fn run_cell_control(
                     CellControlCommand::Poll {
                         yield_time_ms,
                         response_tx: next_response_tx,
+                        preempt: next_preempt,
                     } => {
                         if let Some(result) = pending_result.take() {
                             terminal_reply = Some((
@@ -945,6 +991,7 @@ async fn run_cell_control(
                         response_tx = Some(CellResponseSender::Runtime(next_response_tx));
                         yield_window_ms = Some(yield_time_ms);
                         yield_timer = Some(Box::pin(tokio::time::sleep(Duration::from_millis(yield_time_ms))));
+                        step_preempt = next_preempt;
                         resume_paused_runtime(&runtime_control_tx, pending_mode);
                     }
                     CellControlCommand::PollToPending {
@@ -962,6 +1009,9 @@ async fn run_cell_control(
                             Some(CellResponseSender::ExecuteToPending(next_response_tx));
                         yield_window_ms = None;
                         yield_timer = None;
+                        // Local addition (not vendored): the pause-until-resumed
+                        // surface manages observation timing itself.
+                        step_preempt = None;
                         resume_paused_runtime(&runtime_control_tx, pending_mode);
                     }
                     CellControlCommand::Terminate { response_tx: next_response_tx } => {
@@ -977,6 +1027,9 @@ async fn run_cell_control(
                         termination_requested = true;
                         cancellation_token.cancel();
                         yield_timer = None;
+                        // Local addition (not vendored): termination owns this
+                        // cell; a queued-input signal must not race it.
+                        step_preempt = None;
                         let _ = runtime_tx.send(RuntimeCommand::Terminate);
                         terminate_paused_runtime(&runtime_control_tx, pending_mode);
                         let _ = runtime_terminate_handle.terminate_execution();
@@ -1005,6 +1058,21 @@ async fn run_cell_control(
                     std::future::pending::<()>().await;
                 }
             } => {
+                yield_timer = None;
+                send_yield_response(&cell_id, &mut content_items, &mut response_tx);
+            }
+            // Local addition (not vendored): queued user input preempts the
+            // active observation early. The cell is NOT stopped: it keeps
+            // running and a later wait still collects its terminal output
+            // exactly once. Consuming the signal rearms it: later
+            // observations preempt only on their own step's input.
+            _ = async {
+                match step_preempt.as_ref() {
+                    Some(preempt) => preempt.cancelled().await,
+                    None => std::future::pending::<()>().await,
+                }
+            }, if step_preempt.is_some() => {
+                step_preempt = None;
                 yield_timer = None;
                 send_yield_response(&cell_id, &mut content_items, &mut response_tx);
             }
@@ -1340,6 +1408,7 @@ mod tests {
                 pending_mode: PendingRuntimeMode::Continue,
                 runtime_terminate_handle,
                 cancellation_token: tokio_util::sync::CancellationToken::new(),
+                step_preempt: None,
             },
             event_rx,
             control_rx,
@@ -1436,6 +1505,211 @@ mod tests {
                 error_text: None,
             })
         );
+    }
+
+    // Local addition (not vendored): a cancelled preemption token yields the
+    // active exec observation immediately (long before its yield window)
+    // while the nested tool call is still in flight; the cell keeps running
+    // and a later wait collects the terminal result exactly once.
+    #[tokio::test]
+    async fn preempt_yields_long_exec_while_nested_tool_runs_and_wait_collects_once() {
+        let service = CodeModeService::with_delegate(Arc::new(SlowToolDelegate {
+            delay: Duration::from_millis(400),
+        }));
+        let preempt = tokio_util::sync::CancellationToken::new();
+        let started = service
+            .execute_with_preempt(
+                ExecuteRequest {
+                    enabled_tools: vec![slow_tool_definition()],
+                    source: "const r = await tools.slow({}); text(String(r));".to_string(),
+                    yield_time_ms: Some(60_000),
+                    ..execute_request("")
+                },
+                Some(preempt.clone()),
+            )
+            .await
+            .unwrap();
+        // Let the nested call be admitted, then signal queued input.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        preempt.cancel();
+        let response = tokio::time::timeout(Duration::from_millis(250), started.initial_response())
+            .await
+            .expect("preemption must yield long before the 60 s window")
+            .unwrap();
+        assert_eq!(
+            response,
+            RuntimeResponse::Yielded {
+                cell_id: cell_id("1"),
+                content_items: Vec::new(),
+            }
+        );
+        // Unpreempted wait still observes the eventual result, exactly once.
+        let wait = service
+            .wait(WaitRequest {
+                cell_id: cell_id("1"),
+                yield_time_ms: 2_000,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            wait,
+            WaitOutcome::LiveCell(RuntimeResponse::Result {
+                cell_id: cell_id("1"),
+                content_items: vec![FunctionCallOutputContentItem::InputText {
+                    text: "slow-result".to_string(),
+                }],
+                error_text: None,
+            })
+        );
+        let wait = service
+            .wait(WaitRequest {
+                cell_id: cell_id("1"),
+                yield_time_ms: 1,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(wait, WaitOutcome::MissingCell(_)));
+    }
+
+    // Local addition (not vendored): input queued before a later call in the
+    // same response must preempt that call too. An already-cancelled token
+    // yields a wait immediately instead of holding its yield window.
+    #[tokio::test]
+    async fn already_cancelled_preempt_yields_wait_immediately() {
+        let service = CodeModeService::with_delegate(Arc::new(SlowToolDelegate {
+            delay: Duration::from_millis(400),
+        }));
+        let response = execute(
+            &service,
+            ExecuteRequest {
+                enabled_tools: vec![slow_tool_definition()],
+                source: "const r = await tools.slow({}); text(String(r));".to_string(),
+                yield_time_ms: Some(50),
+                ..execute_request("")
+            },
+        )
+        .await;
+        assert!(matches!(response, RuntimeResponse::Yielded { .. }));
+
+        let preempt = tokio_util::sync::CancellationToken::new();
+        preempt.cancel();
+        let wait = tokio::time::timeout(
+            Duration::from_millis(250),
+            service.wait_with_preempt(
+                WaitRequest {
+                    cell_id: cell_id("1"),
+                    yield_time_ms: 60_000,
+                },
+                Some(preempt),
+            ),
+        )
+        .await
+        .expect("an already-cancelled token must yield the wait immediately")
+        .unwrap();
+        assert_eq!(
+            wait,
+            WaitOutcome::LiveCell(RuntimeResponse::Yielded {
+                cell_id: cell_id("1"),
+                content_items: Vec::new(),
+            })
+        );
+    }
+
+    // Local addition (not vendored): a consumed signal must not leak. After a
+    // preemption fired for the initial observation, a later wait without a
+    // token waits for the real completion instead of yielding on the stale
+    // cancellation.
+    #[tokio::test]
+    async fn consumed_preempt_does_not_yield_a_later_wait() {
+        let service = CodeModeService::new();
+        let preempt = tokio_util::sync::CancellationToken::new();
+        let started = service
+            .execute_with_preempt(
+                ExecuteRequest {
+                    source:
+                        "await new Promise(resolve => setTimeout(resolve, 300)); text('settled');"
+                            .to_string(),
+                    yield_time_ms: Some(60_000),
+                    ..execute_request("")
+                },
+                Some(preempt.clone()),
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        preempt.cancel();
+        let response = tokio::time::timeout(Duration::from_millis(250), started.initial_response())
+            .await
+            .expect("preemption must yield the initial observation")
+            .unwrap();
+        assert!(matches!(response, RuntimeResponse::Yielded { .. }));
+        // The stale cancellation is consumed: this wait must observe the
+        // terminal result (the cell settles at ~300 ms), not an empty yield.
+        let wait = tokio::time::timeout(
+            Duration::from_secs(2),
+            service.wait(WaitRequest {
+                cell_id: cell_id("1"),
+                yield_time_ms: 5_000,
+            }),
+        )
+        .await
+        .expect("wait must not hang on a consumed signal")
+        .unwrap();
+        assert!(matches!(
+            wait,
+            WaitOutcome::LiveCell(RuntimeResponse::Result {
+                error_text: None,
+                ..
+            })
+        ));
+    }
+
+    // Local addition (not vendored): completion wins the race when it lands
+    // before the signal; the outcome is delivered exactly once and the late
+    // cancellation changes nothing.
+    #[tokio::test]
+    async fn late_preempt_after_completion_preserves_outcome_once() {
+        let service = CodeModeService::with_delegate(Arc::new(SlowToolDelegate {
+            delay: Duration::from_millis(50),
+        }));
+        let preempt = tokio_util::sync::CancellationToken::new();
+        let started = service
+            .execute_with_preempt(
+                ExecuteRequest {
+                    enabled_tools: vec![slow_tool_definition()],
+                    source: "const r = await tools.slow({}); text(String(r));".to_string(),
+                    yield_time_ms: Some(60_000),
+                    ..execute_request("")
+                },
+                Some(preempt.clone()),
+            )
+            .await
+            .unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(2), started.initial_response())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            response,
+            RuntimeResponse::Result {
+                cell_id: cell_id("1"),
+                content_items: vec![FunctionCallOutputContentItem::InputText {
+                    text: "slow-result".to_string(),
+                }],
+                error_text: None,
+            }
+        );
+        // Input queued after completion is inert for this cell: it belongs to
+        // the next step's observations.
+        preempt.cancel();
+        let wait = service
+            .wait(WaitRequest {
+                cell_id: cell_id("1"),
+                yield_time_ms: 1,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(wait, WaitOutcome::MissingCell(_)));
     }
 
     #[tokio::test]
@@ -1824,6 +2098,7 @@ mod tests {
                 CellResponseSender::Runtime(response_tx),
                 Some(/*initial_yield_time_ms*/ 1),
                 PendingRuntimeMode::Continue,
+                /*preempt*/ None,
             )
             .await
             .unwrap_err();
@@ -2595,6 +2870,7 @@ image({
                 pending_mode: PendingRuntimeMode::Continue,
                 runtime_terminate_handle,
                 cancellation_token: tokio_util::sync::CancellationToken::new(),
+                step_preempt: None,
             },
             event_rx,
             control_rx,
