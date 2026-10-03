@@ -565,6 +565,7 @@ fn bound_listing(
     budget: usize,
     next_cursor_for: impl Fn(usize) -> Option<String>,
 ) -> ToolResult {
+    let had_entries = !entries.is_empty();
     let mut payload = envelope;
     loop {
         payload[field] = Value::Array(entries.clone());
@@ -588,7 +589,7 @@ fn bound_listing(
             // the current offset forever; refuse instead of stalling the
             // traversal. A genuinely empty upstream page (total == 0) still
             // returns normally.
-            if entries.is_empty() && receipt.total > receipt.malformed {
+            if entries.is_empty() && had_entries {
                 return ToolResult::Error(format!(
                     "MCP resource listing exceeds the {budget}-byte result budget before any entry fits"
                 ));
@@ -2041,6 +2042,31 @@ mod tests {
                 .unwrap()
                 .contains("changed under the continuation cursor")
         );
+    }
+
+    #[test]
+    fn locally_trimmed_empty_pages_refuse_even_when_malformed_rows_dominate() {
+        for (valid, malformed) in [(1, 5), (2, 2), (1, 0)] {
+            let entries = (0..valid)
+                .map(|index| json!({"uri":format!("memo:/{}-{index}", "x".repeat(1_000)), "name":"large"}))
+                .collect();
+            // Listing windows count valid rows separately from malformed rows.
+            let result = bound_listing(
+                entries,
+                ListingReceipt {
+                    total: valid,
+                    malformed,
+                    ..ListingReceipt::default()
+                },
+                json!({"server":"fixture"}),
+                "resources",
+                700,
+                |returned| (returned < valid).then(|| "same-page".into()),
+            );
+            assert!(
+                matches!(result, ToolResult::Error(message) if message.contains("before any entry fits"))
+            );
+        }
     }
 
     #[tokio::test]
