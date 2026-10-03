@@ -381,7 +381,7 @@ impl OpenAiResponsesTransport {
     }
 
     /// One-shot summarization using an already fitted request (always HTTP).
-    async fn summarize_text(&self, body: Value) -> Result<String> {
+    async fn summarize_text(&mut self, body: Value) -> Result<String> {
         let resp = super::http::send_with_retry("openai-responses/compact", || {
             self.apply_headers(self.http.post(&self.http_endpoint))
                 .json(&body)
@@ -394,7 +394,10 @@ impl OpenAiResponsesTransport {
             let t = resp.text().await.unwrap_or_default();
             anyhow::bail!("openai responses compact {status}: {t}");
         }
-        let out = compaction::collect_summary(resp).await?;
+        let mut usage = super::Usage::default();
+        let result = compaction::collect_summary(resp, &mut usage).await;
+        self.state.add_compaction_usage(&usage);
+        let out = result?;
         // Keep only the durable `<summary>` block, dropping the `<analysis>`
         // scratchpad the structured prompt asks for.
         let summary = super::extract_summary(&out);

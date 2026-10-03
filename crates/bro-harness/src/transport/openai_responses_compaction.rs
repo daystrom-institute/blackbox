@@ -7,10 +7,14 @@ use serde_json::{Value, json};
 
 use crate::transport::{CompactionParams, TurnOpts};
 
-pub(super) async fn collect_summary(response: reqwest::Response) -> Result<String> {
+pub(super) async fn collect_summary(
+    response: reqwest::Response,
+    usage: &mut crate::transport::Usage,
+) -> Result<String> {
     let mut stream = response.bytes_stream();
     let mut pending = Vec::new();
     let mut text = String::new();
+    let mut received = 0usize;
     loop {
         let chunk = tokio::time::timeout(super::super::http::stream_idle_timeout(), stream.next())
             .await
@@ -18,7 +22,13 @@ pub(super) async fn collect_summary(response: reqwest::Response) -> Result<Strin
         let Some(chunk) = chunk else {
             bail!("responses compaction stream closed before response.completed");
         };
-        pending.extend_from_slice(&chunk.context("read responses compact chunk")?);
+        let chunk = chunk.context("read responses compact chunk")?;
+        received = received.saturating_add(chunk.len());
+        ensure!(
+            received <= super::COMPACTION_BYTE_BUDGET,
+            "inline compaction stream exceeded byte budget"
+        );
+        pending.extend_from_slice(&chunk);
         while let Some(end) = pending.iter().position(|byte| *byte == b'\n') {
             let line: Vec<_> = pending.drain(..=end).collect();
             let line = std::str::from_utf8(&line).context("invalid compaction SSE UTF-8")?;
@@ -37,6 +47,14 @@ pub(super) async fn collect_summary(response: reqwest::Response) -> Result<Strin
             let kind = event["type"]
                 .as_str()
                 .context("compaction event missing type")?;
+            if matches!(
+                kind,
+                "response.completed" | "response.failed" | "response.incomplete" | "error"
+            ) {
+                usage.add(&crate::transport::openai_responses_stream::terminal_usage(
+                    &event,
+                ));
+            }
             match kind {
                 "response.output_text.delta" => {
                     text.push_str(event["delta"].as_str().context("invalid summary delta")?);

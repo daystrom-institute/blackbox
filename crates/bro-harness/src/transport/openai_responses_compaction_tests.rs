@@ -688,3 +688,41 @@ async fn inline_fitted_request_preserves_tail_and_rolls_back_failed_summary() {
         assert!(serde_json::to_vec(&sent).unwrap().len() < 10_000);
     }
 }
+
+#[tokio::test]
+async fn inline_summary_usage_survives_rejected_replacement_and_drains_once() {
+    for valid in [false, true] {
+        let text = if valid {
+            "<summary>Retained context</summary>"
+        } else {
+            ""
+        };
+        let body = event(json!({"type":"response.output_text.delta", "delta":text}))
+            + &event(json!({"type":"response.completed", "response":{
+                "status":"completed", "usage":{"input_tokens":100,"output_tokens":9,
+                    "input_tokens_details":{"cached_tokens":60}}
+            }}));
+        let (url, request) = server(body, "text/event-stream").await;
+        let mut tx = transport(url, false);
+        let before = tx.snapshot();
+        let result = tx.compact(params(), "summarize", &[], &opts()).await;
+        assert_eq!(result.is_ok(), valid);
+        if !valid {
+            assert_eq!(tx.snapshot(), before);
+        }
+        assert_eq!(
+            tx.take_compaction_usage(),
+            crate::transport::Usage {
+                input_tokens: 40,
+                output_tokens: 9,
+                cached_input_tokens: 60,
+                cache_creation_input_tokens: 0,
+            }
+        );
+        assert_eq!(
+            tx.take_compaction_usage(),
+            crate::transport::Usage::default()
+        );
+        request.await.unwrap();
+    }
+}
