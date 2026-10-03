@@ -916,7 +916,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut request = [0_u8; 8192];
-            socket.read(&mut request).await.unwrap();
+            assert_ne!(socket.read(&mut request).await.unwrap(), 0);
             socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).as_bytes()).await.unwrap();
         });
         let mut tx = transport();
