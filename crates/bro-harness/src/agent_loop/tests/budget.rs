@@ -706,7 +706,10 @@ async fn changed_comp_hash_transition_failure_keeps_previous_model_and_history()
     let before = session.tx.snapshot();
     fail.store(true, Ordering::SeqCst);
     let error = session.apply_control("family-b-model").await.unwrap_err();
-    assert!(format!("{error:#}").contains("history cannot be compacted"));
+    assert!(
+        format!("{error:#}").contains("synthetic compaction failure"),
+        "{error:#}"
+    );
     assert_eq!(session.base_opts.model, "family-a-model");
     assert_eq!(session.model_comp_hash.as_deref(), Some("family-a"));
     assert_eq!(
