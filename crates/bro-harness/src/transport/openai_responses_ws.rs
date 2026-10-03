@@ -124,6 +124,12 @@ impl WsChannel {
             }
         }
         headers.insert("openai-beta", HeaderValue::from_static(WS_BETA));
+        if state.uses_responses_lite() {
+            headers.insert(
+                "x-openai-internal-codex-responses-lite",
+                HeaderValue::from_static("true"),
+            );
+        }
         // Replay sticky routing on reconnect handshakes.
         if let Some(ts) = &self.turn_state
             && let Ok(v) = HeaderValue::from_str(ts)
@@ -1128,6 +1134,14 @@ mod tests {
             let mut ch = WsChannel::new(url);
             let mut state = fresh_state();
             state.configure_responses_lite(lite);
+            let request = ch.build_request(&state).unwrap();
+            assert_eq!(
+                request
+                    .headers()
+                    .get("x-openai-internal-codex-responses-lite")
+                    .map(|value| value.to_str().unwrap()),
+                lite.then_some("true")
+            );
             struct QuietSink;
             impl crate::transport::TurnSink for QuietSink {
                 fn stream_event(&self, _event: Value) {}
@@ -1318,5 +1332,50 @@ mod tests {
             }
             _ => panic!("rejection must be an API error"),
         }
+    }
+    #[tokio::test]
+    async fn steer_drain_eof_before_output_never_replays_or_falls_back() {
+        for lite in [false, true] {
+            let (url, server) = error_event_server(vec![], 1).await;
+            let mut ch = WsChannel::new(url);
+            let mut state = fresh_state();
+            state.configure_responses_lite(lite);
+            let token = tokio_util::sync::CancellationToken::new();
+            token.cancel();
+            state.set_step_preemption(Some(token));
+            let before = state.input.clone();
+            let outcome = ch.run(&mut state, &[], &opts(), &NoSink).await;
+            let WsOutcome::Api(error) = outcome else {
+                panic!("an unfinished steer drain cannot fall back or succeed");
+            };
+            assert!(
+                error
+                    .downcast_ref::<crate::transport::FailedTurnObservation>()
+                    .is_some()
+            );
+            assert_eq!(server.await.unwrap(), 1);
+            assert_eq!(state.input, before);
+            assert!(ch.conn.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn connection_limit_failure_preserves_advice_for_http_fallback() {
+        let event = json!({"type":"error", "error":{
+            "code":"websocket_connection_limit_reached", "message":"reconnect later",
+            "headers":{"retry-after":"3600"}
+        }})
+        .to_string();
+        let (url, server) = error_event_server(vec![event], 1).await;
+        let mut ch = WsChannel::new(url);
+        let mut state = fresh_state();
+        let outcome = ch.run(&mut state, &[], &opts(), &NoSink).await;
+        assert!(matches!(outcome, WsOutcome::Transport(_)));
+        assert!(ch.retry_after().unwrap().remaining_delay() > std::time::Duration::from_secs(3500));
+        assert!(
+            state.pending_retry_advice().unwrap().remaining_delay()
+                > std::time::Duration::from_secs(3500)
+        );
+        assert_eq!(server.await.unwrap(), 1);
     }
 }

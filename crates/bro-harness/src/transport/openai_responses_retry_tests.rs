@@ -981,3 +981,21 @@ async fn cancelled_http_status_retry_retains_advice_for_every_responses_path() {
         assert_eq!(server.await.unwrap().len(), 1, "{route}");
     }
 }
+
+#[tokio::test]
+async fn http_steer_drain_eof_before_output_never_replays() {
+    let (url, server) = raw_http_server(vec![ok_response(String::new())], 1).await;
+    let mut tx = transport(url, false, None);
+    let token = tokio_util::sync::CancellationToken::new();
+    token.cancel();
+    tx.set_step_preemption(Some(token));
+    let before = tx.snapshot();
+    let error = tx.run_turn_http(&[], &opts(), &NoSink).await.unwrap_err();
+    assert!(
+        error
+            .downcast_ref::<crate::transport::FailedTurnObservation>()
+            .is_some()
+    );
+    assert_eq!(tx.snapshot(), before);
+    assert_eq!(server.await.unwrap().len(), 1);
+}
