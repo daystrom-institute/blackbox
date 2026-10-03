@@ -231,6 +231,7 @@ impl OpenAiResponsesTransport {
         label: &str,
         request: reqwest::RequestBuilder,
     ) -> Result<reqwest::Response> {
+        self.honor_pending_retry_advice().await;
         super::http::send_with_retry_observed(
             label,
             || {
