@@ -37,8 +37,13 @@ use uuid::Uuid;
 /// Item type tag of the Responses Lite definitions item (codex
 /// `ResponseItem::AdditionalTools`, serde snake_case tag).
 const ADDITIONAL_TOOLS: &str = "additional_tools";
-/// Side-cell version; any other (or missing) version decodes as unknown.
-const BASELINE_VERSION: u64 = 1;
+/// Snapshot version; any other (or missing) version decodes as unknown.
+/// Version 2 binds the baseline to the retained chain of emitted items.
+const BASELINE_VERSION: u64 = 2;
+/// Upper bound on coupled chain links. At the cap the next sync re-renders
+/// the full catalog and restarts the chain, so validation stays bounded no
+/// matter how often the catalog churns.
+pub(crate) const MAX_CHAIN_LINKS: usize = 64;
 /// A baseline larger than this decodes as unknown and rebuilds from a full
 /// render rather than trusting a bloated or corrupt cell.
 const MAX_BASELINE_ENTRIES: usize = 4096;
@@ -75,7 +80,7 @@ impl LiteToolCatalog {
     pub(crate) fn new(definitions: &[Value]) -> Result<Self> {
         let mut entries = Vec::with_capacity(definitions.len());
         let mut hashes = BTreeMap::new();
-        let mut insert =
+        let insert =
             |hashes: &mut BTreeMap<String, String>, name: String, value: &Value| -> Result<()> {
                 let hash = definition_hash(value);
                 if hashes.insert(name.clone(), hash).is_some() {
@@ -184,23 +189,27 @@ impl LiteToolCatalog {
             }
         }
         let mut items = Vec::new();
-        let anchor_id;
-        if tools.is_empty() {
-            // Nothing newly defined: the previous anchor item (or no anchor
-            // for the empty catalog) remains the authoritative insertion.
-            anchor_id = match previous {
-                PreviousCatalogState::Known(baseline) => baseline.anchor_id.clone(),
-                _ => None,
-            };
-        } else {
+        let mut chain = match previous {
+            PreviousCatalogState::Known(baseline) => baseline.chain.clone(),
+            _ => Vec::new(),
+        };
+        if !tools.is_empty() {
             let id = additional_tools_id(session_id, &tools);
-            anchor_id = Some(id.clone());
+            chain.push(ChainLink::Definitions {
+                id: id.clone(),
+                payload: payload_hash(&Value::Array(tools.clone())),
+            });
             items.push(json!({
                 "type": ADDITIONAL_TOOLS,
                 "id": id,
                 "role": "developer",
                 "tools": tools,
             }));
+        }
+        for notice in &mut notices {
+            chain.push(ChainLink::Notice {
+                payload: payload_hash(notice),
+            });
         }
         items.append(&mut notices);
         if let Some(hashes) = previous_hashes {
@@ -211,16 +220,20 @@ impl LiteToolCatalog {
                 .collect::<Vec<_>>();
             if !removed.is_empty() {
                 let names = removed.join("\n- ");
-                items.push(developer_notice(&format!(
+                let notice = developer_notice(&format!(
                     "The following tools are no longer available. Do not call them:\n- {names}"
-                )));
+                ));
+                chain.push(ChainLink::Notice {
+                    payload: payload_hash(&notice),
+                });
+                items.push(notice);
             }
         }
         LiteCatalogTransition {
             items,
             baseline: CatalogBaseline {
                 hashes: self.hashes.clone(),
-                anchor_id,
+                chain,
             },
         }
     }
@@ -245,23 +258,35 @@ pub(crate) struct LiteCatalogTransition {
     pub(crate) baseline: CatalogBaseline,
 }
 
+/// One retained item the baseline is bound to: the chain of history the
+/// model was actually shown. A baseline stays valid only while every emitted
+/// definitions item and every notice remains retained, in order, with an
+/// unmodified payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ChainLink {
+    /// An `additional_tools` item: its stable id plus a session-independent
+    /// payload hash, so a tampered item under a stolen id still invalidates.
+    Definitions { id: String, payload: String },
+    /// A developer notice (namespace metadata or removal): payload hash only.
+    Notice { payload: String },
+}
+
 /// The comparison baseline: canonical hashes of every declaration the model
-/// has most recently been shown, plus the anchor binding it to the retained
-/// authoritative definition item.
+/// has most recently been shown, plus the retained-item chain binding it to
+/// the authoritative history.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CatalogBaseline {
     hashes: BTreeMap<String, String>,
-    /// Item id of the last `additional_tools` insertion this baseline
-    /// describes; `None` while nothing is defined (known-empty catalog).
-    anchor_id: Option<String>,
+    chain: Vec<ChainLink>,
 }
 
 impl CatalogBaseline {
-    /// The empty known baseline (nothing defined, nothing to couple to).
+    /// The empty known baseline (nothing defined, empty chain): known-empty
+    /// catalog state, stable across requests, never invalidated by history.
     pub(crate) fn empty() -> Self {
         Self {
             hashes: BTreeMap::new(),
-            anchor_id: None,
+            chain: Vec::new(),
         }
     }
 
@@ -269,16 +294,22 @@ impl CatalogBaseline {
         self.hashes.is_empty()
     }
 
-    /// Side-cell form: `{"version":1,"hashes":{...},"anchor_id":"at_..."}`.
+    /// Retained-item chain length; callers re-render the full catalog at
+    /// [`MAX_CHAIN_LINKS`] so validation stays bounded.
+    pub(crate) fn chain_len(&self) -> usize {
+        self.chain.len()
+    }
+
+    /// Snapshot form: `{"version":2,"hashes":{...},"chain":[...]}`.
     pub(crate) fn to_side(&self) -> Value {
         json!({
             "version": BASELINE_VERSION,
             "hashes": self.hashes,
-            "anchor_id": self.anchor_id,
+            "chain": self.chain.iter().map(link_to_side).collect::<Vec<_>>(),
         })
     }
 
-    /// Tolerant restore. Absent, legacy (unversioned), malformed, and
+    /// Tolerant restore. Absent, legacy (older version), malformed, and
     /// oversized cells decode to `Unknown`; the caller then re-renders the
     /// full catalog instead of trusting a stale map.
     pub(crate) fn from_side(value: &Value) -> BaselineRestore {
@@ -291,7 +322,11 @@ impl CatalogBaseline {
         let Some(hashes_value) = object.get("hashes").and_then(Value::as_object) else {
             return BaselineRestore::Unknown;
         };
+        let Some(chain_value) = object.get("chain").and_then(Value::as_array) else {
+            return BaselineRestore::Unknown;
+        };
         if hashes_value.len() > MAX_BASELINE_ENTRIES
+            || chain_value.len() > MAX_CHAIN_LINKS
             || serde_json::to_vec(value).map_or(true, |bytes| bytes.len() > MAX_BASELINE_BYTES)
         {
             return BaselineRestore::Unknown;
@@ -303,26 +338,81 @@ impl CatalogBaseline {
             };
             hashes.insert(name.clone(), hash.to_owned());
         }
-        let anchor_id = match object.get("anchor_id") {
-            None | Some(Value::Null) => None,
-            Some(Value::String(id)) => Some(id.clone()),
-            Some(_) => return BaselineRestore::Unknown,
-        };
-        BaselineRestore::Known(Self { hashes, anchor_id })
+        let mut chain = Vec::with_capacity(chain_value.len());
+        for link in chain_value {
+            match link.as_object().map(|object| {
+                (
+                    object.get("kind").and_then(Value::as_str),
+                    object.get("id").and_then(Value::as_str),
+                    object.get("payload").and_then(Value::as_str),
+                )
+            }) {
+                Some((Some("definitions"), Some(id), Some(payload))) => {
+                    chain.push(ChainLink::Definitions {
+                        id: id.to_owned(),
+                        payload: payload.to_owned(),
+                    });
+                }
+                Some((Some("notice"), None, Some(payload))) => {
+                    chain.push(ChainLink::Notice {
+                        payload: payload.to_owned(),
+                    });
+                }
+                _ => return BaselineRestore::Unknown,
+            }
+        }
+        BaselineRestore::Known(Self { hashes, chain })
     }
 
-    /// Provable coupling to retained history: the baseline describes model
-    /// state only while the `additional_tools` item it was committed with is
-    /// still present. An anchorless (known-empty) baseline couples trivially.
-    /// Compaction or any history rewrite that drops definition items breaks
-    /// the coupling; the caller must downgrade to `Unknown` there.
+    /// Provable coupling to retained history: every chain link must match a
+    /// retained item, in emission order, with an unmodified payload. A
+    /// retained latest delta whose initial definitions were dropped, a lost
+    /// removal or namespace notice, a reordered chain, and a tampered or
+    /// orphan item all invalidate. The empty chain (known-empty catalog)
+    /// couples trivially and is stable.
     pub(crate) fn is_coupled_to(&self, input: &[Value]) -> bool {
-        let Some(anchor) = &self.anchor_id else {
-            return true;
-        };
-        input.iter().any(|item| {
-            item["type"].as_str() == Some(ADDITIONAL_TOOLS) && item["id"].as_str() == Some(anchor)
-        })
+        let mut cursor = 0usize;
+        for link in &self.chain {
+            let mut matched = false;
+            while let Some(item) = input.get(cursor) {
+                cursor += 1;
+                if link_matches(link, item) {
+                    matched = true;
+                    break;
+                }
+            }
+            if !matched {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+fn link_to_side(link: &ChainLink) -> Value {
+    match link {
+        ChainLink::Definitions { id, payload } => {
+            json!({"kind": "definitions", "id": id, "payload": payload})
+        }
+        ChainLink::Notice { payload } => json!({"kind": "notice", "payload": payload}),
+    }
+}
+
+fn link_matches(link: &ChainLink, item: &Value) -> bool {
+    match link {
+        ChainLink::Definitions { id, payload } => {
+            item["type"].as_str() == Some(ADDITIONAL_TOOLS)
+                && item["id"].as_str() == Some(id.as_str())
+                && &payload_hash(&item["tools"]) == payload
+        }
+        ChainLink::Notice { payload } => {
+            item["type"].as_str() == Some("message")
+                && item["role"].as_str() == Some("developer")
+                && item["content"]
+                    .as_array()
+                    .is_some_and(|content| content.len() == 1)
+                && &payload_hash(item) == payload
+        }
     }
 }
 
@@ -363,6 +453,13 @@ fn canonical_json(value: &Value) -> Vec<u8> {
 /// Stable per-declaration fingerprint (uuid v5 over the canonical payload,
 /// codex's identity trick without adding a hash dependency).
 fn definition_hash(value: &Value) -> String {
+    Uuid::new_v5(&hash_domain(), &canonical_json(value)).to_string()
+}
+
+/// Session-independent payload fingerprint for chain coupling: binds the
+/// baseline to the exact bytes of each retained item, so a tampered item
+/// under an otherwise-matching id still invalidates.
+fn payload_hash(value: &Value) -> String {
     Uuid::new_v5(&hash_domain(), &canonical_json(value)).to_string()
 }
 
@@ -430,7 +527,8 @@ mod tests {
         );
         let id = item["id"].as_str().unwrap().to_owned();
         assert!(id.starts_with("at_"), "{id}");
-        assert_eq!(transition.baseline.anchor_id.as_deref(), Some(&id));
+        assert_eq!(transition.baseline.chain_len(), 1);
+        assert!(transition.baseline.is_coupled_to(&[item.clone()]));
         assert_eq!(transition.baseline.hashes.len(), 2);
     }
 
@@ -457,7 +555,12 @@ mod tests {
         assert_eq!(tools[0]["name"], "search");
         let new_id = transition.items[0]["id"].as_str().unwrap().to_owned();
         assert_ne!(new_id, id, "changed payload gets a new identity");
-        assert_eq!(transition.baseline.anchor_id.as_deref(), Some(&new_id));
+        assert_eq!(transition.baseline.chain_len(), 2);
+        assert!(
+            transition
+                .baseline
+                .is_coupled_to(&[first.items[0].clone(), transition.items[0].clone(),])
+        );
         assert_ne!(
             transition.baseline.hashes["search"],
             baseline.hashes["search"]
@@ -494,13 +597,17 @@ mod tests {
             "The following tools are no longer available. Do not call them:\n- search"
         );
         assert_eq!(transition.baseline.hashes.len(), 1);
-        assert_eq!(transition.baseline.anchor_id, None);
+        assert!(matches!(
+            transition.baseline.chain.last(),
+            Some(ChainLink::Notice { .. })
+        ));
     }
 
     #[test]
     fn namespace_member_change_renders_only_that_member() {
         let members = vec![tool("read", "files"), tool("write", "files")];
-        let original = LiteToolCatalog::new(&[namespace("functions", "Tools.", members)]).unwrap();
+        let original =
+            LiteToolCatalog::new(&[namespace("functions", "Tools.", members.clone())]).unwrap();
         let baseline = diff(&original, PreviousCatalogState::Absent).baseline;
         assert_eq!(baseline.hashes.len(), 3, "header plus two members");
 
@@ -516,11 +623,13 @@ mod tests {
     #[test]
     fn namespace_metadata_only_change_is_a_notice_without_members() {
         let members = vec![tool("read", "files")];
-        let original = LiteToolCatalog::new(&[namespace("functions", "Tools.", members)]).unwrap();
+        let original =
+            LiteToolCatalog::new(&[namespace("functions", "Tools.", members.clone())]).unwrap();
         let baseline = diff(&original, PreviousCatalogState::Absent).baseline;
 
         let updated =
-            LiteToolCatalog::new(&[namespace("functions", "Better tools.", members)]).unwrap();
+            LiteToolCatalog::new(&[namespace("functions", "Better tools.", members.clone())])
+                .unwrap();
         let transition = diff(&updated, PreviousCatalogState::Known(&baseline));
         assert_eq!(transition.items.len(), 1);
         assert_eq!(transition.items[0]["type"], "message");
@@ -551,7 +660,7 @@ mod tests {
         let transition = diff(&empty, PreviousCatalogState::Absent);
         assert!(transition.items.is_empty());
         assert!(transition.baseline.is_empty());
-        assert_eq!(transition.baseline.anchor_id, None);
+        assert_eq!(transition.baseline.chain_len(), 0);
 
         // Empty after nonempty keeps the removal notice (covered above) and
         // a later refill renders fully against the known-empty baseline.
@@ -608,16 +717,21 @@ mod tests {
             BaselineRestore::Unknown => panic!("valid baseline must restore"),
         }
 
-        // Legacy bare map (no version), absent, malformed values, and wrong
-        // types all decode to unknown; the caller re-renders fully.
+        // Legacy bare map (no version), older baseline versions, absent,
+        // malformed values, and wrong types all decode to unknown; the
+        // caller re-renders fully.
         for legacy in [
             Value::Null,
             json!({}),
             json!({"functions.read": "hash"}),
             json!({"version": 0, "hashes": {}}),
-            json!({"version": 1, "hashes": {"a": 7}}),
-            json!({"version": 1, "hashes": "nope"}),
-            json!({"version": 1, "hashes": {}, "anchor_id": 4}),
+            json!({"version": 1, "hashes": {}, "anchor_id": null}),
+            json!({"version": 2, "hashes": {"a": 7}}),
+            json!({"version": 2, "hashes": "nope"}),
+            json!({"version": 2, "hashes": {}, "chain": "nope"}),
+            json!({"version": 2, "hashes": {}, "chain": [{"kind": "definitions"}]}),
+            json!({"version": 2, "hashes": {}, "chain": [{"kind": "strange"}]}),
+            json!({"version": 2, "hashes": {}, "chain": [{"kind": "notice", "id": "x", "payload": "p"}]}),
         ] {
             assert!(
                 matches!(
@@ -628,8 +742,9 @@ mod tests {
             );
         }
 
-        // Oversized baselines rebuild instead of trusting a bloated cell.
-        let mut oversized = json!({"version": 1, "hashes": {}, "anchor_id": null});
+        // Oversized baselines and over-long chains rebuild instead of
+        // trusting a bloated cell.
+        let mut oversized = json!({"version": 2, "hashes": {}, "chain": []});
         let hashes = oversized["hashes"].as_object_mut().unwrap();
         for index in 0..=MAX_BASELINE_ENTRIES {
             hashes.insert(format!("tool_{index}"), json!("hash"));
@@ -641,30 +756,104 @@ mod tests {
     }
 
     #[test]
-    fn baseline_couples_to_retained_authoritative_history() {
-        let catalog = LiteToolCatalog::new(&[tool("read", "files")]).unwrap();
-        let transition = diff(&catalog, PreviousCatalogState::Absent);
-        let baseline = transition.baseline;
-        let item = &transition.items[0];
+    fn baseline_couples_to_the_whole_retained_item_chain() {
+        let original = LiteToolCatalog::new(&[tool("read", "files")]).unwrap();
+        let first = diff(&original, PreviousCatalogState::Absent);
+        // A changed declaration appends a delta definitions item, then a
+        // removal appends a notice: a three-link chain in emission order.
+        let updated = LiteToolCatalog::new(&[tool("read", "faster files")]).unwrap();
+        let second = diff(&updated, PreviousCatalogState::Known(&first.baseline));
+        let removal = LiteToolCatalog::new(&[]).unwrap();
+        let third = diff(&removal, PreviousCatalogState::Known(&second.baseline));
+        let definitions = &first.items[0];
+        let delta = &second.items[0];
+        let notice = &third.items[0];
 
-        // Coupled while the anchor item is retained.
-        assert!(baseline.is_coupled_to(&[item.clone()]));
-        assert!(baseline.is_coupled_to(&[
-            json!({"type":"message","role":"user","content":"task"}),
-            item.clone(),
+        // Fully retained, in order: coupled.
+        let history = vec![definitions.clone(), delta.clone(), notice.clone()];
+        assert!(third.baseline.is_coupled_to(&history));
+
+        // Partially retained chain: the latest delta and notice survive but
+        // the initial definitions item was dropped (compaction kept only the
+        // tail): uncoupled, the next diff must re-render fully.
+        assert!(
+            !third
+                .baseline
+                .is_coupled_to(&[delta.clone(), notice.clone()])
+        );
+
+        // A lost notice (removal or namespace change never retained) also
+        // invalidates: the model was never told.
+        assert!(
+            !third
+                .baseline
+                .is_coupled_to(&[definitions.clone(), delta.clone()])
+        );
+
+        // Reordered chain (notice before its definitions): not coupled.
+        assert!(!third.baseline.is_coupled_to(&[
+            notice.clone(),
+            definitions.clone(),
+            delta.clone(),
         ]));
 
-        // Compaction dropped the definition items: uncoupled, downgrade.
-        let compacted = vec![json!({"type":"message","role":"user","content":"task"})];
-        assert!(!baseline.is_coupled_to(&compacted));
+        // Unrelated history never couples.
+        assert!(
+            !third
+                .baseline
+                .is_coupled_to(&[json!({"type":"message","role":"user","content":"task"})])
+        );
 
-        // An orphan snapshot from other history never couples.
-        let stranger = json!({"type":"additional_tools", "id":"at_00000000-0000-5000-8000-000000000000", "role":"developer", "tools":[]});
-        assert!(!baseline.is_coupled_to(&[stranger]));
-
-        // Anchorless (known-empty) baselines couple trivially.
-        assert!(CatalogBaseline::empty().is_coupled_to(&compacted));
+        // The known-empty baseline couples trivially, including to empty
+        // history: stable across requests.
         assert!(CatalogBaseline::empty().is_coupled_to(&[]));
+        assert!(CatalogBaseline::empty().is_coupled_to(&history));
+    }
+
+    #[test]
+    fn tampered_or_orphan_definitions_items_invalidate_coupling() {
+        let original = LiteToolCatalog::new(&[tool("read", "files")]).unwrap();
+        let first = diff(&original, PreviousCatalogState::Absent);
+        let baseline = first.baseline;
+        let item = &first.items[0];
+
+        // Tampered: same id, different payload.
+        let mut tampered = item.clone();
+        tampered["tools"][0]["description"] = json!("Look up tampered files.");
+        assert!(!baseline.is_coupled_to(&[tampered]));
+
+        // Orphan: a well-formed item with a different identity.
+        let orphan = json!({
+            "type": "additional_tools",
+            "id": "at_00000000-0000-5000-8000-000000000000",
+            "role": "developer",
+            "tools": item["tools"].as_array().unwrap().clone(),
+        });
+        assert!(!baseline.is_coupled_to(&[orphan]));
+
+        // Extra trailing history after the chain stays coupled.
+        assert!(baseline.is_coupled_to(&[
+            item.clone(),
+            json!({"type":"message","role":"user","content":"task"}),
+        ]));
+    }
+
+    #[test]
+    fn chain_side_cell_round_trips_through_the_snapshot_form() {
+        let original = LiteToolCatalog::new(&[tool("read", "files")]).unwrap();
+        let first = diff(&original, PreviousCatalogState::Absent);
+        let updated = LiteToolCatalog::new(&[tool("read", "faster files")]).unwrap();
+        let second = diff(&updated, PreviousCatalogState::Known(&first.baseline));
+        let side = second.baseline.to_side();
+        match CatalogBaseline::from_side(&side) {
+            BaselineRestore::Known(restored) => {
+                assert_eq!(restored, second.baseline);
+                assert!(
+                    restored.is_coupled_to(&[first.items[0].clone(), second.items[0].clone(),])
+                );
+            }
+            BaselineRestore::Unknown => panic!("chain baseline must restore"),
+        }
     }
 
     #[test]
