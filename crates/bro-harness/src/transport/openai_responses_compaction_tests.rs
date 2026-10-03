@@ -509,6 +509,7 @@ async fn remote_compaction_limit_prefers_catalog_usable_window_and_honors_overri
         auto_compact_token_limit: None,
         effective_context_window_percent: 95,
         comp_hash: Some("family-a".into()),
+        use_responses_lite: false,
     };
     // Catalog usable window (95 percent of the target) beats the table.
     assert_eq!(

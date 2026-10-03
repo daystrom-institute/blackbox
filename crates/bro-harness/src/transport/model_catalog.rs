@@ -29,6 +29,11 @@ pub struct ModelLimits {
     /// and compaction items. Absent means unknown, which never forces a
     /// transition compaction on its own.
     pub comp_hash: Option<String>,
+    /// codex `use_responses_lite`: the model accepts the Responses Lite
+    /// request shape (tools and base instructions as developer input items,
+    /// empty `instructions`, no `tools` parameter). Absent means false; the
+    /// ordinary Responses wire stays the default.
+    pub use_responses_lite: bool,
 }
 
 impl ModelLimits {
@@ -77,6 +82,7 @@ pub(super) fn parse_catalog(value: &Value) -> Vec<ModelLimits> {
                     .as_u64()
                     .unwrap_or(95),
                 comp_hash: model["comp_hash"].as_str().map(str::to_owned),
+                use_responses_lite: model["use_responses_lite"].as_bool().unwrap_or(false),
             })
         })
         .collect()
@@ -193,6 +199,8 @@ mod tests {
             {"slug":"max-only","max_context_window":1000000},
             {"slug":"clamped","context_window":100000,"effective_context_window_percent":130,
              "comp_hash":"family-b"},
+            {"slug":"lite","context_window":272000,"comp_hash":"family-c",
+             "use_responses_lite":true},
             {"slug":"","context_window":1},
             {"context_window":2}
         ]})
@@ -201,7 +209,7 @@ mod tests {
     #[test]
     fn parse_keeps_named_models_and_derives_codex_limits() {
         let models = parse_catalog(&catalog());
-        assert_eq!(models.len(), 4);
+        assert_eq!(models.len(), 5);
         let astra = &models[0];
         assert_eq!(astra.target_window(), Some(272_000));
         assert_eq!(astra.auto_compact_limit(), Some(244_800));
@@ -222,6 +230,9 @@ mod tests {
         // window; the hash is a plain opaque string.
         assert_eq!(models[3].usable_context_window(), Some(100_000));
         assert_eq!(models[3].comp_hash.as_deref(), Some("family-b"));
+        // Responses Lite is catalog-gated and defaults off when absent.
+        assert!(models[4].use_responses_lite);
+        assert!(!models[0].use_responses_lite);
     }
 
     #[test]
@@ -245,7 +256,7 @@ mod tests {
         .unwrap();
         let cache = cached_catalog(&root, CACHE_MAX_AGE).await.unwrap();
         assert_eq!(client_version(Some(&cache)), "0.154.0");
-        assert_eq!(parse_catalog(&cache).len(), 4);
+        assert_eq!(parse_catalog(&cache).len(), 5);
         assert!(cached_catalog(&root, Duration::ZERO).await.is_none());
         assert_eq!(
             std::fs::read_to_string(root.join("models_cache.json"))

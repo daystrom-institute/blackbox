@@ -28,6 +28,7 @@ pub mod openai_responses;
 mod openai_responses_stream;
 pub mod openai_responses_ws;
 pub mod responses_common;
+pub(crate) mod responses_lite;
 mod snapshot;
 
 pub use catalog_prompt::base_instructions_for_capabilities;

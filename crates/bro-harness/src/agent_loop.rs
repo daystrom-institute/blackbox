@@ -7889,6 +7889,7 @@ mod tests {
             auto_compact_token_limit: None,
             effective_context_window_percent: 95,
             comp_hash: None,
+            use_responses_lite: false,
         });
         let catalog = resolve_window(session.tx.as_ref(), &session.compaction, "gpt-6-astra");
         assert_eq!(catalog.context_window, Some(272_000));
