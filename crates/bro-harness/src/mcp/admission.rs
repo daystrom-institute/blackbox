@@ -177,7 +177,9 @@ pub async fn load_mcp_tools_from_config_with_capability_aliases(
             resources
                 .admitted
                 .insert(server.name().to_owned(), backend.clone());
-        } else if !namespace_permitted {
+        } else if namespace_permitted {
+            resources.unretained.insert(server.name().to_owned());
+        } else {
             resources.excluded.insert(server.name().to_owned());
         }
         loaded.readiness.push(McpServerReadiness {
