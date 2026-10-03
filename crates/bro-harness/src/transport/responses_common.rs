@@ -45,6 +45,26 @@ pub(super) struct ResponsesState {
     /// fresh event each turn (thread-9dfe1da5). Reset on compaction so the
     /// rebuilt buffer regains the manifest.
     pub ambient_hash: Option<u64>,
+    /// Server retry advice (`Retry-After`) carried across request paths: a
+    /// rejected WS handshake, WS retries, the WS→HTTP fallback, HTTP retries
+    /// and in-band stream failures all hand their deadline here so the next
+    /// request waits out the server's window. Deadline-based, so advice goes
+    /// inert the moment it passes; it never extends any retry budget. Not
+    /// persisted: snapshots survive resume, half-waited rate limits do not.
+    pending_retry_after: Option<super::http::RetryAfter>,
+    /// Length of the leading provider-canonical protected prefix of `input`:
+    /// a window returned by the public `/responses/compact` endpoint, which
+    /// must survive normalization (and resume) byte-for-byte. Normalization
+    /// never drops, rewrites or pads items inside the prefix, even where the
+    /// local pairing rules would (a retained output whose call is now covered
+    /// by the encrypted summary is structurally valid). Locally rebuilt
+    /// histories (inline summarizer, v2 retention) keep this at zero.
+    pub protected_prefix: usize,
+    /// Usage returned by remote compaction streams. Compaction spends real
+    /// tokens whether or not its envelope validates, so the transport
+    /// accumulates it on every observed terminal and the loop drains it via
+    /// [`Transport::take_compaction_usage`] after `compact()` returns.
+    compaction_usage: super::Usage,
 }
 
 impl ResponsesState {
@@ -56,7 +76,50 @@ impl ResponsesState {
             input: Vec::new(),
             custom_tool_call_ids: HashSet::new(),
             ambient_hash: None,
+            protected_prefix: 0,
+            pending_retry_after: None,
+            compaction_usage: super::Usage::default(),
         }
+    }
+
+    /// Remember server retry advice, keeping whichever pending deadline is
+    /// earliest. `None` (no advice) never clobbers a pending deadline.
+    pub(super) fn defer_retry_until(&mut self, advice: Option<super::http::RetryAfter>) {
+        let Some(advice) = advice else { return };
+        self.pending_retry_after = Some(match self.pending_retry_after {
+            Some(pending) if pending.deadline() <= advice.deadline() => pending,
+            _ => advice,
+        });
+    }
+
+    /// The pending advice without consuming it, for callers that wait out the
+    /// window first (cancellation-safe: a wait dropped mid-sleep leaves the
+    /// deadline pending) and for assertions.
+    pub(super) fn pending_retry_advice(&self) -> Option<super::http::RetryAfter> {
+        self.pending_retry_after
+    }
+
+    /// Remove the pending advice only once its window has fully elapsed, so a
+    /// cancelled wait never lets the next attempt bypass it.
+    pub(super) fn take_elapsed_retry_advice(&mut self) -> Option<super::http::RetryAfter> {
+        if self
+            .pending_retry_after
+            .is_some_and(|advice| advice.remaining_delay().is_zero())
+        {
+            self.pending_retry_after.take()
+        } else {
+            None
+        }
+    }
+
+    /// Record usage observed on a remote compaction stream.
+    pub(super) fn add_compaction_usage(&mut self, usage: &super::Usage) {
+        self.compaction_usage.add(usage);
+    }
+
+    /// Drain accumulated remote-compaction usage (resets the accumulator).
+    pub(super) fn take_compaction_usage(&mut self) -> super::Usage {
+        std::mem::take(&mut self.compaction_usage)
     }
 
     /// Persist the ambient section into the buffer when it changed since the
@@ -124,29 +187,41 @@ impl ResponsesState {
 
     pub(super) fn snapshot(&self) -> Value {
         // v2 shape carries the ambient hash so resume doesn't re-inject an
-        // unchanged manifest. restore() still accepts the legacy bare array.
+        // unchanged manifest, and the protected-prefix length so a
+        // provider-canonical compaction window survives resume verbatim.
+        // restore() still accepts the legacy bare array.
         json!({
             "input": self.input,
             "ambient_hash": self.ambient_hash,
+            "protected_prefix": self.protected_prefix,
         })
     }
 
     pub(super) fn restore(&mut self, snapshot: Value) {
         if let Some(arr) = snapshot.as_array() {
             // Legacy snapshot (bare input array): no recorded hash — the next
-            // sync_ambient re-injects once, which is safe.
+            // sync_ambient re-injects once, which is safe. Nothing is
+            // protected: the history was normalized by an older build.
             self.input = arr.clone();
             self.custom_tool_call_ids = pending_custom_tool_call_ids(&self.input);
             self.ambient_hash = None;
+            self.protected_prefix = 0;
         } else if let Some(arr) = snapshot.get("input").and_then(Value::as_array) {
             self.input = arr.clone();
             self.custom_tool_call_ids = pending_custom_tool_call_ids(&self.input);
             self.ambient_hash = snapshot.get("ambient_hash").and_then(Value::as_u64);
+            // Defensive clamp: checkpoint validation rejects an over-long
+            // prefix, so this only guards an unvalidated restore from
+            // arithmetic surprises, never from data loss.
+            self.protected_prefix = snapshot
+                .get("protected_prefix")
+                .and_then(Value::as_u64)
+                .map_or(0, |len| (len as usize).min(self.input.len()));
         }
     }
 
     pub(super) fn normalize_for_prompt(&mut self) {
-        normalize_responses_input(&mut self.input);
+        normalize_responses_suffix(&mut self.input, self.protected_prefix);
         self.custom_tool_call_ids = pending_custom_tool_call_ids(&self.input);
     }
 
@@ -361,13 +436,36 @@ fn response_instructions(opts: &TurnOpts) -> String {
 /// `input` buffer (so the next turn carries context), and normalize. Shared by
 /// every Responses transport — the downstream event vocabulary is identical
 /// across HTTP-SSE and WebSocket.
+///
+/// Error wrapping follows the loop's recovery contract: a *pure* context-window
+/// rejection (the failure event arrived before any output, tool or native
+/// effect was observed) keeps only the typed [`super::ContextWindowExceeded`]
+/// cause, so the loop's compact-and-retry guard can recover the turn. Any
+/// other failure, including a context-window rejection after observed output,
+/// is wrapped as a [`super::FailedTurnObservation`] so the guard refuses a
+/// replay that could duplicate already-emitted effects.
 pub(super) fn parse_sse(
     input: &mut Vec<Value>,
     custom_tool_call_ids: &mut HashSet<String>,
     sse: &str,
 ) -> Result<TurnOutput> {
-    parse_sse_validated(input, custom_tool_call_ids, sse)
-        .map_err(|error| responses_failure(error, sse))
+    parse_sse_validated(input, custom_tool_call_ids, sse).map_err(|error| {
+        if error
+            .downcast_ref::<super::FailedTurnObservation>()
+            .is_some()
+        {
+            // Already carries the durable observation evidence.
+            error
+        } else if error
+            .chain()
+            .any(|cause| cause.is::<super::ContextWindowExceeded>())
+        {
+            // Pure rejection: typed cause only, preserved for recovery.
+            error
+        } else {
+            responses_failure(error, sse)
+        }
+    })
 }
 
 /// Output items of one completed Responses stream, without touching history.
@@ -474,6 +572,10 @@ fn parse_sse_validated(
     let mut open_items = std::collections::HashMap::new();
     let mut final_output = None;
     let mut observed_call_items = HashSet::new();
+    // Provider work observed before any failure: output items, tool argument
+    // streams, native calls. A rejection that arrives before any of these is
+    // pure: nothing was emitted, so the loop may recover it.
+    let mut observed_effects = false;
 
     for line in sse.lines() {
         let line = line.trim();
@@ -486,7 +588,9 @@ fn parse_sse_validated(
         }
         let ev: Value = serde_json::from_str(data).context("invalid Responses SSE JSON")?;
         anyhow::ensure!(!terminal, "Responses event after terminal response");
-        match ev["type"].as_str().unwrap_or("") {
+        let kind = ev["type"].as_str().unwrap_or("");
+        observed_effects |= observes_provider_effects(kind);
+        match kind {
             "response.output_item.added" => {
                 let index = ev["output_index"]
                     .as_u64()
@@ -584,14 +688,22 @@ fn parse_sse_validated(
                     .as_str()
                     .or_else(|| ev["message"].as_str())
                     .unwrap_or(data);
-                // A context-window rejection is recoverable: surface a typed
-                // cause so the agent loop can compact + retry rather than fail
-                // the turn. Flows through both the HTTP path and the WS path
-                // (WsOutcome::Api), since both classify via this parser.
-                if matches!(code, "context_length_exceeded" | "context_window_exceeded") {
-                    return Err(anyhow::Error::new(super::ContextWindowExceeded(
+                // A context-window rejection is recoverable when nothing was
+                // observed first: surface a typed cause so the agent loop can
+                // compact + retry rather than fail the turn. The same code
+                // after observed output stays terminal, because a replay
+                // could duplicate the emitted effects, so the typed cause is
+                // wrapped with the durable observation and the loop guard
+                // refuses the retry. Flows through both the HTTP path and the
+                // WS path (WsOutcome::Api), since both classify via this parser.
+                if is_context_window_code(code) {
+                    let typed = anyhow::Error::new(super::ContextWindowExceeded(
                         classify_stream_error(code, message),
-                    )));
+                    ));
+                    if observed_effects {
+                        return Err(responses_failure(typed, sse));
+                    }
+                    return Err(typed);
                 }
                 anyhow::bail!(classify_stream_error(code, message));
             }
@@ -780,6 +892,18 @@ pub(super) fn responses_split(input: &[Value], limit: usize) -> Option<usize> {
 }
 
 pub(super) fn normalize_responses_input(input: &mut Vec<Value>) {
+    normalize_responses_suffix(input, 0);
+}
+
+/// Repair the replay buffer's tool-call pairing, touching only
+/// `input[protected..]`. Items inside the protected prefix are
+/// provider-canonical (a public `/responses/compact` window) and pass through
+/// untouched: a retained output whose call is now covered by the encrypted
+/// summary stays, and a retained call without an output is never padded with
+/// an invented "aborted" result. Call-id pairing is resolved across the whole
+/// buffer so a prefix/suffix boundary never orphans a pair that straddles it.
+pub(super) fn normalize_responses_suffix(input: &mut Vec<Value>, protected: usize) {
+    let protected = protected.min(input.len());
     let function_calls: HashSet<String> = input
         .iter()
         .filter(|item| item["type"] == "function_call")
@@ -791,14 +915,22 @@ pub(super) fn normalize_responses_input(input: &mut Vec<Value>) {
         .filter_map(|item| item["call_id"].as_str().map(str::to_string))
         .collect();
 
-    input.retain(|item| match item["type"].as_str() {
-        Some("function_call_output") => item["call_id"]
-            .as_str()
-            .is_some_and(|id| function_calls.contains(id)),
-        Some("custom_tool_call_output") => item["call_id"]
-            .as_str()
-            .is_some_and(|id| custom_calls.contains(id)),
-        _ => true,
+    let mut index = 0usize;
+    input.retain(|item| {
+        let is_protected = index < protected;
+        index += 1;
+        if is_protected {
+            return true;
+        }
+        match item["type"].as_str() {
+            Some("function_call_output") => item["call_id"]
+                .as_str()
+                .is_some_and(|id| function_calls.contains(id)),
+            Some("custom_tool_call_output") => item["call_id"]
+                .as_str()
+                .is_some_and(|id| custom_calls.contains(id)),
+            _ => true,
+        }
     });
 
     let function_outputs: HashSet<String> = input
@@ -813,6 +945,9 @@ pub(super) fn normalize_responses_input(input: &mut Vec<Value>) {
         .collect();
     let mut missing_outputs = Vec::new();
     for (idx, item) in input.iter().enumerate() {
+        if idx < protected {
+            continue;
+        }
         if item["type"] == "function_call"
             && let Some(call_id) = item["call_id"].as_str()
             && !function_outputs.contains(call_id)
@@ -1000,6 +1135,118 @@ pub(super) fn classify_stream_error(code: &str, message: &str) -> String {
     }
 }
 
+/// True when the code names a context-window rejection. OpenAI exposes both
+/// spellings depending on surface (`context_length_exceeded` on the public
+/// API, `context_window_exceeded` in streams).
+pub(super) fn is_context_window_code(code: &str) -> bool {
+    matches!(code, "context_length_exceeded" | "context_window_exceeded")
+}
+
+/// Server retry advice carried inside a streamed failure envelope. Codex's
+/// backend repeats the rejection headers in `error.headers`; the value uses
+/// the same grammar as the HTTP header (delay seconds or an HTTP-date).
+pub(super) fn in_band_retry_after(ev: &Value) -> Option<super::http::RetryAfter> {
+    let headers = ev["error"]["headers"]
+        .as_object()
+        .or_else(|| ev["response"]["error"]["headers"].as_object())?;
+    let value = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
+        .and_then(|(_, value)| value.as_str())?;
+    super::http::RetryAfter::from_header(value)
+}
+
+/// The machine-readable code of a streamed failure event.
+pub(super) fn stream_error_code<'a>(ev: &'a Value, data: &'a str) -> &'a str {
+    if ev["type"] == "response.failed" {
+        &ev["response"]["error"]["code"]
+    } else {
+        &ev["error"]["code"]
+    }
+    .as_str()
+    .or_else(|| ev["code"].as_str())
+    .unwrap_or("")
+}
+
+pub(super) fn stream_error_message<'a>(ev: &'a Value, data: &'a str) -> &'a str {
+    if ev["type"] == "response.failed" {
+        &ev["response"]["error"]["message"]
+    } else {
+        &ev["error"]["message"]
+    }
+    .as_str()
+    .or_else(|| ev["message"].as_str())
+    .unwrap_or(data)
+}
+
+/// Stream failure codes that are known-transient and therefore retryable
+/// within a bounded budget. The list is an explicit allowlist rather than
+/// "everything else": an unrecognized failure code keeps the previous
+/// terminal behavior, so an unknown envelope can never buy retries (and a
+/// no-code envelope, which vendors emit liberally, stays terminal).
+pub(super) fn retryable_stream_code(code: &str) -> bool {
+    matches!(
+        code,
+        "server_is_overloaded"
+            | "slow_down"
+            | "rate_limit_exceeded"
+            | "overloaded_error"
+            | "temporarily_overloaded"
+    )
+}
+
+/// Classification of a streamed failure event (`response.failed` / `error`)
+/// for the stream retry loops. Mirrors codex's `parse_failed_response` split:
+/// quota, policy, auth and invalid-request codes are terminal regardless of
+/// what a status header suggested; the known-transient overload and
+/// rate-limit codes are retryable within the caller's bounded budget, with
+/// any server advice setting only the timing. Unknown codes stay terminal.
+pub(super) enum StreamFailure {
+    /// Propagate as-is. Carries the typed context-window cause when the code
+    /// names one (the caller decides whether recovery is safe).
+    Terminal(anyhow::Error),
+    /// Retryable within the caller's bounded budget; advice may set timing.
+    Retryable {
+        error: anyhow::Error,
+        advice: Option<super::http::RetryAfter>,
+    },
+}
+
+pub(super) fn classify_stream_failure(
+    code: &str,
+    message: &str,
+    advice: Option<super::http::RetryAfter>,
+) -> StreamFailure {
+    if is_context_window_code(code) {
+        return StreamFailure::Terminal(anyhow::Error::new(super::ContextWindowExceeded(
+            classify_stream_error(code, message),
+        )));
+    }
+    if retryable_stream_code(code) {
+        return StreamFailure::Retryable {
+            error: anyhow::anyhow!(classify_stream_error(code, message)),
+            advice,
+        };
+    }
+    StreamFailure::Terminal(anyhow::anyhow!(classify_stream_error(code, message)))
+}
+
+/// True for events that evidence provider work: output items, tool argument
+/// streams, native calls. Lifecycle-only events (`response.created`,
+/// terminal events) do not count, so a rejection arriving before any of these
+/// is pure. Mirrors [`ResponsesStreamTrace`]'s replay-safety logic.
+fn observes_provider_effects(kind: &str) -> bool {
+    kind.starts_with("response.")
+        && !matches!(
+            kind,
+            "response.created"
+                | "response.in_progress"
+                | "response.completed"
+                | "response.incomplete"
+                | "response.failed"
+        )
+}
+
 /// Classify a non-2xx HTTP response, surfacing any error code from the body
 /// envelope so failures are diagnosable from the log.
 pub(super) fn classify_http_error(status: reqwest::StatusCode, body: &str) -> String {
@@ -1017,6 +1264,23 @@ pub(super) fn classify_http_error(status: reqwest::StatusCode, body: &str) -> St
     } else {
         format!("openai responses {status} [{code}]: {body}")
     }
+}
+
+/// Typed context-window cause for a non-2xx HTTP rejection whose error
+/// envelope carries a context code. A rejected request produced no output,
+/// tool or native effect, so the cause is always safe for the loop's
+/// compact-and-retry recovery; nothing was emitted that a replay could
+/// duplicate.
+pub(super) fn http_context_window_exceeded(
+    status: reqwest::StatusCode,
+    body: &str,
+) -> Option<anyhow::Error> {
+    let code = super::http::json_error_code(body)?;
+    is_context_window_code(&code).then(|| {
+        anyhow::Error::new(super::ContextWindowExceeded(classify_http_error(
+            status, body,
+        )))
+    })
 }
 
 /// Diagnostic breadcrumb for a single Responses stream attempt.
@@ -1081,6 +1345,16 @@ impl ResponsesStreamTrace {
 
     pub(super) fn terminal_seen(&self) -> bool {
         self.terminal_seen
+    }
+
+    /// Bytes consumed so far, for the collector's bounded-buffer check.
+    pub(super) fn bytes_consumed(&self) -> u64 {
+        self.bytes_consumed
+    }
+
+    /// Parsed events so far.
+    pub(super) fn event_count(&self) -> u64 {
+        self.event_count
     }
 
     pub(super) fn fault_context(&self, transport: &str, attempt: u32, max_attempts: u32) -> String {

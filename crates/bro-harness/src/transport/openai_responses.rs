@@ -16,16 +16,72 @@
 //! connection, the SSE consume + mid-stream retry, the 401→refresh recovery, the
 //! WS↔HTTP routing, and compaction (always over HTTP).
 
+use super::http::{RetryAfter, sleep_until_retry};
+use super::openai_responses_stream::{
+    EventFlow, collect_events, collect_json_body, terminal_usage,
+};
 use super::openai_responses_ws::{WsChannel, WsOutcome};
 use super::responses_common::{self, Auth, ResponsesState};
 use super::{Transport, TurnOpts, TurnOutput};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use futures_util::StreamExt;
 use serde_json::{Value, json};
 
 #[path = "openai_responses_compaction.rs"]
 mod compaction;
+
+#[cfg(test)]
+#[path = "openai_responses_retry_tests.rs"]
+mod retry_tests;
+
+/// Byte budget for one collected Responses stream. Turns stream deltas for a
+/// whole model step, so this stays generous while still bounding a runaway
+/// stream; remote compaction uses the tighter compaction budget below.
+const STREAM_BYTE_BUDGET: usize = 64 * 1024 * 1024;
+/// Remote compaction returns one encrypted item, so its collection budget is
+/// small: an envelope larger than this is a fault, not a summary.
+const COMPACTION_BYTE_BUDGET: usize = 4 * 1024 * 1024;
+/// Bounded retry budget for one remote compaction stream attempt sequence.
+const MAX_COMPACTION_STREAM_RETRIES: u32 = 2;
+
+/// Which server-side compaction surface this endpoint speaks. The ChatGPT
+/// (codex/Brodex) backend runs the v2 `compaction_trigger` item over the
+/// normal Responses stream; the public OpenAI API documents a standalone
+/// `/responses/compact` that returns the whole canonical next context window.
+/// Every other API-compatible vendor keeps the local inline summarizer: the
+/// v2 trigger item and the standalone route belong to no compatibility
+/// contract, so they are never assumed for unknown hosts (Azure, gateways,
+/// third-party deployments).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteCompactionMode {
+    /// ChatGPT backend: `compaction_trigger` over the Responses stream.
+    BrodexV2,
+    /// Public OpenAI API: standalone `/responses/compact`.
+    PublicStandalone,
+    /// Unknown vendor: local summarization.
+    InlineOnly,
+}
+
+fn remote_compaction_mode(auth: &Auth, http_endpoint: &str) -> RemoteCompactionMode {
+    match auth {
+        // The codex-private trigger protocol rides the OAuth identity; the
+        // WS/HTTP routing already proves this is the codex backend.
+        Auth::ChatGpt { .. } => RemoteCompactionMode::BrodexV2,
+        Auth::ApiKey(_) => {
+            let host = http_endpoint
+                .trim_start_matches("https://")
+                .trim_start_matches("http://")
+                .split('/')
+                .next()
+                .unwrap_or_default();
+            if host.eq_ignore_ascii_case("api.openai.com") {
+                RemoteCompactionMode::PublicStandalone
+            } else {
+                RemoteCompactionMode::InlineOnly
+            }
+        }
+    }
+}
 
 pub struct OpenAiResponsesTransport {
     state: ResponsesState,
@@ -79,11 +135,26 @@ impl OpenAiResponsesTransport {
         })
     }
 
+    /// The compaction surface this endpoint speaks (see [`RemoteCompactionMode`]).
+    fn remote_compaction_mode(&self) -> RemoteCompactionMode {
+        remote_compaction_mode(&self.state.auth, &self.http_endpoint)
+    }
+
     /// Attach the shared identity + auth headers plus HTTP-request specifics.
     fn apply_headers(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        self.apply_headers_accept(rb, "text/event-stream")
+    }
+
+    /// [`Self::apply_headers`] with an explicit `accept` value, so the JSON
+    /// standalone compaction endpoint is not asked for an SSE body.
+    fn apply_headers_accept(
+        &self,
+        rb: reqwest::RequestBuilder,
+        accept: &'static str,
+    ) -> reqwest::RequestBuilder {
         let mut rb = rb
             .header("content-type", "application/json")
-            .header("accept", "text/event-stream")
+            .header("accept", accept)
             .timeout(super::http::request_timeout());
         for (name, value) in self.state.identity_auth_headers() {
             rb = rb.header(name, value);
@@ -131,10 +202,35 @@ impl OpenAiResponsesTransport {
         .context("responses request (after token refresh)")
     }
 
+    /// Sleep out any server retry advice carried over from an earlier
+    /// exhausted attempt (a rejected WS handshake, exhausted HTTP retries, an
+    /// in-band stream failure). Deadline-based, so advice already past costs
+    /// nothing and advice never extends a retry budget. Cancellation-safe: the
+    /// deadline is only cleared after it elapses, so a turn cancelled mid-wait
+    /// leaves the remaining window pending for the next attempt.
+    async fn honor_pending_retry_advice(&mut self) {
+        let Some(advice) = self.state.pending_retry_advice() else {
+            return;
+        };
+        let wait = advice.remaining_delay();
+        if !wait.is_zero() {
+            tracing::warn!(
+                wait_ms = wait.as_millis() as u64,
+                "honoring server retry advice before next request"
+            );
+            sleep_until_retry(advice).await;
+        }
+        let _ = self.state.take_elapsed_retry_advice();
+    }
+
     /// The HTTP-SSE turn path (also the WS fallback target). Mid-stream resume:
     /// a transient stream fault re-sends the whole request; `state.input` is only
     /// mutated by `parse_sse` on success, so a dropped attempt re-sends exactly.
     /// Retry only while no visible text delta has been emitted (dedup-safe).
+    /// In-band transient failures (overload, rate limit) retry within the same
+    /// bounded budget, honoring server advice for timing only; quota, policy,
+    /// auth and context-window codes stay terminal, and advice survives retry
+    /// exhaustion into the next request.
     async fn run_turn_http(
         &mut self,
         tools: &[super::ToolSpec],
@@ -145,6 +241,7 @@ impl OpenAiResponsesTransport {
         let idle = super::http::stream_idle_timeout();
         let max = super::http::max_retries();
         let mut attempt = 0u32;
+        self.honor_pending_retry_advice().await;
 
         'attempt: loop {
             attempt += 1;
@@ -153,7 +250,16 @@ impl OpenAiResponsesTransport {
                 .await?;
             let status = resp.status();
             if !status.is_success() {
+                // The status-level budget was already spent inside
+                // send_with_retry; preserve any advice for the next request.
+                self.state
+                    .defer_retry_until(RetryAfter::from_headers(resp.headers()));
                 let sse = resp.text().await.unwrap_or_default();
+                // A pure HTTP rejection produced no output at all, so the
+                // typed cause is safe for the loop's compact-and-retry.
+                if let Some(typed) = responses_common::http_context_window_exceeded(status, &sse) {
+                    return Err(typed);
+                }
                 anyhow::bail!(responses_common::classify_http_error(status, &sse));
             }
 
@@ -162,55 +268,10 @@ impl OpenAiResponsesTransport {
                 .get("x-request-id")
                 .and_then(|v| v.to_str().ok())
                 .map(str::to_string);
-            let mut stream = resp.bytes_stream();
-            let mut buf: Vec<u8> = Vec::new();
-            let mut accum = String::new();
-            let mut trace = responses_common::ResponsesStreamTrace::new(request_id);
+            let mut failure_event: Option<Value> = None;
             let mut text_started = false;
-            let mut fault: Option<anyhow::Error> = None;
-
-            'consume: loop {
-                let next = match tokio::time::timeout(idle, stream.next()).await {
-                    Ok(next) => next,
-                    Err(_) => {
-                        fault = Some(anyhow::anyhow!(
-                            "responses SSE idle timeout (no event within idle window)"
-                        ));
-                        break 'consume;
-                    }
-                };
-                let Some(chunk) = next else { break 'consume };
-                let chunk = match chunk {
-                    Ok(c) => c,
-                    Err(e) => {
-                        fault = Some(anyhow::Error::new(e).context("read responses SSE chunk"));
-                        break 'consume;
-                    }
-                };
-                trace.observe_chunk(chunk.len());
-                buf.extend_from_slice(&chunk);
-                while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-                    let raw: Vec<u8> = buf.drain(..=pos).collect();
-                    let line_cow = match std::str::from_utf8(&raw) {
-                        Ok(line) => line,
-                        Err(error) => {
-                            accum.push_str(&String::from_utf8_lossy(&raw));
-                            return Err(responses_common::responses_failure(error.into(), &accum));
-                        }
-                    };
-                    accum.push_str(&line_cow);
-                    let line = line_cow.trim();
-                    let Some(data) = line.strip_prefix("data:") else {
-                        continue;
-                    };
-                    let data = data.trim();
-                    if data.is_empty() || data == "[DONE]" {
-                        continue;
-                    }
-                    let ev: Value = serde_json::from_str(data)
-                        .context("invalid Responses SSE JSON")
-                        .map_err(|error| responses_common::responses_failure(error, &accum))?;
-                    trace.observe_event(&ev);
+            let mut events =
+                collect_events(resp, idle, STREAM_BYTE_BUDGET, request_id, |ev, trace| {
                     match ev["type"].as_str().unwrap_or("") {
                         "response.output_text.delta" => {
                             if let Some(t) = ev["delta"].as_str()
@@ -231,6 +292,7 @@ impl OpenAiResponsesTransport {
                                 }));
                                 trace.mark_emitted_text();
                             }
+                            EventFlow::Continue
                         }
                         "response.reasoning_summary_text.delta"
                         | "response.reasoning_text.delta" => {
@@ -243,36 +305,52 @@ impl OpenAiResponsesTransport {
                                     "delta": {"type": "thinking_delta", "thinking": t},
                                 }));
                             }
+                            EventFlow::Continue
                         }
-                        "response.completed"
-                        | "response.incomplete"
-                        | "response.failed"
-                        | "error" => {
+                        "response.completed" | "response.incomplete" => {
                             trace.mark_terminal_seen();
+                            EventFlow::Terminal
                         }
-                        _ => {}
+                        "response.failed" | "error" => {
+                            failure_event = Some(ev.clone());
+                            trace.mark_terminal_seen();
+                            EventFlow::Terminal
+                        }
+                        _ => EventFlow::Continue,
                     }
+                })
+                .await;
+
+            // An in-band failure envelope is retryable only for transient
+            // codes and only while nothing was emitted; the shared parser
+            // stays authoritative for terminal ones.
+            let mut in_band_fault = None;
+            if events.fault.is_none()
+                && let Some(ev) = failure_event.as_ref()
+            {
+                let data = ev.to_string();
+                let code = responses_common::stream_error_code(ev, &data);
+                let message = responses_common::stream_error_message(ev, &data);
+                if let responses_common::StreamFailure::Retryable { error, advice } =
+                    responses_common::classify_stream_failure(code, message, events.advice)
+                {
+                    events.advice = advice;
+                    in_band_fault = Some(error);
                 }
             }
 
-            if !buf.iter().all(u8::is_ascii_whitespace) {
-                accum.push_str(&String::from_utf8_lossy(&buf));
-                return Err(responses_common::responses_failure(
-                    anyhow::anyhow!("unfinished Responses SSE line"),
-                    &accum,
-                ));
-            }
-            if fault.is_none() && !trace.terminal_seen() {
-                fault = Some(anyhow::anyhow!(
-                    "responses stream closed before a terminal event (response.completed/incomplete/failed)"
-                ));
-            }
-
-            if let Some(err) = fault {
+            if let Some(err) = events.fault.or(in_band_fault) {
                 let max_attempts = max.saturating_add(1);
-                let diagnostics = trace.fault_context("responses HTTP-SSE", attempt, max_attempts);
-                if trace.replay_safe() && attempt <= max {
-                    let wait = super::http::backoff(attempt);
+                let diagnostics =
+                    events
+                        .trace
+                        .fault_context("responses HTTP-SSE", attempt, max_attempts);
+                self.state.defer_retry_until(events.advice);
+                if events.trace.replay_safe() && attempt <= max {
+                    let wait = events
+                        .advice
+                        .map(RetryAfter::remaining_delay)
+                        .unwrap_or_else(|| super::http::backoff(attempt));
                     tracing::warn!(
                         attempt,
                         error = %err,
@@ -280,19 +358,25 @@ impl OpenAiResponsesTransport {
                         wait_ms = wait.as_millis() as u64,
                         "responses stream fault before output; re-sending request"
                     );
-                    tokio::time::sleep(wait).await;
+                    match events.advice {
+                        Some(advice) => sleep_until_retry(advice).await,
+                        None => tokio::time::sleep(wait).await,
+                    }
                     continue 'attempt;
                 }
-                return Err(responses_common::responses_failure(err.context(if !trace.replay_safe() {
-                    format!(
-                        "responses stream fault after partial output; not retried (would duplicate); {diagnostics}"
-                    )
-                } else {
-                    format!("responses stream retries exhausted; {diagnostics}")
-                }), &accum));
+                return Err(responses_common::responses_failure(
+                    err.context(if !events.trace.replay_safe() {
+                        format!(
+                            "responses stream fault after partial output; not retried (would duplicate); {diagnostics}"
+                        )
+                    } else {
+                        format!("responses stream retries exhausted; {diagnostics}")
+                    }),
+                    &events.accum,
+                ));
             }
 
-            return self.state.parse_sse(&accum);
+            return self.state.parse_sse(&events.accum);
         }
     }
 
@@ -323,16 +407,18 @@ impl OpenAiResponsesTransport {
     /// Server-side compaction over the normal Responses stream, as codex's
     /// `compact_remote_v2`: the current history plus a trailing
     /// `compaction_trigger` item is sent with the same request shape as a
-    /// turn, and the stream returns exactly one encrypted `compaction` item.
-    /// (The unary `responses/compact` route this replaced no longer exists on
-    /// the backend; it answers 404.) History is rebuilt client-side the way
-    /// codex does it: user messages retained verbatim, newest first within a
-    /// token budget, then the compaction item. Assistant turns and tool
-    /// traffic are covered by the summary; the ambient manifest is re-injected
-    /// on the next turn. The request is a fitted copy, so source history is
-    /// untouched until a valid replacement exists. Returns the encrypted blob
-    /// for the boundary size signal, or `None` when there is nothing to
-    /// compact.
+    /// turn over the shared HTTP path (auth recovery, bounded status retries,
+    /// server retry advice), and the stream is collected incrementally with
+    /// an idle deadline and a byte budget, stopping at the first terminal
+    /// event. Exactly one encrypted `compaction` item must come back;
+    /// incomplete, failed or malformed envelopes are rejected. History is
+    /// rebuilt client-side the way codex does it: user messages retained
+    /// verbatim, newest first within a token budget, then the compaction
+    /// item. The request is a fitted copy, so source history is untouched
+    /// until a valid replacement exists. Usage observed on the terminal event
+    /// is accumulated for `take_compaction_usage` whether or not validation
+    /// succeeds: the tokens were spent. Returns the encrypted blob for the
+    /// boundary size signal, or `None` when there is nothing to compact.
     async fn remote_compact(
         &mut self,
         tools: &[super::ToolSpec],
@@ -351,32 +437,262 @@ impl OpenAiResponsesTransport {
         // the source history. Unknown model windows remain provider-validated.
         let window = crate::compaction::CompactionPolicy::from_env().context_window(&opts.model);
         let body = compaction::fit_input(body, window)?;
-        let resp = self
-            .send_with_auth_recovery("openai-responses/compact", &body)
-            .await?;
+        let idle = super::http::stream_idle_timeout();
+        let max = MAX_COMPACTION_STREAM_RETRIES;
+        let mut attempt = 0u32;
+        self.honor_pending_retry_advice().await;
+
+        'attempt: loop {
+            attempt += 1;
+            let resp = self
+                .send_with_auth_recovery("openai-responses/compact", &body)
+                .await?;
+            let status = resp.status();
+            if !status.is_success() {
+                // Status-level retries were spent in send_with_retry; keep any
+                // advice for the next request.
+                self.state
+                    .defer_retry_until(RetryAfter::from_headers(resp.headers()));
+                let text = resp.text().await.unwrap_or_default();
+                anyhow::bail!(responses_common::classify_http_error(status, &text));
+            }
+
+            let mut terminal_event: Option<Value> = None;
+            let mut events =
+                collect_events(resp, idle, COMPACTION_BYTE_BUDGET, None, |ev, trace| {
+                    match ev["type"].as_str().unwrap_or("") {
+                        "response.completed"
+                        | "response.incomplete"
+                        | "response.failed"
+                        | "error" => {
+                            terminal_event = Some(ev.clone());
+                            trace.mark_terminal_seen();
+                            EventFlow::Terminal
+                        }
+                        _ => EventFlow::Continue,
+                    }
+                })
+                .await;
+
+            // Account the terminal usage first: validation failures do not
+            // unspend the tokens.
+            if let Some(ev) = terminal_event.as_ref() {
+                self.state.add_compaction_usage(&terminal_usage(ev));
+            }
+
+            // Stream faults and transient in-band failures retry within the
+            // bounded budget (a compaction request emits nothing, so a resend
+            // is always replay-safe); quota, policy, auth and context-window
+            // codes stay terminal through the strict validation below.
+            let mut fault = events.fault.take();
+            if fault.is_none()
+                && let Some(ev) = terminal_event.as_ref()
+                && matches!(ev["type"].as_str(), Some("response.failed" | "error"))
+            {
+                let data = ev.to_string();
+                let code = responses_common::stream_error_code(ev, &data);
+                let message = responses_common::stream_error_message(ev, &data);
+                if let responses_common::StreamFailure::Retryable { error, advice } =
+                    responses_common::classify_stream_failure(code, message, events.advice)
+                {
+                    events.advice = advice;
+                    fault = Some(error);
+                }
+            }
+
+            if let Some(err) = fault {
+                let diagnostics = events.trace.fault_context(
+                    "responses remote compaction",
+                    attempt,
+                    max.saturating_add(1),
+                );
+                self.state.defer_retry_until(events.advice);
+                if attempt <= max {
+                    let wait = events
+                        .advice
+                        .map(RetryAfter::remaining_delay)
+                        .unwrap_or_else(|| super::http::backoff(attempt));
+                    tracing::warn!(
+                        attempt,
+                        error = %err,
+                        diagnostics = %diagnostics,
+                        wait_ms = wait.as_millis() as u64,
+                        "remote compaction stream fault; re-sending request"
+                    );
+                    match events.advice {
+                        Some(advice) => sleep_until_retry(advice).await,
+                        None => tokio::time::sleep(wait).await,
+                    }
+                    continue 'attempt;
+                }
+                return Err(responses_common::responses_failure(
+                    err.context(format!(
+                        "remote compaction stream retries exhausted; {diagnostics}"
+                    )),
+                    &events.accum,
+                ));
+            }
+
+            let output = responses_common::parse_sse_output_items(&events.accum)
+                .map_err(|error| responses_common::responses_failure(error, &events.accum))?;
+            let (summary_item, summary) = compaction::validate_v2_output(&output)?;
+            let mut rebuilt = compaction::retain_for_v2(
+                &self.state.input,
+                compaction::RETAINED_MESSAGE_TOKEN_BUDGET,
+            );
+            rebuilt.push(summary_item);
+            super::snapshot::validate_snapshot("openai-responses", &Value::Array(rebuilt.clone()))?;
+            self.state.input = rebuilt;
+            // Locally rederived history: no provider-canonical prefix remains.
+            self.state.protected_prefix = 0;
+            self.state.normalize_for_prompt();
+            // The rebuilt buffer no longer carries the persisted ambient manifest;
+            // reset the hash so the next turn re-injects it.
+            self.state.ambient_hash = None;
+            // A compaction rewrites history out from under the WS delta baseline;
+            // force the next WS turn to full-replay.
+            if let Some(ws) = self.ws.as_mut() {
+                ws.invalidate();
+            }
+            return Ok(Some(summary));
+        }
+    }
+
+    /// Public OpenAI API compaction: the documented standalone
+    /// `/responses/compact` endpoint (developers.openai.com, "Standalone
+    /// compact endpoint"). The request carries the fitted current window; the
+    /// response's `output` array IS the canonical next context window
+    /// (retained items plus exactly one encrypted compaction item) and is
+    /// installed verbatim, never re-derived with the v2 retention rules. The
+    /// endpoint is stateless and answers JSON, not a stream. Returns
+    /// `Ok(None)` when the endpoint is absent (404/405) so the caller can
+    /// fall back to inline summarization; every other failure is an error
+    /// with the source history untouched.
+    async fn public_compact(&mut self, opts: &TurnOpts) -> Result<Option<String>> {
+        let url = format!("{}/compact", self.http_endpoint.trim_end_matches('/'));
+        let window = crate::compaction::CompactionPolicy::from_env().context_window(&opts.model);
+        let body = compaction::fit_input(
+            json!({"model": opts.model, "input": self.state.input}),
+            window,
+        )?;
+        self.honor_pending_retry_advice().await;
+        let resp = super::http::send_with_retry("openai-responses/compact", || {
+            self.apply_headers_accept(self.http.post(&url), "application/json")
+                .json(&body)
+                .send()
+        })
+        .await
+        .context("responses public compaction request")?;
         let status = resp.status();
-        let text = resp.text().await.context("read compaction stream")?;
+        self.state
+            .defer_retry_until(RetryAfter::from_headers(resp.headers()));
+        if status == reqwest::StatusCode::NOT_FOUND
+            || status == reqwest::StatusCode::METHOD_NOT_ALLOWED
+        {
+            // Bounded drain: even an error body must not buffer unbounded.
+            let _ = collect_json_body(
+                resp,
+                super::http::stream_idle_timeout(),
+                COMPACTION_BYTE_BUDGET,
+            )
+            .await;
+            tracing::warn!(
+                status = status.as_u16(),
+                "public /responses/compact unavailable; falling back to inline summarization"
+            );
+            return Ok(None);
+        }
+        let text = collect_json_body(
+            resp,
+            super::http::stream_idle_timeout(),
+            COMPACTION_BYTE_BUDGET,
+        )
+        .await
+        .context("read public compaction response")?;
         if !status.is_success() {
             anyhow::bail!(responses_common::classify_http_error(status, &text));
         }
-        let output = responses_common::parse_sse_output_items(&text)
-            .map_err(|error| responses_common::responses_failure(error, &text))?;
-        let (summary_item, summary) = compaction::validate_v2_output(&output)?;
-        let mut rebuilt =
-            compaction::retain_for_v2(&self.state.input, compaction::RETAINED_MESSAGE_TOKEN_BUDGET);
-        rebuilt.push(summary_item);
-        super::snapshot::validate_snapshot("openai-responses", &Value::Array(rebuilt.clone()))?;
-        self.state.input = rebuilt;
+        let parsed: Value =
+            serde_json::from_str(&text).context("invalid /responses/compact JSON")?;
+        // Account the reported usage before any semantic validation: the
+        // request was served even when the window turns out invalid.
+        let total_input = parsed["usage"]["input_tokens"].as_u64().unwrap_or(0);
+        let cached = parsed["usage"]["input_tokens_details"]["cached_tokens"]
+            .as_u64()
+            .unwrap_or(0);
+        self.state.add_compaction_usage(&super::Usage {
+            input_tokens: total_input.saturating_sub(cached),
+            output_tokens: parsed["usage"]["output_tokens"].as_u64().unwrap_or(0),
+            cached_input_tokens: cached,
+            cache_creation_input_tokens: 0,
+        });
+        let output = parsed["output"]
+            .as_array()
+            .cloned()
+            .context("/responses/compact response missing output array")?;
+        anyhow::ensure!(
+            !output.is_empty(),
+            "/responses/compact returned an empty context window"
+        );
+        let status_field = parsed["status"].as_str().unwrap_or_default();
+        anyhow::ensure!(
+            parsed["status"].is_null() || status_field == "completed",
+            "/responses/compact did not complete: status {status_field:?}, error {:?}",
+            parsed["error"]
+        );
+        anyhow::ensure!(
+            parsed["error"].is_null(),
+            "/responses/compact response carries an error: {}",
+            parsed["error"]
+        );
+        anyhow::ensure!(
+            output.iter().all(|item| {
+                item.is_object() && item["type"].as_str().is_some_and(|kind| !kind.is_empty())
+            }),
+            "/responses/compact output contains a structurally invalid item"
+        );
+        // Exactly one encrypted compaction item must anchor the new window.
+        let summary = output
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item["type"].as_str(),
+                    Some("compaction" | "compaction_summary")
+                )
+            })
+            .collect::<Vec<_>>();
+        anyhow::ensure!(
+            summary.len() == 1,
+            "/responses/compact expected exactly one compaction item, got {} in {} output items",
+            summary.len(),
+            output.len()
+        );
+        let output_len = output.len();
+        let encrypted = summary[0]["encrypted_content"]
+            .as_str()
+            .filter(|text| !text.trim().is_empty())
+            .context("/responses/compact compaction item has no encrypted_content")?
+            .to_owned();
+        // The returned window is canonical: install it verbatim, no local
+        // retention pass, no pruning, and no normalization (a retained output
+        // whose call is covered by the summary is not an orphan to repair).
+        // The recorded protected prefix keeps the loop's pre-request
+        // normalization and the snapshot/resume path from rewriting it.
+        let snapshot = json!({
+            "input": output.clone(),
+            "ambient_hash": null,
+            "protected_prefix": output_len,
+        });
+        super::snapshot::validate_snapshot("openai-responses", &snapshot)?;
+        self.state.input = output;
+        self.state.protected_prefix = output_len;
         self.state.normalize_for_prompt();
-        // The rebuilt buffer no longer carries the persisted ambient manifest;
-        // reset the hash so the next turn re-injects it.
+        // The returned window no longer carries the persisted ambient manifest.
         self.state.ambient_hash = None;
-        // A compaction rewrites history out from under the WS delta baseline;
-        // force the next WS turn to full-replay.
         if let Some(ws) = self.ws.as_mut() {
             ws.invalidate();
         }
-        Ok(Some(summary))
+        Ok(Some(encrypted))
     }
 }
 
@@ -447,7 +763,12 @@ impl Transport for OpenAiResponsesTransport {
                     // Keep HTTP requests sticky to the WS backend if we captured a
                     // turn-state, then drop the channel. `state.input` is pristine
                     // (WS only commits on success), so HTTP full-replays exactly.
+                    // Advice captured on the rejected WS handshake (or an
+                    // exhausted in-band WS failure) gates the HTTP attempt: the
+                    // fallback gets its own retry budget, but it still waits out
+                    // the server's window instead of re-tripping it instantly.
                     self.ws_turn_state = ws.turn_state().map(str::to_string);
+                    self.state.defer_retry_until(ws.retry_after());
                     self.ws = None;
                 }
             }
@@ -460,6 +781,13 @@ impl Transport for OpenAiResponsesTransport {
         if let Some(ws) = self.ws.as_mut() {
             ws.invalidate();
         }
+    }
+
+    /// Drain usage accumulated by server-side compaction streams (see
+    /// [`Transport::take_compaction_usage`]); the loop accounts it after
+    /// every `compact()` return.
+    fn take_compaction_usage(&mut self) -> super::Usage {
+        self.state.take_compaction_usage()
     }
 
     fn snapshot(&self) -> Value {
@@ -476,13 +804,22 @@ impl Transport for OpenAiResponsesTransport {
         tools: &[super::ToolSpec],
         opts: &TurnOpts,
     ) -> Result<Option<String>> {
-        // Canonical OAI path: the ChatGPT backend supports server-side compaction
-        // (the unary `responses/compact` endpoint), which owns retention + summary
-        // — so the inline `params` knobs don't apply there. Generic API-key
-        // vendors fall through to the client-side summarizer below. This gate
-        // mirrors codex's `supports_remote_compaction()`.
-        if matches!(self.state.auth, Auth::ChatGpt { .. }) {
-            return self.remote_compact(tools, opts).await;
+        // Server-side compaction is an endpoint capability, not an auth-mode
+        // guess: the ChatGPT backend owns the v2 trigger stream, the public
+        // OpenAI API documents the standalone compact endpoint, and generic
+        // API-key vendors keep the client-side summarizer below. The inline
+        // `params` knobs only apply where the summarizer runs.
+        match self.remote_compaction_mode() {
+            RemoteCompactionMode::BrodexV2 => {
+                return self.remote_compact(tools, opts).await;
+            }
+            RemoteCompactionMode::PublicStandalone => {
+                if let Some(summary) = self.public_compact(opts).await? {
+                    return Ok(Some(summary));
+                }
+                // Endpoint absent on this account: fall through to inline.
+            }
+            RemoteCompactionMode::InlineOnly => {}
         }
         let keep_tail = params.keep_tail;
         let n = self.state.input.len();
@@ -510,6 +847,8 @@ impl Transport for OpenAiResponsesTransport {
         }));
         rebuilt.extend_from_slice(&self.state.input[split..]);
         self.state.input = rebuilt;
+        // Locally rederived history: no provider-canonical prefix remains.
+        self.state.protected_prefix = 0;
         // The rebuilt buffer no longer carries the persisted ambient manifest;
         // reset the hash so the next turn re-injects it.
         self.state.ambient_hash = None;

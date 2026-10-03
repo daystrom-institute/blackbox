@@ -23,10 +23,28 @@ pub(crate) fn validate_snapshot(transport: &str, snapshot: &Value) -> Result<()>
                     "Responses ambient_hash must be null or an unsigned integer"
                 );
             }
-            object
+            let items = object
                 .get("input")
                 .and_then(Value::as_array)
-                .context("Responses snapshot requires an input array")?
+                .context("Responses snapshot requires an input array")?;
+            // A protected prefix (a provider-canonical compaction window) must
+            // fit the recorded history; an over-long prefix is a torn or
+            // hand-edited checkpoint and fails closed rather than protecting
+            // items that are not there.
+            if let Some(prefix) = object
+                .get("protected_prefix")
+                .filter(|value| !value.is_null())
+            {
+                let length = prefix.as_u64().with_context(
+                    || "Responses protected_prefix must be null or an unsigned integer",
+                )?;
+                ensure!(
+                    length <= items.len() as u64,
+                    "Responses protected_prefix {length} exceeds the input array ({} items)",
+                    items.len()
+                );
+            }
+            items
         }
         _ => bail!("unsupported snapshot transport: {transport}"),
     };
@@ -298,9 +316,23 @@ mod tests {
             ),
             (
                 "openai-responses",
-                json!({"input":[],"ambient_hash":42,"future_metadata":true}),
+                json!({"input":[], "ambient_hash":42, "future_metadata":true}),
             ),
             ("openai-responses", json!({"input":[]})),
+            (
+                "openai-responses",
+                // A canonical compaction window carrying a structurally valid
+                // retained orphan output plus its protected prefix.
+                json!({
+                    "input": [
+                        {"type":"message","role":"user","content":"kept"},
+                        {"type":"function_call_output","call_id":"summarized-call","output":"retained verbatim"},
+                        {"type":"compaction","encrypted_content":"encrypted"}
+                    ],
+                    "ambient_hash": null,
+                    "protected_prefix": 3
+                }),
+            ),
         ] {
             let before = snapshot.clone();
             validate_snapshot(transport, &snapshot).unwrap();
@@ -322,6 +354,21 @@ mod tests {
             ("openai-responses", json!({"input":null})),
             ("openai-responses", json!({"input":[],"ambient_hash":"42"})),
             ("openai-responses", json!({"input":[],"ambient_hash":-1})),
+            // A protected prefix that outruns the recorded history is a torn
+            // checkpoint: reject rather than silently protecting nothing.
+            ("openai-responses", json!({"input":[],"protected_prefix":1})),
+            (
+                "openai-responses",
+                json!({"input":[{"type":"message","role":"user","content":"x"}],"protected_prefix":2}),
+            ),
+            (
+                "openai-responses",
+                json!({"input":[],"protected_prefix":"1"}),
+            ),
+            (
+                "openai-responses",
+                json!({"input":[],"protected_prefix":-1}),
+            ),
             ("anthropic", json!([null])),
             ("openai-chat", json!(["message"])),
             ("anthropic", json!([{"role":"assistant"}])),
