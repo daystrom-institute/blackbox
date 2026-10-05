@@ -789,6 +789,25 @@ mod acceptance {
         assert_eq!(flag(&argv(&child), "--edit-discipline"), None);
         assert_eq!(plane.finish(&task).await["status"], "completed");
 
+        // A runtime-allocated lane rebuilds the dispatch options; the
+        // discipline is folded back on afterwards and still reaches the child.
+        let (task, _, child) = plane
+            .exec(json!({
+                "prompt": "allocated turn",
+                "pin_provider": "glm",
+                "cwd": cwd,
+                "edit_discipline": "structured",
+            }))
+            .await;
+        await_file(&child.join("stdin"), "allocated turn").await;
+        let allocated = argv(&child);
+        assert_eq!(
+            flag(&allocated, "--edit-discipline"),
+            Some("structured"),
+            "{allocated:?}"
+        );
+        assert_eq!(plane.finish(&task).await["status"], "completed");
+
         // Structured with a code mode that has no code surface spawns nothing.
         let before = (plane.task_count(), child_dirs(&plane.root).len());
         let refused = plane

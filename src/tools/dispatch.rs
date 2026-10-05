@@ -2966,7 +2966,7 @@ mod tests {
             runtime: None,
             context: None,
             code_mode: Some(orchestration::brofile::CodeMode::Only),
-            edit_discipline: None,
+            edit_discipline: Some(orchestration::brofile::EditDiscipline::Structured),
             service_tier: Some("priority".to_string()),
         };
         orchestration::brofile::save_brofile(&brofile, "global", &server.state.store_dir, None)
@@ -2986,6 +2986,18 @@ mod tests {
             .unwrap();
         let fresh = fresh.unwrap();
         assert!(fresh.code_mode.is_some() && fresh.service_tier.is_some());
+        assert_eq!(
+            fresh.edit_discipline,
+            Some(orchestration::brofile::EditDiscipline::Structured)
+        );
+        let fresh_args =
+            Provider::Glm.build_exec_args("fresh", None, "moded-session", None, Some(&fresh));
+        assert!(
+            fresh_args
+                .windows(2)
+                .any(|pair| pair[0] == "--edit-discipline" && pair[1] == "structured"),
+            "{fresh_args:?}"
+        );
 
         // A resume restores the brofile's model and policy, and passes neither
         // code mode nor service tier, so the harness keeps what it saved.
@@ -2995,12 +3007,17 @@ mod tests {
         let opts = opts.unwrap();
         assert_eq!(opts.model.as_deref(), Some("brofile-model"));
         assert_eq!(opts.code_mode, None);
+        assert_eq!(opts.edit_discipline, None);
         assert_eq!(opts.service_tier, None);
         assert!(filters.is_some());
         assert_eq!(brofile.unwrap().unrestored, None);
         let args = Provider::Glm.build_resume_args("moded-session", "continue", None, Some(&opts));
         assert!(!args.iter().any(|arg| arg == "--code-mode"), "{args:?}");
         assert!(!args.iter().any(|arg| arg == "--service-tier"), "{args:?}");
+        assert!(
+            !args.iter().any(|arg| arg == "--edit-discipline"),
+            "{args:?}"
+        );
     }
 
     fn seed_named_session(server: &BlackboxServer, task_id: &str, session: &str, bro: &str) {
