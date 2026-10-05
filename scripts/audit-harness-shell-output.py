@@ -58,7 +58,7 @@ for label, command, expected, extra in [
     ('split-utf8', "printf '\\342'; printf ready >&2; read -r input; printf '\\202\\254'", '€', {}),
     ('split-filter-line', "printf ER; printf ready >&2; read -r input; printf 'ROR final\\n'", 'ERROR final\n', {'output_filter': {'stdout': '^ERROR final\\n$'}}),
 ]:
-    initial = {'command': command, 'yield_time_ms': 200, **extra}
+    initial = {'command': command, 'yield_time_ms': 200, 'stdin': '', **extra}
     isolate_case(label, '''
 let r=await tools.shell_run(INITIAL);
 let so=r.stdout, se=r.stderr, polls=0;
