@@ -238,6 +238,8 @@ fn deliver_and_execute(
 }
 
 /// Run one bbox_render call while a simulated owner applies its operation.
+/// The caller announces the owner first: the render refuses an owner that
+/// never polled, and the applier thread's first poll races the render.
 async fn render_with_owner(
     server: &BlackboxServer,
     owner: &OwnerFixture,
@@ -285,6 +287,7 @@ fn leases(server: &BlackboxServer) -> u64 {
 async fn unbound_callers_render_covered_and_uncovered_remote_projects_through_the_owner() {
     let owner = OwnerFixture::new();
     let server = owner.server();
+    announce(&server, owner.roots.keys().cloned().collect());
     let (uncovered, covered) = scopes();
     for (project, scope, marker) in [
         (UNCOVERED, &uncovered, "UNCOVERED_OWNER_MARKER"),
@@ -446,6 +449,7 @@ async fn receipt_hashes_are_the_owner_written_bytes() {
     let owner = OwnerFixture::new();
     let (scope, _) = scopes();
     let server = owner.server();
+    announce(&server, owner.roots.keys().cloned().collect());
     let response = render_with_owner(&server, &owner, project_params(UNCOVERED)).await;
     let receipt: ProjectRenderReceiptV1 =
         serde_json::from_value(response["receipt"].clone()).unwrap();
@@ -806,6 +810,7 @@ async fn recovery_rechecks_present_validity_of_a_validated_receipt() {
         )
     };
 
+    announce(&server, owner.roots.keys().cloned().collect());
     let completed = render_with_owner(&server, &owner, project_params(UNCOVERED)).await;
     assert_eq!(completed["validation"]["status"], "current");
     let uncovered_operation = completed["operation_id"].as_str().unwrap().to_string();
