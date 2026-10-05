@@ -16,31 +16,30 @@ brief: "Split the system on LOCALITY (checkout-coupled vs shared/append-only), n
 
 > **Status: partial; current-HEAD inventory reverified 2026-08-09.** Durable
 > project identity, the single-host knowledge seam, fleetd, and authenticated
-> Git-history transport are implemented. A published repository whose
-> committed history journal is current is transport-owned and takes no
-> daemon-side Git lease; the Git transport cutover is retired, and bridge and
-> `LegacyLocal` adapters remain intentionally scoped. KT-A through KT-F are
-> implemented: authenticated committed and provisional knowledge sources,
-> harness-local mutation, durable remote `own`/`all`, measured overlap, and an
-> offline strict-cutover marker. For an operator-cutover covered Published row,
+> Git-history transport are implemented. A published repository whose committed
+> history journal is current is transport-owned and takes no daemon-side Git
+> lease; the Git transport cutover is retired, and bridge and `LegacyLocal`
+> adapters remain intentionally scoped. KT-A through KT-F are implemented:
+> authenticated committed knowledge sources, harness-local mutation, measured
+> overlap, and an offline strict-cutover marker. Knowledge, gap, and graph
+> reads are published-only. For an operator-cutover covered Published row,
 > blackboxd no longer watches, reads, writes, or falls back to the checkout for
 > project `.bbox/` state. The shared local adapter bodies now have no covered
-> route and remain only for bridge, uncovered, and `LegacyLocal` lanes.
-> Project render and collected code-source locality need no marker. Render
-> writes stay with the checkout owner whenever one covers the project, an
-> active collected generation is always the effective source, and transcript
-> tool edges of a collected project resolve lexically from its attachment path.
-> A daemon declared without checkout authority (`daemon.no_checkout_authority`)
-> refuses every checkout access before the broker observes or resolves a path,
-> so it never walks a project, cuts back to a local source, or takes a render
-> write lease. The current intended project set is now Published,
-> collected, and served by the off-host corpus deployment. Exact all-route
-> embedding coverage, all-project search/publication/storage validation, and
-> restart re-adoption are green on that topology. Bridge, uncovered, and
-> `LegacyLocal` code paths remain compatibility surfaces with their own
-> retirement gate; the move does not silently delete them. Section 3 is the current
-> code-verified inventory and section 6 is the dependency and retirement map.
-> Line cites rot; reverify
+> route and remain only for bridge, uncovered, and `LegacyLocal` lanes. Project
+> render and collected code-source locality need no marker. Render writes stay
+> with the checkout owner whenever one covers the project, an active collected
+> generation is always the effective source, and transcript tool edges of a
+> collected project resolve lexically from its attachment path. A daemon
+> declared without checkout authority (`daemon.no_checkout_authority`) refuses
+> every checkout access before the broker observes or resolves a path, so it
+> never walks a project, cuts back to a local source, or takes a render write
+> lease. The current intended project set is now Published, collected, and
+> served by the off-host corpus deployment. Exact all-route embedding coverage,
+> all-project search/publication/storage validation, and restart re-adoption
+> are green on that topology. Bridge, uncovered, and `LegacyLocal` code paths
+> remain compatibility surfaces with their own retirement gate; the move does
+> not silently delete them. Section 3 is the current code-verified inventory
+> and section 6 is the dependency and retirement map. Line cites rot; reverify
 > symbols and contracts against code before building on this snapshot. This
 > inventory records the deployed topology; compatibility deletion still
 > requires fresh evidence and explicit authorization.
@@ -74,8 +73,7 @@ The knowledge plane is not an exception to the split; it is the load-bearing
 instance of it (section 4). A worktree's `.bbox/` is working-set truth
 exactly like the code beside it. Merge is the integration boundary for
 knowledge, the same gate code goes through. The corpus indexes published
-truth, plus an explicitly-labeled provisional lane for managed-checkout
-entries that have not merged yet.
+truth only; entries that have not merged stay in their worktree.
 
 ## 1. Evidence: the satellite-arc post-mortem
 
@@ -195,26 +193,26 @@ path-free durable identity does not by itself make the operation local.
 
 | Concern | Current HEAD | Locality end-state | Adapter retirement gate |
 |---|---|---|---|
-| Project-scope render | Managed harnesses keep the public `bbox_render` tool but transport a bounded, path-free authorized knowledge snapshot and invoke the shared `bbox-knowledge` renderer inside their own bound checkout. The canonical plan is SHA-256-pinned and paged as bounded byte chunks below the generic MCP response cap; completion returns the plan hash plus receipt, and the daemon recomputes both the current plan and every projection before accepting it. An unbound call for a project a checkout-owner collector covers completes through that collector. Global render stays daemon/operator-host local; bridge, `LegacyLocal`, and projects no owner covers retain the compatibility adapter, which a daemon without checkout authority never takes. | A harness binding links the same `bbox-knowledge` renderer and writes only inside its own checkout. It obtains the pinned published/global inputs and explicit provisional view from the corpus. Global render remains operator-host local. | Complete in code for every project a checkout owner covers, and for every project on a daemon without checkout authority. Bridge and `LegacyLocal` retirement remain separate. |
+| Project-scope render | Managed harnesses keep the public `bbox_render` tool but transport a bounded, path-free authorized knowledge snapshot and invoke the shared `bbox-knowledge` renderer inside their own bound checkout. The canonical plan is SHA-256-pinned and paged as bounded byte chunks below the generic MCP response cap; completion returns the plan hash plus receipt, and the daemon recomputes both the current plan and every projection before accepting it. An unbound call for a project a checkout-owner collector covers completes through that collector. Global render stays daemon/operator-host local; bridge, `LegacyLocal`, and projects no owner covers retain the compatibility adapter, which a daemon without checkout authority never takes. | A harness binding links the same `bbox-knowledge` renderer and writes only inside its own checkout. It obtains the pinned published/global inputs from the corpus and overlays its own uncommitted knowledge locally. Global render remains operator-host local. | Complete in code for every project a checkout owner covers, and for every project on a daemon without checkout authority. Bridge and `LegacyLocal` retirement remain separate. |
 | Project source indexing | Authenticated collection, immutable generations, activation, and recovery are implemented. An active collected generation is the effective source, and a collected project the pass does not walk gets transcript project/tool-edge attribution lexically from its attachment path. A daemon without checkout authority refuses `LocalProjectWalk` before observation, records a structural state instead of cutting back to a local source, and never probes an attachment. | Checkout owners walk, hash, and ship raw capped bytes; the corpus chunks and indexes them. Every intended project uses an active collected source. No daemon source rung opens a checkout. | Complete in code on a daemon without checkout authority. Intended-project coverage and explicit migration or retirement of bridge and `LegacyLocal` projects remain operator work. |
-| Repo-owned `.bbox/` read and mutation path | KT-A through KT-F are implemented. Authenticated committed candidates and leased provisional workspaces feed the existing accepted and overlay models; managed project mutation runs in the harness; remote `own`/`all` survives restart. For an operator-cutover covered Published row, the marker closes daemon watcher refresh plus local read/write/schema-marker acquisition with no fallback. Non-vacuous publisher and watcher probes prove the covered route performs no checkout-broker operation. Shared local bodies remain only for bridge, uncovered, and `LegacyLocal` lanes. | A harness reads and mutates its own branch state directly. Published and deliberately shared provisional inputs reach the corpus through the authenticated checkout-source contract; corpus coordination, validation, promotion, and indexing remain central. | Complete for covered Published rows. Bridge, uncovered, and `LegacyLocal` retirement remains separately authorized. |
+| Repo-owned `.bbox/` read and mutation path | KT-A through KT-F are implemented. Authenticated committed candidates feed the accepted publication model; managed project mutation runs in the harness; reads are published-only. For an operator-cutover covered Published row, the marker closes daemon watcher refresh plus local read/write/schema-marker acquisition with no fallback. Non-vacuous publisher and watcher probes prove the covered route performs no checkout-broker operation. Shared local bodies remain only for bridge, uncovered, and `LegacyLocal` lanes. | A harness reads and mutates its own branch state directly. Published inputs reach the corpus through the authenticated checkout-source contract; corpus coordination, validation, and indexing remain central. | Complete for covered Published rows. Bridge, uncovered, and `LegacyLocal` retirement remains separately authorized. |
 | Git history ingest | Authenticated complete reachable-history capture, resumable intake, certified P3 materialization, producer overlays, health, recovery, GC, and rebuild are implemented. A published repository whose committed activation journal is current is transport-owned: it uses producer state only and takes no `GitHistory` lease. The local refresh adapter serves a repository with no current journal on a daemon with checkout authority, plus the bridge and `LegacyLocal` categories. | The scope-authorized producer owns Git acquisition for transport-owned published repositories; corpus-side generation publication, selectors, indexing, and graph construction stay central. | Complete for published repositories with a current journal. Later retirement must preserve the named surviving categories until their own gates. |
 
 The rebaseline result is therefore:
 
 - **Complete:** durable project/scope/checkout identity, slice 5's fleetd
   extraction, and KT-A through KT-F remote knowledge transport. For an
-  operator-cutover covered Published row, accepted and selected provisional
-  source is remote and restart-durable, and local watcher/read/write fallback
-  is closed.
+  operator-cutover covered Published row, accepted source is remote and
+  restart-durable, and local watcher/read/write fallback is closed.
 - **Complete for transport-owned published repositories:** typed Git-history
   acquisition/publication. The journal-currency rule closes local fallback
   for a repository whose committed journal is current and leaves the local
   adapter to the other published repositories and the bridge and
   `LegacyLocal` categories.
 - **Complete for owner-covered project render:** hash-pinned, bounded-page
-  plan/receipt transport, checkout-owned shared rendering, fixed-target confinement, explicit
-  published/own/all views, and candidate-gate parity are live; a daemon
+  plan/receipt transport, checkout-owned shared rendering, fixed-target
+  confinement, the published plan with a harness-local overlay of uncommitted
+  knowledge, and candidate-gate parity are live; a daemon
   without checkout authority takes no render write lease.
 - **Complete in code for collected project source:** current v2 activation,
   collected transcript/tool-edge attribution, and, on a daemon without
@@ -265,25 +263,20 @@ of scope here.
 - **Published reads are pinned.** The knowledge view is built from the
   accepted publisher at its pinned commit, not from whichever moving base
   checkout happens to be visible.
-- **Provisional reads are checkout-scoped.** Each admitted checkout can
-  contribute a complete overlay with additions, changes, tombstones, and a
-  `built_from` stamp. `session_knowledge_view` exposes
-  `published|own|all`; only an authoritative session checkout grants `own`,
-  and orchestrators do not silently receive `all`.
-- **Promotion is equality, not observation.** A provisional variant retires
-  only when its content equals the pinned published source. Checkout removal
-  tears down its overlay. Gap views follow the same identity and visibility
-  contract.
+- **Reads are published-only.** Knowledge, gap, and graph reads serve the
+  accepted publication. A checkout's uncommitted entries are visible to the
+  harness that owns the checkout (its own files and its local render
+  overlay) and to no corpus read.
 - **The old host-local redirect authority is gone.** `write_redirects` and
   its purge exception are retired. The project layer rebuilds from the
-  pinned publisher plus admitted live checkouts.
+  pinned publisher.
 - **Integration is enforced against candidate bytes.** The knowledge merge
   gate materializes an immutable candidate tree, invokes the shared renderer
   in check mode, and rejects stale projections or semantic contradictions
   before publication.
 - **Covered Published rows have a strict remote rung.** Authenticated
-  candidates supply committed knowledge/gaps, leased workspace generations
-  supply provisional state, and a managed binding establishes remote `own`.
+  candidates supply committed knowledge/gaps, and a managed binding routes a
+  session's project writes and render to its own checkout.
   An applied KT-E marker closes blackboxd watcher refresh and local
   read/write/schema-marker acquisition for that covered row, including after
   restart or later remote drift. Harness read-your-writes remains direct
@@ -308,31 +301,20 @@ to it:
    branch. The writing harness reads its own files; read-your-writes is
    local and free. **Merge is the integration boundary for knowledge**,
    the same gate code goes through.
-3. **A provisional lane replaces the redirect map.** Every admitted checkout
-   contributes a merge-base working-tree overlay, including untracked files
-   and tombstones, under a compound `(published_scope, checkout_id, entry_id)`
-   identity. Each materialized view carries a `built_from` snapshot; an
-   invalid checkout overlay fails as a whole and never reuses a stale prior
-   snapshot. Visibility is explicit: `provisional=published|own|all`.
-   `own` is the default only when the server has an authoritative session
-   checkout; otherwise the default is `published`. Model-supplied arguments
-   and an unproven request cwd cannot establish own-checkout authority, and
-   orchestrators do not receive implicit `all` visibility. Promotion is
-   content equality against the pinned published commit, not mere observation
-   at a moving base checkout. When equality is observed, only that matching
-   provisional variant is dropped and the published document is rebuilt.
-   Checkout removal tears down its overlay. `write_redirects` is retired,
-   and knowledge state rebuilds from the pinned publisher plus admitted live
-   checkouts. The detailed identity, failure, and lifecycle contract lives in
+3. **Pre-merge knowledge is branch-private.** An entry is invisible outside
+   its worktree until merge: the corpus indexes published truth only, and
+   `write_redirects` is retired. The writing harness sees its own entries
+   through its files and through its render, which overlays the checkout's
+   uncommitted `.bbox/knowledge` onto the published render plan locally.
+   Model-supplied arguments and request cwd never select what a read
+   returns. Knowledge state rebuilds from the pinned publisher. The identity
+   contract lives in
    [checkout-identity-and-provisional-knowledge.md](../corpus/knowledge/checkout-identity-and-provisional-knowledge.md).
-4. **The alternative, named:** branch-private pre-merge knowledge (no
-   provisional lane; entries are simply invisible outside their worktree
-   until merge). It is the purest reading of "the corpus indexes published
-   truth" and strictly less machinery, but it regresses today's
-   daemon-wide in-flight visibility. The provisional lane keeps explicit,
-   authorized access to that visibility while making its epistemic status
-   and checkout identity queryable. If the lane proves noisy in practice,
-   demoting to branch-private is a deletion, not a redesign.
+4. **The alternative, named:** a provisional lane in which every checkout
+   contributes a merge-base working-tree overlay to shared `own`/`all`
+   corpus views. It buys daemon-wide in-flight visibility at the cost of a
+   snapshot transport, leased stores, overlay views, and promotion logic,
+   and it is rejected: merge is the integration boundary.
 5. **Semantic merge defense.** One-file-per-entry makes textual conflicts
    rare and semantic conflicts silent; a knowledge consistency check at the
    merge gate (CI or closeout) is required, not hygiene, once many branches carry
@@ -399,8 +381,8 @@ path, content hash) for dedupe, no spool (the checkout itself is the
 durable backlog; a full rescan is always safe). The existing freshness
 fingerprint (HEAD + indexer version + dirty state) becomes the manifest
 generation. Only registered base roots ship; worktrees remain unindexed by
-the corpus (today's behavior, kept deliberately), with the provisional
-knowledge lane of section 4 as the sole worktree-sourced corpus input.
+the corpus (today's behavior, kept deliberately), and no worktree-sourced
+input reaches the corpus.
 
 Completing this slice makes the corpus movable without mounts: after every
 intended source is collected and the separate Git-history source contract
@@ -433,8 +415,8 @@ The executable dependency map from this rebaseline is:
    collection cannot solve.
 2. **Remote knowledge transport: complete through KT-F.** See
    [knowledge-source-transport-impl.md](knowledge-source-transport-impl.md).
-   Committed publication candidates accepted from the configured ref, leased provisional
-   workspaces, harness-native project knowledge/gap mutations, durable
+   Committed publication candidates accepted from the configured ref,
+   harness-native project knowledge/gap mutations, durable
    `WorkspaceId` binding, strict watcher/read/write cutover, and the
    covered-route retirement proof are live. Shared local implementations remain
    only for bridge, uncovered, or `LegacyLocal` lanes.
@@ -467,13 +449,13 @@ The executable dependency map from this rebaseline is:
    render checking is implemented. Git-history strict cutover is complete for
    covered published repositories. Remote knowledge strict cutover is complete
    for operator-cutover covered Published rows. Managed project render is
-   checkout-owned and has its own published/own/all receipt. Bridge and
+   checkout-owned, renders the published plan with a harness-local overlay,
+   and returns its own receipt. Bridge and
    uncovered render compatibility remain under their own gates.
-3. **Knowledge seam — complete for covered Published rows.** The
-   provisional lane, explicit visibility, promotion, lifecycle, gap
-   convergence, authenticated transport, harness-local mutation, and no-local-
-   fallback marker and covered-route retirement proof are live. Bridge,
-   uncovered, and `LegacyLocal` retirement remains separate.
+3. **Knowledge seam: complete for covered Published rows.** Published-only
+   reads, lifecycle, gap convergence, authenticated transport, harness-local
+   mutation, and no-local-fallback marker and covered-route retirement proof
+   are live. Bridge, uncovered, and `LegacyLocal` retirement remains separate.
 4. **Code-corpus collector: deployed for the current intended Published rows.** The
    producer, ingest endpoint, generations, activation, recovery, the
    no-checkout-authority runtime, and the collected tool-edge path are live. Current intended-project coverage is
@@ -623,9 +605,9 @@ The executable dependency map from this rebaseline is:
   precedent strangler migration whose shape slices 2-4 reuse).
 - **Continues** [repo-owned-project-state.md](../corpus/knowledge/repo-owned-project-state.md):
   section 4 here finishes its identity model and extends its
-  committed-vs-local split to worktrees; the provisional lane is the
-  worktree-generalization of its "uncommitted entries are provisional"
-  rule.
+  committed-vs-local split to worktrees; branch-private pre-merge knowledge
+  is the worktree-generalization of its "uncommitted entries are
+  provisional" rule.
 - **Post-mortem source:** the satellite-arc design corpus lives on
   `salvage/satellite-arc-20260718` (`design/daemon-runtime/
   process-topology.md`, `remote-corpus-host.md`, `blackops-service-

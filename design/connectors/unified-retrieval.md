@@ -50,9 +50,9 @@ Concretely, after M9:
 
 - a natural-language query reaches a record vertex, a connector source
   vertex, a knowledge entry, and a file chunk in one ranked list;
-- every graph-bearing result carries graph id, authority plane, generation,
-  and provisional labeling, so a caller can tell a tenant assertion from a
-  connector projection without a second call;
+- every graph-bearing result carries graph id, authority plane, and
+  generation, so a caller can tell a tenant assertion from a connector
+  projection without a second call;
 - a result can be expanded along its evidence bindings into a bounded path
   whose hops are canonical refs the caller hands straight to
   `bbox_inspect_entity`;
@@ -108,7 +108,7 @@ M9 has to pick one for its result shape:
 
 - storage plane: `GraphSource::{Committed, LocalScratch, ConnectorManaged}`;
 - descriptor authority: `GraphAuthority::{Project, Connector}`;
-- read-surface label: `published | provisional | connector`, minted by
+- read-surface label: `published | connector`, minted by
   `source_label()` in `src/project_graph_read.rs` and already carried on
   `GraphSummary.source` from `bbox_project_graph_list`.
 
@@ -165,36 +165,34 @@ per-property annotations for text indexing and embedding participation, and
 embeddings are strictly per-kind opt-in under per-graph policy. No property
 is embedded or text-indexed implicitly."*
 
-### 1.3 The read plane and its three authority planes (M2)
+### 1.3 The read plane and its two authority planes (M2)
 
 `crates/bbox-indexing/src/project_graph_view.rs` is the read seam, and it is
 already plane-aware:
 
 ```text
 ProjectGraphViewCatalog {
-    published:   ProjectId                -> PublishedProjectGraphView
-    provisional: (ProjectId, WorkspaceId) -> ProvisionalProjectGraphOverlay
-    connector:   (ProjectId, GraphId)     -> ConnectorProjectGraphView
+    published: ProjectId           -> PublishedProjectGraphView
+    connector: (ProjectId, GraphId) -> ConnectorProjectGraphView
 }
 ```
 
-with `list_published` / `list_own` / `load_published` / `load_own` /
-`list_connector` / `load_connector` / `visible_connector`, and the collision
-rule already settled: a project-authored graph shadows a connector graph of
-the same id, refused at install time where it can be
-(`error.graph_authority_conflict`) and resolved at read time where it
-cannot.
+with `list_published` / `load_published` / `list_connector` / `load_connector`
+/ `visible_connector`, and the collision rule already settled: a
+project-authored graph shadows a connector graph of the same id, refused at
+install time where it can be (`error.graph_authority_conflict`) and resolved at
+read time where it cannot.
 
-`ProjectGraphViewEntry` carries `ProjectGraphGenerationIdentity
-{ accepted_generation, accepted_commit, source_generation, workspace_id,
-content_hash }`. That is the identity an index lane keys on and a result
-carries; M9 does not mint a second one.
+`ProjectGraphViewEntry` carries `ProjectGraphGenerationIdentity {
+accepted_generation, accepted_commit, source_generation, content_hash }`. That
+is the identity an index lane keys on and a result carries; M9 does not mint a
+second one.
 
 Two operational facts from this seam bind the indexing design directly:
 
 - **There is no lazy rebuild on read.** Whoever commits a generation must
-  install it into the catalog (`refresh_provisional_graph_views` and the
-  publication paths in `src/server/knowledge_source.rs`). Indexing must
+  install it into the catalog (the publication paths in
+  `src/server/knowledge_source.rs`). Indexing must
   therefore hang off the same installation, not off a reader.
 - **Read context is resolved before the catalog lock is taken.**
   `src/project_graph_read.rs` documents that re-deriving it under the lock
@@ -283,13 +281,13 @@ entire rerank stage is a documentation debt this milestone should clear
 (section 8).
 
 The **knowledge lane is the precedent that matters most for M9**, because
-knowledge is the existing entity family whose visibility could not be left
-to the index alone. Its treatment has three parts, and they are worth
+knowledge is the existing entity family whose authorization could not be
+left to the index alone. Its treatment has three parts, and they are worth
 naming because M9 chooses a different combination:
 
 1. the BM25 lane excludes knowledge outright (`exclude_knowledge = true`)
-   and, when it does not, adds `Occur::MustNot` on
-   `knowledge_visibility == "provisional"`;
+   and, when it does not, adds `Occur::MustNot` on any non-published
+   `knowledge_visibility`;
 2. a pre-authorized in-memory lane is injected in its place;
 3. the vector lane, which cannot carry a Tantivy predicate, is filtered
    per hit by `retain_authorized_knowledge_vectors` **before** fusion.
@@ -297,10 +295,10 @@ naming because M9 chooses a different combination:
 Part 3 is the piece M9 reuses verbatim in spirit. Parts 1 and 2 are the
 piece M9 declines, for the reasons in section 4.2.
 
-The schema already carries `knowledge_visibility`, `knowledge_scope_hash`,
-and `knowledge_checkout_id`, which is proof that per-checkout visibility is
-expressible as index terms. Graph vertices are strictly easier: their
-visibility key is already in the ref family.
+The schema already carries `knowledge_visibility` and
+`knowledge_scope_hash`, which is proof that read authorization is expressible
+as index terms. Graph vertices are strictly easier: their authorization key is
+already in the ref family.
 
 ## 2. Invariants this milestone adds
 
@@ -419,14 +417,11 @@ and is not.
 
 ### 3.3 Authority plane defaults
 
-The three read-surface planes get different defaults because they carry
+The two read-surface planes get different defaults because they carry
 different trust:
 
 - **published** (project-authored, accepted): participates by default under
   the rules above. This is the tenant's own reviewed state.
-- **provisional** (project-authored, a checkout's own overlay):
-  participates, but only for the checkout that authored it, under the
-  existing `published | own | all` semantics. See section 4.5.
 - **connector** (connector-managed source projection): participates by
   default for labels and annotated properties, but a connector graph is a
   projection of a third-party system and its policy should be reviewed at
@@ -450,10 +445,9 @@ canonical ref:
 
 ```text
 project_graph_vertex:<project_id>:<graph_id>:<vertex_id>
-provisional_project_graph_vertex:<scope_hash>:<checkout_id>:<graph_id>:<vertex_id>
 ```
 
-Both ref families already exist in
+The ref family already exists in
 `crates/bbox-corpus-core/src/entity_ref.rs`. M9 introduces no ref family and
 no domain-specific variant, which keeps campaign invariant 1 intact.
 `entity_id` is the only join key across Tantivy and the vector store, so a
@@ -477,7 +471,7 @@ graph-specific text fields:
 | properties with `index: word` | `path_tokens` (code tokenizer) | Identity-shaped values; the tokenizer already splits identifiers and paths, which is what an id-like property wants |
 | properties with `index: text` | `content` | Full BM25 over the body, same field as the label |
 | `graph_id` | new `graph_id` (`STRING \| STORED`) | Section 5.1 needs it filterable |
-| read-surface source label | new `graph_source` (`STRING \| STORED`) | `published` / `provisional` / `connector` |
+| read-surface source label | new `graph_source` (`STRING \| STORED`) | `published` / `connector` |
 | `source_connector` | new `graph_source_connector` (`STRING \| STORED`) | Connector plane only |
 | generation identity | new `graph_generation` (`STRING \| STORED`) | Result field and staleness signal |
 | `project_id` | existing `project_id` | Reuses the existing project filter term |
@@ -486,7 +480,7 @@ graph-specific text fields:
 `doc_type` is `project_graph_vertex` for both planes; the plane is carried
 by `graph_source`, not by `doc_type`. That keeps the existing `doc_type`
 parameter meaningful (one value scopes to graphs) and puts the plane where a
-filter can combine it with visibility.
+filter can combine it with project scope.
 
 Plumbing that must move with the fields, all of it already single-sited:
 
@@ -526,11 +520,10 @@ is a real precedent in this exact pipeline, so declining it needs a reason.
 Knowledge took that shape because its authorization lives in an in-memory
 session view that no index predicate could reproduce, and because the
 knowledge store is small enough to rank in memory. Neither holds for
-graphs. A graph vertex's visibility key is already materialized in its ref
-and can be a Tantivy term (`project_id`, `graph_id`, `graph_source`, plus
-the scope and checkout segments of the provisional form), exactly as
-`knowledge_scope_hash` and `knowledge_checkout_id` already are for the
-knowledge documents that DO get indexed. And a connector source graph can
+graphs. A graph vertex's authorization key is already materialized in its ref
+and can be a Tantivy term (`project_id`, `graph_id`, `graph_source`),
+exactly as `knowledge_scope_hash` already is for the knowledge documents
+that DO get indexed. And a connector source graph can
 carry tens of thousands of vertices, which is the wrong size to rank
 outside Tantivy.
 
@@ -562,7 +555,7 @@ inherited rather than reimplemented.
 
 The trigger is activation, not a poll. The same installation that puts a
 generation into `ProjectGraphViewCatalog` (`install_published`,
-`install_provisional`, `install_connector`) enqueues the corresponding index
+`install_connector`) enqueues the corresponding index
 work. Section 1.3 makes this mandatory rather than merely tidy: the catalog
 has no lazy rebuild on read, so an index lane that waited for a reader would
 never be built. A rejected validation produces no churn:
@@ -584,10 +577,6 @@ Incremental work is keyed on `GraphGeneration.fingerprint` plus the
 matches the indexed one is a no-op, which makes an idempotent connector
 refresh (the campaign's exact-replay case, which the M2 source projection
 contract makes idempotent) free rather than a full lane rewrite.
-
-A `ProjectGraphOverlayValue::Tombstone` removes that graph's provisional
-lane; `remove_provisional` removes the whole workspace's provisional lanes.
-Neither touches the published lane.
 
 The index schema gains the next tag in the established series
 (`INDEX_SCHEMA_VERSION` is currently
@@ -629,41 +618,13 @@ partition".
 
 `bbox_reembed(route=...)` and `bbox_embed_status()` need no new shapes.
 
-### 4.5 Provisional lanes
+### 4.5 Graph reads are published-only
 
-Provisional graph vertices index under the
-`provisional_project_graph_vertex` ref family with the
-`(scope_hash, checkout_id)` key the grammar already carries, and with
-`graph_source = "provisional"`. This is what makes the visibility filter a
-filter rather than a scan: `published` requires
-`graph_source = "published"`, `own` admits the caller's own
-`(scope_hash, checkout_id)` in addition, and `all` admits every valid
-provisional variant. `HybridSearchParams.provisional` already carries this
-parameter, parsed by `ProvisionalMode::parse`, whose default flips to `Own`
-when the session has checkout authority.
-
-The overlay semantics carry over unchanged from `list_own`: a provisional
-upsert shadows the published document for that graph id, and a provisional
-tombstone hides it. In index terms that is a filter-time preference, not a
-write: the published document stays indexed (other checkouts still see it)
-and the query-time union prefers the caller's own overlay. Resolving
-shadowing at write time would make one checkout's in-flight edit mutate
-what every other checkout retrieves, which is the exact failure the
-provisional lane exists to prevent.
-
-One existing accommodation must be preserved, and one widening added, so the
-provisional form stays an implementation detail for callers:
-
-- `resolve_published_form_vertex` already accepts the logical
-  `project_graph_vertex:` form and materializes the provisional compound ref
-  when the hit came from an overlay. A search result should present the
-  same courtesy: the logical ref is what a caller pastes into the next tool.
-- Search needs `doc_type = "project_graph_vertex"` to match the overlay
-  form under `own` / `all`, one-directionally, in
-  `scope_lists_to_doc_type`, which today special-cases
-  exactly one pair (`project_file` also keeping `project_file_v2:`). Graph
-  is the second such pair and should be written as one, not as a growing
-  chain of prefix special cases.
+Graph documents index only accepted publication and connector generations.
+A checkout's uncommitted `.bbox/graphs/` edits never reach the index; they
+are validated after commit, when candidate acceptance runs the merge gate's
+graph pass, and they become retrievable once accepted. `doc_type =
+"project_graph_vertex"` therefore names one ref family with no widening.
 
 ## 5. The query path
 
@@ -704,8 +665,7 @@ The filter's inputs in v1:
 | Input | Source | Effect |
 |---|---|---|
 | Project scope | `HybridSearchParams.resolved_project_id`, installed daemon-side by `resolve_hybrid_project_filter` | Graph documents are project-scoped and join the filtered set |
-| Provisional visibility | `HybridSearchParams.provisional` via `ProvisionalMode::parse` | Section 4.5 |
-| Read-surface source | new `graph_source` parameter (section 6.1) | `published` / `provisional` / `connector`, defaulting to all three |
+| Read-surface source | new `graph_source` parameter (section 6.1) | `published` / `connector`, defaulting to both |
 | Named graphs | new `graph_ids` parameter | Scoping within a project |
 | Per-graph retrieval policy | `text_retrieval_enabled`, `retrieval_excluded_types` | Enforced at index time AND re-checked at query time, so a policy change takes effect before the lane is rewritten |
 | Local scratch exclusion | `GraphSource::LocalScratch` | Never indexed; the query-side check is belt and braces |
@@ -714,13 +674,9 @@ Two wrinkles the implementation must handle rather than discover:
 
 **`keep_under_project_filter` needs graph arms.** It currently matches only
 `project_file`, `project_file_v2`, and `thread`. Adding
-`project_graph_vertex` is mechanical (segment 1 is the project id). Adding
-`provisional_project_graph_vertex` is not: that ref carries `scope_hash` and
-`checkout_id`, no project id. Resolving it to a project requires the view
-catalog, which section 1.3 says must be consulted with the read context
-already resolved. The clean answer is to stamp `project_id` into the
-provisional graph document at index time (the installer knows it) and filter
-on the field rather than parsing the ref. See open question Q6.
+`project_graph_vertex` is mechanical (segment 1 is the project id), and the
+graph document also carries a stamped `project_id` field so the filter never
+parses a ref. See open question Q6.
 
 **The `project` parameter changes meaning slightly** and the tool doc must
 say so. Today it keeps `project_file` and project-scoped `thread` entries
@@ -775,9 +731,9 @@ expansion closes that gap without a second round trip.
 
 When requested, each graph-bearing result carries up to `k` bounded evidence
 paths rooted at it, drawn from the accepted binding set for its project
-(`ProjectGraphViewCatalog::evidence_published` and the `own` / `all`
-variants). Each hop is a canonical ref, so the caller hands it directly to
-`bbox_inspect_entity` without restating anything.
+(`ProjectGraphViewCatalog::evidence_published`). Each hop is a canonical ref,
+so the caller hands it directly to `bbox_inspect_entity` without restating
+anything.
 
 Every hop in an expanded path carries its `EvidenceEndpointStatus` and the
 aggregate `evidence.freshness`. A stale chain is still the answer to "what
@@ -835,35 +791,31 @@ New optional parameters:
 
 | Parameter | Meaning |
 |---|---|
-| `graph_source` | `published` \| `provisional` \| `connector`, repeatable; unset means all. Filter, applied before ranking |
+| `graph_source` | `published` \| `connector`, repeatable; unset means both. Filter, applied before ranking |
 | `graph_ids` | Restrict to named graphs within the resolved project |
 | `expand_evidence` | Bounded evidence paths per graph-bearing result; off by default |
 
 Existing parameters that gain graph meaning without changing shape:
-`doc_type` accepts `project_graph_vertex` (and widens to the provisional
-form under `own` / `all`, section 4.5); `project` now filters graph
-documents; `provisional` now governs provisional graph vertices.
+`doc_type` accepts `project_graph_vertex`; `project` now filters graph
+documents.
 
 `HybridResult` gains, all `skip_serializing_if` absent so non-graph results
 are unchanged on the wire:
 
 ```text
 graph_id                Option<String>
-graph_source            Option<"published" | "provisional" | "connector">
+graph_source            Option<"published" | "connector">
 graph_source_connector  Option<String>   // connector plane only
 graph_vertex_type       Option<String>   // the schema type name
 graph_generation        Option<String>   // ProjectGraphGenerationIdentity content_hash
-graph_logical_ref       Option<String>   // the project_graph_vertex form, for provisional hits
 evidence_paths          Vec<...>         // only when expand_evidence
 source_bindings         Vec<...>         // project_file hits, section 5.4
 ```
 
 `graph_source` reuses the vocabulary `source_label()` already mints and
-`GraphSummary.source` already returns, rather than introducing a fourth
-naming of the same three planes. `graph_logical_ref` is what makes a
-provisional hit pasteable: the compound ref is a correct identity and a
-poor handle, and `resolve_published_form_vertex` already accepts the logical
-form.
+`GraphSummary.source` already returns, rather than introducing another
+naming of the same planes. A graph hit's `entity_id` is the
+`project_graph_vertex:` ref a caller pastes into the next tool.
 
 ### 6.2 `bbox_inspect_entity`
 
@@ -893,13 +845,6 @@ surface that answers "why is my graph not showing up in search" without
 reading a schema artifact, and it is the review point section 3.3 assumes
 for connector graphs.
 
-One consistency note while these surfaces are being touched: the
-`bbox_project_graph_*` family names its visibility parameter `visibility`
-while `bbox_inspect_entity` and `bbox_hybrid_search` name the identical
-policy `provisional`. Same values, same parser. M9 should
-not add a third spelling, and aligning the existing two is a cheap
-correction to make while the family is in hand.
-
 ## 7. Phasing
 
 ### 7.1 M9a: word-index participation and the authority filter
@@ -913,14 +858,11 @@ The shippable slice. Scope:
   fingerprint, through a new `IndexWriteOp`;
 - authority filtering composed before ranking in the word lane;
 - graph-selection gating and the fan-out cap before traversal expansion;
-- result identity fields and `graph_logical_ref`;
+- result identity fields;
 - `bbox_project_graph_describe` participation reporting;
-- the `project_id` field on every graph vertex document (Q6 ruling), so the
-  provisional lane in M9c is a filter change and not a schema bump;
-- the `provisional` spelling with `visibility` as a deprecated alias on the
-  `bbox_project_graph_*` family (Q10 ruling).
+- the `project_id` field on every graph vertex document (Q6 ruling).
 
-Explicitly out: vectors, the provisional and connector planes, evidence
+Explicitly out: vectors, the connector plane, evidence
 expansion, placed-chunk back-pointers.
 
 **Exit gate.** A query that names no ref finds a project-authored record
@@ -951,25 +893,6 @@ project-authored graph of the same id shadows it in search exactly as it
 does in `bbox_project_graph_list`. A reprojection that drops a vertex drops
 its document. `retrieval_excluded_types` on a vendor-shipped schema removes
 a type from search without editing the artifact.
-
-### 7.3 M9c: provisional lanes
-
-Scope: provisional graph vertex documents, the
-`published | own | all` union at query time, overlay shadowing resolved at
-filter time, tombstone handling, the `scope_lists_to_doc_type` widening, and
-the `project_id` stamp that makes `keep_under_project_filter` work for the
-provisional form.
-
-Separated because provisional visibility is the part most likely to leak one
-checkout's in-flight state into another's results, and it deserves its own
-gate rather than riding along.
-
-**Exit gate.** Two checkouts of one project author conflicting provisional
-vertices; each retrieves its own under `own` and neither under `published`;
-`all` returns both, labeled by asserting checkout. A provisional tombstone
-hides the published vertex for the authoring checkout and for no one else.
-Removing the workspace removes its provisional documents. A provisional hit
-carries a pasteable `graph_logical_ref`.
 
 ### 7.4 M9d: evidence expansion and placed-chunk back-pointers
 
@@ -1090,14 +1013,12 @@ so the absence of a decision does not block the slice that needs it.
 **Operator ruling, 2026-08-16.** Q6 was flagged as wanting an early call
 because it shapes the graph vertex document schema before M9a lays it
 down; the operator ruled for the recommendation (stamp `project_id` at
-index time). Q1, Q3, Q4, Q8, and Q10 were put to the operator in the same
+index time). Q1, Q3, Q4, and Q8 were put to the operator in the same
 pass and each was ratified as its standing recommendation. Q2, Q5, Q7, and
 Q9 remain design-internal (their recommendations are the design; no
 operator input was sought). Each ruled item carries a *Decided* line below.
 Consequence for phasing: M9a writes the `project_id` field on every graph
-vertex document, published and provisional alike, even though nothing
-filters on it until M9c, so the provisional lane does not need a schema
-bump.
+vertex document.
 
 **Q1. Do graph vertices need reserved slots in the top-k?**
 A query whose answer is one record vertex can be swamped by file chunks that
@@ -1139,20 +1060,16 @@ while ranking a pinned index reintroduces the bug in a new place, and doing
 it under the lock reintroduces the re-entrancy deadlock
 `src/project_graph_read.rs` already documents.
 
-**Q6. How does the project filter reach a provisional graph vertex?**
-The `provisional_project_graph_vertex` ref carries `scope_hash` and
-`checkout_id`, not `project_id`, so `keep_under_project_filter` cannot parse
-its way to a project. *Recommendation: stamp `project_id` into the
-provisional graph document at index time and filter on the field.* The
-installer knows the project id; deriving it at query time would mean a
-catalog lookup inside the filter, which is both a lock-ordering hazard and a
-per-hit cost. This is the same shape as the existing
-`knowledge_scope_hash` / `knowledge_checkout_id` fields.
-*Decided 2026-08-16: stamp `project_id` into the graph vertex document at index time (published and provisional forms) and filter on the field; M9a lays the field down.*
+**Q6. How does the project filter reach a graph vertex?**
+*Recommendation: stamp `project_id` into the graph document at index time and
+filter on the field.* The installer knows the project id; deriving it at
+query time would mean a catalog lookup inside the filter, which is both a
+lock-ordering hazard and a per-hit cost.
+*Decided: stamp `project_id` into the graph vertex document at index time and filter on the field; M9a lays the field down.*
 
 **Q7. Where does authorization input come from before M10?**
-*Recommendation: v1 authorization is project scope plus provisional
-visibility plus per-graph policy, and nothing else.* The design names the
+*Recommendation: v1 authorization is project scope plus per-graph policy,
+and nothing else; reads are published-only.* The design names the
 M10 seam (a term added to the filter conjunct) rather than inventing a
 placeholder tenant claim, because a placeholder that is never exercised is
 indistinguishable from a bypass when it is finally replaced.
@@ -1170,15 +1087,6 @@ ranking and result shaping?**
 call.* Across calls, a result's `graph_generation` is what tells a caller an
 earlier hit is now stale, which is why it is a result field rather than a
 diagnostic.
-
-**Q10. Does the `visibility` / `provisional` parameter split get fixed
-here?**
-Section 6.4. *Recommendation: align on `provisional` and accept `visibility`
-as a deprecated alias on the `bbox_project_graph_*` family.* It is a small
-correction, it is cheapest while that family is being touched for
-participation reporting, and a third spelling arriving with M9 would make it
-permanent.
-*Decided 2026-08-16: align on `provisional`; `visibility` stays as a deprecated alias on the `bbox_project_graph_*` family, done in M9a.*
 
 ## 10. Relationship
 

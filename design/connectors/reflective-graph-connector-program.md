@@ -29,7 +29,7 @@ status refreshed 2026-08-16. Landed on `beta/blackbox-v2`:
 - **M1 (2026-08-12)**: the reflective graph kernel,
   `crates/bbox-project-graph` - descriptors, schema-as-data validation,
   atomic generations, the `project_graph_vertex` ref family,
-  `bbox_project_graph_list/describe/validate`, provisional visibility -
+  `bbox_project_graph_list/describe/validate`, published-only reads -
   proven live by `examples/graph-live-exercise.sh` and a real external
   authoring exercise (findings on thread-a2062843).
 - **M3 (2026-08-13)**: cross-entity evidence bindings in
@@ -200,9 +200,8 @@ replacement or source reprojection.
 
 Record graphs are checkout-plane state: committed files under the project's
 `.bbox/` tree, reaching the corpus through the same transport lane as other
-repo-owned knowledge, with the `published | own | all` provisional-visibility
-semantics the knowledge lane already carries
-(`design/corpus/knowledge/checkout-identity-and-provisional-knowledge.md`).
+repo-owned knowledge, and reads serve the accepted publication only, as
+knowledge reads do.
 Graph facts must not become a weaker back door around publication authority.
 
 ### 3.3 Evidence bindings
@@ -468,8 +467,7 @@ entity-ref grammar, entity-provider integration, and
 `bbox_project_graph_list/describe/validate` tools. The port re-cut the
 wiring against the current crate tree (the entity-ref and provider
 surfaces moved during the locality decomposition) and placed graph-fact
-reads behind the same published-vs-provisional visibility the knowledge
-lane uses.
+reads behind the same published-only rule the knowledge lane uses.
 
 Exit gate: two unrelated schemas can be loaded, validated, inspected, and
 traversed with no new Rust domain variants.
@@ -541,7 +539,7 @@ Accepted implementation contract (landed in
 - tenant-owned bindings live in `.bbox/evidence/bindings.json`, outside both
   project-authored graph facts and connector-managed source snapshots; as
   committed checkout-plane state they reach the corpus through the repo-owned
-  state lane with `built_from` stamps and provisional visibility;
+  state lane with `built_from` stamps and published-only reads;
 - bindings use canonical `EntityRef` endpoints and generic edge kinds, with no
   connector-specific entity variants;
 - each binding records assertion authority, asserted time, observation or

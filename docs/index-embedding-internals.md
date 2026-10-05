@@ -90,7 +90,7 @@ Schema history:
 | `agentic-corpus-g6-symbol-kind-and-ranges` | Symbol kind and range fields for code nav |
 | `agentic-corpus-g7-transcript-tool-calls` | Transcript tool-call documents |
 | `agentic-corpus-g8-base-project-id` | Transcript and tool-call docs stamped with resolved base project |
-| `agentic-corpus-g9-knowledge-visibility` | Session provisional visibility enforcement |
+| `agentic-corpus-g9-knowledge-visibility` | Knowledge visibility field; every written document is `published` and search excludes any other value |
 | `agentic-corpus-g10-code-source-selectors` | Active code-source selectors for collected code |
 | `agentic-corpus-g11-path-free-project-files` | Path-free project-file keys behind the guarded replacement (P3-E) |
 | `agentic-corpus-g12-conversation-projection` | Conversation-lane fields: source, author, channel, permalink |

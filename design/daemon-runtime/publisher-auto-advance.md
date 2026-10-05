@@ -139,9 +139,9 @@ generation does not verify, and latching that fallback into the graph read
 surface is indistinguishable, to a reader, from an acceptance that never
 happened.
 
-The acceptance is not the only writer of that view. Overlay recomputation,
-provisional capture, and the boot pass install published views too, each
-from accepted content it resolved, and each spends real time between
+The acceptance is not the only writer of that view. The publisher tools and
+the boot pass install published views too, each from accepted content it
+resolved, and each spends real time between
 resolving and installing. So the ordering rule lives at the install site: a
 view whose accepted generation is not the one the pointer currently names may
 not replace a view that is already serving, whichever caller built it. The
@@ -153,11 +153,7 @@ forever: the next install for the pointer's own generation is admitted.
 
 Accepted-publication index convergence (after a swap and in the boot pass)
 rebuilds the project's knowledge scope from the `published` view: accepted
-content only. It never reads peer provisional snapshots, whose leases expire
-on their own schedule; a convergence that read them would record a degraded
-peer read for every expired lease on every swap and would index transient
-peer state. Provisional content stays visible through the `own` and `all`
-views that request it.
+content only, which is the only view any read serves.
 
 ## 6. Accepted generation retention
 

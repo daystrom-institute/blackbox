@@ -41,15 +41,13 @@
 
 ## Graph vertex documents (M9, design/connectors/unified-retrieval.md)
 
-- Every graph vertex document, published AND provisional, carries a stamped
-  `project_id` field, and the project filter for graph vertices resolves on
-  that field. Never resolve a provisional vertex's project by parsing its
-  ref (it carries `scope_hash` + `checkout_id`, no project id) and never by
-  a view-catalog lookup inside the query filter: that is a per-hit cost and
-  the lock-ordering hazard `src/project_graph_read.rs` documents. Same shape
-  as `knowledge_scope_hash` / `knowledge_checkout_id`. M9a lays the field
-  down before anything filters on it so M9c is a filter change, not a
-  schema bump (operator ruling 2026-08-16, Q6).
+- Every graph vertex document carries a stamped `project_id` field, and the
+  project filter for graph vertices resolves on that field. Never resolve a
+  vertex's project by a view-catalog lookup inside the query filter: that is
+  a per-hit cost and the lock-ordering hazard `src/project_graph_read.rs`
+  documents.
+- Only the published plane is indexed. A document or vector under a retired
+  `provisional_` ref or visibility is stale state and is never served.
 - Graph vertices ride the existing BM25 and vector lanes; they add no RRF
   list. A dedicated graph lane is a metrics sweep, not a feature.
 - The graph identity fields (`graph_vertex_type`, `graph_id`, `graph_source`,

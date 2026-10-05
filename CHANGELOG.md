@@ -8,6 +8,35 @@ out explicitly under `Changed` or `Removed`.
 
 ## Unreleased
 
+- Breaking: knowledge, gap, project-graph, hybrid-search, inspect, and render
+  reads are published-only. The `own` and `all` provisional views are
+  removed: `bbox_knowledge`, `bbox_render`, `bbox_gaps`,
+  `bbox_hybrid_search`, `bbox_inspect_entity`, and the
+  `bbox_project_graph_*` tools no longer take `provisional`; the gap and
+  graph tools no longer take `checkout_id` or the `visibility` alias; graph
+  `source` and hybrid `graph_source` accept only `published` and
+  `connector`; and `provisional_knowledge:` and
+  `provisional_project_graph_vertex:` refs no longer parse. Passing a removed
+  parameter fails with an `unknown field` error.
+- Removed: the provisional knowledge-source transport
+  (`/internal/knowledge-source/v1/provisional/*`), the daemon overlay views
+  and their doctor and publisher-status rows, `bro workspace-binding mint`
+  and `capture`, `POST /admin/workspace-binding/mint`, operator-persisted
+  bindings, and `BRO_KNOWLEDGE_SOURCE_URL`. The workspace binding minted at
+  managed harness spawn remains and authorizes only render locality and
+  project write routing; a harness from before this change cannot start a
+  bound session against a daemon from after it, so reinstall the harness in
+  the same deploy.
+- A bound harness render overlays its checkout's uncommitted
+  `.bbox/knowledge` onto the published render plan locally. The receipt
+  carries `local_overlay_sha256`, and the daemon validates such a receipt by
+  shape. Uncommitted knowledge never reaches the daemon.
+- On startup the daemon removes retained provisional state
+  (`knowledge-sources/provisional/`, `journals/provisional-*.json`, and
+  `operator-workspace-bindings.json`) without reading it; failures are
+  logged and never block startup. Blobs only that state referenced are
+  reclaimed by store maintenance after the grace period.
+
 - Brodex accepts `gpt-6.1-sol`, `gpt-6-sol`, and `gpt-6-luna`, with each
   model's supported reasoning efforts and a context-window fallback when the
   backend catalog is unavailable.

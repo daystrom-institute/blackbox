@@ -26,19 +26,20 @@ The graph holds STATE; the design docs hold STORY.
 
 ## The authoring loop
 
-1. Once per checkout: `bro workspace-binding mint --daemon-url
-   https://blackbox.daystrom.app` (the estate daemon is remote; the localhost
-   default is wrong here). Capture after edits with
-   `bro workspace-binding capture` to push the working state.
-2. Mutate through the verb script (`create` / `update` / `edge` / `edge-rm` /
+1. Mutate through the verb script (`create` / `update` / `edge` / `edge-rm` /
    `supersede`, or a batch via `apply <plan.jsonl>`); the staged `check` is
    the gate. Every mutation is staged, checked, and lands as one generation
    bump (one per `apply` batch).
-3. Run `check` (structural mirror of the daemon validator; the daemon's
-   `bbox_project_graph_validate` stays authoritative) and `lint` (instance
-   invariants: graph lifecycle must equal doc frontmatter lifecycle; GapRef
-   gap ids well-formed and resolving to a record; Campaign slug agrees with
-   id; a concluded Inquiry carries an outcome).
+2. Run `check` (a structural mirror of the daemon validator's load-bearing
+   rules) and `lint` (instance invariants: graph lifecycle must equal doc
+   frontmatter lifecycle; GapRef gap ids well-formed and resolving to a
+   record; Campaign slug agrees with id; a concluded Inquiry carries an
+   outcome).
+3. Daemon reads are published-only, so an uncommitted edit is invisible to
+   every MCP read, and the authoritative validator runs only after commit:
+   the merge gate's graph pass checks the candidate tree before refs move,
+   and the accepted view build validates the published generation, which
+   `bbox_project_graph_validate` reports.
 4. Commit to publish. Provenance is git: every mutation lands as a commit
    that names what moved; the committed generation is what other checkouts
    and dispatched agents read.

@@ -126,10 +126,9 @@ A project graph belongs to one catalog project. In the durable project
 catalog, a project is a `ProjectScope` with zero or more checkout
 attachments; the graph's files live in the project's committed `.bbox/` tree
 on the checkout plane, and reach the corpus through the repo-owned state
-lane like other committed project knowledge. Graph-fact reads need the same
-published-versus-provisional visibility answer the knowledge lane carries
-(`published | own | all`), so provisional checkout graphs never masquerade
-as accepted publication.
+lane like other committed project knowledge. Graph-fact reads are
+published-only, as knowledge reads are, so an uncommitted checkout graph never
+masquerades as accepted publication.
 
 Project-owned schema and facts should be reviewable, diffable, and deletable by
 the project.
@@ -535,10 +534,9 @@ out the project id and graph id first; the remainder is the raw vertex id.
 The `project-id` segment is the durable catalog project identity, not a hash
 of a host-local checkout path. A path-derived id does not travel between the
 checkout that authored the graph and the corpus host that serves it; the
-catalog id does. Provisional (checkout-authored, not yet published) graph
-state uses the distinct provisional ref family defined in
-[Reflective graph state transport and visibility](reflective-graph-state-transport.md),
-so a provisional vertex can never be mistaken for a published one.
+catalog id does. Checkout-authored graph state that is not yet published has
+no ref: it is invisible to corpus reads until accepted
+([Reflective graph state transport](reflective-graph-state-transport.md)).
 
 Example:
 

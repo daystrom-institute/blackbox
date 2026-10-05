@@ -277,9 +277,9 @@ surfaced by status (see source-of-truth below).
 The spooler watches files, but "verified project truth" must be tied to committed
 state, not whatever is in the working tree:
 
-- **Indexing/derivation source = the working tree** (so an agent sees its own
-  just-written entries immediately). Uncommitted/unmerged `.bbox/` entries are
-  indexed as **provisional**, never as verified project truth.
+- **Indexing source = the accepted publication.** Uncommitted/unmerged
+  `.bbox/` entries are never indexed; the writing agent sees its own
+  just-written entries through its files and its authoring render.
 - **Two render modes** resolve the apparent circularity (how do you land an entry
   change *and* its matching generated markdown in one commit without an
   amend loop?):

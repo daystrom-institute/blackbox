@@ -10,6 +10,12 @@ tags: [decomposition, project-identity, accepted-publication, knowledge, gaps, c
 brief: "Make verified accepted publication the path-free catalog authority for knowledge and gaps, add safe publisher establishment and advance, rebuild provisional overlays from checkout-local ancestry, and convert every remaining checkout-side adapter to capability-specific leases with bounded health."
 ---
 # Durable project catalog Phase 5 implementation plan
+
+> **Status: complete.** The catalog overlay path (P5-D), the overlay keys,
+> stamps, and domain codes it names, and every `own`/`all` outcome below no
+> longer exist: knowledge and gap reads serve the accepted publication only,
+> and `BuiltFromStamp` has the single `Published` variant. The accepted
+> publication, publisher, and capability-lease parts stand as written.
 Date: 2026-07-25
 Governing design: [`durable-project-catalog-impl.md`](durable-project-catalog-impl.md) sections 5 through 7, 9, 13 through 17.
 Phase lineage: [`durable-project-catalog-phase1-impl.md`](durable-project-catalog-phase1-impl.md), [`durable-project-catalog-phase2-impl.md`](durable-project-catalog-phase2-impl.md), [`durable-project-catalog-phase3-impl.md`](durable-project-catalog-phase3-impl.md), and [`durable-project-catalog-phase4-impl.md`](durable-project-catalog-phase4-impl.md).

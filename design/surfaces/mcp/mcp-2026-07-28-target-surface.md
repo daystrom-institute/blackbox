@@ -194,17 +194,15 @@ Scope channels, ranked by client reach:
 - The OnceLock session-pinning footgun class is deleted: no pinned pair to
   forget to pass (gap-310c36b6), no half-initialized session answering tool
   lists.
-- Checkout authority (`resolve_project_write` + dark overlay refresh) must
-  be **corpus-plane-only** in the target state. Locality-first
-  decomposition removes the daemon's reach into checkouts (checkout-local
-  render, collector-produced indexing, the
-  published-plus-provisional knowledge lane), so write-authority resolution
-  keys off the project registry, identity stores, and the provisional lane,
-  never daemon-local fs/git walks. That makes the required shared cache
-  (keyed by raw selector) trivially remote-safe. Invalidation: generation-
-  keyed with a short TTL backstop; this is a
-  write-authority decision, so staleness has a security flavor. (Open
-  question Q4.)
+- Checkout authority (`resolve_project_write`) must be **corpus-plane-only** in
+  the target state. Locality-first decomposition removes the daemon's reach
+  into checkouts (checkout-local render, collector-produced indexing, the
+  published knowledge lane), so write-authority resolution keys off the project
+  registry and identity stores, never daemon-local fs/git walks. That makes the
+  required shared cache (keyed by raw selector) trivially remote-safe.
+  Invalidation: generation-keyed with a short TTL backstop; this is a
+  write-authority decision, so staleness has a security flavor. (Open question
+  Q4.)
 - Deny semantics change: with no `initialize` to abort, an unknown surface
   fails per-method. Recommended: refuse it at `server/discover` AND
   per-method (defense in depth), so misconfiguration is loud, not a silent

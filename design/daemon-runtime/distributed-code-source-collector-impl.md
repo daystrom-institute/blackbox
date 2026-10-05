@@ -574,7 +574,8 @@ A full rebuild deletes all documents, then reconstructs only:
 
 - the active collected generation for collector-owned projects;
 - the current local snapshot for local-owned projects;
-- existing non-project-file corpus lanes and provisional knowledge documents.
+- existing non-project-file corpus lanes, including published knowledge
+  documents.
 
 There is one fail-safe preservation lane before `delete_all_documents`. For an
 active collected selector whose generation is degraded because a blob is
@@ -585,8 +586,8 @@ document set in the same full-rebuild commit and does not open the bad blob. If
 the inventory cannot be proven complete, the full pass fails before commit and
 the prior index remains active. It never commits a rebuild that silently drops
 a previously active collected scope. The summary and health state report every
-preserved degraded selector. This follows the existing provisional-knowledge
-read-back pattern but is keyed by the exact active source selector.
+preserved degraded selector. The read-back is keyed by the exact active source
+selector.
 
 A failed preservation check sets a persistent unhealthy state for the project
 and the full-rebuild subsystem, including expected and observed document counts

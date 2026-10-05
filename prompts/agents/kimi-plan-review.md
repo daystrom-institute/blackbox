@@ -62,8 +62,8 @@ plan is implementable and complete.
    edge manifests and read views, Git overlays, cutback, doctor/health, GC, and
    server reload. Prove the plan does not require a local `ProjectRecord` or
    fabricate an absolute path anywhere in that lane.
-4. Trace catalog identity and attachment requirements through published and
-   provisional knowledge/gaps, `built_from` responses, publisher authority,
+4. Trace catalog identity and attachment requirements through published
+   knowledge/gaps, `built_from` responses, publisher authority,
    render, file providers, refactor/mutation, artifacts,
    tool/transcript edges, coordination stores, and path-keyed compatibility
    migration. Distinguish durable logical state from execution-path state.

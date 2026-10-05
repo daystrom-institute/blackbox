@@ -11,6 +11,11 @@ brief: "Root cause of the 2026-08-13 incident where /healthz stopped answering a
 
 # Health-probe starvation during code-source ingest
 
+> **Status: partial.** The four handlers of section 3 and the `blocking_http`
+> fix of section 4 no longer exist: the knowledge-source routes are
+> publication-only, and every store call they make runs on the blocking pool.
+> The substrate gaps of section 5 and the detector of section 6 remain open.
+
 Vocabulary is `design/daemon-runtime/concurrency-model.md`: planes (control,
 dispatch, store, index), invariants I1 to I7, anti-patterns P1 to P6.
 

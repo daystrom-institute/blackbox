@@ -21,8 +21,8 @@ Related:
 
 - [Reflective Project Graph](reflective-project-graph.md) - the substrate this
   builds on; schema-as-data, structural validation, hints, visibility planes.
-- [Reflective graph state transport and visibility](reflective-graph-state-transport.md) -
-  published/provisional planes and workspace binding capture.
+- [Reflective graph state transport](reflective-graph-state-transport.md) -
+  the graphs publication lane and published-only reads.
 - [Retrieval Eval Harness](retrieval-eval-harness.md) - the measurement
   instrument the design-graph suite reuses; also the donor-spike provenance
   pointer (`../daystrom-mk2/spikes/Daystrom.Spike.McpPoc/`).
@@ -77,7 +77,7 @@ Four concrete failure mechanics, all observed:
 
 - **The substrate is proven.** The reflective floor landed on this branch and
   is exercised end to end (schema-as-data above the `meta:` floor, structural
-  validation, published/provisional planes, hints with authored and derived
+  validation, published and connector planes, hints with authored and derived
   tiers, declared search participation). This repo has no graph yet; this
   design would be its first.
 - **The operating discipline is proven.** A client repo's campaigns layer

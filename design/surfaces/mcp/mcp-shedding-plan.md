@@ -218,8 +218,8 @@ Categories are `profile`, `convention`, `steering`, `build`, `tool`,
 is a versioned publication schema value, so published rows keep it and the
 reader maps it; nothing rewrites them.
 
-Every reader (central stores, repo entry files, overlays, published sources
-and version-1 accepted rows) applies the same legacy rules: removed fields
+Every reader (central stores, repo entry files, published sources and
+version-1 accepted rows) applies the same legacy rules: removed fields
 are ignored, a stored `rationale` is appended to `content`, a stored
 `decision` category reads as `convention`, and a record whose stored status
 is not active or whose stored expiry has passed is skipped. Writes emit only
@@ -229,6 +229,33 @@ priority, then title.
 `bbox_learn` with `render=false` writes an indexed-only recall entry. The
 persistence guide, `persistence-taxonomy`, `render-lifecycle` and
 `docs/knowledge-store.md` describe the single lane.
+
+### Reads are published-only
+
+Every knowledge, gap, project-graph, hybrid-search, inspect and render read
+serves the accepted publication, and every valid candidate from the
+configured ref is accepted automatically. There are no `own` or `all`
+views: the `provisional` parameter, the `checkout_id` parameter of the gap
+and graph tools, the `visibility` alias and the `provisional_*` ref forms
+are gone, and graph `source` and hybrid `graph_source` take only
+`published` and `connector`. These parameter structs deny unknown fields,
+so a caller passing a removed parameter gets an `unknown field` error.
+
+The provisional snapshot transport, its stores and the daemon-side overlay
+views are deleted, along with their producers (`bro workspace-binding` and
+`POST /admin/workspace-binding/mint`). The daemon removes their retained
+state at startup without reading it.
+
+The workspace binding stays, minted only at managed harness spawn and
+authenticated at MCP initialize, for exactly two purposes: the render
+locality exchange and write routing (a bound session's project knowledge and
+gap writes land in its own checkout, and the daemon refuses them over MCP).
+It never selects what a read returns. Read-your-writes is local to the
+writing harness: its own files, and a render that overlays the checkout's
+uncommitted `.bbox/knowledge` onto the published plan inside the harness.
+Uncommitted project-graph edits have no local validator; they are validated
+after commit, by the merge gate's graph pass over the candidate tree and by
+the accepted view build that `bbox_project_graph_validate` reports.
 
 ## Stage 5: tool-call provenance removal
 
@@ -359,17 +386,10 @@ startup pass removes `edges/observed/`, `edges/explicit/`,
 `edges/derived/project/` and `edges/migrations/` and stamps
 `edges/.versions/legacy-edge-lanes-retired-v1`.
 
-## Open decisions
-
-- **Provisional knowledge views.** Every valid candidate from the configured
-  ref is accepted automatically; the `own` and `all` views that serve unmerged
-  edits stay until it is settled whether workers need remote read-your-writes.
-
 ## Remaining gates
 
 - Each Stage 6 kept item goes when its named condition holds on every live
   deployment.
-- The open decisions above.
 - rmcp migration Phase 0 follows this design. The
   [target-surface doc](mcp-2026-07-28-target-surface.md)'s task candidates
   and resource catalogs are revised against the surviving surface before

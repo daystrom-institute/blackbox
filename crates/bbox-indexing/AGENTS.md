@@ -62,8 +62,8 @@
 - Every graph vertex document carries `project_id` as an exact term (Q6).
   Query-side project scoping filters on that field; it never parses the
   entity ref or consults the catalog inside the filter.
-- Full reindex passes preserve graph lanes like provisional knowledge: there
-  is no durable store the pass walks for them. The schema-migration rebuild
+- Full reindex passes preserve graph lanes: there is no durable store the
+  pass walks for them. The schema-migration rebuild
   starts empty and lanes re-activate at the next accepted view install,
   mirroring the in-memory view catalog's own lifecycle.
 - Lane activation is install-driven, never reindex-driven: a newly published

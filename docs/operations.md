@@ -252,8 +252,8 @@ blackbox project-catalog knowledge-transport-cutover --verify --configured
 
 After the authorized daemon starts, `bbox_doctor(format="summary")` reports
 catalog-scoped `knowledge_transport` findings. A current covered row must use
-remote accepted/provisional sources and has no publisher, watcher, overlay,
-mutation, recovery, or schema-marker fallback to a checkout. Producer removal,
+remote accepted sources and has no publisher, watcher, mutation, recovery,
+or schema-marker fallback to a checkout. Producer removal,
 grant drift, scope migration, accepted-source change, or remote corruption
 degrades/refuses and requires a new reviewed cutover; it never reopens the
 local adapter. Bridge, uncovered, and `LegacyLocal` rows remain outside this

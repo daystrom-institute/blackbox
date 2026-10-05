@@ -50,8 +50,8 @@ a checkout acquire an explicitly selected attachment or return a typed
 
 The implementation also lands two prerequisites before changing identity:
 
-- response-level `built_from` tables for published and provisional knowledge
-  and gap views; and
+- response-level `built_from` tables for published knowledge and gap views;
+  and
 - checkout-access instrumentation enforced through validated leases.
 
 Those prerequisites make mixed-view results and hidden filesystem fallbacks
@@ -131,7 +131,6 @@ This slice does not:
 - transport Git objects or Git history from another host;
 - transport repo-owned knowledge or gaps from a checkout host;
 - expose a model-facing arbitrary JSON, filesystem, or blob endpoint;
-- make provisional `all` visibility cross-host;
 - implement session workspace mount maps that do not exist yet;
 - silently merge two old project ids that claim one durable scope;
 - rewrite existing project, symbol, commit, artifact, or edge refs
@@ -391,7 +390,7 @@ capability is not inferred merely because a directory exists. Acquisition
 revalidates the conservative read or write gate, checkout id, recorded scope,
 catalog match, and operation-specific conditions.
 
-The existing `CheckoutRegistry` remains the recoverable provisional-overlay
+The existing `CheckoutRegistry` remains the recoverable host-local checkout
 discovery census. Its corrupt-file behavior may still degrade to an empty
 index. It may gain `project_id` and `attachment_id` references, but it is not
 the authoritative attachment store and cannot authorize filesystem access.
@@ -445,7 +444,7 @@ on `bbox-indexing`.
 The catalog and attachment store are strict state. Unsupported versions,
 corrupt JSON, invalid ids, duplicate scope or alias, dangling attachment, and
 scope mismatch fail closed at open, before server routes bind. Only the separate
-provisional checkout census is recoverable-by-recompute.
+host-local checkout census is recoverable-by-recompute.
 
 The short catalog mutation lock is the existing canonical
 `projects.json.lock` derived by `with_store_lock(projects_path)`. The bridge
@@ -1046,13 +1045,6 @@ BuiltFromStamp = Published {
     published_scope,
     published_ref,
     publisher_commit,
-} | CheckoutOverlay {
-    published_scope,
-    checkout_id,
-    publisher_commit,
-    checkout_head,
-    merge_base,
-    working_fingerprint,
 }
 ```
 
@@ -1070,9 +1062,9 @@ continue to use their existing clean snapshot and head fields, but expose them
 through the same response wrapper where those surfaces already return
 knowledge or gap rows.
 
-Tests prove that a response merging published, own-checkout, and peer-checkout
-rows has three distinct stamps, stable row references, a working fingerprint
-for dirty bytes, and no accidental reuse after a publisher commit advances.
+Tests prove that a response emits one stamp per distinct published source,
+keeps stable row references, and never reuses a stamp after a publisher commit
+advances.
 
 ## 9. Checkout-access authority and instrumentation
 
@@ -1088,7 +1080,7 @@ Access kinds are closed and code-owned:
 - local project walking;
 - Git history;
 - publisher/config tree read;
-- knowledge or gap overlay read;
+- knowledge or gap working-tree read;
 - blame;
 - render/file provider;
 - provenance note I/O;
@@ -1493,7 +1485,7 @@ be removed.
 
 ## 13. Knowledge, aliases, and publisher authority
 
-### 13.1 Published and provisional reads
+### 13.1 Published reads
 
 Key published knowledge/gap caches by catalog project, `PublishedScope`, full
 publisher ref, and accepted commit. Hydrate logical project metadata with
@@ -1506,9 +1498,8 @@ The durable source of that promise is a strict `AcceptedPublicationStore`
 beside the catalog state, not the current in-memory TTL cache. One immutable
 publication generation contains normalized knowledge entries, normalized gap
 entries, canonical relative-filename manifests for both lanes, scope, full ref,
-accepted commit, per-file/content hashes, counts, and total encoded bytes. The
-manifests preserve the filename presence and equality inputs needed by overlay
-and promotion logic. One atomically replaced
+accepted commit, per-file/content hashes, counts, and total encoded bytes. One
+atomically replaced
 `AcceptedPublicationPointer` contains the complete publisher binding and the
 selected current generation plus the bounded prior pointer used for rollback.
 There is no separately committed binding/manifest pair.
@@ -1532,29 +1523,12 @@ inventories and explicitly removes these generations only after all knowledge
 and gap refs are discharged. Restart with no attachment serves the selected
 accepted generation.
 
-Provisional overlays remain keyed by `(PublishedScope, checkout_id)` and stay
-host-local. `own` uses the authoritative session attachment. `all` means all
-valid overlays on this corpus host, not overlays on remote checkout hosts. The
-new response stamps make that distinction explicit.
-
-After publisher detach, the verified accepted generation remains published
-truth and names accepted commit P plus the canonical published file manifests.
-It does not fabricate Git ancestry, a merge base, or Git objects. Each
-attachment may recompute its overlay only when its own object database contains
-P and can prove and read `B = merge_base(H, P)`. It never silently borrows
-another attachment. A previously valid overlay remains eligible only while the
-accepted pointer still names the same P and its attachment lease, checkout
-HEAD, and working-tree fingerprint all revalidate unchanged. Otherwise it is
-`overlay_baseline_unavailable`.
-
-`published` continues from the accepted generation. An explicit or default
-`own` request for an authoritative checkout whose baseline is unavailable
-returns `provisional_overlay_unavailable`. `all` serves published plus every
-valid peer, omits unavailable peers, and lists them in structured
-`degraded.overlays`. Health reports accepted-publication integrity,
-publisher-advance availability, and per-checkout overlay-baseline availability
-separately. A missing live publisher blocks advance and alternate-object
-assistance, not accepted published reads.
+Every knowledge and gap read serves the accepted generation; there is no
+per-checkout overlay view. After publisher detach, the verified accepted
+generation remains published truth and names accepted commit P plus the
+canonical published file manifests. Health reports accepted-publication
+integrity and publisher-advance availability separately. A missing live
+publisher blocks advance, not accepted published reads.
 
 ### 13.2 Publisher binding
 
@@ -1646,7 +1620,7 @@ or reconstructs a host path from catalog data.
 ### Phase 0: provenance and access prerequisites
 
 1. Add response `built_from` types and response-local table/reference wiring.
-2. Wire published and overlay knowledge/gap assembly to exact stamps.
+2. Wire published knowledge/gap assembly to exact stamps.
 3. Add checkout access kinds, broker, counters, doctor output, and test probes.
 4. Migrate current root reads to leases without changing project identity.
 5. Add the process-lifetime migration lock while retaining version-1 store
@@ -1723,8 +1697,7 @@ reattach, reassign, restart, and explicit retirement converge exactly once.
 
 1. Wire the migration-seeded publisher bindings and accepted generations into
    live views, rebind, and advance.
-2. Key accepted knowledge/gap views by catalog identity and stamps, including
-   per-checkout overlay-baseline degradation after publisher detach.
+2. Key accepted knowledge/gap views by catalog identity and stamps.
 3. Move render, file providers, artifact watchers, refactor/mutation, and
    tool-edge path resolution to leases.
 4. Surface capability-specific health and typed attachment errors.
@@ -1807,9 +1780,7 @@ implemented.
   migration journal, or source selector fails closed for its capability. A
   repo-history reference-manifest mismatch disables GC until deterministic
   rebuild. A missing optional attachment degrades only its capability.
-- Accepted publication never substitutes content for Git ancestry. A missing
-  overlay baseline degrades only that checkout's provisional view while the
-  verified published generation remains readable.
+- Accepted publication never substitutes content for Git ancestry.
 - GC pins active read views, active/retained code generations, the selected Git
   overlay, in-flight rebuild inventories, prepared migration journals,
   committed migration markers, G1 assets, collision-quarantined code
@@ -1939,10 +1910,7 @@ implemented.
 
 ### Response provenance
 
-- Published, own, and peer rows each reference the correct deduplicated
-  response stamp.
-- Dirty overlays carry a working fingerprint and do not claim checkout `HEAD`
-  as complete provenance.
+- Published rows each reference the correct deduplicated response stamp.
 - Publisher advance creates a new stamp; an in-flight response retains the old
   pinned table.
 - Text and structured knowledge/gap paths expose the same stamps.
@@ -2018,11 +1986,8 @@ implemented.
 - Accepted knowledge and gap generations survive restart with no attachment;
   a partial/corrupt candidate cannot advance the manifest or accepted commit,
   and bounded GC preserves pinned/rollback generations.
-- After publisher detach, a peer containing accepted commit P recomputes its
-  overlay from its own Git database. A peer lacking P reports
-  `overlay_baseline_unavailable`: `published` remains available, `own` returns
-  the typed provisional error, and `all` omits only that peer with structured
-  degradation. Restart preserves the same outcomes without inventing ancestry.
+- After publisher detach, published reads keep serving the accepted
+  generation, and restart preserves that without inventing ancestry.
 - Fault injection before/after the accepted-publication pointer swap yields a
   complete old or new binding/content epoch, never mixed provenance.
 - Migration seeds G1 before catalog commit; restart before the first publisher

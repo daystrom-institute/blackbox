@@ -1,37 +1,31 @@
 ---
 title: "Checkout identity and the provisional knowledge lane"
 kind: design
-lifecycle: partial
+lifecycle: archived
 corpus: blackbox-design
 topic:
   - corpus
   - knowledge
   - daemon-runtime
 tags: [identity, worktrees, knowledge-seam, provisional-lane, write-redirects, repo-id, render-check]
-brief: "Retire write_redirects, the host-local map that makes kb.json required to interpret the repo's own committed .bbox/ files. Two moves in one push: (1) a durable published-scope identity key anchored on a strongly-minted repo_id recorded in .bbox/config.toml (the computed first-commit hash is only a bootstrap hint) plus bbox_root_relpath, and (2) a versioned provisional knowledge lane. Each scope has one published layer read from a pinned committed ref; every checkout, including the publisher checkout, contributes at most one provisional overlay computed as a merge-base-relative working-tree diff with tombstones. Overlay keys are (published_scope, checkout_id, entry_id); promotion is content equality at the pinned published commit; own-checkout visibility binds only to server-authoritative session context. Monolithic-rung only. Slices 1 + 3 of locality-first-decomposition.md, hardened through persisted adversarial review and a live-code repair pass (2026-07-21)."
+brief: "Archived: knowledge, gap, and graph reads are published-only, so the provisional overlay lane (section 4) is retired. Section 3 (repo_id and published-scope identity, checkout_id, built_from stamps, schema inventory) still describes live code that cites this file."
 ---
 
 # Checkout identity and the provisional knowledge lane
 
-> **Status: partial.** The additive foundation, prerequisite repair, dark
-> overlay, session-authoritative committed view, promotion, and registry
-> lifecycle, candidate-tree merge gate, gap-store convergence, and monotonic
-> path-fallback cut are landed on `beta/blackbox-v2`.
-> Anchors were re-verified against that branch after the
-> slice-3.2 checkpoint and this design was repaired against the live loader,
-> resolver, index, and entity-ref paths on 2026-07-20. Line cites rot, so grep
-> the named symbols before building. This is the concrete build plan for
-> slices 1 and 3 of
-> [locality-first-decomposition.md](../../daemon-runtime/locality-first-decomposition.md),
-> and the finish of the identity model
-> [repo-owned-project-state.md](repo-owned-project-state.md) specified but did
-> not ship.
-
-The 2026-07-21 repair pass tightened the landed contract around transaction
-authority, independent-clone object access, stable overlay publication,
-strict schema inventory, static-search isolation, reindex preservation, and
-closeout ordering. Those are now acceptance requirements, not optional
-hardening notes.
+> **Status: archived.** Every knowledge, gap, graph, search, inspect, and
+> render read serves the accepted publication only. The provisional overlay
+> lane of section 4 (merge-base working-tree overlays, `published|own|all`
+> visibility, overlay promotion, and the provisional snapshot transport) no
+> longer exists, and a daemon removes its retained state at startup. The
+> identity contract of section 3 is live: `repo_id` and `bbox_root_relpath`
+> key the published scope, `checkout_id` names a checkout, `built_from` stamps
+> responses, and the schema inventory gates migration. The candidate-tree
+> merge gate of section 4.5 is live as the publication acceptance check.
+> Uncommitted `.bbox/knowledge` edits reach a session only through a bound
+> harness's local render overlay
+> ([render-locality-transport-impl.md](../../daemon-runtime/render-locality-transport-impl.md));
+> other readers see them after commit and acceptance.
 
 ## 0. Decision and scope
 

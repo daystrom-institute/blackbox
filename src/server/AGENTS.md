@@ -73,4 +73,10 @@
 - Before bind, a one-time pass removes the retired edge families and stamps
   a store-level marker; later starts cost one stat.
 - Raw `?project=` remains a surface/filter selector only. Managed-workspace
-  authority comes only from the workspace binding header.
+  authority comes only from the workspace binding header, and it covers
+  exactly the render locality exchange and project write routing. Knowledge,
+  gap, and graph reads are published-only and never consult the binding.
+- Startup removes retired provisional knowledge-source state (the
+  `provisional/` store directory, `provisional-*` journals, and the operator
+  bindings file) before the store opens. It is bounded to those members,
+  idempotent, logged on failure, and never read.

@@ -8,7 +8,7 @@ topic:
   - bro-harness
   - knowledge
 tags: [locality, render, knowledge, workspace, transport]
-brief: "Keep bbox_render model-facing while moving project-file writes into the checkout owner: the bound harness for workspace-bound sessions, and the code collector that owns the checkout for every other MCP caller. The corpus supplies a bounded authorized published/own/all snapshot; the owner invokes the shared renderer locally and returns an exact path-free receipt."
+brief: "Keep bbox_render model-facing while moving project-file writes into the checkout owner: the bound harness for workspace-bound sessions, and the code collector that owns the checkout for every other MCP caller. The corpus supplies a bounded published render plan; a bound harness overlays its checkout's uncommitted knowledge onto it locally, the owner invokes the shared renderer, and returns an exact path-free receipt."
 ---
 
 # Project render locality
@@ -30,11 +30,13 @@ the checkout that owns the project, through one of two appliers:
 
 In both lanes:
 
-1. the corpus selects the exact `published`, `own`, or `all` knowledge view and
-   builds a bounded path-free render plan;
+1. the corpus builds a bounded path-free render plan from the published
+   knowledge view;
 2. the applier validates that plan against its own authority (bound published
    scope and workspace, or delivered operation and committed checkout
-   identity), invokes the shared renderer, and may write only fixed provider
+   identity), and a bound harness overlays its checkout's uncommitted
+   knowledge onto a workspace plan (RL-D3); the applier invokes the shared
+   renderer and may write only fixed provider
    filenames and `.bbox/guidance` satellites at its project root;
 3. the applier returns projection hashes, byte counts, local `PROJECT.md`
    presence, and per-output dispositions, never a checkout root or file body;
@@ -83,8 +85,11 @@ global half issues no project operation.
 
 `ProjectRenderPlanV1` binds version, project id, published scope, exactly one
 authority (a workspace id, or a producer id with operation id and sequence),
-provider selection, dry-run flag, normalized request scope, explicit view,
-authorized project entries, and bounded diagnostics. Project entries are
+provider selection, dry-run flag, normalized request scope, view,
+authorized project entries, and bounded diagnostics. The view is the fixed
+wire constant `published`: the plan field stays so every reader of transport
+version 3 decodes the same shape, and a reader refuses a plan naming any
+other view. Project entries are
 rewritten to a constant transport scope; every entry must carry the plan's
 project id. Count, diagnostics, and encoded plan bytes have hard bounds.
 
@@ -113,20 +118,24 @@ Existing hand-authored provider files retain the established refusal
 behavior; generated provider files are replaced. The receipt records each
 disposition.
 
-### RL-D3: view semantics are explicit and pinned
+### RL-D3: plans are published; a bound harness overlays its own checkout
 
-A workspace plan defaults to `own`. A collector-applied plan keeps the
-caller's existing visibility: without checkout context it defaults to
-`published`, `own` still requires authoritative checkout context, and `all`
-keeps its semantics. The collector's working-tree knowledge is never
-substituted for the selected view, and no workspace binding is invented. The selected view is part of the plan and the receipt. Tests
-prove published excludes provisional variants, own replaces the logical row
-with the bound workspace variant, and all carries published plus every valid
-provisional variant under the existing degradation rules.
+Every plan carries the published knowledge view, whoever applies it. A
+collector-applied plan is rendered exactly as issued; the collector's
+working-tree knowledge is never substituted, and no workspace binding is
+invented.
 
-The transport does not reload `.bbox/knowledge` independently and pretend it
-is a published view. Published and provisional authority continues to come
-from the corpus knowledge-source and overlay model.
+A bound harness diffs its checkout's `.bbox/knowledge` working files against
+the checkout HEAD: a changed or new entry file upserts its entry, and a
+deleted or retired entry tombstones its id. It applies that overlay to the
+workspace plan locally (`ProjectRenderPlanV1::with_local_overlay`) before
+invoking the renderer: tombstoned ids leave the plan, upserts replace or add
+rows by id, and every applied row is rebound to the plan's project authority
+so local bytes cannot widen the render. Working reads are nofollow and
+bounded (a symlinked member is skipped), and an invalid working entry
+refuses the render before any write. Uncommitted knowledge
+never travels to the daemon, and a producer plan is never overlaid. With no
+local changes the harness executes the published plan unchanged.
 
 ### RL-D4: completion is exact but path-free
 
@@ -137,6 +146,15 @@ record carries disposition, expected SHA-256, and expected byte count. The
 daemon reconstructs the plan, recomputes projections from the shared
 renderer, and rejects stale plans, provider cardinality drift, mismatched
 bytes, or impossible dispositions before recording completion.
+
+A receipt for an overlaid execution carries `local_overlay_sha256`, the digest
+of the overlay the harness applied. The daemon cannot predict those bytes, so
+it validates such a receipt by shape instead: workspace authority, a
+well-formed digest, one entrypoint per selected provider in order, guidance
+satellites after them under `.bbox/guidance`, unique outputs, dispositions
+coherent with the plan's dry-run intent, and no entrypoint published over a
+failed satellite. A producer receipt naming an overlay is refused. A receipt
+without the digest is validated byte-exactly against the plan.
 
 The user-facing result stays local because it includes the local path. Only
 the receipt crosses back to the daemon.
@@ -272,7 +290,9 @@ The test gates cover:
 - caller transport stripping and absence of checkout roots on the wire;
 - actual writes through the shared renderer under a canonical bound root;
 - fixed-target confinement and provider path-injection refusal;
-- published/own/all plan contents;
+- published-only plan contents for bound and unbound callers;
+- local overlay upserts and tombstones in a bound harness render, and
+  shape validation of the overlaid receipt;
 - exact candidate-tree check parity;
 - zero daemon checkout observations for plan and completion;
 - positive catalog compatibility for a project no owner covers;
@@ -291,7 +311,7 @@ The test gates cover:
 
 - No arbitrary output filename or project root in the transport.
 - No second renderer in the harness or the collector.
-- No collapse of published/own/all into a working-tree-only approximation.
+- No transport of uncommitted knowledge to the daemon.
 - No movement of global render authority into a remote workspace.
 - No implicit retirement of bridge, uncovered, or `LegacyLocal` adapters.
 

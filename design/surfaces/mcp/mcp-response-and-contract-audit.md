@@ -245,7 +245,7 @@ belong to exact-id detail. Preserve enough text to dedupe correctly; a title
 alone is inadequate. Existing exact-id lookup provides the expansion route.
 
 **Knowledge recall:** ref, title/category, useful excerpt, scope/visibility,
-and minimal provenance that distinguishes published from provisional state.
+and minimal published provenance (`built_from`).
 Retain bounded packet/memory signposts with exact expansion handles. Do not
 change ranking or cross-store recall semantics merely to shorten output.
 Separate the primary result limit from sidecar limits and document each.

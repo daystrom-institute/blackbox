@@ -155,10 +155,10 @@ path for current clients. No tasks/resources yet.
    configured surface map, independent of `?project`; each surface's
    visible set is fixed for the daemon's lifetime, so no generation-keyed
    decision cache is needed.
-2. Move checkout authority + dark overlay registration behind a shared cache
+2. Move checkout authority behind a shared cache
    keyed by raw selector (Q4 invalidation: generation + TTL backstop).
-   Resolution must consult corpus-plane state only (project registry,
-   identity stores, provisional lane), never daemon-local fs/git walks:
+   Resolution must consult corpus-plane state only (project registry and
+   identity stores), never daemon-local fs/git walks:
    locality-first decomposition removes the daemon's reach into checkouts,
    so the wire head must not bake in a filesystem the corpus daemon will
    not have. Any residual daemon-local probes needed during the overlap

@@ -101,7 +101,7 @@ The common entity types are:
 | `commit` | Git commit metadata and touched files | "when did this change?" |
 | `task` | A dispatched bro unit | "what produced this artifact?" |
 | `bash_call` | One shell invocation in a transcript | "what did this command emit?" |
-| `project_graph_vertex` | A project-graph vertex (provisional refs cover working generations) | "what does the graph say about X?" |
+| `project_graph_vertex` | A project-graph vertex from an accepted or connector generation | "what does the graph say about X?" |
 
 One Tantivy document is indexed per content block, not per session. A
 long session yields many searchable blocks with independent roles and
@@ -145,9 +145,8 @@ The BM25 chunk list is truncated to the fusion fetch window, but the
 file-level aggregation sums scores over the full (deeper) BM25 fetch, so
 a file whose mentions are spread across many chunks still surfaces; the
 lane contributes nothing when the BM25 fetch spans fewer than two
-distinct files. The knowledge lane is searched separately because
-provisional-visibility policy must be resolved against the caller's
-session before fusion.
+distinct files. The knowledge lane is searched separately, against the
+published knowledge view for the requested project, before fusion.
 
 Vector lanes are per route: hybrid search iterates on-disk vector
 partitions with a nonzero active count and maps each back to a
