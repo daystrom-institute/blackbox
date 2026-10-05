@@ -457,7 +457,9 @@ is a browse projection and carries no recovery duty for the cap.
 Operator-confirmation flows today are "preview or get refused, then call
 again with the apply or force flag" (`bbox_storage_gc` and
 `bbox_edge_compact` apply, `bbox_project_unregister` with `force`,
-`bbox_project_eject` after `dry_run`, the publisher pointer moves). MRTR lets a tool return `InputRequiredResult`
+`bbox_project_eject` after `dry_run`, the publisher pointer moves) and
+operator-acknowledgement arguments an agent may pass through but never
+populate itself (`bbox_reindex` `accept_empty_projects`). MRTR lets a tool return `InputRequiredResult`
 with an elicitation; the client answers and retries the original request
 with `inputResponses`. Elicitation UX already exists client-side in
 2025-11-25 form, so this is a transport upgrade, not a new client capability

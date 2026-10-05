@@ -298,8 +298,9 @@ slice independently of Phase 2, not task notifications.
 ## Phase 5: MRTR approval gates (opportunistic)
 
 - `InputRequiredResult` with elicitation for operator-confirmation flows
-  (the preview/apply maintenance and project administration tools), gated
-  on client elicitation support.
+  (the preview/apply maintenance and project administration tools, and
+  operator-acknowledgement arguments such as `accept_empty_projects`),
+  gated on client elicitation support.
 - If state ever crosses MRTR rounds statelessly, adopt rmcp's
   `request-state` feature (HMAC codec) for integrity.
 - Codex's 2026-09-10 source supplies concrete continuation cases to verify:
