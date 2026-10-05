@@ -1522,6 +1522,9 @@ fn dispatch_body(spec: &DispatchSpec) -> Value {
     if let Some(code_mode) = &spec.code_mode {
         body["code_mode"] = Value::String(code_mode.clone());
     }
+    if let Some(edit_discipline) = &spec.edit_discipline {
+        body["edit_discipline"] = Value::String(edit_discipline.clone());
+    }
     if let Some(service_tier) = &spec.service_tier {
         body["service_tier"] = Value::String(service_tier.clone());
     }
@@ -2237,6 +2240,15 @@ mod tests {
         // must deserialize, not error — mcpServers defaults to empty.
         let cfg: FleetConfig = serde_json::from_str("{}").unwrap();
         assert!(cfg.mcp_servers.is_empty());
+    }
+
+    #[test]
+    fn dispatch_body_carries_edit_discipline_only_when_set() {
+        let mut spec = DispatchSpec::new(Provider::Glm, "hi");
+        // Absent ⇒ no key, so the daemon applies the brofile value or `free`.
+        assert!(dispatch_body(&spec).get("edit_discipline").is_none());
+        spec.edit_discipline = Some("structured".to_string());
+        assert_eq!(dispatch_body(&spec)["edit_discipline"], "structured");
     }
 
     #[test]

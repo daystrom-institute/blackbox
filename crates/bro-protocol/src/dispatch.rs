@@ -50,6 +50,11 @@ pub struct DispatchSpec {
     /// dispatches from the cockpit's `/config` toggle; `None` ⇒ harness default.
     /// Resume does not carry this — the session restores its persisted value.
     pub code_mode: Option<String>,
+    /// Edit discipline for the new session (`free`/`structured`), forwarded to
+    /// the daemon as `ExecParams.edit_discipline`. `None` ⇒ the brofile's
+    /// value, else `free`. Resume does not carry this: the session keeps the
+    /// value it was dispatched with.
+    pub edit_discipline: Option<String>,
     /// Service tier for supported providers. `priority` is the Codex `/fast`
     /// tier; `default` is the standard-routing sentinel. Resume normally
     /// restores the persisted value, but `ResumeSpec.service_tier` can override
@@ -72,6 +77,7 @@ impl DispatchSpec {
             env_overrides: None,
             name: None,
             code_mode: None,
+            edit_discipline: None,
             service_tier: None,
             tool_defaults: None,
         }
