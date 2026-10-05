@@ -2688,7 +2688,8 @@ mod tests {
             ShellRun
                 .call(
                     json!({
-                        "command": "echo keep-start; echo noise-start; sleep 1; echo keep-end; echo noise-end",
+                        "command": "echo keep-start; echo noise-start; read _; echo keep-end; echo noise-end",
+                        "stdin": "",
                         "yield_time_ms": 100,
                         "output_filter": {"stdout": ["keep"]}
                     }),
@@ -2696,15 +2697,29 @@ mod tests {
                 )
                 .await,
         );
+        // The command holds at `read` until this test feeds it a line, so
+        // nothing here depends on how fast the child starts: the first lines
+        // are collected for as long as they take to appear.
         assert_eq!(v["running"], true, "{v}");
-        let first = v["stdout"].as_str().unwrap();
-        assert!(first.contains("keep-start"), "{v}");
-        assert!(!first.contains("noise-start"), "{v}");
-
         let sid = v["session_id"].as_str().unwrap().to_string();
+        let mut first = v["stdout"].as_str().unwrap().to_string();
+        while !first.contains("keep-start") {
+            let p = as_json(
+                ShellPoll
+                    .call(json!({"session_id": sid, "yield_time_ms": 50}), &c)
+                    .await,
+            );
+            assert_eq!(p["running"], true, "{p}");
+            first.push_str(p["stdout"].as_str().unwrap());
+        }
+        assert!(!first.contains("noise-start"), "{first}");
+
         let p = as_json(
             ShellPoll
-                .call(json!({"session_id": sid, "yield_time_ms": 0}), &c)
+                .call(
+                    json!({"session_id": sid, "stdin": "go\n", "yield_time_ms": 0}),
+                    &c,
+                )
                 .await,
         );
         assert_eq!(p["running"], false, "{p}");
