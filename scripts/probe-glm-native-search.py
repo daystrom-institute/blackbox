@@ -32,7 +32,7 @@ import uuid
 
 MAX_BODY_BYTES = 16 * 1024 * 1024
 SAFE_RESPONSE_HEADERS = {"request-id", "x-request-id", "x-log-id", "content-type"}
-REPORT_NAME = "mcp__blackbox__bro_report"
+REPORT_NAME = "mcp__blackbox__probe_report"
 RESUME_ERROR = "error.resume_tool_schema_missing"
 AMBIGUOUS_BATCH_ERROR = "error.glm_ambiguous_client_batch"
 
@@ -168,14 +168,14 @@ class Probe:
                               "capabilities": {"tools": {}},
                               "serverInfo": {"name": "synthetic-probe", "version": "1"}}
                 elif method == "tools/list":
-                    result = {"tools": [{"name": "bro_report",
+                    result = {"tools": [{"name": "probe_report",
                         "description": "Attach the latest progress report to the current task.",
                         "inputSchema": {"type": "object", "properties": {
                             "message": {"type": "string"}, "task_id": {"type": "string"}},
                             "required": ["message"]}}]}
                 elif method == "tools/call":
                     params = body.get("params", {})
-                    valid = (params.get("name") == "bro_report"
+                    valid = (params.get("name") == "probe_report"
                              and isinstance(params.get("arguments", {}).get("message"), str))
                     with probe.lock:
                         probe.mcp_calls.append({"case": probe.case, "params": params, "success": valid,
@@ -330,10 +330,10 @@ class Probe:
             if self.args.cases in ("all", "tools"):
                 self.run_case("fresh-arithmetic", "What is 17 multiplied by 23? Reply with just the number.",
                               report=False)
-                sid = self.run_case("fresh-report", "Discover bro_report, then use it to report that "
+                sid = self.run_case("fresh-report", "Discover probe_report, then use it to report that "
                                     "the synthetic fixture is ready. Reply REPORT_OK after the tool succeeds.")
                 for number in range(1, self.args.report_resumes + 1):
-                    self.run_case(f"resume-report-{number}", "Use the already loaded bro_report directly "
+                    self.run_case(f"resume-report-{number}", "Use the already loaded probe_report directly "
                                   f"to report synthetic checkpoint {number}. Reply CHECKPOINT_OK after success.", sid)
                 if self.args.lost_activation:
                     path = self.snapshot_path(sid)
@@ -344,19 +344,19 @@ class Probe:
                     state["side"]["tool_activations"] = []
                     # This UUID was created above, and this path is under our private BRO_HOME.
                     path.write_bytes(self.clean(json.dumps(state).encode()))
-                    self.run_case("resume-lost-activation", "Use the already loaded bro_report directly "
+                    self.run_case("resume-lost-activation", "Use the already loaded probe_report directly "
                                   "to report the final synthetic checkpoint. Reply CHECKPOINT_OK after success.", sid)
             if self.args.cases in ("all", "search"):
                 sid = self.run_case("fresh-search", "Search the web for the official Python documentation "
                     "for pathlib.Path.resolve. Give its official documentation URL and one sentence about "
-                    "the strict parameter. Then discover bro_report and call it with message SEARCH_COMPLETE "
+                    "the strict parameter. Then discover probe_report and call it with message SEARCH_COMPLETE "
                     "before your final answer.", search=True)
                 self.run_case("resume-after-search", "Using only what is already in this conversation, "
-                    "repeat the documentation URL you found and call the already loaded bro_report with "
+                    "repeat the documentation URL you found and call the already loaded probe_report with "
                     "message REPLAY_COMPLETE.", sid)
                 self.run_case("resume-search", "Search the web for the official Python documentation for "
                     "pathlib.Path.samefile. Give its official documentation URL and one sentence about "
-                    "what it returns. Then call the loaded bro_report with message SECOND_SEARCH_COMPLETE.",
+                    "what it returns. Then call the loaded probe_report with message SECOND_SEARCH_COMPLETE.",
                     sid, search=True)
         except Exception as error:
             self.aborted = True

@@ -85,7 +85,7 @@ class Probe:
             clients = [b for b in parsed["blocks"] if b.get("type") == "tool_use"]
             assert parsed["message_stop"] and not parsed["errors"], "capture must be a complete valid SSE response"
             assert COMMON["duplicate_calls"](clients), "capture must contain identical client calls"
-            assert all(c.get("name") == REPORT for c in clients), "capture client calls must target synthetic bro_report"
+            assert all(c.get("name") == REPORT for c in clients), "capture client calls must target synthetic probe_report"
         self.opener = urllib.request.build_opener(COMMON["NoRedirect"]())
         self.rows = []
         self.mutations = []
@@ -148,13 +148,13 @@ class Probe:
                     result = {"protocolVersion": body["params"]["protocolVersion"], "capabilities": {"tools": {}},
                               "serverInfo": {"name": "synthetic-counter", "version": "1"}}
                 elif method == "tools/list":
-                    result = {"tools": [{"name": "bro_report", "description": "Submit a progress report once.",
+                    result = {"tools": [{"name": "probe_report", "description": "Submit a progress report once.",
                         "inputSchema": {"type": "object", "properties": {"message": {"type": "string"}},
                                         "required": ["message"]}}]}
                 elif method == "tools/call":
                     params = body.get("params", {})
                     arguments = params.get("arguments") if isinstance(params, dict) else None
-                    valid = (isinstance(params, dict) and params.get("name") == "bro_report"
+                    valid = (isinstance(params, dict) and params.get("name") == "probe_report"
                              and isinstance(arguments, dict) and isinstance(arguments.get("message"), str))
                     attempt = {"case": probe.case, "after_response_n": len(probe.rows),
                                "params": params, "success": valid}
@@ -250,7 +250,7 @@ class Probe:
         self.case, self.step = name, 0
         sid = str(uuid.uuid4())
         command = self.base + ["--session-id", sid, "--prompt",
-            "Search the web for official Python pathlib.Path.samefile documentation. Then call bro_report "
+            "Search the web for official Python pathlib.Path.samefile documentation. Then call probe_report "
             "with message SECOND_SEARCH_COMPLETE exactly once. Reuse completed search results if tool calls need correction."]
         process = subprocess.Popen(command, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
         try:
@@ -298,7 +298,7 @@ class Probe:
         else:
             assert process.returncode == 0 and not outcomes[-1].get("is_error"), outcomes[-1]
             assert len(mutations) == 1, mutations
-            assert mutations[0]["params"].get("name") == "bro_report", mutations
+            assert mutations[0]["params"].get("name") == "probe_report", mutations
             assert mutations[0]["params"].get("arguments", {}).get("message") == "SECOND_SEARCH_COMPLETE", mutations
             assert checks, "ambiguity not exercised"
         result = {"case": name, "status": "pass", "provider_requests": len(rows),
