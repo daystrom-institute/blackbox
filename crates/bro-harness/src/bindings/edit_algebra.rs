@@ -99,7 +99,10 @@ impl EditStore {
     ) -> Result<T, String> {
         let mut guard = self.sets.lock().expect("edit store poisoned");
         let set = guard.1.get_mut(id).ok_or_else(|| {
-            format!("unknown EditSet `{id}` (consumed by a prior apply, or never begun)")
+            format!(
+                "unknown EditSet `{}` (consumed by a prior apply, or never begun)",
+                bounded_unknown_id(id)
+            )
         })?;
         f(set)
     }
@@ -112,6 +115,23 @@ impl EditStore {
         let mut guard = self.sets.lock().expect("edit store poisoned");
         guard.1.remove(id);
     }
+}
+
+/// An id that matched no EditSet is whatever the caller sent, of any length.
+/// The refusal shows enough of it to recognize and says how long it was.
+const MAX_REPORTED_UNKNOWN_ID_CHARS: usize = 64;
+
+fn bounded_unknown_id(id: &str) -> String {
+    let chars = id.chars().count();
+    if chars <= MAX_REPORTED_UNKNOWN_ID_CHARS {
+        return id.to_string();
+    }
+    format!(
+        "{}... ({chars} characters)",
+        id.chars()
+            .take(MAX_REPORTED_UNKNOWN_ID_CHARS)
+            .collect::<String>()
+    )
 }
 
 fn err(msg: impl std::fmt::Display) -> ToolResult {
@@ -1889,6 +1909,52 @@ mod tests {
         match result {
             ToolResult::Error(e) => e,
             other => panic!("expected error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unknown_edit_set_id_is_echoed_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (store, cx) = set_up(&root);
+        // A short unknown id is shown whole, as before.
+        let short = error_of(
+            create_files(
+                &store,
+                &cx,
+                json!({ "es": "es-missing", "files": batch(&["a.txt"]) }),
+            )
+            .await,
+        );
+        assert!(short.contains("unknown EditSet `es-missing`"), "{short}");
+
+        // A huge one is cut to a fixed head with its length stated, for every
+        // builder that looks a set up.
+        let huge = "é".repeat(200_000);
+        let refusals = [
+            error_of(
+                create_files(
+                    &store,
+                    &cx,
+                    json!({ "es": huge, "files": batch(&["a.txt"]) }),
+                )
+                .await,
+            ),
+            error_of(
+                EditsApply(store.clone())
+                    .call(json!({ "es": huge }), &cx)
+                    .await,
+            ),
+        ];
+        for refusal in refusals {
+            let head: String = refusal.chars().take(200).collect();
+            assert!(refusal.contains("unknown EditSet"), "{head}");
+            assert!(refusal.contains("(200000 characters)"), "{head}");
+            assert!(
+                refusal.len() < 4 * MAX_REPORTED_UNKNOWN_ID_CHARS + 256,
+                "refusal echoed the id: {} bytes",
+                refusal.len()
+            );
         }
     }
 
