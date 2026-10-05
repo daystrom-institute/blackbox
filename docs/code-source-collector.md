@@ -182,6 +182,15 @@ Delivery errors back off to at most 60 seconds, or the configured mutation
 interval when larger. Delivery changes the checkout; publication still waits
 for the configured committed ref and its publication cycle.
 
+The collector acknowledges each delivered edit with its outcome and, for an
+applied write, the SHA-256 of the bytes now at the path. The daemon settles an
+applied edit only when that digest equals the edit's own content, or when the
+acknowledgement claims no content; a different digest is refused with
+`ack_digest_mismatch` and the edit is delivered again. A repeated
+acknowledgement of an already settled edit answers `already_settled` only
+after the settlement is durable in the daemon's queue, so a settlement that
+failed to persist is retried by the repeat rather than reported as done.
+
 The configured root must be the main Git worktree for its clone. The committed
 scope at the observed `HEAD` must match the configured scope. Symlinks,
 submodules, special files, `.bbox`, build output, and unsupported or oversized

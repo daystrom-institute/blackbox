@@ -1655,6 +1655,14 @@ async fn ack_checkout_mutation(
     let settled = blocking(move || {
         let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         let mut store = state.checkout_mutations.write();
+        if request.outcome == bbox_code_source::CHECKOUT_MUTATION_OUTCOME_APPLIED
+            && let Some(mismatch) = store
+                .applied_digest_mismatch(&request.mutation_id, request.content_sha256.as_deref())
+        {
+            // The owner did not leave the bytes this mutation carries, so
+            // nothing is settled and the mutation stays pending.
+            return Ok(Err(mismatch));
+        }
         let settled = store
             .ack_with_observation(
                 &request.mutation_id,
@@ -1665,13 +1673,24 @@ async fn ack_checkout_mutation(
                 &now,
             )
             .map_err(|error| anyhow!("{error}"))?;
-        Ok::<_, anyhow::Error>((settled, request.outcome.clone()))
+        Ok::<_, anyhow::Error>(Ok((settled, request.outcome.clone())))
     })
     .await?;
-    let (settled, outcome) = settled;
+    let (settled, outcome) = match settled {
+        Ok(settled) => settled,
+        Err(mismatch) => {
+            return Err(HttpError::unprocessable("ack_digest_mismatch", mismatch));
+        }
+    };
     if !settled {
         // Known but already terminal: a duplicated ack after a crash or
-        // retry must not rewrite history.
+        // retry must not rewrite history. The first ack may have settled in
+        // memory and then failed to persist, so the settlement is made
+        // durable again before it is reported as settled.
+        persist_state
+            .persist_checkout_mutations_durable()
+            .await
+            .map_err(HttpError::from_store)?;
         return Ok(Json(CheckoutMutationAckResponseV1 {
             status: "already_settled".to_string(),
         }));
@@ -8989,7 +9008,7 @@ mod tests {
             mutation_id: "cm-00000000000000aa".into(),
             outcome: outcome.into(),
             error: None,
-            content_sha256: Some("a".repeat(64)),
+            content_sha256: checkout_mutation(&scope, "cm-00000000000000aa").target_sha256(),
             observed_sha256: None,
         };
         let response = app
@@ -9041,6 +9060,139 @@ mod tests {
         let page: CheckoutMutationPollResponseV1 = serde_json::from_slice(&body).unwrap();
         assert!(page.mutations.is_empty());
         assert_eq!(page.deferred, 0);
+    }
+
+    async fn post_mutation_ack(
+        app: &axum::Router,
+        token: &str,
+        ack: &CheckoutMutationAckRequestV1,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = app
+            .clone()
+            .oneshot(authenticated_request(
+                "POST",
+                "/internal/code-source/v1/checkout-mutations/ack",
+                token,
+                Body::from(serde_json::to_vec(ack).unwrap()),
+            ))
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    /// An owner reporting bytes other than the mutation's postimage has not
+    /// applied it: nothing settles and the mutation is delivered again.
+    #[tokio::test]
+    async fn an_applied_ack_reporting_other_content_settles_nothing() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let catalog_projects_path = root.join("catalog").join("projects.json");
+        fs::create_dir_all(catalog_projects_path.parent().unwrap()).unwrap();
+        let scope = PublishedScope::try_new("repo_onboard", ".").unwrap();
+        let (state, token) = enabled_catalog_onboard_state(&root, &catalog_projects_path, &scope);
+        let mutation = checkout_mutation(&scope, "cm-00000000000000aa");
+        let mut delete = checkout_mutation(&scope, "cm-00000000000000ab");
+        delete.relative_path = ".bbox/gaps/gap-0123abce.json".into();
+        delete.mode = "delete".into();
+        delete.content_json = None;
+        {
+            let mut queue = state.checkout_mutations.write();
+            queue.enqueue(mutation.clone()).unwrap();
+            queue.enqueue(delete.clone()).unwrap();
+        }
+        let app = router(state.clone()).with_state(state.clone());
+        let ack = |id: &str, content_sha256: Option<String>| CheckoutMutationAckRequestV1 {
+            schema_version: bbox_code_source::CHECKOUT_MUTATION_SCHEMA_VERSION,
+            mutation_id: id.into(),
+            outcome: "applied".into(),
+            error: None,
+            content_sha256,
+            observed_sha256: None,
+        };
+
+        for (id, reported) in [
+            (mutation.mutation_id.as_str(), "a".repeat(64)),
+            (delete.mutation_id.as_str(), "b".repeat(64)),
+        ] {
+            let (status, body) = post_mutation_ack(&app, &token, &ack(id, Some(reported))).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{id}: {body}");
+            assert!(body.to_string().contains("ack_digest_mismatch"), "{body}");
+        }
+        assert_eq!(state.checkout_mutations.read().pending_count(), 2);
+
+        let (status, body) = post_mutation_ack(
+            &app,
+            &token,
+            &ack(&mutation.mutation_id, mutation.target_sha256()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["status"], "applied");
+        // A delete leaves nothing, and an ack that claims no content agrees.
+        let (status, body) = post_mutation_ack(&app, &token, &ack(&delete.mutation_id, None)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["status"], "applied");
+        assert_eq!(state.checkout_mutations.read().pending_count(), 0);
+    }
+
+    /// A settlement that reached memory but not disk is not reported as
+    /// settled: a repeated ack makes it durable first, or fails again.
+    #[tokio::test]
+    async fn a_duplicate_ack_is_durable_before_it_reports_settled() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let catalog_projects_path = root.join("catalog").join("projects.json");
+        fs::create_dir_all(catalog_projects_path.parent().unwrap()).unwrap();
+        let scope = PublishedScope::try_new("repo_onboard", ".").unwrap();
+        let (state, token) = enabled_catalog_onboard_state(&root, &catalog_projects_path, &scope);
+        let mutation = checkout_mutation(&scope, "cm-00000000000000aa");
+        state
+            .checkout_mutations
+            .write()
+            .enqueue(mutation.clone())
+            .unwrap();
+        state.persist_checkout_mutations_durable().await.unwrap();
+        let store_path = walkdir::WalkDir::new(&root)
+            .into_iter()
+            .filter_map(Result::ok)
+            .find(|entry| entry.file_name() == "checkout-mutations.json")
+            .expect("the persisted mutation queue")
+            .into_path();
+        let on_disk = || fs::read_to_string(&store_path).unwrap_or_default();
+        assert!(on_disk().contains("\"Pending\"") || on_disk().contains("pending"));
+
+        // Make the queue file unwritable: a non-empty directory in its place.
+        let saved = on_disk();
+        fs::remove_file(&store_path).unwrap();
+        fs::create_dir(&store_path).unwrap();
+        fs::write(store_path.join("blocker"), b"x").unwrap();
+
+        let app = router(state.clone()).with_state(state.clone());
+        let ack = CheckoutMutationAckRequestV1 {
+            schema_version: bbox_code_source::CHECKOUT_MUTATION_SCHEMA_VERSION,
+            mutation_id: mutation.mutation_id.clone(),
+            outcome: "applied".into(),
+            error: None,
+            content_sha256: mutation.target_sha256(),
+            observed_sha256: None,
+        };
+        let (status, body) = post_mutation_ack(&app, &token, &ack).await;
+        assert!(status.is_server_error(), "{status} {body}");
+        // The settlement exists only in memory, so a repeat is not settled.
+        let (status, body) = post_mutation_ack(&app, &token, &ack).await;
+        assert!(status.is_server_error(), "{status} {body}");
+        assert_ne!(body["status"], "already_settled");
+
+        fs::remove_file(store_path.join("blocker")).unwrap();
+        fs::remove_dir(&store_path).unwrap();
+        fs::write(&store_path, saved).unwrap();
+        let (status, body) = post_mutation_ack(&app, &token, &ack).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["status"], "already_settled");
+        let reopened = crate::checkout_mutations::CheckoutMutations::open(&store_path).unwrap();
+        assert_eq!(reopened.pending_count(), 0, "the settlement is on disk");
     }
 
     /// A collector that never declares guarded support keeps receiving

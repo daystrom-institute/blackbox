@@ -369,6 +369,31 @@ impl CheckoutMutations {
             .count()
     }
 
+    /// Why an `applied` ack reporting `content_sha256` cannot settle the
+    /// pending mutation it names: the owner claims bytes other than the
+    /// mutation's postimage (or any bytes at all for a delete). `None` when
+    /// the report agrees, makes no claim, or names no pending mutation.
+    pub fn applied_digest_mismatch(
+        &self,
+        mutation_id: &str,
+        content_sha256: Option<&str>,
+    ) -> Option<String> {
+        let reported = content_sha256?;
+        let pending = self.store.mutations.iter().find(|pending| {
+            pending.mutation.mutation_id == mutation_id
+                && pending.status == CheckoutMutationStatus::Pending
+        })?;
+        match pending.mutation.target_sha256() {
+            Some(expected) if expected == reported => None,
+            Some(expected) => Some(format!(
+                "ack reports content {reported} for {mutation_id}, whose postimage is {expected}"
+            )),
+            None => Some(format!(
+                "ack reports content {reported} for {mutation_id}, which is a delete"
+            )),
+        }
+    }
+
     /// The scope a mutation targets, regardless of status. Ack handlers
     /// check it against the producer grant before accepting the outcome.
     pub fn scope_of(&self, mutation_id: &str) -> Option<PublishedScope> {
