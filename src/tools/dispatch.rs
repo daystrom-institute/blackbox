@@ -807,6 +807,7 @@ impl BlackboxServer {
             brofile_tool_defaults,
             brofile_coerce_workspace,
             runtime_lease,
+            resume_brofile,
         ) = match self.resolve_resume_target(
             p.session_id.as_deref(),
             p.provider.as_deref(),
@@ -877,11 +878,17 @@ impl BlackboxServer {
         // (the old resume branches dropped the lens; dispatch-prompt-slots.md
         // §6 classifies that as a bug, not behavior to preserve).
         let coerce_workspace = p.coerce_workspace.unwrap_or(brofile_coerce_workspace);
+        // A restored brofile keeps naming the session's tasks, so the next
+        // resume finds it again.
+        let restored_bro_name = resume_brofile
+            .as_ref()
+            .filter(|brofile| brofile.unrestored.is_none())
+            .map(|brofile| brofile.name.clone());
         let ambient_ctx = orch::AmbientContext {
             task_id: Some(task_id.clone()),
             session_id: Some(session_id.clone()),
             project_dir: cwd.clone(),
-            bro_name: None,
+            bro_name: restored_bro_name.clone(),
             thread_id: None,
             work_item_id: None,
             provider: Some(provider),
@@ -932,7 +939,7 @@ impl BlackboxServer {
             self.state.task_store.clone(),
             self.state.tail_tx.clone(),
             Some(self.state.roster_events()),
-            None,
+            restored_bro_name,
             None,
             orch::merge_tool_arg_defaults(
                 ambient_ctx.tool_arg_defaults(),
@@ -967,6 +974,9 @@ impl BlackboxServer {
             "sessionId": inner.session_id,
             "status": inner.status,
         });
+        if let Some(brofile) = &resume_brofile {
+            response["brofile"] = brofile.response();
+        }
         annotate_peak_usage(&mut response, inner.provider, inner.started_at);
         Self::ok_json(&response)
     }
@@ -1004,6 +1014,66 @@ impl BlackboxServer {
             other => other.clone(),
         }
     }
+}
+
+/// What a resume recovered of the brofile its session was dispatched from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResumeBrofile {
+    pub(crate) name: String,
+    /// Why the brofile's policy was not applied to this resume. `None` means
+    /// it was restored.
+    pub(crate) unrestored: Option<String>,
+}
+
+impl ResumeBrofile {
+    fn restored(name: String) -> Self {
+        Self {
+            name,
+            unrestored: None,
+        }
+    }
+
+    /// The single decision point for a session whose brofile no longer
+    /// resolves as it did at dispatch: the resume proceeds without the
+    /// brofile's policy and says so in its result.
+    fn unrestored(name: String, reason: String) -> Self {
+        Self {
+            name,
+            unrestored: Some(reason),
+        }
+    }
+
+    fn response(&self) -> serde_json::Value {
+        match &self.unrestored {
+            None => json!({ "name": self.name, "restored": true }),
+            Some(reason) => json!({
+                "name": self.name,
+                "restored": false,
+                "notice": format!(
+                    "This session was dispatched from brofile '{}', which could not be restored: \
+                     {reason}. The resume runs without that brofile's account, model, effort, \
+                     persona, tool filters and tool defaults.",
+                    self.name
+                ),
+            }),
+        }
+    }
+}
+
+struct RestoredResumeBrofile {
+    name: String,
+    lens: Option<String>,
+    opts: Option<ExecOpts>,
+    env: Option<std::collections::HashMap<String, String>>,
+    cwd: Option<String>,
+    filters: Option<orchestration::mcp::McpFilters>,
+    tool_defaults: Option<BTreeMap<String, Value>>,
+    coerce_workspace: bool,
+}
+
+enum ResolvedResumeBrofile {
+    Restored(RestoredResumeBrofile),
+    Unrestored(ResumeBrofile),
 }
 
 pub(super) fn annotate_peak_usage(
@@ -2378,6 +2448,7 @@ impl BlackboxServer {
             Option<BTreeMap<String, Value>>,
             bool,
             Option<orchestration::allocator::RuntimeLease>,
+            Option<ResumeBrofile>,
         ),
         String,
     > {
@@ -2388,6 +2459,7 @@ impl BlackboxServer {
             let provider = p
                 .parse::<Provider>()
                 .map_err(|_| format!("Unknown provider: {p}"))?;
+            let brofile = self.resume_brofile(provider, sid);
             if let Some(lease) = orchestration::allocator::lookup_lease_for_session(
                 store_dir,
                 &self.state.task_store.read(),
@@ -2420,24 +2492,60 @@ impl BlackboxServer {
                         capabilities: lease.capabilities.clone(),
                     },
                 );
+                // The lease owns the lane (account, model, effort, context).
+                // The brofile still owns the persona, filters and tool
+                // defaults, which no lease records.
+                let (lens, filters, tool_defaults, coerce, brofile) = match brofile {
+                    Some(ResolvedResumeBrofile::Restored(restored)) => (
+                        restored.lens,
+                        restored.filters,
+                        restored.tool_defaults,
+                        restored.coerce_workspace,
+                        Some(ResumeBrofile::restored(restored.name)),
+                    ),
+                    Some(ResolvedResumeBrofile::Unrestored(unrestored)) => {
+                        (None, None, None, false, Some(unrestored))
+                    }
+                    None => (None, None, None, false, None),
+                };
                 return Ok((
                     provider,
                     sid.to_string(),
-                    None,
+                    lens,
                     opts,
                     env,
                     project_dir
                         .map(String::from)
                         .or_else(|| lease.cwd.clone())
                         .or_else(|| lease.project_dir.clone()),
-                    None,
-                    None,
-                    false,
+                    filters,
+                    tool_defaults,
+                    coerce,
                     Some(lease),
+                    brofile,
                 ));
             }
-            // No lease and no brofile: the original context policy is
-            // unrecoverable. Resolve provider env from explicit raw inputs
+            let brofile = match brofile {
+                Some(ResolvedResumeBrofile::Restored(restored)) => {
+                    return Ok((
+                        provider,
+                        sid.to_string(),
+                        restored.lens,
+                        restored.opts,
+                        restored.env,
+                        project_dir.map(String::from).or(restored.cwd),
+                        restored.filters,
+                        restored.tool_defaults,
+                        restored.coerce_workspace,
+                        None,
+                        Some(ResumeBrofile::restored(restored.name)),
+                    ));
+                }
+                Some(ResolvedResumeBrofile::Unrestored(unrestored)) => Some(unrestored),
+                None => None,
+            };
+            // No lease and no restorable brofile: the original context policy
+            // is unrecoverable. Resolve provider env from explicit raw inputs
             // only; do not preserve a provider-wide generated config because
             // it may belong to a different Inception dispatch.
             let env =
@@ -2453,10 +2561,70 @@ impl BlackboxServer {
                 None,
                 false,
                 None,
+                brofile,
             ));
         }
 
         Err("Provide session_id + provider".into())
+    }
+
+    /// The brofile a session was dispatched from, re-resolved for a resume.
+    ///
+    /// A named dispatch stamps the brofile name on its task. The session's
+    /// most recent task that carries one names the brofile, and it resolves in
+    /// the scope of that task's working directory, as the dispatch did.
+    /// `None` means the session was never dispatched by name.
+    fn resume_brofile(
+        &self,
+        provider: Provider,
+        session_id: &str,
+    ) -> Option<ResolvedResumeBrofile> {
+        let (name, cwd) = self
+            .state
+            .task_store
+            .read()
+            .all_tasks()
+            .iter()
+            .filter_map(|task| {
+                let inner = task.inner.lock();
+                (inner.provider == provider && inner.session_id == session_id)
+                    .then(|| {
+                        inner
+                            .bro_label
+                            .clone()
+                            .map(|name| (inner.started_at, name, inner.cwd.clone()))
+                    })
+                    .flatten()
+            })
+            .max_by_key(|(started_at, ..)| *started_at)
+            .map(|(_, name, cwd)| (name, cwd))?;
+        Some(
+            match self.resolve_exec_target(Some(&name), None, cwd.as_deref()) {
+                Ok((resolved, lens, opts, env, _, filters, tool_defaults, coerce_workspace, _))
+                    if resolved == provider =>
+                {
+                    ResolvedResumeBrofile::Restored(RestoredResumeBrofile {
+                        name,
+                        lens,
+                        opts,
+                        env,
+                        cwd,
+                        filters,
+                        tool_defaults,
+                        coerce_workspace,
+                    })
+                }
+                Ok((resolved, ..)) => ResolvedResumeBrofile::Unrestored(ResumeBrofile::unrestored(
+                    name,
+                    format!(
+                        "it now names provider {resolved}, and this session runs on {provider}"
+                    ),
+                )),
+                Err(error) => {
+                    ResolvedResumeBrofile::Unrestored(ResumeBrofile::unrestored(name, error))
+                }
+            },
+        )
     }
 
     /// Resolve the full aggregate-wait selection up front. The whole
@@ -2740,6 +2908,125 @@ mod tests {
         }
         client.cancel().await.unwrap();
         serving.await.unwrap();
+    }
+
+    fn save_resume_brofile(server: &BlackboxServer, name: &str, provider: Provider) {
+        let brofile = orchestration::brofile::Brofile {
+            name: name.to_string(),
+            provider,
+            account: None,
+            lens: Some("resume persona".to_string()),
+            model: Some("brofile-model".to_string()),
+            effort: None,
+            tool_defaults: Some(BTreeMap::from([(
+                "default:file_read.max_lines".to_string(),
+                json!(111),
+            )])),
+            filters: Some(orchestration::mcp::McpFilters {
+                disallow: vec!["glob".to_string()],
+                ..Default::default()
+            }),
+            surface: None,
+            coerce_workspace: None,
+            runtime: None,
+            context: None,
+            code_mode: None,
+            service_tier: None,
+        };
+        orchestration::brofile::save_brofile(&brofile, "global", &server.state.store_dir, None)
+            .unwrap();
+    }
+
+    fn seed_named_session(server: &BlackboxServer, task_id: &str, session: &str, bro: &str) {
+        let task = orch::test_task(task_id, orch::TaskStatus::Completed, Provider::Glm);
+        {
+            let mut inner = task.inner.lock();
+            inner.session_id = session.to_string();
+            inner.bro_label = Some(bro.to_string());
+        }
+        server
+            .state
+            .task_store
+            .write()
+            .insert(task_id.to_string(), task)
+            .unwrap();
+    }
+
+    #[test]
+    fn resume_with_a_lease_keeps_the_lease_lane_and_restores_the_brofile_policy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        save_resume_brofile(&server, "leased-bro", Provider::Glm);
+        seed_named_session(&server, "leased-task", "leased-session", "leased-bro");
+        orchestration::allocator::record_lease(
+            &server.state.store_dir,
+            orchestration::allocator::RuntimeLease {
+                task_id: "leased-task".to_string(),
+                session_id: "leased-session".to_string(),
+                provider: Provider::Glm,
+                account: None,
+                model: Some("lease-model".to_string()),
+                effort: Some("high".to_string()),
+                tier: None,
+                durable: true,
+                capabilities: Vec::new(),
+                project_dir: None,
+                cwd: None,
+                selection_trace_id: "synthetic-trace".to_string(),
+                created_at: 1,
+                last_seen_at: 1,
+                brofile_context: None,
+            },
+        );
+
+        let (_, _, lens, opts, _, _, filters, tool_defaults, _, lease, brofile) = server
+            .resolve_resume_target(Some("leased-session"), Some("glm"), None)
+            .unwrap();
+        // The lease owns the lane; the brofile owns persona, filters and
+        // tool defaults.
+        assert!(lease.is_some());
+        let opts = opts.unwrap();
+        assert_eq!(opts.model.as_deref(), Some("lease-model"));
+        assert_eq!(opts.effort.as_deref(), Some("high"));
+        assert_eq!(lens.as_deref(), Some("resume persona"));
+        assert_eq!(filters.unwrap().disallow, vec!["glob".to_string()]);
+        assert_eq!(
+            tool_defaults.unwrap()["default:file_read.max_lines"],
+            json!(111)
+        );
+        assert_eq!(
+            brofile,
+            Some(ResumeBrofile {
+                name: "leased-bro".to_string(),
+                unrestored: None
+            })
+        );
+    }
+
+    #[test]
+    fn resume_does_not_apply_a_brofile_that_now_names_another_provider() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        save_resume_brofile(&server, "moved-bro", Provider::Deepseek);
+        seed_named_session(&server, "moved-task", "moved-session", "moved-bro");
+
+        let (provider, _, lens, opts, _, _, filters, tool_defaults, _, lease, brofile) = server
+            .resolve_resume_target(Some("moved-session"), Some("glm"), None)
+            .unwrap();
+        assert_eq!(provider, Provider::Glm);
+        assert!(lens.is_none() && opts.is_none() && filters.is_none());
+        assert!(tool_defaults.is_none() && lease.is_none());
+        let brofile = brofile.unwrap();
+        assert_eq!(brofile.name, "moved-bro");
+        let reason = brofile.unrestored.clone().unwrap();
+        assert!(reason.contains("now names provider deepseek"), "{reason}");
+        assert_eq!(brofile.response()["restored"], false);
+
+        // A session with no named task reports no brofile at all.
+        let (.., brofile) = server
+            .resolve_resume_target(Some("unnamed-session"), Some("glm"), None)
+            .unwrap();
+        assert!(brofile.is_none());
     }
 
     fn seed_when_task(

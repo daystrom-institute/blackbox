@@ -17,6 +17,16 @@ Domain home for the dispatch plane. Boundary contract:
   `BRO_HARNESS_TOOL_DEFAULTS` env). Bindings read it host-side via
   `cx.tool_arg_defaults.lookup(tool, param)`; a cell-authored
   `acknowledge_*` is a schema error by design.
+- **Resume restores the brofile from the session, not from the caller.**
+  `bro_resume` takes no brofile selector. The session's most recent task
+  that carries a `bro_label` names the brofile, and it re-resolves in that
+  task's working-directory scope. When it resolves to the same provider, the
+  resume gets its account, model, effort, persona, filters and tool defaults
+  again and the resumed task keeps the label. A session with an allocator
+  lease keeps the lease's lane and takes persona, filters and tool defaults
+  from the brofile. Any other outcome is one decision point
+  (`ResumeBrofile::unrestored`): the resume runs without the brofile's
+  policy and its result carries `brofile.notice`.
 - **Every new dispatch path must thread both lanes, not just the ambient
   map.** The merge helper exists because the direct, workflow, agent, and
   atom dispatch sites each grew the call separately; a new site that passes

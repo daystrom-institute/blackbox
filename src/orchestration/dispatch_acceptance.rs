@@ -411,7 +411,7 @@ mod acceptance {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn the_child_receives_its_routing_and_per_dispatch_lanes_end_with_the_invocation() {
+    async fn the_child_receives_its_routing_and_resume_keeps_the_brofile_lanes() {
         let mut plane = Plane::start().await;
         let cwd = plane.cwd();
         create_brofile(
@@ -494,8 +494,8 @@ mod acceptance {
         );
         assert_eq!(plane.finish(&plain).await["status"], "completed");
 
-        // Per-dispatch defaults and filters applied to the first invocation
-        // only; a resume that does not repeat them starts without them.
+        // Resume restores what the brofile owns. Per-dispatch defaults and
+        // filters applied to the first invocation only.
         let resumed = plane
             .server
             .bro_resume(call(json!({
@@ -506,19 +506,138 @@ mod acceptance {
             })))
             .await;
         let resumed = parsed(&resumed);
+        assert_eq!(
+            resumed["brofile"],
+            json!({ "name": "acceptance-bro", "restored": true }),
+            "{resumed}"
+        );
         let resumed_task = resumed["taskId"].as_str().expect("resume taskId").to_string();
         let second_child = plane.next_child().await;
         await_file(&second_child.join("stdin"), "routed follow-up").await;
+        assert_brofile_lanes(&second_child, &session, &cwd);
         let second = argv(&second_child);
-        assert_eq!(flag(&second, "--resume"), Some(session.as_str()), "{second:?}");
-        assert_eq!(flag(&second, "--cwd"), Some(cwd.as_str()), "{second:?}");
         let context: Value =
             serde_json::from_str(flag(&second, "--additional-context").expect("context"))
                 .expect("context json");
-        assert_eq!(context["default:mcp.bbox_gap.project"], cwd, "{context}");
+        assert_eq!(context["default:shell_run.timeout_ms"], 1000, "{context}");
         assert!(context.get("default:content_search.max_results").is_none(), "{context}");
         let denied: Vec<&str> = flag(&second, "--deny-tools").expect("deny").split(',').collect();
         assert!(!denied.contains(&"web_fetch"), "{denied:?}");
+        assert_eq!(plane.finish(&resumed_task).await["status"], "completed");
+
+        // The resumed task names the brofile too, so a later resume of the
+        // same session restores it again.
+        let again = plane
+            .server
+            .bro_resume(call(json!({
+                "prompt": "third turn",
+                "session_id": session,
+                "provider": "glm",
+                "cwd": cwd,
+            })))
+            .await;
+        let again = parsed(&again);
+        assert_eq!(again["brofile"]["restored"], true, "{again}");
+        let resumed_task = again["taskId"].as_str().expect("resume taskId").to_string();
+        let third_child = plane.next_child().await;
+        await_file(&third_child.join("stdin"), "third turn").await;
+        assert_brofile_lanes(&third_child, &session, &cwd);
+        assert_eq!(plane.finish(&resumed_task).await["status"], "completed");
+    }
+
+    /// A resumed child of the routed session carries everything the brofile
+    /// owns: model, effort, persona, deny filter, tool defaults and the
+    /// account environment.
+    fn assert_brofile_lanes(child: &Path, session: &str, cwd: &str) {
+        let argv = argv(child);
+        assert_eq!(flag(&argv, "--resume"), Some(session), "{argv:?}");
+        assert_eq!(flag(&argv, "--cwd"), Some(cwd), "{argv:?}");
+        assert_eq!(flag(&argv, "--model"), Some("glm-5.3-flash"), "{argv:?}");
+        assert_eq!(flag(&argv, "--effort"), Some("high"), "{argv:?}");
+        let dispatch: Value =
+            serde_json::from_str(flag(&argv, "--dispatch-context").expect("dispatch context"))
+                .expect("dispatch context json");
+        assert_eq!(dispatch["scope"]["bro"], "acceptance-bro", "{dispatch}");
+        let context: Value =
+            serde_json::from_str(flag(&argv, "--additional-context").expect("context"))
+                .expect("context json");
+        assert_eq!(context["default:mcp.bbox_gap.project"], cwd, "{context}");
+        assert_eq!(context["default:file_read.max_lines"], 111, "{context}");
+        let denied: Vec<&str> = flag(&argv, "--deny-tools").expect("deny").split(',').collect();
+        assert!(denied.contains(&"glob"), "{denied:?}");
+        assert!(
+            read(child, "env-names")
+                .lines()
+                .any(|name| name == "ACCEPTANCE_ACCOUNT_MARKER")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resume_of_a_session_whose_brofile_is_gone_runs_bare_and_says_so() {
+        let mut plane = Plane::start().await;
+        let cwd = plane.cwd();
+        create_brofile(
+            &plane,
+            json!({
+                "action": "create",
+                "name": "short-lived-bro",
+                "provider": "glm",
+                "model": "glm-5.3-flash",
+                "disallow_tools": ["glob"],
+            }),
+        )
+        .await;
+        let (task, session, child) = plane
+            .exec(json!({ "prompt": "named turn", "bro": "short-lived-bro", "cwd": cwd }))
+            .await;
+        await_file(&child.join("stdin"), "named turn").await;
+        assert_eq!(plane.finish(&task).await["status"], "completed");
+        create_brofile(&plane, json!({ "action": "delete", "name": "short-lived-bro" })).await;
+
+        let resumed = plane
+            .server
+            .bro_resume(call(json!({
+                "prompt": "after the brofile was deleted",
+                "session_id": session,
+                "provider": "glm",
+                "cwd": cwd,
+            })))
+            .await;
+        let resumed = parsed(&resumed);
+        assert_eq!(resumed["brofile"]["name"], "short-lived-bro", "{resumed}");
+        assert_eq!(resumed["brofile"]["restored"], false, "{resumed}");
+        let notice = resumed["brofile"]["notice"].as_str().expect("notice");
+        assert!(notice.contains("Unknown brofile: short-lived-bro"), "{notice}");
+        assert!(notice.contains("runs without that brofile's"), "{notice}");
+
+        let resumed_task = resumed["taskId"].as_str().expect("resume taskId").to_string();
+        let second = plane.next_child().await;
+        await_file(&second.join("stdin"), "after the brofile was deleted").await;
+        let argv = argv(&second);
+        let denied: Vec<&str> = flag(&argv, "--deny-tools").expect("deny").split(',').collect();
+        assert!(!denied.contains(&"glob"), "{denied:?}");
+        assert_eq!(plane.finish(&resumed_task).await["status"], "completed");
+
+        // A session that was never dispatched by name reports no brofile.
+        let (plain, plain_session, plain_child) = plane
+            .exec(json!({ "prompt": "plain turn", "provider": "glm", "cwd": cwd }))
+            .await;
+        await_file(&plain_child.join("stdin"), "plain turn").await;
+        assert_eq!(plane.finish(&plain).await["status"], "completed");
+        let resumed = plane
+            .server
+            .bro_resume(call(json!({
+                "prompt": "plain follow-up",
+                "session_id": plain_session,
+                "provider": "glm",
+                "cwd": cwd,
+            })))
+            .await;
+        let resumed = parsed(&resumed);
+        assert!(resumed.get("brofile").is_none(), "{resumed}");
+        let resumed_task = resumed["taskId"].as_str().expect("resume taskId").to_string();
+        let child = plane.next_child().await;
+        await_file(&child.join("stdin"), "plain follow-up").await;
         assert_eq!(plane.finish(&resumed_task).await["status"], "completed");
     }
 }
