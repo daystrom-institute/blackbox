@@ -442,6 +442,12 @@ fn emit_tool_result(result: ToolResult, field: Option<&str>) -> Result<bool> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // An HTTP MCP server named in `--mcp-config` is reached through rmcp's
+    // reqwest client, which panics "No provider set" without a process
+    // default CryptoProvider. The harness binary installs one at startup;
+    // this binary is its own process and must too. Idempotent.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let mut cli = Cli::parse();
 
     // gap-3cc07165: a relative --root silently breaks shell spawns inside
