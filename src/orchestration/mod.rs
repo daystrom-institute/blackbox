@@ -798,6 +798,9 @@ pub struct TaskInner {
     /// history is intact. Surfaced through `bro_status` / `bro_wait`.
     pub recoverable: bool,
     pub transcript_location: Option<TranscriptLocation>,
+    /// Absolute harness binary an ops dispatch selected for this session.
+    /// A resume of the session launches the same binary.
+    pub harness_bin: Option<String>,
     pub transcript_cursor: Option<TranscriptCursor>,
     /// Monotonic per-task cursor for live tail events. This is distinct from
     /// provider transcript-file cursors because `tail_tx` carries task lifecycle
@@ -1146,6 +1149,7 @@ mod roster_view_tests {
                 interrupted: false,
                 recoverable: false,
                 transcript_location: None,
+                harness_bin: None,
                 transcript_cursor: None,
                 live_cursor: 0,
                 harness_ingest_seq: 0,
@@ -1597,6 +1601,7 @@ pub(crate) fn test_task(id: &str, status: TaskStatus, provider: Provider) -> Arc
             interrupted: false,
             recoverable: false,
             transcript_location: None,
+            harness_bin: None,
             transcript_cursor: None,
             live_cursor: 0,
             harness_ingest_seq: 0,
@@ -1774,6 +1779,8 @@ struct PersistedTask {
     recoverable: bool,
     #[serde(default)]
     transcript_location: Option<TranscriptLocation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    harness_bin: Option<String>,
     #[serde(default)]
     transcript_cursor: Option<TranscriptCursor>,
     #[serde(default)]
@@ -1904,6 +1911,7 @@ impl TaskStore {
                     interrupted: inner.interrupted,
                     recoverable: inner.recoverable,
                     transcript_location: inner.transcript_location.clone(),
+                    harness_bin: inner.harness_bin.clone(),
                     transcript_cursor: inner.transcript_cursor.clone(),
                     live_cursor: inner.live_cursor,
                     harness_ingest_seq: inner.harness_ingest_seq,
@@ -2090,6 +2098,7 @@ impl TaskStore {
                     interrupted: rec.interrupted,
                     recoverable: rec.recoverable,
                     transcript_location: rec.transcript_location,
+                    harness_bin: rec.harness_bin,
                     transcript_cursor: rec.transcript_cursor,
                     live_cursor,
                     harness_ingest_seq: rec.harness_ingest_seq,
@@ -2476,6 +2485,8 @@ pub struct SpawnTaskParams {
     pub tail_tx: tokio::sync::broadcast::Sender<tail::TailEvent>,
     pub roster_events: Option<RosterEventSink>,
     pub bro_label: Option<String>,
+    /// Absolute harness binary selected for this dispatch, when one was.
+    pub harness_bin: Option<String>,
     /// Spawn-time origin classification (Slice 1b). Determines which
     /// roster tab the task lands in. Defaults to `Unknown` at the field
     /// boundary so test helpers that build `SpawnTaskParams` directly
@@ -2537,6 +2548,7 @@ fn failed_duplicate_task(
             interrupted: false,
             recoverable: false,
             transcript_location: None,
+            harness_bin: None,
             transcript_cursor: None,
             live_cursor: 0,
             harness_ingest_seq: 0,
@@ -2618,6 +2630,7 @@ pub fn spawn_in_process_task(
             interrupted: false,
             recoverable: false,
             transcript_location: None,
+            harness_bin: None,
             transcript_cursor: None,
             live_cursor: 0,
             harness_ingest_seq: 0,
@@ -2798,6 +2811,7 @@ pub async fn spawn_task(
         bro_label,
         None,
         None,
+        None,
         origin,
     )
     .await
@@ -2915,6 +2929,7 @@ pub async fn spawn_task_with_tool_placement(
     bro_label: Option<String>,
     tool_placement: Option<BTreeMap<String, String>>,
     tool_defaults: Option<BTreeMap<String, serde_json::Value>>,
+    harness_bin: Option<String>,
     origin: bro_core::Origin,
 ) -> Arc<Task> {
     // Reservation happens HERE, ahead of the provider branch, so both entry
@@ -2951,6 +2966,7 @@ pub async fn spawn_task_with_tool_placement(
             tail_tx,
             roster_events,
             bro_label,
+            harness_bin,
             origin,
         },
         tool_placement,
@@ -2987,6 +3003,7 @@ async fn spawn_reserved_dispatch(
         tail_tx,
         roster_events,
         bro_label,
+        harness_bin,
         origin,
     } = params;
     // A session must never inherit the daemon's process cwd ($HOME under
@@ -3049,6 +3066,7 @@ async fn spawn_reserved_dispatch(
             bro_label,
             tool_placement,
             tool_defaults,
+            harness_bin,
             origin,
         )
         .await;
@@ -3107,6 +3125,7 @@ async fn spawn_harness_child_task(
     bro_label: Option<String>,
     tool_placement: Option<BTreeMap<String, String>>,
     tool_defaults: Option<BTreeMap<String, serde_json::Value>>,
+    harness_bin: Option<String>,
     origin: bro_core::Origin,
 ) -> Arc<Task> {
     let self_mcp_url = std::env::var("BLACKBOX_MCP_URL")
@@ -3149,6 +3168,7 @@ async fn spawn_harness_child_task(
             shell_env,
             tool_placement,
             tool_defaults,
+            harness_bin.clone(),
             &store_dir,
             self_mcp_url.as_deref(),
             workspace_binding_authority,
@@ -3256,6 +3276,7 @@ async fn spawn_harness_child_task(
             interrupted: false,
             recoverable: false,
             transcript_location,
+            harness_bin,
             transcript_cursor: None,
             live_cursor: 0,
             harness_ingest_seq: 0,
@@ -3344,6 +3365,7 @@ fn prepare_harness_child_launch(
     shell_env: Option<BTreeMap<String, String>>,
     tool_placement: Option<BTreeMap<String, String>>,
     tool_defaults: Option<BTreeMap<String, serde_json::Value>>,
+    harness_bin: Option<String>,
     store_dir: &std::path::Path,
     self_mcp_url: Option<&str>,
     workspace_binding_authority: Option<&dyn WorkspaceBindingAuthority>,
@@ -3443,11 +3465,14 @@ fn prepare_harness_child_launch(
 
     // Binary override: BRO_HARNESS_BIN / provider config resolved daemon-side;
     // the final login-shell path resolution stays executor-side.
-    let bin_override = Some(if let Ok(cfg) = blackbox::config::load() {
-        provider.bin_with_config(&cfg.providers)
-    } else {
-        provider.bin()
-    });
+    // A dispatch that names its own binary wins over both.
+    let bin_override = Some(harness_bin.unwrap_or_else(|| {
+        if let Ok(cfg) = blackbox::config::load() {
+            provider.bin_with_config(&cfg.providers)
+        } else {
+            provider.bin()
+        }
+    }));
 
     // A same-host executor shares the daemon's BRO_HOME. An off-host fleetd
     // writes snapshots, replay logs, and spill artifacts under its own
@@ -4568,6 +4593,9 @@ fn task_view_json_from_inner(
     if let Some(ref label) = inner.bro_label {
         obj["broLabel"] = Value::String(label.clone());
     }
+    if let Some(ref bin) = inner.harness_bin {
+        obj["harnessBin"] = Value::String(bin.clone());
+    }
     if transcript_coordinates {
         if let Some(ref location) = inner.transcript_location {
             obj["transcriptLocation"] = serde_json::to_value(location).unwrap_or(Value::Null);
@@ -5589,6 +5617,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &root,
             Some("http://127.0.0.1:7264/mcp?surface=agent-internal"),
             Some(&FixedWorkspaceBindingAuthority),
@@ -5661,6 +5690,7 @@ mod tests {
             None, // shell_env
             None, // tool_placement
             None, // tool_defaults
+            None,
             &store,
             None, // self_mcp_url
             None, // workspace_binding_authority
@@ -5899,6 +5929,7 @@ mod tests {
                 "default:file_read.offset".to_string(),
                 serde_json::json!("10"),
             )])),
+            None,
             &root,
             Some("http://127.0.0.1:7264/mcp?surface=default"),
             None,
@@ -6021,6 +6052,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             bro_core::Origin::AgentDispatch,
         )
         .await;
@@ -6041,6 +6073,7 @@ mod tests {
             store_dir,
             store,
             tail_tx,
+            None,
             None,
             None,
             None,
@@ -6105,6 +6138,7 @@ mod tests {
                 tail_tx,
                 roster_events: None,
                 bro_label: None,
+                harness_bin: None,
                 origin: bro_core::Origin::AgentDispatch,
             },
         )
@@ -6161,6 +6195,7 @@ mod tests {
                 tail_tx,
                 roster_events: None,
                 bro_label: None,
+                harness_bin: None,
                 origin: bro_core::Origin::AgentDispatch,
             },
         )
@@ -7035,6 +7070,7 @@ mod tests {
                 interrupted: false,
                 recoverable: false,
                 transcript_location: None,
+                harness_bin: None,
                 transcript_cursor: None,
                 live_cursor: 0,
                 harness_ingest_seq: 0,
@@ -7235,6 +7271,7 @@ mod tests {
                 tail_tx,
                 roster_events: None,
                 bro_label: None,
+                harness_bin: None,
                 origin: bro_core::Origin::Cockpit,
             },
         )
@@ -7774,6 +7811,7 @@ mod tests {
                 interrupted: false,
                 recoverable: false,
                 transcript_location: None,
+                harness_bin: None,
                 transcript_cursor: None,
                 live_cursor: 0,
                 harness_ingest_seq: 0,
@@ -7813,6 +7851,7 @@ mod tests {
                 interrupted: false,
                 recoverable: false,
                 transcript_location: None,
+                harness_bin: None,
                 transcript_cursor: None,
                 live_cursor: 0,
                 harness_ingest_seq: 0,
@@ -7869,6 +7908,7 @@ mod tests {
                 interrupted: false,
                 recoverable: false,
                 transcript_location: None,
+                harness_bin: None,
                 transcript_cursor: None,
                 live_cursor: 0,
                 harness_ingest_seq: 0,
@@ -7924,6 +7964,7 @@ mod tests {
                 interrupted: false,
                 recoverable: false,
                 transcript_location: None,
+                harness_bin: None,
                 transcript_cursor: None,
                 live_cursor: 0,
                 harness_ingest_seq: 0,
@@ -8240,6 +8281,7 @@ mod tests {
                 interrupted: false,
                 recoverable: false,
                 transcript_location: None,
+                harness_bin: None,
                 transcript_cursor: None,
                 live_cursor: 0,
                 harness_ingest_seq: 0,
@@ -8286,6 +8328,7 @@ mod tests {
                 tail_tx,
                 roster_events: None,
                 bro_label: None,
+                harness_bin: None,
                 // The legacy `spawn_with_pre_minted_id_tracks_known_id`
                 // test predates Slice 1b; pin origin to a sentinel
                 // value so a regression that drops the origin on
@@ -8866,6 +8909,7 @@ mod tests {
                 interrupted: false,
                 recoverable: false,
                 transcript_location: None,
+                harness_bin: None,
                 transcript_cursor: None,
                 live_cursor: 0,
                 harness_ingest_seq: 0,
@@ -9125,6 +9169,7 @@ mod tests {
                 interrupted: false,
                 recoverable: false,
                 transcript_location: None,
+                harness_bin: None,
                 transcript_cursor: None,
                 live_cursor: 0,
                 harness_ingest_seq: 0,
@@ -9182,6 +9227,7 @@ mod tests {
                 interrupted: false,
                 recoverable: false,
                 transcript_location: None,
+                harness_bin: None,
                 transcript_cursor: None,
                 live_cursor: 0,
                 harness_ingest_seq: 0,
@@ -9239,6 +9285,7 @@ mod tests {
             interrupted: false,
             recoverable: false,
             transcript_location: None,
+            harness_bin: None,
             transcript_cursor: None,
             live_cursor: 0,
             harness_ingest_seq: 0,
@@ -9298,6 +9345,7 @@ mod tests {
             interrupted: false,
             recoverable: false,
             transcript_location: None,
+            harness_bin: None,
             transcript_cursor: None,
             live_cursor: 0,
             harness_ingest_seq: 0,
@@ -9372,6 +9420,7 @@ mod tests {
             interrupted: false,
             recoverable: false,
             transcript_location: None,
+            harness_bin: None,
             transcript_cursor: None,
             live_cursor: 0,
             harness_ingest_seq: 0,
@@ -9431,6 +9480,7 @@ mod tests {
             interrupted: false,
             recoverable: false,
             transcript_location: None,
+            harness_bin: None,
             transcript_cursor: None,
             live_cursor: 0,
             harness_ingest_seq: 0,
@@ -9762,6 +9812,7 @@ mod async_tests {
                 interrupted: false,
                 recoverable: false,
                 transcript_location: None,
+                harness_bin: None,
                 transcript_cursor: None,
                 live_cursor: 0,
                 harness_ingest_seq: 0,
@@ -9807,6 +9858,7 @@ mod async_tests {
                 interrupted: false,
                 recoverable: false,
                 transcript_location: None,
+                harness_bin: None,
                 transcript_cursor: None,
                 live_cursor: 0,
                 harness_ingest_seq: 0,
@@ -9858,6 +9910,7 @@ mod async_tests {
                 interrupted: false,
                 recoverable: false,
                 transcript_location: None,
+                harness_bin: None,
                 transcript_cursor: None,
                 live_cursor: 0,
                 harness_ingest_seq: 0,
@@ -9905,6 +9958,7 @@ mod async_tests {
                 interrupted: false,
                 recoverable: false,
                 transcript_location: None,
+                harness_bin: None,
                 transcript_cursor: None,
                 live_cursor: 0,
                 harness_ingest_seq: 0,
@@ -9964,6 +10018,7 @@ mod async_tests {
                 interrupted: false,
                 recoverable: false,
                 transcript_location: None,
+                harness_bin: None,
                 transcript_cursor: None,
                 live_cursor: 0,
                 harness_ingest_seq: 0,
@@ -10016,6 +10071,7 @@ mod async_tests {
                 interrupted: false,
                 recoverable: false,
                 transcript_location: None,
+                harness_bin: None,
                 transcript_cursor: None,
                 live_cursor: 0,
                 harness_ingest_seq: 0,

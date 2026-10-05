@@ -125,6 +125,13 @@ pub(crate) struct ExecParams {
     /// per-dispatch value overrides the brofile.
     #[serde(default)]
     pub(crate) edit_discipline: Option<orchestration::brofile::EditDiscipline>,
+    /// Absolute path of the harness binary to launch for this session
+    /// instead of the configured one, on the executing host. Accepted only
+    /// on the `ops` surface. The session
+    /// keeps the binary across resume; a path that is missing or not
+    /// executable fails the dispatch with `harness_bin_unavailable`.
+    #[serde(default)]
+    pub(crate) harness_bin: Option<String>,
     /// Per-dispatch service tier for support providers. `priority` is Codex
     /// `/fast`; `default` clears back to backend default. Overrides the
     /// resolved brofile's `service_tier`.

@@ -45,6 +45,29 @@ Domain home for the dispatch plane. Boundary contract:
   `kept` in its response, because both are restrictions; the other fields it
   does not name (tool defaults, surface, context, code mode) are still reset
   by that route.
+- **A dispatch may name its own harness binary, and the session keeps it.**
+  `harness_bin` on `bro_exec` is accepted only on the `ops` surface and only
+  as an absolute path; it becomes the worker spec's `bin_override` ahead of
+  `BRO_HARNESS_BIN` and provider config, and is stored on the task
+  (`harnessBin` in status). Resume has no such parameter: it launches the
+  binary recorded on the newest task of the session that has one (a task
+  that failed before its worker started records none), from any surface. An
+  absolute path is run as given on the executing host, so a missing one
+  fails the task with `harness_bin_unavailable`; nothing falls back to the
+  configured binary while a task of the session still records the path.
+  The record lives in the task store (it survives a restart through the
+  persisted record); once every task of the session that recorded it has
+  been pruned, a resume launches the configured binary with no error. The surface check is on the pinned surface name, so the
+  surface table cannot widen it: configuration changes which tools `ops`
+  shows, never which sessions are `ops`. Like every ops-only tool, it is as
+  strong as the choice of surface: any client that can reach the daemon's
+  MCP endpoint can name `ops`.
+  Known gap: the allocator availability gate (`provider_binary_missing`)
+  probes the configured binary on the daemon host and does not know about a
+  named one, which lives on the executing host. A dispatch that goes through
+  the allocator on a host whose configured binary is missing finds no lane
+  even when `harness_bin` names a good binary; a dispatch that names its
+  provider and no allocation field does not consult the gate.
 - **Every new dispatch path must thread both lanes, not just the ambient
   map.** The merge helper exists because the direct, workflow, agent, and
   atom dispatch sites each grew the call separately; a new site that passes

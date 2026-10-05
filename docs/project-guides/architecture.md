@@ -77,7 +77,8 @@ routing facts:
   server-filtered MCP endpoint. Transport credentials are selected via
   per-child env in `brofile::resolve_provider_env`; shell grandchildren scrub
   those credentials. `BRO_HARNESS_BIN` selects the executable and remains part
-  of the allocator availability gate. See
+  of the allocator availability gate; an ops-surface dispatch can name
+  another absolute path for its own session (`harness_bin`). See
   `design/bro-harness/harness-process-boundary.md`.
 - `codex` is a serde alias for Brodex (bro-harness/Responses); there is no
   separate codex CLI path. The Copilot, Vibe-CLI, and Gemini provider lanes

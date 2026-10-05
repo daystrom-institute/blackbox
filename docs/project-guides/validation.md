@@ -90,6 +90,23 @@ syntax-tier probes pod-side through the cargo shim (`lane-run.sh <lane> --ref
 `lsp.*` probes run host-side and want a lane root with a warm RA build-data
 cache (cold-start on this workspace exceeds the default readiness budget).
 
+**Live validation of an unreleased harness build (`harness_bin`).** To run a
+real dispatch against a `bro-harness` built from a branch without replacing
+the installed one, pass `harness_bin` on `bro_exec` from the ops surface:
+`bro mcp call bro_exec '{"provider":"<provider>","cwd":"<project>","prompt":"...","harness_bin":"/absolute/path/to/bro-harness"}' --surface ops`.
+The parameter is refused on every other surface and for a relative path.
+`bro_status` shows the path as `harnessBin`. `bro_resume` takes no such
+parameter: the session keeps the binary it started with, and a resume after
+the file is gone fails with `harness_bin_unavailable` instead of falling back
+to the installed binary. Every other dispatch is unaffected.
+
+The path is run as given on the host that executes the worker, so the binary
+must be built for that host. A lane build is linux/amd64 and cannot be the
+harness of a worker on the macOS checkout host; build the arm64 binary on the
+Mac in a warm checkout (`cargo build -p bro-harness --bin bro-harness`) and
+pass that path. A lane-built binary is usable only by a fleetd that runs on
+linux/amd64.
+
 Do not record exact test counts in this file. Counts stale quickly and do not
 help an agent choose the right validation.
 

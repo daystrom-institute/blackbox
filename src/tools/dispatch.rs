@@ -69,6 +69,9 @@ pub(crate) struct FreshDispatchRequest {
     /// override, else the brofile value). Folded onto `exec_opts` with
     /// the code mode.
     pub(crate) edit_discipline: Option<orchestration::brofile::EditDiscipline>,
+    /// Absolute harness binary for this dispatch, already checked against
+    /// the calling surface.
+    pub(crate) harness_bin: Option<String>,
     /// Resolved service tier for this fresh dispatch (per-dispatch override
     /// before brofile `service_tier`). Folded onto `exec_opts` after allocator
     /// rebuild so support-provider priority survives lane selection.
@@ -266,6 +269,7 @@ fn allocator_status_runtime_request(
         selection_policy: p.selection_policy.clone(),
         code_mode: None,
         edit_discipline: None,
+        harness_bin: None,
         service_tier: None,
         origin_override: None,
         display_name: None,
@@ -578,6 +582,7 @@ impl BlackboxServer {
                 request.brofile_tool_defaults.as_ref(),
                 request.tool_defaults.as_ref(),
             ),
+            request.harness_bin,
             request.origin,
         )
         .await;
@@ -709,6 +714,10 @@ impl BlackboxServer {
             .service_tier
             .clone()
             .or_else(|| exec_opts.as_ref().and_then(|o| o.service_tier.clone()));
+        let harness_bin = match self.checked_harness_bin(p.harness_bin.as_deref()) {
+            Ok(bin) => bin,
+            Err(error) => return Self::err_text(&error),
+        };
         let lease_brofile_context = brofile_context.clone();
         let dispatched = match self
             .dispatch_fresh_bro_task_with_admission(
@@ -736,6 +745,7 @@ impl BlackboxServer {
                     brofile_context,
                     code_mode: resolved_code_mode,
                     edit_discipline: resolved_edit_discipline,
+                    harness_bin,
                     service_tier: resolved_service_tier,
                     // bro_exec carries no output schema (structured output is delivered
                     // via agent dispatch from the manifest, not generic exec).
@@ -950,6 +960,7 @@ impl BlackboxServer {
         if let Some(admission) = &admission {
             admission.mark_spawn_started();
         }
+        let harness_bin = self.session_harness_bin(provider, &session_id);
         let task = orch::spawn_task_with_tool_placement(
             task_id,
             provider,
@@ -968,6 +979,7 @@ impl BlackboxServer {
                 brofile_tool_defaults.as_ref(),
                 p.tool_defaults.as_ref(),
             ),
+            harness_bin,
             // bro_resume is the user-facing MCP tool for resuming an existing
             // session — same source class as bro_exec. The HTTP control plane
             // (`/control/resume`) overrides this to Cockpit, exactly like
@@ -2593,6 +2605,57 @@ impl BlackboxServer {
         Err("Provide session_id + provider".into())
     }
 
+    /// A dispatch may name its own harness binary only on the `ops` surface
+    /// and only by absolute path: the path is run as given on the executing
+    /// host, with no lookup that could resolve it differently there.
+    ///
+    /// The check is on the surface name this session pinned, not on the
+    /// surface table. Configuration can change which tools `ops` shows; it
+    /// cannot make a session on another surface read as `ops`, and a
+    /// configured surface under any other name never passes. A handler that
+    /// pinned nothing is `default` and is refused.
+    fn checked_harness_bin(&self, requested: Option<&str>) -> Result<Option<String>, String> {
+        let Some(bin) = requested else {
+            return Ok(None);
+        };
+        let surface = self
+            .surface
+            .get()
+            .map(|surface| surface.as_ref())
+            .unwrap_or("default");
+        if surface != "ops" {
+            return Err(format!(
+                "harness_bin is accepted only on the ops surface; this session is on `{surface}`"
+            ));
+        }
+        if !std::path::Path::new(bin).is_absolute() {
+            return Err("harness_bin must be an absolute path".to_string());
+        }
+        Ok(Some(bin.to_string()))
+    }
+
+    /// The harness binary a dispatch selected for the session, read from
+    /// the newest of its tasks that recorded one. A resume inherits it, so a
+    /// session never changes binary between turns. A task that failed before
+    /// its worker started records none, which is why this is not simply the
+    /// latest task: a failed resume must not release the session to the
+    /// configured binary.
+    fn session_harness_bin(&self, provider: Provider, session_id: &str) -> Option<String> {
+        self.state
+            .task_store
+            .read()
+            .all_tasks()
+            .iter()
+            .filter_map(|task| {
+                let inner = task.inner.lock();
+                (inner.provider == provider && inner.session_id == session_id)
+                    .then(|| inner.harness_bin.clone().map(|bin| (inner.started_at, bin)))
+                    .flatten()
+            })
+            .max_by_key(|(started_at, _)| *started_at)
+            .map(|(_, bin)| bin)
+    }
+
     /// The brofile a session was dispatched from, re-resolved for a resume.
     ///
     /// A named dispatch stamps the brofile name on its task. The session's
@@ -3664,6 +3727,7 @@ mod tests {
             selection_policy: None,
             code_mode: None,
             edit_discipline: None,
+            harness_bin: None,
             service_tier: None,
             origin_override: None,
             display_name: None,
@@ -3696,6 +3760,7 @@ mod tests {
             brofile_context: None,
             code_mode: None,
             edit_discipline: None,
+            harness_bin: None,
             service_tier: None,
             output_schema: None,
         }

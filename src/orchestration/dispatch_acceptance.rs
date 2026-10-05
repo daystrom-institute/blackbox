@@ -16,7 +16,8 @@ mod acceptance {
 
     /// A stub standing in for `bro-harness`. It records what it was started
     /// with under `<root>/child-<pid>/` (argv, cwd, the provider it was told to
-    /// be, and environment variable names, never values), appends every stdin line it receives,
+    /// be, the path it was run as, and environment variable names, never
+    /// values), appends every stdin line it receives,
     /// finishes its turn when a line mentions FINISH, and records a
     /// termination signal before exiting on one.
     fn write_recording_stub(root: &Path) -> PathBuf {
@@ -34,6 +35,7 @@ mod acceptance {
              done\n\
              env | sed 's/=.*//' | sort > \"$out/env-names\"\n\
              printf '%s\\n' \"$PWD\" > \"$out/cwd\"\n\
+             printf '%s\\n' \"$0\" > \"$out/bin\"\n\
              printf '%s\\n' \"$BRO_HARNESS_PROVIDER\" > \"$out/provider\"\n\
              trap 'echo term > \"$out/signal\"; exit 143' TERM\n\
              trap 'echo int > \"$out/signal\"; exit 130' INT\n\
@@ -845,5 +847,117 @@ mod acceptance {
             }))
             .is_err()
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dispatch_selected_harness_binary_is_ops_only_and_kept_across_resume() {
+        let mut plane = Plane::start().await;
+        let cwd = plane.cwd();
+        let configured = plane.root.join("recording-harness.sh");
+        let selected = plane.root.join("selected-harness.sh");
+        std::fs::copy(&configured, &selected).expect("copy stub");
+        let ops = crate::server::BlackboxServer::new(plane.state.clone());
+        assert!(ops.surface.set(Arc::from("ops")).is_ok());
+
+        // Refused off the ops surface and as a relative path. Nothing is
+        // recorded or launched.
+        let refusals = [
+            (&plane.server, json!(selected), "only on the ops surface"),
+            (&ops, json!("selected-harness.sh"), "absolute path"),
+        ];
+        for (server, bin, expected) in refusals {
+            let result = server
+                .bro_exec(call(json!({
+                    "prompt": "never runs",
+                    "provider": "glm",
+                    "cwd": cwd,
+                    "harness_bin": bin,
+                })))
+                .await;
+            let text = tool_text(&result);
+            assert_eq!(result.is_error, Some(true), "{text}");
+            assert!(text.contains(expected), "{text}");
+        }
+        // The control route runs on a handler that pinned no surface, so a
+        // request body naming a binary is refused there too.
+        let control = crate::server::control::control_exec_handler(
+            axum::extract::State(plane.state.clone()),
+            axum::Json(
+                serde_json::from_value(json!({
+                    "prompt": "never runs",
+                    "provider": "glm",
+                    "cwd": cwd,
+                    "harness_bin": selected,
+                }))
+                .expect("exec body"),
+            ),
+        )
+        .await
+        .0;
+        let text = tool_text(&control);
+        assert_eq!(control.is_error, Some(true), "{text}");
+        assert!(text.contains("only on the ops surface"), "{text}");
+        assert_eq!(plane.task_count(), 0);
+        assert!(child_dirs(&plane.root).is_empty());
+
+        // On the ops surface the named binary runs instead of the configured
+        // one, and the task says which.
+        let result = ops
+            .bro_exec(call(json!({
+                "prompt": "first turn",
+                "provider": "glm",
+                "cwd": cwd,
+                "harness_bin": selected,
+            })))
+            .await;
+        let exec = parsed(&result);
+        let task = exec["taskId"].as_str().expect("taskId").to_string();
+        let session = exec["sessionId"].as_str().expect("sessionId").to_string();
+        let child = plane.next_child().await;
+        await_file(&child.join("stdin"), "first turn").await;
+        let selected_text = selected.to_string_lossy().into_owned();
+        assert_eq!(read(&child, "bin").trim(), selected_text);
+        assert_eq!(plane.status(&task)["harnessBin"], json!(selected_text));
+        assert_eq!(plane.finish(&task).await["status"], "completed");
+
+        // A resume names no binary and comes from an ordinary surface; the
+        // session keeps the one it started with.
+        let resume = |prompt: &str| {
+            call(json!({
+                "prompt": prompt,
+                "session_id": session,
+                "provider": "glm",
+                "cwd": cwd,
+            }))
+        };
+        let resumed = parsed(&plane.server.bro_resume(resume("second turn")).await);
+        let resumed_task = resumed["taskId"].as_str().expect("resume taskId").to_string();
+        let second = plane.next_child().await;
+        await_file(&second.join("stdin"), "second turn").await;
+        assert_eq!(read(&second, "bin").trim(), selected_text);
+        assert_eq!(plane.status(&resumed_task)["harnessBin"], json!(selected_text));
+        assert_eq!(plane.finish(&resumed_task).await["status"], "completed");
+
+        // Once the binary is gone the resume fails by name; the configured
+        // binary is never substituted, on that resume or the one after it.
+        std::fs::remove_file(&selected).expect("remove selected binary");
+        for prompt in ["third turn", "fourth turn"] {
+            let gone = parsed(&plane.server.bro_resume(resume(prompt)).await);
+            let gone_task = gone["taskId"].as_str().expect("resume taskId").to_string();
+            let waited = plane.wait(&gone_task, 20.0).await;
+            assert_eq!(waited["status"], "failed", "{waited}");
+            let text = waited.to_string();
+            assert!(text.contains("harness_bin_unavailable"), "{text}");
+            assert!(text.contains("selected-harness.sh"), "{text}");
+        }
+        assert_eq!(child_dirs(&plane.root).len(), 2);
+
+        // A dispatch that names no binary still runs the configured one.
+        let (task, _, child) = plane
+            .exec(json!({ "prompt": "plain turn", "provider": "glm", "cwd": cwd }))
+            .await;
+        assert_eq!(read(&child, "bin").trim(), configured.to_string_lossy());
+        assert!(plane.status(&task).get("harnessBin").is_none());
+        assert_eq!(plane.finish(&task).await["status"], "completed");
     }
 }
