@@ -65,6 +65,7 @@ fn harness_exec_and_resume_args_use_stream_json() {
         effort: Some("high".into()),
         provider_defaults: None,
         code_mode: Some(crate::orchestration::brofile::CodeMode::Only),
+        edit_discipline: None,
         service_tier: Some(SERVICE_TIER_PRIORITY.into()),
         output_schema: Some(r#"{"type":"object"}"#.into()),
     };
@@ -97,6 +98,7 @@ fn harness_exec_and_resume_args_use_stream_json() {
         effort: None,
         provider_defaults: None,
         code_mode: None,
+        edit_discipline: None,
         service_tier: Some(SERVICE_TIER_DEFAULT.into()),
         output_schema: None,
     };
@@ -122,6 +124,7 @@ fn harness_exec_and_resume_args_use_stream_json() {
         effort: Some("medium".into()),
         provider_defaults: None,
         code_mode: None,
+        edit_discipline: None,
         service_tier: None,
         output_schema: None,
     };
@@ -145,6 +148,7 @@ fn harness_exec_and_resume_args_use_stream_json() {
             effort: Some("max".into()),
             provider_defaults: None,
             code_mode: None,
+            edit_discipline: None,
             service_tier: None,
             output_schema: None,
         };
@@ -163,6 +167,7 @@ fn harness_exec_and_resume_args_use_stream_json() {
         effort: None,
         provider_defaults: None,
         code_mode: None,
+        edit_discipline: None,
         service_tier: None,
         output_schema: None,
     };

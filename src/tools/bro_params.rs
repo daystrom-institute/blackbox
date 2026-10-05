@@ -117,6 +117,14 @@ pub(crate) struct ExecParams {
     /// lane the Fleet TUI `/config` toggle rides for new roster dispatches.
     #[serde(default)]
     pub(crate) code_mode: Option<orchestration::brofile::CodeMode>,
+    /// Edit discipline for the session: `free` (default) or `structured`.
+    /// `structured` refuses the raw edit tools (`file_edit`, `file_write`,
+    /// `apply_patch`) flat, deferred and inside `exec` cells; edits go
+    /// through `edits.*`. It requires a code surface, so it is refused with
+    /// `code_mode: off`. The session keeps the value across resume. A
+    /// per-dispatch value overrides the brofile.
+    #[serde(default)]
+    pub(crate) edit_discipline: Option<orchestration::brofile::EditDiscipline>,
     /// Per-dispatch service tier for support providers. `priority` is Codex
     /// `/fast`; `default` clears back to backend default. Overrides the
     /// resolved brofile's `service_tier`.
@@ -573,6 +581,16 @@ pub(crate) struct BrofileParams {
     /// harness default (`optional`).
     #[serde(default)]
     pub(crate) code_mode: Option<orchestration::brofile::CodeMode>,
+    /// Default edit discipline for sessions dispatched from this brofile:
+    /// `free` or `structured`; unset means `free`. `structured` refuses the
+    /// raw edit tools (`file_edit`, `file_write`, `apply_patch`) flat,
+    /// deferred and inside `exec` cells; edits go through `edits.*`. It
+    /// requires a code surface, so a brofile cannot combine it with
+    /// `code_mode: off`. A value given on `bro_exec` overrides this default
+    /// for that dispatch, and a started session keeps the value it was
+    /// dispatched with even if the brofile changes later.
+    #[serde(default)]
+    pub(crate) edit_discipline: Option<orchestration::brofile::EditDiscipline>,
     /// Optional service tier embedded in the brofile. For Brodex, `priority`
     /// is Codex `/fast`; `default` clears back to backend default.
     #[serde(default)]

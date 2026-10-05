@@ -437,6 +437,7 @@ mod acceptance {
                 "model": "glm-5.3-flash",
                 "effort": "high",
                 "code_mode": "only",
+                "edit_discipline": "structured",
                 "tool_defaults": {
                     "default:file_read.max_lines": 111,
                     "default:shell_run.timeout_ms": 1000,
@@ -465,6 +466,7 @@ mod acceptance {
         assert_eq!(flag(&first, "--model"), Some("glm-5.3-flash"), "{first:?}");
         assert_eq!(flag(&first, "--effort"), Some("high"), "{first:?}");
         assert_eq!(flag(&first, "--code-mode"), Some("only"), "{first:?}");
+        assert_eq!(flag(&first, "--edit-discipline"), Some("structured"), "{first:?}");
         let context: Value =
             serde_json::from_str(flag(&first, "--additional-context").expect("context"))
                 .expect("context json");
@@ -564,6 +566,7 @@ mod acceptance {
         // them, and passing either here would override that.
         assert_eq!(flag(&argv, "--code-mode"), None, "{argv:?}");
         assert_eq!(flag(&argv, "--service-tier"), None, "{argv:?}");
+        assert_eq!(flag(&argv, "--edit-discipline"), None, "{argv:?}");
         let dispatch: Value =
             serde_json::from_str(flag(&argv, "--dispatch-context").expect("dispatch context"))
                 .expect("dispatch context json");
@@ -736,5 +739,92 @@ mod acceptance {
             .clone()
             .expect("observation kept");
         assert_eq!((after.seq, after.sessions.len()), (5, 1));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn edit_discipline_reaches_a_fresh_child_and_is_refused_without_a_code_surface() {
+        let mut plane = Plane::start().await;
+        let cwd = plane.cwd();
+        create_brofile(
+            &plane,
+            json!({
+                "action": "create",
+                "name": "free-bro",
+                "provider": "glm",
+                "edit_discipline": "free",
+            }),
+        )
+        .await;
+
+        // The per-dispatch value overrides the brofile's.
+        let (task, _, child) = plane
+            .exec(json!({
+                "prompt": "structured turn",
+                "bro": "free-bro",
+                "cwd": cwd,
+                "edit_discipline": "structured",
+            }))
+            .await;
+        await_file(&child.join("stdin"), "structured turn").await;
+        let overridden = argv(&child);
+        assert_eq!(
+            flag(&overridden, "--edit-discipline"),
+            Some("structured"),
+            "{overridden:?}"
+        );
+        assert_eq!(plane.finish(&task).await["status"], "completed");
+
+        // The brofile's value applies when the dispatch names none, and a raw
+        // provider dispatch that names none passes no flag at all.
+        let (task, _, child) = plane
+            .exec(json!({ "prompt": "brofile turn", "bro": "free-bro", "cwd": cwd }))
+            .await;
+        await_file(&child.join("stdin"), "brofile turn").await;
+        assert_eq!(flag(&argv(&child), "--edit-discipline"), Some("free"));
+        assert_eq!(plane.finish(&task).await["status"], "completed");
+        let (task, _, child) = plane
+            .exec(json!({ "prompt": "plain turn", "provider": "glm", "cwd": cwd }))
+            .await;
+        await_file(&child.join("stdin"), "plain turn").await;
+        assert_eq!(flag(&argv(&child), "--edit-discipline"), None);
+        assert_eq!(plane.finish(&task).await["status"], "completed");
+
+        // Structured with a code mode that has no code surface spawns nothing.
+        let before = (plane.task_count(), child_dirs(&plane.root).len());
+        let refused = plane
+            .server
+            .bro_exec(call(json!({
+                "prompt": "must not start",
+                "provider": "glm",
+                "cwd": cwd,
+                "edit_discipline": "structured",
+                "code_mode": "off",
+            })))
+            .await;
+        let text = tool_text(&refused);
+        assert_eq!(refused.is_error, Some(true), "{text}");
+        assert!(text.contains("edit_discipline 'structured'"), "{text}");
+        assert!(text.contains("code_mode 'off'"), "{text}");
+        assert_eq!((plane.task_count(), child_dirs(&plane.root).len()), before);
+
+        // A brofile cannot be saved in that combination either, and an unknown
+        // value is rejected at the tool boundary.
+        let invalid = plane
+            .server
+            .bro_brofile(call(json!({
+                "action": "create",
+                "name": "contradictory-bro",
+                "provider": "glm",
+                "code_mode": "off",
+                "edit_discipline": "structured",
+            })))
+            .await;
+        assert_eq!(invalid.is_error, Some(true), "{}", tool_text(&invalid));
+        assert!(
+            serde_json::from_value::<crate::tools::bro_params::ExecParams>(json!({
+                "prompt": "x", "provider": "glm", "edit_discipline": "strict",
+            }))
+            .is_err()
+        );
     }
 }

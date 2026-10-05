@@ -29,6 +29,22 @@ Domain home for the dispatch plane. Boundary contract:
   from the brofile. Any other outcome is one decision point
   (`ResumeBrofile::unrestored`): the resume runs without the brofile's
   policy and its result carries `brofile.notice`.
+- **Edit discipline is chosen at dispatch and owned by the session.**
+  `edit_discipline` (`free` or `structured`) resolves per-dispatch value,
+  then brofile value, then nothing, and reaches the harness as
+  `--edit-discipline` on a fresh dispatch only. Resume never passes it: the
+  harness saved it with the session, so a later brofile edit does not flip a
+  running session. The daemon refuses `structured` with a resolved
+  `code_mode: off` before spawning; enforcement of the discipline itself
+  lives in the harness. The harness binary must understand the flag before a
+  daemon that sends it is deployed.
+  A brofile's value is a default for callers that name none, not a boundary:
+  a per-dispatch `free` overrides it, as per-dispatch tool filters do. The
+  admin upsert route rewrites a brofile from a few fields. It carries the
+  existing tool filters and `edit_discipline` over and lists them under
+  `kept` in its response, because both are restrictions; the other fields it
+  does not name (tool defaults, surface, context, code mode) are still reset
+  by that route.
 - **Every new dispatch path must thread both lanes, not just the ambient
   map.** The merge helper exists because the direct, workflow, agent, and
   atom dispatch sites each grew the call separately; a new site that passes

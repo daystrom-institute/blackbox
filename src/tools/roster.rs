@@ -347,8 +347,14 @@ impl BlackboxServer {
                     runtime: None,
                     context: p.context.clone(),
                     code_mode: p.code_mode,
+                    edit_discipline: p.edit_discipline,
                     service_tier: p.service_tier.clone(),
                 };
+                if let Some(discipline) = bf.edit_discipline
+                    && let Err(error) = discipline.check_code_mode(bf.code_mode)
+                {
+                    return Self::err_text(&error);
+                }
                 if let Err(e) = brofile::save_brofile(&bf, scope, store_dir, project_dir) {
                     return Self::err_text(&format!("brofile save failed: {e}"));
                 }
@@ -680,6 +686,7 @@ fn validate_brofile_params(p: &BrofileParams) -> anyhow::Result<()> {
                 && p.surface.is_none()
                 && p.context.is_none()
                 && p.code_mode.is_none()
+                && p.edit_discipline.is_none()
                 && p.service_tier.is_none()),
         "persona configuration fields require action=create"
     );

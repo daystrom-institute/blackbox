@@ -66,6 +66,12 @@ pub struct Brofile {
     /// `crate::orchestration::brofile::CodeMode`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code_mode: Option<CodeMode>,
+    /// Optional edit discipline for sessions this brofile dispatches:
+    /// `free` or `structured`. Unset → `free`. A per-dispatch
+    /// `ExecParams.edit_discipline` overrides this, and a started session
+    /// keeps the value it was dispatched with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edit_discipline: Option<EditDiscipline>,
     /// Optional provider service tier. For Brodex/OpenAI Responses, `priority`
     /// is Codex `/fast`; `default` clears back to the backend default. A
     /// per-dispatch service-tier override wins over this brofile value.
@@ -164,6 +170,46 @@ pub enum CodeMode {
     #[default]
     Optional,
     Only,
+}
+
+/// Edit discipline carried to the harness as `--edit-discipline`. `free`
+/// leaves the session's tool surface as it is. `structured` refuses the raw
+/// edit tools (`file_edit`, `file_write`, `apply_patch`) everywhere a model
+/// can reach them and points at `edits.*`. Enforcement lives in the harness;
+/// the daemon only carries the choice and rejects it with a code mode that
+/// has no code surface.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum EditDiscipline {
+    #[default]
+    Free,
+    Structured,
+}
+
+impl EditDiscipline {
+    /// The `--edit-discipline` token / serde value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EditDiscipline::Free => "free",
+            EditDiscipline::Structured => "structured",
+        }
+    }
+
+    /// `structured` edits are made inside `exec` cells, so a session with no
+    /// code surface cannot hold it. `code_mode` is the resolved value when the
+    /// daemon knows one; the harness checks again against the session.
+    pub fn check_code_mode(self, code_mode: Option<CodeMode>) -> Result<(), String> {
+        if self == EditDiscipline::Structured && code_mode == Some(CodeMode::Off) {
+            return Err(
+                "edit_discipline 'structured' cannot be combined with code_mode 'off': \
+                 structured edits are made inside exec cells, which that code mode removes"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
 }
 
 impl CodeMode {
@@ -1108,6 +1154,7 @@ mod tests {
             runtime: None,
             context: None,
             code_mode: None,
+            edit_discipline: None,
             service_tier: None,
         };
         save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
@@ -1141,6 +1188,7 @@ mod tests {
             runtime: None,
             context: None,
             code_mode: None,
+            edit_discipline: None,
             service_tier: Some("priority".into()),
         };
         let written = save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
@@ -1173,6 +1221,7 @@ mod tests {
             runtime: None,
             context: None,
             code_mode: None,
+            edit_discipline: None,
             service_tier: None,
         };
         save_brofile(&global_bf, "global", store.path(), None).expect("brofile save");
@@ -1191,6 +1240,7 @@ mod tests {
             runtime: None,
             context: None,
             code_mode: None,
+            edit_discipline: None,
             service_tier: None,
         };
         save_brofile(
@@ -1228,6 +1278,7 @@ mod tests {
                 runtime: None,
                 context: None,
                 code_mode: None,
+                edit_discipline: None,
                 service_tier: None,
             };
             save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
@@ -1255,6 +1306,7 @@ mod tests {
             runtime: None,
             context: None,
             code_mode: None,
+            edit_discipline: None,
             service_tier: None,
         };
         save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
@@ -1308,6 +1360,7 @@ mod tests {
             runtime: None,
             context: None,
             code_mode: None,
+            edit_discipline: None,
             service_tier: None,
         };
         save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
@@ -1335,6 +1388,7 @@ mod tests {
             runtime: None,
             context: None,
             code_mode: None,
+            edit_discipline: None,
             service_tier: None,
         };
         save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
@@ -1661,6 +1715,7 @@ mod tests {
             runtime: None,
             context: None,
             code_mode: None,
+            edit_discipline: None,
             service_tier: None,
         };
         save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
@@ -1686,6 +1741,7 @@ mod tests {
             runtime: None,
             context: None,
             code_mode: Some(CodeMode::Only),
+            edit_discipline: None,
             service_tier: Some("priority".into()),
         };
         save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
@@ -1728,6 +1784,7 @@ mod tests {
             runtime: None,
             context: None,
             code_mode: None,
+            edit_discipline: None,
             service_tier: None,
         };
         save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
@@ -1752,6 +1809,7 @@ mod tests {
             runtime: None,
             context: None,
             code_mode: None,
+            edit_discipline: None,
             service_tier: None,
         };
         save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
@@ -1772,6 +1830,7 @@ mod tests {
             runtime: None,
             context: None,
             code_mode: None,
+            edit_discipline: None,
             service_tier: None,
         };
         save_brofile(&bf_off, "global", dir.path(), None).expect("brofile save");

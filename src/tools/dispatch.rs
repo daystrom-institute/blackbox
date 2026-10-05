@@ -65,6 +65,10 @@ pub(crate) struct FreshDispatchRequest {
     /// `exec_opts` just before arg construction so it survives an allocator
     /// rebuild of `exec_opts`. `None` ⇒ no `--code-mode` flag (harness default).
     pub(crate) code_mode: Option<orchestration::brofile::CodeMode>,
+    /// Resolved edit discipline for this fresh dispatch (per-dispatch
+    /// override, else the brofile value). Folded onto `exec_opts` with
+    /// the code mode.
+    pub(crate) edit_discipline: Option<orchestration::brofile::EditDiscipline>,
     /// Resolved service tier for this fresh dispatch (per-dispatch override
     /// before brofile `service_tier`). Folded onto `exec_opts` after allocator
     /// rebuild so support-provider priority survives lane selection.
@@ -261,6 +265,7 @@ fn allocator_status_runtime_request(
         durable: p.durable,
         selection_policy: p.selection_policy.clone(),
         code_mode: None,
+        edit_discipline: None,
         service_tier: None,
         origin_override: None,
         display_name: None,
@@ -478,6 +483,11 @@ impl BlackboxServer {
             o.code_mode = Some(cm);
             request.exec_opts = Some(o);
         }
+        if let Some(discipline) = request.edit_discipline {
+            let mut o = request.exec_opts.take().unwrap_or_default();
+            o.edit_discipline = Some(discipline);
+            request.exec_opts = Some(o);
+        }
         if let Some(service_tier) = request.service_tier.take() {
             let mut o = request.exec_opts.take().unwrap_or_default();
             o.service_tier = Some(service_tier);
@@ -684,6 +694,17 @@ impl BlackboxServer {
         let resolved_code_mode = p
             .code_mode
             .or_else(|| exec_opts.as_ref().and_then(|o| o.code_mode));
+        // Edit discipline resolves the same way. A known code mode with no
+        // code surface is refused here, before anything is spawned; the
+        // harness checks again against the session it actually builds.
+        let resolved_edit_discipline = p
+            .edit_discipline
+            .or_else(|| exec_opts.as_ref().and_then(|o| o.edit_discipline));
+        if let Some(discipline) = resolved_edit_discipline
+            && let Err(error) = discipline.check_code_mode(resolved_code_mode)
+        {
+            return Self::err_text(&error);
+        }
         let resolved_service_tier = p
             .service_tier
             .clone()
@@ -714,6 +735,7 @@ impl BlackboxServer {
                     record_to_bro: p.bro.clone(),
                     brofile_context,
                     code_mode: resolved_code_mode,
+                    edit_discipline: resolved_edit_discipline,
                     service_tier: resolved_service_tier,
                     // bro_exec carries no output schema (structured output is delivered
                     // via agent dispatch from the manifest, not generic exec).
@@ -2217,6 +2239,7 @@ impl BlackboxServer {
                         // Resume restores the session's persisted code_mode; the
                         // daemon does not re-pass it (mirrors --model).
                         code_mode: None,
+                        edit_discipline: None,
                         // Resume restores the session's persisted service tier.
                         service_tier: None,
                         // Resume does not re-pass the output schema.
@@ -2347,6 +2370,7 @@ impl BlackboxServer {
             let opts = if bf.model.is_some()
                 || bf.effort.is_some()
                 || bf.code_mode.is_some()
+                || bf.edit_discipline.is_some()
                 || bf.service_tier.is_some()
             {
                 Some(ExecOpts {
@@ -2354,6 +2378,7 @@ impl BlackboxServer {
                     effort: bf.effort.clone(),
                     provider_defaults: None,
                     code_mode: bf.code_mode,
+                    edit_discipline: bf.edit_discipline,
                     service_tier: bf.service_tier.clone(),
                     output_schema: None,
                 })
@@ -2609,6 +2634,7 @@ impl BlackboxServer {
                     // override them. Only a per-resume parameter may do that.
                     let opts = opts.map(|mut opts| {
                         opts.code_mode = None;
+                        opts.edit_discipline = None;
                         opts.service_tier = None;
                         opts
                     });
@@ -2940,6 +2966,7 @@ mod tests {
             runtime: None,
             context: None,
             code_mode: Some(orchestration::brofile::CodeMode::Only),
+            edit_discipline: None,
             service_tier: Some("priority".to_string()),
         };
         orchestration::brofile::save_brofile(&brofile, "global", &server.state.store_dir, None)
@@ -3581,6 +3608,7 @@ mod tests {
                 runtime: None,
                 context: None,
                 code_mode: None,
+                edit_discipline: None,
                 service_tier: None,
             },
             "global",
@@ -3618,6 +3646,7 @@ mod tests {
             durable: None,
             selection_policy: None,
             code_mode: None,
+            edit_discipline: None,
             service_tier: None,
             origin_override: None,
             display_name: None,
@@ -3649,6 +3678,7 @@ mod tests {
             origin,
             brofile_context: None,
             code_mode: None,
+            edit_discipline: None,
             service_tier: None,
             output_schema: None,
         }

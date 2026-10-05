@@ -1113,6 +1113,25 @@ pub(crate) async fn admin_brofile_upsert(
                 .into_response();
         }
     };
+    // This route rewrites the brofile from the request's fields. Tool
+    // filters and an edit discipline are restrictions someone set on purpose,
+    // so existing ones are carried over and named in the response; a rewrite
+    // must not silently lift them. An unreadable existing brofile is not
+    // overwritten.
+    let (filters, edit_discipline) =
+        match orchestration::brofile::read_brofile(&req.name, "global", &state.store_dir, None) {
+            Ok(Some(existing)) => (existing.filters, existing.edit_discipline),
+            Ok(None) => (None, None),
+            Err(e) => {
+                return (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    axum::Json(
+                        json!({"status": "error", "name": req.name, "error": e.to_string()}),
+                    ),
+                )
+                    .into_response();
+            }
+        };
     let bf = orchestration::brofile::Brofile {
         name: req.name.clone(),
         provider,
@@ -1121,14 +1140,22 @@ pub(crate) async fn admin_brofile_upsert(
         model: req.model,
         effort: req.effort,
         tool_defaults: None,
-        filters: None,
+        filters,
         surface: None,
         coerce_workspace: None,
         runtime: None,
         context: None,
         code_mode: None,
+        edit_discipline,
         service_tier: req.service_tier,
     };
+    let mut kept = Vec::new();
+    if bf.filters.is_some() {
+        kept.push("filters");
+    }
+    if bf.edit_discipline.is_some() {
+        kept.push("edit_discipline");
+    }
     if let Err(e) = orchestration::brofile::save_brofile(&bf, "global", &state.store_dir, None) {
         return (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -1136,7 +1163,7 @@ pub(crate) async fn admin_brofile_upsert(
         )
             .into_response();
     }
-    axum::Json(json!({"status": "upserted", "name": req.name})).into_response()
+    axum::Json(json!({"status": "upserted", "name": req.name, "kept": kept})).into_response()
 }
 
 #[cfg(test)]
@@ -1144,6 +1171,80 @@ mod tests {
     use super::*;
     use crate::entity_ref;
     use crate::server::state::BlackboxServer;
+
+    #[tokio::test]
+    async fn admin_brofile_upsert_keeps_existing_filters_and_edit_discipline() {
+        use axum::response::IntoResponse;
+        use orchestration::brofile::{EditDiscipline, read_brofile, save_brofile};
+        let tmp = tempfile::tempdir().unwrap();
+        let state = Arc::new(SharedState::for_test(tmp.path()));
+        let upsert = |model: &'static str, name: &'static str| {
+            let state = state.clone();
+            async move {
+                let response = admin_brofile_upsert(
+                    AxumState(state),
+                    axum::Json(
+                        serde_json::from_value(
+                            json!({ "name": name, "provider": "glm", "model": model }),
+                        )
+                        .unwrap(),
+                    ),
+                )
+                .await
+                .into_response();
+                assert!(response.status().is_success());
+                let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                    .await
+                    .unwrap();
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+            }
+        };
+        let stored = |name: &str| {
+            read_brofile(name, "global", &state.store_dir, None)
+                .unwrap()
+                .unwrap()
+        };
+
+        // A brofile created by the route carries neither restriction.
+        assert_eq!(upsert("first-model", "plain").await["kept"], json!([]));
+        let plain = stored("plain");
+        assert!(plain.filters.is_none() && plain.edit_discipline.is_none());
+
+        // Filters survive a rewrite of the other fields, and the response
+        // says so.
+        let mut filtered = plain.clone();
+        filtered.name = "filtered".to_string();
+        filtered.filters = Some(orchestration::mcp::McpFilters {
+            disallow: vec!["glob".to_string()],
+            ..Default::default()
+        });
+        save_brofile(&filtered, "global", &state.store_dir, None).unwrap();
+        assert_eq!(
+            upsert("second-model", "filtered").await["kept"],
+            json!(["filters"])
+        );
+        let rewritten = stored("filtered");
+        assert_eq!(rewritten.model.as_deref(), Some("second-model"));
+        assert_eq!(
+            rewritten.filters.unwrap().disallow,
+            vec!["glob".to_string()]
+        );
+        assert_eq!(rewritten.edit_discipline, None);
+
+        // So does an edit discipline.
+        let mut strict = plain.clone();
+        strict.name = "strict".to_string();
+        strict.edit_discipline = Some(EditDiscipline::Structured);
+        save_brofile(&strict, "global", &state.store_dir, None).unwrap();
+        assert_eq!(
+            upsert("third-model", "strict").await["kept"],
+            json!(["edit_discipline"])
+        );
+        let rewritten = stored("strict");
+        assert_eq!(rewritten.model.as_deref(), Some("third-model"));
+        assert_eq!(rewritten.edit_discipline, Some(EditDiscipline::Structured));
+        assert!(rewritten.filters.is_none());
+    }
 
     fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         BlackboxServer::new(Arc::new(SharedState::for_test(tmp.path())))
