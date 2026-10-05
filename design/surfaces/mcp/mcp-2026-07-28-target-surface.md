@@ -117,9 +117,9 @@ subscription. From 3.5.0 `ProtocolVersion::LATEST` is 2026-07-28 and
 `LATEST_WITH_INITIALIZE` names the newest handshake version (2025-11-25);
 SDK defaults no longer imply the legacy version, so the version gate is
 the server's `supported_protocol_versions()` override and the client's
-lifecycle mode. The standalone runtime exemplar still needs rerunning on the
-selected SDK version. Exact source anchors and package provenance are in
-the Codex audit record.
+lifecycle mode. The standalone runtime exemplar runs on rmcp 3.5.0 with
+every mechanic and SDK limit unchanged. Exact source anchors and package
+provenance are in the Codex audit record.
 
 ### Convergence with locality-first decomposition
 

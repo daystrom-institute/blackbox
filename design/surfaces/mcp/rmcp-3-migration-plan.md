@@ -59,9 +59,9 @@ plan.
   and is deprecated, #1270), tolerates an empty `cacheScope` (#1281) and
   preserves an explicit `null` `structuredContent` (#1295). The task
   subscription filter and notification rejection paths remain unchanged
-  through 3.5.0; MSRV stays 1.88. The existing exemplar findings
-  are from 3.1; rerun them against the selected version before treating any SDK limitation as
-  fixed or unchanged.
+  through 3.5.0; MSRV stays 1.88. The exemplar runs on 3.5.0 with its
+  findings unchanged; rerun it against any later version before treating
+  an SDK limitation as fixed or unchanged.
 - We skip the entire 2.x line. Most 2.x deprecations are removals in 3.0,
   and we already use the modern names (`CallToolRequestParams`, `ErrorData`,
   `*RequestParams`), so the skip is net favorable.
@@ -276,8 +276,8 @@ slice independently of Phase 2, not task notifications.
 - `resourcesListChanged` if Phase 4 has landed.
 - Harness children switch from bro_wait polling to listen + task handles;
   bro_wait remains the Tier 0 floor for all other clients.
-- SDK gap confirmed by the runtime spike (rmcp 3.1) and source inspection
-  of rmcp 3.5.0: `SubscriptionFilter` has no
+- SDK gap confirmed by the runtime spike and source inspection, both on
+  rmcp 3.5.0: `SubscriptionFilter` has no
   task category, `SubscriptionSink::send` rejects `notifications/tasks`,
   and the client `Subscription` rejects them too. Options: (a) custom glue
   sending task notifications on the active listen response stream, which
@@ -750,7 +750,7 @@ of client `protocolVersion` + capabilities at legacy `initialize` and
 modern discover/request scope so the tripwire covers both lifecycles and
 makes disabled or old-flavor task clients visible in telemetry.
 
-## Spike findings (rmcp 3.1, branch `spike/rmcp-3-exemplar`)
+## Spike findings (rmcp 3.5.0, branch `spike/rmcp-3-exemplar`)
 
 A standalone exemplar crate (`spikes/rmcp-3-exemplar/`, detached workspace)
 exercises every mechanic in this plan: dual-stack stateless/legacy serving,
@@ -758,7 +758,7 @@ per-request scope extraction, the strict tasks dual-shape gate, listen,
 MRTR with HMAC requestState, the resource plane with cursor pagination,
 cache hints, deterministic tools/list, and Tier-0 progress. Six integration
 tests green; `cargo run --bin demo_client` prints a narrated walkthrough of
-all nine mechanics. Verified independently lane-side 2026-08-04.
+all nine mechanics. The crate pins `rmcp = "=3.5.0"`.
 
 Friction items the spike surfaced (full writeup in the spike README):
 
@@ -773,10 +773,10 @@ Friction items the spike surfaced (full writeup in the spike README):
    internal `ProgressTokenProvider` value before sending. Server-side echo
    (our `progress.rs` pattern) is unaffected, but harness client code must
    not assume it controls the token value.
-6. `ServerInfo`/`ClientInfo` are non-exhaustive aliases: constructors and
-   fluent setters, no struct literals (mechanical, Phase 0 tail). rmcp
-   3.4.0 deprecates the aliases outright (#1156); target the underlying
-   types when selecting 3.4.0.
+6. `ServerConfig`/`ClientConfig` are non-exhaustive: constructors and
+   fluent setters, no struct literals. The `ServerInfo`/`ClientInfo`
+   aliases are deprecated (#1156), and so is `RequestStateCodec::new`;
+   `try_new` enforces the minimum signing-key length.
 7. Modern lifecycle metadata validation is strict: a client advertising
    2026-07-28 without the required request `_meta` gets `-32602`. Matters
    for hand-rolled clients and for our harness client's modern path.
