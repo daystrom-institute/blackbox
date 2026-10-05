@@ -3,7 +3,7 @@ use std::sync::Arc;
 use rmcp::{
     ClientHandler,
     model::{
-        ClientCapabilities, ClientInfo, ElicitRequestParams, ElicitResult, ElicitationAction,
+        ClientCapabilities, ClientConfig, ElicitRequestParams, ElicitResult, ElicitationAction,
         ElicitationCapability, FormElicitationCapability, Implementation,
         ProgressNotificationParam, ProtocolVersion, TaskStatusNotificationParams,
     },
@@ -83,7 +83,7 @@ impl DemoClientHandler {
 }
 
 impl ClientHandler for DemoClientHandler {
-    fn get_info(&self) -> ClientInfo {
+    fn get_info(&self) -> ClientConfig {
         let builder = ClientCapabilities::builder().enable_elicitation_with(
             ElicitationCapability::new()
                 .with_form(FormElicitationCapability::new().with_schema_validation(true)),
@@ -93,7 +93,7 @@ impl ClientHandler for DemoClientHandler {
         } else {
             builder.build()
         };
-        ClientInfo::new(
+        ClientConfig::new(
             capabilities,
             Implementation::new("rmcp-3-exemplar-client", env!("CARGO_PKG_VERSION")),
         )

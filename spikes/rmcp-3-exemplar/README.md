@@ -1,4 +1,4 @@
-# rmcp 3.1 MCP 2026-07-28 Exemplar
+# rmcp 3.5 MCP 2026-07-28 Exemplar
 
 This standalone crate is a reference implementation for the MCP mechanics in
 `design/surfaces/mcp/mcp-2026-07-28-target-surface.md` and
@@ -28,7 +28,7 @@ session creation.
 - Production preview: `src/server/mcp.rs`, `src/server/handler.rs`,
   `src/mcp_client.rs`, and `crates/bro-harness/src/mcp.rs`.
 
-rmcp 3.1 does not permit one service to combine `NeverSessionManager` with
+rmcp 3.5 does not permit one service to combine `NeverSessionManager` with
 working legacy sessions. `NeverSessionManager::create_session` always fails,
 while legacy mode routes `initialize` through that method. The spike therefore
 shows the valid configurations explicitly: a dual-stack compatibility endpoint
@@ -72,7 +72,7 @@ results, and cooperative cancellation through a `CancellationToken`.
   path, and surface-packet mutation handlers.
 
 `demo_mutate_surface` emits `notifications/tools/list_changed` through
-`SubscriptionSink`. Task transitions are custom glue because rmcp 3.1 rejects
+`SubscriptionSink`. Task transitions are custom glue because rmcp 3.5 rejects
 `notifications/tasks` in both `SubscriptionSink` and the client
 `Subscription`. The spike sends those notifications on the active listen
 response stream without subscription metadata, where `ClientHandler` receives
@@ -140,7 +140,7 @@ The binary uses `serve_with_lifecycle` in `Auto`, `Discover`, and legacy
 listen notifications, tasks, polling, MRTR automatic and manual rounds,
 progress, and strict legacy plain-JSON task fallback.
 
-## rmcp 3.1 API Friction
+## rmcp 3.5 API Friction
 
 1. `NeverSessionManager` and working legacy sessions are mutually exclusive,
    even when `with_legacy_session_mode(true)` is set.

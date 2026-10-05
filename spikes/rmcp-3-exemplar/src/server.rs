@@ -17,7 +17,7 @@ use rmcp::{
         InputRequest, InputRequiredResult, ListResourceTemplatesResult, ListResourcesResult,
         ListToolsResult, PaginatedRequestParams, ProgressNotificationParam, ProtocolVersion,
         ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
-        ResourceContents, ResourceTemplate, ServerCapabilities, ServerInfo, ServerNotification,
+        ResourceContents, ResourceTemplate, ServerCapabilities, ServerConfig, ServerNotification,
         Task, TaskPayload, TaskStatus, TaskStatusNotification, TaskStatusNotificationParams, Tool,
         ToolAnnotations,
     },
@@ -110,9 +110,10 @@ impl Default for DemoServer {
             state: Arc::new(DemoState {
                 tasks: Mutex::new(HashMap::new()),
                 events,
-                deploy_codec: rmcp::model::RequestStateCodec::new(
-                    b"rmcp-3-exemplar-request-state-secret-key",
-                ),
+                deploy_codec: rmcp::model::RequestStateCodec::try_new(
+                    b"rmcp-3-exemplar-request-state-secret-key".to_vec(),
+                )
+                .expect("exemplar signing key meets the minimum length"),
             }),
         }
     }
@@ -403,8 +404,8 @@ impl ServerHandler for DemoServer {
         ])
     }
 
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(
             ServerCapabilities::builder()
                 .enable_resources()
                 .enable_resources_list_changed()

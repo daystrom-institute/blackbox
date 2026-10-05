@@ -15,7 +15,7 @@ fn args(value: Value) -> Map<String, Value> {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let server = DemoServer::spawn().await?;
-    println!("rmcp 3.1 MCP 2026-07-28 walkthrough");
+    println!("rmcp 3.5 MCP 2026-07-28 walkthrough");
     println!("server: {}", server.base_url);
 
     println!("\n1. Auto lifecycle against the NeverSessionManager endpoint");
