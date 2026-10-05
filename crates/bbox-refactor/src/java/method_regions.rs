@@ -390,6 +390,15 @@ fn region_fact_for_bytes(
     if !non_local_control_flow.is_empty() {
         stop_reasons.push("non_local_control_flow".to_string());
     }
+    // The planner extracts only a whole run of sibling statements of one
+    // block. A region that is a comment, the braceless body of an `if` or
+    // loop, an arrow switch rule body, or a requested range that cuts a
+    // statement would be refused, so it is not reported as extractable.
+    if super::extract_code_block::statement_aligned_count(method, source, byte_start, byte_end)
+        .is_none()
+    {
+        stop_reasons.push("selection_not_statement_aligned".to_string());
+    }
     let live_out_count = live_outs.len();
     let field_touches = field_touches_in_range(
         method,

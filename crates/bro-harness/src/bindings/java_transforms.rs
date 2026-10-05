@@ -11541,7 +11541,17 @@ REFUSALS
                                     the largest aligned run inside it. Rebuild
                                     oldText from one of those ranges: see
                                     analysis.methodRegions statement regions,
-                                    then code.readLines({ file, startLine, endLine })
+                                    then code.readLines({ file, startLine, endLine }).
+                                    Also refused, and named in the message: a
+                                    whole statement that is the braceless body
+                                    of an if/else/loop/label or the unbraced
+                                    body of an arrow switch rule (no block to
+                                    replace it in; add braces first), and a
+                                    braced body selected whole with its braces
+                                    (select the statements inside instead). A
+                                    comment-only selection, one that starts or
+                                    ends inside a comment, and one that takes a
+                                    case label with it are refused too.
   oldText match failures            selected text must match exactly once
 
 RECIPE

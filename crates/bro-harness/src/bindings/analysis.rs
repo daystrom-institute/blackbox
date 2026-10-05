@@ -1158,6 +1158,13 @@ RETURNS
     extractability        { can_extract_with_current_tool, stop_reasons,
                             live_out_count, mutated_capture_count,
                             non_local_control_flow_count }
+                          stop_reasons uses the planner's own rules, including
+                          selection_not_statement_aligned: the region is not a
+                          whole run of sibling statements of one block. That
+                          covers a comment, a range that cuts a statement, the
+                          braceless body of an if/else/loop, and the unbraced
+                          body of an arrow switch rule. java.extractMethodCodeBlock
+                          refuses the same regions.
 
 RECIPE (monolithic-method stage extraction)
   // For large methods, search/filter first instead of materializing every statement.

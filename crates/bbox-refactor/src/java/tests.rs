@@ -10396,6 +10396,255 @@ fn align_extract_params(dir: &Path, source: &str, old_text: &str) -> RefactorPla
     params
 }
 
+const ALIGN_SHAPES_FIXTURE: &str = "package p;\n\
+     class Align {\n\
+     \x20   void run(int x) {\n\
+     \x20       String note = \"h\u{00e9}llo \u{4e16}\u{754c}\"; // caf\u{00e9}\n\
+     \x20       if (x > 0)\n\
+     \x20           System.out.println(note);\n\
+     \x20       switch (x) {\n\
+     \x20           case 1 -> System.out.println(\"one\");\n\
+     \x20           default -> { System.out.println(\"other\"); }\n\
+     \x20       }\n\
+     \x20       switch (x) {\n\
+     \x20           case 2:\n\
+     \x20               System.out.println(\"two\");\n\
+     \x20               break;\n\
+     \x20           default:\n\
+     \x20               break;\n\
+     \x20       }\n\
+     \x20       /* block comment */\n\
+     \x20       System.out.println(\"tail\");\n\
+     \x20   }\n\
+     }\n";
+
+fn align_shapes_error(old_text: &str) -> String {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let params = align_extract_params(&root, ALIGN_SHAPES_FIXTURE, old_text);
+    plan_extract_java_code_block_to_method(&params)
+        .unwrap_err()
+        .to_string()
+}
+
+#[test]
+fn extract_java_code_block_to_method_refuses_a_braceless_body_and_says_why() {
+    let err = align_shapes_error("System.out.println(note);");
+    assert!(
+        err.contains("error.selection_not_statement_aligned"),
+        "{err}"
+    );
+    assert!(err.contains("old_text (line 6)"), "{err}");
+    assert!(
+        err.contains("braceless body of an if, else, loop or label"),
+        "{err}"
+    );
+    // The enclosing if statement is the smallest thing that can be extracted.
+    assert!(
+        err.contains("smallest statement-aligned run containing it: lines 5-6 (1 statement)"),
+        "{err}"
+    );
+}
+
+#[test]
+fn extract_java_code_block_to_method_refuses_an_arrow_switch_rule_body_and_says_why() {
+    let err = align_shapes_error("System.out.println(\"one\");");
+    assert!(
+        err.contains("error.selection_not_statement_aligned"),
+        "{err}"
+    );
+    assert!(err.contains("old_text (line 8)"), "{err}");
+    assert!(
+        err.contains("unbraced body of an arrow switch rule"),
+        "{err}"
+    );
+}
+
+#[test]
+fn extract_java_code_block_to_method_explains_only_selections_in_body_position() {
+    let explained = |err: &str| err.contains("; the selection is the ");
+    // A condition is not a body: refused, with no body explanation.
+    let err = align_shapes_error("(x > 0)");
+    assert!(
+        err.contains("error.selection_not_statement_aligned"),
+        "{err}"
+    );
+    assert!(!explained(&err), "{err}");
+    // A case label is not a body either.
+    let err = align_shapes_error("case 1");
+    assert!(
+        err.contains("error.selection_not_statement_aligned"),
+        "{err}"
+    );
+    assert!(!explained(&err), "{err}");
+
+    // A braced arrow-rule body selected whole is told the truth about itself.
+    let err = align_shapes_error("{ System.out.println(\"other\"); }");
+    assert!(
+        err.contains("whole braced body of an arrow switch rule"),
+        "{err}"
+    );
+    assert!(!err.contains("wrap it in braces"), "{err}");
+    assert!(!err.contains("give the rule a braced body"), "{err}");
+
+    // So is a braced if body, on a fixture that has one.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let braced = "{\n            // log both\n            System.out.println(a);\n            \
+                  System.out.println(x); // tail\n        }";
+    let params = align_extract_params(&root, ALIGN_FIXTURE, braced);
+    let err = plan_extract_java_code_block_to_method(&params)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("error.selection_not_statement_aligned"),
+        "{err}"
+    );
+    assert!(
+        err.contains("whole braced body of an if, else, loop or label"),
+        "{err}"
+    );
+    assert!(!err.contains("wrap it in braces"), "{err}");
+}
+
+#[test]
+fn extract_java_code_block_to_method_refuses_comment_and_case_label_selections() {
+    // Only a comment: nothing is left after trimming.
+    let err = align_shapes_error("/* block comment */");
+    assert!(
+        err.contains("error.selection_not_statement_aligned"),
+        "{err}"
+    );
+    assert!(err.contains("old_text (line 18)"), "{err}");
+
+    // Starts in the middle of a comment and runs through the next statement.
+    let err = align_shapes_error("comment */\n        System.out.println(\"tail\");");
+    assert!(
+        err.contains("error.selection_not_statement_aligned"),
+        "{err}"
+    );
+    assert!(
+        err.contains("largest statement-aligned run inside it: line 19 (1 statement)"),
+        "{err}"
+    );
+
+    // Takes the case label along with the statements of its group.
+    let err = align_shapes_error(
+        "case 2:\n                System.out.println(\"two\");\n                break;",
+    );
+    assert!(
+        err.contains("error.selection_not_statement_aligned"),
+        "{err}"
+    );
+    assert!(
+        err.contains("largest statement-aligned run inside it: lines 13-14 (2 statements)"),
+        "{err}"
+    );
+}
+
+#[test]
+fn extract_java_code_block_to_method_reports_lines_past_multibyte_text_and_a_leading_newline() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    // The selection starts with the newline that ends line 18, so its first
+    // byte is on line 18 while its statement is on line 19, and every byte
+    // offset lies past the multi-byte text on line 4.
+    let source = ALIGN_SHAPES_FIXTURE;
+    let tail = "System.out.println(\"tail\");";
+    let selection = format!("\n        {tail}");
+    let params = align_extract_params(&root, source, &selection);
+    let plan_json = plan_extract_java_code_block_to_method(&params).unwrap();
+    let plan: RefactorPlan = serde_json::from_str(&plan_json).unwrap();
+    let item = plan
+        .items
+        .iter()
+        .find(|item| item.kind == crate::JAVA_EXTRACT_CALL_SITE_ITEM_KIND)
+        .expect("call-site item");
+    // Byte offsets, not character offsets: the range is the selection
+    // exactly, and the lines are the statement's.
+    assert_eq!(&source[item.byte_start..item.byte_end], selection);
+    assert_eq!((item.line_start, item.line_end), (19, 19), "{item:?}");
+
+    // A refusal on the same fixture names the statement's line as well.
+    let err = align_shapes_error("\n        System.out.println(\"tail\")");
+    assert!(err.contains("old_text (line 19)"), "{err}");
+}
+
+#[test]
+fn method_regions_report_unaligned_regions_the_way_the_planner_refuses_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Align.java");
+    fs::write(&path, ALIGN_SHAPES_FIXTURE).unwrap();
+    let source = ALIGN_SHAPES_FIXTURE;
+    let range_of = |text: &str| {
+        let start = source.find(text).expect("fixture text");
+        JavaMethodRegionRequest {
+            label: Some(text.to_string()),
+            byte_start: Some(start),
+            byte_end: Some(start + text.len()),
+            start_line: None,
+            end_line: None,
+        }
+    };
+    let requests = [
+        range_of("System.out.println(note);"),
+        range_of("System.out.println(\"one\");"),
+        range_of("/* block comment */"),
+        range_of("System.out.println(\"tail\")"),
+        range_of("System.out.println(\"tail\");"),
+        range_of("System.out.println(\"two\");\n                break;"),
+    ];
+    let facts = analyze_java_method_regions_with_options(
+        &path,
+        "run",
+        Some("Align"),
+        Some(&requests),
+        Some(&JavaMethodRegionsOptions {
+            include_nested_statement_regions: true,
+            ..Default::default()
+        }),
+    )
+    .unwrap();
+    let unaligned = |region: &JavaMethodRegionFact| {
+        region
+            .extractability
+            .stop_reasons
+            .contains(&"selection_not_statement_aligned".to_string())
+    };
+    let expected = [true, true, true, true, false, false];
+    for (region, expected) in facts.requested_ranges.iter().zip(expected) {
+        assert_eq!(unaligned(region), expected, "{:?}", region.label);
+        if expected {
+            assert!(!region.extractability.can_extract_with_current_tool);
+        }
+    }
+
+    // Every statement region the analysis offers agrees with the planner: it
+    // is marked unaligned exactly when the planner refuses its text for
+    // alignment.
+    assert!(
+        facts.statement_regions.len() >= 8,
+        "{:?}",
+        facts.statement_regions.len()
+    );
+    for region in &facts.statement_regions {
+        let text = &source[region.byte_start..region.byte_end];
+        if source.matches(text).count() != 1 {
+            continue;
+        }
+        let root = dir.path().canonicalize().unwrap();
+        let params = align_extract_params(&root, source, text);
+        let refused = plan_extract_java_code_block_to_method(&params)
+            .err()
+            .is_some_and(|error| {
+                error
+                    .to_string()
+                    .contains("selection_not_statement_aligned")
+            });
+        assert_eq!(unaligned(region), refused, "{} -> {text:?}", region.id);
+    }
+}
+
 #[test]
 fn extract_java_code_block_to_method_refuses_selection_short_of_statement_end() {
     let dir = tempfile::tempdir().unwrap();

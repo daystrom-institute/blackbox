@@ -41,14 +41,27 @@
 //!   start of a statement and end at the end of a statement of the same
 //!   block (or constructor body, or switch group). The refusal names the
 //!   line range of the smallest aligned run containing the selection and
-//!   of the largest aligned run inside it, when one exists.
+//!   of the largest aligned run inside it, when one exists. Two shapes are
+//!   refused under this rule even though the selection is a whole
+//!   statement, because that statement has no block to be replaced in: the
+//!   braceless body of an `if`, `else`, loop or label, and the unbraced
+//!   body of an arrow switch rule (`case X -> stmt;`). The refusal says
+//!   which; wrap the statement in braces first, or select the enclosing
+//!   statement. A braced body selected whole, braces included, is refused
+//!   with its own sentence: select the statements inside the braces. The
+//!   explanation is given only for a node in body position, so a
+//!   condition or a `case` label never gets it. A selection that is only
+//!   whitespace and comments, that starts or ends inside a comment, or
+//!   that takes a `case` label with it is refused under the general rule.
 //!
 //! ## Call-site item
 //!
 //! The plan carries one `items` entry of kind
 //! `JAVA_EXTRACT_CALL_SITE_ITEM_KIND` whose byte range is exactly the
 //! call-site edit's range, with 1-based inclusive lines and a
-//! `statement_count=<n>` attribute.
+//! `statement_count=<n>` attribute. The lines are those the range's
+//! non-whitespace text occupies, so a selection that begins with a line
+//! break reports the line of its first statement.
 //!
 //! ## Operator overrides
 //!
@@ -576,6 +589,87 @@ fn find_enclosing_method_node<'a>(
     None
 }
 
+/// The number of sibling statements `start..end` covers exactly, after
+/// trimming surrounding whitespace and comments, or `None` when the range
+/// is not a whole run of statements of one block. This is the alignment
+/// rule the planner enforces; region analysis reports against the same one.
+pub(super) fn statement_aligned_count(
+    enclosing_method: Node<'_>,
+    source: &str,
+    start: usize,
+    end: usize,
+) -> Option<usize> {
+    let body = enclosing_method.child_by_field_name("body")?;
+    let comments = comment_ranges(body, source);
+    let (start, end) = trim_selection(source, &comments, start, end);
+    aligned_statement_count(body, start, end)
+}
+
+/// Why a selection that is exactly one statement is still not extractable:
+/// the statement is not a member of any block.
+fn uncontained_statement_reason(body: Node<'_>, start: usize, end: usize) -> Option<&'static str> {
+    if start >= end {
+        return None;
+    }
+    let mut node = body.descendant_for_byte_range(start, end.saturating_sub(1))?;
+    while node.start_byte() != start || node.end_byte() != end {
+        if node.id() == body.id() {
+            return None;
+        }
+        node = node.parent()?;
+    }
+    // Climb through wrappers that share the same span to the outermost one.
+    while let Some(parent) = node.parent() {
+        if parent.id() == body.id() || parent.start_byte() != start || parent.end_byte() != end {
+            break;
+        }
+        node = parent;
+    }
+    let parent = node.parent()?;
+    let in_body_position = match parent.kind() {
+        "if_statement" => ["consequence", "alternative"]
+            .iter()
+            .any(|field| is_field_child(parent, field, node)),
+        "while_statement" | "for_statement" | "enhanced_for_statement" | "do_statement" => {
+            is_field_child(parent, "body", node)
+        }
+        // A label names the statement that follows it; the label itself is
+        // an identifier, never a statement.
+        "labeled_statement" => node.kind() != "identifier",
+        // An arrow rule is a label followed by one body.
+        "switch_rule" => node.kind() != "switch_label",
+        _ => false,
+    };
+    if !in_body_position {
+        return None;
+    }
+    let is_rule = parent.kind() == "switch_rule";
+    Some(match (node.kind() == "block", is_rule) {
+        (false, false) => {
+            "the selection is the braceless body of an if, else, loop or label, which has no \
+             block to be replaced in; wrap it in braces first or select the enclosing statement"
+        }
+        (false, true) => {
+            "the selection is the unbraced body of an arrow switch rule, which has no block to \
+             be replaced in; give the rule a braced body first or select the whole switch"
+        }
+        (true, false) => {
+            "the selection is the whole braced body of an if, else, loop or label, braces \
+             included; select the statements inside the braces or the enclosing statement"
+        }
+        (true, true) => {
+            "the selection is the whole braced body of an arrow switch rule, braces included; \
+             select the statements inside the braces or the whole switch"
+        }
+    })
+}
+
+fn is_field_child(parent: Node<'_>, field: &str, node: Node<'_>) -> bool {
+    parent
+        .child_by_field_name(field)
+        .is_some_and(|child| child.id() == node.id())
+}
+
 /// Refuse a selection that is not a whole run of sibling statements.
 ///
 /// Leading and trailing whitespace and comments are trimmed from the
@@ -608,6 +702,9 @@ fn require_statement_aligned_selection(
          statement boundaries of one block",
         line_range_label(source, hint_start, hint_end)
     );
+    if let Some(reason) = uncontained_statement_reason(body, start, end) {
+        message.push_str(&format!("; {reason}"));
+    }
     if let Some(run) = smallest_run_containing(body, hint_start, hint_end) {
         message.push_str(&format!(
             "; smallest statement-aligned run containing it: {} ({})",
@@ -850,7 +947,17 @@ fn call_site_item(
     region_end: usize,
     statement_count: usize,
 ) -> SyntaxItem {
-    let (line_start, line_end) = line_span(source, region_start, region_end);
+    // The byte range is the edit's, whitespace included. The lines are the
+    // ones its text occupies: a selection that begins with the newline ending
+    // the previous line does not start on that line.
+    let text = &source[region_start..region_end];
+    let visible_start = region_start + (text.len() - text.trim_start().len());
+    let visible_end = region_start + text.trim_end().len();
+    let (line_start, line_end) = if visible_start < visible_end {
+        line_span(source, visible_start, visible_end)
+    } else {
+        line_span(source, region_start, region_end)
+    };
     SyntaxItem {
         plan_local_id: format!("{JAVA_EXTRACT_CALL_SITE_ITEM_KIND}:{region_start}:{region_end}"),
         kind: JAVA_EXTRACT_CALL_SITE_ITEM_KIND.to_string(),
