@@ -1625,7 +1625,7 @@ impl BlackboxServer {
                 combined.push('\n');
             }
             combined = view.append_built_from_for_ids(combined, &returned_ids);
-            let mut measured = CallToolResult::success(vec![rmcp::model::Content::text(combined.clone())]);
+            let mut measured = Self::tool_result(vec![rmcp::model::ContentBlock::text(combined.clone())]);
             measured.structured_content = Some(structured.clone());
             measured.is_error = Some(false);
             if serde_json::to_vec(&measured)?.len() > Self::MCP_RESPONSE_CAP_BYTES {

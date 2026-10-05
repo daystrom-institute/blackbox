@@ -17,7 +17,7 @@ parking_lot = "0.12"
 strum = { version = "0.26", features = ["derive"] }
 tracing = "0.1"
 tokio = { version = "1", features = ["full"] }
-rmcp = { version = "1.4", features = [
+rmcp = { version = "3.5", features = [
     "server",
     "macros",
     "transport-streamable-http-server",

@@ -23,7 +23,7 @@ strum = { version = "0.26", features = ["derive"] }
 tracing = "0.1"
 chrono = "0.4"
 tokio = { version = "1", features = ["full"] }
-rmcp = { version = "1.4", features = [
+rmcp = { version = "3.5", features = [
     "server",
     "macros",
     "transport-streamable-http-server",

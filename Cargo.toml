@@ -73,6 +73,7 @@ members = [
 name = "blackbox"
 version = "0.0.1"
 edition = "2024"
+rust-version = "1.88"
 build = "build.rs"
 
 [lints.rust]
@@ -157,7 +158,7 @@ tokio-metrics = "0.5"
 async-trait = "0.1"
 
 # MCP SDK
-rmcp = { version = "1.4", features = [
+rmcp = { version = "3.5", features = [
     "server",
     "macros",
     "transport-streamable-http-server",

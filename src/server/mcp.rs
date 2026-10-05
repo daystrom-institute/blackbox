@@ -21,7 +21,7 @@ pub(super) fn build_http_app(
     let server_config = StreamableHttpServerConfig::default()
         .with_allowed_hosts(cfg.daemon.mcp_allowed_hosts.clone())
         .with_cancellation_token(ct.child_token())
-        .with_stateful_mode(true);
+        .with_legacy_session_mode(true);
 
     let shared_for_mcp = shared.clone();
     let session_keep_alive = cfg.daemon.mcp_session_keepalive_secs;
@@ -230,6 +230,127 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    async fn post_mcp(
+        headers: &[(&str, &str)],
+        body: serde_json::Value,
+    ) -> (StatusCode, axum::http::HeaderMap, String) {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/mcp?surface=interactive")
+            .header("accept", "application/json, text/event-stream")
+            .header("content-type", "application/json")
+            .header("host", "127.0.0.1");
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let response = test_app()
+            .oneshot(request.body(Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            axum::body::to_bytes(response.into_body(), 1 << 20),
+        )
+        .await
+        .map(|bytes| String::from_utf8(bytes.unwrap().to_vec()).unwrap())
+        .unwrap_or_default();
+        (status, headers, body)
+    }
+
+    fn modern_meta() -> serde_json::Value {
+        serde_json::json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientInfo": {"name": "modern-test", "version": "1"},
+            "io.modelcontextprotocol/clientCapabilities": {},
+        })
+    }
+
+    fn initialize_body(protocol_version: &str) -> serde_json::Value {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": protocol_version,
+                "capabilities": {},
+                "clientInfo": {"name": "wire-test", "version": "1"}
+            }
+        })
+    }
+
+    /// Scope is pinned at `initialize`, so a client naming a newer revision is
+    /// answered with the newest handshake revision the wire head serves.
+    #[tokio::test]
+    async fn initialize_answers_with_a_handshake_revision() {
+        for (requested, negotiated) in [
+            ("2026-07-28", "2025-06-18"),
+            ("2025-11-25", "2025-06-18"),
+            ("2025-06-18", "2025-06-18"),
+            ("2025-03-26", "2025-03-26"),
+        ] {
+            let (status, headers, body) = post_mcp(&[], initialize_body(requested)).await;
+            assert_eq!(status, StatusCode::OK, "{requested}");
+            assert!(headers.contains_key("mcp-session-id"), "{requested}");
+            assert!(
+                body.contains(&format!(r#""protocolVersion":"{negotiated}""#)),
+                "{requested}: {body}"
+            );
+            assert!(!body.contains("resultType"), "{requested}: {body}");
+        }
+    }
+
+    /// A sessionless request would bypass the surface, project and workspace
+    /// binding pinned at `initialize`, so the stateless lifecycle is refused
+    /// before any handler runs.
+    #[tokio::test]
+    async fn stateless_lifecycle_requests_are_refused() {
+        let call = serde_json::json!({
+            "name": "bbox_thread_list",
+            "arguments": {},
+            "_meta": modern_meta(),
+        });
+        for (method, extra_header, params) in [
+            (
+                "server/discover",
+                None,
+                serde_json::json!({"_meta": modern_meta()}),
+            ),
+            (
+                "tools/list",
+                None,
+                serde_json::json!({"_meta": modern_meta()}),
+            ),
+            ("tools/call", Some(("mcp-name", "bbox_thread_list")), call),
+        ] {
+            let mut headers = vec![
+                ("mcp-protocol-version", "2026-07-28"),
+                ("mcp-method", method),
+            ];
+            headers.extend(extra_header);
+            let body = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": method,
+                "params": params,
+            });
+            let (status, headers, body) = post_mcp(&headers, body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{method}: {body}");
+            assert!(!headers.contains_key("mcp-session-id"), "{method}");
+            let reply: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(reply["error"]["code"], -32022, "{method}: {body}");
+            assert!(reply.get("result").is_none(), "{method}: {body}");
+        }
+
+        let (status, _, body) = post_mcp(
+            &[("mcp-protocol-version", "2025-06-18")],
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
     }
 
     /// The generic control plane is reachable at the neutral `/control/*`

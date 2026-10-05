@@ -20,7 +20,7 @@ use bro_tools::{Tool, ToolCx, ToolResult};
 use http::{HeaderName, HeaderValue};
 
 use rmcp::ServiceExt;
-use rmcp::model::CallToolRequestParams;
+use rmcp::model::{CallToolRequestParams, ClientConfig, ProtocolVersion};
 
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::transport::{ConfigureCommandExt, StreamableHttpClientTransport, TokioChildProcess};
@@ -262,6 +262,12 @@ enum McpBackend {
     InProcess(Arc<dyn McpSurface>),
 }
 
+/// Client identity for the `initialize` handshake. Connections use the legacy
+/// lifecycle, so the requested revision must be one that has a handshake.
+fn legacy_client_config() -> ClientConfig {
+    ClientConfig::default().with_protocol_version(ProtocolVersion::V_2025_06_18)
+}
+
 /// Start one persistent connection to a remote (stdio/http/sse) MCP server.
 /// InProcess servers have no rmcp connection and are handled by the caller.
 async fn start_remote_server(
@@ -275,12 +281,12 @@ async fn start_remote_server(
             let mut cmd = tokio::process::Command::new(command);
             cmd.args(args).envs(env).kill_on_drop(true);
             let transport = TokioChildProcess::new(cmd.configure(|_| {}))?;
-            ().serve(transport).await?
+            legacy_client_config().serve(transport).await?
         }
         McpServerConfig::Http { url, headers, .. } => {
             let transport =
                 StreamableHttpClientTransport::from_config(http_transport_config(url, headers)?);
-            ().serve(transport).await?
+            legacy_client_config().serve(transport).await?
         }
         McpServerConfig::Sse { .. } => anyhow::bail!("legacy SSE MCP transport is unsupported"),
         McpServerConfig::InProcess { .. } => {

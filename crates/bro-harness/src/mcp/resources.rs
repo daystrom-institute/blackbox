@@ -2804,7 +2804,10 @@ mod tests {
                     .unwrap();
             }
         });
-        let running = ().serve(client).await.unwrap();
+        let running = crate::mcp::legacy_client_config()
+            .serve(client)
+            .await
+            .unwrap();
         RemoteFixture {
             connection: Arc::new(super::super::remote::ServerConn::new(
                 running,

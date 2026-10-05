@@ -30,7 +30,7 @@ impl BlackboxServer {
             || (text.len() <= Self::MCP_RESPONSE_CAP_BYTES
                 && serde_json::from_str::<Value>(text)
                     .is_ok_and(|value| Self::is_invocation_error(&value)));
-        let mut response = CallToolResult::success(text.to_string().into_contents());
+        let mut response = Self::tool_result(text.to_string().into_contents());
         response.structured_content = structured;
         response.is_error = Some(is_error || typed_error);
         let bytes = Self::response_bytes(&response);
@@ -66,7 +66,7 @@ impl BlackboxServer {
         if let Some(tool) = tool {
             error["tool"] = Value::String(tool.into());
         }
-        let mut result = CallToolResult::success(error.to_string().into_contents());
+        let mut result = Self::tool_result(error.to_string().into_contents());
         result.structured_content = Some(error);
         result.is_error = Some(true);
         result
@@ -80,6 +80,15 @@ impl BlackboxServer {
             .get("status")
             .and_then(Value::as_str)
             .is_some_and(|status| status.starts_with("error."))
+    }
+
+    /// Build a tool result in the shape the wire head serves: revisions with
+    /// an `initialize` handshake carry no result-type discriminator, and the
+    /// same value is serialized for control-plane replies and byte budgets.
+    pub(crate) fn tool_result(content: Vec<rmcp::model::ContentBlock>) -> CallToolResult {
+        let mut result = CallToolResult::success(content);
+        result.result_type = None;
+        result
     }
 
     fn response_bytes(response: &CallToolResult) -> usize {

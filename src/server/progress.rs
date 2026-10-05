@@ -277,12 +277,13 @@ pub(crate) fn spawn_progress_notifier(
 
             let send_result = peer
                 .send_notification(rmcp::model::ServerNotification::ProgressNotification(
-                    rmcp::model::Notification::new(rmcp::model::ProgressNotificationParam {
-                        progress_token: progress_token.clone(),
-                        progress: tick as f64,
-                        total: None,
-                        message: Some(msg.clone()),
-                    }),
+                    rmcp::model::Notification::new(
+                        rmcp::model::ProgressNotificationParam::new(
+                            progress_token.clone(),
+                            tick as f64,
+                        )
+                        .with_message(msg.clone()),
+                    ),
                 ))
                 .await;
             match send_result {

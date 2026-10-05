@@ -17,7 +17,7 @@ bbox-corpus-core = { path = "../bbox-corpus-core" }
 parking_lot = "0.12"
 strum = { version = "0.26", features = ["derive"] }
 tracing = "0.1"
-rmcp = { version = "1.4", features = [
+rmcp = { version = "3.5", features = [
     "server",
     "macros",
     "transport-streamable-http-server",

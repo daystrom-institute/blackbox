@@ -124,23 +124,50 @@ observable behavior change. Checklist:
 7. `Annotations.last_modified` is `Option<String>` (was
    `Option<DateTime<Utc>>`) if any tool touches it; `structured_content` is
    `Option<Value>` (we emit text content, so likely no-op).
-8. Result constructors now initialize `result_type: Some(COMPLETE)` and the
-   server omits it for legacy peers; no action beyond snapshot updates.
+8. Result constructors initialize `result_type: Some(COMPLETE)`; the SDK
+   strips it only on the MCP wire for legacy peers. The same
+   `CallToolResult` values are serialized for `/control/*` replies and for
+   the response byte budget, so the daemon builds tool results through
+   `BlackboxServer::tool_result`, which leaves the discriminator absent.
+   The harness removes `resultType` from the model-facing result envelope
+   with the other protocol metadata.
 9. The client call site keeps `serve()` (legacy lifecycle) in
    `crates/bro-harness/src/mcp.rs`. From rmcp
    3.5.0 the default client info (including the `()` handler's) requests
-   `initialize` at 2026-07-28, so zero behavior change requires a client
-   info pinned to `ProtocolVersion::LATEST_WITH_INITIALIZE`. The daemon's
-   `get_info()` default likewise names 2026-07-28; legacy negotiation still
-   echoes the client's supported handshake version.
-10. Compiler-driven remainder: "the compiler is your friend" per the
-    official guide. Deprecated-alias removals should not bite (we use
-    modern names), but expect a tail of renames.
+   `initialize` at 2026-07-28, so the harness serves a `ClientConfig`
+   pinned to `ProtocolVersion::V_2025_06_18`, the revision rmcp 1.4
+   requested.
+10. The daemon serves handshake revisions only. `StreamableHttpService`
+    routes `server/discover` and any request carrying 2026-07-28
+    per-request metadata to the stateless path even with
+    `with_legacy_session_mode(true)`, and that path never calls
+    `initialize`, where surface, project and workspace-binding scope are
+    pinned. Until Phase 1 moves that scope per-request, `BlackboxServer`
+    overrides `supported_protocol_versions()` to
+    `ProtocolVersion::known_up_to(V_2025_06_18)`, names that revision in
+    `get_info()`, and refuses `discover`. The SDK then rejects stateless
+    requests with HTTP 400 and JSON-RPC `-32022` before any handler runs.
+    Widening this set is the Phase 1 version gate (item 5 there), never a
+    side effect of an SDK bump.
+11. Compiler-driven remainder: `Content` -> `ContentBlock`,
+    `RawResource`/`Annotated` -> `Resource`, `PromptMessageRole` -> `Role`,
+    `ServerInfo` -> `ServerConfig`, `ReadResourceResponse` /
+    `GetPromptResponse` return types, and constructors for the
+    non-exhaustive param structs.
+
+Wire differences the bump cannot avoid: `serverInfo.version` and the
+harness `clientInfo.version` report the SDK version; a client requesting
+`2025-03-26` or `2024-11-05` is answered with its own revision where
+rmcp 1.4 always answered `2025-06-18`; a 2026-07-28 probe is refused with
+a JSON-RPC `-32022` body listing the supported revisions where rmcp 1.4
+returned a plain-text HTTP 400.
 
 Validation: `cargo check`, `cargo nextest run --workspace`, `cargo clippy`,
 `scripts/lint-concurrency.sh` (lane-side per the heavy-work contract). Boot a
 dev daemon (`docs/operations-isolated-dev-daemon.md`) and round-trip a real
-MCP client against `/mcp`. Optionally run the official MCP conformance tool
+MCP client against `/mcp`, including a client whose default path leads with
+`server/discover`: it must fall back to `initialize` after the `-32022`
+refusal and see its configured surface. Optionally run the official MCP conformance tool
 against the dev daemon (Q7).
 
 ## Phase 1: stateless-ready wire head + discover
@@ -175,7 +202,9 @@ path for current clients. No tasks/resources yet.
    default `supported_protocol_versions()` is `KNOWN_VERSIONS`, which
    includes 2026-07-28, and from rmcp 3.5.0 `ProtocolVersion::LATEST` is
    `V_2026_07_28`; the gate therefore lives in this override, not in SDK
-   defaults. Clients reach the modern lifecycle only through
+   defaults. Phase 0 leaves the override at handshake revisions up to
+   `2025-06-18` and `discover` refused; this item widens both only after
+   items 1-3 make scope per-request. Clients reach the modern lifecycle only through
    `serve_with_lifecycle` (`Discover` or `Auto`).
 6. Deterministic `tools/list` ordering; set `ttl_ms` +
    `cache_scope: Private` on `ListToolsResult`.

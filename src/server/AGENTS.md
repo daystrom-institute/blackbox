@@ -6,6 +6,15 @@
   per-session OnceLock that get_tool / list_tools / call_tool read. The
   project selector resolves through the Read-intent resolver (alias / id /
   path → base canonical path, literal fallback) into its own OnceLock.
+- Because scope is pinned at `initialize`, the wire head supports handshake
+  protocol revisions only (`supported_protocol_versions`, `get_info`) and
+  refuses `server/discover`. The SDK routes any supported no-handshake
+  revision to a stateless path that never calls `initialize`, which would
+  serve the default surface with no project or workspace binding. Widen the
+  supported set only together with per-request scope resolution.
+- Tool results are built through `BlackboxServer::tool_result`, which leaves
+  the result-type discriminator absent: the same value is serialized on the
+  legacy MCP wire, in `/control/*` replies and for the response budget.
 - An unknown surface must abort initialize BEFORE any session slot is set:
   a refused surface that still pins would leave a half-initialized session
   answering tool lists.

@@ -32,7 +32,7 @@ impl UncertainReason {
 }
 
 pub(super) struct ServerConn {
-    running: RunningService<RoleClient, ()>,
+    running: RunningService<RoleClient, rmcp::model::ClientConfig>,
     server: String,
     tool_timeout: Duration,
     uncertain: Mutex<Option<UncertainReason>>,
@@ -42,7 +42,7 @@ pub(super) struct ServerConn {
 
 impl ServerConn {
     pub(super) fn new(
-        running: RunningService<RoleClient, ()>,
+        running: RunningService<RoleClient, rmcp::model::ClientConfig>,
         server: String,
         tool_timeout_ms: u64,
     ) -> Self {
@@ -551,7 +551,10 @@ mod tests {
                     .unwrap();
             }
         });
-        let running = ().serve(client).await.unwrap();
+        let running = crate::mcp::legacy_client_config()
+            .serve(client)
+            .await
+            .unwrap();
         Fixture {
             connection: Arc::new(ServerConn::new(running, "fixture".into(), timeout_ms)),
             requests,

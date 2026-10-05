@@ -6,7 +6,7 @@
 //! omission explicitly rather than feeding base64 into model text.
 
 use bro_tools::ToolResult;
-use rmcp::model::{CallToolResult, Content};
+use rmcp::model::{CallToolResult, ContentBlock};
 use serde_json::{Value, json};
 
 pub(super) const RESULT_GUIDANCE: &str = "Returns {content, structuredContent?, isError}; on failure this envelope is in the error message.";
@@ -15,9 +15,9 @@ pub(crate) fn from_native_result(result: ToolResult) -> ToolResult {
     let mut envelope = CallToolResult::default();
     match result {
         ToolResult::Json(value) => envelope.structured_content = Some(value),
-        ToolResult::Text(text) => envelope.content.push(Content::text(text)),
+        ToolResult::Text(text) => envelope.content.push(ContentBlock::text(text)),
         ToolResult::Error(error) => {
-            envelope.content.push(Content::text(error));
+            envelope.content.push(ContentBlock::text(error));
             envelope.is_error = Some(true);
         }
     }
@@ -35,6 +35,7 @@ pub(super) fn to_tool_result(result: &CallToolResult) -> ToolResult {
         .as_object_mut()
         .expect("CallToolResult is an object");
     object.remove("_meta");
+    object.remove("resultType");
     let server_error = result.is_error.unwrap_or(false);
     object.insert("isError".into(), json!(server_error));
     let mut unsupported = Vec::new();
@@ -282,7 +283,10 @@ mod tests {
                     .unwrap();
             }
         });
-        let running = ().serve(client).await.unwrap();
+        let running = crate::mcp::legacy_client_config()
+            .serve(client)
+            .await
+            .unwrap();
         let stop = running.cancellation_token();
         let connection = Arc::new(ServerConn::new(running, "fixture".into(), 300_000));
         let spec = crate::mcp::remote_tool_spec(connection.list_tools().await.unwrap().remove(0));

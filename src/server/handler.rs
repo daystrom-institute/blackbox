@@ -5,11 +5,12 @@ use crate::server::{self, BlackboxServer};
 
 use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, CustomRequest, CustomResult, ErrorCode,
-    GetPromptRequestParams, GetPromptResult, InitializeRequestParams, InitializeResult,
-    ListPromptsResult, ListResourcesResult, ListToolsResult, PaginatedRequestParams, Prompt,
-    PromptArgument, PromptMessage, PromptMessageRole, RawResource, ReadResourceRequestParams,
-    ReadResourceResult, ResourceContents, ServerCapabilities, ServerInfo,
+    CallToolRequestParams, CallToolResponse, CustomRequest, CustomResult, DiscoverResult,
+    ErrorCode, GetPromptRequestParams, GetPromptResponse, GetPromptResult, InitializeRequestParams,
+    InitializeResult, ListPromptsResult, ListResourcesResult, ListToolsResult,
+    PaginatedRequestParams, Prompt, PromptArgument, PromptMessage, ProtocolVersion,
+    ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
+    ResourceContents, Role, ServerCapabilities, ServerConfig,
 };
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, ServerHandler, tool_handler};
@@ -71,15 +72,20 @@ impl BlackboxServer {
     }
 }
 
+/// The newest protocol revision this wire head serves. Surface, project and
+/// workspace-binding scope are pinned at `initialize`, so only revisions with
+/// that handshake are supported and `server/discover` is refused.
+const LEGACY_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V_2025_06_18;
+
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for BlackboxServer {
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         let mut extensions = BTreeMap::new();
         extensions.insert(
             "io.modelcontextprotocol/skills".to_string(),
             serde_json::Map::new(),
         );
-        ServerInfo::new(
+        ServerConfig::new(
             ServerCapabilities::builder()
                 .enable_extensions_with(extensions)
                 .enable_prompts()
@@ -87,8 +93,24 @@ impl ServerHandler for BlackboxServer {
                 .enable_tools()
                 .build(),
         )
+        .with_protocol_version(LEGACY_PROTOCOL_VERSION)
         .with_instructions(format!(
             "Blackbox provides unified transcript search, knowledge management, and multi-provider agent orchestration. Project onboarding is described by resource {ONBOARDING_SKILL_URI}."
+        ))
+    }
+
+    fn supported_protocol_versions(&self) -> std::borrow::Cow<'static, [ProtocolVersion]> {
+        std::borrow::Cow::Borrowed(ProtocolVersion::known_up_to(&LEGACY_PROTOCOL_VERSION))
+    }
+
+    async fn discover(
+        &self,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<DiscoverResult, ErrorData> {
+        Err(ErrorData::new(
+            ErrorCode::METHOD_NOT_FOUND,
+            "server/discover",
+            None,
         ))
     }
 
@@ -230,14 +252,12 @@ impl ServerHandler for BlackboxServer {
         _context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, ErrorData> {
         Ok(ListResourcesResult {
-            resources: vec![rmcp::model::Annotated::new(
-                RawResource::new(ONBOARDING_SKILL_URI, "onboard-project/SKILL.md")
+            resources: vec![
+                Resource::new(ONBOARDING_SKILL_URI, "onboard-project/SKILL.md")
                     .with_description(ONBOARDING_SKILL_DESCRIPTION)
                     .with_mime_type("text/markdown"),
-                None,
-            )],
-            next_cursor: None,
-            meta: None,
+            ],
+            ..Default::default()
         })
     }
 
@@ -245,7 +265,7 @@ impl ServerHandler for BlackboxServer {
         &self,
         request: ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<ReadResourceResult, ErrorData> {
+    ) -> Result<ReadResourceResponse, ErrorData> {
         if request.uri != ONBOARDING_SKILL_URI {
             return Err(ErrorData::resource_not_found(
                 format!("resource not found: {}", request.uri),
@@ -255,7 +275,8 @@ impl ServerHandler for BlackboxServer {
         Ok(ReadResourceResult::new(vec![
             ResourceContents::text(onboarding_skill::render(&self.state), ONBOARDING_SKILL_URI)
                 .with_mime_type("text/markdown"),
-        ]))
+        ])
+        .into())
     }
 
     async fn list_prompts(
@@ -273,8 +294,7 @@ impl ServerHandler for BlackboxServer {
                         .with_required(false),
                 ]),
             )],
-            next_cursor: None,
-            meta: None,
+            ..Default::default()
         })
     }
 
@@ -282,7 +302,7 @@ impl ServerHandler for BlackboxServer {
         &self,
         request: GetPromptRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<GetPromptResult, ErrorData> {
+    ) -> Result<GetPromptResponse, ErrorData> {
         if request.name != ONBOARDING_SKILL_NAME {
             return Err(ErrorData::invalid_params(
                 format!("unknown prompt: {}", request.name),
@@ -298,11 +318,11 @@ impl ServerHandler for BlackboxServer {
             .map(|path| format!("Please onboard the project at `{path}`."))
             .unwrap_or_else(|| "Please onboard the current project.".to_string());
         let message = format!("{}\n\n{target}\n", onboarding_skill::render(&self.state));
-        Ok(GetPromptResult::new(vec![PromptMessage::new_text(
-            PromptMessageRole::User,
-            message,
-        )])
-        .with_description(ONBOARDING_SKILL_DESCRIPTION))
+        Ok(
+            GetPromptResult::new(vec![PromptMessage::new_text(Role::User, message)])
+                .with_description(ONBOARDING_SKILL_DESCRIPTION)
+                .into(),
+        )
     }
 
     async fn on_custom_request(
@@ -338,7 +358,7 @@ impl ServerHandler for BlackboxServer {
         &self,
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, ErrorData> {
+    ) -> Result<CallToolResponse, ErrorData> {
         let surface = self.session_surface();
         if !self.session_tools().contains(request.name.as_ref()) {
             return Err(ErrorData::new(
@@ -435,7 +455,7 @@ mod tests {
 
         let resources = client.list_resources(None).await.unwrap();
         assert_eq!(resources.resources.len(), 1);
-        assert_eq!(resources.resources[0].raw.uri, ONBOARDING_SKILL_URI);
+        assert_eq!(resources.resources[0].uri, ONBOARDING_SKILL_URI);
         let read = client
             .read_resource(ReadResourceRequestParams::new(ONBOARDING_SKILL_URI))
             .await
