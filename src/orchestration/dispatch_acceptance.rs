@@ -432,6 +432,7 @@ mod acceptance {
                 "account": "acceptance-account",
                 "model": "glm-5.3-flash",
                 "effort": "high",
+                "code_mode": "only",
                 "tool_defaults": {
                     "default:file_read.max_lines": 111,
                     "default:shell_run.timeout_ms": 1000,
@@ -459,6 +460,7 @@ mod acceptance {
         assert_eq!(read(&child, "cwd").trim(), cwd);
         assert_eq!(flag(&first, "--model"), Some("glm-5.3-flash"), "{first:?}");
         assert_eq!(flag(&first, "--effort"), Some("high"), "{first:?}");
+        assert_eq!(flag(&first, "--code-mode"), Some("only"), "{first:?}");
         let context: Value =
             serde_json::from_str(flag(&first, "--additional-context").expect("context"))
                 .expect("context json");
@@ -554,6 +556,10 @@ mod acceptance {
         assert_eq!(flag(&argv, "--cwd"), Some(cwd), "{argv:?}");
         assert_eq!(flag(&argv, "--model"), Some("glm-5.3-flash"), "{argv:?}");
         assert_eq!(flag(&argv, "--effort"), Some("high"), "{argv:?}");
+        // Code mode and service tier stay with the session: the harness saved
+        // them, and passing either here would override that.
+        assert_eq!(flag(&argv, "--code-mode"), None, "{argv:?}");
+        assert_eq!(flag(&argv, "--service-tier"), None, "{argv:?}");
         let dispatch: Value =
             serde_json::from_str(flag(&argv, "--dispatch-context").expect("dispatch context"))
                 .expect("dispatch context json");

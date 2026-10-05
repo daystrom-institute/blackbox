@@ -2603,6 +2603,15 @@ impl BlackboxServer {
                 Ok((resolved, lens, opts, env, _, filters, tool_defaults, coerce_workspace, _))
                     if resolved == provider =>
                 {
+                    // Code mode and service tier belong to the session once it
+                    // has started: the harness saved the values the first
+                    // dispatch resolved, and an explicit flag on resume would
+                    // override them. Only a per-resume parameter may do that.
+                    let opts = opts.map(|mut opts| {
+                        opts.code_mode = None;
+                        opts.service_tier = None;
+                        opts
+                    });
                     ResolvedResumeBrofile::Restored(RestoredResumeBrofile {
                         name,
                         lens,
@@ -2930,11 +2939,41 @@ mod tests {
             coerce_workspace: None,
             runtime: None,
             context: None,
-            code_mode: None,
-            service_tier: None,
+            code_mode: Some(orchestration::brofile::CodeMode::Only),
+            service_tier: Some("priority".to_string()),
         };
         orchestration::brofile::save_brofile(&brofile, "global", &server.state.store_dir, None)
             .unwrap();
+    }
+
+    #[test]
+    fn resume_leaves_code_mode_and_service_tier_to_the_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        save_resume_brofile(&server, "moded-bro", Provider::Glm);
+        seed_named_session(&server, "moded-task", "moded-session", "moded-bro");
+
+        // A fresh dispatch from this brofile carries both.
+        let (_, _, fresh, ..) = server
+            .resolve_exec_target(Some("moded-bro"), None, None)
+            .unwrap();
+        let fresh = fresh.unwrap();
+        assert!(fresh.code_mode.is_some() && fresh.service_tier.is_some());
+
+        // A resume restores the brofile's model and policy, and passes neither
+        // code mode nor service tier, so the harness keeps what it saved.
+        let (_, _, _, opts, _, _, filters, _, _, _, brofile) = server
+            .resolve_resume_target(Some("moded-session"), Some("glm"), None)
+            .unwrap();
+        let opts = opts.unwrap();
+        assert_eq!(opts.model.as_deref(), Some("brofile-model"));
+        assert_eq!(opts.code_mode, None);
+        assert_eq!(opts.service_tier, None);
+        assert!(filters.is_some());
+        assert_eq!(brofile.unwrap().unrestored, None);
+        let args = Provider::Glm.build_resume_args("moded-session", "continue", None, Some(&opts));
+        assert!(!args.iter().any(|arg| arg == "--code-mode"), "{args:?}");
+        assert!(!args.iter().any(|arg| arg == "--service-tier"), "{args:?}");
     }
 
     fn seed_named_session(server: &BlackboxServer, task_id: &str, session: &str, bro: &str) {

@@ -22,7 +22,9 @@ Domain home for the dispatch plane. Boundary contract:
   that carries a `bro_label` names the brofile, and it re-resolves in that
   task's working-directory scope. When it resolves to the same provider, the
   resume gets its account, model, effort, persona, filters and tool defaults
-  again and the resumed task keeps the label. A session with an allocator
+  again and the resumed task keeps the label. Code mode and service tier are
+  not re-sent: the harness saved them with the session, and only a per-resume
+  parameter overrides that. A session with an allocator
   lease keeps the lease's lane and takes persona, filters and tool defaults
   from the brofile. Any other outcome is one decision point
   (`ResumeBrofile::unrestored`): the resume runs without the brofile's
