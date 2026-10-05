@@ -68,7 +68,12 @@
   coordinator-held pin clear, which unlinks writer temporaries a live peer
   daemon may still be publishing through. The offline `blackbox` CLI
   deliberately does not take these locks; it cannot reach those paths and
-  relies on the per-store locks instead.
+  relies on the per-store locks instead. An offline writer of a store the
+  daemon holds in memory probes them with `held_instance_lock_covering`
+  (existing lock files only, an instant shared lock, nothing kept):
+  `producer-claims revoke` refuses while any instance lock covering the
+  claims store is held, since its per-store lock is keyed to a projects path
+  the CLI and the daemon can resolve differently.
 - `run_blocking`'s per-call log line (`tool`, `elapsed_ms`, `bytes`) is the
   only built-in tool telemetry; keep it intact when wrapping handlers.
 - MCP response budgets cover the serialized result, including text escaping

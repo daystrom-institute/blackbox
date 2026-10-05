@@ -808,8 +808,11 @@ fn open_producer_claims(
 /// it shared, so revoke refuses with `error.project_catalog_cli_lock` and
 /// writes nothing, and a daemon starting meanwhile blocks on its shared
 /// acquisition (taken before it loads producer claims) until the revocation
-/// is on disk. `before_flush` runs after the in-memory revoke, before the
-/// flush.
+/// is on disk. That lock is keyed to the projects path, which this command's
+/// configuration may resolve differently from the daemon that owns the
+/// claims store, so revoke also refuses while any daemon instance lock
+/// covering the claims store itself is held. Both refusals name the held
+/// lock. `before_flush` runs after the in-memory revoke, before the flush.
 fn revoke_producer_claim(
     config: &config::Config,
     args: ProducerClaimRevokeArgs,
@@ -818,6 +821,30 @@ fn revoke_producer_claim(
     let scope = parse_claim_scope(&args.scope)?;
     let _claim = acquire_admin_exclusive_claim(&config.paths.projects_path)?;
     let path = &config.paths.producer_claims_path;
+    match blackbox::server::instance_lock::held_instance_lock_covering(path) {
+        Ok(None) => {}
+        Ok(Some(lock)) => {
+            return Err(CommandFailure::new(
+                "error.project_catalog_cli_lock",
+                format!(
+                    "a running daemon holds the instance lock {} that covers the producer \
+                     claims store {}; stop it before revoking a claim",
+                    lock.display(),
+                    path.display()
+                ),
+            ));
+        }
+        Err(error) => {
+            return Err(CommandFailure::new(
+                "error.project_catalog_cli_lock",
+                format!(
+                    "could not probe the daemon instance locks covering the producer claims \
+                     store {}: {error}",
+                    path.display()
+                ),
+            ));
+        }
+    }
     let store = open_producer_claims(path)?;
     let revoked = store.write().revoke(&args.producer, &scope);
     before_flush();
@@ -1657,6 +1684,15 @@ mod tests {
         })
         .unwrap_err();
         assert_eq!(refused.code, "error.project_catalog_cli_lock");
+        let lock_path =
+            bbox_indexing::project_catalog_migration_lock::project_catalog_migration_lock_path(
+                &state_dir.join("projects.json"),
+            );
+        assert!(
+            refused.message.contains(&lock_path.display().to_string()),
+            "{}",
+            refused.message
+        );
         assert_eq!(std::fs::read(&claims_path).unwrap(), before);
 
         let listed = execute_producer_claims(ProducerClaimsArgs {
@@ -1668,6 +1704,44 @@ mod tests {
         drop(daemon);
     }
 
+    /// A daemon whose configuration resolves another projects path holds no
+    /// lifetime lock this command would contend on, but its instance lock
+    /// still covers the claims store.
+    #[test]
+    fn producer_claim_revoke_refuses_while_a_daemon_instance_lock_covers_the_claims_store() {
+        let (_directory, config_path, state_dir, claims_path) = producer_claims_fixture();
+        let before = std::fs::read(&claims_path).unwrap();
+        let revoke = || {
+            execute_producer_claims(ProducerClaimsArgs {
+                config: Some(config_path.clone()),
+                command: ProducerClaimsCommand::Revoke(ProducerClaimRevokeArgs {
+                    producer: "producer-a".into(),
+                    scope: "repo-a/.".into(),
+                }),
+            })
+        };
+        let daemon = blackbox::server::instance_lock::acquire_instance_lock(&state_dir).unwrap();
+
+        let refused = revoke().unwrap_err();
+        assert_eq!(refused.code, "error.project_catalog_cli_lock");
+        assert!(
+            refused
+                .message
+                .contains(&daemon.path().display().to_string()),
+            "{}",
+            refused.message
+        );
+        assert!(
+            refused.message.contains(&claims_path.display().to_string()),
+            "{}",
+            refused.message
+        );
+        assert_eq!(std::fs::read(&claims_path).unwrap(), before);
+
+        drop(daemon);
+        assert_eq!(revoke().unwrap()["revoked"], true);
+    }
+
     #[test]
     fn producer_claim_revoke_excludes_daemon_startup_until_the_revocation_is_flushed() {
         let (_directory, config_path, state_dir, claims_path) = producer_claims_fixture();
@@ -1675,7 +1749,7 @@ mod tests {
         let projects_path = state_dir.join("projects.json");
         let (loaded_tx, loaded_rx) = std::sync::mpsc::channel();
         let mut daemon = None;
-        let mut loaded_before_flush = None;
+        let mut shared_refused_before_flush = None;
 
         let revoked = revoke_producer_claim(
             &config,
@@ -1684,8 +1758,19 @@ mod tests {
                 scope: "repo-a/.".into(),
             },
             || {
-                // A daemon starting now takes the lifetime lock shared before
-                // it loads producer claims, as daemon open does.
+                // A daemon open takes the lifetime lock shared before it loads
+                // producer claims. That acquisition cannot succeed now: a
+                // non-blocking shared attempt on the same lock file is
+                // refused while revoke holds it exclusive.
+                let lock_path =
+                    bbox_indexing::project_catalog_migration_lock::project_catalog_migration_lock_path(
+                        &projects_path,
+                    );
+                let probe = std::fs::File::open(&lock_path).unwrap();
+                shared_refused_before_flush =
+                    Some(fs2::FileExt::try_lock_shared(&probe).is_err());
+                drop(probe);
+                // The blocking acquisition a starting daemon makes.
                 let (started_tx, started_rx) = std::sync::mpsc::channel();
                 daemon = Some(std::thread::spawn(move || {
                     started_tx.send(()).unwrap();
@@ -1695,19 +1780,21 @@ mod tests {
                     drop(lock);
                 }));
                 started_rx.recv().unwrap();
-                loaded_before_flush = loaded_rx
-                    .recv_timeout(std::time::Duration::from_millis(500))
-                    .ok();
             },
         )
         .unwrap();
         assert_eq!(revoked["revoked"], true);
         assert_eq!(
-            loaded_before_flush, None,
-            "a starting daemon loaded producer claims before the revocation was flushed"
+            shared_refused_before_flush,
+            Some(true),
+            "a starting daemon could take the lifetime lock before the revocation was flushed"
         );
         daemon.unwrap().join().unwrap();
-        assert_eq!(loaded_rx.recv().unwrap(), 0);
+        assert_eq!(
+            loaded_rx.recv().unwrap(),
+            0,
+            "the daemon loaded claims that still held the revoked one"
+        );
     }
 
     #[test]
@@ -2366,8 +2453,14 @@ fn acquire_admin_exclusive_claim(
         .ok_or_else(|| {
             CommandFailure::new(
                 "error.project_catalog_cli_lock",
-                "the lifetime migration lock is held; stop the daemon before \
-                 offline administration",
+                format!(
+                    "the lifetime migration lock {} is held; stop the daemon before \
+                     offline administration",
+                    bbox_indexing::project_catalog_migration_lock::project_catalog_migration_lock_path(
+                        projects_path
+                    )
+                    .display()
+                ),
             )
         })
 }

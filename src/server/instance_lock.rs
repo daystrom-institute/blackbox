@@ -53,6 +53,12 @@
 //! lock). Taking a process-lifetime exclusive root lock there would refuse
 //! every offline `project-catalog list`/`get` against a live daemon, which
 //! trades a real capability for no additional safety.
+//!
+//! An offline writer of a store the daemon keeps in memory may still PROBE
+//! them: `held_instance_lock_covering` reports whether a running daemon
+//! claims a given store path, without creating or keeping any lock. The
+//! producer-claims revoke uses it, because the per-store lock it takes is
+//! keyed to a path its own configuration may resolve differently.
 
 use bbox_corpus_core::json_store::open_lock_path_nofollow;
 use fs2::FileExt;
@@ -503,6 +509,48 @@ fn acquire_root(
     }
 }
 
+/// The instance lock of a running daemon that covers `path`, if one is held.
+///
+/// For offline writers of one store: a daemon claims a file root through its
+/// sibling lock and everything under a claimed directory through that
+/// directory's lock, whatever configuration the caller itself loaded. So the
+/// candidates are the sibling lock of `path` and, for every ancestor, the
+/// lock inside it and the lock beside it. A candidate is only ever opened if
+/// it already exists; the probe takes a shared lock for an instant and
+/// releases it, so it never creates a lock file and never keeps a claim.
+pub fn held_instance_lock_covering(path: &Path) -> std::io::Result<Option<PathBuf>> {
+    let path = canonical_root_path(path);
+    let sibling = |root: &Path| -> Option<PathBuf> {
+        let mut name = root.file_name()?.to_os_string();
+        name.push(INSTANCE_LOCK_SUFFIX);
+        Some(root.parent()?.join(name))
+    };
+    let mut candidates: Vec<PathBuf> = sibling(&path).into_iter().collect();
+    for ancestor in path.ancestors().skip(1) {
+        candidates.push(ancestor.join(INSTANCE_LOCK_NAME));
+        candidates.extend(sibling(ancestor));
+    }
+    for candidate in candidates {
+        match std::fs::symlink_metadata(&candidate) {
+            Ok(metadata) if metadata.file_type().is_file() => {}
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        }
+        let file = match File::open(&candidate) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        match FileExt::try_lock_shared(&file) {
+            Ok(()) => FileExt::unlock(&file)?,
+            Err(error) if is_lock_contended(&error) => return Ok(Some(candidate)),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(None)
+}
+
 /// Contention reports as the platform's would-block error rather than a
 /// distinct kind, so compare against the value `fs2` documents for it.
 fn is_lock_contended(error: &std::io::Error) -> bool {
@@ -513,6 +561,48 @@ fn is_lock_contended(error: &std::io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_held_lock_covering_a_store_is_found_from_the_store_path_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let state = root.join("state");
+        std::fs::create_dir_all(state.join("nested")).unwrap();
+        let store = state.join("nested").join("producer-claims.json");
+
+        // No lock file anywhere: nothing is held and nothing is created.
+        assert_eq!(held_instance_lock_covering(&store).unwrap(), None);
+        assert!(!instance_lock_path(&state).exists());
+
+        // A daemon whose state root contains the store.
+        let state_guard = acquire_instance_lock(&state).unwrap();
+        assert_eq!(
+            held_instance_lock_covering(&store).unwrap().as_deref(),
+            Some(instance_lock_path(&state).as_path())
+        );
+        drop(state_guard);
+        // The lock file remains but is no longer held.
+        assert_eq!(held_instance_lock_covering(&store).unwrap(), None);
+
+        // A daemon that claims the store as its own file root.
+        let file_root = InstanceRoot::file("producer claims store", "TEST", store.clone());
+        let file_guard = acquire_root(&file_root, std::slice::from_ref(&file_root)).unwrap();
+        assert_eq!(
+            held_instance_lock_covering(&store).unwrap(),
+            Some(file_root.lock_path())
+        );
+        drop(file_guard);
+
+        // A daemon that claims a containing directory through a sibling lock.
+        let dir_root = InstanceRoot::directory("bro home", "TEST", state.join("nested"));
+        let dir_guard = acquire_root(&dir_root, std::slice::from_ref(&dir_root)).unwrap();
+        assert_eq!(
+            held_instance_lock_covering(&store).unwrap(),
+            Some(dir_root.lock_path())
+        );
+        drop(dir_guard);
+        assert_eq!(held_instance_lock_covering(&store).unwrap(), None);
+    }
     use bbox_edge_sidecar::snapshot::{
         clear_pending_local_activation_pins, pending_local_activation_pins_dir,
     };
