@@ -73,6 +73,8 @@ rmcp = { version = "3.5", features = [
 
 [dev-dependencies]
 tempfile = "3"
+# Paused time, for tests that cross the MCP discovery wait.
+tokio = { version = "1", features = ["full", "test-util"] }
 # Loads the bundled (non language-pack) grammars directly in binding tests.
 bbox-chunker = { path = "../bbox-chunker" }
 

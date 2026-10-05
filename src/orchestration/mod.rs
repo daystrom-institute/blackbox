@@ -57,6 +57,12 @@ const BLACKBOX_SERVICE_ENV_VARS: &[&str] = &[
     "TRANSCRIPT_SEARCH_INDEX_PATH",
 ];
 
+/// Harness switches a worker must not inherit from the process that spawns
+/// it. They are removed with the service variables and reach a worker only
+/// through an explicit account or per-dispatch env, which is applied after
+/// the removal.
+const WORKER_UNINHERITED_ENV_VARS: &[&str] = &["BRO_HARNESS_MCP_HTTP_LIFECYCLE"];
+
 const HARNESS_SPAWN_SCRUB_ENV: &str = "BRO_HARNESS_SPAWN_SCRUB";
 
 /// The process-wide executor every harness dispatch goes through.
@@ -3468,6 +3474,7 @@ fn prepare_harness_child_launch(
         env: bro_protocol::SecretEnv::new(env),
         env_unset: BLACKBOX_SERVICE_ENV_VARS
             .iter()
+            .chain(WORKER_UNINHERITED_ENV_VARS)
             .map(|key| (*key).to_string())
             .collect(),
         initial_messages: vec![harness_user_input(initial_prompt)],
@@ -5932,6 +5939,12 @@ mod tests {
         );
         // env_unset carries the full service scrub list.
         assert!(spec.env_unset.iter().any(|k| k == "BRO_HOME"));
+        // A harness lifecycle switch is never inherited from the spawner.
+        assert!(
+            spec.env_unset
+                .iter()
+                .any(|k| k == "BRO_HARNESS_MCP_HTTP_LIFECYCLE")
+        );
         assert!(spec.env_unset.iter().any(|k| k == "BLACKBOX_MCP_URL"));
         let scrub = spec
             .env

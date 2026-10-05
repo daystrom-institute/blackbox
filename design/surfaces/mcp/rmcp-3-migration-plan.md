@@ -212,11 +212,16 @@ path for current clients. No tasks/resources yet.
    `cache_scope: Private` on `ListToolsResult`.
 7. The harness child client connects through `serve_with_lifecycle`.
    HTTP servers use `Auto` (probe discover at 2026-07-28, fall back to the
-   2025-06-18 handshake) when `BRO_HARNESS_MCP_HTTP_LIFECYCLE=auto`;
-   otherwise, and always for stdio servers, the handshake. A stdio child
-   that ignores an unknown method would hold startup for the SDK's whole
-   discovery timeout, so stdio stays out of `Auto`. The harness connection
-   to the daemon exercises the modern path once both gates are on.
+   2025-06-18 handshake) when `BRO_HARNESS_MCP_HTTP_LIFECYCLE=auto` and the
+   server's `startup_timeout_ms` is at least 20 s; otherwise, and always
+   for stdio servers, the handshake. The SDK waits a fixed 10 s for a
+   discovery answer before falling back, so a tighter budget would turn a
+   silent peer that connects today into a startup timeout, and a stdio
+   child that ignores an unknown method would hold startup for the whole
+   wait. The daemon removes the variable from the environment a worker
+   inherits; it reaches a worker only through an explicit account or
+   per-dispatch env. The harness connection to the daemon exercises the
+   modern path once both gates are on.
 8. `BBOX_MCP_SESSION_KEEPALIVE_SECS` becomes legacy-only; document.
 
 Validation: per-request scope extraction covered by unit tests at the

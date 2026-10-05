@@ -528,3 +528,48 @@ mod absolute_bin_tests {
             .unwrap();
     }
 }
+
+#[cfg(test)]
+mod child_env_tests {
+    use super::{HarnessExecutor, LocalExecutor, WorkerSpawnSpec};
+
+    /// The child environment is the daemon's minus `env_unset`, then the spec
+    /// env: a variable on the scrub list is not inherited, and the same
+    /// variable set by the spec reaches the child.
+    #[tokio::test]
+    async fn a_scrubbed_variable_reaches_the_child_only_through_the_spec_env() {
+        const VAR: &str = "BRO_HARNESS_MCP_HTTP_LIFECYCLE";
+        // SAFETY: nextest runs each test in its own process.
+        unsafe { std::env::set_var(VAR, "inherited") };
+        let seen_by_child = |env: std::collections::BTreeMap<String, String>| async move {
+            let spec = WorkerSpawnSpec {
+                task_id: "task-1".to_string(),
+                session_id: "sess-1".to_string(),
+                workspace_id: None,
+                workspace_scope: None,
+                provider: bro_core::Provider::Glm,
+                bin_override: Some("/bin/sh".to_string()),
+                argv: vec![
+                    "-c".to_string(),
+                    format!("printf '%s\\n' \"${{{VAR}-unset}}\""),
+                ],
+                cwd: None,
+                env: bro_protocol::SecretEnv::new(env),
+                env_unset: vec![VAR.to_string()],
+                initial_messages: vec![],
+                bro_home: std::env::temp_dir(),
+                event_log_path: std::env::temp_dir().join("sess-1.events.jsonl"),
+            };
+            let mut child = LocalExecutor.spawn(spec).await.unwrap();
+            let line = child.events.recv().await;
+            let _ = child.outcome.await;
+            line
+        };
+        assert_eq!(
+            seen_by_child(Default::default()).await.as_deref(),
+            Some("unset")
+        );
+        let explicit = [(VAR.to_string(), "auto".to_string())].into();
+        assert_eq!(seen_by_child(explicit).await.as_deref(), Some("auto"));
+    }
+}

@@ -14,9 +14,15 @@
 //! Lifecycle: every connection uses the `initialize` handshake at 2025-06-18
 //! unless `BRO_HARNESS_MCP_HTTP_LIFECYCLE=auto`, which makes HTTP servers
 //! probe `server/discover` first and fall back to the handshake when the
-//! peer rejects it. Stdio servers always use the handshake. Code that reads
-//! a connection must hold for both: a sessionless peer has no session id,
-//! and its results carry a `resultType`.
+//! peer rejects it or stays silent. The probe is used only for a server
+//! whose `startup_timeout_ms` is at least 20 s, since the SDK waits a fixed
+//! 10 s on a silent peer before falling back. Stdio servers always use the
+//! handshake. Code that reads a connection must hold for both: a sessionless
+//! peer has no session id, and its results carry a `resultType`.
+//!
+//! The variable is read from the harness process environment. The daemon
+//! removes it from the environment a dispatched worker inherits, so it
+//! reaches a worker only through an explicit account or per-dispatch env.
 //!
 //! Startup is bounded per server. Required failures abort session construction;
 //! optional failures publish sanitized readiness. Catalogs are fixed for the
@@ -279,15 +285,33 @@ fn legacy_client_config() -> ClientConfig {
 /// means the handshake; `auto` probes `server/discover` first.
 const HTTP_LIFECYCLE_ENV: &str = "BRO_HARNESS_MCP_HTTP_LIFECYCLE";
 
-/// How a connection to an HTTP MCP server is established. Stdio servers
-/// always use the handshake: a child that ignores an unknown method would
-/// hold startup for the whole discovery timeout.
-fn http_lifecycle(selected: Option<&str>) -> ClientLifecycleMode {
+/// The SDK waits this long for a discovery answer before `auto` falls back
+/// to the handshake, and offers no way to shorten it.
+const AUTO_DISCOVERY_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The smallest startup budget under which `auto` is used: the discovery
+/// wait, and as long again for the handshake that follows a silent peer.
+const AUTO_MIN_STARTUP_BUDGET: std::time::Duration = AUTO_DISCOVERY_WAIT.saturating_mul(2);
+
+/// How a connection to an HTTP MCP server is established. `auto` is honored
+/// only when the server's startup budget leaves room for a peer that never
+/// answers discovery; under a tighter budget the connection uses the
+/// handshake, so a server that connects today is never timed out by the
+/// probe. Stdio servers always use the handshake: a child that ignores an
+/// unknown method would hold startup for the whole discovery wait.
+fn http_lifecycle(
+    selected: Option<&str>,
+    startup_budget: std::time::Duration,
+) -> ClientLifecycleMode {
     match selected.map(str::trim) {
-        Some(value) if value.eq_ignore_ascii_case("auto") => ClientLifecycleMode::Auto {
-            preferred_versions: vec![ProtocolVersion::V_2026_07_28],
-            legacy_version: Some(ProtocolVersion::V_2025_06_18),
-        },
+        Some(value)
+            if value.eq_ignore_ascii_case("auto") && startup_budget >= AUTO_MIN_STARTUP_BUDGET =>
+        {
+            ClientLifecycleMode::Auto {
+                preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+                legacy_version: Some(ProtocolVersion::V_2025_06_18),
+            }
+        }
         _ => ClientLifecycleMode::Initialize,
     }
 }
@@ -297,6 +321,7 @@ fn http_lifecycle(selected: Option<&str>) -> ClientLifecycleMode {
 async fn start_remote_server(
     server: &McpServerConfig,
     tool_timeout_ms: u64,
+    startup_timeout_ms: u64,
 ) -> anyhow::Result<Arc<ServerConn>> {
     let running = match server {
         McpServerConfig::Stdio {
@@ -312,7 +337,10 @@ async fn start_remote_server(
         McpServerConfig::Http { url, headers, .. } => {
             let transport =
                 StreamableHttpClientTransport::from_config(http_transport_config(url, headers)?);
-            let lifecycle = http_lifecycle(std::env::var(HTTP_LIFECYCLE_ENV).ok().as_deref());
+            let lifecycle = http_lifecycle(
+                std::env::var(HTTP_LIFECYCLE_ENV).ok().as_deref(),
+                std::time::Duration::from_millis(startup_timeout_ms),
+            );
             legacy_client_config()
                 .serve_with_lifecycle(transport, lifecycle)
                 .await?
@@ -335,13 +363,14 @@ async fn start_remote_server(
 async fn server_backend_and_specs(
     server: &McpServerConfig,
     tool_timeout_ms: u64,
+    startup_timeout_ms: u64,
 ) -> anyhow::Result<(McpBackend, Vec<McpToolSpec>)> {
     match server {
         McpServerConfig::InProcess { server: svc, .. } => {
             Ok((McpBackend::InProcess(svc.clone()), svc.list_tools().await?))
         }
         remote => {
-            let conn = start_remote_server(remote, tool_timeout_ms).await?;
+            let conn = start_remote_server(remote, tool_timeout_ms, startup_timeout_ms).await?;
             let specs = conn
                 .list_tools()
                 .await?
@@ -477,30 +506,54 @@ fn http_transport_config(
 mod tests {
     use super::*;
 
+    const ROOMY: std::time::Duration = std::time::Duration::from_secs(30);
+
     #[test]
     fn the_http_lifecycle_is_the_handshake_unless_auto_is_selected() {
         for legacy in [None, Some(""), Some("legacy"), Some("discover"), Some("1")] {
             assert_eq!(
-                http_lifecycle(legacy),
+                http_lifecycle(legacy, ROOMY),
                 ClientLifecycleMode::Initialize,
                 "{legacy:?}"
             );
         }
-        for auto in ["auto", " AUTO "] {
+        let auto = ClientLifecycleMode::Auto {
+            preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+            legacy_version: Some(ProtocolVersion::V_2025_06_18),
+        };
+        for selected in ["auto", " AUTO "] {
+            assert_eq!(http_lifecycle(Some(selected), ROOMY), auto);
+        }
+        // The probe needs room for a silent peer inside the startup budget.
+        assert_eq!(http_lifecycle(Some("auto"), AUTO_MIN_STARTUP_BUDGET), auto);
+        for tight in [
+            AUTO_MIN_STARTUP_BUDGET - std::time::Duration::from_millis(1),
+            AUTO_DISCOVERY_WAIT,
+            std::time::Duration::from_millis(1),
+        ] {
             assert_eq!(
-                http_lifecycle(Some(auto)),
-                ClientLifecycleMode::Auto {
-                    preferred_versions: vec![ProtocolVersion::V_2026_07_28],
-                    legacy_version: Some(ProtocolVersion::V_2025_06_18),
-                }
+                http_lifecycle(Some("auto"), tight),
+                ClientLifecycleMode::Initialize,
+                "{tight:?}"
             );
         }
     }
 
-    /// Connects with the `auto` lifecycle to a line-delimited peer that
-    /// either answers or rejects discovery, lists tools, and returns every
-    /// request the peer saw.
-    async fn auto_lifecycle_requests(peer_is_modern: bool) -> Vec<Value> {
+    #[derive(Clone, Copy)]
+    enum Discovery {
+        Answered,
+        Rejected,
+        Ignored,
+    }
+
+    /// Connects with `auto` selected, under `startup_budget` and the same
+    /// timeout admission applies, to a line-delimited peer that answers,
+    /// rejects or ignores discovery; lists tools; and returns every request
+    /// the peer saw.
+    async fn auto_lifecycle_requests(
+        discovery: Discovery,
+        startup_budget: std::time::Duration,
+    ) -> Vec<Value> {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
         let (client, server) = tokio::io::duplex(16 * 1024);
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -512,27 +565,28 @@ mod tests {
                 let request: Value = serde_json::from_str(&line).unwrap();
                 captured.lock().unwrap().push(request.clone());
                 let id = request["id"].clone();
-                let reply = match request["method"].as_str().unwrap() {
-                    "server/discover" if peer_is_modern => serde_json::json!({
+                let reply = match (request["method"].as_str().unwrap(), discovery) {
+                    ("server/discover", Discovery::Answered) => serde_json::json!({
                         "jsonrpc":"2.0","id":id,"result":{
                             "resultType":"complete",
                             "supportedVersions":["2025-06-18","2026-07-28"],
                             "capabilities":{"tools":{}},
                             "ttlMs":1000,"cacheScope":"private"}}),
-                    "server/discover" => serde_json::json!({
+                    ("server/discover", Discovery::Rejected) => serde_json::json!({
                         "jsonrpc":"2.0","id":id,
                         "error":{"code":-32601,"message":"Method not found"}}),
-                    "initialize" => serde_json::json!({
+                    ("server/discover", Discovery::Ignored) => continue,
+                    ("initialize", _) => serde_json::json!({
                         "jsonrpc":"2.0","id":id,"result":{
                             "protocolVersion":request["params"]["protocolVersion"],
                             "capabilities":{"tools":{}},
                             "serverInfo":{"name":"fixture","version":"1"}}}),
-                    "tools/list" => serde_json::json!({
+                    ("tools/list", _) => serde_json::json!({
                         "jsonrpc":"2.0","id":id,"result":{
                             "resultType":"complete","tools":[],
                             "ttlMs":1000,"cacheScope":"private"}}),
-                    "notifications/initialized" => continue,
-                    method => panic!("unexpected fixture method {method}"),
+                    ("notifications/initialized", _) => continue,
+                    (method, _) => panic!("unexpected fixture method {method}"),
                 };
                 write
                     .write_all(format!("{reply}\n").as_bytes())
@@ -540,26 +594,36 @@ mod tests {
                     .unwrap();
             }
         });
-        let running = legacy_client_config()
-            .serve_with_lifecycle(client, http_lifecycle(Some("auto")))
-            .await
-            .unwrap();
-        let conn = remote::ServerConn::new(running, "fixture".into(), 5_000);
-        assert!(conn.list_tools().await.unwrap().is_empty());
+        let conn = tokio::time::timeout(startup_budget, async {
+            let running = legacy_client_config()
+                .serve_with_lifecycle(client, http_lifecycle(Some("auto"), startup_budget))
+                .await
+                .unwrap();
+            let conn = remote::ServerConn::new(running, "fixture".into(), 5_000);
+            assert!(conn.list_tools().await.unwrap().is_empty());
+            conn
+        })
+        .await
+        .expect("the connection starts inside its startup budget");
         drop(conn);
         peer.abort();
         let seen = requests.lock().unwrap().clone();
         seen
     }
 
-    #[tokio::test]
-    async fn auto_uses_the_sessionless_lifecycle_when_the_peer_answers_discovery() {
-        let requests = auto_lifecycle_requests(true).await;
-        let methods: Vec<_> = requests
+    fn methods(requests: &[Value]) -> Vec<&str> {
+        requests
             .iter()
             .map(|request| request["method"].as_str().unwrap())
-            .collect();
-        assert_eq!(methods, ["server/discover", "tools/list"]);
+            .collect()
+    }
+
+    const HANDSHAKE: [&str; 3] = ["initialize", "notifications/initialized", "tools/list"];
+
+    #[tokio::test]
+    async fn auto_uses_the_sessionless_lifecycle_when_the_peer_answers_discovery() {
+        let requests = auto_lifecycle_requests(Discovery::Answered, ROOMY).await;
+        assert_eq!(methods(&requests), ["server/discover", "tools/list"]);
         assert_eq!(
             requests[1]["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"], "2026-07-28",
             "{}",
@@ -569,20 +633,9 @@ mod tests {
 
     #[tokio::test]
     async fn auto_falls_back_to_the_handshake_when_the_peer_rejects_discovery() {
-        let requests = auto_lifecycle_requests(false).await;
-        let methods: Vec<_> = requests
-            .iter()
-            .map(|request| request["method"].as_str().unwrap())
-            .collect();
-        assert_eq!(
-            methods,
-            [
-                "server/discover",
-                "initialize",
-                "notifications/initialized",
-                "tools/list"
-            ]
-        );
+        let requests = auto_lifecycle_requests(Discovery::Rejected, ROOMY).await;
+        assert_eq!(methods(&requests)[0], "server/discover");
+        assert_eq!(methods(&requests)[1..], HANDSHAKE);
         assert_eq!(requests[1]["params"]["protocolVersion"], "2025-06-18");
         assert!(
             requests[3]["params"]["_meta"]
@@ -591,6 +644,27 @@ mod tests {
             "{}",
             requests[3]
         );
+    }
+
+    /// A peer that never answers discovery costs the SDK's fixed wait, and
+    /// the handshake that follows still fits a budget that admits the probe.
+    #[tokio::test(start_paused = true)]
+    async fn auto_falls_back_inside_a_roomy_budget_when_the_peer_ignores_discovery() {
+        let started = tokio::time::Instant::now();
+        let requests = auto_lifecycle_requests(Discovery::Ignored, AUTO_MIN_STARTUP_BUDGET).await;
+        assert_eq!(methods(&requests)[0], "server/discover");
+        assert_eq!(methods(&requests)[1..], HANDSHAKE);
+        assert!(started.elapsed() >= AUTO_DISCOVERY_WAIT);
+    }
+
+    /// Under a budget too tight for the probe the same peer is never probed,
+    /// so it connects as it does without the flag instead of timing out.
+    #[tokio::test(start_paused = true)]
+    async fn a_tight_budget_skips_the_probe_for_a_peer_that_ignores_discovery() {
+        let started = tokio::time::Instant::now();
+        let requests = auto_lifecycle_requests(Discovery::Ignored, AUTO_DISCOVERY_WAIT).await;
+        assert_eq!(methods(&requests), HANDSHAKE);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 
     fn mock_tool(name: &'static str) -> Arc<dyn Tool> {

@@ -67,7 +67,7 @@ pub async fn load_mcp_tools_from_config_with_capability_aliases(
             .unwrap_or_default();
         let connection = tokio::time::timeout(
             std::time::Duration::from_millis(policy.startup_timeout_ms),
-            server_backend_and_specs(server, policy.tool_timeout_ms),
+            server_backend_and_specs(server, policy.tool_timeout_ms, policy.startup_timeout_ms),
         )
         .await;
         let (backend, specs) = match connection {

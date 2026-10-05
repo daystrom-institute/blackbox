@@ -84,6 +84,17 @@ Domain home for the dispatch plane. Boundary contract:
   is a new task with fresh supervision state, so a new worker process never
   reports under an existing task's held sequence.
 
+## Worker environment inheritance
+
+- A worker inherits the spawning process's environment minus the spec's
+  `env_unset`, then gets the spec env. `env_unset` is composed in one place
+  (`prepare_harness_child_launch`): the service variables plus
+  `WORKER_UNINHERITED_ENV_VARS`, the harness switches that must come only
+  from an explicit account or per-dispatch env
+  (`BRO_HARNESS_MCP_HTTP_LIFECYCLE`). Add a harness switch there when a
+  stray export in the daemon's or fleetd's environment must not change
+  every worker on the host.
+
 ## Allocator binary eligibility follows the executor boundary
 
 - Harness provider binaries are resolved on the host that actually spawns the
