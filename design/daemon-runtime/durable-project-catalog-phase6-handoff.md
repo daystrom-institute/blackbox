@@ -145,8 +145,13 @@ where each step retires the rows that pinned the surface it deletes.
 ### 3.5 Compatibility observation counters
 `CheckoutAccessObservations` keeps a closed, low-cardinality key space as
 Phase 6 cut evidence ([plan 4.17](durable-project-catalog-phase5-impl.md)).
-Do NOT delete it before the cut: `active_compatibility_lanes` is how the cut
-is judged safe. Delete `CheckoutAccessSourceLane::{LegacyProjectRecord,
+Do NOT delete it before the cut: it is how the cut is judged safe. The
+counters are durable lifetime totals, so recency is reported beside them:
+`active_compatibility_lanes` lists the lanes that granted since the daemon
+opened the observations, and doctor names every lane whose grants all
+predate that with its last grant time, which is the evidence that holds
+across restarts.
+Delete `CheckoutAccessSourceLane::{LegacyProjectRecord,
 LegacyCheckoutRegistry, LegacyPathResolver}` with the lanes themselves, and
 keep `NativeAttachment`.
 
@@ -177,7 +182,7 @@ Each row names the bridge surface it pins and what happens to that row:
 | `published_gaps`, `own_gaps`, `all_gaps` | Same, gap lane | Dies with 3.2 and 3.3. |
 | `project_administration` | `bbox_project_list` over `ProjectRecord` | Dies with 3.1. This row is the one that will move FIRST, because it renders record fields directly. |
 | `watcher_carriers` | `ArtifactWatchAttachment::{Selected, CheckoutId}` | Dies with 3.4. |
-| `checkout_observations` | Compatibility lane key-space and the granted/denied split | Dies with 3.5. Its `active_compatibility_lanes` going empty IS the cut signal. |
+| `checkout_observations` | Compatibility lane key-space and the granted/denied split | Dies with 3.5. Its `active_compatibility_lanes` staying empty, with no lane's last grant later than the cut candidate's deploy, IS the cut signal. |
 | `render` | Bridge-lane ROUTING into a surface that survives | Row dies; the surface does not. A red row here during Phase 6 means a converted adapter changed output, which is a defect, not progress. |
 | `doctor_report` | The COMPLETE serialized doctor response, findings and messages included, less only [D-041](../../DECISION_LEDGER.md#d-041) and the declared exact-value substitutions (daemon version, host state directory, fixture root, observation wall clock) | Row dies. Doctor survives; its bridge-shaped findings do not. |
 | `catalog_only_tools_refuse` | `bbox_project_publisher_advance` and `_status` refusing `error.project_catalog_inactive` | INVERTS at retirement. The fixture daemon runs bridge mode, where this refusal stays correct through and after the P6-F operator cut, so the row is carried UNCHANGED through Phase 6 (live catalog-mode success is proved separately by the catalog lane's own tests). At the retirement-phase bridge deletion this is the one row that must be DELETED rather than carried: a bridge-modeless tree cannot refuse this way, so a row asserting it would be actively false. |
