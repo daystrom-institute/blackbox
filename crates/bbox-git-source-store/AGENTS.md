@@ -18,11 +18,21 @@
   with its original creation time and lifecycle; mismatches fail closed.
   Each accepted upload attempt takes a durable per-repository acceptance
   sequence, checkpointed in its upload record before `current-ready.json`
-  moves. Only a newer sequence repoints the repository and reopens a
-  `Superseded`/`Failed` source, and the reopen is durable before the pointer
-  names it, so a probe never reports a terminal source as current. A
-  completed upload replay is a no-op and an equal sequence must name the same
-  upload and source.
+  moves. While a pointer exists, only a newer sequence repoints the
+  repository and reopens a `Superseded`/`Failed` source, a completed upload
+  replay is a no-op, and an equal sequence must name the same upload and
+  source. The reopen is durable before the pointer names it, so a probe
+  never reports a terminal source as current.
+- Operator retirement removes the pointer and with it the baseline
+  acceptances are ordered against. A completed upload replay stays a no-op.
+  The next finalize that reaches the pointer step publishes it again and
+  reopens its source, whatever its sequence: a fresh upload, or an
+  interrupted upload resumed with a checkpoint older than the retired
+  pointer's. Retirement does not touch the counter, so sequences stay
+  unique. Every read of `current-ready.json`, including the pointer listing
+  and retirement, goes through the one validating loader; a malformed
+  pointer is refused, never listed and never removed. No tool clears one:
+  that is a manual edit of the store with the daemon stopped.
 - Upload records and history pointers without acceptance fields are legacy
   state, never reinterpreted: a legacy pointer is a baseline below every new
   acceptance and a completed legacy upload never gains one. Allocation

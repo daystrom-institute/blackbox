@@ -1515,9 +1515,10 @@ impl GitSourceStore {
         Ok(Some(pointer.source_generation_id))
     }
 
-    /// Every repository's ready pointer as a listing view. Retirement and
-    /// activation revalidate the pointer against its generation under the
-    /// mutation lock; this read does not.
+    /// Every repository's ready pointer as a listing view, each read through
+    /// the validating loader. Retirement and activation also revalidate the
+    /// pointer against its generation under the mutation lock; this read
+    /// does not.
     pub fn current_ready_pointers(&self) -> Result<Vec<ReadyPointerViewV1>> {
         let mut pointers = Vec::new();
         for repo_dir in read_directories(&self.root.join("repos"))? {
@@ -1532,13 +1533,7 @@ impl GitSourceStore {
             if NofollowDirectory::open_existing(&history_dir)?.is_none() {
                 continue;
             }
-            if let Some(pointer) = read_json::<ReadyPointerV1>(
-                &history_dir,
-                "current-ready.json",
-                MAX_GENERATION_RECORD_BYTES,
-                "Git-history ready pointer",
-            )? {
-                validate_generation_id(&pointer.source_generation_id)?;
+            if let Some(pointer) = load_history_ready_pointer(&history_dir)? {
                 pointers.push(ReadyPointerViewV1 {
                     repo_history_id,
                     source_generation_id: pointer.source_generation_id,
@@ -1552,8 +1547,10 @@ impl GitSourceStore {
     }
 
     /// Retire one repository's ready pointer under the same lock and
-    /// protection discipline as maintenance: the pointer must still name an
-    /// installed generation it agrees with, the pointed generation is marked
+    /// protection discipline as maintenance: the pointer must pass the
+    /// validating loader and still name an installed generation it agrees
+    /// with (a malformed pointer is refused, never removed), the pointed
+    /// generation is marked
     /// `Superseded` so its state stops claiming readiness, and the pointer
     /// file itself is removed as a durable regular file. Returns the retired
     /// source generation id, or `None` when no pointer existed.
@@ -1563,16 +1560,9 @@ impl GitSourceStore {
     ) -> Result<Option<String>> {
         let _guard = self.lock_mutation()?;
         let history_dir = self.repo_history_root(repo_history_id)?;
-        let Some(pointer) = read_json::<ReadyPointerV1>(
-            &history_dir,
-            "current-ready.json",
-            MAX_GENERATION_RECORD_BYTES,
-            "Git-history ready pointer",
-        )?
-        else {
+        let Some(pointer) = load_history_ready_pointer(&history_dir)? else {
             return Ok(None);
         };
-        validate_generation_id(&pointer.source_generation_id)?;
         let source = self.load_generation(repo_history_id, &pointer.source_generation_id)?;
         if source.producer_id != pointer.producer_id
             || source.descriptor.repo_head != pointer.repo_head
@@ -3819,6 +3809,193 @@ mod tests {
         assert_eq!(source_a.state, GitHistorySourceStateV1::Ready);
         assert_eq!(source_a.diagnostic, None);
         assert_unique_acceptances(&store);
+    }
+
+    /// Retirement removes the pointer and with it the baseline acceptances
+    /// are ordered against. A completed upload replay stays a no-op, a fresh
+    /// upload is a new acceptance, and an interrupted upload whose
+    /// checkpoint is older than the retired pointer's publishes the pointer
+    /// again when it resumes. The counter is untouched, so sequences stay
+    /// unique.
+    #[test]
+    fn a_retired_pointer_is_republished_by_the_next_acceptance() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = history_store(&temp.path().canonicalize().unwrap().join("git-sources"));
+        let (history, namespace) = history_ids();
+        let (completed_a, generation_a) =
+            ingest_fixture(&store, &history, &namespace, fixture_for('1', '2'));
+        assert_eq!(
+            accepted(&ready_pointer(&store, &history)),
+            (1, completed_a.clone())
+        );
+
+        let retired = store.retire_current_ready_pointer(&history).unwrap();
+        assert_eq!(retired.as_deref(), Some(generation_a.as_str()));
+        assert!(store.current_ready_pointers().unwrap().is_empty());
+        assert_eq!(acceptance_counter(&store, &history), Some(2));
+
+        // A replay of the completed upload stays a no-op: no pointer, and
+        // the source stays retired.
+        store
+            .finalize_history_upload("producer-a", &completed_a)
+            .unwrap();
+        assert!(store.current_ready_pointers().unwrap().is_empty());
+        assert_eq!(
+            stored_source(&store, &history, &generation_a).state,
+            GitHistorySourceStateV1::Superseded
+        );
+
+        // A fresh upload of the same head is a new acceptance: it publishes
+        // the pointer again and reopens the source.
+        let (fresh_a, generation) =
+            ingest_fixture(&store, &history, &namespace, fixture_for('1', '2'));
+        assert_eq!(generation, generation_a);
+        assert_ne!(fresh_a, completed_a);
+        assert_eq!(accepted(&ready_pointer(&store, &history)), (2, fresh_a));
+        let source = stored_source(&store, &history, &generation_a);
+        assert_eq!(source.state, GitHistorySourceStateV1::Ready);
+        assert_eq!(source.diagnostic, None);
+
+        // An upload of A is checkpointed and interrupted, then B is accepted
+        // with a newer sequence and its pointer is retired. Resuming the
+        // interrupted upload meets no pointer, so its older checkpoint
+        // publishes the pointer.
+        let interrupted_a =
+            upload_to_missing_records(&store, &history, &namespace, fixture_for('1', '2'));
+        fail_finalize_at("acceptance-checkpoint");
+        assert!(
+            store
+                .finalize_history_upload("producer-a", &interrupted_a)
+                .is_err()
+        );
+        assert_eq!(
+            upload_record(&store, &interrupted_a).accepted_sequence,
+            Some(3)
+        );
+        let (completed_b, generation_b) =
+            ingest_fixture(&store, &history, &namespace, fixture_for('1', '3'));
+        assert_eq!(accepted(&ready_pointer(&store, &history)), (4, completed_b));
+        assert_eq!(
+            store
+                .retire_current_ready_pointer(&history)
+                .unwrap()
+                .as_deref(),
+            Some(generation_b.as_str())
+        );
+        rewrite_source(&store, &history, &generation_a, |source| {
+            source.state = GitHistorySourceStateV1::Superseded;
+            source.diagnostic = Some("superseded by the repository current-ready source".into());
+        });
+        store
+            .finalize_history_upload("producer-a", &interrupted_a)
+            .unwrap();
+        let republished = ready_pointer(&store, &history);
+        assert_eq!(republished.source_generation_id, generation_a);
+        assert_eq!(accepted(&republished), (3, interrupted_a));
+        assert_eq!(
+            stored_source(&store, &history, &generation_a).state,
+            GitHistorySourceStateV1::Ready
+        );
+        assert_eq!(acceptance_counter(&store, &history), Some(5));
+        assert_unique_acceptances(&store);
+    }
+
+    /// HEAD returns to A while an interrupted upload of A still holds an
+    /// acceptance checkpoint older than the pointer. Begin resumes that
+    /// upload; its finalize completes without rewinding the pointer or
+    /// reopening A, and the upload after it is the one that repoints.
+    #[test]
+    fn a_stale_checkpoint_resumed_on_head_return_converges_with_the_next_upload() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = history_store(&temp.path().canonicalize().unwrap().join("git-sources"));
+        let (history, namespace) = history_ids();
+        let (_, generation_a) = ingest_fixture(&store, &history, &namespace, fixture_for('1', '2'));
+
+        // A second upload of A is checkpointed and then interrupted before
+        // it reaches the pointer.
+        let interrupted =
+            upload_to_missing_records(&store, &history, &namespace, fixture_for('1', '2'));
+        fail_finalize_at("acceptance-checkpoint");
+        assert!(
+            store
+                .finalize_history_upload("producer-a", &interrupted)
+                .is_err()
+        );
+        assert_eq!(
+            upload_record(&store, &interrupted).accepted_sequence,
+            Some(2)
+        );
+
+        // HEAD moves to B, which becomes current; A is superseded.
+        let (completed_b, generation_b) =
+            ingest_fixture(&store, &history, &namespace, fixture_for('1', '3'));
+        let after_b = ready_pointer(&store, &history);
+        assert_eq!(accepted(&after_b), (3, completed_b));
+        rewrite_source(&store, &history, &generation_a, |source| {
+            source.state = GitHistorySourceStateV1::Superseded;
+            source.diagnostic = Some("superseded by the repository current-ready source".into());
+        });
+
+        // HEAD returns to A. Begin hands back the interrupted upload with
+        // the state it stopped in.
+        let resumed = store
+            .begin_history_upload("producer-a", &history, &namespace, fixture_for('1', '2').0)
+            .unwrap();
+        assert_eq!(resumed.upload_id, interrupted);
+        assert_eq!(resumed.state, GitHistorySourceStateV1::MissingRecords);
+        let finalized = store
+            .finalize_history_upload("producer-a", &interrupted)
+            .unwrap();
+        assert_eq!(finalized.source_generation_id, generation_a);
+        assert_eq!(ready_pointer(&store, &history), after_b);
+        assert_eq!(after_b.source_generation_id, generation_b);
+        assert_eq!(
+            stored_source(&store, &history, &generation_a).state,
+            GitHistorySourceStateV1::Superseded
+        );
+        assert_eq!(
+            upload_record(&store, &interrupted).state,
+            GitHistorySourceStateV1::Ready
+        );
+
+        // The next upload of A is a new attempt and a newer acceptance.
+        let (fresh, generation) =
+            ingest_fixture(&store, &history, &namespace, fixture_for('1', '2'));
+        assert_ne!(fresh, interrupted);
+        assert_eq!(generation, generation_a);
+        let pointer = ready_pointer(&store, &history);
+        assert_eq!(pointer.source_generation_id, generation_a);
+        assert_eq!(accepted(&pointer), (4, fresh));
+        let source = stored_source(&store, &history, &generation_a);
+        assert_eq!(source.state, GitHistorySourceStateV1::Ready);
+        assert_eq!(source.diagnostic, None);
+        assert_unique_acceptances(&store);
+    }
+
+    /// The listing and the retirement read the pointer through the same
+    /// validating loader as acceptance: a malformed pointer is refused by
+    /// both and is never removed.
+    #[test]
+    fn a_malformed_pointer_is_refused_by_listing_and_retirement() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = history_store(&temp.path().canonicalize().unwrap().join("git-sources"));
+        let (history, namespace) = history_ids();
+        ingest_fixture(&store, &history, &namespace, fixture_for('1', '2'));
+        let mut pointer = serde_json::to_value(ready_pointer(&store, &history)).unwrap();
+        pointer["accepted_sequence"] = serde_json::json!(0);
+        let raw = serde_json::to_string(&pointer).unwrap();
+        write_ready_pointer(&store, &history, &raw);
+
+        assert!(store.current_ready_pointers().is_err());
+        assert!(store.retire_current_ready_pointer(&history).is_err());
+        let on_disk = fs::read_to_string(
+            store
+                .repo_history_root(&history)
+                .unwrap()
+                .join("current-ready.json"),
+        )
+        .unwrap();
+        assert_eq!(on_disk, raw);
     }
 
     #[test]
