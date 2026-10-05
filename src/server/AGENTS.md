@@ -16,8 +16,9 @@
   a request naming an unknown surface or an unauthenticated binding is
   refused on all of them, never served a partial catalog.
 - Catalog listings (tools, resources, prompts) are stable in order and carry
-  `ttlMs` and `cacheScope: private` only for a peer on a revision without a
-  handshake. A handshake-revision peer receives the listing without them.
+  `ttlMs` and `cacheScope: private` only for a request that reached an
+  uninitialized handler on a revision without a handshake. A handler that
+  initialized never adds them, whatever version a request's `_meta` claims.
 - The wire head supports handshake protocol revisions only
   (`supported_protocol_versions`, `get_info`) and refuses `server/discover`.
   The SDK routes any supported no-handshake revision to a stateless path

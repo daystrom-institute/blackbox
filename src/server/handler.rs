@@ -205,7 +205,7 @@ impl BlackboxServer {
         &self,
         parts: Option<&http::request::Parts>,
     ) -> Result<std::borrow::Cow<'_, Self>, ErrorData> {
-        if self.surface.get().is_some() || parts.is_none() {
+        if self.scope_pinned() || parts.is_none() {
             return Ok(std::borrow::Cow::Borrowed(self));
         }
         let scope = self.resolve_request_scope(parts).await?;
@@ -226,6 +226,11 @@ impl BlackboxServer {
         self.scoped_for(context.extensions.get::<http::request::Parts>())
             .await
             .map(|_| ())
+    }
+
+    /// Whether `initialize` bound this handler to a session scope.
+    fn scope_pinned(&self) -> bool {
+        self.surface.get().is_some()
     }
 
     fn unpinned_clone(&self) -> Self {
@@ -251,8 +256,15 @@ const CATALOG_LIST_TTL_MS: u64 = 300_000;
 /// Cache hints for a catalog listing. They exist only in revisions without
 /// a handshake; a client on a handshake revision receives the listing as it
 /// always has. Listings depend on the caller's surface, so they are private.
-fn catalog_cache_hints(version: Option<&ProtocolVersion>) -> (Option<u64>, Option<CacheScope>) {
-    if version.is_some_and(|version| !version.has_initialize()) {
+///
+/// A session that initialized negotiated a handshake revision, and that
+/// decides: `session_initialized` wins over `request_version`, which is the
+/// request's own `_meta` value and therefore whatever the client wrote.
+fn catalog_cache_hints(
+    session_initialized: bool,
+    request_version: Option<&ProtocolVersion>,
+) -> (Option<u64>, Option<CacheScope>) {
+    if !session_initialized && request_version.is_some_and(|version| !version.has_initialize()) {
         (Some(CATALOG_LIST_TTL_MS), Some(CacheScope::Private))
     } else {
         (None, None)
@@ -342,7 +354,8 @@ impl ServerHandler for BlackboxServer {
             .into_iter()
             .filter(|t| visible.contains(t.name.as_ref()))
             .collect();
-        let (ttl_ms, cache_scope) = catalog_cache_hints(context.protocol_version().as_ref());
+        let (ttl_ms, cache_scope) =
+            catalog_cache_hints(self.scope_pinned(), context.protocol_version().as_ref());
         Ok(ListToolsResult {
             tools,
             ttl_ms,
@@ -357,7 +370,8 @@ impl ServerHandler for BlackboxServer {
         context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, ErrorData> {
         self.refuse_unservable_scope(&context).await?;
-        let (ttl_ms, cache_scope) = catalog_cache_hints(context.protocol_version().as_ref());
+        let (ttl_ms, cache_scope) =
+            catalog_cache_hints(self.scope_pinned(), context.protocol_version().as_ref());
         Ok(ListResourcesResult {
             resources: vec![
                 Resource::new(ONBOARDING_SKILL_URI, "onboard-project/SKILL.md")
@@ -395,7 +409,8 @@ impl ServerHandler for BlackboxServer {
         context: RequestContext<RoleServer>,
     ) -> Result<ListPromptsResult, ErrorData> {
         self.refuse_unservable_scope(&context).await?;
-        let (ttl_ms, cache_scope) = catalog_cache_hints(context.protocol_version().as_ref());
+        let (ttl_ms, cache_scope) =
+            catalog_cache_hints(self.scope_pinned(), context.protocol_version().as_ref());
         Ok(ListPromptsResult {
             prompts: vec![Prompt::new(
                 ONBOARDING_SKILL_NAME,
@@ -518,6 +533,10 @@ mod tests {
         (dir, BlackboxServer::new(state))
     }
 
+    // The handler methods take a `RequestContext`, which needs a live peer and
+    // cannot be built here, so scope handling is tested through `scoped_for`
+    // and the hint decision through `catalog_cache_hints`; the call sites in
+    // the resource, prompt and custom-request methods have no direct test.
     fn request_parts(uri: &str, headers: &[(&str, &str)]) -> http::request::Parts {
         let mut request = http::Request::builder().uri(uri);
         for (name, value) in headers {
@@ -583,23 +602,29 @@ mod tests {
     }
 
     #[test]
-    fn catalog_cache_hints_exist_only_without_a_handshake() {
+    fn catalog_cache_hints_exist_only_for_an_uninitialized_modern_request() {
+        let modern = ProtocolVersion::V_2026_07_28;
         for version in [
             None,
             Some(ProtocolVersion::V_2025_03_26),
             Some(ProtocolVersion::V_2025_06_18),
             Some(ProtocolVersion::LATEST_WITH_INITIALIZE),
         ] {
-            assert_eq!(
-                catalog_cache_hints(version.as_ref()),
-                (None, None),
-                "{version:?}"
-            );
+            for session_initialized in [false, true] {
+                assert_eq!(
+                    catalog_cache_hints(session_initialized, version.as_ref()),
+                    (None, None),
+                    "{session_initialized} {version:?}"
+                );
+            }
         }
         assert_eq!(
-            catalog_cache_hints(Some(&ProtocolVersion::V_2026_07_28)),
+            catalog_cache_hints(false, Some(&modern)),
             (Some(CATALOG_LIST_TTL_MS), Some(CacheScope::Private))
         );
+        // The request's own version is client-written. A session that
+        // initialized keeps its listing shape whatever a request claims.
+        assert_eq!(catalog_cache_hints(true, Some(&modern)), (None, None));
     }
 
     #[test]
