@@ -485,6 +485,7 @@ impl ServerConn {
 mod tests {
     use super::*;
     use bro_capabilities::{ToolCapability, ToolInvocation};
+    use rmcp::ServiceExt;
     use serde_json::json;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
     use tokio::sync::Notify;

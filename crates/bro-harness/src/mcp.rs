@@ -11,6 +11,13 @@
 //! connection for the whole session instead of being dropped when no
 //! `McpTool` retains it; stdio children are reaped via `kill_on_drop(true)`.
 //!
+//! Lifecycle: every connection uses the `initialize` handshake at 2025-06-18
+//! unless `BRO_HARNESS_MCP_HTTP_LIFECYCLE=auto`, which makes HTTP servers
+//! probe `server/discover` first and fall back to the handshake when the
+//! peer rejects it. Stdio servers always use the handshake. Code that reads
+//! a connection must hold for both: a sessionless peer has no session id,
+//! and its results carry a `resultType`.
+//!
 //! Startup is bounded per server. Required failures abort session construction;
 //! optional failures publish sanitized readiness. Catalogs are fixed for the
 //! session. Dynamic list-change reconciliation is not implemented.
@@ -19,8 +26,8 @@ use async_trait::async_trait;
 use bro_tools::{Tool, ToolCx, ToolResult};
 use http::{HeaderName, HeaderValue};
 
-use rmcp::ServiceExt;
 use rmcp::model::{CallToolRequestParams, ClientConfig, ProtocolVersion};
+use rmcp::service::{ClientLifecycleMode, ClientServiceExt};
 
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::transport::{ConfigureCommandExt, StreamableHttpClientTransport, TokioChildProcess};
@@ -262,10 +269,27 @@ enum McpBackend {
     InProcess(Arc<dyn McpSurface>),
 }
 
-/// Client identity for the `initialize` handshake. Connections use the legacy
-/// lifecycle, so the requested revision must be one that has a handshake.
+/// Client identity for the `initialize` handshake. The requested revision
+/// must be one that has a handshake.
 fn legacy_client_config() -> ClientConfig {
     ClientConfig::default().with_protocol_version(ProtocolVersion::V_2025_06_18)
+}
+
+/// Selects the lifecycle for HTTP MCP servers. Unset or any other value
+/// means the handshake; `auto` probes `server/discover` first.
+const HTTP_LIFECYCLE_ENV: &str = "BRO_HARNESS_MCP_HTTP_LIFECYCLE";
+
+/// How a connection to an HTTP MCP server is established. Stdio servers
+/// always use the handshake: a child that ignores an unknown method would
+/// hold startup for the whole discovery timeout.
+fn http_lifecycle(selected: Option<&str>) -> ClientLifecycleMode {
+    match selected.map(str::trim) {
+        Some(value) if value.eq_ignore_ascii_case("auto") => ClientLifecycleMode::Auto {
+            preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+            legacy_version: Some(ProtocolVersion::V_2025_06_18),
+        },
+        _ => ClientLifecycleMode::Initialize,
+    }
 }
 
 /// Start one persistent connection to a remote (stdio/http/sse) MCP server.
@@ -281,12 +305,17 @@ async fn start_remote_server(
             let mut cmd = tokio::process::Command::new(command);
             cmd.args(args).envs(env).kill_on_drop(true);
             let transport = TokioChildProcess::new(cmd.configure(|_| {}))?;
-            legacy_client_config().serve(transport).await?
+            legacy_client_config()
+                .serve_with_lifecycle(transport, ClientLifecycleMode::Initialize)
+                .await?
         }
         McpServerConfig::Http { url, headers, .. } => {
             let transport =
                 StreamableHttpClientTransport::from_config(http_transport_config(url, headers)?);
-            legacy_client_config().serve(transport).await?
+            let lifecycle = http_lifecycle(std::env::var(HTTP_LIFECYCLE_ENV).ok().as_deref());
+            legacy_client_config()
+                .serve_with_lifecycle(transport, lifecycle)
+                .await?
         }
         McpServerConfig::Sse { .. } => anyhow::bail!("legacy SSE MCP transport is unsupported"),
         McpServerConfig::InProcess { .. } => {
@@ -447,6 +476,122 @@ fn http_transport_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_http_lifecycle_is_the_handshake_unless_auto_is_selected() {
+        for legacy in [None, Some(""), Some("legacy"), Some("discover"), Some("1")] {
+            assert_eq!(
+                http_lifecycle(legacy),
+                ClientLifecycleMode::Initialize,
+                "{legacy:?}"
+            );
+        }
+        for auto in ["auto", " AUTO "] {
+            assert_eq!(
+                http_lifecycle(Some(auto)),
+                ClientLifecycleMode::Auto {
+                    preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+                    legacy_version: Some(ProtocolVersion::V_2025_06_18),
+                }
+            );
+        }
+    }
+
+    /// Connects with the `auto` lifecycle to a line-delimited peer that
+    /// either answers or rejects discovery, lists tools, and returns every
+    /// request the peer saw.
+    async fn auto_lifecycle_requests(peer_is_modern: bool) -> Vec<Value> {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let (client, server) = tokio::io::duplex(16 * 1024);
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = requests.clone();
+        let peer = tokio::spawn(async move {
+            let (read, mut write) = tokio::io::split(server);
+            let mut lines = tokio::io::BufReader::new(read).lines();
+            while let Some(line) = lines.next_line().await.unwrap() {
+                let request: Value = serde_json::from_str(&line).unwrap();
+                captured.lock().unwrap().push(request.clone());
+                let id = request["id"].clone();
+                let reply = match request["method"].as_str().unwrap() {
+                    "server/discover" if peer_is_modern => serde_json::json!({
+                        "jsonrpc":"2.0","id":id,"result":{
+                            "resultType":"complete",
+                            "supportedVersions":["2025-06-18","2026-07-28"],
+                            "capabilities":{"tools":{}},
+                            "ttlMs":1000,"cacheScope":"private"}}),
+                    "server/discover" => serde_json::json!({
+                        "jsonrpc":"2.0","id":id,
+                        "error":{"code":-32601,"message":"Method not found"}}),
+                    "initialize" => serde_json::json!({
+                        "jsonrpc":"2.0","id":id,"result":{
+                            "protocolVersion":request["params"]["protocolVersion"],
+                            "capabilities":{"tools":{}},
+                            "serverInfo":{"name":"fixture","version":"1"}}}),
+                    "tools/list" => serde_json::json!({
+                        "jsonrpc":"2.0","id":id,"result":{
+                            "resultType":"complete","tools":[],
+                            "ttlMs":1000,"cacheScope":"private"}}),
+                    "notifications/initialized" => continue,
+                    method => panic!("unexpected fixture method {method}"),
+                };
+                write
+                    .write_all(format!("{reply}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        let running = legacy_client_config()
+            .serve_with_lifecycle(client, http_lifecycle(Some("auto")))
+            .await
+            .unwrap();
+        let conn = remote::ServerConn::new(running, "fixture".into(), 5_000);
+        assert!(conn.list_tools().await.unwrap().is_empty());
+        drop(conn);
+        peer.abort();
+        let seen = requests.lock().unwrap().clone();
+        seen
+    }
+
+    #[tokio::test]
+    async fn auto_uses_the_sessionless_lifecycle_when_the_peer_answers_discovery() {
+        let requests = auto_lifecycle_requests(true).await;
+        let methods: Vec<_> = requests
+            .iter()
+            .map(|request| request["method"].as_str().unwrap())
+            .collect();
+        assert_eq!(methods, ["server/discover", "tools/list"]);
+        assert_eq!(
+            requests[1]["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"], "2026-07-28",
+            "{}",
+            requests[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_falls_back_to_the_handshake_when_the_peer_rejects_discovery() {
+        let requests = auto_lifecycle_requests(false).await;
+        let methods: Vec<_> = requests
+            .iter()
+            .map(|request| request["method"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            methods,
+            [
+                "server/discover",
+                "initialize",
+                "notifications/initialized",
+                "tools/list"
+            ]
+        );
+        assert_eq!(requests[1]["params"]["protocolVersion"], "2025-06-18");
+        assert!(
+            requests[3]["params"]["_meta"]
+                .get("io.modelcontextprotocol/protocolVersion")
+                .is_none(),
+            "{}",
+            requests[3]
+        );
+    }
 
     fn mock_tool(name: &'static str) -> Arc<dyn Tool> {
         struct T(&'static str);

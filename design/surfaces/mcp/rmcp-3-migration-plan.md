@@ -210,10 +210,13 @@ path for current clients. No tasks/resources yet.
    `serve_with_lifecycle` (`Discover` or `Auto`).
 6. Deterministic `tools/list` ordering; set `ttl_ms` +
    `cache_scope: Private` on `ListToolsResult`.
-7. Upgrade the harness child client to `serve_with_lifecycle`: `Auto`
-   mode (probe discover, fall back to legacy). Third-party stdio servers
-   (biofilter) exercise the legacy fallback; the harness connection to the
-   daemon exercises the modern path once the gate is on.
+7. The harness child client connects through `serve_with_lifecycle`.
+   HTTP servers use `Auto` (probe discover at 2026-07-28, fall back to the
+   2025-06-18 handshake) when `BRO_HARNESS_MCP_HTTP_LIFECYCLE=auto`;
+   otherwise, and always for stdio servers, the handshake. A stdio child
+   that ignores an unknown method would hold startup for the SDK's whole
+   discovery timeout, so stdio stays out of `Auto`. The harness connection
+   to the daemon exercises the modern path once both gates are on.
 8. `BBOX_MCP_SESSION_KEEPALIVE_SECS` becomes legacy-only; document.
 
 Validation: per-request scope extraction covered by unit tests at the
