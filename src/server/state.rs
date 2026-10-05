@@ -124,6 +124,8 @@ pub(crate) struct SharedState {
     /// Injected project-record authority handed to every runtime consumer that
     /// only enumerates records (index writer, index selectors, providers).
     pub(crate) records_provider: Arc<dyn bbox_corpus_core::project_record::ProjectRecordsProvider>,
+    /// Resolved `?project=` selectors reused across sessionless MCP requests.
+    pub(crate) project_selector_cache: super::handler::ProjectSelectorCache,
     /// Host-local discovery index of checkouts that carry repo-owned state.
     pub(crate) checkout_registry: Arc<RwLock<bbox_indexing::checkout_registry::CheckoutRegistry>>,
     /// Bounded, path-free evidence for every checkout lease acquisition and
@@ -634,6 +636,7 @@ impl SharedState {
             // accepted-publication runtime.
             accepted_publications: None,
             records_provider,
+            project_selector_cache: Default::default(),
             checkout_registry,
             checkout_access_observations,
             checkout_access,

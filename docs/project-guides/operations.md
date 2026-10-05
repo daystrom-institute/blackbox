@@ -23,7 +23,9 @@ selects a different file.
 Important state/config env vars:
 
 - Daemon: `BBOX_PORT`, `BBOX_BIND`, `BLACKBOX_MCP_NAME`,
-  `BBOX_MCP_SESSION_KEEPALIVE_SECS`, `BLACKBOX_SHUTDOWN_GRACE_SECS`,
+  `BBOX_MCP_SESSION_KEEPALIVE_SECS`, `BBOX_MCP_MODERN_LIFECYCLE` (serve
+  MCP 2026-07-28 sessionless requests and `server/discover`; default off),
+  `BLACKBOX_SHUTDOWN_GRACE_SECS`,
   `BBOX_CONTEXT_CEILING_RATIO` (legacy roster telemetry threshold; default
   0.8, must be in `(0, 1]`, read once per process). Ordinary MCP status,
   wait and dashboard replies omit context telemetry. Explicit status debug

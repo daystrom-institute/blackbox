@@ -72,6 +72,56 @@ impl BlackboxServer {
     }
 }
 
+/// How long a resolved project selector is reused when the catalog has not
+/// moved. The authority epoch is the real invalidation; this bound only
+/// limits what a change the epoch does not carry (a checkout moved on disk)
+/// can leave stale.
+const PROJECT_SELECTOR_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+const PROJECT_SELECTOR_CACHE_ENTRIES: usize = 256;
+
+/// Resolved `?project=` selectors for requests that arrive without a
+/// session. A session resolves its selector once at `initialize`; a
+/// sessionless client sends the same selector on every request, and each
+/// resolution is a blocking probe. An entry is reused only while the project
+/// authority epoch it was resolved under is current and it is younger than
+/// [`PROJECT_SELECTOR_TTL`]. Workspace bindings are never cached: they are
+/// authenticated on every request.
+#[derive(Default)]
+pub(crate) struct ProjectSelectorCache {
+    entries: parking_lot::Mutex<std::collections::HashMap<String, CachedProjectSelector>>,
+}
+
+struct CachedProjectSelector {
+    resolved: String,
+    authority_epoch: u64,
+    resolved_at: std::time::Instant,
+}
+
+impl ProjectSelectorCache {
+    fn get(&self, raw: &str, authority_epoch: u64, now: std::time::Instant) -> Option<String> {
+        let entries = self.entries.lock();
+        let entry = entries.get(raw)?;
+        (entry.authority_epoch == authority_epoch
+            && now.saturating_duration_since(entry.resolved_at) < PROJECT_SELECTOR_TTL)
+            .then(|| entry.resolved.clone())
+    }
+
+    fn put(&self, raw: String, resolved: String, authority_epoch: u64, now: std::time::Instant) {
+        let mut entries = self.entries.lock();
+        if entries.len() >= PROJECT_SELECTOR_CACHE_ENTRIES && !entries.contains_key(&raw) {
+            entries.clear();
+        }
+        entries.insert(
+            raw,
+            CachedProjectSelector {
+                resolved,
+                authority_epoch,
+                resolved_at: now,
+            },
+        );
+    }
+}
+
 /// The scope one request is served under: the tool surface and its visible
 /// set, the project filter selector, and managed-workspace authority. All of
 /// it derives from transport context the client sends on every request (the
@@ -90,6 +140,16 @@ impl BlackboxServer {
     pub(super) async fn resolve_request_scope(
         &self,
         parts: Option<&http::request::Parts>,
+    ) -> Result<RequestScope, ErrorData> {
+        self.resolve_scope(parts, false).await
+    }
+
+    /// `reuse_project_resolution` lets a sessionless request reuse a selector
+    /// resolved for an earlier one; `initialize` always resolves afresh.
+    async fn resolve_scope(
+        &self,
+        parts: Option<&http::request::Parts>,
+        reuse_project_resolution: bool,
     ) -> Result<RequestScope, ErrorData> {
         let (surface_str, project_raw, workspace_binding) = if let Some(parts) = parts {
             let project =
@@ -155,22 +215,54 @@ impl BlackboxServer {
             Some(project_id) => Some(project_id),
             None => match project_raw.clone() {
                 Some(raw) => {
-                    let server = self.clone();
-                    let resolved = tokio::task::spawn_blocking(move || {
-                        server
-                            .resolve_project_filter(&raw)
-                            .and_then(|resolution| {
-                                resolution
-                                    .store_key()
-                                    .or(resolution.project_id())
-                                    .map(str::to_owned)
+                    let authority_epoch = self
+                        .state
+                        .records_provider
+                        .records_snapshot()
+                        .authority_epoch;
+                    let cached = reuse_project_resolution
+                        .then(|| {
+                            self.state.project_selector_cache.get(
+                                &raw,
+                                authority_epoch,
+                                std::time::Instant::now(),
+                            )
+                        })
+                        .flatten();
+                    let resolved = match cached {
+                        Some(resolved) => resolved,
+                        None => {
+                            let server = self.clone();
+                            let selector = raw.clone();
+                            let resolved = tokio::task::spawn_blocking(move || {
+                                server
+                                    .resolve_project_filter(&selector)
+                                    .and_then(|resolution| {
+                                        resolution
+                                            .store_key()
+                                            .or(resolution.project_id())
+                                            .map(str::to_owned)
+                                    })
+                                    .unwrap_or(selector)
                             })
-                            .unwrap_or(raw)
-                    })
-                    .await
-                    .map_err(|e| {
-                        ErrorData::internal_error(format!("project resolution failed: {e}"), None)
-                    })?;
+                            .await
+                            .map_err(|e| {
+                                ErrorData::internal_error(
+                                    format!("project resolution failed: {e}"),
+                                    None,
+                                )
+                            })?;
+                            if reuse_project_resolution {
+                                self.state.project_selector_cache.put(
+                                    raw,
+                                    resolved.clone(),
+                                    authority_epoch,
+                                    std::time::Instant::now(),
+                                );
+                            }
+                            resolved
+                        }
+                    };
                     Some(resolved)
                 }
                 None => None,
@@ -208,7 +300,7 @@ impl BlackboxServer {
         if self.scope_pinned() || parts.is_none() {
             return Ok(std::borrow::Cow::Borrowed(self));
         }
-        let scope = self.resolve_request_scope(parts).await?;
+        let scope = self.resolve_scope(parts, true).await?;
         let server = self.unpinned_clone();
         server.pin_scope(scope);
         Ok(std::borrow::Cow::Owned(server))
@@ -226,6 +318,10 @@ impl BlackboxServer {
         self.scoped_for(context.extensions.get::<http::request::Parts>())
             .await
             .map(|_| ())
+    }
+
+    fn modern_lifecycle_enabled(&self) -> bool {
+        self.state.config.read().daemon.mcp_modern_lifecycle
     }
 
     /// Whether `initialize` bound this handler to a session scope.
@@ -253,6 +349,17 @@ impl BlackboxServer {
 /// across a daemon restart.
 const CATALOG_LIST_TTL_MS: u64 = 300_000;
 
+/// Whether a request is served under a revision without a handshake. A
+/// session that initialized negotiated a handshake revision, and that
+/// decides: the request's own version is whatever the client wrote in
+/// `_meta`, so it is consulted only when no session exists.
+fn serves_sessionless_revision(
+    session_initialized: bool,
+    request_version: Option<&ProtocolVersion>,
+) -> bool {
+    !session_initialized && request_version.is_some_and(|version| !version.has_initialize())
+}
+
 /// Cache hints for a catalog listing. They exist only in revisions without
 /// a handshake; a client on a handshake revision receives the listing as it
 /// always has. Listings depend on the caller's surface, so they are private.
@@ -264,17 +371,26 @@ fn catalog_cache_hints(
     session_initialized: bool,
     request_version: Option<&ProtocolVersion>,
 ) -> (Option<u64>, Option<CacheScope>) {
-    if !session_initialized && request_version.is_some_and(|version| !version.has_initialize()) {
+    if serves_sessionless_revision(session_initialized, request_version) {
         (Some(CATALOG_LIST_TTL_MS), Some(CacheScope::Private))
     } else {
         (None, None)
     }
 }
 
-/// The newest protocol revision this wire head serves. Surface, project and
-/// workspace-binding scope are pinned at `initialize`, so only revisions with
-/// that handshake are supported and `server/discover` is refused.
+/// The newest handshake revision this wire head serves, and the version every
+/// `initialize` is answered with when the client names something newer.
 const LEGACY_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V_2025_06_18;
+
+/// Revisions served when `daemon.mcp_modern_lifecycle` is on: the handshake
+/// revisions above plus the sessionless one. 2025-11-25 stays out, so an
+/// `initialize` naming it is still answered with [`LEGACY_PROTOCOL_VERSION`].
+static MODERN_LIFECYCLE_VERSIONS: [ProtocolVersion; 4] = [
+    ProtocolVersion::V_2024_11_05,
+    ProtocolVersion::V_2025_03_26,
+    ProtocolVersion::V_2025_06_18,
+    ProtocolVersion::V_2026_07_28,
+];
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for BlackboxServer {
@@ -299,18 +415,31 @@ impl ServerHandler for BlackboxServer {
     }
 
     fn supported_protocol_versions(&self) -> std::borrow::Cow<'static, [ProtocolVersion]> {
-        std::borrow::Cow::Borrowed(ProtocolVersion::known_up_to(&LEGACY_PROTOCOL_VERSION))
+        if self.modern_lifecycle_enabled() {
+            std::borrow::Cow::Borrowed(&MODERN_LIFECYCLE_VERSIONS)
+        } else {
+            std::borrow::Cow::Borrowed(ProtocolVersion::known_up_to(&LEGACY_PROTOCOL_VERSION))
+        }
     }
 
     async fn discover(
         &self,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<DiscoverResult, ErrorData> {
-        Err(ErrorData::new(
-            ErrorCode::METHOD_NOT_FOUND,
-            "server/discover",
-            None,
-        ))
+        if !self.modern_lifecycle_enabled() {
+            return Err(ErrorData::new(
+                ErrorCode::METHOD_NOT_FOUND,
+                "server/discover",
+                None,
+            ));
+        }
+        // A client that will be refused on every method learns it here.
+        self.refuse_unservable_scope(&context).await?;
+        Ok(DiscoverResult::from_server_info(
+            self.supported_protocol_versions().into_owned(),
+            self.get_info(),
+        )
+        .with_ttl_ms(CATALOG_LIST_TTL_MS))
     }
 
     async fn initialize(
@@ -330,10 +459,12 @@ impl ServerHandler for BlackboxServer {
         Ok(self.get_info())
     }
 
+    /// The served definition of one tool, whatever the caller's surface. The
+    /// SDK calls this without a request, on a handler it built for the
+    /// purpose, to read an input schema for header validation, and caches the
+    /// answer for the process. It is a catalog lookup, never an authorization
+    /// point: `list_tools` and `call_tool` apply the request's surface.
     fn get_tool(&self, name: &str) -> Option<rmcp::model::Tool> {
-        if !self.session_tools().contains(name) {
-            return None;
-        }
         self.tool_router.get(name).cloned()
     }
 
@@ -504,8 +635,16 @@ impl ServerHandler for BlackboxServer {
                 None,
             ));
         }
+        // Tools build results without a result-type discriminator, the shape
+        // handshake revisions carry. A sessionless revision requires it.
+        let sessionless =
+            serves_sessionless_revision(self.scope_pinned(), context.protocol_version().as_ref());
         let tcc = ToolCallContext::new(server.as_ref(), request, context);
-        server.tool_router.call(tcc).await
+        let mut response = server.tool_router.call(tcc).await?;
+        if sessionless && let CallToolResponse::Complete(result) = &mut response {
+            result.result_type = Some(rmcp::model::ResultType::COMPLETE);
+        }
+        Ok(response)
     }
 }
 
@@ -625,6 +764,86 @@ mod tests {
         // The request's own version is client-written. A session that
         // initialized keeps its listing shape whatever a request claims.
         assert_eq!(catalog_cache_hints(true, Some(&modern)), (None, None));
+    }
+
+    #[test]
+    fn a_cached_project_selector_is_reused_only_under_its_epoch_and_age() {
+        let cache = ProjectSelectorCache::default();
+        let start = std::time::Instant::now();
+        assert_eq!(cache.get("alias", 7, start), None);
+        cache.put("alias".into(), "p_resolved".into(), 7, start);
+        assert_eq!(cache.get("alias", 7, start).as_deref(), Some("p_resolved"));
+        assert_eq!(cache.get("other", 7, start), None);
+        // A moved project authority invalidates at once.
+        assert_eq!(cache.get("alias", 8, start), None);
+        // So does age, whatever the epoch says.
+        let just_inside = start + PROJECT_SELECTOR_TTL - std::time::Duration::from_millis(1);
+        assert_eq!(
+            cache.get("alias", 7, just_inside).as_deref(),
+            Some("p_resolved")
+        );
+        assert_eq!(cache.get("alias", 7, start + PROJECT_SELECTOR_TTL), None);
+        // A newer resolution replaces the entry.
+        cache.put("alias".into(), "p_moved".into(), 8, start);
+        assert_eq!(cache.get("alias", 8, start).as_deref(), Some("p_moved"));
+
+        // The table is bounded: filling it past the limit starts over.
+        for index in 0..PROJECT_SELECTOR_CACHE_ENTRIES {
+            cache.put(format!("selector-{index}"), "p".into(), 8, start);
+        }
+        assert!(cache.entries.lock().len() <= PROJECT_SELECTOR_CACHE_ENTRIES);
+    }
+
+    #[tokio::test]
+    async fn a_sessionless_request_reuses_a_resolved_selector_and_initialize_does_not() {
+        let (_dir, server) = test_server();
+        let parts = request_parts("/mcp?surface=ops&project=literal-project", &[]);
+        assert!(
+            server
+                .state
+                .project_selector_cache
+                .entries
+                .lock()
+                .is_empty()
+        );
+        // The session path resolves afresh and leaves nothing behind.
+        server.resolve_request_scope(Some(&parts)).await.unwrap();
+        assert!(
+            server
+                .state
+                .project_selector_cache
+                .entries
+                .lock()
+                .is_empty()
+        );
+        // The sessionless path records what it resolved and serves it again.
+        let first = server.scoped_for(Some(&parts)).await.unwrap();
+        assert_eq!(server.state.project_selector_cache.entries.lock().len(), 1);
+        let second = server.scoped_for(Some(&parts)).await.unwrap();
+        assert_eq!(
+            first.surface_project.get().unwrap().as_deref(),
+            second.surface_project.get().unwrap().as_deref()
+        );
+        assert_eq!(
+            second.surface_project.get().unwrap().as_deref(),
+            Some("literal-project")
+        );
+    }
+
+    #[test]
+    fn modern_revisions_are_supported_only_when_enabled() {
+        let (_dir, server) = test_server();
+        let legacy = server.supported_protocol_versions();
+        assert!(!legacy.contains(&ProtocolVersion::V_2026_07_28));
+        assert!(!legacy.contains(&ProtocolVersion::LATEST_WITH_INITIALIZE));
+        server.state.config.write().daemon.mcp_modern_lifecycle = true;
+        let modern = server.supported_protocol_versions();
+        assert!(modern.contains(&ProtocolVersion::V_2026_07_28));
+        assert!(
+            !modern.contains(&ProtocolVersion::LATEST_WITH_INITIALIZE),
+            "the handshake answer must not move to 2025-11-25"
+        );
+        assert_eq!(&modern[..3], &legacy[..]);
     }
 
     #[test]

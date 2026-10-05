@@ -19,16 +19,30 @@
   `ttlMs` and `cacheScope: private` only for a request that reached an
   uninitialized handler on a revision without a handshake. A handler that
   initialized never adds them, whatever version a request's `_meta` claims.
-- The wire head supports handshake protocol revisions only
-  (`supported_protocol_versions`, `get_info`) and refuses `server/discover`.
-  The SDK routes any supported no-handshake revision to a stateless path
-  that never calls `initialize`. `get_tool` has no request context and
-  resolves `default` on that path, and unpinned resolution pays the blocking
-  project probe on every call. Widening the supported set is a deliberate
-  gate, never a side effect of an SDK bump.
+- `daemon.mcp_modern_lifecycle` (`BBOX_MCP_MODERN_LIFECYCLE`, default off)
+  is the version gate. Off, the wire head supports handshake revisions only
+  (`supported_protocol_versions`, `get_info`) and refuses `server/discover`,
+  so the SDK rejects a sessionless request before any handler runs. On, the
+  supported set adds 2026-07-28 and `discover` answers after the same scope
+  check as every other method. 2025-11-25 stays out of the set in both
+  states so `initialize` keeps answering 2025-06-18. The SDK routes any
+  supported no-handshake revision to a stateless path that never calls
+  `initialize`; widening the supported set is this gate, never a side effect
+  of an SDK bump.
+- `get_tool` has no request context, so it is a catalog lookup and never a
+  visibility decision. Visibility is decided where scope is known:
+  `list_tools` and `call_tool`.
+- `scoped_for` reuses a resolved `?project=` selector from
+  `ProjectSelectorCache`, keyed by the raw selector and valid for one
+  project authority epoch and a short TTL, so a sessionless request does not
+  repeat the blocking project probe. `initialize` always resolves afresh and
+  never reads or fills the cache. The surface and the workspace binding are
+  never cached.
 - Tool results are built through `BlackboxServer::tool_result`, which leaves
   the result-type discriminator absent: the same value is serialized on the
   legacy MCP wire, in `/control/*` replies and for the response budget.
+  `call_tool` sets `resultType: complete` on the way out only for a request
+  served sessionless on a no-handshake revision, which requires it.
 - A refused scope (unknown surface, unauthenticated binding) must fail
   BEFORE any slot is set: resolution returns the whole scope or an error,
   and `pin_scope` sets every slot together, so no half-initialized handler

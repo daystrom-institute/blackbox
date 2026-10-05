@@ -269,6 +269,207 @@ mod tests {
         })
     }
 
+    /// One sessionless 2026-07-28 request against an app whose daemon serves
+    /// the modern lifecycle, returning the status and the JSON-RPC reply.
+    async fn modern_request(
+        uri: &str,
+        method: &str,
+        mut params: serde_json::Value,
+        extra_headers: &[(&str, &str)],
+    ) -> (StatusCode, serde_json::Value) {
+        let (app, state) = test_app_with_state();
+        state.config.write().daemon.mcp_modern_lifecycle = true;
+        params["_meta"] = modern_meta();
+        let body = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": method, "params": params,
+        });
+        let mut request = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("accept", "application/json, text/event-stream")
+            .header("content-type", "application/json")
+            .header("host", "127.0.0.1")
+            .header("mcp-protocol-version", "2026-07-28")
+            .header("mcp-method", method);
+        for (name, value) in extra_headers {
+            request = request.header(*name, *value);
+        }
+        let response = app
+            .oneshot(request.body(Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        assert!(!response.headers().contains_key("mcp-session-id"));
+        let text = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            axum::body::to_bytes(response.into_body(), 4 << 20),
+        )
+        .await
+        .map(|bytes| String::from_utf8(bytes.unwrap().to_vec()).unwrap())
+        .unwrap_or_default();
+        let reply = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: ").or(Some(line)))
+            .find_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .unwrap_or_else(|| panic!("no JSON-RPC reply in {text:?}"));
+        (status, reply)
+    }
+
+    fn tool_names(reply: &serde_json::Value) -> Vec<&str> {
+        reply["result"]["tools"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no tool list in {reply}"))
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect()
+    }
+
+    /// With the modern lifecycle on, discovery names the sessionless revision
+    /// beside the handshake ones and never the handshake revision the legacy
+    /// answer must not move to.
+    #[tokio::test]
+    async fn discover_advertises_the_sessionless_revision_when_enabled() {
+        let (status, reply) = modern_request(
+            "/mcp?surface=readonly",
+            "server/discover",
+            serde_json::json!({}),
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{reply}");
+        assert_eq!(
+            reply["result"]["supportedVersions"],
+            serde_json::json!(["2024-11-05", "2025-03-26", "2025-06-18", "2026-07-28"])
+        );
+        assert_eq!(reply["result"]["cacheScope"], "private");
+        assert!(reply["result"]["capabilities"]["tools"].is_object());
+    }
+
+    /// A sessionless request is served under the scope its own URL names:
+    /// each surface lists and calls exactly its own tools.
+    #[tokio::test]
+    async fn sessionless_requests_are_served_under_their_own_surface() {
+        let (status, readonly) = modern_request(
+            "/mcp?surface=readonly",
+            "tools/list",
+            serde_json::json!({}),
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{readonly}");
+        let readonly_tools = tool_names(&readonly);
+        assert!(readonly_tools.contains(&"bbox_hybrid_search"));
+        assert!(!readonly_tools.contains(&"bbox_learn"));
+        assert!(!readonly_tools.contains(&"bro_exec"));
+        let mut sorted = readonly_tools.clone();
+        sorted.sort_unstable();
+        assert_eq!(readonly_tools, sorted, "the listing is in name order");
+        assert_eq!(readonly["result"]["ttlMs"], 300_000);
+        assert_eq!(readonly["result"]["cacheScope"], "private");
+
+        let (_, ops) =
+            modern_request("/mcp?surface=ops", "tools/list", serde_json::json!({}), &[]).await;
+        let ops_tools = tool_names(&ops);
+        assert!(ops_tools.contains(&"bro_exec") && ops_tools.contains(&"bbox_learn"));
+        assert!(ops_tools.len() > readonly_tools.len());
+
+        let call = |surface: &'static str, tool: &'static str| async move {
+            modern_request(
+                surface,
+                "tools/call",
+                serde_json::json!({ "name": tool, "arguments": {} }),
+                &[("mcp-name", tool)],
+            )
+            .await
+        };
+        let (status, allowed) = call("/mcp?surface=readonly", "bbox_thread_list").await;
+        assert_eq!(status, StatusCode::OK, "{allowed}");
+        assert_eq!(allowed["result"]["isError"], false);
+        assert_eq!(
+            allowed["result"]["resultType"], "complete",
+            "a sessionless revision requires the result type: {allowed}"
+        );
+        let (_, refused) = call("/mcp?surface=readonly", "bbox_learn").await;
+        assert_eq!(refused["error"]["code"], -32601, "{refused}");
+        assert!(
+            refused["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("not available on surface 'readonly'"),
+            "{refused}"
+        );
+    }
+
+    /// An unknown surface is refused at discovery and on every method, so a
+    /// misconfigured client never receives a partial catalog.
+    #[tokio::test]
+    async fn an_unknown_surface_is_refused_on_every_sessionless_method() {
+        for (method, params, headers) in [
+            ("server/discover", serde_json::json!({}), vec![]),
+            ("tools/list", serde_json::json!({}), vec![]),
+            ("resources/list", serde_json::json!({}), vec![]),
+            ("prompts/list", serde_json::json!({}), vec![]),
+            (
+                "resources/read",
+                serde_json::json!({ "uri": "blackbox://skills/onboard-project/SKILL.md" }),
+                vec![("mcp-name", "blackbox://skills/onboard-project/SKILL.md")],
+            ),
+            (
+                "tools/call",
+                serde_json::json!({ "name": "bbox_thread_list", "arguments": {} }),
+                vec![("mcp-name", "bbox_thread_list")],
+            ),
+        ] {
+            let (_, reply) = modern_request("/mcp?surface=missing", method, params, &headers).await;
+            assert_eq!(reply["error"]["code"], -32600, "{method}: {reply}");
+            assert!(
+                reply["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("tool surface denied"),
+                "{method}: {reply}"
+            );
+            assert!(reply.get("result").is_none(), "{method}: {reply}");
+        }
+    }
+
+    /// Enabling the modern lifecycle leaves the handshake answer where it
+    /// was: a client naming a newer handshake revision still gets 2025-06-18.
+    #[tokio::test]
+    async fn the_handshake_answer_is_unchanged_when_the_modern_lifecycle_is_enabled() {
+        let (app, state) = test_app_with_state();
+        state.config.write().daemon.mcp_modern_lifecycle = true;
+        for requested in ["2026-07-28", "2025-11-25", "2025-06-18"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/mcp?surface=interactive")
+                        .header("accept", "application/json, text/event-stream")
+                        .header("content-type", "application/json")
+                        .header("host", "127.0.0.1")
+                        .body(Body::from(initialize_body(requested).to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{requested}");
+            assert!(response.headers().contains_key("mcp-session-id"));
+            let body = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                axum::body::to_bytes(response.into_body(), 1 << 20),
+            )
+            .await
+            .map(|bytes| String::from_utf8(bytes.unwrap().to_vec()).unwrap())
+            .unwrap_or_default();
+            assert!(
+                body.contains(r#""protocolVersion":"2025-06-18""#),
+                "{requested}: {body}"
+            );
+        }
+    }
+
     fn initialize_body(protocol_version: &str) -> serde_json::Value {
         serde_json::json!({
             "jsonrpc": "2.0",

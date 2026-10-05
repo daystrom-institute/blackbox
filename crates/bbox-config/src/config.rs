@@ -59,6 +59,7 @@ pub struct DaemonOverrides {
     pub shutdown_grace_secs: Option<u64>,
     pub task_ttl_ms: Option<u64>,
     pub mcp_session_keepalive_secs: Option<u64>,
+    pub mcp_modern_lifecycle: Option<bool>,
     pub poller_min_interval_secs: Option<u64>,
     pub executor: Option<ExecutorKind>,
 }
@@ -308,6 +309,10 @@ struct RawDaemonConfig {
     pub task_ttl_ms: u64,
     #[serde(default = "default_daemon_mcp_session_keepalive_secs")]
     pub mcp_session_keepalive_secs: u64,
+    /// Serve the 2026-07-28 MCP lifecycle (`server/discover`, sessionless
+    /// requests) beside handshake sessions. Off by default.
+    #[serde(default)]
+    pub mcp_modern_lifecycle: bool,
     #[serde(default = "default_daemon_poller_min_interval_secs")]
     pub poller_min_interval_secs: u64,
     #[serde(default = "default_checkout_lifecycle_writer_wait_ms")]
@@ -606,6 +611,8 @@ pub struct DaemonConfig {
     pub shutdown_grace_secs: u64,
     pub task_ttl_ms: u64,
     pub mcp_session_keepalive_secs: u64,
+    /// Serve the 2026-07-28 MCP lifecycle beside handshake sessions.
+    pub mcp_modern_lifecycle: bool,
     pub poller_min_interval_secs: u64,
     pub checkout_lifecycle_writer_wait_ms: u64,
     pub executor: ExecutorKind,
@@ -1109,6 +1116,7 @@ impl Config {
                 shutdown_grace_secs: default_daemon_shutdown_grace_secs(),
                 task_ttl_ms: default_daemon_task_ttl_ms(),
                 mcp_session_keepalive_secs: default_daemon_mcp_session_keepalive_secs(),
+                mcp_modern_lifecycle: false,
                 poller_min_interval_secs: default_daemon_poller_min_interval_secs(),
                 checkout_lifecycle_writer_wait_ms: default_checkout_lifecycle_writer_wait_ms(),
                 executor: default_daemon_executor(),
@@ -1221,6 +1229,12 @@ fn apply_explicit_env(raw: RawConfig) -> RawConfig {
         && let Ok(k) = keepalive.parse()
     {
         raw.daemon.mcp_session_keepalive_secs = k;
+    }
+
+    if let Ok(modern) = std::env::var("BBOX_MCP_MODERN_LIFECYCLE")
+        && !modern.trim().is_empty()
+    {
+        raw.daemon.mcp_modern_lifecycle = matches!(modern.trim(), "1" | "true" | "yes");
     }
 
     // shutdown_grace_secs
@@ -1504,6 +1518,7 @@ pub fn load_with(options: LoadOptions) -> Result<Config> {
             shutdown_grace_secs: raw.daemon.shutdown_grace_secs,
             task_ttl_ms: raw.daemon.task_ttl_ms,
             mcp_session_keepalive_secs: raw.daemon.mcp_session_keepalive_secs,
+            mcp_modern_lifecycle: raw.daemon.mcp_modern_lifecycle,
             poller_min_interval_secs: raw.daemon.poller_min_interval_secs,
             checkout_lifecycle_writer_wait_ms: raw.daemon.checkout_lifecycle_writer_wait_ms,
             executor: raw.daemon.executor,
@@ -1852,6 +1867,9 @@ fn apply_flag_overrides(mut raw: RawConfig, overrides: ConfigOverrides) -> RawCo
     }
     if let Some(mcp_session_keepalive_secs) = overrides.daemon.mcp_session_keepalive_secs {
         raw.daemon.mcp_session_keepalive_secs = mcp_session_keepalive_secs;
+    }
+    if let Some(mcp_modern_lifecycle) = overrides.daemon.mcp_modern_lifecycle {
+        raw.daemon.mcp_modern_lifecycle = mcp_modern_lifecycle;
     }
     if let Some(poller_min_interval_secs) = overrides.daemon.poller_min_interval_secs {
         raw.daemon.poller_min_interval_secs = poller_min_interval_secs;

@@ -137,13 +137,12 @@ observable behavior change. Checklist:
    `initialize` at 2026-07-28, so the harness serves a `ClientConfig`
    pinned to `ProtocolVersion::V_2025_06_18`, the revision rmcp 1.4
    requested.
-10. The daemon serves handshake revisions only. `StreamableHttpService`
-    routes `server/discover` and any request carrying 2026-07-28
-    per-request metadata to the stateless path even with
-    `with_legacy_session_mode(true)`, and that path never calls
-    `initialize`, where surface, project and workspace-binding scope are
-    pinned. Until Phase 1 moves that scope per-request, `BlackboxServer`
-    overrides `supported_protocol_versions()` to
+10. The daemon serves handshake revisions only unless the Phase 1 gate is
+    on. `StreamableHttpService` routes `server/discover` and any request
+    carrying 2026-07-28 per-request metadata to the stateless path even
+    with `with_legacy_session_mode(true)`, and that path never calls
+    `initialize`. With the gate off, `BlackboxServer` overrides
+    `supported_protocol_versions()` to
     `ProtocolVersion::known_up_to(V_2025_06_18)`, names that revision in
     `get_info()`, and refuses `discover`. The SDK then rejects stateless
     requests with HTTP 400 and JSON-RPC `-32022` before any handler runs.
@@ -197,14 +196,17 @@ path for current clients. No tasks/resources yet.
 4. Deny semantics (Q5) reduce to "unknown surface": refuse it on
    `server/discover` and per-method; keep the legacy initialize-time abort
    for legacy sessions.
-5. Override `supported_protocol_versions()`; advertise both
-   `V_2025_11_25` and `V_2026_07_28` behind a config gate (Q2). The SDK
-   default `supported_protocol_versions()` is `KNOWN_VERSIONS`, which
-   includes 2026-07-28, and from rmcp 3.5.0 `ProtocolVersion::LATEST` is
-   `V_2026_07_28`; the gate therefore lives in this override, not in SDK
-   defaults. Phase 0 leaves the override at handshake revisions up to
-   `2025-06-18` and `discover` refused; this item widens both only after
-   items 1-3 make scope per-request. Clients reach the modern lifecycle only through
+5. Override `supported_protocol_versions()` behind the config gate
+   `daemon.mcp_modern_lifecycle` (`BBOX_MCP_MODERN_LIFECYCLE`, default
+   off). The SDK default `supported_protocol_versions()` is
+   `KNOWN_VERSIONS`, which includes 2026-07-28, and from rmcp 3.5.0
+   `ProtocolVersion::LATEST` is `V_2026_07_28`; the gate therefore lives
+   in this override, not in SDK defaults. Off, the set is the handshake
+   revisions up to `2025-06-18` and `discover` is refused. On, the set
+   adds `V_2026_07_28` and `discover` answers. `V_2025_11_25` is in
+   neither set: adding it would move the `initialize` answer for current
+   clients, which is a separate decision from serving sessionless ones.
+   Clients reach the modern lifecycle only through
    `serve_with_lifecycle` (`Discover` or `Auto`).
 6. Deterministic `tools/list` ordering; set `ttl_ms` +
    `cache_scope: Private` on `ListToolsResult`.

@@ -882,6 +882,7 @@ pub(super) fn open_shared_state(
         project_authority,
         accepted_publications,
         records_provider,
+        project_selector_cache: Default::default(),
         checkout_registry,
         checkout_access_observations,
         checkout_access,

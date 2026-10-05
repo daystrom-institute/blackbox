@@ -395,24 +395,22 @@ mod tests {
     }
 
     #[test]
-    fn session_surface_gates_get_tool() {
+    fn a_surface_decides_the_visible_set_and_the_catalog_lookup_does_not() {
         let tmp = tempfile::TempDir::new().unwrap();
         let srv = BlackboxServer::new(Arc::new(SharedState::for_test(tmp.path())));
-        assert!(srv.surface.set(Arc::from("readonly")).is_ok());
-        assert!(srv.get_tool("bbox_hybrid_search").is_some());
-        assert!(srv.get_tool("bbox_learn").is_none());
-        assert!(srv.get_tool("bro_exec").is_none());
-
-        let ops = BlackboxServer::new(Arc::new(SharedState::for_test(tmp.path())));
-        assert!(ops.surface.set(Arc::from("ops")).is_ok());
-        assert!(ops.get_tool("bro_exec").is_some());
-
-        // initialize refuses a surface missing from the table.
+        let readonly = srv.surface_tools_for("readonly").unwrap();
+        assert!(readonly.contains("bbox_hybrid_search"));
+        assert!(!readonly.contains("bbox_learn"));
+        assert!(!readonly.contains("bro_exec"));
+        assert!(srv.surface_tools_for("ops").unwrap().contains("bro_exec"));
+        // A surface missing from the table has no visible set at all.
         assert!(srv.surface_tools_for("missing").is_none());
-        assert!(srv.surface_tools_for("ops").is_some());
-        let unknown = BlackboxServer::new(Arc::new(SharedState::for_test(tmp.path())));
-        assert!(unknown.surface.set(Arc::from("missing")).is_ok());
-        assert!(unknown.get_tool("bbox_hybrid_search").is_none());
+
+        // The catalog lookup serves the SDK's schema reads and is the same
+        // for every caller; visibility is applied where requests arrive.
+        assert!(srv.surface.set(Arc::from("readonly")).is_ok());
+        assert!(srv.get_tool("bbox_learn").is_some());
+        assert!(srv.get_tool("bbox_roadmap").is_none());
     }
 
     #[test]
