@@ -1674,7 +1674,26 @@ pub struct CheckoutAccessHealth {
     #[serde(skip_serializing)]
     #[schemars(skip)]
     pub target_counters: Vec<CheckoutAccessTargetCounter>,
+    /// Compatibility lanes that granted access since this process opened the
+    /// observations. Lifetime totals never make a lane active.
     pub active_compatibility_lanes: Vec<CheckoutAccessSourceLane>,
+    /// Every compatibility lane with a recorded grant, with how recently and
+    /// how often it granted. Not part of the frozen bridge health wire; the
+    /// same facts are derivable from `counters`.
+    #[serde(skip_serializing)]
+    #[schemars(skip)]
+    pub compatibility_lanes: Vec<CheckoutCompatibilityLaneHealth>,
+}
+
+/// Grant history of one compatibility lane. Counters are durable lifetime
+/// totals, so recency is reported beside them: `granted_since_start` counts
+/// grants this process recorded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CheckoutCompatibilityLaneHealth {
+    pub lane: CheckoutAccessSourceLane,
+    pub granted: u64,
+    pub granted_since_start: u64,
+    pub last_granted_unix_secs: Option<u64>,
 }
 
 /// Cloneable observation handle shared by all broker instances and doctor.
@@ -1685,6 +1704,9 @@ pub struct CheckoutAccessHealth {
 pub struct CheckoutAccessObservations {
     store_path: Option<Arc<PathBuf>>,
     state: Arc<Mutex<CheckoutAccessObservationSnapshot>>,
+    /// Counters as they stood when this process opened the store: the
+    /// baseline that separates this process's grants from lifetime totals.
+    opened_counters: Arc<Vec<CheckoutAccessCounter>>,
 }
 
 impl CheckoutAccessObservations {
@@ -1703,6 +1725,7 @@ impl CheckoutAccessObservations {
         };
         Ok(Self {
             store_path: Some(Arc::new(store_path)),
+            opened_counters: Arc::new(snapshot.counters.clone()),
             state: Arc::new(Mutex::new(snapshot)),
         })
     }
@@ -1711,11 +1734,12 @@ impl CheckoutAccessObservations {
         Self {
             store_path: None,
             state: Arc::new(Mutex::new(CheckoutAccessObservationSnapshot::default())),
+            opened_counters: Arc::default(),
         }
     }
 
     pub fn health(&self) -> CheckoutAccessHealth {
-        health_from_snapshot(&self.state.lock())
+        health_from_snapshot(&self.state.lock(), &self.opened_counters)
     }
 
     fn record(
@@ -1910,7 +1934,10 @@ fn is_cutover_target_kind(kind: CheckoutAccessKind) -> bool {
     )
 }
 
-fn health_from_snapshot(snapshot: &CheckoutAccessObservationSnapshot) -> CheckoutAccessHealth {
+fn health_from_snapshot(
+    snapshot: &CheckoutAccessObservationSnapshot,
+    opened_counters: &[CheckoutAccessCounter],
+) -> CheckoutAccessHealth {
     let operations = CheckoutAccessKind::ALL
         .into_iter()
         .map(|kind| {
@@ -1944,16 +1971,39 @@ fn health_from_snapshot(snapshot: &CheckoutAccessObservationSnapshot) -> Checkou
             }
         })
         .collect();
-    let active_compatibility_lanes = CheckoutAccessSourceLane::ALL
+    let granted_on = |counters: &[CheckoutAccessCounter], lane: CheckoutAccessSourceLane| {
+        counters
+            .iter()
+            .filter(|counter| {
+                counter.source_lane == lane && counter.outcome == CheckoutAccessOutcome::Granted
+            })
+            .fold((0_u64, None::<u64>), |(count, last), counter| {
+                (
+                    count.saturating_add(counter.count),
+                    (counter.count > 0)
+                        .then_some(counter.last_unix_secs)
+                        .max(last),
+                )
+            })
+    };
+    let compatibility_lanes: Vec<CheckoutCompatibilityLaneHealth> = CheckoutAccessSourceLane::ALL
         .into_iter()
-        .filter(|lane| {
-            lane.is_compatibility()
-                && snapshot.counters.iter().any(|counter| {
-                    counter.source_lane == *lane
-                        && counter.outcome == CheckoutAccessOutcome::Granted
-                        && counter.count > 0
-                })
+        .filter(|lane| lane.is_compatibility())
+        .filter_map(|lane| {
+            let (granted, last_granted_unix_secs) = granted_on(&snapshot.counters, lane);
+            let (granted_at_open, _) = granted_on(opened_counters, lane);
+            (granted > 0).then_some(CheckoutCompatibilityLaneHealth {
+                lane,
+                granted,
+                granted_since_start: granted.saturating_sub(granted_at_open),
+                last_granted_unix_secs,
+            })
         })
+        .collect();
+    let active_compatibility_lanes = compatibility_lanes
+        .iter()
+        .filter(|lane| lane.granted_since_start > 0)
+        .map(|lane| lane.lane)
         .collect();
     CheckoutAccessHealth {
         sequence: snapshot.sequence,
@@ -1961,6 +2011,7 @@ fn health_from_snapshot(snapshot: &CheckoutAccessObservationSnapshot) -> Checkou
         counters: snapshot.counters.clone(),
         target_counters: snapshot.target_counters.clone(),
         active_compatibility_lanes,
+        compatibility_lanes,
     }
 }
 
@@ -3038,10 +3089,31 @@ mod tests {
             .unwrap();
         let health = reopened.health();
         assert_eq!(health.sequence, 3);
+        // The legacy grant predates this open: it is lifetime history with a
+        // last-grant time, and it does not make the lane active now.
+        assert!(health.active_compatibility_lanes.is_empty());
+        assert_eq!(health.compatibility_lanes.len(), 1);
+        let lane = &health.compatibility_lanes[0];
+        assert_eq!(lane.lane, CheckoutAccessSourceLane::LegacyProjectRecord);
+        assert_eq!(lane.granted, 1);
+        assert_eq!(lane.granted_since_start, 0);
+        assert!(lane.last_granted_unix_secs.is_some());
+        // A grant recorded by this process makes it active again.
+        reopened
+            .record(
+                "project-1",
+                CheckoutAccessKind::Blame,
+                CheckoutAccessSourceLane::LegacyProjectRecord,
+                CheckoutAccessOutcome::Granted,
+            )
+            .unwrap();
+        let regranted = reopened.health();
         assert_eq!(
-            health.active_compatibility_lanes,
+            regranted.active_compatibility_lanes,
             vec![CheckoutAccessSourceLane::LegacyProjectRecord]
         );
+        assert_eq!(regranted.compatibility_lanes[0].granted, 2);
+        assert_eq!(regranted.compatibility_lanes[0].granted_since_start, 1);
         assert!(
             health.counters.len()
                 <= CheckoutAccessKind::ALL.len() * CheckoutAccessSourceLane::ALL.len() * 2

@@ -693,6 +693,25 @@ fn checkout_access_section(
                 "active checkout compatibility lanes: {lanes}"
             )));
         }
+        // Counters are lifetime totals. A lane that granted before this
+        // daemon started and not since is history, reported with its last
+        // grant time and never as active.
+        for lane in health
+            .compatibility_lanes
+            .iter()
+            .filter(|lane| lane.granted_since_start == 0)
+        {
+            let last_grant = lane
+                .last_granted_unix_secs
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "never".into());
+            findings.push(Finding::info(format!(
+                "checkout compatibility lane {} has not granted since daemon start: {} lifetime grant(s), last grant {}",
+                lane.lane.as_str(),
+                lane.granted,
+                last_grant,
+            )));
+        }
     }
     SectionReport {
         section: "checkout_access",
@@ -2421,6 +2440,40 @@ mod tests {
                 .message
                 .contains("active checkout compatibility lanes: legacy_project_record")
         }));
+    }
+
+    /// A lane whose grants all predate this daemon is history: it is named
+    /// with its last grant time and never listed as active.
+    #[test]
+    fn a_lane_with_only_earlier_grants_is_reported_as_history() {
+        use bbox_indexing::checkout_access::{
+            CheckoutAccessHealth, CheckoutAccessSourceLane, CheckoutCompatibilityLaneHealth,
+        };
+
+        let section = checkout_access_section(&CheckoutAccessHealth {
+            sequence: 9,
+            operations: Vec::new(),
+            counters: Vec::new(),
+            target_counters: Vec::new(),
+            active_compatibility_lanes: Vec::new(),
+            compatibility_lanes: vec![CheckoutCompatibilityLaneHealth {
+                lane: CheckoutAccessSourceLane::LegacyPathResolver,
+                granted: 795,
+                granted_since_start: 0,
+                last_granted_unix_secs: Some(1_786_213_255),
+            }],
+        });
+        let messages: Vec<&str> = section
+            .findings
+            .iter()
+            .map(|finding| finding.message.as_str())
+            .collect();
+        assert_eq!(
+            messages,
+            [
+                "checkout compatibility lane legacy_path_resolver has not granted since daemon start: 795 lifetime grant(s), last grant 1786213255"
+            ]
+        );
     }
 
     #[test]
