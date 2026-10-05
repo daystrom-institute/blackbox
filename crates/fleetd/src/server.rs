@@ -213,14 +213,26 @@ pub fn validate_tcp_listen_address(
     address: SocketAddr,
     allow_nonloopback: bool,
 ) -> anyhow::Result<()> {
+    validate_tcp_listen_address_with_tls(address, allow_nonloopback, false)
+}
+
+/// [`validate_tcp_listen_address`] for a listener that may serve TLS. A
+/// non-loopback address is granted by the TLS identity (the daemon pins it)
+/// or by the explicit plaintext grant; a plaintext non-loopback listener
+/// needs the grant whether or not an identity exists.
+pub fn validate_tcp_listen_address_with_tls(
+    address: SocketAddr,
+    allow_nonloopback_plaintext: bool,
+    tls: bool,
+) -> anyhow::Result<()> {
     if address.ip().is_unspecified() || address.ip().is_multicast() {
         anyhow::bail!(
             "refusing fleetd TCP listener {address}; bind one concrete loopback or encrypted-interface address, never wildcard or multicast"
         );
     }
-    if !address.ip().is_loopback() && !allow_nonloopback {
+    if !address.ip().is_loopback() && !tls && !allow_nonloopback_plaintext {
         anyhow::bail!(
-            "refusing non-loopback fleetd TCP listener {address}; pass --allow-nonloopback-tcp only for an encrypted, ACL-restricted transport such as a tailnet"
+            "refusing non-loopback plaintext fleetd TCP listener {address}; give it a TLS identity (--tls-identity-dir, see `fleetd identity init`) or pass --allow-nonloopback-tcp only for an encrypted, ACL-restricted transport such as a tailnet"
         );
     }
     Ok(())
@@ -281,15 +293,25 @@ impl Default for TcpBindBackoff {
 /// condition (the interface that carries the address is down, or the port is
 /// still held), so it is retried with bounded backoff and never ends the
 /// process: the Unix listener and every supervised session keep running.
-pub async fn serve_tcp_retrying(state: Arc<Fleetd>, address: SocketAddr, backoff: TcpBindBackoff) {
+pub async fn serve_tcp_retrying(
+    state: Arc<Fleetd>,
+    address: SocketAddr,
+    backoff: TcpBindBackoff,
+    tls: Option<tokio_rustls::TlsAcceptor>,
+) {
     let mut delay = backoff.initial;
     let mut attempt: u64 = 0;
     loop {
         attempt += 1;
         match TcpListener::bind(address).await {
             Ok(listener) => {
-                tracing::info!(%address, attempt, "fleetd TCP listener enabled");
-                serve_tcp(state, listener).await;
+                tracing::info!(
+                    %address,
+                    attempt,
+                    tls = tls.is_some(),
+                    "fleetd TCP listener enabled"
+                );
+                serve_tcp(state, listener, tls).await;
                 return;
             }
             Err(error) => {
@@ -328,8 +350,14 @@ pub async fn serve(state: Arc<Fleetd>, listener: UnixListener) {
 
 /// Accept explicitly-enabled TCP owner connections. The bearer gate and
 /// generation fence are identical to Unix. TCP cannot supply a Unix peer uid,
-/// so callers must provide the network identity boundary outside fleetd.
-pub async fn serve_tcp(state: Arc<Fleetd>, listener: TcpListener) {
+/// so the network identity boundary is either the TLS identity the daemon
+/// pins (`tls` given) or, for a plaintext listener, a transport the operator
+/// has secured outside fleetd.
+pub async fn serve_tcp(
+    state: Arc<Fleetd>,
+    listener: TcpListener,
+    tls: Option<tokio_rustls::TlsAcceptor>,
+) {
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(accepted) => accepted,
@@ -339,12 +367,33 @@ pub async fn serve_tcp(state: Arc<Fleetd>, listener: TcpListener) {
             }
         };
         let state = state.clone();
+        let tls = tls.clone();
         tokio::spawn(async move {
-            if let Err(error) = serve_tcp_connection(state, stream).await {
+            let served = match tls {
+                Some(acceptor) => serve_tls_connection(state, stream, acceptor).await,
+                None => serve_tcp_connection(state, stream).await,
+            };
+            if let Err(error) = served {
                 tracing::warn!(%peer, %error, "TCP daemon connection ended with an error");
             }
         });
     }
+}
+
+/// TLS counterpart to [`serve_tcp_connection`]: the handshake with fleetd's
+/// identity comes first, and a peer that does not complete it (a plaintext
+/// client, or one that refused the certificate) never reaches the protocol.
+pub async fn serve_tls_connection(
+    state: Arc<Fleetd>,
+    stream: TcpStream,
+    acceptor: tokio_rustls::TlsAcceptor,
+) -> anyhow::Result<()> {
+    stream.set_nodelay(true)?;
+    let stream = acceptor
+        .accept(stream)
+        .await
+        .map_err(|error| anyhow::anyhow!("TLS handshake failed: {error}"))?;
+    serve_authenticated_connection(state, stream, "tls").await
 }
 
 /// Handshake, authenticate, then run one owner connection to completion.

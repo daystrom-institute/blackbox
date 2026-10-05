@@ -184,7 +184,7 @@ async fn start_fleetd_tcp() -> TcpHarness {
         ServiceToken::parse(TEST_TOKEN).expect("token"),
         build_identity(),
     );
-    tokio::spawn(serve_tcp(state.clone(), listener));
+    tokio::spawn(serve_tcp(state.clone(), listener, None));
     TcpHarness {
         _directory: directory,
         root,
@@ -210,6 +210,7 @@ async fn tcp_bind_failure_is_retried_while_the_unix_listener_serves() {
             initial: Duration::from_millis(20),
             max: Duration::from_millis(80),
         },
+        None,
     ));
 
     // Several bind attempts fail while the port is held.
@@ -263,7 +264,14 @@ async fn an_unavailable_tcp_address_does_not_stop_another_from_serving() {
     };
     let tasks: Vec<_> = [unavailable, free]
         .into_iter()
-        .map(|address| tokio::spawn(serve_tcp_retrying(harness.state.clone(), address, backoff)))
+        .map(|address| {
+            tokio::spawn(serve_tcp_retrying(
+                harness.state.clone(),
+                address,
+                backoff,
+                None,
+            ))
+        })
         .collect();
 
     let mut listening = false;

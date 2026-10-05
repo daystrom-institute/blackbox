@@ -106,7 +106,15 @@ const FLEETD_DUPLICATE_SESSION_CODE: &str = "session.duplicate";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FleetdEndpoint {
     Unix(PathBuf),
+    /// Plaintext TCP; the operator secures the transport outside the daemon.
     Tcp(String),
+    /// TLS to a fleetd whose certificate is pinned by digest: the daemon
+    /// accepts exactly that certificate, and the bearer token travels inside
+    /// the channel.
+    Tls {
+        address: String,
+        fingerprint: PinnedFingerprint,
+    },
 }
 
 impl FleetdEndpoint {
@@ -114,12 +122,151 @@ impl FleetdEndpoint {
         match self {
             Self::Unix(path) => format!("unix://{}", path.display()),
             Self::Tcp(address) => format!("tcp://{address}"),
+            Self::Tls { address, .. } => format!("tls://{address}"),
         }
     }
 
     fn is_remote(&self) -> bool {
-        matches!(self, Self::Tcp(_))
+        matches!(self, Self::Tcp(_) | Self::Tls { .. })
     }
+}
+
+/// The SHA-256 digest of the DER certificate a `tls://` fleetd presents, as
+/// `fleetd identity init` prints it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PinnedFingerprint([u8; 32]);
+
+impl PinnedFingerprint {
+    /// Parse 64 hex digits, with or without `:` or `-` separators between
+    /// byte pairs, in either case.
+    pub fn parse(text: &str) -> anyhow::Result<Self> {
+        let hex: String = text
+            .trim()
+            .chars()
+            .filter(|c| !matches!(c, ':' | '-' | ' '))
+            .collect();
+        if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            anyhow::bail!(
+                "daemon.fleetd_tls_fingerprint must be the 64 hex digit SHA-256 of the fleetd certificate, as `fleetd identity init` prints it"
+            );
+        }
+        let mut bytes = [0_u8; 32];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16)?;
+        }
+        Ok(Self(bytes))
+    }
+
+    fn matches(&self, certificate: &[u8]) -> bool {
+        use sha2::Digest as _;
+        let digest = sha2::Sha256::digest(certificate);
+        digest.as_slice() == self.0
+    }
+
+    pub fn to_hex(&self) -> String {
+        self.0.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+}
+
+impl std::fmt::Debug for PinnedFingerprint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.to_hex())
+    }
+}
+
+/// Accepts one certificate: the pinned one. No chain, no name, no expiry
+/// check: the identity is self-signed and the pin is the whole trust
+/// decision. Signatures within the handshake are still verified with the
+/// provider's algorithms.
+#[derive(Debug)]
+struct PinnedServerVerifier {
+    fingerprint: PinnedFingerprint,
+    provider: Arc<rustls::crypto::CryptoProvider>,
+}
+
+impl rustls::client::danger::ServerCertVerifier for PinnedServerVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        if self.fingerprint.matches(end_entity.as_ref()) {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::ApplicationVerificationFailure,
+            ))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// The client configuration for a pinned fleetd.
+fn pinned_tls_connector(
+    fingerprint: PinnedFingerprint,
+) -> anyhow::Result<tokio_rustls::TlsConnector> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(PinnedServerVerifier {
+            fingerprint,
+            provider,
+        }))
+        .with_no_client_auth();
+    Ok(tokio_rustls::TlsConnector::from(Arc::new(config)))
+}
+
+/// The TLS server name for `host:port`. Under pinning the name is not
+/// checked, but the handshake needs a well-formed one (SNI for a DNS name).
+fn tls_server_name(address: &str) -> anyhow::Result<rustls::pki_types::ServerName<'static>> {
+    let host = if let Some(rest) = address.strip_prefix('[') {
+        rest.split(']').next().unwrap_or_default().to_string()
+    } else {
+        address
+            .rsplit_once(':')
+            .map(|(host, _)| host.to_string())
+            .unwrap_or_default()
+    };
+    rustls::pki_types::ServerName::try_from(host.clone()).map_err(|error| {
+        anyhow::anyhow!("fleetd TLS endpoint host `{host}` is not a valid server name: {error}")
+    })
 }
 
 /// Where fleetd and its token live, plus how to start the local Unix form if
@@ -174,22 +321,54 @@ impl FleetdConfig {
         token_file: Option<&Path>,
         worker_home: Option<&Path>,
         worker_bro_home: Option<&Path>,
+        tls_fingerprint: Option<&str>,
     ) -> anyhow::Result<Self> {
         let state_dir = state_dir.as_ref().to_path_buf();
+        let tls_fingerprint = tls_fingerprint
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
         let Some(endpoint) = endpoint.map(str::trim).filter(|value| !value.is_empty()) else {
-            if token_file.is_some() || worker_home.is_some() || worker_bro_home.is_some() {
+            if token_file.is_some()
+                || worker_home.is_some()
+                || worker_bro_home.is_some()
+                || tls_fingerprint.is_some()
+            {
                 anyhow::bail!(
                     "remote fleetd token/worker paths require daemon.fleetd_endpoint; refusing ambiguous off-host settings on the state-local Unix executor"
                 );
             }
             return Ok(Self::in_state_dir(state_dir));
         };
-        let Some(address) = endpoint.strip_prefix("tcp://") else {
+        let (address, resolved_endpoint) = if let Some(address) = endpoint.strip_prefix("tls://") {
+            validate_tcp_address(endpoint, address)?;
+            let fingerprint = tls_fingerprint.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "fleetd TLS endpoint `{endpoint}` requires daemon.fleetd_tls_fingerprint or BLACKBOX_FLEETD_TLS_FINGERPRINT, the digest `fleetd identity init` printed"
+                )
+            })?;
+            let fingerprint = PinnedFingerprint::parse(fingerprint)?;
+            tls_server_name(address)?;
+            (
+                address,
+                FleetdEndpoint::Tls {
+                    address: address.to_string(),
+                    fingerprint,
+                },
+            )
+        } else if let Some(address) = endpoint.strip_prefix("tcp://") {
+            validate_tcp_address(endpoint, address)?;
+            if tls_fingerprint.is_some() {
+                anyhow::bail!(
+                    "daemon.fleetd_tls_fingerprint is set but the fleetd endpoint `{endpoint}` is plaintext; use tls://host:port or drop the fingerprint"
+                );
+            }
+            (address, FleetdEndpoint::Tcp(address.to_string()))
+        } else {
             anyhow::bail!(
-                "unsupported fleetd endpoint `{endpoint}`; expected tcp://host:port or omit it for the state-local Unix socket"
+                "unsupported fleetd endpoint `{endpoint}`; expected tls://host:port, tcp://host:port, or omit it for the state-local Unix socket"
             );
         };
-        validate_tcp_address(endpoint, address)?;
+        let _ = address;
         let token = token_file.ok_or_else(|| {
             anyhow::anyhow!(
                 "remote fleetd endpoint `{endpoint}` requires daemon.fleetd_token_file or BLACKBOX_FLEETD_TOKEN_FILE"
@@ -203,7 +382,7 @@ impl FleetdConfig {
             worker_bro_home,
         )?;
         Ok(Self {
-            endpoint: FleetdEndpoint::Tcp(address.to_string()),
+            endpoint: resolved_endpoint,
             token: token.to_path_buf(),
             state_dir,
             binary: None,
@@ -526,6 +705,30 @@ impl FleetdExecutor {
                 stream.set_nodelay(true).map_err(|error| {
                     anyhow::anyhow!("cannot configure remote fleetd socket: {error}")
                 })?;
+                self.finish_dial(stream).await
+            }
+            FleetdEndpoint::Tls {
+                address,
+                fingerprint,
+            } => {
+                let stream = TcpStream::connect(address).await.map_err(|error| {
+                    anyhow::anyhow!(
+                        "cannot reach remote fleetd at tls://{address}: {error}. Remote fleetd is never auto-started and there is no local-executor fallback."
+                    )
+                })?;
+                stream.set_nodelay(true).map_err(|error| {
+                    anyhow::anyhow!("cannot configure remote fleetd socket: {error}")
+                })?;
+                let connector = pinned_tls_connector(fingerprint.clone())?;
+                let stream = connector
+                    .connect(tls_server_name(address)?, stream)
+                    .await
+                    .map_err(|error| {
+                        anyhow::anyhow!(
+                            "TLS handshake with fleetd at tls://{address} failed: {error}. The daemon accepts only the certificate whose SHA-256 is daemon.fleetd_tls_fingerprint ({}); compare it with `fleetd identity show` on the fleetd host.",
+                            fingerprint.to_hex()
+                        )
+                    })?;
                 self.finish_dial(stream).await
             }
         }
@@ -2191,6 +2394,130 @@ mod tests {
     }
 
     #[test]
+    fn a_tls_endpoint_needs_its_pin_and_a_plaintext_endpoint_refuses_one() {
+        let pin = "ab".repeat(32);
+        let config = FleetdConfig::resolve(
+            "/state/cage",
+            Some("tls://192.168.0.149:7265"),
+            Some(Path::new("/run/secrets/fleetd-token")),
+            Some(Path::new("/worker/home")),
+            Some(Path::new("/worker/state/bro")),
+            Some(&format!(" {pin} ")),
+        )
+        .unwrap();
+        assert_eq!(
+            config.endpoint,
+            FleetdEndpoint::Tls {
+                address: "192.168.0.149:7265".to_string(),
+                fingerprint: PinnedFingerprint::parse(&pin).unwrap(),
+            }
+        );
+        assert!(config.endpoint.is_remote());
+        assert_eq!(config.endpoint.label(), "tls://192.168.0.149:7265");
+
+        let without_pin = FleetdConfig::resolve(
+            "/state/cage",
+            Some("tls://fleet.lan:7265"),
+            Some(Path::new("/run/secrets/fleetd-token")),
+            Some(Path::new("/worker/home")),
+            Some(Path::new("/worker/state/bro")),
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            without_pin.contains("requires daemon.fleetd_tls_fingerprint"),
+            "{without_pin}"
+        );
+
+        let plaintext_with_pin = FleetdConfig::resolve(
+            "/state/cage",
+            Some("tcp://fleet.lan:7265"),
+            Some(Path::new("/run/secrets/fleetd-token")),
+            Some(Path::new("/worker/home")),
+            Some(Path::new("/worker/state/bro")),
+            Some(&pin),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            plaintext_with_pin.contains("is plaintext"),
+            "{plaintext_with_pin}"
+        );
+
+        let pin_without_endpoint =
+            FleetdConfig::resolve("/state/local", None, None, None, None, Some(&pin))
+                .unwrap_err()
+                .to_string();
+        assert!(pin_without_endpoint.contains("require daemon.fleetd_endpoint"));
+    }
+
+    #[test]
+    fn a_pin_is_64_hex_digits_in_any_common_spelling() {
+        let canonical = "0123456789abcdef".repeat(4);
+        let spellings = [
+            canonical.clone(),
+            canonical.to_uppercase(),
+            canonical
+                .as_bytes()
+                .chunks(2)
+                .map(|pair| std::str::from_utf8(pair).unwrap())
+                .collect::<Vec<_>>()
+                .join(":"),
+        ];
+        for spelling in spellings {
+            assert_eq!(
+                PinnedFingerprint::parse(&spelling).unwrap().to_hex(),
+                canonical
+            );
+        }
+        for bad in [
+            "",
+            "abcd",
+            &canonical[..62],
+            &format!("{canonical}00"),
+            &format!("zz{}", &canonical[2..]),
+        ] {
+            assert!(PinnedFingerprint::parse(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_pinned_verifier_accepts_exactly_the_pinned_certificate() {
+        use rustls::client::danger::ServerCertVerifier as _;
+        use sha2::Digest as _;
+        let certificate =
+            rustls::pki_types::CertificateDer::from(b"not even a certificate".to_vec());
+        let digest = sha2::Sha256::digest(certificate.as_ref());
+        let pin = digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let verifier = PinnedServerVerifier {
+            fingerprint: PinnedFingerprint::parse(&pin).unwrap(),
+            provider: provider.clone(),
+        };
+        let name = tls_server_name("192.168.0.149:7265").unwrap();
+        let now = rustls::pki_types::UnixTime::now();
+        assert!(
+            verifier
+                .verify_server_cert(&certificate, &[], &name, &[], now)
+                .is_ok()
+        );
+        let other = rustls::pki_types::CertificateDer::from(b"another certificate".to_vec());
+        assert!(
+            verifier
+                .verify_server_cert(&other, &[], &name, &[], now)
+                .is_err()
+        );
+        // Names are accepted for IPs and DNS hosts alike; only the pin decides.
+        tls_server_name("fleet.lan:7265").unwrap();
+        tls_server_name("[2001:db8::1]:7265").unwrap();
+        pinned_tls_connector(verifier.fingerprint.clone()).unwrap();
+    }
+
+    #[test]
     fn remote_endpoint_requires_an_explicit_token_file() {
         let error = FleetdConfig::resolve(
             "/state/cage",
@@ -2198,6 +2525,7 @@ mod tests {
             None,
             Some(Path::new("/worker/home")),
             Some(Path::new("/worker/state/bro")),
+            None,
         )
         .unwrap_err();
         assert!(
@@ -2212,6 +2540,7 @@ mod tests {
             Some(Path::new("/run/secrets/fleetd-token")),
             Some(Path::new("/worker/home")),
             Some(Path::new("/worker/state/bro")),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -2250,6 +2579,7 @@ mod tests {
                     Some(Path::new("/run/secrets/fleetd-token")),
                     home,
                     bro_home,
+                    None,
                 )
                 .is_err()
             );
@@ -2262,6 +2592,7 @@ mod tests {
             "/state/local",
             None,
             Some(Path::new("/run/secrets/ambiguous")),
+            None,
             None,
             None,
         )
@@ -2286,6 +2617,7 @@ mod tests {
                     Some(Path::new("/run/secrets/fleetd-token")),
                     Some(Path::new("/worker/home")),
                     Some(Path::new("/worker/state/bro")),
+                    None,
                 )
                 .is_err(),
                 "{endpoint} must fail before daemon startup completes"
@@ -2297,6 +2629,7 @@ mod tests {
             Some(Path::new("/run/secrets/fleetd-token")),
             Some(Path::new("/worker/home")),
             Some(Path::new("/worker/state/bro")),
+            None,
         )
         .expect("bracketed IPv6 with a nonzero port is valid");
     }
@@ -2684,6 +3017,7 @@ mod tests {
             Some(&token),
             Some(&root),
             Some(&root),
+            None,
         )
         .unwrap();
         let executor = Arc::new(FleetdExecutor::new(config));

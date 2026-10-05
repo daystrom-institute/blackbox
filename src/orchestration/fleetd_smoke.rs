@@ -124,6 +124,70 @@ mod smoke {
             panic!("fleetd did not bind tcp://{tcp_address} within the deadline");
         }
 
+        /// Start fleetd serving TLS on a loopback address with an identity
+        /// made by `fleetd identity init`, returning the process and the
+        /// fingerprint that command printed.
+        async fn start_tls(state_dir: &Path) -> (Self, String) {
+            std::fs::create_dir_all(state_dir).expect("state dir");
+            let reservation = std::net::TcpListener::bind("127.0.0.1:0")
+                .expect("reserve loopback port");
+            let tcp_address = reservation.local_addr().expect("reserved address");
+            drop(reservation);
+            let init = std::process::Command::new(fleetd_binary())
+                .args(["identity", "init", "--state-dir"])
+                .arg(state_dir)
+                .arg("--listen-tcp")
+                .arg(tcp_address.to_string())
+                .output()
+                .expect("run fleetd identity init");
+            assert!(init.status.success(), "{}", String::from_utf8_lossy(&init.stderr));
+            let stdout = String::from_utf8_lossy(&init.stdout);
+            let fingerprint = stdout
+                .lines()
+                .find_map(|line| line.strip_prefix("sha256 fingerprint to pin: "))
+                .unwrap_or_else(|| panic!("no fingerprint in {stdout}"))
+                .trim()
+                .to_string();
+            let child = std::process::Command::new(fleetd_binary())
+                .arg("--state-dir")
+                .arg(state_dir)
+                .arg("--listen-tcp")
+                .arg(tcp_address.to_string())
+                .arg("--tls-identity-dir")
+                .arg(state_dir)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("start TLS fleetd");
+            let deadline = tokio::time::Instant::now() + DEADLINE;
+            while tokio::time::Instant::now() < deadline {
+                if tokio::net::TcpStream::connect(tcp_address).await.is_ok() {
+                    let process = Self {
+                        child,
+                        state_dir: state_dir.to_path_buf(),
+                        tcp_address: Some(tcp_address),
+                    };
+                    return (process, fingerprint);
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            panic!("fleetd did not bind tls://{tcp_address} within the deadline");
+        }
+
+        fn remote_tls_config(&self, fingerprint: &str) -> FleetdConfig {
+            let address = self.tcp_address.expect("TCP fleetd process");
+            FleetdConfig::resolve(
+                &self.state_dir,
+                Some(&format!("tls://{address}")),
+                Some(&self.state_dir.join("fleetd.token")),
+                Some(&self.state_dir),
+                Some(&self.state_dir),
+                Some(fingerprint),
+            )
+            .expect("valid remote TLS config")
+        }
+
         pub(super) fn config(&self) -> FleetdConfig {
             let mut config = FleetdConfig::in_state_dir(&self.state_dir);
             // Never let an ambient BLACKBOX_FLEETD_BIN from the developer's shell
@@ -141,6 +205,7 @@ mod smoke {
                 Some(&self.state_dir.join("fleetd.token")),
                 Some(&self.state_dir),
                 Some(&self.state_dir),
+                None,
             )
             .expect("valid remote config")
         }
@@ -379,6 +444,60 @@ mod smoke {
         );
     }
 
+    /// The daemon reaches a TLS fleetd only through the pinned certificate:
+    /// the right digest drives a real dispatch, another digest is refused at
+    /// the handshake, and a plaintext dial of the TLS listener never reaches
+    /// the protocol.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pinned_tls_fleetd_drives_a_dispatch_and_refuses_every_other_peer() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonical tempdir");
+        let (fleetd, fingerprint) = FleetdProcess::start_tls(&root.join("state")).await;
+        let log = root.join("tls.events.jsonl");
+        let stub = write_stub(
+            &root,
+            "tls.sh",
+            &[r#"{"type":"assistant","seq":1}"#],
+            &log,
+            "exit 0\n",
+        );
+
+        let executor = FleetdExecutor::new(fleetd.remote_tls_config(&fingerprint));
+        let mut handle = executor
+            .spawn(spec_for(&stub, "tls-session", "tls-task", &log, &root))
+            .await
+            .expect("the pinned TLS fleetd accepted the spawn");
+        assert!(recv_line(&mut handle.events).await.contains(r#""seq":1"#));
+        let outcome = tokio::time::timeout(DEADLINE, handle.outcome)
+            .await
+            .expect("outcome within deadline")
+            .expect("outcome published");
+        assert_eq!(outcome.exit_code, Some(0));
+
+        // Another certificate's digest: refused in the handshake, before any
+        // token is sent.
+        let other = fingerprint
+            .chars()
+            .map(|c| if c == '0' { '1' } else { '0' })
+            .collect::<String>();
+        let error = match FleetdExecutor::new(fleetd.remote_tls_config(&other))
+            .spawn(spec_for(&stub, "tls-refused", "tls-refused-task", &log, &root))
+            .await
+        {
+            Ok(_) => panic!("a pin that does not match the certificate must be refused"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("TLS handshake with fleetd"), "{error}");
+        assert!(error.contains(&other), "{error}");
+
+        // A plaintext dial of the TLS listener never completes the protocol
+        // handshake.
+        let plaintext = FleetdExecutor::new(fleetd.remote_config())
+            .spawn(spec_for(&stub, "tls-plain", "tls-plain-task", &log, &root))
+            .await;
+        assert!(plaintext.is_err(), "plaintext against a TLS listener must fail");
+    }
+
     #[tokio::test]
     async fn unreachable_remote_fleetd_is_never_autostarted_and_creates_no_token() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -394,6 +513,7 @@ mod smoke {
             Some(&token),
             Some(&root),
             Some(&root),
+            None,
         )
         .expect("valid remote config");
         let executor = FleetdExecutor::new(config);

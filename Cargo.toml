@@ -191,6 +191,8 @@ futures = "0.3"
 async-stream = "0.3"
 
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
+# Pinned TLS to a remote fleetd (daemon.fleetd_endpoint = tls://...).
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 
 # Process management (SIGTERM)
 libc = "0.2"

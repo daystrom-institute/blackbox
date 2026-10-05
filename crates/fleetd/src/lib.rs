@@ -21,6 +21,7 @@ pub mod registry;
 pub mod replay;
 pub mod server;
 pub mod spawn;
+pub mod tls;
 pub mod workspace;
 
 pub use paths::{FleetdPaths, default_state_dir};

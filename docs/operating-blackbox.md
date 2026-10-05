@@ -238,6 +238,36 @@ the harness. The token file must already exist, be owned by the daemon uid,
 and have no group or other permission bits. A remote client never creates that
 file, starts fleetd, or falls back to a local worker.
 
+A `tcp://` endpoint is plaintext: the bearer token is only as private as the
+network between the two hosts, so fleetd serves a non-loopback plaintext
+listener only behind `--allow-nonloopback-tcp`, on an encrypted,
+ACL-restricted transport such as a tailnet. The `tls://` form pins fleetd's
+own certificate instead:
+
+```toml
+[daemon]
+executor = "fleetd"
+fleetd_endpoint = "tls://192.168.0.149:7265"
+fleetd_tls_fingerprint = "<sha256 printed by `fleetd identity init`>"
+fleetd_token_file = "/run/secrets/fleetd-token"
+fleetd_worker_home = "/home/on-agent-host"
+fleetd_worker_bro_home = "/state/on-agent-host/bro"
+```
+
+On the fleetd host, `fleetd identity init --listen-tcp <ip:port>` writes
+`fleetd-tls.crt` and `fleetd-tls.key` into the state dir (or
+`--tls-identity-dir`) and prints the certificate's SHA-256; fleetd then runs
+with `--tls-identity-dir <dir>` (or `BLACKBOX_FLEETD_TLS_IDENTITY_DIR`) and
+serves every `--listen-tcp` address over TLS, which grants a non-loopback
+address without the plaintext flag. The daemon accepts exactly the
+certificate whose digest is `fleetd_tls_fingerprint`
+(`BLACKBOX_FLEETD_TLS_FINGERPRINT`); no authority, name or expiry is
+consulted, and the token is sent only inside that channel. `fleetd identity
+show` prints the digest of an existing identity; `identity init` refuses to
+replace one, since the daemon's pin would break. To rotate, remove the two
+files, run `identity init` again, update the daemon's fingerprint, and
+restart both.
+
 An off-host worker also needs a reachable daemon capability URL. Set
 `BLACKBOX_MCP_URL` on blackboxd to the tailnet ingress URL, including the MCP
 path, instead of the bind-derived loopback default. Worker event logs remain

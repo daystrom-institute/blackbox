@@ -112,6 +112,7 @@ pub fn install_configured_harness_executor(
     fleetd_token_file: Option<&std::path::Path>,
     fleetd_worker_home: Option<&std::path::Path>,
     fleetd_worker_bro_home: Option<&std::path::Path>,
+    fleetd_tls_fingerprint: Option<&str>,
     task_store: Arc<RwLock<TaskStore>>,
     tail_tx: tokio::sync::broadcast::Sender<tail::TailEvent>,
     workspace_binding_authority: Option<Arc<dyn WorkspaceBindingAuthority>>,
@@ -126,6 +127,7 @@ pub fn install_configured_harness_executor(
             fleetd_token_file,
             fleetd_worker_home,
             fleetd_worker_bro_home,
+            fleetd_tls_fingerprint,
         )?,
     };
     Ok(install_harness_executor_with_config(

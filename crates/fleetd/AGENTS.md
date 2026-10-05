@@ -33,8 +33,9 @@ into a binary that changes a few times a year is the fix.
   `cargo tree` graph, not on `Cargo.toml`, so a transitive arrival fails too.
   Run it whenever you touch a manifest here.
 - **A TCP address that cannot be bound never ends the process.** Whether the
-  operator granted the address (loopback, or non-loopback with the explicit
-  opt-in; never wildcard or multicast) is validated once at startup and is
+  operator granted the address (loopback, or non-loopback with a TLS identity
+  or the explicit plaintext opt-in; never wildcard or multicast) is validated
+  once at startup and is
   fatal. Whether a granted address can be bound right now is an environment
   condition: each address has its own listener task, which retries with
   bounded backoff while the Unix listener, every other address and every
@@ -52,9 +53,16 @@ into a binary that changes a few times a year is the fix.
   be `Authenticate` with a valid bearer token. A well-formed `Spawn` sent
   first is refused, not executed. Unix accepts also run `verify_peer_uid` as a
   second independent check: it proves the peer runs as our uid, never which
-  service it is. TCP has no Unix uid claim, is disabled by default, refuses a
-  non-loopback bind without a second explicit grant, and is valid only behind
-  an encrypted, ACL-restricted network identity boundary such as a tailnet.
+  service it is. TCP has no Unix uid claim and is disabled by default. Its
+  network identity boundary is one of two things: the TLS identity in
+  `src/tls.rs` (`--tls-identity-dir`, made by `fleetd identity init`), which
+  the daemon pins by certificate digest so only that certificate is ever
+  accepted and the token travels inside the channel; or, for a plaintext
+  listener, an encrypted, ACL-restricted transport outside fleetd such as a
+  tailnet, granted by `--allow-nonloopback-tcp`. A non-loopback plaintext
+  bind without that grant is refused; an identity that cannot be loaded is
+  fatal at startup. The identity is never regenerated in place: `identity
+  init` refuses an existing one, because the daemon's pin would break.
 - **Disconnect is not session death.** Losing the owner connection keeps
   children running, keeps the registry, and pauses relaying. Emitted messages
   with no owner attached are DROPPED on purpose: the durable event log is the
@@ -132,7 +140,7 @@ local version.
 The transport is `bro-rpc`'s length-prefixed bounded framing, which bans
 newline framing outright (see `crates/bro-rpc/AGENTS.md`). The same framed
 protocol runs over the state-local Unix socket and the explicitly configured
-TCP endpoint. The Unix path derives its token and socket from the state dir;
+TCP endpoint, plaintext or TLS. The Unix path derives its token and socket from the state dir;
 the remote client requires a pre-existing explicit token file and never
 creates or auto-starts anything.
 

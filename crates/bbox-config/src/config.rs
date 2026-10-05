@@ -329,6 +329,12 @@ struct RawDaemonConfig {
     /// creates a remote transport token.
     #[serde(default)]
     pub fleetd_token_file: Option<PathBuf>,
+    /// SHA-256 digest, lowercase hex, of the DER certificate a `tls://`
+    /// fleetd endpoint presents (printed by `fleetd identity init`). The
+    /// daemon accepts that certificate and no other. Required with `tls://`,
+    /// refused with `tcp://`.
+    #[serde(default)]
+    pub fleetd_tls_fingerprint: Option<String>,
     /// Filesystem home on the machine that runs a remote fleetd worker. This
     /// is deliberately distinct from the daemon container's HOME: provider
     /// credentials and checkout paths remain worker-local.
@@ -618,6 +624,7 @@ pub struct DaemonConfig {
     pub executor: ExecutorKind,
     pub fleetd_endpoint: Option<String>,
     pub fleetd_token_file: Option<PathBuf>,
+    pub fleetd_tls_fingerprint: Option<String>,
     pub fleetd_worker_home: Option<PathBuf>,
     pub fleetd_worker_bro_home: Option<PathBuf>,
     /// The daemon holds no checkout; see `[daemon] no_checkout_authority`.
@@ -1122,6 +1129,7 @@ impl Config {
                 executor: default_daemon_executor(),
                 fleetd_endpoint: None,
                 fleetd_token_file: None,
+                fleetd_tls_fingerprint: None,
                 fleetd_worker_home: None,
                 fleetd_worker_bro_home: None,
                 no_checkout_authority: false,
@@ -1272,6 +1280,11 @@ fn apply_explicit_env(raw: RawConfig) -> RawConfig {
         && !path.trim().is_empty()
     {
         raw.daemon.fleetd_token_file = Some(PathBuf::from(path));
+    }
+    if let Ok(fingerprint) = std::env::var("BLACKBOX_FLEETD_TLS_FINGERPRINT")
+        && !fingerprint.trim().is_empty()
+    {
+        raw.daemon.fleetd_tls_fingerprint = Some(fingerprint.trim().to_string());
     }
     if let Ok(path) = std::env::var("BLACKBOX_FLEETD_WORKER_HOME")
         && !path.trim().is_empty()
@@ -1524,6 +1537,7 @@ pub fn load_with(options: LoadOptions) -> Result<Config> {
             executor: raw.daemon.executor,
             fleetd_endpoint: raw.daemon.fleetd_endpoint,
             fleetd_token_file,
+            fleetd_tls_fingerprint: raw.daemon.fleetd_tls_fingerprint,
             fleetd_worker_home,
             fleetd_worker_bro_home,
             no_checkout_authority: raw.daemon.no_checkout_authority,

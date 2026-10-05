@@ -41,6 +41,7 @@ pub async fn run() -> anyhow::Result<()> {
         cfg.daemon.fleetd_token_file.as_deref(),
         cfg.daemon.fleetd_worker_home.as_deref(),
         cfg.daemon.fleetd_worker_bro_home.as_deref(),
+        cfg.daemon.fleetd_tls_fingerprint.as_deref(),
         shared.task_store.clone(),
         shared.tail_tx.clone(),
         Some(std::sync::Arc::new(
