@@ -149,6 +149,7 @@ impl Registry {
                     | "git_commit"
                     | "sandbox_status"
                     | "sandbox_grounding"
+                    | "shell_list"
             ) {
                 // Compatibility and convenience tools remain callable, but basic
                 // file/search/shell operations own the default authoring surface.
@@ -1260,6 +1261,29 @@ mod tests {
             assert!(error.to_string().contains("file_read"));
             assert_eq!(second_resume.activation_state(), json!([]));
         }
+    }
+
+    #[test]
+    fn shell_list_is_deferred_while_the_session_tools_stay_on_the_wire() {
+        let builtins = vec![
+            mk("shell_run", "run"),
+            mk("shell_poll", "poll"),
+            mk("shell_kill", "kill"),
+            mk("shell_list", "list retained shell sessions"),
+        ];
+        let registry = Registry::new(
+            builtins,
+            vec![],
+            &PinPolicy::default(),
+            &ToolFilter::default(),
+        )
+        .unwrap();
+        let wire: Vec<String> = registry.wire_specs().into_iter().map(|s| s.name).collect();
+        for name in ["shell_run", "shell_poll", "shell_kill"] {
+            assert!(wire.contains(&name.to_string()), "wire: {wire:?}");
+        }
+        assert!(!wire.contains(&"shell_list".to_string()), "wire: {wire:?}");
+        assert!(registry.manifest().iter().any(|(n, _)| n == "shell_list"));
     }
 
     #[test]
