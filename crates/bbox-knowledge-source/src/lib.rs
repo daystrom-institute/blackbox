@@ -1,12 +1,12 @@
-//! Dependency-clean contracts for remote knowledge and gap source transport.
+//! Dependency-clean contracts for committed knowledge publication transport.
 //!
 //! # Wire compatibility
 //!
 //! Strictness is asymmetric by direction. Request bodies the daemon RECEIVES
 //! stay `#[serde(deny_unknown_fields)]`: a misspelled or stale field from a
 //! client is a refusal, not a silently ignored intent. Response bodies a
-//! client DECODES (`*ResponseV1`, `*StatusV1`, `*PageV1`,
-//! `ProvisionalCaptureContextV1`) are tolerant of unknown fields, because a
+//! client DECODES (`*ResponseV1`, `*StatusV1`, `*PageV1`) are tolerant of
+//! unknown fields, because a
 //! long-lived CLI or collector routinely predates the daemon it talks to and a
 //! daemon-side additive field must degrade to "ignored", never to "every older
 //! client bricks". Any field ADDED to a response type carries
@@ -18,7 +18,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use bbox_corpus_core::identity::PublishedScope;
-use bro_core::WorkspaceId;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -44,8 +43,6 @@ pub const EVIDENCE_BINDINGS_FILENAME: &str = "bindings.json";
 /// `edges.jsonl` are required, `graph.json` is optional.
 pub const GRAPH_SOURCE_FILENAMES: [&str; 4] =
     ["graph.json", "schema.json", "vertices.jsonl", "edges.jsonl"];
-pub const MAX_ANCESTRY_NODES: u64 = 2_000_000;
-pub const MAX_ANCESTRY_EDGES: u64 = 8_000_000;
 pub const MAX_ANCESTRY_PAGE_NODES: u64 = 2_000;
 pub const MAX_ANCESTRY_PAGE_BYTES: u64 = 2 * 1024 * 1024;
 pub const MAX_MANIFEST_PAGE_ENTRIES: u64 = 2_000;
@@ -69,8 +66,6 @@ pub struct KnowledgeSourceLimits {
     pub max_graphs_per_lane: u64,
     pub max_graph_bytes: u64,
     pub max_graph_rows_per_file: u64,
-    pub max_ancestry_nodes: u64,
-    pub max_ancestry_edges: u64,
     pub max_ancestry_page_nodes: u64,
     pub max_ancestry_page_bytes: u64,
     pub max_manifest_page_entries: u64,
@@ -89,8 +84,6 @@ impl Default for KnowledgeSourceLimits {
             max_graphs_per_lane: MAX_GRAPHS_PER_LANE,
             max_graph_bytes: MAX_GRAPH_BYTES,
             max_graph_rows_per_file: MAX_GRAPH_ROWS_PER_FILE,
-            max_ancestry_nodes: MAX_ANCESTRY_NODES,
-            max_ancestry_edges: MAX_ANCESTRY_EDGES,
             max_ancestry_page_nodes: MAX_ANCESTRY_PAGE_NODES,
             max_ancestry_page_bytes: MAX_ANCESTRY_PAGE_BYTES,
             max_manifest_page_entries: MAX_MANIFEST_PAGE_ENTRIES,
@@ -110,8 +103,6 @@ impl KnowledgeSourceLimits {
         validate_limit(self.max_graphs_per_lane, MAX_GRAPHS_PER_LANE)?;
         validate_limit(self.max_graph_bytes, MAX_GRAPH_BYTES)?;
         validate_limit(self.max_graph_rows_per_file, MAX_GRAPH_ROWS_PER_FILE)?;
-        validate_limit(self.max_ancestry_nodes, MAX_ANCESTRY_NODES)?;
-        validate_limit(self.max_ancestry_edges, MAX_ANCESTRY_EDGES)?;
         validate_limit(self.max_ancestry_page_nodes, MAX_ANCESTRY_PAGE_NODES)?;
         validate_limit(self.max_ancestry_page_bytes, MAX_ANCESTRY_PAGE_BYTES)?;
         validate_limit(self.max_manifest_page_entries, MAX_MANIFEST_PAGE_ENTRIES)?;
@@ -153,24 +144,6 @@ pub enum ContractError {
     ManifestLimitExceeded,
     #[error("source manifest page is invalid")]
     InvalidManifestPage,
-    #[error("ancestry witness is not strictly sorted")]
-    AncestryOutOfOrder,
-    #[error("ancestry witness contains an invalid or duplicate parent")]
-    InvalidAncestryParent,
-    #[error("ancestry witness is incomplete")]
-    AncestryIncomplete,
-    #[error("ancestry witness contains unreachable nodes")]
-    AncestryUnreachable,
-    #[error("ancestry witness contains a cycle")]
-    AncestryCycle,
-    #[error("claimed merge base is not reachable from both commits")]
-    InvalidMergeBase,
-    #[error("ancestry count does not match its descriptor")]
-    AncestryCountMismatch,
-    #[error("ancestry commitment does not match its descriptor")]
-    AncestryCommitmentMismatch,
-    #[error("ancestry witness exceeds an enforced limit")]
-    AncestryLimitExceeded,
     #[error("generation exceeds its enforced byte limit")]
     GenerationLimitExceeded,
     #[error("graph source path is not exactly <graph-id>/<known-file>")]
@@ -228,10 +201,9 @@ pub enum SourceLaneV1 {
     /// Repo-owned project bro configuration: `.bro/brofiles/<name>.json`,
     /// `.bbox/mcp.json`, and the committed `.bbox/config.toml` its MCP
     /// enablement reporting reads. Retired `.bro/teamplates/<name>.json`
-    /// files from earlier collectors remain admissible and are ignored. Publication
-    /// only: provisional workspace snapshots never carry it. Unlike the
-    /// other lanes it is explicitly optional on the candidate, so "this
-    /// producer publishes configuration and there is none" and "this
+    /// files from earlier collectors remain admissible and are ignored.
+    /// Unlike the other lanes it is explicitly optional on the candidate, so
+    /// "this producer publishes configuration and there is none" and "this
     /// producer predates the lane" stay distinguishable.
     Config,
 }
@@ -260,8 +232,7 @@ impl SourceLaneV1 {
     }
 }
 
-/// Which lanes a stored generation identity or working-pair commitment was
-/// minted over.
+/// Which lanes a stored publication generation identity was minted over.
 ///
 /// Every rung is the exact preimage some shipped binary used, so this ladder
 /// is APPEND-ONLY: a new lane adds a rung at the top and never edits one
@@ -277,8 +248,7 @@ enum LaneVintage {
     /// Current: knowledge, gaps, graphs, evidence, and the configuration
     /// lane. The configuration lane is publication-only and its absence is
     /// explicit (`None`), so it commits only when present: a candidate
-    /// without it has exactly its pre-configuration preimage. Working pairs
-    /// and provisional identities never carry it.
+    /// without it has exactly its pre-configuration preimage.
     Current,
 }
 
@@ -294,13 +264,6 @@ impl LaneVintage {
     fn includes_config(self) -> bool {
         matches!(self, Self::Current)
     }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-#[serde(rename_all = "snake_case")]
-pub enum SnapshotClassV1 {
-    Baseline,
-    Working,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -431,68 +394,6 @@ impl PublicationCandidateDescriptorV1 {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct AncestryCommitV1 {
-    pub commit_oid: String,
-    pub parent_oids: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct AncestryDescriptorV1 {
-    pub ancestry_sha256: String,
-    pub node_count: u64,
-    pub edge_count: u64,
-    pub page_count: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct AncestryPageV1 {
-    pub page_index: u64,
-    pub nodes: Vec<AncestryCommitV1>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct StableCaptureV1 {
-    pub transaction_pending_before: bool,
-    pub transaction_pending_after: bool,
-    pub first_working_pair_sha256: String,
-    pub second_working_pair_sha256: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ProvisionalWorkspaceDescriptorV1 {
-    pub schema_version: u32,
-    pub scope: PublishedScope,
-    pub workspace_id: WorkspaceId,
-    pub sequence: u64,
-    pub accepted_generation: String,
-    pub accepted_commit: String,
-    pub checkout_head: String,
-    pub merge_base: String,
-    pub object_format: GitObjectFormatV1,
-    pub ancestry: AncestryDescriptorV1,
-    pub capture: StableCaptureV1,
-    pub baseline_knowledge: SourceManifestDescriptorV1,
-    pub baseline_gaps: SourceManifestDescriptorV1,
-    #[serde(default)]
-    pub baseline_graphs: SourceManifestDescriptorV1,
-    /// Absent in every workspace captured before the evidence lane existed.
-    #[serde(default)]
-    pub baseline_evidence: SourceManifestDescriptorV1,
-    pub working_knowledge: SourceManifestDescriptorV1,
-    pub working_gaps: SourceManifestDescriptorV1,
-    #[serde(default)]
-    pub working_graphs: SourceManifestDescriptorV1,
-    /// Absent in every workspace captured before the evidence lane existed.
-    #[serde(default)]
-    pub working_evidence: SourceManifestDescriptorV1,
-}
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceGenerationStateV1 {
@@ -510,6 +411,8 @@ pub struct BeginSourceUploadResponseV1 {
     pub upload_id: String,
     pub max_manifest_page_entries: u64,
     pub max_manifest_page_bytes: u64,
+    /// The two ancestry page bounds stay on the wire because released
+    /// collectors require them when decoding this response.
     pub max_ancestry_page_nodes: u64,
     pub max_ancestry_page_bytes: u64,
     pub max_blob_bytes: u64,
@@ -541,94 +444,11 @@ pub struct BeginPublicationUploadRequestV1 {
     pub descriptor: PublicationCandidateDescriptorV1,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ProvisionalProbeRequestV1 {
-    pub scope: PublishedScope,
-    pub workspace_id: WorkspaceId,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ProvisionalProbeResponseV1 {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub current: Option<ProvisionalWorkspaceStatusV1>,
-    /// The next durable sequence for this workspace. This remains monotonic
-    /// after the current lease expires or its pointer is explicitly retired.
-    pub next_sequence: u64,
-}
-
-/// Daemon-authenticated inputs a workspace owner must pin before capturing a
-/// provisional generation. The project id is deliberately absent: the
-/// workspace binding already selects it, while the source descriptor carries
-/// only the portable published scope and accepted content identity.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ProvisionalCaptureContextV1 {
-    pub scope: PublishedScope,
-    pub accepted_generation: String,
-    pub accepted_commit: String,
-    pub lease_ttl_secs: u64,
-}
-
-impl ProvisionalCaptureContextV1 {
-    pub fn validate(&self) -> Result<(), ContractError> {
-        validate_scope(&self.scope)?;
-        validate_sha256(&self.accepted_generation)?;
-        if self.lease_ttl_secs == 0 {
-            return Err(ContractError::InvalidLimit);
-        }
-        match self.accepted_commit.len() {
-            40 => validate_object_id(&self.accepted_commit, GitObjectFormatV1::Sha1),
-            64 => validate_object_id(&self.accepted_commit, GitObjectFormatV1::Sha256),
-            _ => Err(ContractError::InvalidObjectId),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct BeginProvisionalUploadRequestV1 {
-    pub descriptor: ProvisionalWorkspaceDescriptorV1,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct FinalizeProvisionalUploadRequestV1 {
-    pub lease_ttl_secs: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct RenewProvisionalGenerationRequestV1 {
-    pub lease_ttl_secs: u64,
-}
-
 impl PublicationProbeRequestV1 {
     pub fn validate(&self) -> Result<(), ContractError> {
         validate_scope(&self.scope)?;
         validate_full_ref(&self.full_ref)?;
         validate_object_id(&self.publisher_commit, self.object_format)
-    }
-}
-
-impl ProvisionalProbeRequestV1 {
-    pub fn validate(&self) -> Result<(), ContractError> {
-        validate_scope(&self.scope)?;
-        WorkspaceId::parse(self.workspace_id.as_str()).map_err(|_| ContractError::InvalidInput)?;
-        Ok(())
-    }
-}
-
-impl ProvisionalProbeResponseV1 {
-    pub fn validate(&self) -> Result<(), ContractError> {
-        if self.next_sequence == 0
-            || self
-                .current
-                .as_ref()
-                .is_some_and(|current| current.sequence >= self.next_sequence)
-        {
-            return Err(ContractError::InvalidInput);
-        }
-        Ok(())
     }
 }
 
@@ -677,191 +497,8 @@ pub struct PublicationCandidateStatusV1 {
     pub diagnostic: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ProvisionalWorkspaceStatusV1 {
-    pub source_generation_id: String,
-    pub state: SourceGenerationStateV1,
-    pub workspace_id: WorkspaceId,
-    pub sequence: u64,
-    pub accepted_generation: String,
-    pub checkout_head: String,
-    pub observed_at_unix_secs: u64,
-    pub baseline_knowledge_manifest_sha256: String,
-    pub baseline_gap_manifest_sha256: String,
-    #[serde(default)]
-    pub baseline_graph_manifest_sha256: String,
-    #[serde(default)]
-    pub baseline_evidence_manifest_sha256: String,
-    pub working_knowledge_manifest_sha256: String,
-    pub working_gap_manifest_sha256: String,
-    #[serde(default)]
-    pub working_graph_manifest_sha256: String,
-    #[serde(default)]
-    pub working_evidence_manifest_sha256: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub lease_expires_unix_secs: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub diagnostic: Option<String>,
-}
-
-impl ProvisionalWorkspaceDescriptorV1 {
-    pub fn validate_header(&self, limits: KnowledgeSourceLimits) -> Result<(), ContractError> {
-        validate_schema(self.schema_version)?;
-        validate_scope(&self.scope)?;
-        validate_sha256(&self.accepted_generation)?;
-        validate_object_id(&self.accepted_commit, self.object_format)?;
-        validate_object_id(&self.checkout_head, self.object_format)?;
-        validate_object_id(&self.merge_base, self.object_format)?;
-        validate_ancestry_descriptor(&self.ancestry, limits)?;
-        self.capture.validate()?;
-        self.baseline_knowledge.validate_header(limits)?;
-        self.baseline_gaps.validate_header(limits)?;
-        self.baseline_graphs.validate_header(limits)?;
-        self.baseline_evidence.validate_header(limits)?;
-        self.working_knowledge.validate_header(limits)?;
-        self.working_gaps.validate_header(limits)?;
-        self.working_graphs.validate_header(limits)?;
-        self.working_evidence.validate_header(limits)?;
-        // A workspace commits to a working pair over the lanes its own binary
-        // knew about, so admission walks the vintage ladder rather than a
-        // single legacy special case. Each older rung is admissible only for
-        // the exact absent-lane shape a binary of that vintage could have
-        // produced: a capture carrying real evidence content has no
-        // pre-evidence vintage, and one carrying graph content has no
-        // pre-graphs vintage.
-        if !self
-            .admissible_working_pair_vintages()
-            .into_iter()
-            .any(|vintage| {
-                self.capture.first_working_pair_sha256 == self.working_pair_for_vintage(vintage)
-            })
-        {
-            return Err(ContractError::InvalidInput);
-        }
-        validate_total_bytes(
-            [
-                self.baseline_knowledge.logical_bytes,
-                self.baseline_gaps.logical_bytes,
-                self.baseline_graphs.logical_bytes,
-                self.baseline_evidence.logical_bytes,
-                self.working_knowledge.logical_bytes,
-                self.working_gaps.logical_bytes,
-                self.working_graphs.logical_bytes,
-                self.working_evidence.logical_bytes,
-            ],
-            limits.max_generation_bytes,
-        )
-    }
-
-    /// The vintages this descriptor's shape could legitimately have been
-    /// minted by, newest first.
-    fn admissible_working_pair_vintages(&self) -> Vec<LaneVintage> {
-        let mut vintages = vec![LaneVintage::Current];
-        if self.working_evidence.is_absent_lane() {
-            vintages.push(LaneVintage::PreEvidence);
-            if self.working_graphs.is_absent_lane() {
-                vintages.push(LaneVintage::PreGraphs);
-            }
-        }
-        vintages
-    }
-
-    fn working_pair_for_vintage(&self, vintage: LaneVintage) -> String {
-        working_pair_for_vintage(
-            &self.working_knowledge,
-            &self.working_gaps,
-            &self.working_graphs,
-            &self.working_evidence,
-            vintage,
-        )
-    }
-}
-
-impl StableCaptureV1 {
-    pub fn validate(&self) -> Result<(), ContractError> {
-        validate_sha256(&self.first_working_pair_sha256)?;
-        validate_sha256(&self.second_working_pair_sha256)?;
-        if self.transaction_pending_before
-            || self.transaction_pending_after
-            || self.first_working_pair_sha256 != self.second_working_pair_sha256
-        {
-            return Err(ContractError::InvalidInput);
-        }
-        Ok(())
-    }
-}
-
 pub fn source_file_blob_sha256(bytes: &[u8]) -> String {
     sha256(bytes)
-}
-
-/// The stable-capture commitment over every working lane.
-///
-/// Evidence participates because `.bbox/evidence/bindings.json` is
-/// checkout-plane state an author can edit mid-capture; leaving it out would
-/// let an evidence-only edit slip through the stability re-read undetected.
-pub fn working_pair_sha256(
-    knowledge: &SourceManifestDescriptorV1,
-    gaps: &SourceManifestDescriptorV1,
-    graphs: &SourceManifestDescriptorV1,
-    evidence: &SourceManifestDescriptorV1,
-) -> String {
-    working_pair_for_vintage(knowledge, gaps, graphs, evidence, LaneVintage::Current)
-}
-
-/// The working-pair commitment exactly as it was computed before the evidence
-/// lane existed: knowledge, gaps, and graphs. Never mint with this; it exists
-/// so stored pre-evidence captures stay readable.
-pub fn pre_evidence_working_pair_sha256(
-    knowledge: &SourceManifestDescriptorV1,
-    gaps: &SourceManifestDescriptorV1,
-    graphs: &SourceManifestDescriptorV1,
-) -> String {
-    working_pair_for_vintage(
-        knowledge,
-        gaps,
-        graphs,
-        &SourceManifestDescriptorV1::default(),
-        LaneVintage::PreEvidence,
-    )
-}
-
-/// The working-pair commitment exactly as it was computed before the graphs
-/// lane existed: knowledge and gaps only. Never mint with this; it exists so
-/// stored pre-graphs captures stay readable.
-pub fn legacy_working_pair_sha256(
-    knowledge: &SourceManifestDescriptorV1,
-    gaps: &SourceManifestDescriptorV1,
-) -> String {
-    working_pair_for_vintage(
-        knowledge,
-        gaps,
-        &SourceManifestDescriptorV1::default(),
-        &SourceManifestDescriptorV1::default(),
-        LaneVintage::PreGraphs,
-    )
-}
-
-/// One preimage builder for every rung of the ladder. Older vintages simply
-/// stop hashing earlier, which is exactly what their binaries did.
-fn working_pair_for_vintage(
-    knowledge: &SourceManifestDescriptorV1,
-    gaps: &SourceManifestDescriptorV1,
-    graphs: &SourceManifestDescriptorV1,
-    evidence: &SourceManifestDescriptorV1,
-    vintage: LaneVintage,
-) -> String {
-    let mut encoded = Vec::new();
-    push_field(&mut encoded, b"bbox-knowledge-working-pair-v1");
-    hash_manifest_descriptor(&mut encoded, knowledge);
-    hash_manifest_descriptor(&mut encoded, gaps);
-    if vintage.includes_graphs() {
-        hash_manifest_descriptor(&mut encoded, graphs);
-    }
-    if vintage.includes_evidence() {
-        hash_manifest_descriptor(&mut encoded, evidence);
-    }
-    sha256(&encoded)
 }
 
 pub fn validate_source_blob(
@@ -908,24 +545,6 @@ pub fn validate_manifest_page(
         || page.entries.len() as u64 > limits.max_manifest_page_entries
         || encoded_page_bytes == 0
         || encoded_page_bytes > limits.max_manifest_page_bytes
-    {
-        return Err(ContractError::InvalidManifestPage);
-    }
-    Ok(())
-}
-
-pub fn validate_ancestry_page(
-    descriptor: &AncestryDescriptorV1,
-    page: &AncestryPageV1,
-    encoded_page_bytes: u64,
-    limits: KnowledgeSourceLimits,
-) -> Result<(), ContractError> {
-    validate_ancestry_descriptor(descriptor, limits)?;
-    if page.nodes.is_empty()
-        || page.page_index >= descriptor.page_count
-        || page.nodes.len() as u64 > limits.max_ancestry_page_nodes
-        || encoded_page_bytes == 0
-        || encoded_page_bytes > limits.max_ancestry_page_bytes
     {
         return Err(ContractError::InvalidManifestPage);
     }
@@ -1055,175 +674,6 @@ pub fn validate_publication_candidate(
     validate_evidence_source_manifest(evidence)
 }
 
-pub fn ancestry_sha256(format: GitObjectFormatV1, nodes: &[AncestryCommitV1]) -> String {
-    let mut encoded = Vec::new();
-    push_field(&mut encoded, b"bbox-knowledge-source-ancestry-v1");
-    encoded.push(format.tag());
-    encoded.extend_from_slice(&(nodes.len() as u64).to_be_bytes());
-    for node in nodes {
-        push_field(&mut encoded, node.commit_oid.as_bytes());
-        encoded.extend_from_slice(&(node.parent_oids.len() as u64).to_be_bytes());
-        for parent in &node.parent_oids {
-            push_field(&mut encoded, parent.as_bytes());
-        }
-    }
-    sha256(&encoded)
-}
-
-pub fn validate_ancestry(
-    descriptor: &AncestryDescriptorV1,
-    nodes: &[AncestryCommitV1],
-    object_format: GitObjectFormatV1,
-    checkout_head: &str,
-    accepted_commit: &str,
-    merge_base: &str,
-    limits: KnowledgeSourceLimits,
-) -> Result<(), ContractError> {
-    validate_ancestry_descriptor(descriptor, limits)?;
-    validate_object_id(checkout_head, object_format)?;
-    validate_object_id(accepted_commit, object_format)?;
-    validate_object_id(merge_base, object_format)?;
-    if nodes.len() as u64 != descriptor.node_count {
-        return Err(ContractError::AncestryCountMismatch);
-    }
-
-    let mut by_oid = BTreeMap::new();
-    let mut previous: Option<&str> = None;
-    let mut edge_count = 0_u64;
-    for node in nodes {
-        validate_object_id(&node.commit_oid, object_format)?;
-        if previous.is_some_and(|prior| prior >= node.commit_oid.as_str()) {
-            return Err(ContractError::AncestryOutOfOrder);
-        }
-        let mut parents = BTreeSet::new();
-        for parent in &node.parent_oids {
-            validate_object_id(parent, object_format)?;
-            if parent == &node.commit_oid || !parents.insert(parent.as_str()) {
-                return Err(ContractError::InvalidAncestryParent);
-            }
-        }
-        edge_count = edge_count
-            .checked_add(node.parent_oids.len() as u64)
-            .ok_or(ContractError::AncestryLimitExceeded)?;
-        by_oid.insert(node.commit_oid.as_str(), node);
-        previous = Some(&node.commit_oid);
-    }
-    if edge_count != descriptor.edge_count {
-        return Err(ContractError::AncestryCountMismatch);
-    }
-    if edge_count > limits.max_ancestry_edges {
-        return Err(ContractError::AncestryLimitExceeded);
-    }
-    for node in nodes {
-        if node
-            .parent_oids
-            .iter()
-            .any(|parent| !by_oid.contains_key(parent.as_str()))
-        {
-            return Err(ContractError::AncestryIncomplete);
-        }
-    }
-    if !by_oid.contains_key(checkout_head)
-        || !by_oid.contains_key(accepted_commit)
-        || !by_oid.contains_key(merge_base)
-    {
-        return Err(ContractError::AncestryIncomplete);
-    }
-
-    let from_head = reachable_ancestors(checkout_head, &by_oid);
-    let from_accepted = reachable_ancestors(accepted_commit, &by_oid);
-    if !from_head.contains(merge_base) || !from_accepted.contains(merge_base) {
-        return Err(ContractError::InvalidMergeBase);
-    }
-    let union = from_head
-        .union(&from_accepted)
-        .copied()
-        .collect::<BTreeSet<_>>();
-    if union.len() != nodes.len() {
-        return Err(ContractError::AncestryUnreachable);
-    }
-    validate_acyclic(nodes, &by_oid)?;
-    let common = from_head
-        .intersection(&from_accepted)
-        .copied()
-        .collect::<BTreeSet<_>>();
-    let best = best_common_ancestors(&by_oid, &common);
-    if best.len() != 1 || !best.contains(merge_base) {
-        return Err(ContractError::InvalidMergeBase);
-    }
-    if ancestry_sha256(object_format, nodes) != descriptor.ancestry_sha256 {
-        return Err(ContractError::AncestryCommitmentMismatch);
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn validate_provisional_workspace(
-    descriptor: &ProvisionalWorkspaceDescriptorV1,
-    ancestry: &[AncestryCommitV1],
-    baseline_knowledge: &[SourceFileManifestEntryV1],
-    baseline_gaps: &[SourceFileManifestEntryV1],
-    baseline_graphs: &[SourceFileManifestEntryV1],
-    baseline_evidence: &[SourceFileManifestEntryV1],
-    working_knowledge: &[SourceFileManifestEntryV1],
-    working_gaps: &[SourceFileManifestEntryV1],
-    working_graphs: &[SourceFileManifestEntryV1],
-    working_evidence: &[SourceFileManifestEntryV1],
-    limits: KnowledgeSourceLimits,
-) -> Result<(), ContractError> {
-    descriptor.validate_header(limits)?;
-    validate_ancestry(
-        &descriptor.ancestry,
-        ancestry,
-        descriptor.object_format,
-        &descriptor.checkout_head,
-        &descriptor.accepted_commit,
-        &descriptor.merge_base,
-        limits,
-    )?;
-    for (lane, manifest, entries) in [
-        (
-            SourceLaneV1::Knowledge,
-            &descriptor.baseline_knowledge,
-            baseline_knowledge,
-        ),
-        (SourceLaneV1::Gaps, &descriptor.baseline_gaps, baseline_gaps),
-        (
-            SourceLaneV1::Graphs,
-            &descriptor.baseline_graphs,
-            baseline_graphs,
-        ),
-        (
-            SourceLaneV1::Evidence,
-            &descriptor.baseline_evidence,
-            baseline_evidence,
-        ),
-        (
-            SourceLaneV1::Knowledge,
-            &descriptor.working_knowledge,
-            working_knowledge,
-        ),
-        (SourceLaneV1::Gaps, &descriptor.working_gaps, working_gaps),
-        (
-            SourceLaneV1::Graphs,
-            &descriptor.working_graphs,
-            working_graphs,
-        ),
-        (
-            SourceLaneV1::Evidence,
-            &descriptor.working_evidence,
-            working_evidence,
-        ),
-    ] {
-        validate_source_manifest(&descriptor.scope, lane, manifest, entries, limits)?;
-    }
-    validate_graph_source_manifest(&descriptor.scope, baseline_graphs, limits)?;
-    validate_graph_source_manifest(&descriptor.scope, working_graphs, limits)?;
-    validate_evidence_source_manifest(baseline_evidence)?;
-    validate_evidence_source_manifest(working_evidence)?;
-    Ok(())
-}
-
 pub fn publication_candidate_generation_id(
     producer_id: &str,
     descriptor: &PublicationCandidateDescriptorV1,
@@ -1348,118 +798,6 @@ fn admissible_publication_vintages(
 
 pub fn validate_publication_generation_id(value: &str) -> Result<(), ContractError> {
     validate_prefixed_generation_id(value, "kps_")
-}
-
-pub fn provisional_workspace_generation_id(
-    descriptor: &ProvisionalWorkspaceDescriptorV1,
-) -> Result<String, ContractError> {
-    descriptor.validate_header(KnowledgeSourceLimits::default())?;
-    Ok(provisional_generation_id_for(
-        descriptor,
-        LaneVintage::Current,
-    ))
-}
-
-/// The provisional generation identity exactly as it was minted before the
-/// evidence lane existed. A re-derivation for recognizing stored state, never
-/// a minting path.
-pub fn pre_evidence_provisional_workspace_generation_id(
-    descriptor: &ProvisionalWorkspaceDescriptorV1,
-) -> String {
-    provisional_generation_id_for(descriptor, LaneVintage::PreEvidence)
-}
-
-/// The provisional generation identity exactly as it was minted before the
-/// graphs lane existed. Same contract as the pre-evidence variant.
-pub fn legacy_provisional_workspace_generation_id(
-    descriptor: &ProvisionalWorkspaceDescriptorV1,
-) -> String {
-    provisional_generation_id_for(descriptor, LaneVintage::PreGraphs)
-}
-
-fn provisional_generation_id_for(
-    descriptor: &ProvisionalWorkspaceDescriptorV1,
-    vintage: LaneVintage,
-) -> String {
-    let mut encoded = Vec::new();
-    push_field(
-        &mut encoded,
-        b"bbox-knowledge-provisional-source-generation-v1",
-    );
-    hash_scope(&mut encoded, &descriptor.scope);
-    push_field(&mut encoded, descriptor.workspace_id.as_str().as_bytes());
-    encoded.extend_from_slice(&descriptor.sequence.to_be_bytes());
-    push_field(&mut encoded, descriptor.accepted_generation.as_bytes());
-    push_field(&mut encoded, descriptor.accepted_commit.as_bytes());
-    push_field(&mut encoded, descriptor.checkout_head.as_bytes());
-    push_field(&mut encoded, descriptor.merge_base.as_bytes());
-    encoded.push(descriptor.object_format.tag());
-    hash_ancestry_descriptor(&mut encoded, &descriptor.ancestry);
-    encoded.push(u8::from(descriptor.capture.transaction_pending_before));
-    encoded.push(u8::from(descriptor.capture.transaction_pending_after));
-    push_field(
-        &mut encoded,
-        descriptor.capture.first_working_pair_sha256.as_bytes(),
-    );
-    push_field(
-        &mut encoded,
-        descriptor.capture.second_working_pair_sha256.as_bytes(),
-    );
-    // Baseline lanes hash first, then working lanes, each in lane order. Older
-    // vintages omit the lanes they never had, which preserves the exact
-    // interleaving their binaries produced.
-    hash_manifest_descriptor(&mut encoded, &descriptor.baseline_knowledge);
-    hash_manifest_descriptor(&mut encoded, &descriptor.baseline_gaps);
-    if vintage.includes_graphs() {
-        hash_manifest_descriptor(&mut encoded, &descriptor.baseline_graphs);
-    }
-    if vintage.includes_evidence() {
-        hash_manifest_descriptor(&mut encoded, &descriptor.baseline_evidence);
-    }
-    hash_manifest_descriptor(&mut encoded, &descriptor.working_knowledge);
-    hash_manifest_descriptor(&mut encoded, &descriptor.working_gaps);
-    if vintage.includes_graphs() {
-        hash_manifest_descriptor(&mut encoded, &descriptor.working_graphs);
-    }
-    if vintage.includes_evidence() {
-        hash_manifest_descriptor(&mut encoded, &descriptor.working_evidence);
-    }
-    format!("kws_{}", sha256(&encoded))
-}
-
-/// Whether `stored_id` is an identity this workspace descriptor can carry.
-///
-/// An older rung is admissible only when BOTH that vintage's lanes are absent,
-/// which is the only shape a capture of that vintage can present.
-pub fn provisional_generation_id_matches(
-    descriptor: &ProvisionalWorkspaceDescriptorV1,
-    stored_id: &str,
-) -> Result<bool, ContractError> {
-    if provisional_workspace_generation_id(descriptor)? == stored_id {
-        return Ok(true);
-    }
-    Ok(admissible_provisional_vintages(descriptor)
-        .into_iter()
-        .any(|vintage| provisional_generation_id_for(descriptor, vintage) == stored_id))
-}
-
-fn admissible_provisional_vintages(
-    descriptor: &ProvisionalWorkspaceDescriptorV1,
-) -> Vec<LaneVintage> {
-    let mut vintages = Vec::new();
-    if descriptor.baseline_evidence.is_absent_lane() && descriptor.working_evidence.is_absent_lane()
-    {
-        vintages.push(LaneVintage::PreEvidence);
-        if descriptor.baseline_graphs.is_absent_lane() && descriptor.working_graphs.is_absent_lane()
-        {
-            vintages.push(LaneVintage::PreGraphs);
-        }
-    }
-    vintages
-}
-
-pub fn validate_provisional_generation_id(value: &str) -> Result<(), ContractError> {
-    validate_prefixed_generation_id(value, "kws_")
 }
 
 fn validate_schema(schema_version: u32) -> Result<(), ContractError> {
@@ -1787,129 +1125,6 @@ fn graph_source_may_be_empty(path: &str) -> bool {
         && (path.ends_with("/vertices.jsonl") || path.ends_with("/edges.jsonl"))
 }
 
-fn validate_ancestry_descriptor(
-    descriptor: &AncestryDescriptorV1,
-    limits: KnowledgeSourceLimits,
-) -> Result<(), ContractError> {
-    limits.validate()?;
-    validate_sha256(&descriptor.ancestry_sha256)?;
-    if descriptor.node_count == 0
-        || descriptor.node_count > limits.max_ancestry_nodes
-        || descriptor.edge_count > limits.max_ancestry_edges
-        || descriptor.page_count == 0
-        || descriptor.page_count > descriptor.node_count
-        || descriptor.page_count > limits.max_manifest_pages
-        || descriptor.page_count
-            < descriptor
-                .node_count
-                .div_ceil(limits.max_ancestry_page_nodes)
-    {
-        return Err(ContractError::AncestryLimitExceeded);
-    }
-    Ok(())
-}
-
-fn reachable_ancestors<'a>(
-    start: &'a str,
-    by_oid: &BTreeMap<&'a str, &'a AncestryCommitV1>,
-) -> BTreeSet<&'a str> {
-    let mut reachable = BTreeSet::new();
-    let mut pending = vec![start];
-    while let Some(oid) = pending.pop() {
-        if !reachable.insert(oid) {
-            continue;
-        }
-        pending.extend(by_oid[oid].parent_oids.iter().map(String::as_str));
-    }
-    reachable
-}
-
-/// Return the common ancestors with no strictly newer common descendant.
-/// The graph is already closure-checked and acyclic. Processing children
-/// before parents marks every older common ancestor in one linear pass.
-fn best_common_ancestors<'a>(
-    by_oid: &BTreeMap<&'a str, &'a AncestryCommitV1>,
-    common: &BTreeSet<&'a str>,
-) -> BTreeSet<&'a str> {
-    let mut remaining_children = by_oid
-        .keys()
-        .map(|oid| (*oid, 0_usize))
-        .collect::<BTreeMap<_, _>>();
-    for node in by_oid.values() {
-        for parent in &node.parent_oids {
-            *remaining_children
-                .get_mut(parent.as_str())
-                .expect("ancestry closure checked before merge-base computation") += 1;
-        }
-    }
-    let mut ready = remaining_children
-        .iter()
-        .filter_map(|(oid, children)| (*children == 0).then_some(*oid))
-        .collect::<Vec<_>>();
-    let mut has_common_descendant = BTreeSet::new();
-    while let Some(oid) = ready.pop() {
-        let carries_common = common.contains(oid) || has_common_descendant.contains(oid);
-        for parent in &by_oid[oid].parent_oids {
-            let parent = parent.as_str();
-            if carries_common {
-                has_common_descendant.insert(parent);
-            }
-            let children = remaining_children
-                .get_mut(parent)
-                .expect("ancestry closure checked before merge-base computation");
-            *children -= 1;
-            if *children == 0 {
-                ready.push(parent);
-            }
-        }
-    }
-    common
-        .iter()
-        .filter(|oid| !has_common_descendant.contains(**oid))
-        .copied()
-        .collect()
-}
-
-fn validate_acyclic<'a>(
-    nodes: &'a [AncestryCommitV1],
-    by_oid: &BTreeMap<&'a str, &'a AncestryCommitV1>,
-) -> Result<(), ContractError> {
-    let mut dependencies = nodes
-        .iter()
-        .map(|node| (node.commit_oid.as_str(), node.parent_oids.len()))
-        .collect::<BTreeMap<_, _>>();
-    let mut children = BTreeMap::<&str, Vec<&str>>::new();
-    for node in nodes {
-        for parent in &node.parent_oids {
-            children
-                .entry(parent.as_str())
-                .or_default()
-                .push(node.commit_oid.as_str());
-        }
-    }
-    let mut ready = dependencies
-        .iter()
-        .filter_map(|(oid, count)| (*count == 0).then_some(*oid))
-        .collect::<Vec<_>>();
-    let mut processed = 0_usize;
-    while let Some(oid) = ready.pop() {
-        processed += 1;
-        for child in children.get(oid).into_iter().flatten() {
-            let count = dependencies
-                .get_mut(child)
-                .expect("ancestry closure checked before cycle detection");
-            *count -= 1;
-            if *count == 0 {
-                ready.push(child);
-            }
-        }
-    }
-    if processed != by_oid.len() {
-        return Err(ContractError::AncestryCycle);
-    }
-    Ok(())
-}
-
 fn hash_scope(encoded: &mut Vec<u8>, scope: &PublishedScope) {
     push_field(encoded, scope.repo_id().as_bytes());
     push_field(encoded, scope.bbox_root_relpath().as_bytes());
@@ -1919,13 +1134,6 @@ fn hash_manifest_descriptor(encoded: &mut Vec<u8>, descriptor: &SourceManifestDe
     push_field(encoded, descriptor.manifest_sha256.as_bytes());
     encoded.extend_from_slice(&descriptor.file_count.to_be_bytes());
     encoded.extend_from_slice(&descriptor.logical_bytes.to_be_bytes());
-    encoded.extend_from_slice(&descriptor.page_count.to_be_bytes());
-}
-
-fn hash_ancestry_descriptor(encoded: &mut Vec<u8>, descriptor: &AncestryDescriptorV1) {
-    push_field(encoded, descriptor.ancestry_sha256.as_bytes());
-    encoded.extend_from_slice(&descriptor.node_count.to_be_bytes());
-    encoded.extend_from_slice(&descriptor.edge_count.to_be_bytes());
     encoded.extend_from_slice(&descriptor.page_count.to_be_bytes());
 }
 
@@ -2025,95 +1233,6 @@ mod tests {
         )]
     }
 
-    fn ancestry(format: GitObjectFormatV1) -> (AncestryDescriptorV1, Vec<AncestryCommitV1>) {
-        let oid_len = format.oid_len();
-        let root = "1".repeat(oid_len);
-        let accepted = "2".repeat(oid_len);
-        let head = "3".repeat(oid_len);
-        let nodes = vec![
-            AncestryCommitV1 {
-                commit_oid: root.clone(),
-                parent_oids: Vec::new(),
-            },
-            AncestryCommitV1 {
-                commit_oid: accepted,
-                parent_oids: vec![root.clone()],
-            },
-            AncestryCommitV1 {
-                commit_oid: head,
-                parent_oids: vec![root],
-            },
-        ];
-        let descriptor = AncestryDescriptorV1 {
-            ancestry_sha256: ancestry_sha256(format, &nodes),
-            node_count: nodes.len() as u64,
-            edge_count: 2,
-            page_count: 1,
-        };
-        (descriptor, nodes)
-    }
-
-    fn provisional() -> (
-        ProvisionalWorkspaceDescriptorV1,
-        Vec<AncestryCommitV1>,
-        Vec<SourceFileManifestEntryV1>,
-        Vec<SourceFileManifestEntryV1>,
-    ) {
-        let knowledge = vec![entry(
-            ".bbox/knowledge/knowledge-1.json",
-            br#"{"id":"knowledge-1"}"#,
-        )];
-        let gaps = vec![entry(
-            ".bbox/gaps/gap-11111111.json",
-            br#"{"id":"gap-11111111"}"#,
-        )];
-        let (ancestry, nodes) = ancestry(GitObjectFormatV1::Sha1);
-        let baseline_knowledge = manifest(SourceLaneV1::Knowledge, &knowledge);
-        let baseline_gaps = manifest(SourceLaneV1::Gaps, &gaps);
-        let working_knowledge = manifest(SourceLaneV1::Knowledge, &knowledge);
-        let working_gaps = manifest(SourceLaneV1::Gaps, &gaps);
-        let empty_graphs = SourceManifestDescriptorV1::default();
-        let empty_evidence = SourceManifestDescriptorV1::default();
-        let working_pair = working_pair_sha256(
-            &working_knowledge,
-            &working_gaps,
-            &empty_graphs,
-            &empty_evidence,
-        );
-        let descriptor = ProvisionalWorkspaceDescriptorV1 {
-            schema_version: SCHEMA_VERSION,
-            scope: scope(),
-            workspace_id: WorkspaceId::parse("0123456789abcdef0123456789abcdef").unwrap(),
-            sequence: 7,
-            accepted_generation: "a".repeat(64),
-            accepted_commit: "2".repeat(40),
-            checkout_head: "3".repeat(40),
-            merge_base: "1".repeat(40),
-            object_format: GitObjectFormatV1::Sha1,
-            ancestry,
-            capture: StableCaptureV1 {
-                transaction_pending_before: false,
-                transaction_pending_after: false,
-                first_working_pair_sha256: working_pair.clone(),
-                second_working_pair_sha256: working_pair,
-            },
-            baseline_knowledge,
-            baseline_gaps,
-            baseline_graphs: empty_graphs.clone(),
-            baseline_evidence: empty_evidence.clone(),
-            working_knowledge,
-            working_gaps,
-            working_graphs: empty_graphs,
-            working_evidence: empty_evidence,
-        };
-        (descriptor, nodes, knowledge, gaps)
-    }
-
-    /// The manifest digest is lane-local and does not move when a lane is
-    /// added, so it stays a hard golden. The generation identity DOES move,
-    /// so its golden lives on the ladder rung that minted it: the literal
-    /// below is the value this crate asserted for these exact fixtures while
-    /// graphs was the newest lane, and it is now the pre-evidence rung.
     #[test]
     fn publication_manifest_and_generation_have_golden_commitments() {
         let (descriptor, knowledge, gaps) = publication();
@@ -2314,117 +1433,6 @@ mod tests {
         ));
     }
 
-    /// Same split as the publication golden. The ancestry digest is lane-free
-    /// and stays a hard golden. The generation identity hashes the working
-    /// pair, which the evidence lane widened, so reproducing the pre-evidence
-    /// identity means restoring the pre-evidence capture commitment first -
-    /// exactly what a stored pre-evidence workspace carries on disk.
-    #[test]
-    fn provisional_source_and_generation_have_golden_commitments() {
-        let (descriptor, nodes, knowledge, gaps) = provisional();
-        validate_provisional_workspace(
-            &descriptor,
-            &nodes,
-            &knowledge,
-            &gaps,
-            &[],
-            &[],
-            &knowledge,
-            &gaps,
-            &[],
-            &[],
-            KnowledgeSourceLimits::default(),
-        )
-        .unwrap();
-        assert_eq!(
-            descriptor.ancestry.ancestry_sha256,
-            "ed5a0a409a0be0e8ffd40e95bd6bea7ef83c5732fd0b5f403098ed3eddb8e408"
-        );
-
-        let mut pre_evidence = descriptor.clone();
-        let pair = pre_evidence_working_pair_sha256(
-            &pre_evidence.working_knowledge,
-            &pre_evidence.working_gaps,
-            &pre_evidence.working_graphs,
-        );
-        pre_evidence.capture.first_working_pair_sha256 = pair.clone();
-        pre_evidence.capture.second_working_pair_sha256 = pair;
-        assert_eq!(
-            pre_evidence_provisional_workspace_generation_id(&pre_evidence),
-            "kws_1c65ac3aec908e12d6b741901abb05a23a9026cd303887cbdff0d6c759a99672"
-        );
-        // A stored pre-evidence workspace opens: its capture commitment and
-        // its identity are both admissible while the evidence lane is absent.
-        pre_evidence
-            .validate_header(KnowledgeSourceLimits::default())
-            .unwrap();
-        assert!(
-            provisional_generation_id_matches(
-                &pre_evidence,
-                &pre_evidence_provisional_workspace_generation_id(&pre_evidence)
-            )
-            .unwrap()
-        );
-    }
-
-    /// The pre-evidence rung is admissible only for the shape a pre-evidence
-    /// binary could have written. A workspace that actually carries evidence
-    /// content has no pre-evidence vintage and is held to the current rung.
-    #[test]
-    fn pre_evidence_identity_is_admissible_only_without_evidence_content() {
-        let (mut descriptor, ..) = provisional();
-        let pre_evidence = pre_evidence_provisional_workspace_generation_id(&descriptor);
-        let current = provisional_workspace_generation_id(&descriptor).unwrap();
-        assert_ne!(pre_evidence, current);
-        assert!(provisional_generation_id_matches(&descriptor, &pre_evidence).unwrap());
-        assert!(provisional_generation_id_matches(&descriptor, &current).unwrap());
-
-        descriptor.working_evidence = manifest(SourceLaneV1::Evidence, &evidence_entries());
-        let pair = working_pair_sha256(
-            &descriptor.working_knowledge,
-            &descriptor.working_gaps,
-            &descriptor.working_graphs,
-            &descriptor.working_evidence,
-        );
-        descriptor.capture.first_working_pair_sha256 = pair.clone();
-        descriptor.capture.second_working_pair_sha256 = pair;
-        descriptor
-            .validate_header(KnowledgeSourceLimits::default())
-            .unwrap();
-        assert!(!provisional_generation_id_matches(&descriptor, &pre_evidence).unwrap());
-        assert!(
-            provisional_generation_id_matches(
-                &descriptor,
-                &provisional_workspace_generation_id(&descriptor).unwrap(),
-            )
-            .unwrap()
-        );
-    }
-
-    /// A capture that carries evidence content cannot present a pre-evidence
-    /// working-pair commitment. This is the stability guarantee: an
-    /// evidence-only edit during capture has to move the pair.
-    #[test]
-    fn a_pre_evidence_working_pair_stops_being_admissible_with_evidence_content() {
-        let (mut descriptor, ..) = provisional();
-        let pre_evidence_pair = pre_evidence_working_pair_sha256(
-            &descriptor.working_knowledge,
-            &descriptor.working_gaps,
-            &descriptor.working_graphs,
-        );
-        descriptor.capture.first_working_pair_sha256 = pre_evidence_pair.clone();
-        descriptor.capture.second_working_pair_sha256 = pre_evidence_pair;
-        descriptor
-            .validate_header(KnowledgeSourceLimits::default())
-            .unwrap();
-
-        descriptor.working_evidence = manifest(SourceLaneV1::Evidence, &evidence_entries());
-        assert!(matches!(
-            descriptor.validate_header(KnowledgeSourceLimits::default()),
-            Err(ContractError::InvalidInput)
-        ));
-    }
-
     /// The evidence lane is one document at one exact path. Anything else is
     /// refused, so the replacement rule cannot be smuggled past.
     #[test]
@@ -2546,10 +1554,9 @@ mod tests {
         assert_eq!(EVIDENCE_BINDINGS_FILENAME, "bindings.json");
     }
 
-    /// Both goldens below are the values the pre-graphs-lane binary minted for
-    /// these exact fixtures, taken from the assertions this crate carried
-    /// before the graphs lane landed. They pin the legacy derivations to real
-    /// on-disk identity rather than to a restatement of the current code.
+    /// The golden below is the value the pre-graphs-lane binary minted for
+    /// this exact fixture. It pins the legacy derivation to real on-disk
+    /// identity rather than to a restatement of the current code.
     #[test]
     fn legacy_derivations_reproduce_pre_graphs_identity() {
         let (publication_descriptor, _, _) = publication();
@@ -2557,43 +1564,6 @@ mod tests {
             legacy_publication_candidate_generation_id("producer-a", &publication_descriptor),
             "kps_ed7b6e9e7378e05714065e1bac8f6ac8c12e47d2b758c5eb6a41edfd62a5df56"
         );
-
-        let (mut descriptor, ..) = provisional();
-        let legacy_pair =
-            legacy_working_pair_sha256(&descriptor.working_knowledge, &descriptor.working_gaps);
-        descriptor.capture.first_working_pair_sha256 = legacy_pair.clone();
-        descriptor.capture.second_working_pair_sha256 = legacy_pair;
-        assert_eq!(
-            legacy_provisional_workspace_generation_id(&descriptor),
-            "kws_b2ef389d2c997a9c6aac48af0c7af608412d26f4dabf682e7b293b36e5feb37a"
-        );
-        // A pre-graphs working-pair commitment stays admissible while the
-        // graph lane is absent, and stops being admissible the moment the
-        // workspace carries graph content.
-        descriptor
-            .validate_header(KnowledgeSourceLimits::default())
-            .unwrap();
-        assert!(
-            provisional_generation_id_matches(
-                &descriptor,
-                &legacy_provisional_workspace_generation_id(&descriptor)
-            )
-            .unwrap()
-        );
-        // Content on EITHER newer lane retires the pre-graphs vintage: no
-        // binary of that era could have written either one.
-        let mut with_graphs = descriptor.clone();
-        with_graphs.working_graphs = manifest(SourceLaneV1::Graphs, &graph_entries("records"));
-        assert!(matches!(
-            with_graphs.validate_header(KnowledgeSourceLimits::default()),
-            Err(ContractError::InvalidInput)
-        ));
-        let mut with_evidence = descriptor;
-        with_evidence.working_evidence = manifest(SourceLaneV1::Evidence, &evidence_entries());
-        assert!(matches!(
-            with_evidence.validate_header(KnowledgeSourceLimits::default()),
-            Err(ContractError::InvalidInput)
-        ));
     }
 
     #[test]
@@ -2726,8 +1696,6 @@ mod tests {
             Box::new(|limits| limits.max_files_per_lane = MAX_SOURCE_FILES_PER_LANE + 1),
             Box::new(|limits| limits.max_file_bytes = MAX_SOURCE_FILE_BYTES + 1),
             Box::new(|limits| limits.max_lane_bytes = MAX_SOURCE_LANE_BYTES + 1),
-            Box::new(|limits| limits.max_ancestry_nodes = MAX_ANCESTRY_NODES + 1),
-            Box::new(|limits| limits.max_ancestry_edges = MAX_ANCESTRY_EDGES + 1),
             Box::new(|limits| limits.max_ancestry_page_nodes = MAX_ANCESTRY_PAGE_NODES + 1),
             Box::new(|limits| limits.max_ancestry_page_bytes = MAX_ANCESTRY_PAGE_BYTES + 1),
             Box::new(|limits| limits.max_manifest_page_entries = MAX_MANIFEST_PAGE_ENTRIES + 1),
@@ -2744,179 +1712,6 @@ mod tests {
         let mut zero = caps;
         zero.max_file_bytes = 0;
         assert_eq!(zero.validate(), Err(ContractError::InvalidLimit));
-    }
-
-    #[test]
-    fn ancestry_accepts_sha1_and_sha256_and_rejects_incomplete_graphs() {
-        for format in [GitObjectFormatV1::Sha1, GitObjectFormatV1::Sha256] {
-            let (descriptor, nodes) = ancestry(format);
-            validate_ancestry(
-                &descriptor,
-                &nodes,
-                format,
-                &"3".repeat(format.oid_len()),
-                &"2".repeat(format.oid_len()),
-                &"1".repeat(format.oid_len()),
-                KnowledgeSourceLimits::default(),
-            )
-            .unwrap();
-            validate_ancestry_page(
-                &descriptor,
-                &AncestryPageV1 {
-                    page_index: 0,
-                    nodes: nodes.clone(),
-                },
-                1024,
-                KnowledgeSourceLimits::default(),
-            )
-            .unwrap();
-
-            let mut incomplete = nodes.clone();
-            incomplete.remove(0);
-            let descriptor = AncestryDescriptorV1 {
-                ancestry_sha256: ancestry_sha256(format, &incomplete),
-                node_count: incomplete.len() as u64,
-                edge_count: 2,
-                page_count: 1,
-            };
-            assert_eq!(
-                validate_ancestry(
-                    &descriptor,
-                    &incomplete,
-                    format,
-                    &"3".repeat(format.oid_len()),
-                    &"2".repeat(format.oid_len()),
-                    &"1".repeat(format.oid_len()),
-                    KnowledgeSourceLimits::default()
-                ),
-                Err(ContractError::AncestryIncomplete)
-            );
-        }
-    }
-
-    #[test]
-    fn ancestry_rejects_multiple_best_merge_bases() {
-        let format = GitObjectFormatV1::Sha1;
-        let oid = |value: &str| value.repeat(40);
-        let nodes = vec![
-            AncestryCommitV1 {
-                commit_oid: oid("1"),
-                parent_oids: vec![],
-            },
-            AncestryCommitV1 {
-                commit_oid: oid("2"),
-                parent_oids: vec![oid("1")],
-            },
-            AncestryCommitV1 {
-                commit_oid: oid("3"),
-                parent_oids: vec![oid("1")],
-            },
-            AncestryCommitV1 {
-                commit_oid: oid("4"),
-                parent_oids: vec![oid("2"), oid("3")],
-            },
-            AncestryCommitV1 {
-                commit_oid: oid("5"),
-                parent_oids: vec![oid("2"), oid("3")],
-            },
-        ];
-        let descriptor = AncestryDescriptorV1 {
-            ancestry_sha256: ancestry_sha256(format, &nodes),
-            node_count: nodes.len() as u64,
-            edge_count: 6,
-            page_count: 1,
-        };
-        assert_eq!(
-            validate_ancestry(
-                &descriptor,
-                &nodes,
-                format,
-                &oid("4"),
-                &oid("5"),
-                &oid("2"),
-                KnowledgeSourceLimits::default(),
-            ),
-            Err(ContractError::InvalidMergeBase)
-        );
-    }
-
-    #[test]
-    fn ancestry_refuses_cycles_duplicate_parents_and_bad_object_ids() {
-        let format = GitObjectFormatV1::Sha1;
-        let one = "1".repeat(40);
-        let two = "2".repeat(40);
-        let cycle = vec![
-            AncestryCommitV1 {
-                commit_oid: one.clone(),
-                parent_oids: vec![two.clone()],
-            },
-            AncestryCommitV1 {
-                commit_oid: two.clone(),
-                parent_oids: vec![one.clone()],
-            },
-        ];
-        let descriptor = AncestryDescriptorV1 {
-            ancestry_sha256: ancestry_sha256(format, &cycle),
-            node_count: 2,
-            edge_count: 2,
-            page_count: 1,
-        };
-        assert_eq!(
-            validate_ancestry(
-                &descriptor,
-                &cycle,
-                format,
-                &two,
-                &one,
-                &one,
-                KnowledgeSourceLimits::default()
-            ),
-            Err(ContractError::AncestryCycle)
-        );
-
-        let duplicate_parent = vec![
-            AncestryCommitV1 {
-                commit_oid: one.clone(),
-                parent_oids: Vec::new(),
-            },
-            AncestryCommitV1 {
-                commit_oid: two.clone(),
-                parent_oids: vec![one.clone(), one.clone()],
-            },
-        ];
-        let descriptor = AncestryDescriptorV1 {
-            ancestry_sha256: ancestry_sha256(format, &duplicate_parent),
-            node_count: 2,
-            edge_count: 2,
-            page_count: 1,
-        };
-        assert_eq!(
-            validate_ancestry(
-                &descriptor,
-                &duplicate_parent,
-                format,
-                &two,
-                &one,
-                &one,
-                KnowledgeSourceLimits::default()
-            ),
-            Err(ContractError::InvalidAncestryParent)
-        );
-
-        let mut bad_oid = duplicate_parent;
-        bad_oid[1].commit_oid = "g".repeat(40);
-        assert_eq!(
-            validate_ancestry(
-                &descriptor,
-                &bad_oid,
-                format,
-                &two,
-                &one,
-                &one,
-                KnowledgeSourceLimits::default()
-            ),
-            Err(ContractError::InvalidObjectId)
-        );
     }
 
     #[test]
@@ -2939,88 +1734,20 @@ mod tests {
             base,
             publication_candidate_generation_id("producer-a", &changed).unwrap()
         );
-
-        let (provisional, _, _, _) = provisional();
-        let base = provisional_workspace_generation_id(&provisional).unwrap();
-        let mut changed = provisional.clone();
-        changed.sequence += 1;
-        assert_ne!(base, provisional_workspace_generation_id(&changed).unwrap());
-        let mut changed = provisional.clone();
-        changed.ancestry.ancestry_sha256 = "b".repeat(64);
-        assert_ne!(base, provisional_workspace_generation_id(&changed).unwrap());
-        let mut changed = provisional.clone();
-        changed.working_gaps.manifest_sha256 = "b".repeat(64);
-        let changed_pair = working_pair_sha256(
-            &changed.working_knowledge,
-            &changed.working_gaps,
-            &changed.working_graphs,
-            &changed.working_evidence,
-        );
-        changed.capture.first_working_pair_sha256 = changed_pair.clone();
-        changed.capture.second_working_pair_sha256 = changed_pair;
-        assert_ne!(base, provisional_workspace_generation_id(&changed).unwrap());
     }
 
     #[test]
-    fn provisional_capture_requires_a_stable_nontransactional_pair() {
-        let (descriptor, _, _, _) = provisional();
-        descriptor
-            .validate_header(KnowledgeSourceLimits::default())
-            .unwrap();
-
-        let mut pending = descriptor.clone();
-        pending.capture.transaction_pending_before = true;
-        assert_eq!(
-            pending.validate_header(KnowledgeSourceLimits::default()),
-            Err(ContractError::InvalidInput)
-        );
-
-        let mut moved = descriptor;
-        moved.capture.second_working_pair_sha256 = "b".repeat(64);
-        assert_eq!(
-            moved.validate_header(KnowledgeSourceLimits::default()),
-            Err(ContractError::InvalidInput)
-        );
-    }
-
-    #[test]
-    fn provisional_capture_context_validates_accepted_identity_and_lease() {
-        let mut context = ProvisionalCaptureContextV1 {
-            scope: scope(),
-            accepted_generation: "a".repeat(64),
-            accepted_commit: "1".repeat(40),
-            lease_ttl_secs: 60,
-        };
-        context.validate().unwrap();
-
-        context.lease_ttl_secs = 0;
-        assert_eq!(context.validate(), Err(ContractError::InvalidLimit));
-        context.lease_ttl_secs = 60;
-        context.accepted_commit = "1".repeat(41);
-        assert_eq!(context.validate(), Err(ContractError::InvalidObjectId));
-        context.accepted_commit = "1".repeat(40);
-        context.accepted_generation = "z".repeat(64);
-        assert_eq!(context.validate(), Err(ContractError::InvalidDigest));
-    }
-
-    #[test]
-    fn wire_decode_refuses_unknown_fields_and_noncanonical_workspace_ids() {
+    fn wire_decode_refuses_unknown_fields() {
         let (descriptor, _, _) = publication();
         let mut value = serde_json::to_value(&descriptor).unwrap();
         value["unexpected"] = serde_json::json!(true);
         assert!(serde_json::from_value::<PublicationCandidateDescriptorV1>(value).is_err());
-
-        let (descriptor, _, _, _) = provisional();
-        let mut value = serde_json::to_value(&descriptor).unwrap();
-        value["workspace_id"] = serde_json::json!("0123456789abcdef0123456789abcdeF");
-        assert!(serde_json::from_value::<ProvisionalWorkspaceDescriptorV1>(value).is_err());
     }
 
     /// Wire-compat invariant (see the crate docs): every body a client decodes
     /// tolerates fields it does not know, so a daemon-side additive change
-    /// never bricks an older CLI or collector. The probe response is the load
-    /// bearing case: it embeds the status type, and a strict status made every
-    /// capture after the first fail at the pre-upload probe.
+    /// never bricks an older collector. The probe response embeds the status
+    /// type, so both must stay tolerant.
     #[test]
     fn client_decoded_responses_tolerate_unknown_fields() {
         fn with_extra<T: Serialize + serde::de::DeserializeOwned>(value: &T) -> T {
@@ -3028,44 +1755,6 @@ mod tests {
             json["field_from_a_newer_daemon"] = serde_json::json!("ignored");
             serde_json::from_value(json).unwrap()
         }
-        let status = ProvisionalWorkspaceStatusV1 {
-            source_generation_id: "kws_x".into(),
-            state: SourceGenerationStateV1::Ready,
-            workspace_id: WorkspaceId::parse("0123456789abcdef0123456789abcdef").unwrap(),
-            sequence: 1,
-            accepted_generation: "a".repeat(64),
-            checkout_head: "b".repeat(40),
-            observed_at_unix_secs: 1,
-            baseline_knowledge_manifest_sha256: "c".repeat(64),
-            baseline_gap_manifest_sha256: "d".repeat(64),
-            baseline_graph_manifest_sha256: "e".repeat(64),
-            baseline_evidence_manifest_sha256: "f".repeat(64),
-            working_knowledge_manifest_sha256: "0".repeat(64),
-            working_gap_manifest_sha256: "1".repeat(64),
-            working_graph_manifest_sha256: "2".repeat(64),
-            working_evidence_manifest_sha256: "3".repeat(64),
-            lease_expires_unix_secs: Some(2),
-            diagnostic: None,
-        };
-        assert_eq!(with_extra(&status), status);
-        let probe = ProvisionalProbeResponseV1 {
-            current: Some(status.clone()),
-            next_sequence: 2,
-        };
-        let mut nested = serde_json::to_value(&probe).unwrap();
-        nested["current"]["field_from_a_newer_daemon"] = serde_json::json!(true);
-        assert_eq!(
-            serde_json::from_value::<ProvisionalProbeResponseV1>(nested).unwrap(),
-            probe
-        );
-        assert_eq!(with_extra(&probe), probe);
-        let context = ProvisionalCaptureContextV1 {
-            scope: scope(),
-            accepted_generation: "a".repeat(64),
-            accepted_commit: "b".repeat(40),
-            lease_ttl_secs: 60,
-        };
-        assert_eq!(with_extra(&context), context);
         let begin = BeginSourceUploadResponseV1 {
             upload_id: "u".into(),
             max_manifest_page_entries: 1,
@@ -3119,13 +1808,15 @@ mod tests {
     /// stay strict.
     #[test]
     fn daemon_received_requests_reject_unknown_fields() {
-        let request = ProvisionalProbeRequestV1 {
+        let request = PublicationProbeRequestV1 {
             scope: scope(),
-            workspace_id: WorkspaceId::parse("0123456789abcdef0123456789abcdef").unwrap(),
+            full_ref: "refs/heads/main".into(),
+            publisher_commit: "b".repeat(40),
+            object_format: GitObjectFormatV1::Sha1,
         };
         let mut json = serde_json::to_value(&request).unwrap();
         json["stale_field"] = serde_json::json!(1);
-        assert!(serde_json::from_value::<ProvisionalProbeRequestV1>(json).is_err());
+        assert!(serde_json::from_value::<PublicationProbeRequestV1>(json).is_err());
     }
 
     fn config_entries(prefix: &str) -> Vec<SourceFileManifestEntryV1> {

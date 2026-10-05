@@ -45,18 +45,17 @@ canonical_path_read	crates/bbox-indexing/src/publisher.rs	fn elect_publisher	1	d
 canonical_path_read	crates/bbox-indexing/src/publisher.rs	fn project_published_scope	1	delete with ProjectRecord
 canonical_path_read	crates/bbox-providers/src/providers/file.rs	fn resolve_absolute	1	delete with ProjectRecord
 canonical_path_read	src/doctor.rs	fn projects_section	2	delete with ProjectRecord
-canonical_path_read	src/server/gap_view.rs	fn session_gap_view	7	delete with ProjectRecord
+canonical_path_read	src/server/gap_view.rs	fn session_gap_view	5	delete with ProjectRecord
 canonical_path_read	src/server/knowledge_lifecycle.rs	fn publisher_project_inventory	1	delete with ProjectRecord
 canonical_path_read	src/server/knowledge_lifecycle.rs	fn reconcile_knowledge_scope_index	1	delete with ProjectRecord
 canonical_path_read	src/server/knowledge_lifecycle.rs	fn reconcile_path_fallback_cut	1	delete with ProjectRecord
 canonical_path_read	src/server/knowledge_lifecycle.rs	fn write_knowledge_schema_epoch_marker	1	delete with ProjectRecord
-canonical_path_read	src/server/knowledge_view.rs	fn session_knowledge_view	7	delete with ProjectRecord
+canonical_path_read	src/server/knowledge_view.rs	fn session_knowledge_view	5	delete with ProjectRecord
 canonical_path_read	src/server/repo_io.rs	fn gap_base_carriers	1	delete with ProjectRecord
 canonical_path_read	src/server/repo_io.rs	fn knowledge_base_carriers	1	delete with ProjectRecord
 canonical_path_read	src/server/routes.rs	fn enqueue_project_knowledge_embeds	1	delete with ProjectRecord
 canonical_path_read	src/server/store_helpers.rs	fn sync_knowledge_entry_to_index	1	delete with ProjectRecord
 canonical_path_read	src/tools/knowledge.rs	fn prepare_knowledge_write	1	delete with ProjectRecord
-canonical_path_read	src/tools/knowledge.rs	fn refresh_dark_knowledge_overlay	1	delete with ProjectRecord
 canonical_path_read	src/tools/projects.rs	fn bbox_project_eject	1	delete with ProjectRecord
 canonical_path_read	src/tools/projects.rs	fn bbox_project_rename	2	delete with ProjectRecord
 canonical_path_read	src/tools/projects.rs	fn bbox_project_unregister	1	delete with ProjectRecord
@@ -102,9 +101,6 @@ checkout_root_path	src/bin/blackbox.rs	fn execute_get	1	collapse into the lease 
 checkout_root_path	src/bin/blackbox.rs	fn probe_retire_evidence	1	collapse into the lease confined readers
 checkout_root_path	src/server/checkout_access.rs	fn project_root	1	collapse into the lease confined readers
 checkout_root_path	src/server/code_source.rs	fn stage_git_current_overlay_after_activation	2	collapse into the lease confined readers
-checkout_root_path	src/server/gap_view.rs	fn refresh_dark_gap_overlay	1	collapse into the lease confined readers
-checkout_root_path	src/server/gap_view.rs	fn stable_catalog_gap_overlay	2	collapse into the lease confined readers
-checkout_root_path	src/server/gap_view.rs	fn stable_gap_overlay	2	collapse into the lease confined readers
 checkout_root_path	src/server/knowledge_lifecycle.rs	fn acquire_authorized_publisher_lease	1	collapse into the lease confined readers
 checkout_root_path	src/server/knowledge_lifecycle.rs	fn prepare_existing_knowledge_mutation	1	collapse into the lease confined readers
 checkout_root_path	src/server/knowledge_lifecycle.rs	fn reconcile_dark_knowledge_checkouts	3	collapse into the lease confined readers
@@ -112,16 +108,13 @@ checkout_root_path	src/server/knowledge_lifecycle.rs	fn recover_dark_knowledge_t
 checkout_root_path	src/server/knowledge_lifecycle.rs	fn resolve_authorized_publisher	5	collapse into the lease confined readers
 checkout_root_path	src/server/knowledge_lifecycle.rs	fn resolve_registered_checkout	2	collapse into the lease confined readers
 checkout_root_path	src/server/knowledge_lifecycle.rs	fn with_authorized_publisher_root	2	collapse into the lease confined readers
-checkout_root_path	src/server/knowledge_view.rs	fn stable_catalog_knowledge_overlay	2	collapse into the lease confined readers
 checkout_root_path	src/server/open.rs	fn backfill_project_languages	1	collapse into the lease confined readers
 checkout_root_path	src/server/open.rs	fn open_shared_state	1	collapse into the lease confined readers
 checkout_root_path	src/server/repo_io.rs	fn with_access	1	collapse into the lease confined readers
 checkout_root_path	src/tools/gaps.rs	fn bbox_gap	1	collapse into the lease confined readers
 checkout_root_path	src/tools/gaps.rs	fn bbox_gap_resolve	1	collapse into the lease confined readers
 checkout_root_path	src/tools/gaps.rs	fn bbox_gap_update	1	collapse into the lease confined readers
-checkout_root_path	src/tools/knowledge.rs	fn refresh_dark_knowledge_overlay	1	collapse into the lease confined readers
 checkout_root_path	src/tools/knowledge.rs	fn register_dark_knowledge_checkout	1	collapse into the lease confined readers
-checkout_root_path	src/tools/knowledge.rs	fn stable_knowledge_overlay	2	collapse into the lease confined readers
 checkout_root_path	src/tools/project_catalog.rs	fn attachment_row_governing	1	collapse into the lease confined readers
 checkout_root_path	src/tools/project_catalog.rs	fn bbox_project_attach	4	collapse into the lease confined readers
 checkout_root_path	src/tools/project_catalog.rs	fn bbox_project_publisher_advance	1	collapse into the lease confined readers

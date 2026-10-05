@@ -14,14 +14,12 @@ pub use crate::git::git_root_for_path;
 #[serde(rename_all = "snake_case")]
 pub enum EntityType {
     Knowledge,
-    ProvisionalKnowledge,
     SystemMemory,
     Transcript,
     File,
     ProjectFile,
     ProjectFileV2,
     ProjectGraphVertex,
-    ProvisionalProjectGraphVertex,
     Session,
     Thread,
     Symbol,
@@ -34,16 +32,14 @@ pub enum EntityType {
 }
 
 impl EntityType {
-    pub const ALL: [EntityType; 18] = [
+    pub const ALL: [EntityType; 16] = [
         EntityType::Knowledge,
-        EntityType::ProvisionalKnowledge,
         EntityType::SystemMemory,
         EntityType::Transcript,
         EntityType::File,
         EntityType::ProjectFile,
         EntityType::ProjectFileV2,
         EntityType::ProjectGraphVertex,
-        EntityType::ProvisionalProjectGraphVertex,
         EntityType::Session,
         EntityType::Thread,
         EntityType::Symbol,
@@ -58,14 +54,12 @@ impl EntityType {
     pub fn as_str(self) -> &'static str {
         match self {
             EntityType::Knowledge => "knowledge",
-            EntityType::ProvisionalKnowledge => "provisional_knowledge",
             EntityType::SystemMemory => "system_memory",
             EntityType::Transcript => "transcript",
             EntityType::File => "file",
             EntityType::ProjectFile => "project_file",
             EntityType::ProjectFileV2 => "project_file_v2",
             EntityType::ProjectGraphVertex => "project_graph_vertex",
-            EntityType::ProvisionalProjectGraphVertex => "provisional_project_graph_vertex",
             EntityType::Session => "session",
             EntityType::Thread => "thread",
             EntityType::Symbol => "symbol",
@@ -81,9 +75,6 @@ impl EntityType {
     pub fn example(self) -> &'static str {
         match self {
             EntityType::Knowledge => "knowledge:<entry_id>",
-            EntityType::ProvisionalKnowledge => {
-                "provisional_knowledge:<scope_hash>:<checkout_id>:<entry_id>"
-            }
             EntityType::SystemMemory => "system_memory:<sm-id>",
             EntityType::Transcript => {
                 "transcript:<provider>:<session_id>:<line_offset>:<event_idx>"
@@ -97,9 +88,6 @@ impl EntityType {
             }
             EntityType::ProjectGraphVertex => {
                 "project_graph_vertex:<project_id>:<graph_id>:<vertex_id>"
-            }
-            EntityType::ProvisionalProjectGraphVertex => {
-                "provisional_project_graph_vertex:<scope_hash>:<checkout_id>:<graph_id>:<vertex_id>"
             }
             EntityType::Session => "session:<provider>:<session_id>",
             EntityType::Thread => "thread:<thread_id>",
@@ -143,11 +131,6 @@ pub enum EntityRef {
     Knowledge {
         id: String,
     },
-    ProvisionalKnowledge {
-        scope_hash: String,
-        checkout_id: String,
-        entry_id: String,
-    },
     SystemMemory {
         id: String,
     },
@@ -175,12 +158,6 @@ pub enum EntityRef {
     },
     ProjectGraphVertex {
         project_id: String,
-        graph_id: String,
-        vertex_id: String,
-    },
-    ProvisionalProjectGraphVertex {
-        scope_hash: String,
-        checkout_id: String,
         graph_id: String,
         vertex_id: String,
     },
@@ -248,21 +225,6 @@ impl EntityRef {
             EntityType::Knowledge => parse_single(input, rest, EntityType::Knowledge, |id| {
                 EntityRef::Knowledge { id }
             }),
-            EntityType::ProvisionalKnowledge => {
-                let parts = rest.split(':').collect::<Vec<_>>();
-                if parts.len() != 3
-                    || parts.iter().any(|part| part.is_empty())
-                    || parts[0].len() != 64
-                    || !parts[0].bytes().all(|byte| byte.is_ascii_hexdigit())
-                {
-                    return Err(shape_error(input, EntityType::ProvisionalKnowledge));
-                }
-                Ok(EntityRef::ProvisionalKnowledge {
-                    scope_hash: parts[0].to_ascii_lowercase(),
-                    checkout_id: parts[1].to_string(),
-                    entry_id: parts[2].to_string(),
-                })
-            }
             EntityType::SystemMemory => parse_single(input, rest, EntityType::SystemMemory, |id| {
                 EntityRef::SystemMemory { id }
             }),
@@ -271,9 +233,6 @@ impl EntityRef {
             EntityType::ProjectFile => parse_project_file(input, rest),
             EntityType::ProjectFileV2 => parse_project_file_v2(input, rest),
             EntityType::ProjectGraphVertex => parse_project_graph_vertex(input, rest),
-            EntityType::ProvisionalProjectGraphVertex => {
-                parse_provisional_project_graph_vertex(input, rest)
-            }
             EntityType::Session => parse_session(input, rest),
             EntityType::Thread => parse_single(input, rest, EntityType::Thread, |thread_id| {
                 EntityRef::Thread { thread_id }
@@ -300,29 +259,6 @@ impl EntityRef {
     pub fn try_render(&self) -> Result<String, EntityRefRenderError> {
         match self {
             EntityRef::Knowledge { id } => Ok(format!("knowledge:{id}")),
-            EntityRef::ProvisionalKnowledge {
-                scope_hash,
-                checkout_id,
-                entry_id,
-            } => {
-                if scope_hash.len() != 64
-                    || !scope_hash.bytes().all(|byte| byte.is_ascii_hexdigit())
-                    || checkout_id.is_empty()
-                    || checkout_id.contains(':')
-                    || entry_id.is_empty()
-                    || entry_id.contains(':')
-                {
-                    return Err(EntityRefRenderError {
-                        field: "scope_hash/checkout_id/entry_id",
-                        value: format!("{scope_hash}:{checkout_id}:{entry_id}"),
-                        message: "provisional knowledge ref has an invalid field".to_string(),
-                    });
-                }
-                Ok(format!(
-                    "provisional_knowledge:{}:{checkout_id}:{entry_id}",
-                    scope_hash.to_ascii_lowercase()
-                ))
-            }
             EntityRef::SystemMemory { id } => Ok(format!("system_memory:{id}")),
             EntityRef::Transcript {
                 provider,
@@ -365,22 +301,6 @@ impl EntityRef {
                     "project_graph_vertex:{project_id}:{graph_id}:{vertex_id}"
                 ))
             }
-            EntityRef::ProvisionalProjectGraphVertex {
-                scope_hash,
-                checkout_id,
-                graph_id,
-                vertex_id,
-            } => {
-                validate_hex_ref_field("scope_hash", scope_hash, 64)?;
-                validate_hex_ref_field("checkout_id", checkout_id, 32)?;
-                validate_project_graph_ref_field("graph_id", graph_id, false)?;
-                validate_project_graph_ref_field("vertex_id", vertex_id, true)?;
-                Ok(format!(
-                    "provisional_project_graph_vertex:{}:{}:{graph_id}:{vertex_id}",
-                    scope_hash.to_ascii_lowercase(),
-                    checkout_id.to_ascii_lowercase()
-                ))
-            }
             EntityRef::Session {
                 provider,
                 session_id,
@@ -420,16 +340,12 @@ impl EntityRef {
     pub fn entity_type(&self) -> EntityType {
         match self {
             EntityRef::Knowledge { .. } => EntityType::Knowledge,
-            EntityRef::ProvisionalKnowledge { .. } => EntityType::ProvisionalKnowledge,
             EntityRef::SystemMemory { .. } => EntityType::SystemMemory,
             EntityRef::Transcript { .. } => EntityType::Transcript,
             EntityRef::File { .. } => EntityType::File,
             EntityRef::ProjectFile { .. } => EntityType::ProjectFile,
             EntityRef::ProjectFileV2 { .. } => EntityType::ProjectFileV2,
             EntityRef::ProjectGraphVertex { .. } => EntityType::ProjectGraphVertex,
-            EntityRef::ProvisionalProjectGraphVertex { .. } => {
-                EntityType::ProvisionalProjectGraphVertex
-            }
             EntityRef::Session { .. } => EntityType::Session,
             EntityRef::Thread { .. } => EntityType::Thread,
             EntityRef::Symbol { .. } => EntityType::Symbol,
@@ -508,24 +424,6 @@ fn validate_project_graph_ref_field(
             field,
             value: value.to_string(),
             message: format!("project graph ref field `{field}` is invalid: `{value}`"),
-        })
-    } else {
-        Ok(())
-    }
-}
-
-fn validate_hex_ref_field(
-    field: &'static str,
-    value: &str,
-    length: usize,
-) -> Result<(), EntityRefRenderError> {
-    if value.len() != length || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        Err(EntityRefRenderError {
-            field,
-            value: value.to_string(),
-            message: format!(
-                "project graph ref field `{field}` must be {length} hexadecimal characters"
-            ),
         })
     } else {
         Ok(())
@@ -717,34 +615,6 @@ fn parse_project_graph_vertex(input: &str, rest: &str) -> Result<EntityRef, Enti
     }
     Ok(EntityRef::ProjectGraphVertex {
         project_id: project_id.to_string(),
-        graph_id: graph_id.to_string(),
-        vertex_id: vertex_id.to_string(),
-    })
-}
-
-fn parse_provisional_project_graph_vertex(
-    input: &str,
-    rest: &str,
-) -> Result<EntityRef, EntityRefParseError> {
-    let entity_type = EntityType::ProvisionalProjectGraphVertex;
-    let (scope_hash, tail) = split_first(input, rest, entity_type, "checkout_id")?;
-    let (checkout_id, tail) = split_first(input, tail, entity_type, "graph_id")?;
-    let (graph_id, vertex_id) = split_first(input, tail, entity_type, "vertex_id")?;
-    if scope_hash.len() != 64
-        || checkout_id.len() != 32
-        || !scope_hash.bytes().all(|byte| byte.is_ascii_hexdigit())
-        || !checkout_id.bytes().all(|byte| byte.is_ascii_hexdigit())
-    {
-        return Err(shape_error(input, entity_type));
-    }
-    validate_parsed_graph_ref_field(input, graph_id, entity_type)?;
-    let vertex_id = non_empty(input, vertex_id, entity_type, "vertex_id")?;
-    if vertex_id.chars().any(char::is_control) {
-        return Err(shape_error(input, entity_type));
-    }
-    Ok(EntityRef::ProvisionalProjectGraphVertex {
-        scope_hash: scope_hash.to_ascii_lowercase(),
-        checkout_id: checkout_id.to_ascii_lowercase(),
         graph_id: graph_id.to_string(),
         vertex_id: vertex_id.to_string(),
     })
@@ -1227,36 +1097,9 @@ mod tests {
     }
 
     #[test]
-    fn provisional_project_graph_vertex_ref_round_trips_and_normalizes_hex() {
-        let rendered = format!(
-            "provisional_project_graph_vertex:{}:{}:governance-record:gov:Decision:decision-001",
-            "A".repeat(64),
-            "B".repeat(32)
-        );
-        let parsed = EntityRef::parse(&rendered).unwrap();
-        assert_eq!(
-            parsed.render(),
-            format!(
-                "provisional_project_graph_vertex:{}:{}:governance-record:gov:Decision:decision-001",
-                "a".repeat(64),
-                "b".repeat(32)
-            )
-        );
-        assert_eq!(
-            parsed.entity_type(),
-            EntityType::ProvisionalProjectGraphVertex
-        );
-    }
-
-    #[test]
     fn project_graph_refs_reject_invalid_fixed_segments() {
         assert!(EntityRef::parse("project_graph_vertex::governance-record:decision-001").is_err());
-        assert!(
-            EntityRef::parse(
-                "provisional_project_graph_vertex:abcd:0123456789abcdef0123456789abcdef:governance-record:decision-001"
-            )
-            .is_err()
-        );
+        assert!(EntityRef::parse("project_graph_vertex:p1:governance-record:").is_err());
     }
 
     #[test]
@@ -1321,55 +1164,44 @@ mod tests {
             0 => EntityRef::Knowledge {
                 id: rng.token("know-"),
             },
-            1 => EntityRef::ProvisionalKnowledge {
-                scope_hash: rng.hex(64),
-                checkout_id: rng.token("checkout-"),
-                entry_id: rng.token("know-"),
-            },
-            2 => EntityRef::SystemMemory {
+            1 => EntityRef::SystemMemory {
                 id: format!("sm-{}", rng.token("memory-")),
             },
-            3 => EntityRef::Transcript {
+            2 => EntityRef::Transcript {
                 provider: rng.provider("p", true),
                 session_id: format!("{}:{}", rng.token("sess-"), rng.token("turn-")),
                 line_offset: rng.next(),
                 event_idx: rng.next() as u32,
             },
-            4 => EntityRef::File {
+            3 => EntityRef::File {
                 path: format!("{}/{}.rs", rng.token("src"), rng.token("mod")),
             },
-            5 => EntityRef::ProjectFile {
+            4 => EntityRef::ProjectFile {
                 project_id: rng.hex(8),
                 rel_path_hash: rng.hex(8),
                 chunk_hash: rng.hex(64),
                 occurrence_idx: rng.next() as u32,
             },
-            6 => EntityRef::ProjectFileV2 {
+            5 => EntityRef::ProjectFileV2 {
                 project_id: rng.hex(8),
                 snapshot_id: format!("head-{}-{}", rng.hex(12), rng.hex(16)),
                 rel_path_hash: rng.hex(8),
                 chunk_hash: rng.hex(64),
                 occurrence_idx: rng.next() as u32,
             },
-            7 => EntityRef::ProjectGraphVertex {
+            6 => EntityRef::ProjectGraphVertex {
                 project_id: rng.hex(8),
                 graph_id: rng.token("graph-"),
                 vertex_id: format!("{}:{}", rng.token("vertex-"), rng.token("nested-")),
             },
-            8 => EntityRef::ProvisionalProjectGraphVertex {
-                scope_hash: rng.hex(64),
-                checkout_id: rng.hex(32),
-                graph_id: rng.token("graph-"),
-                vertex_id: format!("{}:{}", rng.token("vertex-"), rng.token("nested-")),
-            },
-            9 => EntityRef::Session {
+            7 => EntityRef::Session {
                 provider: rng.provider("p", true),
                 session_id: format!("{}:{}", rng.token("sess-"), rng.token("sub-")),
             },
-            10 => EntityRef::Thread {
+            8 => EntityRef::Thread {
                 thread_id: rng.token("thread-"),
             },
-            11 => EntityRef::Symbol {
+            9 => EntityRef::Symbol {
                 project_id: rng.hex(8),
                 qualified_name: format!(
                     "{}::{}::{}",
@@ -1379,7 +1211,7 @@ mod tests {
                 ),
                 defn_hash: rng.hex(64),
             },
-            12 => EntityRef::SymbolV2 {
+            10 => EntityRef::SymbolV2 {
                 project_id: rng.hex(8),
                 snapshot_id: format!("head-{}-{}", rng.hex(12), rng.hex(16)),
                 qualified_name: format!(
@@ -1390,21 +1222,21 @@ mod tests {
                 ),
                 defn_hash: rng.hex(64),
             },
-            13 => EntityRef::Brofile {
+            11 => EntityRef::Brofile {
                 name: rng.token("bro-"),
             },
-            14 => EntityRef::Commit {
+            12 => EntityRef::Commit {
                 repo_id: rng.hex(8),
                 sha: rng.hex(40),
             },
-            15 => EntityRef::Task {
+            13 => EntityRef::Task {
                 task_id: rng.token("task-"),
             },
-            16 => EntityRef::BashCall {
+            14 => EntityRef::BashCall {
                 session: format!("{}:{}", rng.token("sess-"), rng.token("tool-")),
                 turn: rng.next() as u32,
             },
-            17 => EntityRef::Artifact {
+            15 => EntityRef::Artifact {
                 kind: "workflow".into(),
                 name: rng.token("workflow-"),
                 version: Some("1".into()),

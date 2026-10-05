@@ -1,8 +1,5 @@
 //! Publisher election for a published knowledge scope (design §4.1).
 //!
-//! Slice 3.1 of
-//! `design/corpus/knowledge/checkout-identity-and-provisional-knowledge.md`.
-//!
 //! Published truth for a scope is the COMMITTED tree of exactly ONE registered
 //! clone. The project registry permits multiple registered paths with the same
 //! repo identity, and if two clones of one `(repo_id, bbox_root_relpath)` have

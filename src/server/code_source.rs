@@ -3141,9 +3141,7 @@ pub(crate) fn spawn_store_maintenance(state: &Arc<SharedState>) -> Result<()> {
                     {
                         tracing::info!(
                             expired_uploads = report.expired_uploads,
-                            expired_leases = report.expired_provisional_leases,
                             publication_generations = report.retired_publication_generations,
-                            provisional_generations = report.retired_provisional_generations,
                             blobs = report.deleted_blobs,
                             bytes = report.deleted_blob_bytes,
                             "knowledge-source maintenance reclaimed unreferenced data"

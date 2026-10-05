@@ -3420,12 +3420,6 @@ fn prepare_harness_child_launch(
             binding.token.expose_secret().to_string(),
         );
         env.insert(
-            bro_protocol::KNOWLEDGE_SOURCE_URL_ENV.to_string(),
-            self_mcp_url
-                .expect("workspace binding requires a self MCP URL")
-                .to_string(),
-        );
-        env.insert(
             bro_protocol::WORKSPACE_SCOPE_ENV.to_string(),
             serde_json::to_string(&binding.scope)?,
         );
@@ -5597,13 +5591,7 @@ mod tests {
             spec.env.as_map().get(bro_protocol::WORKSPACE_BINDING_ENV),
             Some(&secret)
         );
-        assert_eq!(
-            spec.env
-                .as_map()
-                .get(bro_protocol::KNOWLEDGE_SOURCE_URL_ENV)
-                .map(String::as_str),
-            Some("http://127.0.0.1:7264/mcp?surface=agent-internal")
-        );
+        assert!(!spec.env.as_map().contains_key("BRO_KNOWLEDGE_SOURCE_URL"));
         assert_eq!(
             serde_json::from_str::<bbox_corpus_core::identity::PublishedScope>(
                 spec.env
@@ -5618,7 +5606,6 @@ mod tests {
         assert!(!format!("{spec:?}").contains(&secret));
         let scrub = spec.env.as_map().get(HARNESS_SPAWN_SCRUB_ENV).unwrap();
         assert!(scrub.contains(bro_protocol::WORKSPACE_BINDING_ENV));
-        assert!(scrub.contains(bro_protocol::KNOWLEDGE_SOURCE_URL_ENV));
         assert!(scrub.contains(bro_protocol::WORKSPACE_SCOPE_ENV));
         let raw_config = spec
             .argv

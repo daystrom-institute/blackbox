@@ -251,13 +251,8 @@ pub(super) fn execute_reindex_pass(
     )?;
     let retired_tool_calls =
         purge_retired_tool_call_documents(&recovery_reader.searcher(), fields, writer)?;
-    let provisional_documents = if full {
-        collect_provisional_documents(index, fields)?
-    } else {
-        Vec::new()
-    };
-    // Graph word lanes have no durable store this pass walks: like provisional
-    // knowledge they are carried across a full rebuild, so a periodic pass
+    // Graph word lanes have no durable store this pass walks: they are
+    // carried across a full rebuild, so a periodic pass
     // does not purge every indexed graph. The schema-migration rebuild starts
     // from an already-empty index and re-activates lanes at the next accepted
     // view install, mirroring the in-memory view catalog's own lifecycle.
@@ -421,9 +416,6 @@ pub(super) fn execute_reindex_pass(
     let mut meta = if full {
         tracing::info!("auto-reindex: periodic full rebuild requested");
         writer.delete_all_documents()?;
-        for document in provisional_documents {
-            writer.add_document(document)?;
-        }
         for document in preserved_graph_documents {
             writer.add_document(document)?;
         }
@@ -953,27 +945,6 @@ fn index_path_from_config(config: &ReindexConfig) -> std::path::PathBuf {
         .parent()
         .map(std::path::Path::to_path_buf)
         .unwrap_or_else(|| std::path::PathBuf::from("."))
-}
-
-fn collect_provisional_documents(
-    index: &Index,
-    fields: FieldHandles,
-) -> Result<Vec<TantivyDocument>> {
-    let reader = index.reader()?;
-    let searcher = reader.searcher();
-    let query = TermQuery::new(
-        Term::from_field_text(fields.knowledge_visibility, "provisional"),
-        IndexRecordOption::Basic,
-    );
-    let count = searcher.search(&query, &Count)?;
-    if count == 0 {
-        return Ok(Vec::new());
-    }
-    searcher
-        .search(&query, &TopDocs::with_limit(count))?
-        .into_iter()
-        .map(|(_, address)| searcher.doc::<TantivyDocument>(address).map_err(Into::into))
-        .collect()
 }
 
 fn collect_scoped_published_knowledge(

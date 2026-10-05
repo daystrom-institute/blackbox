@@ -43,7 +43,6 @@ members = [
     "crates/bbox-git-source",
     "crates/bbox-git-source-store",
     "crates/bbox-knowledge-source",
-    "crates/bbox-knowledge-source-client",
     "crates/bbox-knowledge-source-store",
     "crates/bbox-corpus-index",
     "crates/bbox-edge-sidecar",
@@ -250,10 +249,6 @@ syn = { version = "2", features = ["full", "parsing", "extra-traits", "visit"] }
 proc-macro2 = { version = "1", features = ["span-locations"] }
 
 filetime = "0.2"
-# The real provisional capture client, so the workspace-binding mint route is
-# proven against the client an actual bound workspace runs rather than a
-# hand-rolled request sequence. Test scope only: the daemon never links it.
-bbox-knowledge-source-client = { path = "crates/bbox-knowledge-source-client" }
 # Enable bbox-vectors' test-global-store helpers for the daemon's own tests.
 # cfg(test) doesn't cross crate boundaries, so this dev-dep turns on the
 # `test-support` feature only when building blackbox's tests (off in release).

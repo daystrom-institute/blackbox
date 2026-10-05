@@ -185,14 +185,9 @@ pub struct GapNote {
     pub project_id: Option<String>,
     /// Transient logical write-carrier id. A managed checkout carries the
     /// repo-owned gap file while `project` remains the durable base scope.
-    /// Never retained in the central store or committed record; the checkout
-    /// registry reconstructs its provisional overlay after restart.
+    /// Never retained in the central store or committed record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub write_dir: Option<String>,
-    /// Checkout identity for a provisional variant in a detached read view.
-    /// Never persisted in either the central store or repo-owned files.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provisional_checkout_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -359,7 +354,6 @@ impl GapNote {
             project: None,
             project_id: None,
             write_dir: None,
-            provisional_checkout_id: None,
             task_id: None,
             session_id: None,
             provider: None,
@@ -458,6 +452,7 @@ pub enum GapDetail {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GapListParams {
     /// Exact gap id `gap-<8hex>` (bare 8-hex suffix accepted).
     #[serde(default)]
@@ -483,13 +478,6 @@ pub struct GapListParams {
     /// the response diagnostics.
     #[serde(default)]
     pub project: Option<String>,
-    /// Provisional visibility policy: published, own, or all.
-    #[serde(default)]
-    pub provisional: Option<String>,
-    /// Select one provisional variant by its listed checkout identity. This
-    /// filters the already visible view and never widens authority.
-    #[serde(default)]
-    pub checkout_id: Option<String>,
     /// Free-text substring over title/domain/wanted_capability.
     #[serde(default)]
     pub query: Option<String>,
@@ -508,14 +496,14 @@ pub struct GapListParams {
     #[serde(default)]
     pub detail: Option<GapDetail>,
     /// Exact JSON continuation from body.next_cursor. Requires id or diagnostics_detail;
-    /// changed record, visibility or filter selection invalidates the cursor.
+    /// a changed record or filter selection invalidates the cursor.
     #[serde(default)]
     pub body_cursor: Option<String>,
     /// Select exact JSON pages (default/max 4096 bytes). Requires id or diagnostics_detail;
     /// exact records omit offset and limit. Oversized rows advertise this reader.
     #[serde(default)]
     pub body_limit: Option<usize>,
-    /// Read exact visibility diagnostics for this filter/view scope using
+    /// Read exact source diagnostics for this filter scope using
     /// body_limit/body_cursor instead of gap records. Omit id.
     #[serde(default)]
     pub diagnostics_detail: bool,
@@ -639,7 +627,6 @@ pub fn committed_gap_note_bytes(entry: &GapNote) -> Result<Vec<u8>> {
     let mut on_disk = entry.clone();
     on_disk.project = None;
     on_disk.write_dir = None;
-    on_disk.provisional_checkout_id = None;
     bbox_corpus_core::json_store::to_vec_pretty_newline(&on_disk)
 }
 
@@ -787,7 +774,6 @@ fn load_repo_gap_entries(project_dir: &Path, durable_project: &str) -> Result<Ve
         // root's file the merge-observation signal that drops a retained
         // redirect (the load overwrites the central copy by id).
         entry.write_dir = None;
-        entry.provisional_checkout_id = None;
         if entry.updated_at.is_empty() {
             entry.updated_at = entry.created_at.clone();
         }
@@ -1251,7 +1237,7 @@ impl GapStore {
     /// Seed checkout-local variants before a mutation. Reload reconstructs the
     /// published/base store first; this replaces those records with the
     /// session checkout's own files so successive updates never overwrite an
-    /// earlier provisional edit with stale published bytes.
+    /// earlier checkout edit with stale published bytes.
     fn seed_checkout_entries(
         &mut self,
         durable_project: Option<&str>,
@@ -1280,7 +1266,6 @@ impl GapStore {
         for mut gap in entries {
             gap.project = Some(durable_project.to_string());
             gap.write_dir = Some(write_carrier_id.to_string());
-            gap.provisional_checkout_id = None;
             if let Some(existing) = self.data.gaps.iter_mut().find(|item| item.id == gap.id) {
                 *existing = gap;
             } else {
@@ -1338,16 +1323,16 @@ impl GapStore {
         // Per durable-project dir: ids whose rewrite is targeted into a
         // checkout (`write_dir != project`). Their committed base files are
         // protected from generation purge while the checkout carries the
-        // provisional variant.
+        // changed variant.
         let mut redirected: BTreeMap<GapRepoCarrier, BTreeSet<&str>> = BTreeMap::new();
         for g in &self.data.gaps {
             match g.project.as_deref() {
                 Some(project) if !project.is_empty() => {
                     let base = self.carrier_for_project(project).cloned();
                     match g.write_dir.as_deref().filter(|id| !id.is_empty()) {
-                        // The checkout file is the only provisional carrier.
-                        // Registry discovery reconstructs its overlay after a
-                        // restart, so the central store never retains a copy.
+                        // The checkout file is the only carrier of a
+                        // redirected write, so the central store never
+                        // retains a copy.
                         Some(write_carrier_id)
                             if self.repo_owned_carriers.contains(write_carrier_id) =>
                         {
@@ -1379,7 +1364,6 @@ impl GapStore {
         }
         for gap in &mut central.gaps {
             gap.write_dir = None;
-            gap.provisional_checkout_id = None;
         }
         bbox_corpus_core::json_store::atomic_write_json_locked(&self.store_path, &central)?;
         let loaded = self
@@ -1623,7 +1607,6 @@ impl GapStore {
             project,
             project_id: p.project_id.clone(),
             write_dir,
-            provisional_checkout_id: None,
             task_id: p.task_id.clone(),
             session_id: p.session_id.clone(),
             provider: p.provider.clone(),
@@ -2078,12 +2061,6 @@ impl GapStore {
             .gaps
             .iter()
             .filter(|g| {
-                if p.checkout_id
-                    .as_deref()
-                    .is_some_and(|id| g.provisional_checkout_id.as_deref() != Some(id))
-                {
-                    return false;
-                }
                 if let Some(needle) = &id_needle {
                     if g.id
                         .strip_prefix("gap-")
@@ -2234,14 +2211,8 @@ impl GapStore {
                 }
                 row["exact_read"] =
                     serde_json::json!({"tool":"bbox_gaps","id":gap.id,"body_limit":4096});
-                if let Some(provisional) = &p.provisional {
-                    row["exact_read"]["provisional"] = serde_json::json!(provisional);
-                }
                 if let Some(project_id) = &gap.project_id {
                     row["exact_read"]["project_id"] = serde_json::json!(project_id);
-                }
-                if let Some(checkout) = &gap.provisional_checkout_id {
-                    row["exact_read"]["checkout_id"] = serde_json::json!(checkout);
                 }
                 Ok(row)
             })
@@ -2251,7 +2222,7 @@ impl GapStore {
             "rows": rows, "total": total, "offset": offset,
             "next_offset": (end < total as u64).then_some(end),
             "detail": detail,
-            "detail_hint": "Use id with body_limit=4096 for exact stored JSON; continue body.next_cursor with body_cursor and keep visibility/filter selectors unchanged."
+            "detail_hint": "Use id with body_limit=4096 for exact stored JSON; continue body.next_cursor with body_cursor and keep filter selectors unchanged."
         }))
     }
 
@@ -3212,9 +3183,8 @@ mod tests {
         );
     }
 
-    /// Checkout-targeted gaps never leak into the host-global store. Registry
-    /// overlay reconstruction owns restart visibility; after merge the base
-    /// project loader observes the same committed record normally.
+    /// Checkout-targeted gaps never leak into the host-global store. After
+    /// merge the base project loader observes the same committed record.
     #[test]
     fn redirected_gap_stays_out_of_central_and_loads_after_base_merge() {
         let base_dir = tempdir().unwrap();
@@ -3261,7 +3231,7 @@ mod tests {
         assert!(base_file.exists());
     }
 
-    /// A checkout removed before merging drops its provisional bytes with the
+    /// A checkout removed before merging drops its uncommitted bytes with the
     /// branch checkout. The daemon neither retains a host-global copy nor
     /// falls back to rewriting the base checkout.
     #[test]
@@ -3707,7 +3677,6 @@ mod tests {
             project: Some(project.into()),
             project_id: project_id.map(str::to_string),
             write_dir: None,
-            provisional_checkout_id: None,
             task_id: None,
             session_id: None,
             provider: None,

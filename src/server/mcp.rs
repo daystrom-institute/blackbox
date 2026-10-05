@@ -115,13 +115,6 @@ pub(super) fn build_http_app(
             "/admin/brofile/upsert",
             axum::routing::post(admin_brofile_upsert),
         )
-        // Operator authority, never an MCP tool: minting a workspace binding
-        // hands out the capability that selects one provisional workspace.
-        // See src/server/workspace_binding_mint.rs for the verification limits.
-        .route(
-            "/admin/workspace-binding/mint",
-            axum::routing::post(super::workspace_binding_mint::admin_workspace_binding_mint),
-        )
         .merge(super::code_source::router(shared.clone()))
         .merge(super::file_source::router(shared.clone()))
         .merge(super::conversation_source::router(shared.clone()))

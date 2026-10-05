@@ -3204,7 +3204,6 @@ pub(crate) mod fixtures {
             project: None,
             project_id: None,
             write_dir: None,
-            provisional_checkout_id: None,
             task_id: None,
             session_id: None,
             provider: None,
@@ -3359,7 +3358,6 @@ mod tests {
             project: Some("/temporary/checkout".to_string()),
             project_id: None,
             write_dir: Some("/temporary/carrier".to_string()),
-            provisional_checkout_id: Some("checkout-local".to_string()),
             task_id: Some("task-example".to_string()),
             session_id: Some("session-example".to_string()),
             provider: Some("provider-a".to_string()),
@@ -4021,7 +4019,6 @@ mod tests {
         let json = serde_json::to_value(normalized).unwrap();
         assert!(json.get("project").is_none());
         assert!(json.get("write_dir").is_none());
-        assert!(json.get("provisional_checkout_id").is_none());
         assert_eq!(json["task_id"], "task-example");
     }
 

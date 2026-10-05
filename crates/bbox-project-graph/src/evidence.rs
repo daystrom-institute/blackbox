@@ -190,7 +190,6 @@ fn project_scoped_type(entity_type: EntityType) -> bool {
         EntityType::ProjectFile
             | EntityType::ProjectFileV2
             | EntityType::ProjectGraphVertex
-            | EntityType::ProvisionalProjectGraphVertex
             | EntityType::Symbol
             | EntityType::SymbolV2
     )

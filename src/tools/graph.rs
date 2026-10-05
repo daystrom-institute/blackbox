@@ -27,14 +27,10 @@ pub(crate) struct EdgeCompactParams {
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ProjectGraphListParams {
     /// Registered project id, alias, base path, or worktree path.
     pub project: Option<String>,
-    /// Visibility policy: published, own, or all. `provisional` is the
-    /// canonical spelling; `visibility` is accepted as a deprecated alias
-    /// for older callers and recordings.
-    #[serde(default, alias = "visibility")]
-    pub provisional: Option<String>,
     /// Maximum graphs per page (1..=100, default 20). Pages also obey a
     /// serialized byte budget.
     pub limit: Option<usize>,
@@ -47,23 +43,16 @@ pub(crate) struct ProjectGraphListParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ProjectGraphDescribeParams {
     /// Registered project id, alias, base path, or worktree path.
     pub project: String,
     pub graph_id: String,
-    /// Visibility policy: published, own, or all. `provisional` is the
-    /// canonical spelling; `visibility` is accepted as a deprecated alias
-    /// for older callers and recordings.
-    #[serde(default, alias = "visibility")]
-    pub provisional: Option<String>,
-    /// Authority-plane selector: published, provisional, or connector.
-    /// Filters the variants visibility already returned; never widens it.
+    /// Authority-plane selector: published or connector. Narrows the
+    /// visible variants; never widens them.
     pub source: Option<String>,
-    /// Checkout identity of one provisional variant, from its list entry.
-    pub checkout_id: Option<String>,
-    /// Generation content hash, from its list entry. Distinct
-    /// sources/checkouts can repeat one hash, so combine it with source or
-    /// checkout_id when they do.
+    /// Generation content hash, from its list entry. Two sources can repeat
+    /// one hash, so combine it with source when they do.
     pub expected_content_hash: Option<String>,
     /// detail=summary (default) keeps the response compact; detail=schema
     /// and detail=descriptor recover the exact JSON bodies in bounded pages.
@@ -86,23 +75,16 @@ pub(crate) struct ProjectGraphDescribeParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ProjectGraphValidateParams {
     /// Registered project id, alias, base path, or worktree path.
     pub project: String,
     pub graph_id: String,
-    /// Visibility policy: published, own, or all. `provisional` is the
-    /// canonical spelling; `visibility` is accepted as a deprecated alias
-    /// for older callers and recordings.
-    #[serde(default, alias = "visibility")]
-    pub provisional: Option<String>,
-    /// Authority-plane selector: published, provisional, or connector.
-    /// Filters the variants visibility already returned; never widens it.
+    /// Authority-plane selector: published or connector. Narrows the
+    /// visible variants; never widens them.
     pub source: Option<String>,
-    /// Checkout identity of one provisional variant, from its list entry.
-    pub checkout_id: Option<String>,
-    /// Generation content hash, from its list entry. Distinct
-    /// sources/checkouts can repeat one hash, so combine it with source or
-    /// checkout_id when they do.
+    /// Generation content hash, from its list entry. Two sources can repeat
+    /// one hash, so combine it with source when they do.
     pub expected_content_hash: Option<String>,
     /// detail=summary (default) returns bounded error pages; detail=errors
     /// recovers the complete error array as exact JSON pages.
@@ -149,7 +131,7 @@ impl BlackboxServer {
                     return Ok((output, structured));
                 }
             };
-            let knowledge_view = server.session_knowledge_view(None, p.provisional.as_deref())?;
+            let knowledge_view = server.session_knowledge_view(None)?;
             let read_view = server.state.code_read_view.read().clone();
             if matches!(
                 &entity_ref,
@@ -172,7 +154,7 @@ impl BlackboxServer {
                 .provider_context()
                 .with_knowledge_view(&knowledge_view.knowledge)
                 .with_searcher(&read_view.searcher)
-                .with_project_graph_resolver(&server, p.provisional.as_deref());
+                .with_project_graph_resolver(&server);
             let output = mcp_tools::inspect::inspect_entity(&p, &provider_ctx, &entity_ref)?;
             knowledge_view.enrich_json_response(output)
         })
@@ -181,7 +163,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_project_graph_list",
-        description = "List visible project graphs in bounded pages (default 20, max 100, also byte-budgeted) ordered by graph_id, source, then checkout. Continue with next_offset plus expected_view_stamp."
+        description = "List visible project graphs in bounded pages (default 20, max 100, also byte-budgeted) ordered by graph_id then source. Continue with next_offset plus expected_view_stamp."
     )]
     pub(crate) async fn bbox_project_graph_list(
         &self,
@@ -190,10 +172,8 @@ impl BlackboxServer {
         let server = self.clone();
         Self::run_blocking("bbox_project_graph_list", move || {
             let offset = p.offset.unwrap_or(0);
-            let (_, graphs, view_stamp) = server.project_graph_inventory_domain(
-                p.project.as_deref(),
-                p.provisional.as_deref(),
-            )?;
+            let (graphs, view_stamp) =
+                server.project_graph_inventory_domain(p.project.as_deref())?;
             if offset > 0 && p.expected_view_stamp.is_none() {
                 bail!("error.graph_view_stamp_required: continue with expected_view_stamp from the previous response");
             }
@@ -215,11 +195,10 @@ impl BlackboxServer {
                 p.offset,
             )?;
             page["status"] = json!("ok");
-            page["provisional"] = json!(p.provisional);
             page["view_stamp"] = json!(view_stamp);
-            page["order"] = json!("graph_id_source_checkout_asc");
+            page["order"] = json!("graph_id_source_asc");
             page["continuation_note"] = json!(
-                "Live view state, not a snapshot: published installs and provisional overlays replace whole entries, so a changed view refuses nonzero offsets instead of paging a different inventory."
+                "Live view state, not a snapshot: published installs replace whole entries, so a changed view refuses nonzero offsets instead of paging a different inventory."
             );
             Ok(serde_json::to_string(&page)?)
         })
@@ -239,7 +218,6 @@ impl BlackboxServer {
             let detail = crate::project_graph_read::GraphDescribeDetail::parse(p.detail.as_deref())?;
             let selector = crate::project_graph_read::GraphVariantSelector::parse(
                 p.source.as_deref(),
-                p.checkout_id.as_deref(),
                 p.expected_content_hash.as_deref(),
             )?;
             match detail {
@@ -250,16 +228,12 @@ impl BlackboxServer {
                     if p.body_limit.is_some() {
                         bail!("error.bad_input: body_limit requires detail=schema or detail=descriptor");
                     }
-                    let (mut graphs, view_stamp) = server.project_graph_describe_domain(
-                        &p.project,
-                        &p.graph_id,
-                        p.provisional.as_deref(),
-                    )?;
+                    let (mut graphs, view_stamp) =
+                        server.project_graph_describe_domain(&p.project, &p.graph_id)?;
                     if let Some(selector) = &selector {
                         graphs.retain(|description| {
                             selector.matches_parts(
                                 description.summary.source,
-                                description.summary.checkout_id.as_deref(),
                                 description.summary.content_hash.as_str(),
                             )
                         });
@@ -308,12 +282,12 @@ impl BlackboxServer {
                     page["status"] = json!("ok");
                     page["detail"] = json!("summary");
                     page["view_stamp"] = json!(view_stamp);
-                    page["order"] = json!("source_checkout_content_asc");
+                    page["order"] = json!("source_content_asc");
                     page["continuation_note"] = json!(
-                        "Live view state, not a snapshot: published installs and provisional overlays replace whole entries, so a changed variant set refuses nonzero offsets instead of paging different variants."
+                        "Live view state, not a snapshot: published installs replace whole entries, so a changed variant set refuses nonzero offsets instead of paging different variants."
                     );
                     page["detail_hint"] = json!(
-                        "Exact schema: detail=\"schema\"; descriptor: detail=\"descriptor\"; select one variant with source, checkout_id, and expected_content_hash when several are visible; continue with cursor=body.next_cursor."
+                        "Exact schema: detail=\"schema\"; descriptor: detail=\"descriptor\"; select one variant with source and expected_content_hash when several are visible; continue with cursor=body.next_cursor."
                     );
                     Ok(serde_json::to_string(&page)?)
                 }
@@ -331,17 +305,14 @@ impl BlackboxServer {
                     let read = server.project_graph_detail_domain(
                         &p.project,
                         &p.graph_id,
-                        p.provisional.as_deref(),
                         detail,
                         selector.as_ref(),
                     )?;
                     let scope = format!(
-                        "{}:{}:{}:{}:{}:{}:{}",
+                        "{}:{}:{}:{}:{}",
                         read.project_id,
-                        read.provisional_mode,
                         p.graph_id,
                         read.source,
-                        read.checkout_id.as_deref().unwrap_or("-"),
                         read.generation.content_hash,
                         detail.as_str()
                     );
@@ -377,7 +348,6 @@ impl BlackboxServer {
             let detail = crate::project_graph_read::GraphValidateDetail::parse(p.detail.as_deref())?;
             let selector = crate::project_graph_read::GraphVariantSelector::parse(
                 p.source.as_deref(),
-                p.checkout_id.as_deref(),
                 p.expected_content_hash.as_deref(),
             )?;
             match detail {
@@ -393,7 +363,6 @@ impl BlackboxServer {
                     let graphs = server.project_graph_validate_domain(
                         &p.project,
                         &p.graph_id,
-                        p.provisional.as_deref(),
                         selector.as_ref(),
                         error_offset,
                         error_limit,
@@ -402,7 +371,7 @@ impl BlackboxServer {
                     if paging {
                         if graphs.len() > 1 {
                             bail!(
-                                "error.project_graph_ambiguous: error paging needs exactly one visible variant; select one with source, checkout_id, and expected_content_hash (or narrow provisional to published or own)"
+                                "error.project_graph_ambiguous: error paging needs exactly one visible variant; select one with source and expected_content_hash"
                             );
                         }
                         let Some(graph) = graphs.first() else {
@@ -419,8 +388,8 @@ impl BlackboxServer {
                             bail!("error.graph_errors_changed: validation errors changed since the previous page; restart at error_offset=0 without expected_error_stamp");
                         }
                     }
-                    let scope = json!([p.project, p.graph_id, p.provisional, p.source,
-                        p.checkout_id, p.expected_content_hash, error_offset, error_limit]);
+                    let scope = json!([p.project, p.graph_id, p.source,
+                        p.expected_content_hash, error_offset, error_limit]);
                     let stamp = format!("{:x}", Sha256::digest(serde_json::to_vec(
                         &json!([scope, graphs]))?));
                     let offset = p.variant_offset.unwrap_or(0);
@@ -437,7 +406,7 @@ impl BlackboxServer {
                     page["status"] = json!("ok");
                     page["detail"] = json!("summary");
                     page["view_stamp"] = json!(stamp);
-                    page["detail_hint"] = json!("Continue variants with variant_offset=next_offset and expected_view_stamp=view_stamp. Exact errors: detail=errors with one variant selected by source, checkout_id and expected_content_hash.");
+                    page["detail_hint"] = json!("Continue variants with variant_offset=next_offset and expected_view_stamp=view_stamp. Exact errors: detail=errors with one variant selected by source and expected_content_hash.");
                     Ok(page.to_string())
                 }
                 crate::project_graph_read::GraphValidateDetail::Errors => {
@@ -456,16 +425,13 @@ impl BlackboxServer {
                     let read = server.project_graph_validation_errors_domain(
                         &p.project,
                         &p.graph_id,
-                        p.provisional.as_deref(),
                         selector.as_ref(),
                     )?;
                     let scope = format!(
-                        "{}:{}:{}:{}:{}:{}:errors",
+                        "{}:{}:{}:{}:errors",
                         read.project_id,
-                        read.provisional_mode,
                         p.graph_id,
                         read.source,
-                        read.checkout_id.as_deref().unwrap_or("-"),
                         read.generation.content_hash
                     );
                     let body = super::body_page::json_body_page(
@@ -574,61 +540,6 @@ mod tests {
         assert_eq!(std::fs::read_to_string(backup).unwrap(), original);
     }
 
-    #[tokio::test]
-    async fn validation_variant_pages_reconstruct_and_refuse_changed_inventory() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().canonicalize().unwrap();
-        let server = test_server(&tmp);
-        let project = install_published_entries(&server, &root, |project| {
-            vec![graph_entry(synthetic_graph(
-                project,
-                "shared",
-                "vary",
-                "vary:Node",
-                "one",
-            ))]
-        });
-        for id in 0..25 {
-            install_overlay(
-                &server,
-                &project,
-                &format!("{id:032x}"),
-                synthetic_graph(&project, "shared", "vary", "vary:Node", "one"),
-            );
-        }
-        let args = json!({"project":project,"graph_id":"shared","provisional":"all"});
-        let first = server
-            .bbox_project_graph_validate(Parameters(serde_json::from_value(args.clone()).unwrap()))
-            .await;
-        let first: serde_json::Value = serde_json::from_str(&extract_text(&first)).unwrap();
-        assert_eq!(first["total"], 26);
-        assert_eq!(first["count"], 20);
-        let mut next = args.clone();
-        next["variant_offset"] = first["next_offset"].clone();
-        let unstamped = server
-            .bbox_project_graph_validate(Parameters(serde_json::from_value(next.clone()).unwrap()))
-            .await;
-        assert_eq!(unstamped.is_error, Some(true));
-        next["expected_view_stamp"] = first["view_stamp"].clone();
-        let second = server
-            .bbox_project_graph_validate(Parameters(serde_json::from_value(next.clone()).unwrap()))
-            .await;
-        let second: serde_json::Value = serde_json::from_str(&extract_text(&second)).unwrap();
-        assert_eq!(second["count"], 6);
-        assert!(second["next_offset"].is_null());
-        assert_eq!(first["view_stamp"], second["view_stamp"]);
-        install_overlay(
-            &server,
-            &project,
-            &format!("{:032x}", 26),
-            synthetic_graph(&project, "shared", "vary", "vary:Node", "two"),
-        );
-        let stale = server
-            .bbox_project_graph_validate(Parameters(serde_json::from_value(next).unwrap()))
-            .await;
-        assert!(extract_text(&stale).contains("error.graph_view_changed"));
-    }
-
     use crate::server::state::SharedState;
     use bbox_corpus_core::identity::PublishedScope;
     use std::path::PathBuf;
@@ -643,9 +554,7 @@ mod tests {
         wire["content"][0]["text"].as_str().unwrap().to_string()
     }
 
-    /// Parses the governance-record fixture into a graph generation. Callable
-    /// more than once per test so a provisional overlay can carry its own
-    /// (identical) generation alongside the published one.
+    /// Parses the governance-record fixture into a graph generation.
     fn load_governance_generation(
         project_id: &str,
         root: &std::path::Path,
@@ -702,7 +611,6 @@ mod tests {
                             accepted_generation: "generation-one".into(),
                             accepted_commit: "a".repeat(40),
                             source_generation: None,
-                            workspace_id: None,
                             content_hash: graph.fingerprint.clone(),
                         },
                         graph,
@@ -795,7 +703,6 @@ mod tests {
                 accepted_generation: "generation-one".into(),
                 accepted_commit: "a".repeat(40),
                 source_generation: None,
-                workspace_id: None,
                 content_hash,
             },
             graph,
@@ -967,7 +874,6 @@ mod tests {
                 accepted_generation: "generation-one".into(),
                 accepted_commit: "b".repeat(40),
                 source_generation: None,
-                workspace_id: None,
                 content_hash: format!("invalid-{error_count:04}"),
             },
             synthetic_validation_errors(error_count),
@@ -1143,7 +1049,6 @@ mod tests {
                 property_cursor: None,
                 property_limit: None,
                 entity_ref: entity_ref.to_string(),
-                provisional: Some("published".into()),
                 edge_types: None,
                 direction: Some("both".into()),
                 per_type_limit: Some(10),
@@ -1186,9 +1091,7 @@ mod tests {
             .bbox_project_graph_describe(Parameters(ProjectGraphDescribeParams {
                 project: project_id.clone(),
                 graph_id: "source".into(),
-                provisional: Some("published".into()),
                 source: None,
-                checkout_id: None,
                 expected_content_hash: None,
                 detail: None,
                 cursor: None,
@@ -1217,19 +1120,43 @@ mod tests {
         );
     }
 
-    /// Q10: `provisional` is the canonical spelling on the project graph
-    /// family and `visibility` keeps working as a deprecated serde alias.
+    /// The removed visibility selectors are unknown fields on every project
+    /// graph tool, so a caller still passing one gets a clear refusal.
     #[test]
-    fn project_graph_params_accept_visibility_as_a_deprecated_alias() {
-        let exact: ProjectGraphDescribeParams =
-            serde_json::from_str(r#"{"project":"p1","graph_id":"g","visibility":"own"}"#).unwrap();
-        assert_eq!(exact.provisional.as_deref(), Some("own"));
-        let listed: ProjectGraphListParams =
-            serde_json::from_str(r#"{"visibility":"all"}"#).unwrap();
-        assert_eq!(listed.provisional.as_deref(), Some("all"));
-        let canonical: ProjectGraphListParams =
-            serde_json::from_str(r#"{"provisional":"published"}"#).unwrap();
-        assert_eq!(canonical.provisional.as_deref(), Some("published"));
+    fn project_graph_params_refuse_removed_visibility_fields() {
+        for removed in ["provisional", "visibility", "checkout_id"] {
+            let describe = serde_json::from_value::<ProjectGraphDescribeParams>(
+                json!({"project":"p1","graph_id":"g", removed: "own"}),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(describe.contains("unknown field"), "{describe}");
+            let validate = serde_json::from_value::<ProjectGraphValidateParams>(
+                json!({"project":"p1","graph_id":"g", removed: "own"}),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(validate.contains("unknown field"), "{validate}");
+            let listed =
+                serde_json::from_value::<ProjectGraphListParams>(json!({ removed: "all" }))
+                    .unwrap_err()
+                    .to_string();
+            assert!(listed.contains("unknown field"), "{listed}");
+            let inspect = serde_json::from_value::<InspectEntityParams>(
+                json!({"entity_ref":"knowledge:x", removed: "own"}),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(inspect.contains("unknown field"), "{inspect}");
+        }
+        let source = serde_json::from_value::<ProjectGraphDescribeParams>(
+            json!({"project":"p1","graph_id":"g","source":"provisional"}),
+        )
+        .unwrap();
+        assert!(
+            crate::project_graph_read::GraphVariantSelector::parse(source.source.as_deref(), None)
+                .is_err()
+        );
     }
 
     /// Shared driver for the exact detail reads: returns the raw tool text so
@@ -1246,9 +1173,7 @@ mod tests {
             .bbox_project_graph_describe(Parameters(ProjectGraphDescribeParams {
                 project: project.into(),
                 graph_id: graph_id.into(),
-                provisional: Some("published".into()),
                 source: None,
-                checkout_id: None,
                 expected_content_hash: None,
                 detail: Some(detail.into()),
                 cursor,
@@ -1309,9 +1234,7 @@ mod tests {
                 .bbox_project_graph_validate(Parameters(ProjectGraphValidateParams {
                     project: project.into(),
                     graph_id: graph_id.into(),
-                    provisional: Some("published".into()),
                     source: None,
-                    checkout_id: None,
                     expected_content_hash: None,
                     detail: Some("errors".into()),
                     cursor,
@@ -1360,9 +1283,7 @@ mod tests {
             .bbox_project_graph_describe(Parameters(ProjectGraphDescribeParams {
                 project: project_id.clone(),
                 graph_id: "wide".into(),
-                provisional: Some("published".into()),
                 source: None,
-                checkout_id: None,
                 expected_content_hash: None,
                 detail: None,
                 cursor: None,
@@ -1517,9 +1438,7 @@ mod tests {
             .bbox_project_graph_describe(Parameters(ProjectGraphDescribeParams {
                 project: project_id.clone(),
                 graph_id: "wide".into(),
-                provisional: Some("published".into()),
                 source: None,
-                checkout_id: None,
                 expected_content_hash: None,
                 detail: None,
                 cursor: Some(cursor),
@@ -1543,518 +1462,6 @@ mod tests {
         );
     }
 
-    /// Installs one provisional overlay for a distinct checkout, standing in
-    /// for a second workspace's uncommitted variant of the same graph id.
-    fn install_overlay(
-        server: &BlackboxServer,
-        project_id: &str,
-        workspace_hex: &str,
-        graph: bbox_project_graph::GraphGeneration,
-    ) -> String {
-        let workspace_id = bro_core::WorkspaceId::parse(workspace_hex.to_string()).unwrap();
-        let graph_id = graph.key.graph_id.clone();
-        server
-            .state
-            .project_graph_views
-            .write()
-            .install_provisional(
-                bbox_indexing::project_graph_view::ProvisionalProjectGraphOverlay {
-                    project_id: bbox_corpus_core::project_catalog::ProjectId::parse(
-                        project_id.to_string(),
-                    )
-                    .unwrap(),
-                    scope: PublishedScope::try_new("test-plane", ".").unwrap(),
-                    workspace_id: workspace_id.clone(),
-                    source_generation_id: "working-one".into(),
-                    graphs: std::collections::BTreeMap::from([(
-                        graph_id.clone(),
-                        bbox_indexing::project_graph_view::ProjectGraphOverlayValue::Upsert(
-                            bbox_indexing::project_graph_view::ProjectGraphViewEntry::valid(
-                                graph_id,
-                                bbox_indexing::project_graph_view::ProjectGraphGenerationIdentity {
-                                    accepted_generation: "generation-one".into(),
-                                    accepted_commit: "a".repeat(40),
-                                    source_generation: Some("working-one".into()),
-                                    workspace_id: Some(workspace_id),
-                                    content_hash: graph.fingerprint.clone(),
-                                },
-                                graph,
-                            ),
-                        ),
-                    )]),
-                    evidence: None,
-                },
-            );
-        workspace_hex.to_string()
-    }
-
-    /// Detail read with the precise variant selector. The selector mirrors
-    /// the list entry identity: authority plane, checkout, and content hash.
-    async fn describe_selected_text(
-        server: &BlackboxServer,
-        project: &str,
-        graph_id: &str,
-        detail: &str,
-        source: Option<&str>,
-        checkout_id: Option<&str>,
-        expected_content_hash: Option<&str>,
-        cursor: Option<String>,
-        body_limit: Option<usize>,
-    ) -> String {
-        let result = server
-            .bbox_project_graph_describe(Parameters(ProjectGraphDescribeParams {
-                project: project.into(),
-                graph_id: graph_id.into(),
-                provisional: Some("all".into()),
-                source: source.map(Into::into),
-                checkout_id: checkout_id.map(Into::into),
-                expected_content_hash: expected_content_hash.map(Into::into),
-                detail: Some(detail.into()),
-                cursor,
-                body_limit,
-                variant_limit: None,
-                variant_offset: None,
-                expected_view_stamp: None,
-            }))
-            .await;
-        extract_text(&result)
-    }
-
-    /// Multi-variant summary page driver with the same selector fields.
-    async fn describe_variants_text(
-        server: &BlackboxServer,
-        project: &str,
-        graph_id: &str,
-        source: Option<&str>,
-        checkout_id: Option<&str>,
-        expected_content_hash: Option<&str>,
-        variant_limit: Option<usize>,
-        variant_offset: Option<usize>,
-        expected_view_stamp: Option<String>,
-    ) -> String {
-        let result = server
-            .bbox_project_graph_describe(Parameters(ProjectGraphDescribeParams {
-                project: project.into(),
-                graph_id: graph_id.into(),
-                provisional: Some("all".into()),
-                source: source.map(Into::into),
-                checkout_id: checkout_id.map(Into::into),
-                expected_content_hash: expected_content_hash.map(Into::into),
-                detail: None,
-                cursor: None,
-                body_limit: None,
-                variant_limit,
-                variant_offset,
-                expected_view_stamp,
-            }))
-            .await;
-        extract_text(&result)
-    }
-
-    /// A04 follow-up: one graph id can be visible as several variants at
-    /// once, and distinct sources/checkouts can repeat one content hash. The
-    /// summary pages the variants, and exact reads select precisely with the
-    /// identity the list already exposes; body cursors stay bound to that
-    /// selection, so even a byte-identical sibling cannot be paged by
-    /// another variant's cursor.
-    #[tokio::test]
-    async fn project_graph_variants_select_and_page_across_sources_and_checkouts() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().canonicalize().unwrap();
-        let server = test_server(&tmp);
-        let project_id = install_published_entries(&server, &root, |project| {
-            vec![graph_entry(synthetic_graph(
-                project,
-                "shared",
-                "vary",
-                "vary:Node",
-                "one",
-            ))]
-        });
-        let workspace_a = "a".repeat(32);
-        let workspace_b = "b".repeat(32);
-        // The workspace-A overlay repeats the published content hash across
-        // a different source and checkout; workspace-B carries distinct
-        // bytes so the variant set spans both hazard shapes.
-        install_overlay(
-            &server,
-            &project_id,
-            &workspace_a,
-            synthetic_graph(&project_id, "shared", "vary", "vary:Node", "one"),
-        );
-        install_overlay(
-            &server,
-            &project_id,
-            &workspace_b,
-            synthetic_graph(&project_id, "shared", "vary", "vary:Node", "two"),
-        );
-        let expected_schema = serde_json::to_value(
-            &synthetic_graph(&project_id, "shared", "vary", "vary:Node", "one").schema,
-        )
-        .unwrap();
-
-        let listed = server
-            .bbox_project_graph_list(Parameters(ProjectGraphListParams {
-                project: Some(project_id.clone()),
-                provisional: Some("all".into()),
-                limit: None,
-                offset: None,
-                expected_view_stamp: None,
-            }))
-            .await;
-        let listed_text = extract_text(&listed);
-        let listed_page: serde_json::Value = serde_json::from_str(&listed_text).unwrap();
-        let rows = listed_page["graphs"].as_array().unwrap();
-        assert_eq!(rows.len(), 3, "{listed_text}");
-        let published_row = rows
-            .iter()
-            .find(|row| row["source"] == json!("published"))
-            .expect("published variant listed");
-        let repeated_hash = published_row["content_hash"].as_str().unwrap();
-        let overlay_a_row = rows
-            .iter()
-            .find(|row| row["checkout_id"].as_str() == Some(workspace_a.as_str()))
-            .expect("workspace-A overlay listed");
-        assert_eq!(
-            overlay_a_row["content_hash"],
-            json!(repeated_hash),
-            "distinct source and checkout repeat one content hash"
-        );
-
-        // The multi-variant default summary is a bounded page, not an
-        // unbounded graphs array.
-        let summary = describe_variants_text(
-            &server,
-            &project_id,
-            "shared",
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        .await;
-        let summary_text = summary.clone();
-        let summary_page: serde_json::Value = serde_json::from_str(&summary_text).unwrap();
-        assert_eq!(summary_page["total"], json!(3), "{summary_text}");
-        assert_eq!(summary_page["count"], json!(3), "{summary_text}");
-        assert!(summary_page["next_offset"].is_null(), "{summary_text}");
-        assert!(
-            summary_page["view_stamp"]
-                .as_str()
-                .is_some_and(|s| !s.is_empty()),
-            "{summary_text}"
-        );
-        let summary_envelope = serde_json::to_vec(&summary_page).unwrap().len();
-        assert!(
-            summary_envelope < 8192,
-            "the complete multi-variant summary stays bounded: {summary_envelope}"
-        );
-
-        // Variant paging continues by stamp and refuses a changed set.
-        let first = describe_variants_text(
-            &server,
-            &project_id,
-            "shared",
-            None,
-            None,
-            None,
-            Some(1),
-            None,
-            None,
-        )
-        .await;
-        let first_text = first;
-        let first_page: serde_json::Value = serde_json::from_str(&first_text).unwrap();
-        assert_eq!(first_page["count"], json!(1), "{first_text}");
-        assert_eq!(first_page["next_offset"], json!(1), "{first_text}");
-        assert_eq!(
-            first_page["graphs"][0]["summary"]["source"],
-            json!("provisional")
-        );
-        let view_stamp = first_page["view_stamp"].as_str().unwrap().to_string();
-
-        let unstamped = describe_variants_text(
-            &server,
-            &project_id,
-            "shared",
-            None,
-            None,
-            None,
-            Some(1),
-            Some(1),
-            None,
-        )
-        .await;
-        assert!(
-            unstamped.contains("error.graph_view_stamp_required"),
-            "nonzero variant offsets require the stamp: {unstamped}"
-        );
-
-        let second = describe_variants_text(
-            &server,
-            &project_id,
-            "shared",
-            None,
-            None,
-            None,
-            Some(1),
-            Some(1),
-            Some(view_stamp.clone()),
-        )
-        .await;
-        let second_text = second;
-        let second_page: serde_json::Value = serde_json::from_str(&second_text).unwrap();
-        assert_eq!(
-            second_page["graphs"][0]["summary"]["checkout_id"],
-            json!(workspace_b),
-            "page two continues into the workspace-B overlay: {second_text}"
-        );
-
-        let wrong_stamp = describe_variants_text(
-            &server,
-            &project_id,
-            "shared",
-            None,
-            None,
-            None,
-            Some(1),
-            Some(2),
-            Some("deadbeef".into()),
-        )
-        .await;
-        assert!(
-            wrong_stamp.contains("error.graph_view_changed"),
-            "an unknown stamp refuses: {wrong_stamp}"
-        );
-
-        install_overlay(
-            &server,
-            &project_id,
-            &"c".repeat(32),
-            synthetic_graph(&project_id, "shared", "vary", "vary:Node", "three"),
-        );
-        let changed = describe_variants_text(
-            &server,
-            &project_id,
-            "shared",
-            None,
-            None,
-            None,
-            Some(1),
-            Some(2),
-            Some(view_stamp),
-        )
-        .await;
-        assert!(
-            changed.contains("error.graph_view_changed"),
-            "a changed variant set refuses continuation: {changed}"
-        );
-        let restarted = describe_variants_text(
-            &server,
-            &project_id,
-            "shared",
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        .await;
-        let restarted_page: serde_json::Value = serde_json::from_str(&restarted).unwrap();
-        assert_eq!(restarted_page["total"], json!(4), "{restarted}");
-
-        // A repeated hash alone stays ambiguous; the summary narrows to the
-        // two variants that carry it.
-        let hash_only = describe_variants_text(
-            &server,
-            &project_id,
-            "shared",
-            None,
-            None,
-            Some(repeated_hash),
-            None,
-            None,
-            None,
-        )
-        .await;
-        let hash_only_page: serde_json::Value = serde_json::from_str(&hash_only).unwrap();
-        assert_eq!(hash_only_page["total"], json!(2), "{hash_only}");
-        let ambiguous = describe_selected_text(
-            &server,
-            &project_id,
-            "shared",
-            "schema",
-            None,
-            None,
-            Some(repeated_hash),
-            None,
-            None,
-        )
-        .await;
-        assert!(
-            ambiguous.contains("error.project_graph_ambiguous")
-                && ambiguous.matches("content_hash=").count() >= 2,
-            "an ambiguous selector lists every selectable identity: {ambiguous}"
-        );
-
-        // Selecting by source (or checkout) resolves the repeated hash, and
-        // the exact read reconstructs the selected variant's schema.
-        let selected_summary = describe_variants_text(
-            &server,
-            &project_id,
-            "shared",
-            Some("published"),
-            None,
-            Some(repeated_hash),
-            None,
-            None,
-            None,
-        )
-        .await;
-        let selected_page: serde_json::Value = serde_json::from_str(&selected_summary).unwrap();
-        assert_eq!(
-            selected_page["summary"]["source"],
-            json!("published"),
-            "the selected variant unwraps alone: {selected_summary}"
-        );
-
-        let mut joined = String::new();
-        let mut cursor = None;
-        loop {
-            let text = describe_selected_text(
-                &server,
-                &project_id,
-                "shared",
-                "schema",
-                Some("published"),
-                None,
-                Some(repeated_hash),
-                cursor,
-                None,
-            )
-            .await;
-            let page: serde_json::Value = serde_json::from_str(&text).unwrap();
-            joined.push_str(page["body"]["text"].as_str().unwrap());
-            cursor = page["body"]["next_cursor"]
-                .as_str()
-                .map(ToString::to_string);
-            if cursor.is_none() {
-                break;
-            }
-        }
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&joined).unwrap(),
-            expected_schema
-        );
-
-        let mut joined = String::new();
-        let mut cursor = None;
-        loop {
-            let text = describe_selected_text(
-                &server,
-                &project_id,
-                "shared",
-                "schema",
-                None,
-                Some(&workspace_a),
-                Some(repeated_hash),
-                cursor,
-                None,
-            )
-            .await;
-            let page: serde_json::Value = serde_json::from_str(&text).unwrap();
-            joined.push_str(page["body"]["text"].as_str().unwrap());
-            cursor = page["body"]["next_cursor"]
-                .as_str()
-                .map(ToString::to_string);
-            if cursor.is_none() {
-                break;
-            }
-        }
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&joined).unwrap(),
-            expected_schema,
-            "the workspace-A overlay carries the same bytes; selection resolves it"
-        );
-
-        // Body cursors bind to the exact selection: a cursor minted for the
-        // published variant refuses under the byte-identical overlay.
-        let published_first = describe_selected_text(
-            &server,
-            &project_id,
-            "shared",
-            "schema",
-            Some("published"),
-            None,
-            Some(repeated_hash),
-            None,
-            Some(64),
-        )
-        .await;
-        let published_page: serde_json::Value = serde_json::from_str(&published_first).unwrap();
-        let published_cursor = published_page["body"]["next_cursor"]
-            .as_str()
-            .expect("a 64-byte page always continues")
-            .to_string();
-        let cross_variant = describe_selected_text(
-            &server,
-            &project_id,
-            "shared",
-            "schema",
-            None,
-            Some(&workspace_a),
-            Some(repeated_hash),
-            Some(published_cursor),
-            None,
-        )
-        .await;
-        assert!(
-            cross_variant.contains("restart without cursor"),
-            "a cursor must not cross variants that repeat one hash: {cross_variant}"
-        );
-
-        let no_match = describe_selected_text(
-            &server,
-            &project_id,
-            "shared",
-            "schema",
-            None,
-            Some(&"f".repeat(32)),
-            None,
-            None,
-            None,
-        )
-        .await;
-        assert!(
-            no_match.contains("error.not_found"),
-            "a selector that matches nothing is not_found: {no_match}"
-        );
-
-        let bad_source = describe_selected_text(
-            &server,
-            &project_id,
-            "shared",
-            "schema",
-            Some("museum"),
-            None,
-            None,
-            None,
-            None,
-        )
-        .await;
-        assert!(
-            bad_source.contains("error.bad_input"),
-            "unknown source vocabulary refuses: {bad_source}"
-        );
-    }
-
-    /// A04 follow-up: one huge retrieval-exclusion array must not inflate
-    /// the default summary. The count stays inline, the exact sorted list
-    /// stays recoverable through the schema body read, and the serialized
-    /// summary stays bounded.
     #[tokio::test]
     async fn project_graph_describe_bounds_oversized_retrieval_metadata() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2068,9 +1475,7 @@ mod tests {
             .bbox_project_graph_describe(Parameters(ProjectGraphDescribeParams {
                 project: project_id.clone(),
                 graph_id: "heavy".into(),
-                provisional: Some("published".into()),
                 source: None,
-                checkout_id: None,
                 expected_content_hash: None,
                 detail: None,
                 cursor: None,
@@ -2143,7 +1548,6 @@ mod tests {
                     server
                         .bbox_project_graph_list(Parameters(ProjectGraphListParams {
                             project: Some(project_id),
-                            provisional: Some("published".into()),
                             limit,
                             offset,
                             expected_view_stamp,
@@ -2273,9 +1677,7 @@ mod tests {
                     .bbox_project_graph_validate(Parameters(ProjectGraphValidateParams {
                         project: project_id,
                         graph_id,
-                        provisional: Some("published".into()),
                         source: None,
-                        checkout_id: None,
                         expected_content_hash: None,
                         detail,
                         cursor: None,
@@ -2415,7 +1817,6 @@ mod tests {
         let listed = server
             .bbox_project_graph_list(Parameters(ProjectGraphListParams {
                 project: Some(project_id.clone()),
-                provisional: Some("published".into()),
                 limit: None,
                 offset: None,
                 expected_view_stamp: None,
@@ -2519,7 +1920,6 @@ mod tests {
                 property_cursor: None,
                 property_limit: None,
                 entity_ref: format!("project_graph_vertex:{project_id}:records:filing-1"),
-                provisional: Some("published".into()),
                 edge_types: None,
                 direction: Some("both".into()),
                 per_type_limit: Some(10),
@@ -2551,7 +1951,6 @@ mod tests {
         let listed = server
             .bbox_project_graph_list(Parameters(ProjectGraphListParams {
                 project: Some(project_id.clone()),
-                provisional: Some("published".into()),
                 limit: None,
                 offset: None,
                 expected_view_stamp: None,
@@ -2572,9 +1971,7 @@ mod tests {
             .bbox_project_graph_describe(Parameters(ProjectGraphDescribeParams {
                 project: project_id.clone(),
                 graph_id: "governance-record".into(),
-                provisional: Some("published".into()),
                 source: None,
-                checkout_id: None,
                 expected_content_hash: None,
                 detail: None,
                 cursor: None,
@@ -2598,9 +1995,7 @@ mod tests {
             .bbox_project_graph_validate(Parameters(ProjectGraphValidateParams {
                 project: project_id.clone(),
                 graph_id: "governance-record".into(),
-                provisional: Some("published".into()),
                 source: None,
-                checkout_id: None,
                 expected_content_hash: None,
                 detail: None,
                 cursor: None,
@@ -2628,7 +2023,6 @@ mod tests {
                 property_cursor: None,
                 property_limit: None,
                 entity_ref: vertex_ref.clone(),
-                provisional: Some("published".into()),
                 edge_types: None,
                 direction: Some("both".into()),
                 per_type_limit: Some(10),
@@ -2639,117 +2033,6 @@ mod tests {
         assert!(inspected_text.contains("record/case@1"), "{inspected_text}");
     }
 
-    #[tokio::test]
-    async fn project_graph_tools_surface_invalid_own_overlay_without_fallback() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().canonicalize().unwrap();
-        let server = test_server(&tmp);
-        let project_id = install_governance_graph(&server, &root);
-        let scope = PublishedScope::try_new("repo-governance", ".").unwrap();
-        let workspace_id = bro_core::WorkspaceId::parse("a".repeat(32)).unwrap();
-        server.set_session_checkout_for_test(
-            project_id.clone(),
-            scope.clone(),
-            workspace_id.to_string(),
-            root,
-        );
-        server
-            .state
-            .project_graph_views
-            .write()
-            .install_provisional(
-                bbox_indexing::project_graph_view::ProvisionalProjectGraphOverlay {
-                    project_id: bbox_corpus_core::project_catalog::ProjectId::parse(
-                        project_id.clone(),
-                    )
-                    .unwrap(),
-                    scope,
-                    workspace_id: workspace_id.clone(),
-                    source_generation_id: "working-one".into(),
-                    graphs: std::collections::BTreeMap::from([(
-                        "governance-record".into(),
-                        bbox_indexing::project_graph_view::ProjectGraphOverlayValue::Upsert(
-                            bbox_indexing::project_graph_view::ProjectGraphViewEntry::invalid(
-                                "governance-record".into(),
-                                bbox_indexing::project_graph_view::ProjectGraphGenerationIdentity {
-                                    accepted_generation: "generation-one".into(),
-                                    accepted_commit: "a".repeat(40),
-                                    source_generation: Some("working-one".into()),
-                                    workspace_id: Some(workspace_id),
-                                    content_hash: "invalid-content".into(),
-                                },
-                                vec![bbox_project_graph::ValidationError::new(
-                                    "edge.missing_vertex",
-                                    "edges.jsonl",
-                                    Some(7),
-                                    "edge target is missing",
-                                )],
-                            ),
-                        ),
-                    )]),
-                    evidence: None,
-                },
-            );
-
-        let own = server
-            .bbox_project_graph_validate(Parameters(ProjectGraphValidateParams {
-                project: project_id.clone(),
-                graph_id: "governance-record".into(),
-                provisional: Some("own".into()),
-                source: None,
-                checkout_id: None,
-                expected_content_hash: None,
-                detail: None,
-                cursor: None,
-                body_limit: None,
-                error_offset: None,
-                error_limit: None,
-                expected_error_stamp: None,
-                variant_limit: None,
-                variant_offset: None,
-                expected_view_stamp: None,
-            }))
-            .await;
-        let own_text = extract_text(&own);
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&own_text).unwrap()["graphs"][0]["valid"],
-            false
-        );
-        assert!(own_text.contains("edge.missing_vertex"), "{own_text}");
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&own_text).unwrap()["graphs"][0]["source"],
-            "provisional"
-        );
-
-        let published = server
-            .bbox_project_graph_validate(Parameters(ProjectGraphValidateParams {
-                project: project_id,
-                graph_id: "governance-record".into(),
-                provisional: Some("published".into()),
-                source: None,
-                checkout_id: None,
-                expected_content_hash: None,
-                detail: None,
-                cursor: None,
-                body_limit: None,
-                error_offset: None,
-                error_limit: None,
-                expected_error_stamp: None,
-                variant_limit: None,
-                variant_offset: None,
-                expected_view_stamp: None,
-            }))
-            .await;
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&extract_text(&published)).unwrap()["graphs"]
-                [0]["valid"],
-            true
-        );
-    }
-
-    /// Symbol refs have no entity doc and the daemon keeps no edge graph, so
-    /// nothing proves one exists: a well-formed symbol ref is not_found, and
-    /// the refusal carries no suggestion list drawn from a graph.
     #[tokio::test]
     async fn symbol_refs_without_an_entity_doc_are_not_found() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2765,7 +2048,6 @@ mod tests {
                     property_cursor: None,
                     property_limit: None,
                     entity_ref: entity_ref.into(),
-                    provisional: None,
                     edge_types: None,
                     direction: None,
                     per_type_limit: Some(5),
@@ -2815,7 +2097,6 @@ mod tests {
                         property_cursor: None,
                         property_limit: None,
                         entity_ref,
-                        provisional: None,
                         edge_types: None,
                         direction: None,
                         per_type_limit: Some(5),
@@ -2855,7 +2136,6 @@ mod tests {
                 property_cursor: None,
                 property_limit: None,
                 entity_ref: "system_memory:sm-agentic-opening-sequence".into(),
-                provisional: None,
                 edge_types: None,
                 direction: None,
                 per_type_limit: Some(0),
@@ -3239,7 +2519,6 @@ mod graph_vector_lane {
                         accepted_generation: stamp.into(),
                         accepted_commit: "a".repeat(40),
                         source_generation: None,
-                        workspace_id: None,
                         content_hash: generation.fingerprint.clone(),
                     },
                     generation,
@@ -3304,9 +2583,7 @@ mod graph_vector_lane {
             .bbox_project_graph_describe(Parameters(ProjectGraphDescribeParams {
                 project: project.project_id.clone(),
                 graph_id: GRAPH_ID.into(),
-                provisional: Some("published".into()),
                 source: None,
-                checkout_id: None,
                 expected_content_hash: None,
                 detail: None,
                 cursor: None,
@@ -3363,9 +2640,7 @@ mod graph_vector_lane {
             .bbox_project_graph_describe(Parameters(ProjectGraphDescribeParams {
                 project: project.project_id.clone(),
                 graph_id: GRAPH_ID.into(),
-                provisional: Some("published".into()),
                 source: None,
-                checkout_id: None,
                 expected_content_hash: None,
                 detail: None,
                 cursor: None,

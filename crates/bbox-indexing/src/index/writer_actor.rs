@@ -4888,42 +4888,39 @@ mod tests {
         );
     }
 
+    /// A knowledge document an older daemon wrote under the retired
+    /// provisional visibility.
+    fn write_legacy_provisional_document(index: &TranscriptIndex, entry_id: &str, content: &str) {
+        let fields = index.field_handles();
+        let mut document = tantivy::TantivyDocument::new();
+        document.add_text(fields.doc_type, "knowledge");
+        document.add_text(
+            fields.entity_id,
+            format!("provisional_knowledge:scope:checkout:{entry_id}"),
+        );
+        document.add_text(
+            fields.logical_ref,
+            super::super::knowledge_docs::knowledge_entity_id(entry_id),
+        );
+        document.add_text(fields.knowledge_visibility, "provisional");
+        document.add_text(fields.content, content);
+        let mut writer: tantivy::IndexWriter = index.index_handle().writer(50_000_000).unwrap();
+        writer.add_document(document).unwrap();
+        writer.commit().unwrap();
+        index.reader_reload_for_test();
+    }
+
     #[test]
-    fn logical_replace_removes_every_prior_visibility_variant() {
+    fn a_legacy_provisional_document_is_never_served_and_logical_replace_removes_it() {
         let dir = tempfile::tempdir().unwrap();
         let index = test_index(dir.path());
-        let actor = IndexWriterActor::spawn_for(&index);
-        let logical_ref = super::super::knowledge_docs::knowledge_entity_id("scope0001");
-        let published =
-            KnowledgeIndexDocument::published(test_entry("scope0001", "published obsolete marker"));
-        let mut provisional = published.clone();
-        provisional.entity_id = "provisional_knowledge:scope:checkout:scope0001".into();
-        provisional.entry.content = "provisional obsolete marker".into();
-        provisional.visibility = "provisional".into();
-
-        actor.enqueue(IndexWriteOp::ReplaceKnowledgeLogical {
-            logical_ref: logical_ref.clone(),
-            documents: vec![published, provisional],
-        });
-        actor.flush_blocking().unwrap();
-        assert!(search(&index, "published obsolete").contains("published"));
-        assert!(!search(&index, "provisional obsolete").contains("provisional"));
+        write_legacy_provisional_document(&index, "scope0001", "provisional obsolete marker");
         assert_eq!(visibility_count(&index, "provisional"), 1);
+        assert!(!search(&index, "provisional obsolete").contains("provisional"));
 
-        actor.enqueue(IndexWriteOp::UpsertKnowledge(Box::new(test_entry(
-            "scope0001",
-            "published variant update",
-        ))));
-        actor.flush_blocking().unwrap();
-        assert!(search(&index, "published variant update").contains("published"));
-        assert_eq!(
-            visibility_count(&index, "provisional"),
-            1,
-            "variant-precise upsert must not delete the provisional document"
-        );
-
+        let actor = IndexWriterActor::spawn_for(&index);
         actor.enqueue(IndexWriteOp::ReplaceKnowledgeLogical {
-            logical_ref,
+            logical_ref: super::super::knowledge_docs::knowledge_entity_id("scope0001"),
             documents: vec![KnowledgeIndexDocument::published(test_entry(
                 "scope0001",
                 "replacement current marker",
@@ -4931,36 +4928,22 @@ mod tests {
         });
         actor.flush_blocking().unwrap();
 
-        assert!(!search(&index, "published obsolete").contains("published"));
-        assert!(!search(&index, "provisional obsolete").contains("provisional"));
         assert_eq!(visibility_count(&index, "provisional"), 0);
+        assert_eq!(visibility_count(&index, "published"), 1);
         assert!(search(&index, "replacement current").contains("replacement"));
     }
 
     #[test]
-    fn reindex_passes_preserve_provisional_documents() {
+    fn a_full_reindex_drops_legacy_provisional_documents() {
         let dir = tempfile::tempdir().unwrap();
         let index = test_index(dir.path());
+        write_legacy_provisional_document(&index, "scope0002", "provisional generation");
         let actor = IndexWriterActor::spawn_for(&index);
-        let logical_ref = super::super::knowledge_docs::knowledge_entity_id("scope0002");
-        let published =
-            KnowledgeIndexDocument::published(test_entry("scope0002", "published generation"));
-        let mut provisional = published.clone();
-        provisional.entity_id = "provisional_knowledge:scope:checkout:scope0002".into();
-        provisional.entry.content = "provisional generation".into();
-        provisional.visibility = "provisional".into();
-        actor.enqueue(IndexWriteOp::ReplaceKnowledgeLogical {
-            logical_ref,
-            documents: vec![published, provisional],
-        });
-        actor.flush_blocking().unwrap();
-        assert_eq!(visibility_count(&index, "provisional"), 1);
-
         actor.run_reindex_pass(false, true).unwrap();
         assert_eq!(visibility_count(&index, "provisional"), 1);
 
         actor.run_reindex_pass(true, true).unwrap();
-        assert_eq!(visibility_count(&index, "provisional"), 1);
+        assert_eq!(visibility_count(&index, "provisional"), 0);
     }
 
     fn doc_type_count(index: &TranscriptIndex, doc_type: &str) -> usize {
@@ -5274,7 +5257,7 @@ mod tests {
 
         actor.enqueue(IndexWriteOp::UpsertKnowledge(Box::new(entry)));
         // Graph word lanes have no store the pass walks: they must ride the
-        // rebuild the same way provisional knowledge does.
+        // rebuild.
         actor.replace_project_graph_lane(
             "p_00000000000000000000000000000f71",
             "governance-record",

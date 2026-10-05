@@ -62,65 +62,6 @@ impl InspectableEntityProvider for KnowledgeProvider {
     }
 }
 
-pub struct ProvisionalKnowledgeProvider;
-
-impl InspectableEntityProvider for ProvisionalKnowledgeProvider {
-    fn entity_type(&self) -> EntityType {
-        EntityType::ProvisionalKnowledge
-    }
-
-    fn owns_ref(&self, r: &EntityRef) -> bool {
-        matches!(r, EntityRef::ProvisionalKnowledge { .. })
-    }
-
-    fn get_entity(&self, ctx: &ProviderContext<'_>, r: &EntityRef) -> Result<EntityView> {
-        let EntityRef::ProvisionalKnowledge {
-            scope_hash,
-            checkout_id,
-            entry_id,
-        } = r
-        else {
-            anyhow::bail!("expected provisional knowledge ref");
-        };
-        let ref_string = r.to_string();
-        let kb = ctx
-            .knowledge_view()
-            .ok_or_else(|| anyhow::anyhow!("provisional knowledge requires a visibility view"))?;
-        let entry = kb.entry(&ref_string).ok_or_else(|| {
-            anyhow::anyhow!("provisional knowledge entry {ref_string} is not visible")
-        })?;
-        let mut properties = BTreeMap::new();
-        properties.insert("id".into(), entry_id.clone());
-        properties.insert("scope_hash".into(), scope_hash.clone());
-        properties.insert("checkout_id".into(), checkout_id.clone());
-        properties.insert("logical_ref".into(), format!("knowledge:{entry_id}"));
-        insert_entry_properties(&mut properties, entry);
-        if let Some(metadata) = kb.view_metadata(&ref_string) {
-            if let Some(scope) = &metadata.published_scope {
-                properties.insert("repo_id".into(), scope.repo_id().to_string());
-                properties.insert(
-                    "bbox_root_relpath".into(),
-                    scope.bbox_root_relpath().to_string(),
-                );
-            }
-            if let Some(content_hash) = &metadata.content_hash {
-                properties.insert("content_hash".into(), content_hash.clone());
-            }
-            if let Some(stamp) = &metadata.overlay_snapshot_id {
-                properties.insert("overlay_snapshot_id".into(), stamp.clone());
-            }
-        }
-        Ok(empty_neighborhood_view(r, properties))
-    }
-
-    fn compact_label(&self, ctx: &ProviderContext<'_>, r: &EntityRef) -> Option<String> {
-        let ref_string = r.to_string();
-        ctx.knowledge_view()
-            .and_then(|kb| kb.entry(&ref_string))
-            .map(|entry| truncate_label(&entry.title))
-    }
-}
-
 fn insert_entry_properties(properties: &mut BTreeMap<String, String>, entry: &KnowledgeEntry) {
     properties.insert("title".into(), entry.title.clone());
     properties.insert("content".into(), entry.content.clone());

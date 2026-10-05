@@ -23,9 +23,14 @@ const DEFAULT_LIMIT: usize = 10;
 const MAX_LIMIT: usize = 50;
 const DEFAULT_FETCH: usize = 50;
 const RRF_K: f32 = 60.0;
+/// Prefix shared by the retired provisional knowledge and graph vertex refs.
+/// No current entity type carries it, so a stored vector or document under
+/// it is stale state and never served.
+const RETIRED_PROVISIONAL_REF_PREFIX: &str = "provisional_";
 const VECTOR_WEIGHT: f32 = 0.6;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct HybridSearchParams {
     /// Search query. In the default smart mode adjacent terms broaden recall,
     /// quoted phrases stay exact and `-term` excludes; `mode=fulltext` takes
@@ -112,15 +117,11 @@ pub struct HybridSearchParams {
     /// callers cannot forge identity; `None` means no scoping.
     #[serde(skip)]
     pub resolved_project_id: Option<String>,
-    /// Knowledge visibility policy: published, own, or all.
-    #[serde(default)]
-    pub provisional: Option<String>,
-    /// Read-surface plane filter for graph vertex documents: `published`,
-    /// `provisional`, or `connector`. Repeatable; unset means every plane.
-    /// Composed into the word lane BEFORE ranking, so off-plane graph
-    /// documents never consume rank positions. M9a indexes the published
-    /// plane only; the other plane names parse but match no documents until
-    /// their milestones land.
+    /// Read-surface plane filter for graph vertex documents: `published` or
+    /// `connector`. Repeatable; unset means every plane. Composed into the
+    /// word lane BEFORE ranking, so off-plane graph documents never consume
+    /// rank positions. Only the published plane is indexed; `connector`
+    /// parses but matches no documents.
     #[serde(default)]
     pub graph_source: Option<Vec<String>>,
     /// Restrict graph vertex results to the named graphs within the resolved
@@ -244,8 +245,8 @@ pub struct HybridResult {
     /// the wire.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub graph_id: Option<String>,
-    /// The authority plane this hit was indexed under: `published`,
-    /// `provisional`, or `connector`.
+    /// The authority plane this hit was indexed under: `published` or
+    /// `connector`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub graph_source: Option<String>,
     /// Owning connector identity; present on connector-plane hits only.
@@ -259,9 +260,8 @@ pub struct HybridResult {
     /// detect staleness.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub graph_generation: Option<String>,
-    /// The pasteable `project_graph_vertex` form of the hit. Provisional hits
-    /// carry a compound ref as `entity_id` whose scope segments make a poor
-    /// handle; the logical form resolves through the read plane directly.
+    /// The pasteable `project_graph_vertex` form of the hit, which resolves
+    /// through the read plane directly.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub graph_logical_ref: Option<String>,
     #[serde(skip)]
@@ -800,10 +800,11 @@ fn retain_authorized_knowledge_vectors(list: &mut RankedList, knowledge: &Knowle
     list.hits
         .retain(|hit| match EntityRef::parse(&hit.entity_id) {
             Ok(EntityRef::Knowledge { id }) => knowledge.entry(&id).is_some(),
-            Ok(EntityRef::ProvisionalKnowledge { .. }) => knowledge.entry(&hit.entity_id).is_some(),
+            // A vector left from a retired provisional variant is never
+            // visible, whatever the knowledge view holds.
             Err(_)
                 if hit.entity_id.starts_with("knowledge:")
-                    || hit.entity_id.starts_with("provisional_knowledge:") =>
+                    || hit.entity_id.starts_with(RETIRED_PROVISIONAL_REF_PREFIX) =>
             {
                 false
             }
@@ -849,16 +850,14 @@ fn retain_authorized_graph_vectors(
             ..
         }) = EntityRef::parse(&hit.entity_id)
         else {
-            // Every non-graph ref passes; provisional graph refs and
-            // malformed graph-prefixed ids are dropped by the snapshot check
-            // (and by the no-snapshot arm) below.
+            // Every non-graph ref passes; malformed graph-prefixed ids and
+            // retired provisional vertex refs are dropped by the snapshot
+            // check (and by the no-snapshot arm).
             return match policy {
                 Some(policy) => policy.admits_graph_vector(&hit.entity_id),
                 None => {
                     !hit.entity_id.starts_with("project_graph_vertex:")
-                        && !hit
-                            .entity_id
-                            .starts_with("provisional_project_graph_vertex:")
+                        && !hit.entity_id.starts_with(RETIRED_PROVISIONAL_REF_PREFIX)
                 }
             };
         };
@@ -1013,10 +1012,7 @@ fn keep_under_project_filter(
     match parts.next() {
         Some("project_file" | "project_file_v2") => parts.next() == Some(target_project_id),
         // Graph vertices are project-scoped: segment 1 of the logical ref is
-        // the project id (design 5.1). The provisional ref form carries scope
-        // and checkout segments instead, so it passes here and relies on the
-        // pre-ranking authority clause, which filters on the project_id field
-        // stamped into the document at index time (Q6 ruling).
+        // the project id (design 5.1).
         Some("project_graph_vertex") => parts.next() == Some(target_project_id),
         Some("thread") => thread_matches_project_filter(parts.next(), target_project_id, ctx),
         _ => true,
@@ -1108,7 +1104,7 @@ fn file_dedup_key(entity_id: &str) -> Option<String> {
         // the entity id would pollute the aggregate lane with singleton
         // groups. Keeping the arm visible also documents that the source-path
         // pseudo-path stamped for provenance must never become a dedup key.
-        "project_graph_vertex" | "provisional_project_graph_vertex" => None,
+        "project_graph_vertex" => None,
         _ => None,
     }
 }
@@ -1479,10 +1475,7 @@ fn enrich_fused_features<'a>(
             if let Some(properties) = indexed_properties {
                 loaded_properties.insert(entity_id.to_string(), properties);
             }
-            if (entity_id.starts_with("knowledge:")
-                || entity_id.starts_with("provisional_knowledge:"))
-                && feature.doc_type.is_none()
-            {
+            if entity_id.starts_with("knowledge:") && feature.doc_type.is_none() {
                 feature.doc_type = Some("knowledge".into());
             }
             if feature.doc_type.is_none() {
@@ -1531,13 +1524,9 @@ fn knowledge_entry_for_entity<'a>(
     knowledge: &'a Knowledge,
     entity_id: &str,
 ) -> Option<&'a bbox_knowledge::knowledge::KnowledgeEntry> {
-    if let Some(id) = entity_id.strip_prefix("knowledge:") {
-        knowledge.entry(id)
-    } else if entity_id.starts_with("provisional_knowledge:") {
-        knowledge.entry(entity_id)
-    } else {
-        None
-    }
+    entity_id
+        .strip_prefix("knowledge:")
+        .and_then(|id| knowledge.entry(id))
 }
 
 fn label_for_entity(
@@ -1554,11 +1543,7 @@ fn label_for_entity(
             // as the hit title. Preferring it keeps label resolution off the
             // provider registry for a hit whose identity came from the index,
             // and keeps the label on the generation the hit was ranked from.
-            if matches!(
-                r,
-                EntityRef::ProjectGraphVertex { .. }
-                    | EntityRef::ProvisionalProjectGraphVertex { .. }
-            ) {
+            if matches!(r, EntityRef::ProjectGraphVertex { .. }) {
                 // A vector-only graph hit has no BM25 twin; its stored
                 // document (enriched into `loaded`) still starts with the
                 // label, so fall back to the first line of the preview
@@ -1697,15 +1682,8 @@ mod tests {
 
     #[test]
     fn knowledge_vectors_are_kept_only_for_exactly_visible_entities() {
-        let scope = bbox_corpus_core::identity::PublishedScope::try_new("repo", ".").unwrap();
-        let provisional_ref =
-            bbox_knowledge::overlay::provisional_entity_ref(&scope, "checkout", "changed");
-        let mut provisional = visible_knowledge_entry("changed");
-        provisional.id = provisional_ref.clone();
-        let knowledge = Knowledge::detached_view(
-            vec![visible_knowledge_entry("published"), provisional],
-            BTreeMap::new(),
-        );
+        let knowledge =
+            Knowledge::detached_view(vec![visible_knowledge_entry("published")], BTreeMap::new());
         let hit = |entity_id: &str, rank| RankedHit {
             entity_id: entity_id.into(),
             rank,
@@ -1718,7 +1696,7 @@ mod tests {
             hits: vec![
                 hit("knowledge:published", 1),
                 hit("knowledge:hidden", 2),
-                hit(&provisional_ref, 3),
+                hit("provisional_knowledge:scope:checkout:changed", 3),
                 hit("project_file:p:f:h:1", 4),
             ],
         };
@@ -1730,14 +1708,7 @@ mod tests {
             .iter()
             .map(|hit| hit.entity_id.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(
-            ids,
-            [
-                "knowledge:published",
-                provisional_ref.as_str(),
-                "project_file:p:f:h:1"
-            ]
-        );
+        assert_eq!(ids, ["knowledge:published", "project_file:p:f:h:1"]);
     }
 
     #[test]
@@ -2441,7 +2412,6 @@ pdf_figure = "voyage_visual"
         let store = KnowledgeStore {
             version: 1,
             built_from: Default::default(),
-            provenance: Default::default(),
             entries: vec![KnowledgeEntry {
                 render_placement: Default::default(),
                 id: "vector-only".into(),
@@ -2801,7 +2771,6 @@ mod graph_word_lane_pipeline {
             query_vector: None,
             project: None,
             resolved_project_id: None,
-            provisional: None,
             graph_source: None,
             graph_ids: None,
             rerank_cap: None,
@@ -2935,7 +2904,7 @@ mod graph_word_lane_pipeline {
     }
 
     /// Plane selection and the pinned policy snapshot compose into the same
-    /// pre-ranking conjunct: a provisional-plane request sees no published
+    /// pre-ranking conjunct: a connector-plane request sees no published
     /// documents, and a lane the snapshot disables never enters the ranked
     /// list even though its documents sit in the index.
     #[test]
@@ -2959,12 +2928,12 @@ mod graph_word_lane_pipeline {
             ],
         );
 
-        let mut provisional = params("settlement record");
-        provisional.graph_source = Some(vec!["provisional".to_string()]);
-        let response = search(&index, &provisional, None);
+        let mut connector = params("settlement record");
+        connector.graph_source = Some(vec!["connector".to_string()]);
+        let response = search(&index, &connector, None);
         assert!(
             response.results.is_empty(),
-            "provisional-plane selection must match no published lane: {}",
+            "connector-plane selection must match no published lane: {}",
             response.text
         );
 
@@ -3229,7 +3198,7 @@ mod graph_vector_lane_authority {
             ..Default::default()
         }));
         assert!(!admitted(&GraphWordAuthority {
-            graph_sources: BTreeSet::from(["provisional".to_string()]),
+            graph_sources: BTreeSet::from(["connector".to_string()]),
             ..Default::default()
         }));
         assert!(admitted(&GraphWordAuthority {

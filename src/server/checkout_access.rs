@@ -912,8 +912,11 @@ mod tests {
         );
     }
 
+    /// A covered project whose producer was removed still serves accepted
+    /// content to a session pinned to its checkout, and the read never opens
+    /// the checkout.
     #[test]
-    fn covered_producer_loss_refuses_own_without_local_fallback() {
+    fn covered_producer_loss_serves_published_without_a_checkout_lease() {
         let fixture = CatalogFixture::new();
         let scope = CatalogFixture::scope(".");
         fixture.add_published_project(PROJECT, &scope);
@@ -943,17 +946,12 @@ mod tests {
         server.set_session_checkout_for_test(PROJECT.into(), scope, CHECKOUT_ONE.into(), checkout);
         let before = server.state.checkout_access.health().sequence;
 
-        let error = server
-            .session_knowledge_view(None, Some("own"))
-            .err()
-            .expect("producer loss keeps the strict row closed");
-
-        assert!(format!("{error:#}").contains("pending knowledge transport re-cutover"));
-        let gap_error = server
-            .session_gap_view(None, Some("own"))
-            .err()
-            .expect("gap views share the same no-fallback boundary");
-        assert!(format!("{gap_error:#}").contains("pending knowledge transport re-cutover"));
+        let view = server.session_knowledge_view(None).unwrap();
+        assert!(
+            view.items.iter().any(|item| item.entry.id == "knowledge-a"),
+            "accepted content is served"
+        );
+        server.session_gap_view(None).unwrap();
         assert_eq!(server.state.checkout_access.health().sequence, before);
     }
 

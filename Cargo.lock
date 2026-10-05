@@ -739,29 +739,11 @@ version = "0.0.1"
 dependencies = [
  "bbox-code-source",
  "bbox-corpus-core",
- "bro-core",
  "hex",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "thiserror 2.0.18",
-]
-
-[[package]]
-name = "bbox-knowledge-source-client"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "axum",
- "bbox-corpus-core",
- "bbox-knowledge-source",
- "bro-core",
- "bro-protocol",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
 ]
 
 [[package]]
@@ -771,7 +753,6 @@ dependencies = [
  "anyhow",
  "bbox-corpus-core",
  "bbox-knowledge-source",
- "bro-core",
  "hex",
  "serde",
  "serde_json",
@@ -1190,7 +1171,6 @@ dependencies = [
  "bbox-indexing",
  "bbox-knowledge",
  "bbox-knowledge-source",
- "bbox-knowledge-source-client",
  "bbox-knowledge-source-store",
  "bbox-mcp-tools",
  "bbox-project-graph",
@@ -1308,7 +1288,6 @@ dependencies = [
  "anyhow",
  "axum",
  "bbox-corpus-core",
- "bbox-knowledge-source-client",
  "bbox-util",
  "bro-core",
  "bro-fleet-client",
@@ -1395,7 +1374,6 @@ dependencies = [
  "bbox-corpus-core",
  "bbox-gaps",
  "bbox-knowledge",
- "bbox-knowledge-source-client",
  "bbox-refactor",
  "bbox-util",
  "bro-apply-patch",

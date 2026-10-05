@@ -1,15 +1,22 @@
-//! Authenticated knowledge and gap source intake.
+//! Authenticated knowledge and gap source intake, plus the workspace binding
+//! registry.
 //!
-//! Publication candidates use the existing project-scoped producer grant.
-//! Provisional snapshots use an exact, expiring workspace binding. Both
-//! middleware boundaries run before Axum parses a request body.
+//! Publication candidates use the existing project-scoped producer grant; the
+//! middleware boundary runs before Axum parses a request body.
+//!
+//! A workspace binding is the path-free capability a managed harness worker
+//! presents on its daemon MCP session. It authorizes exactly two things for
+//! that one checkout: the render locality exchange (`bbox_render` with the
+//! bound-workspace selector) and the write-routing refusal that sends project
+//! knowledge and gap writes to the harness's own checkout. It never selects
+//! what a read returns: every read is published-only.
 
 use std::collections::BTreeMap;
 use std::io::SeekFrom;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Result, bail};
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Extension, Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
@@ -19,24 +26,18 @@ use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use bbox_code_source::ErrorResponse;
 use bbox_knowledge_source::{
-    AncestryPageV1, BeginProvisionalUploadRequestV1, BeginPublicationUploadRequestV1,
-    BeginSourceUploadResponseV1, ContractError, FinalizeProvisionalUploadRequestV1,
-    FinalizeSourceUploadResponseV1, KnowledgeSourceLimits, MAX_ANCESTRY_PAGE_BYTES,
-    MAX_MANIFEST_PAGE_BYTES, MAX_SOURCE_FILE_BYTES, MissingSourceBlobsPageV1,
-    ProvisionalCaptureContextV1, ProvisionalProbeRequestV1, ProvisionalProbeResponseV1,
-    ProvisionalWorkspaceStatusV1, PublicationCandidateStatusV1, PublicationProbeRequestV1,
-    PublicationProbeResponseV1, RenewProvisionalGenerationRequestV1, SnapshotClassV1, SourceLaneV1,
-    SourceManifestPageV1,
+    BeginPublicationUploadRequestV1, BeginSourceUploadResponseV1, ContractError,
+    FinalizeSourceUploadResponseV1, KnowledgeSourceLimits, MAX_MANIFEST_PAGE_BYTES,
+    MAX_SOURCE_FILE_BYTES, MissingSourceBlobsPageV1, PublicationCandidateStatusV1,
+    PublicationProbeRequestV1, PublicationProbeResponseV1, SourceLaneV1, SourceManifestPageV1,
 };
 use bbox_knowledge_source_store::{
-    KnowledgeSourceStore, ProvisionalAuthorityV1, ProvisionalSequenceConflict,
-    PublicationAuthorityV1, ReadyProvisionalWorkspace, ReadyPublicationFile, StoreLimits,
-    StoreRequestError,
+    KnowledgeSourceStore, PublicationAuthorityV1, StoreLimits, StoreRequestError,
 };
 use bro_core::WorkspaceId;
 use bro_rpc::ServiceToken;
 use futures::StreamExt;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
@@ -46,23 +47,9 @@ use super::producer_auth::{ProducerGrant, RepoTransportGrantError};
 const UPLOAD_BODY_TEMP_PREFIX: &str = ".knowledge-source-upload-body-";
 const UPLOAD_BODY_TEMP_SUFFIX: &str = ".tmp";
 const WORKSPACE_BINDING_TTL_SECS: u64 = 24 * 60 * 60;
-
-/// Prefix for the synthetic task/session id an operator-minted binding
-/// carries (`bro workspace-binding mint`). The managed spawn path keys
-/// bindings by a real `(task_id, session_id)`; an operator lease has neither,
-/// so it keys by workspace identity under this reserved prefix. The prefix is
-/// also what selects the durable lane: operator bindings outlive the daemon
-/// process (persisted as token hashes, restored at boot), while spawn bindings
-/// stay process-lifetime because their task dies with the daemon anyway.
-pub(crate) const OPERATOR_LEASE_PREFIX: &str = "operator-workspace-binding";
-
-/// On-disk record of the operator-minted bindings under the knowledge-source
-/// store root. Holds token HASHES only: the secret itself is returned once at
-/// mint and never persisted in recoverable form. No expiry is recorded; an
-/// operator binding lives until it is superseded (`replace`) or revoked, and
-/// the boot restore re-arms the in-memory TTL and renewal loop.
-const OPERATOR_BINDINGS_FILENAME: &str = "operator-workspace-bindings.json";
-const OPERATOR_BINDINGS_VERSION: u32 = 1;
+/// How often a live task's binding has its expiry pushed out. Well inside
+/// the TTL so one missed tick never expires a working session.
+const WORKSPACE_BINDING_RENEW_INTERVAL_SECS: u64 = 60 * 60;
 
 fn workspace_binding_token_sha256(secret: &str) -> [u8; 32] {
     use sha2::Digest as _;
@@ -77,22 +64,6 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
         .zip(right)
         .fold(0u8, |acc, (l, r)| acc | (l ^ r))
         == 0
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct PersistedOperatorBindingsV1 {
-    version: u32,
-    bindings: Vec<PersistedOperatorBindingV1>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PersistedOperatorBindingV1 {
-    token_sha256: String,
-    task_id: String,
-    session_id: String,
-    project_id: String,
-    scope: bbox_corpus_core::identity::PublishedScope,
-    workspace_id: WorkspaceId,
 }
 
 #[derive(Clone)]
@@ -112,9 +83,8 @@ impl WorkspaceBindingGrant {
 }
 
 struct WorkspaceBindingEntry {
-    /// SHA-256 of the 64-hex binding secret. Only the hash is held, in memory
-    /// and (for operator bindings) on disk, so nothing daemon-side can
-    /// reconstruct a token.
+    /// SHA-256 of the 64-hex binding secret. Only the hash is held, in
+    /// memory, so nothing daemon-side can reconstruct a token.
     token_sha256: [u8; 32],
     grant: WorkspaceBindingGrant,
 }
@@ -132,9 +102,7 @@ pub(crate) struct KnowledgeSourceRuntime {
     store: Arc<KnowledgeSourceStore>,
     workspace_bindings: parking_lot::RwLock<Vec<WorkspaceBindingEntry>>,
     /// Renewal cancellation handles keyed by the task id that owns the
-    /// binding. This lives on the runtime that owns the bindings themselves
-    /// so every minting path (managed worker spawn and the operator mint
-    /// route) shares one registry instead of one per authority instance.
+    /// binding, beside the bindings themselves.
     workspace_binding_renewals: parking_lot::Mutex<BTreeMap<String, CancellationToken>>,
     /// Bounded record of what candidate acceptance last did per project.
     /// It lives beside the publication candidates it reacts to, so no new
@@ -182,8 +150,9 @@ impl bbox_indexing::checkout_access::CheckoutAccessPolicy for KnowledgeTransport
 
 impl KnowledgeSourceRuntime {
     pub(crate) fn open(config: &crate::config::Config) -> Result<Self> {
+        let root = config.paths.state_dir.join("knowledge-sources");
         let store = Arc::new(KnowledgeSourceStore::open(
-            config.paths.state_dir.join("knowledge-sources"),
+            root,
             checked_store_limits(config)?,
         )?);
         reap_upload_body_tempfiles(store.root())?;
@@ -240,15 +209,6 @@ impl KnowledgeSourceRuntime {
         matched
     }
 
-    /// Whether a live binding is currently installed under `task_id`. The
-    /// operator mint uses this to refuse a silent supersession.
-    pub(crate) fn has_live_workspace_binding_for_task(&self, task_id: &str, now: u64) -> bool {
-        self.workspace_bindings
-            .read()
-            .iter()
-            .any(|entry| entry.grant.task_id == task_id && entry.grant.expires_unix_secs > now)
-    }
-
     pub(crate) fn authenticate_workspace_binding_now(
         &self,
         candidate: &str,
@@ -273,98 +233,6 @@ impl KnowledgeSourceRuntime {
             token_sha256,
             grant,
         });
-    }
-
-    fn operator_bindings_path(&self) -> std::path::PathBuf {
-        self.store.root().join(OPERATOR_BINDINGS_FILENAME)
-    }
-
-    /// Read the persisted operator bindings. A missing file is an empty set; a
-    /// corrupt or foreign-version file is an error the caller logs and treats
-    /// as empty rather than a boot failure (the operator re-mints).
-    fn load_persisted_operator_bindings(&self) -> Result<Vec<PersistedOperatorBindingV1>> {
-        let path = self.operator_bindings_path();
-        let bytes = match std::fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(error) => {
-                return Err(
-                    anyhow::Error::new(error).context(format!("reading {}", path.display()))
-                );
-            }
-        };
-        let file: PersistedOperatorBindingsV1 = serde_json::from_slice(&bytes)
-            .with_context(|| format!("decoding {}", path.display()))?;
-        if file.version != OPERATOR_BINDINGS_VERSION {
-            bail!(
-                "{} is version {}, this daemon reads version {}",
-                path.display(),
-                file.version,
-                OPERATOR_BINDINGS_VERSION
-            );
-        }
-        Ok(file.bindings)
-    }
-
-    /// Rewrite the persisted operator bindings from a modified list. Owner-only
-    /// permissions, written to a sibling temp file and renamed into place.
-    fn write_persisted_operator_bindings(
-        &self,
-        bindings: Vec<PersistedOperatorBindingV1>,
-    ) -> Result<()> {
-        let path = self.operator_bindings_path();
-        let file = PersistedOperatorBindingsV1 {
-            version: OPERATOR_BINDINGS_VERSION,
-            bindings,
-        };
-        let bytes = serde_json::to_vec_pretty(&file)?;
-        let temp = path.with_extension("json.tmp");
-        {
-            let mut options = std::fs::OpenOptions::new();
-            options.write(true).create(true).truncate(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt as _;
-                options.mode(0o600);
-            }
-            let mut handle = options
-                .open(&temp)
-                .with_context(|| format!("creating {}", temp.display()))?;
-            use std::io::Write as _;
-            handle.write_all(&bytes)?;
-            handle.sync_all()?;
-        }
-        std::fs::rename(&temp, &path).with_context(|| format!("installing {}", path.display()))?;
-        Ok(())
-    }
-
-    /// Record (or replace, keyed by task id) one operator binding on disk.
-    fn persist_operator_binding(
-        &self,
-        token_sha256: [u8; 32],
-        grant: &WorkspaceBindingGrant,
-    ) -> Result<()> {
-        let mut bindings = self.load_persisted_operator_bindings().unwrap_or_default();
-        bindings.retain(|entry| entry.task_id != grant.task_id);
-        bindings.push(PersistedOperatorBindingV1 {
-            token_sha256: hex::encode(token_sha256),
-            task_id: grant.task_id.clone(),
-            session_id: grant.session_id.clone(),
-            project_id: grant.project_id.clone(),
-            scope: grant.scope.clone(),
-            workspace_id: grant.workspace_id.clone(),
-        });
-        self.write_persisted_operator_bindings(bindings)
-    }
-
-    fn forget_persisted_operator_binding(&self, task_id: &str) -> Result<()> {
-        let mut bindings = self.load_persisted_operator_bindings()?;
-        let before = bindings.len();
-        bindings.retain(|entry| entry.task_id != task_id);
-        if bindings.len() == before {
-            return Ok(());
-        }
-        self.write_persisted_operator_bindings(bindings)
     }
 
     #[cfg(test)]
@@ -392,11 +260,6 @@ impl KnowledgeSourceRuntime {
                 true
             }
         });
-        if task_id.starts_with(OPERATOR_LEASE_PREFIX)
-            && let Err(error) = self.forget_persisted_operator_binding(task_id)
-        {
-            tracing::warn!(task_id, error = %error, "failed to drop persisted operator binding");
-        }
         revoked
     }
 
@@ -413,23 +276,10 @@ impl KnowledgeSourceRuntime {
             now,
         );
     }
-
-    #[cfg(test)]
-    pub(crate) fn install_workspace_binding_for_test(
-        &self,
-        token: ServiceToken,
-        grant: WorkspaceBindingGrant,
-    ) {
-        self.install_workspace_binding(token, grant, 0);
-    }
 }
 
 /// Production adapter joining managed-checkout authority to the path-free
 /// session capability retained by fleetd. It never persists or logs a token.
-///
-/// The grant/mint/install mechanics themselves are free functions below so the
-/// operator mint route (`super::workspace_binding_mint`) issues byte-identical
-/// bindings through exactly this code rather than a forked token model.
 pub(crate) struct DaemonWorkspaceBindingAuthority {
     state: Arc<SharedState>,
 }
@@ -558,61 +408,11 @@ pub(crate) fn install_workspace_binding(
     )
 }
 
-/// Restore the operator bindings persisted under the knowledge-source store
-/// root: re-arm each one's TTL and renewal loop as if freshly minted. Runs at
-/// boot so a checkout's `bro workspace-binding` capability survives daemon
-/// restarts and deploys instead of dying with the process. Failures are
-/// logged, not fatal: the remedy is a re-mint, never a daemon that will not
-/// start.
-pub(crate) fn restore_operator_workspace_bindings(state: &Arc<SharedState>) {
-    let persisted = match state.knowledge_sources.load_persisted_operator_bindings() {
-        Ok(persisted) => persisted,
-        Err(error) => {
-            tracing::warn!(error = %error, "operator workspace bindings not restored");
-            return;
-        }
-    };
-    let mut restored = 0usize;
-    for record in persisted {
-        let Some(token_sha256) = hex::decode(&record.token_sha256)
-            .ok()
-            .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
-        else {
-            tracing::warn!(task_id = %record.task_id, "persisted operator binding has a malformed token hash; skipped");
-            continue;
-        };
-        let grant = WorkspaceBindingGrant {
-            task_id: record.task_id,
-            session_id: record.session_id,
-            project_id: record.project_id,
-            scope: record.scope,
-            workspace_id: record.workspace_id,
-            expires_unix_secs: now_unix_secs().saturating_add(WORKSPACE_BINDING_TTL_SECS),
-        };
-        match install_workspace_binding_hashed(state, grant.clone(), token_sha256) {
-            Ok(()) => restored += 1,
-            Err(error) => tracing::warn!(
-                task_id = %grant.task_id,
-                workspace_id = %grant.workspace_id,
-                error = %error,
-                "persisted operator binding not restored"
-            ),
-        }
-    }
-    if restored > 0 {
-        tracing::info!(restored, "restored operator workspace bindings");
-    }
-}
-
 fn install_workspace_binding_hashed(
     state: &Arc<SharedState>,
     grant: WorkspaceBindingGrant,
     token_sha256: [u8; 32],
 ) -> Result<()> {
-    let interval_secs = state
-        .knowledge_sources
-        .store()
-        .provisional_renew_interval_secs()?;
     let runtime = tokio::runtime::Handle::try_current()
         .map_err(|_| anyhow::anyhow!("workspace binding requires an async runtime"))?;
     state.knowledge_sources.install_workspace_binding_hashed(
@@ -620,12 +420,6 @@ fn install_workspace_binding_hashed(
         grant.clone(),
         now_unix_secs(),
     );
-    if grant.task_id.starts_with(OPERATOR_LEASE_PREFIX) {
-        state
-            .knowledge_sources
-            .persist_operator_binding(token_sha256, &grant)
-            .context("persisting operator workspace binding")?;
-    }
     let cancellation = CancellationToken::new();
     if let Some(prior) = state
         .knowledge_sources
@@ -640,41 +434,12 @@ fn install_workspace_binding_hashed(
         loop {
             tokio::select! {
                 _ = cancellation.cancelled() => break,
-                _ = tokio::time::sleep(Duration::from_secs(interval_secs)) => {
+                _ = tokio::time::sleep(Duration::from_secs(WORKSPACE_BINDING_RENEW_INTERVAL_SECS)) => {
                     state.knowledge_sources.extend_workspace_binding(
                         &grant.task_id,
                         &grant.session_id,
                         now_unix_secs(),
                     );
-                    let renewal_state = state.clone();
-                    let renewal_grant = grant.clone();
-                    match tokio::task::spawn_blocking(move || {
-                        renew_selected_provisional_if_current(
-                            &renewal_state,
-                            &renewal_grant,
-                        )
-                    })
-                    .await
-                    {
-                        Ok(Ok(ProvisionalRenewal::RetiredStale)) => tracing::info!(
-                            task_id = %grant.task_id,
-                            workspace_id = %grant.workspace_id,
-                            "retired provisional workspace after accepted publication advanced"
-                        ),
-                        Ok(Ok(ProvisionalRenewal::Absent | ProvisionalRenewal::Renewed)) => {}
-                        Ok(Err(error)) => tracing::warn!(
-                            task_id = %grant.task_id,
-                            workspace_id = %grant.workspace_id,
-                            error = %error,
-                            "failed to reconcile live provisional workspace renewal"
-                        ),
-                        Err(error) => tracing::warn!(
-                            task_id = %grant.task_id,
-                            workspace_id = %grant.workspace_id,
-                            error = %error,
-                            "provisional workspace renewal task failed"
-                        ),
-                    }
                 }
             }
         }
@@ -726,41 +491,10 @@ impl crate::orchestration::WorkspaceBindingAuthority for DaemonWorkspaceBindingA
         {
             cancellation.cancel();
         }
-        for grant in self
-            .state
+        self.state
             .knowledge_sources
-            .revoke_workspace_bindings(task_id)
-        {
-            let authority = provisional_authority(&grant);
-            let store = self.state.knowledge_sources.store();
-            match store.selected_provisional(&authority, now_unix_secs()) {
-                Ok(Some(source)) => {
-                    if let Err(error) =
-                        store.retire_provisional(&authority, &source.source_generation_id)
-                    {
-                        tracing::warn!(
-                            task_id,
-                            workspace_id = %grant.workspace_id,
-                            error = %error,
-                            "failed to retire terminal provisional workspace"
-                        );
-                    }
-                }
-                Ok(None) => {}
-                Err(error) => tracing::warn!(
-                    task_id,
-                    workspace_id = %grant.workspace_id,
-                    error = %error,
-                    "failed to inspect terminal provisional workspace"
-                ),
-            }
-        }
+            .revoke_workspace_bindings(task_id);
     }
-}
-
-pub(crate) struct RemoteProvisionalOverlayPair {
-    pub(crate) knowledge: bbox_knowledge::overlay::OverlaySnapshot,
-    pub(crate) gaps: bbox_gaps::overlay::GapOverlaySnapshot,
 }
 
 impl super::BlackboxServer {
@@ -782,319 +516,6 @@ impl super::BlackboxServer {
             );
         }
     }
-
-    pub(crate) fn observe_knowledge_transport_shadow(
-        &self,
-        project_id: &str,
-        operation: bbox_indexing::knowledge_transport_observations::KnowledgeTransportOperationV1,
-        workspace_id: Option<&str>,
-        reference_snapshot_id: &str,
-        transport_snapshot_id: &str,
-    ) {
-        if let Err(error) = self.state.knowledge_transport_observations.record_shadow(
-            project_id,
-            operation,
-            workspace_id,
-            reference_snapshot_id,
-            transport_snapshot_id,
-        ) {
-            tracing::warn!(
-                project_id,
-                error = %error,
-                "knowledge transport shadow observation could not be persisted"
-            );
-        }
-    }
-
-    /// Materialize the exact selected remote generation and converge both
-    /// knowledge and gap lanes through the same source-neutral overlay cores
-    /// used by local checkouts. The accepted generation must still be the one
-    /// the workspace captured against.
-    pub(crate) fn remote_provisional_overlays(
-        &self,
-        grant: &WorkspaceBindingGrant,
-        verified: &bbox_indexing::accepted_publication_runtime::VerifiedAcceptedPublication,
-    ) -> Result<Option<RemoteProvisionalOverlayPair>> {
-        if verified.content_stamp().project_id().as_str() != grant.project_id
-            || verified.content_stamp().accepted_scope() != &grant.scope
-        {
-            bail!("workspace binding does not match accepted project content");
-        }
-        self.remote_provisional_overlays_for_workspace(
-            &grant.project_id,
-            &grant.scope,
-            &grant.workspace_id,
-            verified,
-        )
-    }
-
-    pub(crate) fn remote_provisional_overlays_for_workspace(
-        &self,
-        project_id: &str,
-        scope: &bbox_corpus_core::identity::PublishedScope,
-        workspace_id: &WorkspaceId,
-        verified: &bbox_indexing::accepted_publication_runtime::VerifiedAcceptedPublication,
-    ) -> Result<Option<RemoteProvisionalOverlayPair>> {
-        let authority = ProvisionalAuthorityV1 {
-            project_id: project_id.to_string(),
-            scope: scope.clone(),
-            workspace_id: workspace_id.clone(),
-        };
-        let Some(source) = self
-            .state
-            .knowledge_sources
-            .store()
-            .materialize_selected_provisional(&authority, now_unix_secs())?
-        else {
-            return Ok(None);
-        };
-        if source.project_id != project_id
-            || source.descriptor.scope != *scope
-            || source.descriptor.workspace_id != *workspace_id
-        {
-            bail!("selected workspace generation does not match its binding authority");
-        }
-        self.remote_provisional_overlays_from_source(source, verified)
-            .map(Some)
-    }
-
-    pub(crate) fn remote_provisional_overlays_from_source(
-        &self,
-        source: ReadyProvisionalWorkspace,
-        verified: &bbox_indexing::accepted_publication_runtime::VerifiedAcceptedPublication,
-    ) -> Result<RemoteProvisionalOverlayPair> {
-        let accepted = verified.content_stamp();
-        if source.project_id != accepted.project_id().as_str()
-            || source.descriptor.scope != *accepted.accepted_scope()
-            || source.descriptor.accepted_generation != accepted.generation_id()
-            || source.descriptor.accepted_commit != accepted.accepted_commit()
-        {
-            bail!(
-                "error.provisional_snapshot_stale: selected workspace generation does not match accepted content"
-            );
-        }
-        let scope = &source.descriptor.scope;
-        let workspace_id = source.descriptor.workspace_id.as_str();
-
-        let baseline_knowledge = bbox_knowledge::overlay::BaselineKnowledgeSnapshot::new(
-            provisional_file_map(&source.baseline_knowledge, "knowledge")?,
-        )?;
-        let working_knowledge = bbox_knowledge::overlay::WorkingKnowledgeSnapshot::new(
-            provisional_file_map(&source.working_knowledge, "knowledge")?,
-        )?;
-        let knowledge_digests = super::knowledge_view::accepted_knowledge_digests(verified);
-        let knowledge = bbox_knowledge::overlay::recompute_catalog_overlay_from_sources(
-            bbox_knowledge::overlay::CatalogOverlayPublished {
-                published_scope: scope,
-                checkout_id: workspace_id,
-                full_ref: accepted.full_ref(),
-                accepted_commit: accepted.accepted_commit(),
-                accepted_generation: accepted.generation_id(),
-                published: &knowledge_digests,
-            },
-            &source.descriptor.checkout_head,
-            &source.descriptor.merge_base,
-            &baseline_knowledge,
-            &working_knowledge,
-        )
-        .map_err(|error| anyhow::anyhow!("{error:#}"))?;
-
-        let baseline_gaps = bbox_gaps::overlay::BaselineGapSnapshot::new(provisional_file_map(
-            &source.baseline_gaps,
-            "gap",
-        )?)?;
-        let working_gaps = bbox_gaps::overlay::WorkingGapSnapshot::new(provisional_file_map(
-            &source.working_gaps,
-            "gap",
-        )?)?;
-        let gap_digests = super::gap_view::accepted_gap_digests(verified);
-        let gaps = bbox_gaps::overlay::recompute_catalog_overlay_from_sources(
-            bbox_gaps::overlay::CatalogGapOverlayPublished {
-                published_scope: scope,
-                checkout_id: workspace_id,
-                full_ref: accepted.full_ref(),
-                accepted_commit: accepted.accepted_commit(),
-                accepted_generation: accepted.generation_id(),
-                published: &gap_digests,
-            },
-            &source.descriptor.checkout_head,
-            &source.descriptor.merge_base,
-            &baseline_gaps,
-            &working_gaps,
-        )
-        .map_err(|error| anyhow::anyhow!("{error:#}"))?;
-        let graphs =
-            bbox_indexing::project_graph_view::build_provisional_graph_overlay(&source, verified)?;
-        let published = bbox_indexing::project_graph_view::build_published_graph_view(verified)?;
-        // `verified` is the caller's snapshot, and this path is exactly where
-        // it goes stale: the overlay recomputation above reads the checkout
-        // and materializes a generation, which takes long enough for an
-        // acceptance to land in the middle of it. It is NOT re-read from the
-        // pointer here, because the knowledge and gap halves of this pair are
-        // computed against that same snapshot and the provisional source was
-        // validated against it; swapping snapshots for the graph half alone
-        // would publish a pair whose members disagree about the baseline.
-        // Instead the published half passes the install gate, which refuses a
-        // view the pointer no longer names. The overlay half is unaffected:
-        // it is keyed by workspace and positioned against the snapshot it was
-        // built from.
-        let publish_admitted = super::knowledge_view::published_graph_view_install_admitted(
-            &self.state,
-            &published,
-            super::knowledge_view::PublishedGraphViewInstaller::RemoteProvisionalOverlay,
-        );
-        // One write guard for both halves of the install: converging the word
-        // lanes first, then swapping published and provisional together, so no
-        // reader can see the new published view beside the old or missing
-        // provisional overlay.
-        if publish_admitted {
-            super::knowledge_view::converge_published_graph_word_lanes(&self.state, &published);
-        }
-        {
-            let mut views = self.state.project_graph_views.write();
-            if publish_admitted {
-                views.install_published(published);
-            }
-            views.install_provisional(graphs);
-        }
-
-        Ok(RemoteProvisionalOverlayPair { knowledge, gaps })
-    }
-}
-
-/// Install one workspace's provisional project-graph views for the generation
-/// it just finalized.
-///
-/// The mirror of `refresh_published_graph_views` on the accept path. The graph
-/// read surface has no lazy rebuild-on-read: reads serve whatever was last
-/// installed, so whoever commits a generation has to install it. Without this
-/// a cold own-visibility graph read answers from the published lane, and a
-/// read after a second capture answers from the previous provisional
-/// generation, until some knowledge or gap own read happens to recompute the
-/// overlay pair and install the graphs alongside it.
-///
-/// Failure degrades rather than propagates, matching the accept path: the
-/// generation is already durable and selected, and the next capture or overlay
-/// recomputation reconciles the view.
-fn refresh_provisional_graph_views(state: &SharedState, authority: &ProvisionalAuthorityV1) {
-    let Some(runtime) = &state.accepted_publications else {
-        return;
-    };
-    let project_id =
-        match bbox_corpus_core::project_catalog::ProjectId::parse(authority.project_id.clone()) {
-            Ok(project_id) => project_id,
-            Err(error) => {
-                tracing::warn!(
-                    project_id = %authority.project_id,
-                    error = %error,
-                    "provisional graph view refresh skipped: unparseable project id"
-                );
-                return;
-            }
-        };
-    let verified = match runtime.load_verified(&project_id) {
-        Ok(verified) => verified,
-        Err(error) => {
-            tracing::warn!(
-                project_id = %project_id,
-                workspace_id = %authority.workspace_id,
-                code = error.code(),
-                "provisional graph view refresh skipped: no verified accepted content"
-            );
-            return;
-        }
-    };
-    let source = match state
-        .knowledge_sources
-        .store()
-        .materialize_selected_provisional(authority, now_unix_secs())
-    {
-        Ok(Some(source)) => source,
-        Ok(None) => return,
-        Err(error) => {
-            tracing::warn!(
-                project_id = %project_id,
-                workspace_id = %authority.workspace_id,
-                error = %error,
-                "provisional graph view refresh failed to materialize the selected generation"
-            );
-            return;
-        }
-    };
-    let built =
-        bbox_indexing::project_graph_view::build_provisional_graph_overlay(&source, &verified);
-    let overlay = match built {
-        Ok(overlay) => overlay,
-        Err(error) => {
-            tracing::warn!(
-                project_id = %project_id,
-                workspace_id = %authority.workspace_id,
-                error = %error,
-                "provisional graph view refresh failed; own graph reads may serve stale \
-                 content until the next capture"
-            );
-            return;
-        }
-    };
-    // Own visibility is the published view overlaid by this workspace, so a
-    // daemon that never installed the published side (a restart after the
-    // accept) would answer own reads from the overlay alone. Build it only
-    // when it is missing: it is unchanged by a capture, and rebuilding it on
-    // every capture would pay for the whole accepted graph tree per mutation.
-    let published_missing = state
-        .project_graph_views
-        .read()
-        .published_view(&project_id)
-        .is_none();
-    let published = published_missing
-        .then(|| bbox_indexing::project_graph_view::build_published_graph_view(&verified))
-        .transpose()
-        .unwrap_or_else(|error| {
-            tracing::warn!(
-                project_id = %project_id,
-                error = %error,
-                "published graph view rebuild failed during a provisional refresh"
-            );
-            None
-        });
-    // Same one-guard contract as the remote overlay path: the word lanes
-    // converge first, then the published and provisional views swap together
-    // under a single write acquisition. The published half still passes the
-    // install gate: "no view was installed when this capture started" is not
-    // proof that none is installed now.
-    let published = published.filter(|published| {
-        super::knowledge_view::published_graph_view_install_admitted(
-            state,
-            published,
-            super::knowledge_view::PublishedGraphViewInstaller::ProvisionalCapture,
-        )
-    });
-    if let Some(published) = published {
-        super::knowledge_view::converge_published_graph_word_lanes(state, &published);
-        let mut views = state.project_graph_views.write();
-        views.install_published(published);
-        views.install_provisional(overlay);
-    } else {
-        state
-            .project_graph_views
-            .write()
-            .install_provisional(overlay);
-    }
-}
-
-fn provisional_file_map(
-    files: &[ReadyPublicationFile],
-    lane: &str,
-) -> Result<BTreeMap<String, Vec<u8>>> {
-    let mut mapped = BTreeMap::new();
-    for file in files {
-        let filename = super::knowledge_view::basename(&file.manifest.repository_relative_filename)
-            .ok_or_else(|| anyhow::anyhow!("provisional {lane} filename has no basename"))?;
-        if mapped.insert(filename, file.source_bytes.clone()).is_some() {
-            bail!("provisional {lane} snapshot contains duplicate basenames");
-        }
-    }
-    Ok(mapped)
 }
 
 fn store_limits(config: &crate::config::Config) -> StoreLimits {
@@ -1115,8 +536,6 @@ fn checked_store_limits(config: &crate::config::Config) -> Result<StoreLimits> {
     if limits.max_open_uploads_per_authority == 0
         || limits.retained_publication_generations == 0
         || limits.upload_idle_ttl_secs == 0
-        || limits.max_provisional_lease_secs == 0
-        || limits.retained_provisional_generations == 0
     {
         bail!("knowledge-source limits must be nonzero");
     }
@@ -1124,14 +543,11 @@ fn checked_store_limits(config: &crate::config::Config) -> Result<StoreLimits> {
 }
 
 pub(crate) fn router(state: Arc<SharedState>) -> Router<Arc<SharedState>> {
-    publication_router(state.clone())
-        .merge(provisional_router(state))
-        .layer(axum::middleware::from_fn(stamp_daemon_build_id))
+    publication_router(state).layer(axum::middleware::from_fn(stamp_daemon_build_id))
 }
 
 /// Stamp every knowledge-source response, success or refusal, with this
-/// daemon's build identity. Clients (`bro workspace-binding`, the collectors)
-/// compare it against their own build id so a decode failure or a stuck
+/// daemon's build identity. Clients (the collectors) compare it against their own build id so a decode failure or a stuck
 /// capture can be named as build skew instead of guessed at. Same source as
 /// the roster's `daemon_build_id`.
 async fn stamp_daemon_build_id(request: Request, next: Next) -> Response {
@@ -1180,179 +596,6 @@ fn publication_router(state: Arc<SharedState>) -> Router<Arc<SharedState>> {
             state,
             super::producer_auth::authenticate_knowledge_source_request,
         ))
-}
-
-fn provisional_router(state: Arc<SharedState>) -> Router<Arc<SharedState>> {
-    Router::new()
-        .route(
-            "/internal/knowledge-source/v1/provisional/context",
-            get(provisional_capture_context),
-        )
-        .route(
-            "/internal/knowledge-source/v1/provisional/probe",
-            post(probe_provisional).layer(DefaultBodyLimit::max(64 * 1024)),
-        )
-        .route(
-            "/internal/knowledge-source/v1/provisional/uploads",
-            post(begin_provisional_upload).layer(DefaultBodyLimit::max(64 * 1024)),
-        )
-        .route(
-            "/internal/knowledge-source/v1/provisional/uploads/{upload_id}/ancestry/{page}",
-            post(put_provisional_ancestry_page)
-                .layer(DefaultBodyLimit::max(MAX_ANCESTRY_PAGE_BYTES as usize)),
-        )
-        .route(
-            "/internal/knowledge-source/v1/provisional/uploads/{upload_id}/manifest/{class}/{lane}/{page}",
-            post(put_provisional_manifest_page)
-                .layer(DefaultBodyLimit::max(MAX_MANIFEST_PAGE_BYTES as usize)),
-        )
-        .route(
-            "/internal/knowledge-source/v1/provisional/uploads/{upload_id}/missing",
-            get(missing_provisional_blobs),
-        )
-        .route(
-            "/internal/knowledge-source/v1/provisional/uploads/{upload_id}/blobs/{hash}",
-            put(put_provisional_blob)
-                .layer(DefaultBodyLimit::max(MAX_SOURCE_FILE_BYTES as usize)),
-        )
-        .route(
-            "/internal/knowledge-source/v1/provisional/uploads/{upload_id}/finalize",
-            post(finalize_provisional_upload).layer(DefaultBodyLimit::max(16 * 1024)),
-        )
-        .route(
-            "/internal/knowledge-source/v1/provisional/uploads/{upload_id}/abort",
-            post(abort_provisional_upload).layer(DefaultBodyLimit::max(1)),
-        )
-        .route(
-            "/internal/knowledge-source/v1/provisional/generations/{generation}/renew",
-            post(renew_provisional_generation).layer(DefaultBodyLimit::max(16 * 1024)),
-        )
-        .route(
-            "/internal/knowledge-source/v1/provisional/generations/{generation}/retire",
-            post(retire_provisional_generation).layer(DefaultBodyLimit::max(1)),
-        )
-        .route(
-            "/internal/knowledge-source/v1/provisional/generations/{generation}/status",
-            get(provisional_generation_status),
-        )
-        .route_layer(axum::middleware::from_fn_with_state(
-            state,
-            authenticate_workspace_source_request,
-        ))
-}
-
-async fn provisional_capture_context(
-    State(state): State<Arc<SharedState>>,
-    Extension(grant): Extension<WorkspaceBindingGrant>,
-) -> Result<Json<ProvisionalCaptureContextV1>, HttpError> {
-    // Off the worker: this reads through the accepted-publication on-disk
-    // lock. See `blocking_http`.
-    Ok(Json(
-        blocking_http(move || current_provisional_capture_context(&state, &grant)).await?,
-    ))
-}
-
-fn current_provisional_capture_context(
-    state: &SharedState,
-    grant: &WorkspaceBindingGrant,
-) -> Result<ProvisionalCaptureContextV1, HttpError> {
-    let runtime = state.accepted_publications.as_ref().ok_or_else(|| {
-        HttpError::new(
-            StatusCode::CONFLICT,
-            "knowledge_source_accepted_generation_stale",
-            "accepted publication is unavailable",
-        )
-    })?;
-    let project_id = bbox_corpus_core::project_catalog::ProjectId::parse(grant.project_id.clone())
-        .map_err(|_| {
-            HttpError::new(
-                StatusCode::CONFLICT,
-                "knowledge_source_scope_forbidden",
-                "workspace project authority is unavailable",
-            )
-        })?;
-    let verified = runtime.load_verified(&project_id).map_err(|_| {
-        HttpError::new(
-            StatusCode::CONFLICT,
-            "knowledge_source_accepted_generation_stale",
-            "accepted publication is unavailable",
-        )
-    })?;
-    let stamp = verified.content_stamp();
-    if stamp.accepted_scope() != &grant.scope {
-        return Err(HttpError::new(
-            StatusCode::CONFLICT,
-            "knowledge_source_accepted_generation_stale",
-            "workspace scope no longer matches accepted publication",
-        ));
-    }
-    let context = ProvisionalCaptureContextV1 {
-        scope: grant.scope.clone(),
-        accepted_generation: stamp.generation_id().to_string(),
-        accepted_commit: stamp.accepted_commit().to_string(),
-        lease_ttl_secs: state
-            .knowledge_sources
-            .store()
-            .max_provisional_lease_secs()
-            .map_err(HttpError::from_store)?,
-    };
-    context
-        .validate()
-        .map_err(|error| HttpError::from_contract(&error))?;
-    Ok(context)
-}
-
-fn require_current_provisional_descriptor(
-    state: &SharedState,
-    grant: &WorkspaceBindingGrant,
-    descriptor: &bbox_knowledge_source::ProvisionalWorkspaceDescriptorV1,
-) -> Result<(), HttpError> {
-    let current = current_provisional_capture_context(state, grant)?;
-    if !provisional_descriptor_matches_current(descriptor, grant, &current) {
-        return Err(HttpError::new(
-            StatusCode::CONFLICT,
-            "knowledge_source_accepted_generation_stale",
-            "provisional capture does not match the current accepted publication",
-        ));
-    }
-    Ok(())
-}
-
-fn provisional_descriptor_matches_current(
-    descriptor: &bbox_knowledge_source::ProvisionalWorkspaceDescriptorV1,
-    grant: &WorkspaceBindingGrant,
-    current: &ProvisionalCaptureContextV1,
-) -> bool {
-    descriptor.scope == current.scope
-        && descriptor.workspace_id == grant.workspace_id
-        && descriptor.accepted_generation == current.accepted_generation
-        && descriptor.accepted_commit == current.accepted_commit
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProvisionalRenewal {
-    Absent,
-    Renewed,
-    RetiredStale,
-}
-
-fn renew_selected_provisional_if_current(
-    state: &SharedState,
-    grant: &WorkspaceBindingGrant,
-) -> Result<ProvisionalRenewal> {
-    let current = current_provisional_capture_context(state, grant)
-        .map_err(|error| anyhow::anyhow!("{}: {}", error.body.code, error.body.message))?;
-    let authority = provisional_authority(grant);
-    let store = state.knowledge_sources.store();
-    let Some(selected) = store.selected_provisional(&authority, now_unix_secs())? else {
-        return Ok(ProvisionalRenewal::Absent);
-    };
-    if !provisional_descriptor_matches_current(&selected.descriptor, grant, &current) {
-        store.retire_provisional(&authority, &selected.source_generation_id)?;
-        return Ok(ProvisionalRenewal::RetiredStale);
-    }
-    store.renew_selected_provisional(&authority)?;
-    Ok(ProvisionalRenewal::Renewed)
 }
 
 async fn probe_publication(
@@ -1504,291 +747,6 @@ async fn publication_generation_status(
     ))
 }
 
-async fn probe_provisional(
-    State(state): State<Arc<SharedState>>,
-    Extension(grant): Extension<WorkspaceBindingGrant>,
-    Json(request): Json<ProvisionalProbeRequestV1>,
-) -> Result<Json<ProvisionalProbeResponseV1>, HttpError> {
-    request
-        .validate()
-        .map_err(|error| HttpError::from_contract(&error))?;
-    let authority = provisional_authority(&grant);
-    if request.scope != authority.scope || request.workspace_id != authority.workspace_id {
-        return Err(HttpError::forbidden_scope());
-    }
-    let store = state.knowledge_sources.store();
-    let probe = blocking(move || store.probe_provisional(&authority, now_unix_secs())).await?;
-    Ok(Json(ProvisionalProbeResponseV1 {
-        current: probe.current,
-        next_sequence: probe.next_sequence,
-    }))
-}
-
-async fn begin_provisional_upload(
-    State(state): State<Arc<SharedState>>,
-    Extension(grant): Extension<WorkspaceBindingGrant>,
-    Json(request): Json<BeginProvisionalUploadRequestV1>,
-) -> Result<(StatusCode, Json<BeginSourceUploadResponseV1>), HttpError> {
-    {
-        // Off the worker: accepted-publication on-disk lock. See
-        // `blocking_http`.
-        let state = state.clone();
-        let grant = grant.clone();
-        let descriptor = request.descriptor.clone();
-        blocking_http(move || require_current_provisional_descriptor(&state, &grant, &descriptor))
-            .await?;
-    }
-    let authority = provisional_authority(&grant);
-    let store = state.knowledge_sources.store();
-    let response =
-        blocking(move || store.begin_provisional_upload(&authority, request.descriptor)).await?;
-    Ok((StatusCode::CREATED, Json(response)))
-}
-
-async fn put_provisional_ancestry_page(
-    State(state): State<Arc<SharedState>>,
-    Extension(grant): Extension<WorkspaceBindingGrant>,
-    Path((upload_id, page)): Path<(String, u64)>,
-    Json(page_body): Json<AncestryPageV1>,
-) -> Result<StatusCode, HttpError> {
-    let authority = provisional_authority(&grant);
-    let store = state.knowledge_sources.store();
-    blocking(move || store.put_provisional_ancestry_page(&authority, &upload_id, page, &page_body))
-        .await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-async fn put_provisional_manifest_page(
-    State(state): State<Arc<SharedState>>,
-    Extension(grant): Extension<WorkspaceBindingGrant>,
-    Path((upload_id, class, lane, page)): Path<(String, String, String, u64)>,
-    Json(page_body): Json<SourceManifestPageV1>,
-) -> Result<StatusCode, HttpError> {
-    let class = parse_class(&class)?;
-    let lane = parse_lane(&lane)?;
-    let authority = provisional_authority(&grant);
-    let store = state.knowledge_sources.store();
-    blocking(move || {
-        store.put_provisional_manifest_page(&authority, &upload_id, class, lane, page, &page_body)
-    })
-    .await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-async fn missing_provisional_blobs(
-    State(state): State<Arc<SharedState>>,
-    Extension(grant): Extension<WorkspaceBindingGrant>,
-    Path(upload_id): Path<String>,
-    Query(query): Query<MissingQuery>,
-) -> Result<Json<MissingSourceBlobsPageV1>, HttpError> {
-    let authority = provisional_authority(&grant);
-    let store = state.knowledge_sources.store();
-    Ok(Json(
-        blocking(move || {
-            store.missing_provisional_blobs(&authority, &upload_id, query.cursor.as_deref())
-        })
-        .await?,
-    ))
-}
-
-async fn put_provisional_blob(
-    State(state): State<Arc<SharedState>>,
-    Extension(grant): Extension<WorkspaceBindingGrant>,
-    Path((upload_id, hash)): Path<(String, String)>,
-    headers: HeaderMap,
-    body: Body,
-) -> Result<StatusCode, HttpError> {
-    let authority = provisional_authority(&grant);
-    let store = state.knowledge_sources.store();
-    let expected_size = {
-        let store = store.clone();
-        let authority = authority.clone();
-        let upload_id = upload_id.clone();
-        let hash = hash.clone();
-        blocking(move || store.expected_provisional_blob_size(&authority, &upload_id, &hash))
-            .await?
-    };
-    let file = bounded_body_file(store.root(), &headers, body, expected_size).await?;
-    blocking(move || {
-        store.install_provisional_blob(&authority, &upload_id, &hash, expected_size, file)
-    })
-    .await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-async fn finalize_provisional_upload(
-    State(state): State<Arc<SharedState>>,
-    Extension(grant): Extension<WorkspaceBindingGrant>,
-    Path(upload_id): Path<String>,
-    Json(request): Json<FinalizeProvisionalUploadRequestV1>,
-) -> Result<(StatusCode, Json<FinalizeSourceUploadResponseV1>), HttpError> {
-    let authority = provisional_authority(&grant);
-    let store = state.knowledge_sources.store();
-    let descriptor = {
-        let store = store.clone();
-        let authority = authority.clone();
-        let upload_id = upload_id.clone();
-        blocking(move || store.provisional_upload_descriptor(&authority, &upload_id)).await?
-    };
-    {
-        // Off the worker: accepted-publication on-disk lock. See
-        // `blocking_http`.
-        let state = state.clone();
-        let grant = grant.clone();
-        blocking_http(move || require_current_provisional_descriptor(&state, &grant, &descriptor))
-            .await?;
-    }
-    let response = {
-        let authority = authority.clone();
-        blocking(move || {
-            store.finalize_provisional_upload(&authority, &upload_id, request.lease_ttl_secs)
-        })
-        .await?
-    };
-    // The generation is durable and selected by the time finalize returns, so
-    // this is where its graph views become the workspace's own lane.
-    {
-        let state = state.clone();
-        let authority = authority.clone();
-        blocking(move || {
-            refresh_provisional_graph_views(&state, &authority);
-            Ok::<_, anyhow::Error>(())
-        })
-        .await?;
-    }
-    for operation in [
-        bbox_indexing::knowledge_transport_observations::KnowledgeTransportOperationV1::ProjectKnowledgeMutation,
-        bbox_indexing::knowledge_transport_observations::KnowledgeTransportOperationV1::ProjectGapMutation,
-    ] {
-        if let Err(error) = state.knowledge_transport_observations.record(
-            &grant.project_id,
-            operation,
-            bbox_indexing::knowledge_transport_observations::KnowledgeTransportOutcomeV1::Remote,
-        ) {
-            tracing::warn!(
-                project_id = %grant.project_id,
-                error = %error,
-                "knowledge transport provisional-finalize observation could not be persisted"
-            );
-        }
-    }
-    Ok((StatusCode::ACCEPTED, Json(response)))
-}
-
-async fn renew_provisional_generation(
-    State(state): State<Arc<SharedState>>,
-    Extension(grant): Extension<WorkspaceBindingGrant>,
-    Path(generation): Path<String>,
-    Json(request): Json<RenewProvisionalGenerationRequestV1>,
-) -> Result<Json<ProvisionalWorkspaceStatusV1>, HttpError> {
-    let authority = provisional_authority(&grant);
-    let store = state.knowledge_sources.store();
-    let descriptor = {
-        let store = store.clone();
-        let authority = authority.clone();
-        let generation = generation.clone();
-        blocking(move || store.provisional_generation_descriptor(&authority, &generation)).await?
-    };
-    // Off the worker: accepted-publication on-disk lock. See `blocking_http`.
-    let currency = {
-        let state = state.clone();
-        let grant = grant.clone();
-        blocking_http(move || require_current_provisional_descriptor(&state, &grant, &descriptor))
-            .await
-    };
-    if let Err(error) = currency {
-        let store = store.clone();
-        let authority = authority.clone();
-        let stale_generation = generation.clone();
-        let _ = blocking(move || store.retire_provisional(&authority, &stale_generation)).await;
-        return Err(error);
-    }
-    Ok(Json(
-        blocking(move || store.renew_provisional(&authority, &generation, request.lease_ttl_secs))
-            .await?,
-    ))
-}
-
-async fn abort_provisional_upload(
-    State(state): State<Arc<SharedState>>,
-    Extension(grant): Extension<WorkspaceBindingGrant>,
-    Path(upload_id): Path<String>,
-) -> Result<StatusCode, HttpError> {
-    let authority = provisional_authority(&grant);
-    let store = state.knowledge_sources.store();
-    blocking(move || store.abort_provisional_upload(&authority, &upload_id)).await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-async fn retire_provisional_generation(
-    State(state): State<Arc<SharedState>>,
-    Extension(grant): Extension<WorkspaceBindingGrant>,
-    Path(generation): Path<String>,
-) -> Result<StatusCode, HttpError> {
-    let authority = provisional_authority(&grant);
-    let store = state.knowledge_sources.store();
-    blocking(move || store.retire_provisional(&authority, &generation)).await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-async fn provisional_generation_status(
-    State(state): State<Arc<SharedState>>,
-    Extension(grant): Extension<WorkspaceBindingGrant>,
-    Path(generation): Path<String>,
-) -> Result<Json<ProvisionalWorkspaceStatusV1>, HttpError> {
-    let authority = provisional_authority(&grant);
-    let store = state.knowledge_sources.store();
-    Ok(Json(
-        blocking(move || store.provisional_status(&authority, &generation)).await?,
-    ))
-}
-
-async fn authenticate_workspace_source_request(
-    State(state): State<Arc<SharedState>>,
-    mut request: Request,
-    next: Next,
-) -> Response {
-    if !state
-        .code_sources
-        .producer_auth()
-        .knowledge_transport_enabled()
-    {
-        return error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "knowledge_transport_disabled",
-            "knowledge transport is disabled",
-        );
-    }
-    let candidate = request
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "));
-    let Some(grant) = candidate.and_then(|candidate| {
-        state
-            .knowledge_sources
-            .authenticate_workspace_binding(candidate, now_unix_secs())
-    }) else {
-        // A well-formed binding token this daemon does not know is a
-        // different situation from no credential at all: the binding was
-        // superseded, revoked, or expired, and the fix is a re-mint. Say so;
-        // a bare 401 sent operators chasing the checkout instead.
-        let well_formed = candidate.is_some_and(|candidate| ServiceToken::parse(candidate).is_ok());
-        return if well_formed {
-            error_response(
-                StatusCode::UNAUTHORIZED,
-                "workspace_binding_unknown",
-                "workspace binding is not known to this daemon (superseded by a later mint, \
-                 revoked, or expired); mint again with `bro workspace-binding mint --replace`",
-            )
-        } else {
-            error_response(StatusCode::UNAUTHORIZED, "unauthorized", "unauthorized")
-        };
-    };
-    request.extensions_mut().insert(grant);
-    next.run(request).await
-}
-
 fn require_project_grant(
     state: &SharedState,
     grant: &ProducerGrant,
@@ -1856,45 +814,17 @@ fn require_matching_publication_authority(
     Ok(authority)
 }
 
-fn provisional_authority(grant: &WorkspaceBindingGrant) -> ProvisionalAuthorityV1 {
-    ProvisionalAuthorityV1 {
-        project_id: grant.project_id.clone(),
-        scope: grant.scope.clone(),
-        workspace_id: grant.workspace_id.clone(),
-    }
-}
-
-/// Publication manifests admit every provisional lane plus the
-/// publication-only configuration lane.
+/// Publication manifest lanes.
 fn parse_publication_lane(value: &str) -> Result<SourceLaneV1, HttpError> {
-    match value {
-        "config" => Ok(SourceLaneV1::Config),
-        other => parse_lane(other),
-    }
-}
-
-/// Provisional workspace lanes. The configuration lane is commit-gated
-/// publication state and never travels in a workspace snapshot.
-fn parse_lane(value: &str) -> Result<SourceLaneV1, HttpError> {
     match value {
         "knowledge" => Ok(SourceLaneV1::Knowledge),
         "gaps" => Ok(SourceLaneV1::Gaps),
         "graphs" => Ok(SourceLaneV1::Graphs),
         "evidence" => Ok(SourceLaneV1::Evidence),
+        "config" => Ok(SourceLaneV1::Config),
         _ => Err(HttpError::unprocessable(
             "knowledge_source_manifest_invalid",
             "knowledge-source lane is invalid",
-        )),
-    }
-}
-
-fn parse_class(value: &str) -> Result<SnapshotClassV1, HttpError> {
-    match value {
-        "baseline" => Ok(SnapshotClassV1::Baseline),
-        "working" => Ok(SnapshotClassV1::Working),
-        _ => Err(HttpError::unprocessable(
-            "knowledge_source_manifest_invalid",
-            "knowledge-source snapshot class is invalid",
         )),
     }
 }
@@ -1965,30 +895,6 @@ async fn blocking<T: Send + 'static>(
         .map_err(HttpError::from_store)
 }
 
-/// Blocking-pool twin of [`blocking`] for operations that already yield an
-/// `HttpError` and so cannot go through `HttpError::from_store`.
-///
-/// This exists for one reason worth stating at the call sites that use it.
-/// The accepted-publication read path takes an ON-DISK exclusive lock, and
-/// `acquire_store_lock_nofollow_with_timeout` (bbox-corpus-core
-/// `json_store.rs`) waits for it by spin-sleeping on `std::thread::sleep`
-/// for up to `ACCEPTED_PUBLICATION_LOCK_TIMEOUT` (15s). Called from an
-/// `async fn` body that is not a blocking-pool closure, one contended read
-/// parks a tokio WORKER for those 15 seconds. Worker count defaults to one
-/// per core, so a handful of concurrent provisional requests during a
-/// publication window park every worker at once, and the runtime then polls
-/// nothing at all: not the MCP transport, not the axum accept loop, and not
-/// `/healthz`, whose handler holds no lock and is ready on its first poll.
-/// That is the 2026-08-13 ingest starvation
-/// (design/daemon-runtime/healthz-ingest-starvation.md).
-async fn blocking_http<T: Send + 'static>(
-    operation: impl FnOnce() -> Result<T, HttpError> + Send + 'static,
-) -> Result<T, HttpError> {
-    tokio::task::spawn_blocking(operation)
-        .await
-        .map_err(|_| HttpError::storage("knowledge-source blocking task failed"))?
-}
-
 fn reap_upload_body_tempfiles(store_root: &std::path::Path) -> Result<u64> {
     let mut reaped = 0_u64;
     for entry in std::fs::read_dir(store_root)? {
@@ -2017,17 +923,6 @@ pub(crate) fn now_unix_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
-}
-
-fn error_response(status: StatusCode, code: &str, message: &str) -> Response {
-    (
-        status,
-        Json(ErrorResponse {
-            code: code.to_string(),
-            message: message.to_string(),
-        }),
-    )
-        .into_response()
 }
 
 #[derive(Debug)]
@@ -2078,7 +973,6 @@ impl HttpError {
     fn from_contract(error: &ContractError) -> Self {
         match error {
             ContractError::ManifestLimitExceeded
-            | ContractError::AncestryLimitExceeded
             | ContractError::GenerationLimitExceeded
             | ContractError::InvalidLimit => Self::too_large(
                 "knowledge_source_limit_exceeded",
@@ -2087,16 +981,6 @@ impl HttpError {
             ContractError::UnsupportedSchema(_) => Self::unprocessable(
                 "knowledge_source_contract_unsupported",
                 "knowledge-source contract version is unsupported",
-            ),
-            ContractError::AncestryIncomplete
-            | ContractError::AncestryUnreachable
-            | ContractError::AncestryCycle => Self::unprocessable(
-                "knowledge_source_ancestry_incomplete",
-                "knowledge-source ancestry evidence is invalid",
-            ),
-            ContractError::InvalidMergeBase => Self::unprocessable(
-                "knowledge_source_merge_base_mismatch",
-                "knowledge-source merge base is invalid",
             ),
             ContractError::ManifestCommitmentMismatch
             | ContractError::ManifestCountMismatch
@@ -2158,23 +1042,11 @@ impl HttpError {
                     "knowledge_source_input_invalid",
                     "knowledge-source input is invalid",
                 ),
-                StoreRequestError::Conflict => {
-                    // Name the holder when the store knows it: a bare
-                    // "conflicts with durable state" left capture authors
-                    // guessing which sequence and generation they were
-                    // converging against.
-                    let message = error
-                        .downcast_ref::<ProvisionalSequenceConflict>()
-                        .map_or_else(
-                            || "knowledge-source evidence conflicts with durable state".to_string(),
-                            |detail| format!("knowledge-source evidence conflicts with durable state: {detail}"),
-                        );
-                    Self::new(
-                        StatusCode::CONFLICT,
-                        "knowledge_source_generation_conflict",
-                        message,
-                    )
-                }
+                StoreRequestError::Conflict => Self::new(
+                    StatusCode::CONFLICT,
+                    "knowledge_source_generation_conflict",
+                    "knowledge-source evidence conflicts with durable state",
+                ),
                 StoreRequestError::NotFound => {
                     Self::new(StatusCode::NOT_FOUND, "not_found", "resource not found")
                 }
@@ -2193,7 +1065,6 @@ impl IntoResponse for HttpError {
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
-    use std::io::Cursor;
 
     use axum::body::to_bytes;
     use axum::http::Request;
@@ -2204,53 +1075,40 @@ mod tests {
         RepoHistoryRecord,
     };
     use bbox_knowledge_source::{
-        AncestryCommitV1, AncestryDescriptorV1, GitObjectFormatV1, SCHEMA_VERSION,
-        SourceFileManifestEntryV1, SourceGenerationStateV1, SourceManifestDescriptorV1,
-        StableCaptureV1, ancestry_sha256, source_file_blob_sha256, source_manifest_sha256,
-        working_pair_sha256,
+        GitObjectFormatV1, SCHEMA_VERSION, SourceFileManifestEntryV1, SourceManifestDescriptorV1,
+        source_file_blob_sha256, source_manifest_sha256,
     };
     use tower::ServiceExt;
 
     use super::*;
     use crate::server::producer_auth::ProducerAuthRuntime;
-    use crate::server::state::catalog_fixture::{
-        COMMIT_ONE, COMMIT_TWO, CatalogFixture, gap_note, knowledge_entry,
-    };
+    use crate::server::state::catalog_fixture::CatalogFixture;
 
-    /// The configuration lane is publication-only: the publication manifest
-    /// route admits it, the provisional route refuses it with the same typed
-    /// invalid-lane error an unknown segment gets.
+    /// The publication manifest route admits every lane, including the
+    /// configuration lane, and refuses an unknown segment.
     #[test]
-    fn config_lane_segment_is_publication_only() {
-        assert_eq!(
-            parse_publication_lane("config").unwrap(),
-            SourceLaneV1::Config
-        );
-        for lane in ["knowledge", "gaps", "graphs", "evidence"] {
-            assert_eq!(
-                parse_publication_lane(lane).unwrap(),
-                parse_lane(lane).unwrap()
-            );
+    fn publication_lane_segments_are_exact() {
+        for (segment, lane) in [
+            ("knowledge", SourceLaneV1::Knowledge),
+            ("gaps", SourceLaneV1::Gaps),
+            ("graphs", SourceLaneV1::Graphs),
+            ("evidence", SourceLaneV1::Evidence),
+            ("config", SourceLaneV1::Config),
+        ] {
+            assert_eq!(parse_publication_lane(segment).unwrap(), lane);
         }
-        assert!(parse_lane("config").is_err());
         assert!(parse_publication_lane("configuration").is_err());
     }
 
     const KNOWLEDGE_BYTES: &[u8] = br#"{"id":"knowledge-1"}"#;
 
     struct TestAuthority {
-        catalog_fixture: crate::server::state::catalog_fixture::CatalogFixture,
+        /// Owns the catalog tempdir for the fixture's lifetime.
+        _catalog_fixture: crate::server::state::catalog_fixture::CatalogFixture,
         state: Arc<SharedState>,
         producer_token: String,
         other_producer_token: String,
-        workspace_token: String,
-        other_workspace_token: String,
-        expired_workspace_token: String,
-        project_id: ProjectId,
         scope: PublishedScope,
-        workspace_id: WorkspaceId,
-        accepted_generation: String,
-        accepted_commit: String,
     }
 
     fn project(
@@ -2302,7 +1160,7 @@ mod tests {
         let catalog_fixture = crate::server::state::catalog_fixture::CatalogFixture::new();
         catalog_fixture.add_published_project(project_id.as_str(), &scope);
         catalog_fixture.add_published_project(other_project_id.as_str(), &other_scope);
-        let accepted = catalog_fixture.install_publication(
+        catalog_fixture.install_publication(
             project_id.as_str(),
             &scope,
             crate::server::state::catalog_fixture::COMMIT_TWO,
@@ -2359,52 +1217,12 @@ mod tests {
                 &catalog,
             )));
 
-        let workspace_id = WorkspaceId::parse("0123456789abcdef0123456789abcdef").unwrap();
-        let other_workspace_id = WorkspaceId::parse("fedcba9876543210fedcba9876543210").unwrap();
-        let workspace_token = "3".repeat(64);
-        let other_workspace_token = "4".repeat(64);
-        let expired_workspace_token = "5".repeat(64);
-        for (index, (token, bound_workspace, expires)) in [
-            (
-                workspace_token.clone(),
-                workspace_id.clone(),
-                now_unix_secs() + 600,
-            ),
-            (
-                other_workspace_token.clone(),
-                other_workspace_id,
-                now_unix_secs() + 600,
-            ),
-            (expired_workspace_token.clone(), workspace_id.clone(), 1),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            state.knowledge_sources.install_workspace_binding_for_test(
-                ServiceToken::parse(token).unwrap(),
-                WorkspaceBindingGrant {
-                    task_id: format!("task-test-{index}"),
-                    session_id: format!("session-test-{index}"),
-                    project_id: project_id.as_str().to_string(),
-                    scope: scope.clone(),
-                    workspace_id: bound_workspace,
-                    expires_unix_secs: expires,
-                },
-            );
-        }
         TestAuthority {
-            catalog_fixture,
+            _catalog_fixture: catalog_fixture,
             state,
             producer_token,
             other_producer_token,
-            workspace_token,
-            other_workspace_token,
-            expired_workspace_token,
-            project_id,
             scope,
-            workspace_id,
-            accepted_generation: accepted.generation_id,
-            accepted_commit: crate::server::state::catalog_fixture::COMMIT_TWO.to_string(),
         }
     }
 
@@ -2468,287 +1286,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn bound_remote_own_materializes_both_lanes_and_rejects_accepted_advance() {
-        const PROJECT: &str = "p_remoteown";
-        const WORKSPACE: &str = "0123456789abcdef0123456789abcdef";
-        let fixture = CatalogFixture::new();
-        let scope = CatalogFixture::scope(".");
-        fixture.add_published_project(PROJECT, &scope);
-        let accepted_knowledge = knowledge_entry("remote-knowledge", "accepted");
-        let accepted_gap = gap_note("gap-1234abcd", "accepted");
-        let installed = fixture.install_publication(
-            PROJECT,
-            &scope,
-            COMMIT_ONE,
-            std::slice::from_ref(&accepted_knowledge),
-            std::slice::from_ref(&accepted_gap),
-        );
-        let server = fixture.server();
-        let workspace_id = WorkspaceId::parse(WORKSPACE).unwrap();
-        let authority = ProvisionalAuthorityV1 {
-            project_id: PROJECT.to_string(),
-            scope: scope.clone(),
-            workspace_id: workspace_id.clone(),
-        };
-        let working_knowledge = knowledge_entry("remote-knowledge", "changed remotely");
-        let working_gap = gap_note("gap-1234abcd", "changed remotely");
-        let baseline_knowledge_bytes =
-            bbox_knowledge::knowledge::committed_knowledge_entry_bytes(&accepted_knowledge)
-                .unwrap();
-        let working_knowledge_bytes =
-            bbox_knowledge::knowledge::committed_knowledge_entry_bytes(&working_knowledge).unwrap();
-        let baseline_gap_bytes = bbox_gaps::gaps::committed_gap_note_bytes(&accepted_gap).unwrap();
-        let working_gap_bytes = bbox_gaps::gaps::committed_gap_note_bytes(&working_gap).unwrap();
-        let source_entry = |path: &str, bytes: &[u8]| SourceFileManifestEntryV1 {
-            repository_relative_filename: path.to_string(),
-            encoded_bytes: bytes.len() as u64,
-            content_sha256: source_file_blob_sha256(bytes),
-        };
-        let baseline_knowledge_manifest = vec![source_entry(
-            ".bbox/knowledge/remote-knowledge.json",
-            &baseline_knowledge_bytes,
-        )];
-        let working_knowledge_manifest = vec![source_entry(
-            ".bbox/knowledge/remote-knowledge.json",
-            &working_knowledge_bytes,
-        )];
-        let baseline_gap_manifest = vec![source_entry(
-            ".bbox/gaps/gap-1234abcd.json",
-            &baseline_gap_bytes,
-        )];
-        let working_gap_manifest = vec![source_entry(
-            ".bbox/gaps/gap-1234abcd.json",
-            &working_gap_bytes,
-        )];
-        let merge_base = "0".repeat(40);
-        let checkout_head = "3".repeat(40);
-        let ancestry = vec![
-            AncestryCommitV1 {
-                commit_oid: merge_base.clone(),
-                parent_oids: Vec::new(),
-            },
-            AncestryCommitV1 {
-                commit_oid: COMMIT_ONE.to_string(),
-                parent_oids: vec![merge_base.clone()],
-            },
-            AncestryCommitV1 {
-                commit_oid: checkout_head.clone(),
-                parent_oids: vec![merge_base.clone()],
-            },
-        ];
-        let baseline_knowledge_descriptor =
-            manifest(SourceLaneV1::Knowledge, &baseline_knowledge_manifest);
-        let baseline_gap_descriptor = manifest(SourceLaneV1::Gaps, &baseline_gap_manifest);
-        let working_knowledge_descriptor =
-            manifest(SourceLaneV1::Knowledge, &working_knowledge_manifest);
-        let working_gap_descriptor = manifest(SourceLaneV1::Gaps, &working_gap_manifest);
-        let empty_graphs = bbox_knowledge_source::SourceManifestDescriptorV1::default();
-        let empty_evidence = bbox_knowledge_source::SourceManifestDescriptorV1::default();
-        let working_pair = working_pair_sha256(
-            &working_knowledge_descriptor,
-            &working_gap_descriptor,
-            &empty_graphs,
-            &empty_evidence,
-        );
-        let descriptor = bbox_knowledge_source::ProvisionalWorkspaceDescriptorV1 {
-            schema_version: SCHEMA_VERSION,
-            scope: scope.clone(),
-            workspace_id: workspace_id.clone(),
-            sequence: 1,
-            accepted_generation: installed.generation_id,
-            accepted_commit: COMMIT_ONE.to_string(),
-            checkout_head,
-            merge_base,
-            object_format: GitObjectFormatV1::Sha1,
-            ancestry: AncestryDescriptorV1 {
-                ancestry_sha256: ancestry_sha256(GitObjectFormatV1::Sha1, &ancestry),
-                node_count: ancestry.len() as u64,
-                edge_count: 2,
-                page_count: 1,
-            },
-            capture: StableCaptureV1 {
-                transaction_pending_before: false,
-                transaction_pending_after: false,
-                first_working_pair_sha256: working_pair.clone(),
-                second_working_pair_sha256: working_pair,
-            },
-            baseline_knowledge: baseline_knowledge_descriptor,
-            baseline_gaps: baseline_gap_descriptor,
-            baseline_graphs: empty_graphs.clone(),
-            baseline_evidence: empty_evidence.clone(),
-            working_knowledge: working_knowledge_descriptor,
-            working_gaps: working_gap_descriptor,
-            working_graphs: empty_graphs,
-            working_evidence: empty_evidence,
-        };
-        let store = server.state.knowledge_sources.store();
-        let upload = store
-            .begin_provisional_upload(&authority, descriptor)
-            .unwrap();
-        store
-            .put_provisional_ancestry_page(
-                &authority,
-                &upload.upload_id,
-                0,
-                &bbox_knowledge_source::AncestryPageV1 {
-                    page_index: 0,
-                    nodes: ancestry,
-                },
-            )
-            .unwrap();
-        for (class, lane, entries) in [
-            (
-                SnapshotClassV1::Baseline,
-                SourceLaneV1::Knowledge,
-                baseline_knowledge_manifest,
-            ),
-            (
-                SnapshotClassV1::Baseline,
-                SourceLaneV1::Gaps,
-                baseline_gap_manifest,
-            ),
-            (
-                SnapshotClassV1::Working,
-                SourceLaneV1::Knowledge,
-                working_knowledge_manifest,
-            ),
-            (
-                SnapshotClassV1::Working,
-                SourceLaneV1::Gaps,
-                working_gap_manifest,
-            ),
-        ] {
-            store
-                .put_provisional_manifest_page(
-                    &authority,
-                    &upload.upload_id,
-                    class,
-                    lane,
-                    0,
-                    &SourceManifestPageV1 {
-                        page_index: 0,
-                        entries,
-                    },
-                )
-                .unwrap();
-        }
-        assert_eq!(
-            store
-                .missing_provisional_blobs(&authority, &upload.upload_id, None)
-                .unwrap()
-                .hashes
-                .len(),
-            4
-        );
-        let mut blobs = BTreeMap::new();
-        for bytes in [
-            baseline_knowledge_bytes,
-            working_knowledge_bytes,
-            baseline_gap_bytes,
-            working_gap_bytes,
-        ] {
-            blobs.insert(source_file_blob_sha256(&bytes), bytes);
-        }
-        for (hash, bytes) in blobs {
-            store
-                .install_provisional_blob(
-                    &authority,
-                    &upload.upload_id,
-                    &hash,
-                    bytes.len() as u64,
-                    Cursor::new(bytes),
-                )
-                .unwrap();
-        }
-        store
-            .finalize_provisional_upload(&authority, &upload.upload_id, 60)
-            .unwrap();
-        let grant = WorkspaceBindingGrant {
-            task_id: "task-remote".to_string(),
-            session_id: "session-remote".to_string(),
-            project_id: PROJECT.to_string(),
-            scope: scope.clone(),
-            workspace_id,
-            expires_unix_secs: now_unix_secs() + 60,
-        };
-        server
-            .state
-            .knowledge_sources
-            .install_workspace_binding_for_test(
-                ServiceToken::parse("8".repeat(64)).unwrap(),
-                grant.clone(),
-            );
-        assert!(
-            server
-                .session_workspace_binding
-                .set(Some(Arc::new(grant)))
-                .is_ok()
-        );
-
-        let knowledge = server.session_knowledge_view(None, Some("own")).unwrap();
-        let knowledge_row = knowledge
-            .items
-            .iter()
-            .find(|item| item.entry.id == "remote-knowledge")
-            .unwrap();
-        assert_eq!(knowledge_row.entry.content, "changed remotely");
-        assert_eq!(knowledge_row.entry.project_id.as_deref(), Some(PROJECT));
-        assert_eq!(knowledge_row.entry.project, None);
-        let gaps = server.session_gap_view(None, Some("own")).unwrap();
-        let gap = gaps
-            .gaps
-            .all()
-            .iter()
-            .find(|gap| gap.id == "gap-1234abcd")
-            .unwrap();
-        assert_eq!(gap.title, "changed remotely");
-        assert_eq!(gap.project_id.as_deref(), Some(PROJECT));
-
-        // `all` is a durable project view, not a projection of the daemon's
-        // in-memory session-token cache. A restart clears that cache while the
-        // source-store selection remains authoritative and live.
-        server
-            .state
-            .knowledge_sources
-            .workspace_bindings
-            .write()
-            .clear();
-        assert!(
-            server
-                .state
-                .knowledge_sources
-                .active_workspace_bindings(now_unix_secs())
-                .is_empty()
-        );
-        let all_knowledge = server.session_knowledge_view(None, Some("all")).unwrap();
-        assert!(all_knowledge.items.iter().any(|item| {
-            item.entry.id == "remote-knowledge" && item.entry.content == "changed remotely"
-        }));
-        let all_gaps = server.session_gap_view(None, Some("all")).unwrap();
-        assert!(
-            all_gaps
-                .gaps
-                .all()
-                .iter()
-                .any(|gap| { gap.id.contains("gap-1234abcd") && gap.title == "changed remotely" })
-        );
-
-        fixture.install_publication(
-            PROJECT,
-            &scope,
-            COMMIT_TWO,
-            &[knowledge_entry("remote-knowledge", "advanced")],
-            &[gap_note("gap-1234abcd", "advanced")],
-        );
-        server.invalidate_catalog_published_content(&ProjectId::parse(PROJECT).unwrap());
-        let error = server
-            .session_knowledge_view(None, Some("own"))
-            .err()
-            .expect("accepted advance must stale the captured workspace");
-        assert!(format!("{error:#}").contains("error.provisional_snapshot_stale"));
-    }
-
     fn request(method: &str, uri: &str, token: Option<&str>, body: Body) -> Request<Body> {
         let mut builder = Request::builder()
             .method(method)
@@ -2798,183 +1335,6 @@ mod tests {
         }
     }
 
-    fn provisional_descriptor(
-        scope: PublishedScope,
-        workspace_id: WorkspaceId,
-        accepted_generation: String,
-        accepted_commit: String,
-    ) -> (
-        bbox_knowledge_source::ProvisionalWorkspaceDescriptorV1,
-        Vec<AncestryCommitV1>,
-    ) {
-        let root = "1".repeat(40);
-        let nodes = vec![
-            AncestryCommitV1 {
-                commit_oid: root.clone(),
-                parent_oids: Vec::new(),
-            },
-            AncestryCommitV1 {
-                commit_oid: "2".repeat(40),
-                parent_oids: vec![root.clone()],
-            },
-            AncestryCommitV1 {
-                commit_oid: "3".repeat(40),
-                parent_oids: vec![root],
-            },
-        ];
-        let knowledge = vec![entry()];
-        let knowledge_manifest = manifest(SourceLaneV1::Knowledge, &knowledge);
-        let gaps_manifest = manifest(SourceLaneV1::Gaps, &[]);
-        let graphs_manifest = SourceManifestDescriptorV1::default();
-        let evidence_manifest = SourceManifestDescriptorV1::default();
-        let working_pair = working_pair_sha256(
-            &knowledge_manifest,
-            &gaps_manifest,
-            &graphs_manifest,
-            &evidence_manifest,
-        );
-        (
-            bbox_knowledge_source::ProvisionalWorkspaceDescriptorV1 {
-                schema_version: SCHEMA_VERSION,
-                scope,
-                workspace_id,
-                sequence: 1,
-                accepted_generation,
-                accepted_commit,
-                checkout_head: "3".repeat(40),
-                merge_base: "1".repeat(40),
-                object_format: GitObjectFormatV1::Sha1,
-                ancestry: AncestryDescriptorV1 {
-                    ancestry_sha256: ancestry_sha256(GitObjectFormatV1::Sha1, &nodes),
-                    node_count: nodes.len() as u64,
-                    edge_count: 2,
-                    page_count: 1,
-                },
-                capture: StableCaptureV1 {
-                    transaction_pending_before: false,
-                    transaction_pending_after: false,
-                    first_working_pair_sha256: working_pair.clone(),
-                    second_working_pair_sha256: working_pair,
-                },
-                baseline_knowledge: knowledge_manifest.clone(),
-                baseline_gaps: gaps_manifest.clone(),
-                baseline_graphs: graphs_manifest.clone(),
-                baseline_evidence: evidence_manifest.clone(),
-                working_knowledge: knowledge_manifest,
-                working_gaps: gaps_manifest,
-                working_graphs: graphs_manifest,
-                working_evidence: evidence_manifest,
-            },
-            nodes,
-        )
-    }
-
-    /// A well-formed binding token the daemon does not know names itself
-    /// (superseded / revoked / expired, remedy: re-mint) instead of the bare
-    /// `unauthorized` a missing or malformed credential gets.
-    #[tokio::test]
-    async fn unknown_but_well_formed_binding_gets_a_typed_401_with_the_remint_hint() {
-        let temporary = tempfile::tempdir().unwrap();
-        let root = temporary.path().canonicalize().unwrap();
-        let fixture = enabled_state(&root);
-        let app = router(fixture.state.clone()).with_state(fixture.state.clone());
-        let probe = |token: Option<&'static str>| {
-            app.clone().oneshot(request(
-                "GET",
-                "/internal/knowledge-source/v1/provisional/context",
-                token,
-                Body::empty(),
-            ))
-        };
-        let unknown = "f".repeat(64);
-        let unknown: &'static str = Box::leak(unknown.into_boxed_str());
-        for (token, code) in [
-            (None, "unauthorized"),
-            (Some("not-a-token"), "unauthorized"),
-            (Some(unknown), "workspace_binding_unknown"),
-        ] {
-            let response = probe(token).await.unwrap();
-            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-            let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
-                .await
-                .unwrap();
-            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-            assert_eq!(body["code"], code, "{body}");
-            if code == "workspace_binding_unknown" {
-                assert!(
-                    body["message"]
-                        .as_str()
-                        .unwrap()
-                        .contains("bro workspace-binding mint"),
-                    "{body}"
-                );
-            }
-        }
-    }
-
-    /// Bindings are held as token hashes; installing, authenticating, and the
-    /// persisted operator record all round-trip through the hash and the
-    /// secret itself never lands on disk.
-    #[test]
-    fn operator_binding_records_persist_hashes_and_round_trip() {
-        let temporary = tempfile::tempdir().unwrap();
-        let root = temporary.path().canonicalize().unwrap();
-        let runtime = KnowledgeSourceRuntime::for_test(&root);
-        let secret = "a".repeat(64);
-        let token = ServiceToken::parse(secret.clone()).unwrap();
-        let grant = WorkspaceBindingGrant {
-            task_id: format!("{OPERATOR_LEASE_PREFIX}:0123456789abcdef0123456789abcdef"),
-            session_id: format!("{OPERATOR_LEASE_PREFIX}:0123456789abcdef0123456789abcdef"),
-            project_id: "p_test".into(),
-            scope: bbox_corpus_core::identity::PublishedScope::try_new("repo", ".").unwrap(),
-            workspace_id: WorkspaceId::parse("0123456789abcdef0123456789abcdef").unwrap(),
-            expires_unix_secs: 10,
-        };
-        runtime.install_workspace_binding_for_test(token, grant.clone());
-        assert!(runtime.authenticate_workspace_binding(&secret, 5).is_some());
-        assert!(
-            runtime
-                .authenticate_workspace_binding(&"b".repeat(64), 5)
-                .is_none()
-        );
-        assert!(runtime.has_live_workspace_binding_for_task(&grant.task_id, 5));
-        assert!(!runtime.has_live_workspace_binding_for_task(&grant.task_id, 10));
-
-        runtime
-            .persist_operator_binding(workspace_binding_token_sha256(&secret), &grant)
-            .unwrap();
-        let contents = std::fs::read_to_string(runtime.operator_bindings_path()).unwrap();
-        assert!(!contents.contains(&secret));
-        let loaded = runtime.load_persisted_operator_bindings().unwrap();
-        assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].task_id, grant.task_id);
-        assert_eq!(
-            hex::decode(&loaded[0].token_sha256).unwrap(),
-            workspace_binding_token_sha256(&secret)
-        );
-        // Re-persisting the same task id replaces, never accumulates.
-        runtime
-            .persist_operator_binding(workspace_binding_token_sha256(&"c".repeat(64)), &grant)
-            .unwrap();
-        assert_eq!(runtime.load_persisted_operator_bindings().unwrap().len(), 1);
-        // Revoking an operator task drops the record from disk too.
-        assert_eq!(runtime.revoke_workspace_bindings(&grant.task_id).len(), 1);
-        assert!(
-            runtime
-                .load_persisted_operator_bindings()
-                .unwrap()
-                .is_empty()
-        );
-        // A missing file is an empty set, not an error.
-        std::fs::remove_file(runtime.operator_bindings_path()).unwrap();
-        assert!(
-            runtime
-                .load_persisted_operator_bindings()
-                .unwrap()
-                .is_empty()
-        );
-    }
-
     #[tokio::test]
     async fn every_knowledge_source_response_carries_the_daemon_build_id() {
         let temporary = tempfile::tempdir().unwrap();
@@ -2988,7 +1348,7 @@ mod tests {
         for (path, token) in [
             ("/internal/knowledge-source/v1/publication/uploads", None),
             (
-                "/internal/knowledge-source/v1/provisional/probe",
+                "/internal/knowledge-source/v1/publication/probe",
                 Some(fixture.other_producer_token.as_str()),
             ),
         ] {
@@ -3333,517 +1693,5 @@ mod tests {
         assert_eq!(status, StatusCode::ACCEPTED);
         // The fixture owns the catalog tempdir, so the caller holds it.
         (catalog_fixture, state, project_id)
-    }
-
-    #[tokio::test]
-    async fn provisional_routes_require_live_exact_workspace_binding() {
-        let temporary = tempfile::tempdir().unwrap();
-        let root = temporary.path().canonicalize().unwrap();
-        let fixture = enabled_state(&root);
-        let app = router(fixture.state.clone()).with_state(fixture.state.clone());
-        for token in [None, Some(fixture.expired_workspace_token.as_str())] {
-            let denied = app
-                .clone()
-                .oneshot(request(
-                    "POST",
-                    "/internal/knowledge-source/v1/provisional/uploads",
-                    token,
-                    Body::from("{"),
-                ))
-                .await
-                .unwrap();
-            assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
-        }
-
-        let context = app
-            .clone()
-            .oneshot(request(
-                "GET",
-                "/internal/knowledge-source/v1/provisional/context",
-                Some(&fixture.workspace_token),
-                Body::empty(),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(context.status(), StatusCode::OK);
-        let context: ProvisionalCaptureContextV1 =
-            serde_json::from_slice(&to_bytes(context.into_body(), 64 * 1024).await.unwrap())
-                .unwrap();
-        assert_eq!(context.scope, fixture.scope);
-        assert_eq!(context.accepted_generation, fixture.accepted_generation);
-        assert_eq!(context.accepted_commit, fixture.accepted_commit);
-
-        let (descriptor, nodes) = provisional_descriptor(
-            fixture.scope.clone(),
-            fixture.workspace_id.clone(),
-            fixture.accepted_generation.clone(),
-            fixture.accepted_commit.clone(),
-        );
-        let mut stale_descriptor = descriptor.clone();
-        stale_descriptor.accepted_generation = "a".repeat(64);
-        let stale = app
-            .clone()
-            .oneshot(request(
-                "POST",
-                "/internal/knowledge-source/v1/provisional/uploads",
-                Some(&fixture.workspace_token),
-                Body::from(
-                    serde_json::to_vec(&BeginProvisionalUploadRequestV1 {
-                        descriptor: stale_descriptor,
-                    })
-                    .unwrap(),
-                ),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(stale.status(), StatusCode::CONFLICT);
-        let begun = app
-            .clone()
-            .oneshot(request(
-                "POST",
-                "/internal/knowledge-source/v1/provisional/uploads",
-                Some(&fixture.workspace_token),
-                Body::from(
-                    serde_json::to_vec(&BeginProvisionalUploadRequestV1 { descriptor }).unwrap(),
-                ),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(begun.status(), StatusCode::CREATED);
-        let begun: BeginSourceUploadResponseV1 =
-            serde_json::from_slice(&to_bytes(begun.into_body(), 64 * 1024).await.unwrap()).unwrap();
-
-        let hidden = app
-            .clone()
-            .oneshot(request(
-                "GET",
-                &format!(
-                    "/internal/knowledge-source/v1/provisional/uploads/{}/missing",
-                    begun.upload_id
-                ),
-                Some(&fixture.other_workspace_token),
-                Body::empty(),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(hidden.status(), StatusCode::NOT_FOUND);
-
-        let ancestry = app
-            .clone()
-            .oneshot(request(
-                "POST",
-                &format!(
-                    "/internal/knowledge-source/v1/provisional/uploads/{}/ancestry/0",
-                    begun.upload_id
-                ),
-                Some(&fixture.workspace_token),
-                Body::from(
-                    serde_json::to_vec(&AncestryPageV1 {
-                        page_index: 0,
-                        nodes,
-                    })
-                    .unwrap(),
-                ),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(ancestry.status(), StatusCode::NO_CONTENT);
-        for class in ["baseline", "working"] {
-            let page = app
-                .clone()
-                .oneshot(request(
-                    "POST",
-                    &format!(
-                        "/internal/knowledge-source/v1/provisional/uploads/{}/manifest/{class}/knowledge/0",
-                        begun.upload_id
-                    ),
-                    Some(&fixture.workspace_token),
-                    Body::from(
-                        serde_json::to_vec(&SourceManifestPageV1 {
-                            page_index: 0,
-                            entries: vec![entry()],
-                        })
-                        .unwrap(),
-                    ),
-                ))
-                .await
-                .unwrap();
-            assert_eq!(page.status(), StatusCode::NO_CONTENT);
-        }
-        let missing = app
-            .clone()
-            .oneshot(request(
-                "GET",
-                &format!(
-                    "/internal/knowledge-source/v1/provisional/uploads/{}/missing",
-                    begun.upload_id
-                ),
-                Some(&fixture.workspace_token),
-                Body::empty(),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(missing.status(), StatusCode::OK);
-
-        let hash = source_file_blob_sha256(KNOWLEDGE_BYTES);
-        let blob = Request::builder()
-            .method("PUT")
-            .uri(format!(
-                "/internal/knowledge-source/v1/provisional/uploads/{}/blobs/{hash}",
-                begun.upload_id
-            ))
-            .header(
-                header::AUTHORIZATION,
-                format!("Bearer {}", fixture.workspace_token),
-            )
-            .header(header::CONTENT_LENGTH, KNOWLEDGE_BYTES.len())
-            .body(Body::from(KNOWLEDGE_BYTES))
-            .unwrap();
-        assert_eq!(
-            app.clone().oneshot(blob).await.unwrap().status(),
-            StatusCode::NO_CONTENT
-        );
-        let finalized = app
-            .clone()
-            .oneshot(request(
-                "POST",
-                &format!(
-                    "/internal/knowledge-source/v1/provisional/uploads/{}/finalize",
-                    begun.upload_id
-                ),
-                Some(&fixture.workspace_token),
-                Body::from(
-                    serde_json::to_vec(&FinalizeProvisionalUploadRequestV1 { lease_ttl_secs: 60 })
-                        .unwrap(),
-                ),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(finalized.status(), StatusCode::ACCEPTED);
-        let finalized: FinalizeSourceUploadResponseV1 =
-            serde_json::from_slice(&to_bytes(finalized.into_body(), 64 * 1024).await.unwrap())
-                .unwrap();
-
-        let (mut second_descriptor, _) = provisional_descriptor(
-            fixture.scope.clone(),
-            fixture.workspace_id.clone(),
-            fixture.accepted_generation.clone(),
-            fixture.accepted_commit.clone(),
-        );
-        second_descriptor.sequence = 2;
-        let second = app
-            .clone()
-            .oneshot(request(
-                "POST",
-                "/internal/knowledge-source/v1/provisional/uploads",
-                Some(&fixture.workspace_token),
-                Body::from(
-                    serde_json::to_vec(&BeginProvisionalUploadRequestV1 {
-                        descriptor: second_descriptor,
-                    })
-                    .unwrap(),
-                ),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(second.status(), StatusCode::CREATED);
-        let second: BeginSourceUploadResponseV1 =
-            serde_json::from_slice(&to_bytes(second.into_body(), 64 * 1024).await.unwrap())
-                .unwrap();
-        fixture.catalog_fixture.install_publication(
-            "p_00000000000000000000000000000001",
-            &fixture.scope,
-            crate::server::state::catalog_fixture::COMMIT_ONE,
-            &[],
-            &[],
-        );
-        fixture
-            .state
-            .accepted_publications
-            .as_ref()
-            .unwrap()
-            .invalidate_content(&fixture.project_id);
-        let stale_renew = app
-            .clone()
-            .oneshot(request(
-                "POST",
-                &format!(
-                    "/internal/knowledge-source/v1/provisional/generations/{}/renew",
-                    finalized.source_generation_id
-                ),
-                Some(&fixture.workspace_token),
-                Body::from(
-                    serde_json::to_vec(&RenewProvisionalGenerationRequestV1 { lease_ttl_secs: 60 })
-                        .unwrap(),
-                ),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(stale_renew.status(), StatusCode::CONFLICT);
-        assert_eq!(
-            fixture
-                .state
-                .knowledge_sources
-                .store()
-                .provisional_status(
-                    &ProvisionalAuthorityV1 {
-                        project_id: fixture.project_id.as_str().to_string(),
-                        scope: fixture.scope.clone(),
-                        workspace_id: fixture.workspace_id.clone(),
-                    },
-                    &finalized.source_generation_id,
-                )
-                .unwrap()
-                .state,
-            SourceGenerationStateV1::Retired
-        );
-        let stale_finalize = app
-            .oneshot(request(
-                "POST",
-                &format!(
-                    "/internal/knowledge-source/v1/provisional/uploads/{}/finalize",
-                    second.upload_id
-                ),
-                Some(&fixture.workspace_token),
-                Body::from(
-                    serde_json::to_vec(&FinalizeProvisionalUploadRequestV1 { lease_ttl_secs: 60 })
-                        .unwrap(),
-                ),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(stale_finalize.status(), StatusCode::CONFLICT);
-    }
-
-    /// A capture that fails after `begin` (the graph-manifest 422 that
-    /// motivated this) used to leave an open upload holding the sequence, and
-    /// every later capture at that sequence answered 409 until the idle TTL
-    /// expired it. The workspace binding is one writer: its newest descriptor
-    /// supersedes the stale upload, and the abort route lets the client
-    /// abandon its own failed upload explicitly.
-    #[tokio::test]
-    async fn stale_open_upload_is_superseded_and_abort_abandons_uploads() {
-        let temporary = tempfile::tempdir().unwrap();
-        let root = temporary.path().canonicalize().unwrap();
-        let fixture = enabled_state(&root);
-        let app = router(fixture.state.clone()).with_state(fixture.state.clone());
-        let begin = |descriptor: bbox_knowledge_source::ProvisionalWorkspaceDescriptorV1| {
-            request(
-                "POST",
-                "/internal/knowledge-source/v1/provisional/uploads",
-                Some(&fixture.workspace_token),
-                Body::from(
-                    serde_json::to_vec(&BeginProvisionalUploadRequestV1 { descriptor }).unwrap(),
-                ),
-            )
-        };
-        let missing = |upload_id: &str, token: &str| {
-            request(
-                "GET",
-                &format!("/internal/knowledge-source/v1/provisional/uploads/{upload_id}/missing"),
-                Some(token),
-                Body::empty(),
-            )
-        };
-        let abort = |upload_id: &str, token: &str| {
-            request(
-                "POST",
-                &format!("/internal/knowledge-source/v1/provisional/uploads/{upload_id}/abort"),
-                Some(token),
-                Body::empty(),
-            )
-        };
-
-        let (descriptor, nodes) = provisional_descriptor(
-            fixture.scope.clone(),
-            fixture.workspace_id.clone(),
-            fixture.accepted_generation.clone(),
-            fixture.accepted_commit.clone(),
-        );
-        let stale = app
-            .clone()
-            .oneshot(begin(descriptor.clone()))
-            .await
-            .unwrap();
-        assert_eq!(stale.status(), StatusCode::CREATED);
-        let stale: BeginSourceUploadResponseV1 =
-            serde_json::from_slice(&to_bytes(stale.into_body(), 64 * 1024).await.unwrap()).unwrap();
-        let ancestry = app
-            .clone()
-            .oneshot(request(
-                "POST",
-                &format!(
-                    "/internal/knowledge-source/v1/provisional/uploads/{}/ancestry/0",
-                    stale.upload_id
-                ),
-                Some(&fixture.workspace_token),
-                Body::from(
-                    serde_json::to_vec(&AncestryPageV1 {
-                        page_index: 0,
-                        nodes,
-                    })
-                    .unwrap(),
-                ),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(ancestry.status(), StatusCode::NO_CONTENT);
-
-        // The checkout moved on at the same sequence: superseded, not 409.
-        let mut moved = descriptor.clone();
-        moved.checkout_head = "2".repeat(40);
-        let fresh = app.clone().oneshot(begin(moved)).await.unwrap();
-        assert_eq!(fresh.status(), StatusCode::CREATED);
-        let fresh: BeginSourceUploadResponseV1 =
-            serde_json::from_slice(&to_bytes(fresh.into_body(), 64 * 1024).await.unwrap()).unwrap();
-        assert_ne!(fresh.upload_id, stale.upload_id);
-        assert_eq!(
-            app.clone()
-                .oneshot(missing(&stale.upload_id, &fixture.workspace_token))
-                .await
-                .unwrap()
-                .status(),
-            StatusCode::NOT_FOUND
-        );
-
-        // Abort is authority-bound: another workspace's token is a no-op.
-        assert_eq!(
-            app.clone()
-                .oneshot(abort(&fresh.upload_id, &fixture.other_workspace_token))
-                .await
-                .unwrap()
-                .status(),
-            StatusCode::NO_CONTENT
-        );
-        assert_ne!(
-            app.clone()
-                .oneshot(missing(&fresh.upload_id, &fixture.workspace_token))
-                .await
-                .unwrap()
-                .status(),
-            StatusCode::NOT_FOUND
-        );
-        for _ in 0..2 {
-            assert_eq!(
-                app.clone()
-                    .oneshot(abort(&fresh.upload_id, &fixture.workspace_token))
-                    .await
-                    .unwrap()
-                    .status(),
-                StatusCode::NO_CONTENT
-            );
-        }
-        assert_eq!(
-            app.clone()
-                .oneshot(missing(&fresh.upload_id, &fixture.workspace_token))
-                .await
-                .unwrap()
-                .status(),
-            StatusCode::NOT_FOUND
-        );
-        // And the same descriptor begins clean afterwards.
-        let again = app.oneshot(begin(descriptor)).await.unwrap();
-        assert_eq!(again.status(), StatusCode::CREATED);
-    }
-
-    /// The 409 names what holds the sequence when the store knows, so a
-    /// capture author converges instead of guessing.
-    #[test]
-    fn generation_conflict_message_names_the_holder() {
-        let detail = bbox_knowledge_source_store::ProvisionalSequenceConflict {
-            sequence: 7,
-            requested_generation_id: format!("kws_{}", "a".repeat(64)),
-            existing_generation_id: format!("kws_{}", "b".repeat(64)),
-            holder: bbox_knowledge_source_store::ProvisionalSequenceHolder::FinalizedSequence,
-        };
-        let error = HttpError::from_store(
-            anyhow::Error::new(StoreRequestError::Conflict).context(detail.clone()),
-        );
-        assert_eq!(error.status, StatusCode::CONFLICT);
-        assert_eq!(error.body.code, "knowledge_source_generation_conflict");
-        assert!(
-            error.body.message.contains("sequence 7"),
-            "{}",
-            error.body.message
-        );
-        assert!(
-            error.body.message.contains(&detail.existing_generation_id),
-            "{}",
-            error.body.message
-        );
-        assert!(
-            error.body.message.contains(&detail.requested_generation_id),
-            "{}",
-            error.body.message
-        );
-        // A bare Conflict keeps the coarse message.
-        let bare = HttpError::from_store(anyhow::Error::new(StoreRequestError::Conflict));
-        assert_eq!(bare.body.code, "knowledge_source_generation_conflict");
-        assert!(!bare.body.message.contains("sequence"));
-    }
-
-    /// The 2026-08-13 ingest starvation, reduced to its smallest form.
-    ///
-    /// The provisional handlers read accepted publications through an
-    /// on-disk exclusive lock whose waiter spin-sleeps on
-    /// `std::thread::sleep` for up to 15s
-    /// (`acquire_store_lock_nofollow_with_timeout`). Run inline in an
-    /// `async fn` body, that parks a tokio WORKER. One worker per core means
-    /// a few concurrent requests park the entire runtime, after which
-    /// nothing is polled: not the MCP transport, not the accept loop, and
-    /// not `/healthz`, whose handler holds no lock and is ready on its first
-    /// poll.
-    ///
-    /// This runs on a deliberately single-worker runtime so that a
-    /// regression (moving the wait back onto the worker) cannot pass: with
-    /// one worker parked there is no second worker to rescue the spawned
-    /// task.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn blocking_http_keeps_a_parked_operation_off_the_only_worker() {
-        let parked = tokio::spawn(blocking_http(move || {
-            // Stand-in for the lock waiter's spin-sleep.
-            std::thread::sleep(std::time::Duration::from_millis(600));
-            Ok::<_, HttpError>(())
-        }));
-
-        // A trivial spawned task needs the worker to poll it. If the parked
-        // operation were sitting on that worker, this could not finish until
-        // the sleep above did.
-        let polled = tokio::time::timeout(
-            std::time::Duration::from_millis(250),
-            tokio::spawn(async { 7_u8 }),
-        )
-        .await
-        .expect("the runtime must keep polling ready tasks while the operation is parked")
-        .expect("the probe task must not panic");
-        assert_eq!(polled, 7);
-
-        parked
-            .await
-            .expect("the parked task must not panic")
-            .expect("the parked operation must succeed");
-    }
-
-    /// `blocking` maps its error through `HttpError::from_store`, which would
-    /// flatten an already-shaped status. The provisional currency checks
-    /// answer 409 `knowledge_source_accepted_generation_stale`, and clients
-    /// branch on exactly that, so the relocation must not disturb it.
-    #[tokio::test]
-    async fn blocking_http_preserves_the_operation_status_and_code() {
-        let error = blocking_http(move || {
-            Err::<(), _>(HttpError::new(
-                StatusCode::CONFLICT,
-                "knowledge_source_accepted_generation_stale",
-                "workspace scope no longer matches accepted publication",
-            ))
-        })
-        .await
-        .expect_err("the operation error must surface");
-
-        assert_eq!(error.status, StatusCode::CONFLICT);
-        assert_eq!(
-            error.body.code,
-            "knowledge_source_accepted_generation_stale"
-        );
     }
 }

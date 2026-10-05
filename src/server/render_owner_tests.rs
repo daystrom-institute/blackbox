@@ -327,17 +327,17 @@ async fn owner_renders_keep_view_provider_project_doc_and_file_semantics() {
     let (scope, _) = scopes();
     let root = owner.root(&scope).to_path_buf();
 
-    // Explicit own still requires authoritative checkout context, and the
-    // refusal issues no operation.
+    // A removed view selector is an unknown field and issues no operation.
     announce(&server, owner.roots.keys().cloned().collect());
-    let refused = server
-        .bbox_render(Parameters(RenderParams {
-            provisional: Some("own".into()),
-            ..project_params(UNCOVERED)
+    for removed in ["provisional", "visibility"] {
+        let refused = serde_json::from_value::<RenderParams>(serde_json::json!({
+            "project": UNCOVERED,
+            "scope": "project",
+            removed: "own",
         }))
-        .await;
-    assert_eq!(refused.is_error, Some(true));
-    assert!(text(&refused).contains("own requires authoritative checkout context"));
+        .unwrap_err();
+        assert!(refused.to_string().contains("unknown field"), "{refused}");
+    }
     assert_eq!(
         server.state.render_operations.latest_sequence(UNCOVERED),
         None
@@ -359,17 +359,16 @@ async fn owner_renders_keep_view_provider_project_doc_and_file_semantics() {
         None
     );
 
-    let all = render_with_owner(
+    let published = render_with_owner(
         &server,
         &owner,
         RenderParams {
-            provisional: Some("all".into()),
             provider: Some("claude".into()),
             ..project_params(UNCOVERED)
         },
     )
     .await;
-    assert_eq!(all["view"], "all");
+    assert_eq!(published["view"], "published");
     assert!(root.join("CLAUDE.md").is_file());
     assert!(
         !root.join("AGENTS.md").exists(),
@@ -988,7 +987,6 @@ async fn complete_harness_render(
     let params = RenderParams {
         project: Some(crate::tools::render::BOUND_WORKSPACE_RENDER_SELECTOR.into()),
         scope: Some("project".into()),
-        provisional: Some("published".into()),
         ..Default::default()
     };
     let mut assembler = ProjectRenderPlanAssemblerV1::default();

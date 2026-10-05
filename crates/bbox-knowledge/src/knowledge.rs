@@ -99,6 +99,7 @@ pub struct LearnParams {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct KnowledgeListParams {
     #[serde(default)]
     pub category: Option<String>,
@@ -143,11 +144,6 @@ pub struct KnowledgeListParams {
     /// Maximum bytes per detail body page. Values are clamped to 256..4096.
     #[serde(default)]
     pub detail_limit: Option<u64>,
-    /// Published knowledge only, the authoritative session checkout's view,
-    /// or every valid provisional variant. Defaults to own when the session
-    /// has checkout authority, otherwise published.
-    #[serde(default)]
-    pub provisional: Option<String>,
     /// Internal, not part of the MCP schema: an additional project path the
     /// project filter also matches. Set by the daemon adapter when `project`
     /// was a managed-worktree path resolved to its registered base, so entries
@@ -181,6 +177,7 @@ pub struct ForgetParams {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RenderParams {
     /// Render for specific provider or all
     #[serde(default)]
@@ -207,9 +204,6 @@ pub struct RenderParams {
     /// dry_run is meaningless here because nothing is written daemon-side.
     #[serde(default)]
     pub global_plan: Option<GlobalRenderPlanRequestV1>,
-    /// Provisional visibility policy: published, own, or all.
-    #[serde(default)]
-    pub provisional: Option<String>,
     /// Recover one earlier checkout-owner project render by its operation id
     /// (`ro-...`, returned when a render was still pending). Returns the
     /// recorded receipt and whether it is still current; it never re-applies
@@ -392,13 +386,11 @@ struct QueryMatch {
 pub struct KnowledgeViewMetadata {
     pub logical_ref: String,
     pub published_scope: Option<bbox_corpus_core::identity::PublishedScope>,
-    pub checkout_id: Option<String>,
     pub content_hash: Option<String>,
-    pub overlay_snapshot_id: Option<String>,
     /// Response-local reference into the containing view's `built_from`
     /// table. This is detached-view metadata and is never persisted.
     pub built_from_ref: Option<String>,
-    /// Explicit label for rows that predate provable published/overlay
+    /// Explicit label for rows that predate provable published
     /// provenance. Never populated for newly assembled stamped rows.
     pub compatibility_lane: Option<String>,
 }
@@ -719,10 +711,7 @@ fn project_is_repo_owned(project_dir: &Path) -> bool {
 
 /// Load every project-scoped entry committed under `<project_dir>/.bbox/knowledge/`,
 /// stamping each with `project = project_dir` (the field is absent on disk).
-fn load_repo_kb_entries(
-    project_dir: &Path,
-    durable_project: &str,
-) -> Result<(Vec<KnowledgeEntry>, BTreeMap<String, EntryProvenance>)> {
+fn load_repo_kb_entries(project_dir: &Path, durable_project: &str) -> Result<Vec<KnowledgeEntry>> {
     let git_root = bbox_corpus_core::git::git_root_for_path(project_dir);
     let transaction_root = git_root.as_deref().unwrap_or(project_dir);
     if crate::transaction::has_pending_transaction(transaction_root) {
@@ -730,28 +719,21 @@ fn load_repo_kb_entries(
             project = %project_dir.display(),
             "kb load skipped checkout with pending knowledge transaction"
         );
-        return Ok((Vec::new(), BTreeMap::new()));
+        return Ok(Vec::new());
     }
     let dir = repo_kb_dir(project_dir);
     let directory = match bbox_corpus_core::json_store::NofollowDirectory::open_existing(&dir) {
         Ok(Some(directory)) => directory,
-        Ok(None) => return Ok((Vec::new(), BTreeMap::new())),
+        Ok(None) => return Ok(Vec::new()),
         Err(error) => {
             tracing::warn!(
                 "kb load: refusing unsafe directory {}: {error:#}",
                 dir.display()
             );
-            return Ok((Vec::new(), BTreeMap::new()));
+            return Ok(Vec::new());
         }
     };
     let mut out = Vec::new();
-    let mut provenance = BTreeMap::new();
-    // Committed-tree context for the published-vs-provisional label (slice 3.2),
-    // computed once per root: the git root plus the repo-relative prefix of this
-    // checkout's `.bbox/` (`""` at repo root, `"<sub>/"` for a monorepo
-    // subproject). `None` for a non-git root or one with no HEAD — every entry
-    // then stays `Unknown` (absent from the map).
-    let prov_ctx = provenance_context(project_dir);
     let mut skipped = 0usize;
     // A directory-level read failure (TOCTOU between the exists() check and the
     // read, a permissions blip) must also be non-fatal: aborting here would let
@@ -762,7 +744,7 @@ fn load_repo_kb_entries(
         Ok(rd) => rd,
         Err(e) => {
             tracing::warn!("kb load: cannot read {}: {e}", dir.display());
-            return Ok((Vec::new(), BTreeMap::new()));
+            return Ok(Vec::new());
         }
     };
     // Skip-and-continue per file: a single malformed/partial entry (e.g. an
@@ -814,22 +796,6 @@ fn load_repo_kb_entries(
         entry.scope = Scope::Project;
         entry.project = Some(durable_project.to_string());
         entry.project_id = None;
-        // Published-vs-provisional label (slice 3.2): a working file
-        // byte-identical to its committed-tree blob is Published; anything else
-        // (new, modified, or committed-read failed while the root IS a git repo
-        // with a HEAD) is Provisional. Unknown (absent) when there is no git
-        // context. `raw` is the committed-FORMAT on-disk content (project +
-        // recall are stripped from committed files and re-applied in memory),
-        // so a byte comparison against the committed blob is exact.
-        if let Some((git_root, rel_prefix)) = &prov_ctx {
-            let repo_rel = format!("{rel_prefix}.bbox/knowledge/{}.json", entry.id);
-            let prov = match bbox_corpus_core::git::read_committed_file(git_root, "HEAD", &repo_rel)
-            {
-                Some(committed) if committed.as_bytes() == raw => EntryProvenance::Published,
-                _ => EntryProvenance::Provisional,
-            };
-            provenance.insert(entry.id.clone(), prov);
-        }
         out.push(entry);
     }
     // Merge host-local recall telemetry back onto the committed (recall-free)
@@ -850,25 +816,9 @@ fn load_repo_kb_entries(
             "kb load: directory changed during read {}; discarding snapshot: {error:#}",
             dir.display()
         );
-        return Ok((Vec::new(), BTreeMap::new()));
+        return Ok(Vec::new());
     }
-    Ok((out, provenance))
-}
-
-/// Committed-tree context for the provenance label: the git root plus the
-/// repo-relative prefix of `project_dir`'s `.bbox/` (`""` at the repo root,
-/// `"<sub>/"` for a monorepo subproject). `None` when `project_dir` is not in a
-/// git repo, the repo has no HEAD, or the root sits outside the resolved git
-/// tree — every entry then stays `Unknown`.
-fn provenance_context(project_dir: &Path) -> Option<(PathBuf, String)> {
-    let git_root = bbox_corpus_core::git::git_root_for_path(project_dir)?;
-    bbox_corpus_core::git::current_head(&git_root)?;
-    let rel_prefix = match bbox_corpus_core::identity::bbox_root_relpath(&git_root, project_dir) {
-        Some(rel) if rel == "." => String::new(),
-        Some(rel) => format!("{rel}/"),
-        None => return None,
-    };
-    Some((git_root, rel_prefix))
+    Ok(out)
 }
 
 /// Persist `entries` (all owned by `project_dir`) one file per entry under
@@ -1012,22 +962,10 @@ pub struct KnowledgeStore {
     /// dropped on load, so the next persist deletes them.
     #[serde(deserialize_with = "deserialize_stored_entries")]
     pub entries: Vec<KnowledgeEntry>,
-    /// Load-time published-vs-provisional label per entry id (design §3.4 /
-    /// slice 3.2). An entry whose committed-tree blob is byte-identical to its
-    /// working file is [`EntryProvenance::Published`]; a dirty/new/uncommitted
-    /// working file is [`EntryProvenance::Provisional`]; a non-git root or a
-    /// root with no HEAD leaves the id absent (→ [`EntryProvenance::Unknown`]).
-    ///
-    /// Labeling ONLY (slice 3.2): it does not change which entries are visible;
-    /// the working tree is still the source of truth for the query surface. The
-    /// label is what the cross-checkout visibility rule and the merge gate will
-    /// consume. `#[serde(skip)]`: never persisted, recomputed each reload.
-    #[serde(skip)]
-    pub provenance: BTreeMap<String, EntryProvenance>,
     /// Load-time provenance: durable project scope → the HEAD commit its
     /// committed `.bbox/knowledge/` entries were built from at the last reload
     /// (design §3.4, "built_from" stamp). This is the commit a consumer reads
-    /// to distinguish published from provisional once the overlay lands.
+    /// for its `built_from` stamp.
     ///
     /// NEVER persisted: it is `#[serde(skip)]`, so it is absent from both the
     /// central `kb.json` and every repo-owned entry file, and is recomputed
@@ -1040,30 +978,12 @@ pub struct KnowledgeStore {
     pub built_from: BTreeMap<String, String>,
 }
 
-/// Published-vs-provisional label for a durable entry, derived at load by
-/// comparing the working file to its committed-tree blob (design §3.4, slice
-/// 3.2). Never persisted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum EntryProvenance {
-    /// Provenance not determined: a non-git root, a root with no HEAD, or an
-    /// entry outside a resolvable git tree. The safe default.
-    #[default]
-    Unknown,
-    /// The working file is byte-identical to the committed-tree blob — the
-    /// entry is published truth.
-    Published,
-    /// The working file is new, modified, or otherwise not byte-identical to
-    /// the committed tree — an uncommitted provisional change.
-    Provisional,
-}
-
 impl KnowledgeStore {
     pub fn new() -> Self {
         Self {
             version: 1,
             entries: Vec::new(),
             built_from: BTreeMap::new(),
-            provenance: BTreeMap::new(),
         }
     }
 }
@@ -1496,7 +1416,6 @@ impl Knowledge {
         // Carry load-time provenance into the snapshot for `StoreSnapshot`
         // consumers. `#[serde(skip)]` keeps it out of the persisted `kb.json`.
         central.built_from = self.store.built_from.clone();
-        central.provenance = self.store.provenance.clone();
         Ok(central)
     }
 
@@ -1625,7 +1544,7 @@ impl Knowledge {
         let persisted = self.with_repo_write(&carrier, |project_dir| {
             if !project_is_repo_owned(project_dir) {
                 anyhow::bail!(
-                    "checkout knowledge carrier {} is unavailable; refusing to retain provisional bytes centrally",
+                    "checkout knowledge carrier {} is unavailable; refusing to retain checkout bytes centrally",
                     carrier.carrier_id
                 );
             }
@@ -1736,7 +1655,7 @@ impl Knowledge {
         let persisted = self.with_repo_write(&carrier, |project_dir| {
             if !project_is_repo_owned(project_dir) {
                 anyhow::bail!(
-                    "checkout knowledge carrier {} is unavailable; refusing to retain provisional bytes centrally",
+                    "checkout knowledge carrier {} is unavailable; refusing to retain checkout bytes centrally",
                     carrier.carrier_id
                 );
             }
@@ -1829,24 +1748,20 @@ impl Knowledge {
         // `built_from` is `#[serde(skip)]` → empty), so clearing here is belt +
         // suspenders against a caller that repopulates without a full reset.
         self.store.built_from.clear();
-        // Provenance is load-time, per-reload state like built_from; clear so a
-        // dropped root or a promoted entry does not keep a stale label.
-        self.store.provenance.clear();
         self.repo_owned_projects.clear();
         self.repo_loaded_ids.clear();
         self.degraded_carriers.clear();
         for carrier in &carriers {
             let durable_project = carrier.project.clone();
             let loaded = self.with_repo_read(carrier, |root| {
-                let (entries, provenance) = load_repo_kb_entries(root, &carrier.project)?;
+                let entries = load_repo_kb_entries(root, &carrier.project)?;
                 Ok((
                     bbox_corpus_core::git::current_head(root),
                     entries,
-                    provenance,
                     project_is_repo_owned(root),
                 ))
             });
-            let (head, entries, mut prov, repo_owned) = match loaded {
+            let (head, entries, repo_owned) = match loaded {
                 Ok(loaded) => loaded,
                 Err(error) => {
                     tracing::warn!(
@@ -1875,12 +1790,8 @@ impl Knowledge {
                     if existing.scope == Scope::Project
                         && existing.project.as_deref() == Some(durable_project.as_str())
                     {
-                        let id = entry.id.clone();
                         *existing = entry;
                         accepted = true;
-                        if let Some(provenance) = prov.remove(&id) {
-                            self.store.provenance.insert(id, provenance);
-                        }
                     } else {
                         tracing::warn!(
                             id = %entry.id,
@@ -1891,12 +1802,8 @@ impl Knowledge {
                         );
                     }
                 } else {
-                    let id = entry.id.clone();
                     self.store.entries.push(entry);
                     accepted = true;
-                    if let Some(provenance) = prov.remove(&id) {
-                        self.store.provenance.insert(id, provenance);
-                    }
                 }
                 if accepted {
                     self.repo_loaded_ids
@@ -1937,8 +1844,7 @@ impl Knowledge {
 
     /// Load-time `built_from` provenance: durable project scope → the
     /// HEAD commit its committed entries were built from at the last reload
-    /// (design §3.4). Recomputed each reload, never persisted. The commit a
-    /// consumer reads to distinguish published from provisional.
+    /// (design §3.4). Recomputed each reload, never persisted.
     pub fn built_from(&self) -> &BTreeMap<String, String> {
         &self.store.built_from
     }
@@ -1948,14 +1854,6 @@ impl Knowledge {
     /// carrier loaded.
     pub fn degraded_carriers(&self) -> &BTreeMap<String, String> {
         &self.degraded_carriers
-    }
-
-    /// Published-vs-provisional label for an entry id (design §3.4, slice 3.2).
-    /// `Unknown` when the id was loaded from a non-git root, a root with no
-    /// HEAD, or is not present. Labeling only — this does not affect which
-    /// entries are visible.
-    pub fn provenance_of(&self, id: &str) -> EntryProvenance {
-        self.store.provenance.get(id).copied().unwrap_or_default()
     }
 
     /// Count entries currently scoped to `project_dir` (across central and any
@@ -2016,9 +1914,8 @@ impl Knowledge {
     }
 
     /// Resolve a logical knowledge ref through a detached visibility view.
-    /// Own-mode views can replace the published entry with one compound
-    /// provisional entity id, while graph edges and older breadcrumbs still
-    /// address the stable `knowledge:<id>` logical ref.
+    /// Graph edges and breadcrumbs address the stable `knowledge:<id>`
+    /// logical ref; exactly one visible row must carry it.
     pub fn entry_for_logical_ref(&self, logical_ref: &str) -> Option<&KnowledgeEntry> {
         let mut candidates = self
             .view_metadata
@@ -2053,14 +1950,10 @@ impl Knowledge {
                     Some(_) => return None,
                     None => substring_match(query, &corpus)?,
                 };
-                let entity_id = if entry.id.starts_with("provisional_knowledge:") {
-                    entry.id.clone()
-                } else {
-                    EntityRef::Knowledge {
-                        id: entry.id.clone(),
-                    }
-                    .to_string()
-                };
+                let entity_id = EntityRef::Knowledge {
+                    id: entry.id.clone(),
+                }
+                .to_string();
                 Some(KnowledgeSearchHit {
                     entity_id,
                     score: query_match.score.max(0.1) as f32,
@@ -2107,7 +2000,7 @@ impl Knowledge {
 
     /// `learn_result` with an explicit checkout carrier. The entry keeps
     /// `p.project` as its durable scope while its repo-owned file is written
-    /// through the opaque logical id in `write_dir`, then the provisional
+    /// through the opaque logical id in `write_dir`, then the checkout
     /// mutation is removed from the central in-memory store. The compatibility
     /// parameter name is retained for callers; the value is never opened as a
     /// path by this crate. `None` preserves base/global behavior.
@@ -2152,7 +2045,7 @@ impl Knowledge {
     }
 
     /// Commit-this rider for the explicit checkout that carried a just-written
-    /// provisional entry. The file itself is the authority because checkout
+    /// checkout entry. The file itself is the authority because checkout
     /// entries are intentionally absent from the central mutable store.
     pub fn repo_record_rider_at(
         &self,
@@ -4096,27 +3989,44 @@ mod tests {
     }
 
     #[test]
-    fn detached_view_resolves_one_provisional_variant_by_logical_ref() {
-        let entity_id = "provisional_knowledge:scope:checkout:entry".to_string();
-        let mut provisional = entry("entry", "provisional", "visible variant", Scope::Project);
-        provisional.id = entity_id.clone();
+    fn detached_view_resolves_one_row_by_logical_ref() {
+        let row = entry("entry", "published", "visible row", Scope::Project);
         let metadata = BTreeMap::from([(
-            entity_id.clone(),
+            "entry".to_string(),
             KnowledgeViewMetadata {
                 logical_ref: "knowledge:entry".into(),
                 built_from_ref: Some("built_from_0".into()),
                 ..Default::default()
             },
         )]);
-        let mut view = Knowledge::detached_view(vec![provisional], metadata);
+        let mut view = Knowledge::detached_view(vec![row], metadata);
 
         assert_eq!(
             view.entry_for_logical_ref("knowledge:entry")
                 .map(|entry| entry.id.as_str()),
-            Some(entity_id.as_str())
+            Some("entry")
         );
         let listed = view.list(&KnowledgeListParams::default()).unwrap();
         assert!(listed.contains("built_from=built_from_0"), "{listed}");
+    }
+
+    #[test]
+    fn removed_visibility_parameters_are_unknown_fields() {
+        for removed in ["provisional", "visibility", "checkout_id"] {
+            let listed = serde_json::from_value::<KnowledgeListParams>(serde_json::json!({
+                removed: "all"
+            }))
+            .unwrap_err()
+            .to_string();
+            assert!(listed.contains("unknown field"), "{listed}");
+            let rendered = serde_json::from_value::<RenderParams>(serde_json::json!({
+                "project": "p",
+                removed: "own"
+            }))
+            .unwrap_err()
+            .to_string();
+            assert!(rendered.contains("unknown field"), "{rendered}");
+        }
     }
 
     #[test]
@@ -4142,7 +4052,6 @@ mod tests {
                 scope: Some("project".into()),
                 dry_run: Some(false),
                 global_plan: None,
-                provisional: None,
                 operation: None,
                 scope_project: Some("/registry/base".into()),
                 locality: None,
@@ -4187,7 +4096,7 @@ mod tests {
             producer: None,
             provider: provider.map(str::to_owned),
             dry_run,
-            view: ProjectRenderViewV1::Own,
+            view: ProjectRenderViewV1::Published,
             requested_scope: "project".into(),
             entries: vec![rendered],
             diagnostics: None,
@@ -4298,7 +4207,7 @@ mod tests {
 
     /// A checkout-scoped write keeps the entry keyed to the base scope while
     /// the committed file lands in the worktree. The central store does not
-    /// retain a duplicate; provisional visibility belongs to the overlay.
+    /// retain a duplicate.
     #[test]
     fn learn_with_write_dir_redirects_repo_file_and_keeps_base_scope() {
         let central = tempfile::tempdir().unwrap();
@@ -4331,7 +4240,7 @@ mod tests {
         assert!(repo_kb_dir(&wt_root).join(format!("{id}.json")).exists());
         assert!(!repo_kb_dir(&base_root).join(format!("{id}.json")).exists());
 
-        // The central store and mutable base view do not retain provisional
+        // The central store and mutable base view do not retain checkout
         // bytes. The commit rider is derived from the explicit checkout file.
         let central = kb.central_snapshot().unwrap();
         assert!(!central.entries.iter().any(|e| e.id == id));
@@ -5347,8 +5256,7 @@ mod tests {
         );
 
         // Reload merges telemetry back onto the recall-free committed entry.
-        let (loaded, _prov) =
-            load_repo_kb_entries(&repo_root, &repo_root.to_string_lossy()).unwrap();
+        let loaded = load_repo_kb_entries(&repo_root, &repo_root.to_string_lossy()).unwrap();
         let e = loaded.iter().find(|e| e.id == "recl0001").unwrap();
         assert_eq!(e.recall_count, 99);
         assert_eq!(e.last_recalled.as_deref(), Some("2026-05-31T00:00:00Z"));
@@ -5510,7 +5418,7 @@ mod tests {
         )
         .unwrap();
 
-        let (loaded, _) = load_repo_kb_entries(&root, root.to_string_lossy().as_ref()).unwrap();
+        let loaded = load_repo_kb_entries(&root, root.to_string_lossy().as_ref()).unwrap();
         assert!(loaded.is_empty(), "unsafe id must not enter the live store");
 
         let known_ids = BTreeSet::from([unsafe_entry.id.as_str()]);
@@ -5538,7 +5446,7 @@ mod tests {
         fs::create_dir_all(repo_kb_dir(&root)).unwrap();
         symlink(&target, repo_kb_dir(&root).join("linked.json")).unwrap();
 
-        let (loaded, _) = load_repo_kb_entries(&root, root.to_string_lossy().as_ref()).unwrap();
+        let loaded = load_repo_kb_entries(&root, root.to_string_lossy().as_ref()).unwrap();
         assert!(loaded.is_empty(), "symlinked knowledge must not load");
     }
 
@@ -5558,7 +5466,7 @@ mod tests {
         .unwrap();
         symlink(outside.path(), repo_kb_dir(&root)).unwrap();
 
-        let (loaded, _) = load_repo_kb_entries(&root, root.to_string_lossy().as_ref()).unwrap();
+        let loaded = load_repo_kb_entries(&root, root.to_string_lossy().as_ref()).unwrap();
         assert!(
             loaded.is_empty(),
             "symlinked knowledge directory must not load"
@@ -5601,7 +5509,6 @@ mod tests {
         let central_store = KnowledgeStore {
             version: 1,
             entries: vec![global],
-            provenance: BTreeMap::new(),
             built_from: BTreeMap::new(),
         };
         let store_path = central.path().join("kb.json");
@@ -5650,7 +5557,6 @@ mod tests {
         let legacy = KnowledgeStore {
             version: 1,
             built_from: Default::default(),
-            provenance: Default::default(),
             entries: vec![KnowledgeEntry {
                 render_placement: Default::default(),
                 id: "legacy01".into(),
@@ -6391,7 +6297,7 @@ mod tests {
         assert!(kb2.built_from().is_empty());
     }
 
-    // ── published-vs-provisional labeling (design §3.4, slice 3.2) ─────
+    // ── git fixtures ─────
 
     fn git_run(dir: &Path, args: &[&str]) {
         assert!(
@@ -6426,94 +6332,6 @@ mod tests {
             last_recalled: None,
         };
         serde_json::to_string(&e).unwrap()
-    }
-
-    #[test]
-    fn provenance_labels_published_and_provisional() {
-        let central = tempfile::tempdir().unwrap();
-        let repo = tempfile::tempdir().unwrap();
-        let root = repo.path().canonicalize().unwrap();
-        git_init_commit(&root); // seed commit so HEAD exists
-        let kbdir = repo_kb_dir(&root);
-        std::fs::create_dir_all(&kbdir).unwrap();
-        // Two committed entries.
-        std::fs::write(kbdir.join("e1.json"), entry_json("e1", "one")).unwrap();
-        std::fs::write(kbdir.join("e2.json"), entry_json("e2", "two")).unwrap();
-        git_run(&root, &["add", "."]);
-        git_run(&root, &["commit", "-q", "-m", "entries"]);
-        // e2 modified in the working tree; e3 brand new (uncommitted).
-        std::fs::write(kbdir.join("e2.json"), entry_json("e2", "two-EDITED")).unwrap();
-        std::fs::write(kbdir.join("e3.json"), entry_json("e3", "three")).unwrap();
-
-        let mut kb = Knowledge::open(&central.path().join("kb.json")).unwrap();
-        kb.set_project_roots(vec![root.clone()]).unwrap();
-
-        // Labeling ONLY: all three working-tree entries stay visible.
-        assert!(kb.entry("e1").is_some());
-        assert!(kb.entry("e2").is_some());
-        assert!(kb.entry("e3").is_some());
-        // Labels reflect committed-vs-working.
-        assert_eq!(kb.provenance_of("e1"), EntryProvenance::Published);
-        assert_eq!(kb.provenance_of("e2"), EntryProvenance::Provisional);
-        assert_eq!(kb.provenance_of("e3"), EntryProvenance::Provisional);
-    }
-
-    #[test]
-    fn provenance_unknown_for_non_git_root() {
-        let central = tempfile::tempdir().unwrap();
-        let repo = tempfile::tempdir().unwrap();
-        let root = repo.path().canonicalize().unwrap();
-        let kbdir = repo_kb_dir(&root);
-        std::fs::create_dir_all(&kbdir).unwrap();
-        std::fs::write(kbdir.join("e1.json"), entry_json("e1", "one")).unwrap();
-
-        let mut kb = Knowledge::open(&central.path().join("kb.json")).unwrap();
-        kb.set_project_roots(vec![root.clone()]).unwrap();
-        // Still visible, just unlabeled.
-        assert!(kb.entry("e1").is_some());
-        assert_eq!(kb.provenance_of("e1"), EntryProvenance::Unknown);
-    }
-
-    #[test]
-    fn provenance_field_is_never_serialized() {
-        // The label is #[serde(skip)]: it must never appear in the persisted
-        // store, and must skip-deserialize to empty. (Testing the invariant
-        // directly, not through save() — save rewrites repo-owned files in the
-        // daemon's persist format, a separate concern from serialization.)
-        let mut store = KnowledgeStore::new();
-        store
-            .provenance
-            .insert("e1".into(), EntryProvenance::Published);
-        let json = serde_json::to_string(&store).unwrap();
-        assert!(
-            !json.contains("provenance"),
-            "provenance must not be serialized: {json}"
-        );
-        let back: KnowledgeStore = serde_json::from_str(&json).unwrap();
-        assert!(
-            back.provenance.is_empty(),
-            "provenance must skip-deserialize to empty"
-        );
-    }
-
-    #[test]
-    fn provenance_recomputed_and_cleared_on_root_change() {
-        let central = tempfile::tempdir().unwrap();
-        let repo = tempfile::tempdir().unwrap();
-        let root = repo.path().canonicalize().unwrap();
-        git_init_commit(&root);
-        let kbdir = repo_kb_dir(&root);
-        std::fs::create_dir_all(&kbdir).unwrap();
-        std::fs::write(kbdir.join("e1.json"), entry_json("e1", "one")).unwrap();
-
-        let mut kb = Knowledge::open(&central.path().join("kb.json")).unwrap();
-        // Uncommitted new entry → Provisional.
-        kb.set_project_roots(vec![root.clone()]).unwrap();
-        assert_eq!(kb.provenance_of("e1"), EntryProvenance::Provisional);
-
-        // Dropping the root clears the label.
-        kb.set_project_roots(vec![]).unwrap();
-        assert_eq!(kb.provenance_of("e1"), EntryProvenance::Unknown);
     }
 
     // ── Dual-read (plan §8.2) ────────────────────────────────────────────

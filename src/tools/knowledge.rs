@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use crate::knowledge::{ForgetParams, KnowledgeListParams, LearnParams, ResponseFormat};
 use crate::server::BlackboxServer;
@@ -117,7 +117,7 @@ pub(crate) fn router() -> ToolRouter<BlackboxServer> {
 }
 
 fn has_runtime_knowledge_filter(p: &KnowledgeListParams) -> bool {
-    p.scope.is_some() || p.project.is_some() || p.provider.is_some() || p.provisional.is_some()
+    p.scope.is_some() || p.project.is_some() || p.provider.is_some()
 }
 
 /// Extract the top knowledge entry id from a `kb.list` entries block for the
@@ -139,16 +139,7 @@ fn entry_ids(entries_block: &str) -> Vec<String> {
             let rest = line.strip_prefix('[')?;
             let end = rest.find(']')?;
             let id = rest[..end].trim();
-            if id.is_empty() {
-                return None;
-            }
-            match bbox_corpus_core::entity_ref::EntityRef::parse(id) {
-                Ok(bbox_corpus_core::entity_ref::EntityRef::ProvisionalKnowledge {
-                    entry_id,
-                    ..
-                }) => Some(entry_id),
-                _ => Some(id.to_string()),
-            }
+            (!id.is_empty()).then(|| id.to_string())
         })
         .collect()
 }
@@ -166,100 +157,7 @@ fn returned_entry_ids(entries_block: &str) -> Vec<String> {
 }
 
 fn knowledge_entity_ref(id: &str) -> String {
-    if id.starts_with("provisional_knowledge:") {
-        id.to_string()
-    } else {
-        format!("knowledge:{id}")
-    }
-}
-
-fn stable_knowledge_overlay(
-    publisher_root: &std::path::Path,
-    published_ref: &str,
-    checkout_lease: &bbox_indexing::checkout_access::ValidatedCheckoutLease,
-    checkout: &bbox_corpus_core::project_record::ResolvedCheckoutScope,
-) -> Result<bbox_knowledge::overlay::OverlaySnapshot, bbox_knowledge::overlay::OverlayRecomputeError>
-{
-    use bbox_knowledge::overlay::{
-        OverlayRecomputeError, WorkingKnowledgeSnapshot, recompute_overlay_result,
-    };
-
-    let pending = || {
-        checkout_lease
-            .checkout_relative_regular_file_exists(
-                ".bbox/local/knowledge-transactions/pending.json",
-            )
-            .map_err(anyhow::Error::new)
-            .map_err(OverlayRecomputeError::transient)
-    };
-    let working = || {
-        let files = checkout_lease
-            .read_relative_json_directory(".bbox/knowledge")
-            .map_err(anyhow::Error::new)
-            .map_err(OverlayRecomputeError::transient)?;
-        WorkingKnowledgeSnapshot::new(files).map_err(OverlayRecomputeError::transient)
-    };
-    if pending()? {
-        return Err(OverlayRecomputeError::transient(anyhow::anyhow!(
-            "checkout transaction is pending; provisional overlay refresh deferred"
-        )));
-    }
-    let first_working = working()?;
-    let mut candidate = recompute_overlay_result(
-        publisher_root,
-        published_ref,
-        checkout_lease.checkout_root(),
-        &first_working,
-        checkout,
-    )?;
-    for _ in 0..2 {
-        if pending()? {
-            return Err(OverlayRecomputeError::transient(anyhow::anyhow!(
-                "checkout transaction began during provisional overlay refresh"
-            )));
-        }
-        let next_working = working()?;
-        let next = recompute_overlay_result(
-            publisher_root,
-            published_ref,
-            checkout_lease.checkout_root(),
-            &next_working,
-            checkout,
-        )?;
-        if same_knowledge_snapshot(&candidate, &next) && !pending()? {
-            return Ok(next);
-        }
-        candidate = next;
-    }
-    Err(OverlayRecomputeError::transient(anyhow::anyhow!(
-        "checkout state changed repeatedly during provisional overlay refresh"
-    )))
-}
-
-fn classify_knowledge_overlay_access_error(
-    error: anyhow::Error,
-) -> bbox_knowledge::overlay::OverlayRecomputeError {
-    if error
-        .downcast_ref::<bbox_indexing::checkout_access::CheckoutAccessError>()
-        .is_some_and(|access| {
-            crate::server::checkout_access_error_is_definitively_stale(access.code)
-        })
-    {
-        return bbox_knowledge::overlay::OverlayRecomputeError::invalid_content(error);
-    }
-    match error.downcast::<bbox_knowledge::overlay::OverlayRecomputeError>() {
-        Ok(error) => error,
-        Err(error) => bbox_knowledge::overlay::OverlayRecomputeError::transient(error),
-    }
-}
-
-fn same_knowledge_snapshot(
-    left: &bbox_knowledge::overlay::OverlaySnapshot,
-    right: &bbox_knowledge::overlay::OverlaySnapshot,
-) -> bool {
-    left.snapshot_id == right.snapshot_id
-        && left.status == right.status
-        && left.diagnostics == right.diagnostics
+    format!("knowledge:{id}")
 }
 
 fn log_tool_ok(tool: &'static str, start: std::time::Instant, bytes: usize) {
@@ -438,7 +336,7 @@ impl BlackboxServer {
                 .any(|record| record.canonical_path == durable_scope);
         if registered_without_checkout {
             anyhow::bail!(
-                "managed checkout {raw} has no provisional identity; refusing a write that cannot be reconstructed after restart"
+                "managed checkout {raw} has no checkout identity; refusing a write that cannot be reconstructed after restart"
             );
         }
         *project = Some(durable_scope);
@@ -899,216 +797,6 @@ impl BlackboxServer {
         }
         Err(anyhow::Error::new(CheckoutRegistryChanged))
     }
-
-    pub(crate) fn refresh_dark_knowledge_overlay(
-        &self,
-        checkout: &bbox_corpus_core::project_record::ResolvedCheckoutScope,
-    ) -> crate::server::KnowledgeOverlayRefreshOutcome {
-        use crate::server::KnowledgeOverlayRefreshOutcome;
-        use bbox_knowledge::overlay::{
-            OverlayKey, OverlayRecomputeError, OverlayRecomputeErrorKind, OverlaySnapshot,
-            OverlayStatus, TransientPreservationOutcome,
-        };
-
-        let _refresh = self.state.knowledge_overlay_refresh.lock();
-        // An explicit overlay refresh is an observer boundary, not a hot view
-        // read. Re-resolve authority now so publisher movement promotes away
-        // matching provisional values immediately. The following gap refresh
-        // reuses this freshly cached decision.
-        self.invalidate_publisher_authority_cache(&checkout.published_scope);
-        let generation = self
-            .state
-            .knowledge_overlays
-            .write()
-            .begin_refresh(OverlayKey {
-                published_scope: checkout.published_scope.clone(),
-                checkout_id: checkout.checkout_id.clone(),
-            });
-        let projects = self.state.records_provider.records_snapshot().records;
-        let prior = self
-            .state
-            .knowledge_overlays
-            .read()
-            .get(&checkout.published_scope, &checkout.checkout_id)
-            .cloned();
-        let prior_is_valid = prior
-            .as_ref()
-            .is_some_and(|snapshot| snapshot.status == OverlayStatus::Valid);
-        let mut publisher_project = None;
-        let mut publication_guard = None;
-        let snapshot = match self
-            .authorize_publisher_classified(&projects, &checkout.published_scope)
-        {
-            Ok(publisher) => {
-                publisher_project = projects
-                    .iter()
-                    .find(|project| project.project_id == publisher.project_id)
-                    .map(|project| project.canonical_path.clone());
-                let refreshed = match self.acquire_authorized_overlay_access(&publisher, checkout) {
-                    Ok((publisher_lease, checkout_lease)) => {
-                        let prepared = stable_knowledge_overlay(
-                            publisher_lease.project_root(),
-                            &publisher.branch_ref,
-                            &checkout_lease,
-                            checkout,
-                        );
-                        match self
-                            .state
-                            .checkout_access
-                            .publication_guard_for([&publisher_lease, &checkout_lease])
-                        {
-                            Ok(guard) => {
-                                publication_guard = Some(guard);
-                                prepared
-                            }
-                            Err(error) => {
-                                Err(OverlayRecomputeError::transient(anyhow::Error::new(error)))
-                            }
-                        }
-                    }
-                    Err(error) => Err(classify_knowledge_overlay_access_error(error)),
-                };
-                match refreshed {
-                    Ok(snapshot) => snapshot,
-                    Err(err)
-                        if err.kind == OverlayRecomputeErrorKind::Transient && prior_is_valid =>
-                    {
-                        tracing::warn!(
-                            error = %err,
-                            checkout = %checkout.checkout_id,
-                            scope = ?checkout.published_scope,
-                            "knowledge overlay refresh degraded; preserving prior valid snapshot"
-                        );
-                        let mut preserved = prior.clone().expect("prior valid snapshot");
-                        preserved.diagnostics = vec![format!("refresh degraded: {err:#}")];
-                        match self
-                            .state
-                            .knowledge_overlays
-                            .write()
-                            .preserve_transient_if_latest(generation, preserved)
-                        {
-                            TransientPreservationOutcome::Preserved { .. } => {
-                                return KnowledgeOverlayRefreshOutcome::PreservedTransient;
-                            }
-                            TransientPreservationOutcome::Superseded => {
-                                return KnowledgeOverlayRefreshOutcome::Superseded;
-                            }
-                            TransientPreservationOutcome::Exhausted => OverlaySnapshot::invalid(
-                                checkout,
-                                format!(
-                                    "transient knowledge overlay refresh limit exceeded: {err:#}"
-                                ),
-                            ),
-                        }
-                    }
-                    Err(err) => OverlaySnapshot::invalid(checkout, format!("{err:#}")),
-                }
-            }
-            Err(err) if err.is_transient() && prior_is_valid => {
-                tracing::warn!(
-                    error = %err,
-                    checkout = %checkout.checkout_id,
-                    scope = ?checkout.published_scope,
-                    "knowledge publisher refresh degraded; preserving prior valid snapshot"
-                );
-                let mut preserved = prior.clone().expect("prior valid snapshot");
-                preserved.diagnostics = vec![format!("publisher refresh degraded: {err:#}")];
-                match self
-                    .state
-                    .knowledge_overlays
-                    .write()
-                    .preserve_transient_if_latest(generation, preserved)
-                {
-                    TransientPreservationOutcome::Preserved { .. } => {
-                        return KnowledgeOverlayRefreshOutcome::PreservedTransient;
-                    }
-                    TransientPreservationOutcome::Superseded => {
-                        return KnowledgeOverlayRefreshOutcome::Superseded;
-                    }
-                    TransientPreservationOutcome::Exhausted => OverlaySnapshot::invalid(
-                        checkout,
-                        format!("transient knowledge publisher refresh limit exceeded: {err:#}"),
-                    ),
-                }
-            }
-            Err(err) => OverlaySnapshot::invalid(checkout, format!("{err:#}")),
-        };
-        let _publication_is_held = publication_guard.as_ref();
-        let invalid = snapshot.status == OverlayStatus::Invalid;
-        let prior_commit = prior
-            .as_ref()
-            .and_then(|snapshot| snapshot.stamp.as_ref())
-            .map(|stamp| stamp.publisher_commit.as_str());
-        let current_commit = snapshot
-            .stamp
-            .as_ref()
-            .map(|stamp| stamp.publisher_commit.as_str());
-        let publisher_moved = prior_commit != current_commit;
-        let unchanged = prior.as_ref().is_some_and(|prior| {
-            prior.snapshot_id == snapshot.snapshot_id
-                && prior.status == snapshot.status
-                && prior.diagnostics == snapshot.diagnostics
-        });
-        let mut affected = BTreeSet::new();
-        if let Some(prior) = &prior {
-            affected.extend(prior.values.keys().cloned());
-        }
-        affected.extend(snapshot.values.keys().cloned());
-
-        if !self
-            .state
-            .knowledge_overlays
-            .write()
-            .publish_if_latest(generation, snapshot)
-        {
-            return KnowledgeOverlayRefreshOutcome::Superseded;
-        }
-        if unchanged && !invalid {
-            return KnowledgeOverlayRefreshOutcome::Converged;
-        }
-        self.invalidate_published_snapshot_caches(&checkout.published_scope);
-
-        let Some(project) = publisher_project else {
-            self.clear_knowledge_scope_in_index(&checkout.published_scope);
-            return KnowledgeOverlayRefreshOutcome::Invalid;
-        };
-        if invalid {
-            if let Err(err) =
-                self.sync_knowledge_scope_to_index(&checkout.published_scope, &project)
-            {
-                tracing::warn!(
-                    error = %err,
-                    scope = ?checkout.published_scope,
-                    "invalid knowledge overlay convergence failed closed"
-                );
-                self.clear_knowledge_scope_in_index(&checkout.published_scope);
-            }
-            return KnowledgeOverlayRefreshOutcome::Invalid;
-        }
-        if publisher_moved {
-            if let Err(err) =
-                self.sync_knowledge_scope_to_index(&checkout.published_scope, &project)
-            {
-                tracing::warn!(
-                    error = %err,
-                    scope = ?checkout.published_scope,
-                    "knowledge publisher convergence failed closed"
-                );
-                self.clear_knowledge_scope_in_index(&checkout.published_scope);
-            }
-            return KnowledgeOverlayRefreshOutcome::Converged;
-        }
-        for entry_id in affected {
-            if let Err(err) = self.sync_knowledge_logical_ref_for_project(&entry_id, &project) {
-                tracing::warn!(
-                    error = %err,
-                    entry = %entry_id,
-                    "knowledge overlay convergence failed; the next observer pass will retry"
-                );
-            }
-        }
-        KnowledgeOverlayRefreshOutcome::Converged
-    }
 }
 
 fn matches_system_memory_catalog(category: Option<&str>) -> bool {
@@ -1258,7 +946,6 @@ fn knowledge_query_scope(p: &KnowledgeListParams) -> serde_json::Value {
         "provider": p.provider,
         "query": p.query,
         "mode": p.mode,
-        "provisional": p.provisional,
     })
 }
 
@@ -1280,7 +967,7 @@ fn resolve_knowledge_item<'a>(
         !selector.is_empty(),
         "entry_detail must name a knowledge entry"
     );
-    if selector.starts_with("knowledge:") || selector.starts_with("provisional_knowledge:") {
+    if selector.starts_with("knowledge:") {
         return items
             .iter()
             .find(|item| item.entity_ref == selector)
@@ -1481,11 +1168,7 @@ fn exact_entry_detail_response(
         "knowledge variant {} is not in the requested filter scope",
         item.entity_ref
     );
-    let mut canonical_entry = item.entry.clone();
-    if item.entity_ref.starts_with("provisional_knowledge:") {
-        canonical_entry.id = item.entity_ref.clone();
-    }
-    let body = serde_json::to_string(&canonical_entry)?;
+    let body = serde_json::to_string(&item.entry)?;
     let scope_seed = format!(
         "{}\0{}",
         item.entity_ref,
@@ -1747,14 +1430,13 @@ impl BlackboxServer {
             )?;
             let rider = kb.repo_record_rider_at(&result.id, write_dir.as_ref())?;
             drop(kb);
-            let overlay_refreshed = checkout.is_some();
-            if let Some(checkout) = checkout.as_ref() {
-                server.refresh_dark_knowledge_overlay(checkout);
-            }
+            // A checkout-carried write is not published until it merges, so
+            // it never enters the published index here.
+            let checkout_carried = checkout.is_some();
             Ok::<_, anyhow::Error>((
                 result,
                 rider,
-                overlay_refreshed,
+                checkout_carried,
                 KnowledgeMutationOwner::Local,
             ))
         })
@@ -1763,12 +1445,12 @@ impl BlackboxServer {
         .and_then(std::convert::identity);
 
         match write_result {
-            Ok((result, rider, overlay_refreshed, owner)) => {
+            Ok((result, rider, checkout_carried, owner)) => {
                 if let Err(e) = self.persist_knowledge_mutation(owner).await {
                     log_tool_err("bbox_learn", start, &e);
                     return Self::err_text(&format!("Error: {e:#}"));
                 }
-                if !overlay_refreshed
+                if !checkout_carried
                     && let Err(err) = self.sync_knowledge_entry_to_index(&result.id)
                 {
                     tracing::warn!(error = %err, entry = %result.id, "knowledge index sync failed; will reconstruct on next reindex cycle");
@@ -1852,7 +1534,6 @@ impl BlackboxServer {
 
             let mut view = server.session_knowledge_view(
                 p.project.as_deref(),
-                p.provisional.as_deref(),
             )?;
             if p.entry_detail.is_some() {
                 let mut scope_params = p.clone();
@@ -2002,7 +1683,6 @@ impl BlackboxServer {
                     .map(|carrier| carrier.carrier_id.as_str()),
                 target.seed.as_ref(),
             )?;
-            server.finish_existing_knowledge_mutation(target.checkout.as_ref());
             Ok::<_, anyhow::Error>((
                 message,
                 target.id,
@@ -2015,12 +1695,13 @@ impl BlackboxServer {
         .and_then(std::convert::identity);
 
         match write_result {
-            Ok((message, id, provisional, owner)) => {
+            Ok((message, id, checkout_carried, owner)) => {
                 if let Err(e) = self.persist_knowledge_mutation(owner).await {
                     log_tool_err("bbox_forget", start, &e);
                     return Self::err_text(&format!("Error: {e:#}"));
                 }
-                if !provisional && let Err(err) = self.tombstone_knowledge_entry_in_index(&id) {
+                if !checkout_carried && let Err(err) = self.tombstone_knowledge_entry_in_index(&id)
+                {
                     tracing::warn!(error = %err, entry = %id, "knowledge index tombstone failed; will reconstruct on next reindex cycle");
                 }
                 log_tool_ok("bbox_forget", start, message.len());
@@ -2101,26 +1782,6 @@ mod tests {
         assert_eq!(first_entry_id(block).as_deref(), Some("abc123"));
         assert_eq!(first_entry_id("No entries found."), None);
         assert_eq!(first_entry_id(""), None);
-    }
-
-    #[test]
-    fn overlay_access_classification_matches_reconciliation_staleness() {
-        use bbox_indexing::checkout_access::{CheckoutAccessError, CheckoutAccessErrorCode};
-        use bbox_knowledge::overlay::OverlayRecomputeErrorKind;
-
-        let stale =
-            classify_knowledge_overlay_access_error(anyhow::Error::new(CheckoutAccessError::new(
-                CheckoutAccessErrorCode::AttachmentInactive,
-                "inactive test attachment",
-            )));
-        assert_eq!(stale.kind, OverlayRecomputeErrorKind::InvalidContent);
-
-        let transient =
-            classify_knowledge_overlay_access_error(anyhow::Error::new(CheckoutAccessError::new(
-                CheckoutAccessErrorCode::ObservationUnavailable,
-                "temporary observation failure",
-            )));
-        assert_eq!(transient.kind, OverlayRecomputeErrorKind::Transient);
     }
 
     #[test]
@@ -2580,7 +2241,7 @@ mod tests {
         assert_ne!(learn.is_error, Some(true), "learn failed: {learn:?}");
 
         // Durable scope = registered base; committed file = worktree checkout.
-        // Provisional bytes are intentionally absent from the central store.
+        // Checkout bytes are intentionally absent from the central store.
         let ids = std::fs::read_dir(wt_canon.join(".bbox/knowledge"))
             .unwrap()
             .filter_map(Result::ok)
@@ -2605,9 +2266,9 @@ mod tests {
             "the daemon must not mutate the base checkout"
         );
 
-        // Slice 3.3 dark state: the composite registry row was durable before
-        // the write, and the post-write overlay sees the new untracked entry
-        // without affecting the still-legacy retrieval behavior asserted above.
+        // The checkout is registered, and its uncommitted entry stays out of
+        // every read: even a session pinned to that checkout reads the
+        // published view, and a daemon-side render does not include it.
         let scope = bbox_corpus_core::identity::PublishedScope::try_new(repo_id, ".").unwrap();
         let checkout_id = bbox_corpus_core::identity::ensure_checkout_id(&wt_canon).unwrap();
         assert!(
@@ -2618,37 +2279,12 @@ mod tests {
                 .get(&checkout_id, &scope)
                 .is_some()
         );
-        let overlays = server.state.knowledge_overlays.read();
-        let snapshot = overlays.get(&scope, &checkout_id).expect("dark overlay");
-        assert_eq!(
-            snapshot.status,
-            bbox_knowledge::overlay::OverlayStatus::Valid,
-            "{snapshot:?}"
-        );
-        assert!(matches!(
-            snapshot.values.get(&id),
-            Some(bbox_knowledge::overlay::OverlayValue::Upsert { .. })
-        ));
-        drop(overlays);
-
-        // Tool arguments cannot grant own-checkout visibility. Model the MCP
-        // transport authority that a real worktree session records at init.
         server.set_session_checkout_for_test(project_id, scope, checkout_id, wt_canon.clone());
-        let own = server
-            .session_knowledge_view(Some(base_canon.to_str().unwrap()), Some("own"))
+        let pinned = server
+            .session_knowledge_view(Some(base_canon.to_str().unwrap()))
             .unwrap();
-        let own_entry = own
-            .items
-            .iter()
-            .find(|item| item.entry.id == id)
-            .expect("checkout entry visible through own overlay");
-        assert_eq!(
-            own_entry.entry.project.as_deref(),
-            Some(base_canon.to_string_lossy().as_ref()),
-            "overlay entry must key to the registered base, not the worktree"
-        );
+        assert!(pinned.items.iter().all(|item| item.entry.id != id));
 
-        // The other half of the gap: render from the worktree sees the entry.
         let render = server
             .bbox_render(Parameters(RenderParams {
                 provider: Some("claude".into()),
@@ -2659,14 +2295,14 @@ mod tests {
             }))
             .await;
         assert_ne!(render.is_error, Some(true), "render failed: {render:?}");
-        let rendered = std::fs::read_to_string(wt_canon.join("CLAUDE.md")).unwrap();
+        let rendered = std::fs::read_to_string(wt_canon.join("CLAUDE.md")).unwrap_or_default();
         assert!(
-            rendered.contains("WORKTREE_KB_MARKER"),
-            "worktree render must include the just-learned entry: {rendered}"
+            !rendered.contains("WORKTREE_KB_MARKER"),
+            "a daemon-side render serves published knowledge only: {rendered}"
         );
 
         // A checkout write whose identity cannot be reconstructed after a
-        // restart fails closed before writing another provisional file.
+        // restart fails closed before writing another checkout file.
         let local = wt_canon.join(".bbox/local");
         std::fs::remove_dir_all(&local).unwrap();
         std::fs::write(&local, "block overlay marker creation").unwrap();
@@ -2883,7 +2519,6 @@ mod tests {
         let p = KnowledgeListParams {
             project: Some("/registered/project".into()),
             query: Some("escaped \"metadata\"".into()),
-            provisional: Some("all".into()),
             ..Default::default()
         };
         bound_structured_knowledge_rows(&mut structured, &p);
@@ -2895,7 +2530,6 @@ mod tests {
         assert_eq!(arguments["entry_detail"], "knowledge:big00001");
         assert_eq!(arguments["project"], "/registered/project");
         assert_eq!(arguments["query"], "escaped \"metadata\"");
-        assert_eq!(arguments["provisional"], "all");
     }
 
     #[test]
@@ -2905,7 +2539,7 @@ mod tests {
         let providers = vec!["\"provider\" ".repeat(32); 8];
         let mut structured = json!({
             "rows": [{
-                "entity_ref": "provisional_knowledge:project:checkout:metadata",
+                "entity_ref": "knowledge:metadata",
                 "entry": {
                     "id": "metadata",
                     "title": title,
@@ -2930,86 +2564,8 @@ mod tests {
         assert_eq!(entry["providers"]["count"], 8);
         assert_eq!(entry["providers"]["truncated"], true);
         let arguments = &structured["rows"][0]["detail"]["arguments"];
-        assert_eq!(
-            arguments["entry_detail"],
-            "provisional_knowledge:project:checkout:metadata"
-        );
+        assert_eq!(arguments["entry_detail"], "knowledge:metadata");
         assert_eq!(arguments["category"], "convention");
-    }
-
-    #[test]
-    fn exact_entry_detail_binds_canonical_provisional_variant_and_scope() {
-        use crate::server::knowledge_view::{KnowledgeViewItem, SessionKnowledgeView};
-
-        let own_ref = "provisional_knowledge:project:own-checkout:shared".to_string();
-        let peer_ref = "provisional_knowledge:project:peer-checkout:shared".to_string();
-        let published_ref = "knowledge:shared".to_string();
-        let published = stamped_entry("shared", "published variant", "project");
-        let mut own = stamped_entry("shared", "own variant", "project");
-        own.content = "own ".repeat(256);
-        let mut peer = stamped_entry("shared", "peer variant", "project");
-        peer.content = "peer ".repeat(256);
-
-        let mut store_entries = Vec::new();
-        let mut items = Vec::new();
-        for (entity_ref, entry) in [
-            (published_ref.clone(), published.clone()),
-            (own_ref.clone(), own.clone()),
-            (peer_ref.clone(), peer.clone()),
-        ] {
-            let item_entry = entry.clone();
-            store_entries.push(entry);
-            items.push(KnowledgeViewItem {
-                entity_ref,
-                entry: item_entry,
-                metadata: Default::default(),
-            });
-        }
-        let view = SessionKnowledgeView {
-            knowledge: bbox_knowledge::knowledge::Knowledge::detached_view(
-                store_entries,
-                BTreeMap::new(),
-            ),
-            items,
-            built_from: Default::default(),
-            diagnostics: Vec::new(),
-            degraded_overlays: Vec::new(),
-        };
-        let visible_refs = [published_ref, own_ref.clone(), peer_ref.clone()];
-        let p = KnowledgeListParams {
-            entry_detail: Some(own_ref.clone()),
-            provisional: Some("all".into()),
-            detail_limit: Some(257),
-            ..Default::default()
-        };
-
-        let (_, first) = exact_entry_detail_response(&view, &p, &visible_refs).unwrap();
-        assert_eq!(first["entity_ref"], own_ref);
-        assert_eq!(first["scope"]["provisional"], "all");
-        let cursor = first["body"]["next_cursor"].as_str().unwrap().to_string();
-        let mut changed_scope = p.clone();
-        changed_scope.query = Some("changed scope".into());
-        changed_scope.detail_cursor = Some(cursor);
-        let stale = exact_entry_detail_response(&view, &changed_scope, &visible_refs)
-            .expect_err("changed filter scope must invalidate cursor");
-        assert!(stale.to_string().contains("stale detail cursor"));
-
-        let mut bare = p.clone();
-        bare.entry_detail = Some("shared".into());
-        let ambiguous = exact_entry_detail_response(&view, &bare, &visible_refs)
-            .expect_err("duplicate bare id must reject");
-        assert!(ambiguous.to_string().contains("ambiguous across variants"));
-        assert!(ambiguous.to_string().contains(&own_ref));
-
-        let mut hidden = p.clone();
-        hidden.entry_detail = Some(peer_ref);
-        let out_of_scope = exact_entry_detail_response(&view, &hidden, &[own_ref])
-            .expect_err("filter scope must reject a hidden variant");
-        assert!(
-            out_of_scope
-                .to_string()
-                .contains("not in the requested filter scope")
-        );
     }
 
     #[tokio::test]
@@ -3117,7 +2673,7 @@ mod tests {
             server.state.kb.write().upsert_generated(entry).unwrap();
         }
         let mut offset = 0;
-        let mut seen = BTreeSet::new();
+        let mut seen = std::collections::BTreeSet::new();
         loop {
             let result = server
                 .bbox_knowledge(Parameters(KnowledgeListParams {

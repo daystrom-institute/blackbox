@@ -1,13 +1,18 @@
-//! Checkout-owner routing for project-scoped knowledge and gap mutations.
+//! Checkout-owner routing for project-scoped knowledge and gap mutations,
+//! and the bound project render.
 //!
 //! A managed harness writes repository-owned records directly into its bound
-//! checkout. The daemon remains the global-store authority and the transport
-//! convergence target, but it is not in the local mutation commit path.
+//! checkout. The daemon remains the global-store authority, but it is not in
+//! the local mutation commit path, and nothing the harness writes is uploaded:
+//! a record reaches other readers only once it is committed and published.
+//!
+//! The bound project render executes the daemon's published render plan in
+//! the checkout, after overlaying the checkout's own uncommitted
+//! `.bbox/knowledge` changes, so a worker's render reflects its unmerged
+//! knowledge without any remote transport.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
@@ -18,13 +23,11 @@ use bbox_knowledge::knowledge::{
     ForgetParams, Knowledge, LearnParams, ProjectRenderExecutionV1, ProjectRenderPlanAssemblerV1,
     ProjectRenderPlanChunkV1, ProjectRenderPlanV1, ResponseFormat, execute_workspace_render_plan,
 };
+use bbox_knowledge::overlay::{WorkingKnowledgeSnapshot, local_knowledge_overlay};
 use bbox_knowledge::repo_io::{KnowledgeRepoCarrier, KnowledgeRepoRead, KnowledgeRepoWrite};
-use bbox_knowledge_source_client::{CaptureOutcome, WorkspaceCaptureClient};
 use bro_tools::{FreeformGrammar, Tool, ToolAnnotations, ToolCx, ToolResult};
 use serde_json::{Value, json};
 
-const RETRY_DELAYS_SECS: &[u64] = &[1, 2, 4, 8, 16];
-const MAX_SYNC_ERROR_CHARS: usize = 600;
 const BOUND_WORKSPACE_RENDER_SELECTOR: &str = "$bound-workspace";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,32 +63,22 @@ pub async fn install_project_mutation_routes(
     capability_server: Option<&str>,
 ) -> Result<Vec<Arc<dyn Tool>>> {
     let token = locality_session_var(cx, bro_protocol::WORKSPACE_BINDING_ENV);
-    let source_url = locality_session_var(cx, bro_protocol::KNOWLEDGE_SOURCE_URL_ENV);
     let scope = locality_session_var(cx, bro_protocol::WORKSPACE_SCOPE_ENV);
-    if token.is_none() && source_url.is_none() && scope.is_none() {
+    if token.is_none() && scope.is_none() {
         return Ok(tools);
     }
-    let token = token.context("bound workspace session is missing its capability token")?;
-    let source_url =
-        source_url.context("bound workspace session is missing its source endpoint")?;
+    // The binding token itself rides only the daemon MCP header; locality
+    // needs just its presence to know the session is bound.
+    token.context("bound workspace session is missing its capability token")?;
     let scope = scope.context("bound workspace session is missing its published scope")?;
     let capability_server = capability_server
         .filter(|name| !name.trim().is_empty())
         .context("bound workspace session has no daemon capability server")?;
     let root = cx.root.clone();
-    let runtime = tokio::task::spawn_blocking(move || {
-        LocalProjectRuntime::open(&root, &token, &source_url, &scope)
-    })
-    .await
-    .map_err(|error| anyhow!("locality runtime initialization failed: {error}"))??;
+    let runtime = tokio::task::spawn_blocking(move || LocalProjectRuntime::open(&root, &scope))
+        .await
+        .map_err(|error| anyhow!("locality runtime initialization failed: {error}"))??;
     let runtime = Arc::new(runtime);
-    if let Err(error) = runtime.sync_once().await {
-        tracing::warn!(
-            error = %bounded_error(&error),
-            "initial project source convergence is pending"
-        );
-        runtime.schedule_retry();
-    }
 
     Ok(tools
         .into_iter()
@@ -251,6 +244,8 @@ impl Tool for LocalRenderTool {
             }
         };
 
+        // The completion names the published plan the daemon issued; a
+        // receipt for an overlaid execution carries the overlay digest.
         let mut complete_input = public;
         complete_input.insert(
             "_render_locality".into(),
@@ -410,9 +405,7 @@ impl Tool for ProjectMutationTool {
         let kind = self.kind;
         let local = tokio::task::spawn_blocking(move || runtime.mutate(kind, local_input)).await;
         match local {
-            Ok(Ok(Some(result))) => crate::mcp::result::from_native_result(
-                self.runtime.finish_local_mutation(result).await,
-            ),
+            Ok(Ok(Some(result))) => crate::mcp::result::from_native_result(result),
             Ok(Ok(None)) => self.upstream.call(input, cx).await,
             Ok(Err(error)) => local_error(format!("local project mutation failed: {error:#}")),
             Err(error) => local_error(format!("local project mutation task failed: {error}")),
@@ -430,13 +423,10 @@ struct LocalProjectRuntime {
     project_root: PathBuf,
     scope: PublishedScope,
     workspace_id: bro_core::WorkspaceId,
-    capture: WorkspaceCaptureClient,
-    sync_lock: tokio::sync::Mutex<()>,
-    retry_active: AtomicBool,
 }
 
 impl LocalProjectRuntime {
-    fn open(root: &Path, raw_token: &str, source_url: &str, raw_scope: &str) -> Result<Self> {
+    fn open(root: &Path, raw_scope: &str) -> Result<Self> {
         let workspace_root = bbox_corpus_core::git::managed_checkout_root(root)
             .context("bound harness root is not a managed checkout")?;
         let scope: PublishedScope =
@@ -457,7 +447,6 @@ impl LocalProjectRuntime {
         )?
         .context("managed checkout has no workspace identity")?;
         let workspace_id = bro_core::WorkspaceId::parse(workspace_id)?;
-        let token = bro_protocol::WorkspaceBindingToken::parse(raw_token.to_string())?;
         let durable_project = format!(
             "published:{}:{}",
             scope.repo_id(),
@@ -485,14 +474,6 @@ impl LocalProjectRuntime {
             GapStore::open(&workspace_root.join(".bbox/local/harness-gaps-central.json"))?;
         gaps.configure_repo_io(io.clone(), io, vec![gap_carrier.clone()])?;
         gaps.set_path_fallback_cut(true);
-        let capture = WorkspaceCaptureClient::new_for_trusted_daemon_endpoint(
-            source_url,
-            token,
-            workspace_root.clone(),
-            project_root.clone(),
-            workspace_id.clone(),
-            scope.clone(),
-        )?;
         Ok(Self {
             knowledge: Mutex::new(knowledge),
             gaps: Mutex::new(gaps),
@@ -503,9 +484,6 @@ impl LocalProjectRuntime {
             project_root,
             scope,
             workspace_id,
-            capture,
-            sync_lock: tokio::sync::Mutex::new(()),
-            retry_active: AtomicBool::new(false),
         })
     }
 
@@ -538,18 +516,38 @@ impl LocalProjectRuntime {
         Ok(BOUND_WORKSPACE_RENDER_SELECTOR.to_string())
     }
 
+    /// Execute the published plan in the bound checkout after overlaying
+    /// the checkout's own uncommitted knowledge. A checkout with no
+    /// uncommitted knowledge executes the published plan unchanged; otherwise
+    /// the receipt names the overlay it rendered.
     fn execute_render_plan(
         &self,
         plan: &ProjectRenderPlanV1,
         issued_at_ms: Option<u64>,
     ) -> Result<ProjectRenderExecutionV1> {
-        execute_workspace_render_plan(
-            plan,
+        let working = WorkingKnowledgeSnapshot::read_project_dir(&self.project_root)
+            .context("reading the bound checkout's working knowledge")?;
+        let overlay = local_knowledge_overlay(&self.workspace_root, &self.scope, &working)
+            .context("diffing the bound checkout's working knowledge against HEAD")?;
+        if overlay.is_empty() {
+            return execute_workspace_render_plan(
+                plan,
+                &self.project_root,
+                &self.scope,
+                self.workspace_id.as_str(),
+                issued_at_ms,
+            );
+        }
+        let overlaid = plan.with_local_overlay(overlay.upserts(), overlay.tombstones())?;
+        let mut execution = execute_workspace_render_plan(
+            &overlaid,
             &self.project_root,
             &self.scope,
             self.workspace_id.as_str(),
             issued_at_ms,
-        )
+        )?;
+        execution.receipt.local_overlay_sha256 = Some(overlay.digest());
+        Ok(execution)
     }
 
     fn mutate(&self, kind: MutationKind, input: Value) -> Result<Option<ToolResult>> {
@@ -688,48 +686,6 @@ impl LocalProjectRuntime {
         *project = Some(self.durable_project.clone());
         Ok(())
     }
-
-    async fn finish_local_mutation(self: &Arc<Self>, result: ToolResult) -> ToolResult {
-        match self.sync_once().await {
-            Ok(outcome) => attach_sync(result, false, Some(&outcome), None),
-            Err(error) => {
-                self.schedule_retry();
-                attach_sync(result, true, None, Some(&bounded_error(&error)))
-            }
-        }
-    }
-
-    async fn sync_once(&self) -> Result<CaptureOutcome> {
-        let _guard = self.sync_lock.lock().await;
-        self.capture.sync_once().await
-    }
-
-    fn schedule_retry(self: &Arc<Self>) {
-        if self.retry_active.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        let runtime = self.clone();
-        tokio::spawn(async move {
-            for delay in RETRY_DELAYS_SECS {
-                tokio::time::sleep(Duration::from_secs(*delay)).await;
-                match runtime.sync_once().await {
-                    Ok(outcome) => {
-                        tracing::info!(
-                            generation = %outcome.source_generation_id,
-                            sequence = outcome.sequence,
-                            "project source convergence retry succeeded"
-                        );
-                        break;
-                    }
-                    Err(error) => tracing::warn!(
-                        error = %bounded_error(&error),
-                        "project source convergence retry remains pending"
-                    ),
-                }
-            }
-            runtime.retry_active.store(false, Ordering::Release);
-        });
-    }
 }
 
 struct BoundRepoIo {
@@ -824,67 +780,6 @@ fn local_gap_id(gaps: &GapStore, requested: &str) -> Option<String> {
         .then_some(canonical)
 }
 
-fn attach_sync(
-    result: ToolResult,
-    pending: bool,
-    outcome: Option<&CaptureOutcome>,
-    error: Option<&str>,
-) -> ToolResult {
-    match result {
-        ToolResult::Text(mut text) => {
-            if pending {
-                text.push_str("\n\nProvisional sync: pending; the checkout write is durable and bounded retry is active.");
-                if let Some(error) = error {
-                    text.push_str("\nSync diagnostic: ");
-                    text.push_str(error);
-                }
-            } else if let Some(outcome) = outcome {
-                text.push_str(&format!(
-                    "\n\nProvisional sync: ready generation {} sequence {}{}.",
-                    outcome.source_generation_id,
-                    outcome.sequence,
-                    if outcome.reused { " (renewed)" } else { "" }
-                ));
-            }
-            ToolResult::Text(text)
-        }
-        ToolResult::Json(mut value) => {
-            if !value.is_object() {
-                value = json!({ "result": value });
-            }
-            let object = value.as_object_mut().expect("normalized JSON object");
-            object.insert("provisional_sync_pending".into(), json!(pending));
-            if let Some(outcome) = outcome {
-                object.insert(
-                    "source_generation_id".into(),
-                    json!(outcome.source_generation_id),
-                );
-                object.insert("source_generation_sequence".into(), json!(outcome.sequence));
-                object.insert("source_generation_reused".into(), json!(outcome.reused));
-            }
-            if let Some(error) = error {
-                object.insert("provisional_sync_error".into(), json!(error));
-            }
-            ToolResult::Json(value)
-        }
-        ToolResult::Error(error) => ToolResult::Error(error),
-    }
-}
-
-fn bounded_error(error: &anyhow::Error) -> String {
-    let rendered = format!("{error:#}");
-    let mut chars = rendered.chars();
-    let bounded = chars
-        .by_ref()
-        .take(MAX_SYNC_ERROR_CHARS)
-        .collect::<String>();
-    if chars.next().is_some() {
-        format!("{bounded}...")
-    } else {
-        bounded
-    }
-}
-
 fn poisoned_lock<T>(error: std::sync::PoisonError<T>) -> anyhow::Error {
     anyhow!("local project mutation lock is poisoned: {error}")
 }
@@ -974,13 +869,8 @@ mod tests {
         git(&root, &["add", "."]);
         git(&root, &["commit", "-q", "-m", "base"]);
         let scope = PublishedScope::try_new("locality-test", ".").unwrap();
-        let runtime = LocalProjectRuntime::open(
-            &root,
-            &"a".repeat(64),
-            "http://127.0.0.1:0/mcp?surface=agent-internal",
-            &serde_json::to_string(&scope).unwrap(),
-        )
-        .unwrap();
+        let runtime =
+            LocalProjectRuntime::open(&root, &serde_json::to_string(&scope).unwrap()).unwrap();
         (directory, root, Arc::new(runtime))
     }
 
@@ -1189,71 +1079,82 @@ mod tests {
         assert!(knowledge_files(&runtime.project_root).is_empty());
     }
 
-    #[tokio::test]
-    async fn render_wrapper_keeps_checkout_path_local_and_writes_shared_projection() {
-        struct FakeDaemonRender {
-            plan: ProjectRenderPlanV1,
-            calls: Arc<Mutex<Vec<Value>>>,
+    struct FakeDaemonRender {
+        plan: ProjectRenderPlanV1,
+        calls: Arc<Mutex<Vec<Value>>>,
+    }
+
+    #[async_trait]
+    impl Tool for FakeDaemonRender {
+        fn name(&self) -> &str {
+            "mcp__blackbox__bbox_render"
         }
 
-        #[async_trait]
-        impl Tool for FakeDaemonRender {
-            fn name(&self) -> &str {
-                "mcp__blackbox__bbox_render"
-            }
+        fn description(&self) -> &str {
+            "fake render"
+        }
 
-            fn description(&self) -> &str {
-                "fake render"
-            }
+        fn input_schema(&self) -> Value {
+            json!({ "type": "object" })
+        }
 
-            fn input_schema(&self) -> Value {
-                json!({ "type": "object" })
-            }
-
-            async fn call(&self, input: Value, _cx: &ToolCx) -> ToolResult {
-                self.calls.lock().unwrap().push(input.clone());
-                match input["_render_locality"]["phase"].as_str() {
-                    Some("plan") => {
-                        let offset = input["_render_locality"]["offset"].as_u64().unwrap() as usize;
-                        let expected = input["_render_locality"]["plan_sha256"].as_str();
-                        let chunk = self.plan.transport_chunk(offset, expected, None).unwrap();
-                        crate::mcp::result::from_native_result(ToolResult::Json(json!({
-                            "status": "render_locality_plan_chunk",
-                            "chunk": chunk,
-                        })))
+        async fn call(&self, input: Value, _cx: &ToolCx) -> ToolResult {
+            self.calls.lock().unwrap().push(input.clone());
+            match input["_render_locality"]["phase"].as_str() {
+                Some("plan") => {
+                    let offset = input["_render_locality"]["offset"].as_u64().unwrap() as usize;
+                    let expected = input["_render_locality"]["plan_sha256"].as_str();
+                    let chunk = self.plan.transport_chunk(offset, expected, None).unwrap();
+                    crate::mcp::result::from_native_result(ToolResult::Json(json!({
+                        "status": "render_locality_plan_chunk",
+                        "chunk": chunk,
+                    })))
+                }
+                Some("complete") => {
+                    // The daemon validates the receipt against the plan it
+                    // issued, as production does.
+                    let receipt: bbox_knowledge::knowledge::ProjectRenderReceiptV1 =
+                        serde_json::from_value(input["_render_locality"]["receipt"].clone())
+                            .unwrap();
+                    if let Err(error) = receipt.validate_against(&self.plan) {
+                        return ToolResult::Error(format!("{error:#}"));
                     }
-                    Some("complete") => crate::mcp::result::from_native_result(ToolResult::Text(
+                    crate::mcp::result::from_native_result(ToolResult::Text(
                         json!({"status":"render_locality_complete", "diagnostics":null})
                             .to_string(),
-                    )),
-                    other => ToolResult::Error(format!("unexpected phase {other:?}")),
+                    ))
                 }
+                other => ToolResult::Error(format!("unexpected phase {other:?}")),
             }
         }
+    }
 
-        let (_directory, root, runtime) = runtime();
-        runtime
-            .mutate(
-                MutationKind::Learn,
-                json!({
-                    "content": "PROJECT_RENDER_HARNESS_MARKER",
-                    "category": "convention",
-                    "scope": "project",
-                    "project": root,
-                }),
-            )
-            .unwrap();
-        let mut entry = {
-            let mut knowledge = runtime.knowledge.lock().unwrap();
-            knowledge.reload().unwrap();
-            knowledge.all_entries()[0].clone()
-        };
-        entry.project = Some(bbox_knowledge::knowledge::PROJECT_RENDER_TRANSPORT_SCOPE.into());
-        entry.project_id = Some("project-render-locality".into());
-        entry
-            .content
-            .push_str(&" PROJECT_RENDER_HARNESS_PAGE".repeat(2_000));
-        let plan = ProjectRenderPlanV1 {
+    fn published_entry(id: &str, content: &str) -> bbox_knowledge::knowledge::KnowledgeEntry {
+        bbox_knowledge::knowledge::KnowledgeEntry {
+            render_placement: Default::default(),
+            id: id.into(),
+            title: id.into(),
+            content: content.into(),
+            cluster: None,
+            category: bbox_knowledge::knowledge::Category::Convention,
+            scope: bbox_knowledge::knowledge::Scope::Project,
+            project: Some(bbox_knowledge::knowledge::PROJECT_RENDER_TRANSPORT_SCOPE.into()),
+            project_id: Some("project-render-locality".into()),
+            providers: Vec::new(),
+            priority: bbox_knowledge::knowledge::Priority::Standard,
+            render: true,
+            created_at: "2026-09-01T00:00:00Z".into(),
+            updated_at: "2026-09-01T00:00:00Z".into(),
+            recall_count: 0,
+            last_recalled: None,
+        }
+    }
+
+    fn published_plan(
+        runtime: &LocalProjectRuntime,
+        entries: Vec<bbox_knowledge::knowledge::KnowledgeEntry>,
+    ) -> ProjectRenderPlanV1 {
+        ProjectRenderPlanV1 {
             version: bbox_knowledge::knowledge::PROJECT_RENDER_TRANSPORT_VERSION,
             project_id: "project-render-locality".into(),
             scope: runtime.scope.clone(),
@@ -1261,11 +1162,18 @@ mod tests {
             producer: None,
             provider: Some("claude".into()),
             dry_run: false,
-            view: bbox_knowledge::knowledge::ProjectRenderViewV1::Own,
+            view: bbox_knowledge::knowledge::ProjectRenderViewV1::Published,
             requested_scope: "project".into(),
-            entries: vec![entry],
+            entries,
             diagnostics: None,
-        };
+        }
+    }
+
+    async fn render_through(
+        runtime: Arc<LocalProjectRuntime>,
+        root: &Path,
+        plan: ProjectRenderPlanV1,
+    ) -> (ToolResult, Vec<Value>) {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let tool = LocalRenderTool {
             upstream: Arc::new(FakeDaemonRender {
@@ -1282,26 +1190,47 @@ mod tests {
                     "scope": "project",
                     "_render_locality": { "phase": "caller-forged" }
                 }),
-                &tool_cx(&root),
+                &tool_cx(root),
             )
             .await;
+        let calls = calls.lock().unwrap().clone();
+        (response, calls)
+    }
+
+    /// The daemon issues a published plan; the harness overlays the
+    /// checkout's own uncommitted knowledge before executing it, and the
+    /// receipt names that overlay so the daemon validates it by shape.
+    #[tokio::test]
+    async fn render_overlays_uncommitted_local_knowledge_onto_the_published_plan() {
+        let (_directory, root, runtime) = runtime();
+        runtime
+            .mutate(
+                MutationKind::Learn,
+                json!({
+                    "content": "LOCAL_UNMERGED_RENDER_MARKER",
+                    "category": "convention",
+                    "scope": "project",
+                    "project": root,
+                }),
+            )
+            .unwrap();
+        let mut published = published_entry("published-entry", "PUBLISHED_RENDER_MARKER");
+        published
+            .content
+            .push_str(&" PROJECT_RENDER_HARNESS_PAGE".repeat(2_000));
+        let plan = published_plan(&runtime, vec![published]);
+        let (response, calls) = render_through(runtime, &root, plan).await;
         let ToolResult::Json(envelope) = response else {
             panic!("local render must return the MCP envelope");
         };
-        assert_eq!(envelope["isError"], false);
+        assert_eq!(envelope["isError"], false, "{envelope}");
+        let rendered = fs::read_to_string(root.join("CLAUDE.md")).unwrap();
+        assert!(rendered.contains("PUBLISHED_RENDER_MARKER"), "{rendered}");
         assert!(
-            envelope["content"][0]["text"]
-                .as_str()
-                .unwrap()
-                .contains("Wrote project")
-        );
-        assert!(
-            fs::read_to_string(root.join("CLAUDE.md"))
-                .unwrap()
-                .contains("PROJECT_RENDER_HARNESS_MARKER")
+            rendered.contains("LOCAL_UNMERGED_RENDER_MARKER"),
+            "{rendered}"
         );
 
-        let calls = calls.lock().unwrap();
         assert!(
             calls.len() > 2,
             "the large plan must require multiple pages"
@@ -1312,24 +1241,89 @@ mod tests {
         }
         let completion = calls.last().unwrap();
         assert_eq!(completion["_render_locality"]["phase"], "complete");
-        assert!(completion["_render_locality"]["receipt"].is_object());
         assert!(completion["_render_locality"]["plan_sha256"].is_string());
+        let digest = completion["_render_locality"]["receipt"]["local_overlay_sha256"]
+            .as_str()
+            .expect("an overlaid render names its overlay");
+        assert_eq!(digest.len(), 64);
         assert!(
-            !serde_json::to_string(&*calls)
+            !serde_json::to_string(&calls)
                 .unwrap()
                 .contains(root.to_str().unwrap()),
             "project render transport must not expose the absolute checkout root"
         );
+        assert!(
+            !serde_json::to_string(&calls)
+                .unwrap()
+                .contains("LOCAL_UNMERGED_RENDER_MARKER"),
+            "uncommitted knowledge never travels to the daemon"
+        );
+    }
+
+    /// A committed checkout has no overlay: the published plan executes
+    /// unchanged and the receipt validates strictly. A local deletion of a
+    /// committed entry tombstones the published row of the same id.
+    #[tokio::test]
+    async fn render_without_local_changes_is_published_only_and_local_deletes_tombstone() {
+        let (_directory, root, runtime) = runtime();
+        let plan = published_plan(
+            &runtime,
+            vec![published_entry("kept-entry", "PUBLISHED_ONLY_MARKER")],
+        );
+        let (response, calls) = render_through(runtime.clone(), &root, plan).await;
+        let ToolResult::Json(envelope) = response else {
+            panic!("local render must return the MCP envelope");
+        };
+        assert_eq!(envelope["isError"], false, "{envelope}");
+        assert!(
+            calls.last().unwrap()["_render_locality"]["receipt"]
+                .get("local_overlay_sha256")
+                .is_none()
+        );
+        assert!(
+            fs::read_to_string(root.join("CLAUDE.md"))
+                .unwrap()
+                .contains("PUBLISHED_ONLY_MARKER")
+        );
+
+        let dir = root.join(".bbox/knowledge");
+        fs::create_dir_all(&dir).unwrap();
+        let mut committed = published_entry("removed-entry", "REMOVED_LOCALLY_MARKER");
+        committed.project = None;
+        committed.project_id = None;
+        fs::write(
+            dir.join("removed-entry.json"),
+            serde_json::to_vec_pretty(&committed).unwrap(),
+        )
+        .unwrap();
+        git(&root, &["add", ".bbox/knowledge"]);
+        git(&root, &["commit", "-q", "-m", "committed entry"]);
+        fs::remove_file(dir.join("removed-entry.json")).unwrap();
+        let plan = published_plan(
+            &runtime,
+            vec![
+                published_entry("kept-entry", "PUBLISHED_ONLY_MARKER"),
+                published_entry("removed-entry", "REMOVED_LOCALLY_MARKER"),
+            ],
+        );
+        let (response, _calls) = render_through(runtime, &root, plan).await;
+        let ToolResult::Json(envelope) = response else {
+            panic!("local render must return the MCP envelope");
+        };
+        assert_eq!(envelope["isError"], false, "{envelope}");
+        let rendered = fs::read_to_string(root.join("CLAUDE.md")).unwrap();
+        assert!(rendered.contains("PUBLISHED_ONLY_MARKER"), "{rendered}");
+        assert!(!rendered.contains("REMOVED_LOCALLY_MARKER"), "{rendered}");
     }
 
     #[tokio::test]
-    async fn daemon_outage_leaves_local_write_durable_and_reports_pending_sync() {
+    async fn local_writes_are_durable_and_report_no_transport() {
         let (_directory, _root, runtime) = runtime();
         let local = runtime
             .mutate(
                 MutationKind::Learn,
                 json!({
-                    "content": "survives transport outage",
+                    "content": "stays in the checkout",
                     "category": "memory",
                     "render": false,
                     "scope": "project",
@@ -1337,11 +1331,65 @@ mod tests {
             )
             .unwrap()
             .unwrap();
-        let response = runtime.finish_local_mutation(local).await;
-        let ToolResult::Text(response) = response else {
+        let ToolResult::Text(response) = local else {
             panic!("learn response should be text");
         };
-        assert!(response.contains("Provisional sync: pending"));
+        assert!(!response.contains("sync"), "{response}");
         assert_eq!(knowledge_files(&runtime.project_root).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_bound_session_without_a_source_endpoint_installs_locality() {
+        let (_directory, root, _runtime) = runtime();
+        let mut cx = tool_cx(&root);
+        cx.session_env = Arc::new(std::collections::BTreeMap::from([
+            (
+                bro_protocol::WORKSPACE_BINDING_ENV.to_string(),
+                "a".repeat(64),
+            ),
+            (
+                bro_protocol::WORKSPACE_SCOPE_ENV.to_string(),
+                serde_json::to_string(&PublishedScope::try_new("locality-test", ".").unwrap())
+                    .unwrap(),
+            ),
+        ]));
+        struct Remember;
+        #[async_trait]
+        impl Tool for Remember {
+            fn name(&self) -> &str {
+                "mcp__blackbox__bbox_learn"
+            }
+            fn description(&self) -> &str {
+                "fixture"
+            }
+            fn input_schema(&self) -> Value {
+                json!({"type":"object"})
+            }
+            async fn call(&self, _: Value, _: &ToolCx) -> ToolResult {
+                ToolResult::Text("remote".into())
+            }
+        }
+        let tools =
+            install_project_mutation_routes(vec![Arc::new(Remember)], &cx, Some("blackbox"))
+                .await
+                .unwrap();
+        let response = tools[0]
+            .call(
+                json!({"scope":"project","category":"memory","render":false,"content":"routed"}),
+                &cx,
+            )
+            .await;
+        assert!(!response.is_error());
+        assert_eq!(knowledge_files(&root).len(), 1);
+
+        let unbound = tool_cx(&root);
+        let tools =
+            install_project_mutation_routes(vec![Arc::new(Remember)], &unbound, Some("blackbox"))
+                .await
+                .unwrap();
+        assert_eq!(
+            tools[0].call(json!({}), &unbound).await.into_content(),
+            ("remote".to_string(), false)
+        );
     }
 }

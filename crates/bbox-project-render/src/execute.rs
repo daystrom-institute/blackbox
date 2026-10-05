@@ -1019,6 +1019,7 @@ pub fn execute_project_render_plan_with(
         producer: plan.producer.clone(),
         project_doc_nonempty,
         incomplete: applied.incomplete,
+        local_overlay_sha256: None,
         projections,
     };
     receipt.validate_against(plan)?;
@@ -1143,6 +1144,7 @@ pub fn reconcile_interrupted_render(
         producer: plan.producer.clone(),
         project_doc_nonempty: record.project_doc_nonempty,
         incomplete,
+        local_overlay_sha256: None,
         projections,
     };
     receipt.validate_against(plan)?;

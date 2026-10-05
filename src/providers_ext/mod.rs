@@ -15,7 +15,6 @@ pub(crate) fn extra_providers() -> Vec<Box<dyn InspectableEntityProvider>> {
         Box::new(virtual_task::TaskProvider),
         Box::new(brofile::BrofileProvider),
         Box::new(project_graph::ProjectGraphVertexProvider::published()),
-        Box::new(project_graph::ProjectGraphVertexProvider::provisional()),
     ]
 }
 

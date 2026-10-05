@@ -132,13 +132,11 @@ impl GraphWordAuthority {
         let mut sources = std::collections::BTreeSet::new();
         for value in raw {
             match value.as_str() {
-                super::GRAPH_SOURCE_PUBLISHED
-                | super::GRAPH_SOURCE_PROVISIONAL
-                | super::GRAPH_SOURCE_CONNECTOR => {
+                super::GRAPH_SOURCE_PUBLISHED | super::GRAPH_SOURCE_CONNECTOR => {
                     sources.insert(value.clone());
                 }
                 other => anyhow::bail!(
-                    "invalid graph_source {other:?} (expected \"published\", \"provisional\", or \"connector\")"
+                    "invalid graph_source {other:?} (expected \"published\" or \"connector\")"
                 ),
             }
         }
@@ -216,9 +214,8 @@ impl GraphWordPolicySnapshot {
     /// embeds under the pinned accepted generation AND the vertex is still
     /// embed-eligible there. `entity_id` is the vector hit's id; anything that
     /// is not a `project_graph_vertex:` ref is not this lane's concern and
-    /// passes. Provisional vertex refs never embed in this milestone and are
-    /// dropped outright so a stray vector cannot leak a checkout-private
-    /// vertex into another caller's results.
+    /// passes. A retired provisional vertex ref is stale state and is dropped
+    /// outright so a stray vector cannot leak a checkout-private vertex.
     pub fn admits_graph_vector(&self, entity_id: &str) -> bool {
         use bbox_corpus_core::entity_ref::EntityRef;
         match EntityRef::parse(entity_id) {
@@ -235,7 +232,6 @@ impl GraphWordPolicySnapshot {
                     })
                 })
                 .unwrap_or(false),
-            Ok(EntityRef::ProvisionalProjectGraphVertex { .. }) => false,
             Err(_)
                 if entity_id.starts_with("project_graph_vertex:")
                     || entity_id.starts_with("provisional_project_graph_vertex:") =>
@@ -406,8 +402,7 @@ pub struct HybridBm25Hit {
     pub graph_source_connector: Option<String>,
     pub graph_vertex_type: Option<String>,
     pub graph_generation: Option<String>,
-    /// The pasteable logical ref; equals the entity id on the published plane
-    /// and carries the project form for provisional hits in later milestones.
+    /// The pasteable logical ref; equals the entity id on the published plane.
     pub logical_ref: Option<String>,
     /// Read coordinates, present only on conversation documents.
     #[serde(default)]
@@ -892,9 +887,9 @@ impl TranscriptIndex {
                 )),
             ));
         } else {
-            // Static corpus callers have no checkout authority. Provisional
-            // knowledge is injected only through a session-scoped knowledge
-            // view, so it must never escape through this generic BM25 lane.
+            // Only published knowledge is served. A document stamped with the
+            // retired provisional visibility is stale state left by an older
+            // daemon and never escapes through this generic BM25 lane.
             clauses.push((
                 Occur::MustNot,
                 Box::new(TermQuery::new(
@@ -3678,18 +3673,18 @@ mod graph_word_lane_tests {
         let baseline = search(&index, None);
         assert_eq!(baseline.len(), 5, "{baseline:?}");
 
-        // Plane selection: no M9a document lives on the provisional plane,
-        // so selecting it must remove every graph document and keep the
-        // non-graph transcript hits.
-        let provisional_only = GraphWordAuthority {
-            graph_sources: BTreeSet::from(["provisional".to_string()]),
+        // Plane selection: no indexed document lives on the connector
+        // plane, so selecting it must remove every graph document and keep
+        // the non-graph transcript hits.
+        let connector_only = GraphWordAuthority {
+            graph_sources: BTreeSet::from(["connector".to_string()]),
             ..Default::default()
         };
-        let hits = search(&index, Some(&provisional_only));
+        let hits = search(&index, Some(&connector_only));
         assert!(
             hits.iter()
                 .all(|(entity_id, _, _)| !entity_id.starts_with("project_graph_vertex:")),
-            "provisional-plane selection must drop every published graph doc: {hits:?}"
+            "connector-plane selection must drop every published graph doc: {hits:?}"
         );
 
         // Named-graph selection keeps the requested lane and drops the rest.
@@ -3723,7 +3718,7 @@ mod graph_word_lane_tests {
             BTreeSet::from(["connector".to_string(), "published".to_string()])
         );
         assert!(GraphWordAuthority::parse_graph_sources(&["project".to_string()]).is_err());
-        assert!(GraphWordAuthority::parse_graph_sources(&["provisional".to_string()]).is_ok());
+        assert!(GraphWordAuthority::parse_graph_sources(&["provisional".to_string()]).is_err());
     }
 
     /// from_parts merges the pinned policy snapshot with per-call selection

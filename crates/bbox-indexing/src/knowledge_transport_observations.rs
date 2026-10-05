@@ -3,8 +3,11 @@
 //! Checkout lease counters prove the negative half of cutover: covered
 //! projects stop opening local trees. These observations prove the positive
 //! half during overlap by recording which logical operation used local or
-//! remote state and by retaining the latest bounded shadow comparison for
-//! each project/workspace lane.
+//! remote state.
+//!
+//! Files written by older daemons may carry counters for the retired
+//! provisional read operations and their shadow comparisons. Loading drops
+//! those rows, and the next write persists the pruned snapshot.
 
 use std::collections::BTreeSet;
 use std::fs::{File, OpenOptions};
@@ -22,7 +25,6 @@ use serde::{Deserialize, Serialize};
 const OBSERVATION_VERSION: u32 = 1;
 const MAX_ID_BYTES: usize = 256;
 const MAX_COUNTERS: usize = 65_536;
-const MAX_COMPARISONS: usize = 16_384;
 const MAX_OBSERVATION_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(
@@ -32,10 +34,6 @@ const MAX_OBSERVATION_BYTES: usize = 32 * 1024 * 1024;
 pub enum KnowledgeTransportOperationV1 {
     PublishedKnowledge,
     PublishedGaps,
-    ProvisionalOwnKnowledge,
-    ProvisionalOwnGaps,
-    ProvisionalAllKnowledge,
-    ProvisionalAllGaps,
     ProjectKnowledgeMutation,
     ProjectGapMutation,
     AcceptedPublicationMutation,
@@ -49,8 +47,6 @@ pub enum KnowledgeTransportOperationV1 {
 pub enum KnowledgeTransportOutcomeV1 {
     Local,
     Remote,
-    ShadowEqual,
-    ShadowMismatch,
     Degraded,
     AuthoritativeRefusal,
 }
@@ -67,32 +63,12 @@ pub struct KnowledgeTransportOperationCounterV1 {
     pub last_unix_secs: u64,
 }
 
-/// Latest exact shadow comparison for one logical lane.
-///
-/// `reference_snapshot_id` names the already-authoritative accepted or local
-/// overlay result. `transport_snapshot_id` names the remote transport result.
-/// Both are content identities, never paths.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct KnowledgeTransportShadowComparisonV1 {
-    pub project_id: String,
-    pub operation: KnowledgeTransportOperationV1,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workspace_id: Option<String>,
-    pub reference_snapshot_id: String,
-    pub transport_snapshot_id: String,
-    pub equal: bool,
-    pub sequence: u64,
-    pub observed_at_unix_secs: u64,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct KnowledgeTransportObservationSnapshotV1 {
     pub version: u32,
     pub sequence: u64,
     pub counters: Vec<KnowledgeTransportOperationCounterV1>,
-    pub comparisons: Vec<KnowledgeTransportShadowComparisonV1>,
 }
 
 impl Default for KnowledgeTransportObservationSnapshotV1 {
@@ -101,7 +77,6 @@ impl Default for KnowledgeTransportObservationSnapshotV1 {
             version: OBSERVATION_VERSION,
             sequence: 0,
             counters: Vec::new(),
-            comparisons: Vec::new(),
         }
     }
 }
@@ -142,47 +117,6 @@ impl KnowledgeTransportObservationsV1 {
         outcome: KnowledgeTransportOutcomeV1,
     ) -> Result<u64> {
         self.mutate(|snapshot| record_counter(snapshot, project_id, operation, outcome))
-    }
-
-    pub fn record_shadow(
-        &self,
-        project_id: &str,
-        operation: KnowledgeTransportOperationV1,
-        workspace_id: Option<&str>,
-        reference_snapshot_id: &str,
-        transport_snapshot_id: &str,
-    ) -> Result<u64> {
-        self.mutate(|snapshot| {
-            let equal = reference_snapshot_id == transport_snapshot_id;
-            let sequence = record_counter(
-                snapshot,
-                project_id,
-                operation,
-                if equal {
-                    KnowledgeTransportOutcomeV1::ShadowEqual
-                } else {
-                    KnowledgeTransportOutcomeV1::ShadowMismatch
-                },
-            )?;
-            let observed_at_unix_secs = now_unix_secs();
-            let comparison = KnowledgeTransportShadowComparisonV1 {
-                project_id: project_id.to_string(),
-                operation,
-                workspace_id: workspace_id.map(str::to_owned),
-                reference_snapshot_id: reference_snapshot_id.to_string(),
-                transport_snapshot_id: transport_snapshot_id.to_string(),
-                equal,
-                sequence,
-                observed_at_unix_secs,
-            };
-            match snapshot.comparisons.binary_search_by(|current| {
-                comparison_key(current).cmp(&comparison_key(&comparison))
-            }) {
-                Ok(index) => snapshot.comparisons[index] = comparison,
-                Err(index) => snapshot.comparisons.insert(index, comparison),
-            }
-            Ok(sequence)
-        })
     }
 
     fn mutate(
@@ -261,23 +195,16 @@ fn record_counter(
     Ok(sequence)
 }
 
-fn comparison_key(
-    comparison: &KnowledgeTransportShadowComparisonV1,
-) -> (&str, KnowledgeTransportOperationV1, Option<&str>) {
-    (
-        comparison.project_id.as_str(),
-        comparison.operation,
-        comparison.workspace_id.as_deref(),
-    )
-}
-
 fn load_snapshot(path: &Path) -> Result<KnowledgeTransportObservationSnapshotV1> {
     match std::fs::read(path) {
         Ok(bytes) => {
             if bytes.is_empty() || bytes.len() > MAX_OBSERVATION_BYTES {
                 anyhow::bail!("knowledge transport observation file is empty or oversized");
             }
-            let snapshot = serde_json::from_slice(&bytes)
+            let mut raw: serde_json::Value = serde_json::from_slice(&bytes)
+                .with_context(|| format!("parsing {}", path.display()))?;
+            prune_retired_rows(&mut raw);
+            let snapshot = serde_json::from_value(raw)
                 .with_context(|| format!("parsing {}", path.display()))?;
             validate_snapshot(&snapshot)
                 .with_context(|| format!("validating {}", path.display()))?;
@@ -290,6 +217,35 @@ fn load_snapshot(path: &Path) -> Result<KnowledgeTransportObservationSnapshotV1>
     }
 }
 
+/// Operations and outcomes only the retired provisional read lane recorded.
+const RETIRED_OPERATIONS: [&str; 4] = [
+    "provisional_own_knowledge",
+    "provisional_own_gaps",
+    "provisional_all_knowledge",
+    "provisional_all_gaps",
+];
+const RETIRED_OUTCOMES: [&str; 2] = ["shadow_equal", "shadow_mismatch"];
+
+/// Drop the retired provisional counters and the shadow comparison set from
+/// a snapshot an older daemon wrote. Removing rows keeps the remaining
+/// counters in canonical order, so the pruned snapshot still validates.
+fn prune_retired_rows(raw: &mut serde_json::Value) {
+    let Some(object) = raw.as_object_mut() else {
+        return;
+    };
+    object.remove("comparisons");
+    if let Some(counters) = object
+        .get_mut("counters")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        counters.retain(|counter| {
+            let field = |name: &str| counter.get(name).and_then(serde_json::Value::as_str);
+            !field("operation").is_some_and(|operation| RETIRED_OPERATIONS.contains(&operation))
+                && !field("outcome").is_some_and(|outcome| RETIRED_OUTCOMES.contains(&outcome))
+        });
+    }
+}
+
 fn validate_snapshot(snapshot: &KnowledgeTransportObservationSnapshotV1) -> Result<()> {
     if snapshot.version != OBSERVATION_VERSION {
         anyhow::bail!(
@@ -297,7 +253,7 @@ fn validate_snapshot(snapshot: &KnowledgeTransportObservationSnapshotV1) -> Resu
             snapshot.version
         );
     }
-    if snapshot.counters.len() > MAX_COUNTERS || snapshot.comparisons.len() > MAX_COMPARISONS {
+    if snapshot.counters.len() > MAX_COUNTERS {
         anyhow::bail!("knowledge transport observation set exceeds its row bound");
     }
     if !snapshot.counters.windows(2).all(|pair| {
@@ -310,11 +266,7 @@ fn validate_snapshot(snapshot: &KnowledgeTransportObservationSnapshotV1) -> Resu
             pair[1].operation,
             pair[1].outcome,
         )
-    }) || !snapshot
-        .comparisons
-        .windows(2)
-        .all(|pair| comparison_key(&pair[0]) < comparison_key(&pair[1]))
-    {
+    }) {
         anyhow::bail!("knowledge transport observations are not canonical");
     }
     let mut counter_keys = BTreeSet::new();
@@ -331,36 +283,6 @@ fn validate_snapshot(snapshot: &KnowledgeTransportObservationSnapshotV1) -> Resu
             ))
         {
             anyhow::bail!("invalid knowledge transport observation counter");
-        }
-    }
-    let mut comparison_keys = BTreeSet::new();
-    for comparison in &snapshot.comparisons {
-        validate_id(&comparison.project_id, "project id")?;
-        if let Some(workspace_id) = &comparison.workspace_id {
-            validate_id(workspace_id, "workspace id")?;
-        }
-        validate_id(&comparison.reference_snapshot_id, "reference snapshot id")?;
-        validate_id(&comparison.transport_snapshot_id, "transport snapshot id")?;
-        if comparison.equal
-            != (comparison.reference_snapshot_id == comparison.transport_snapshot_id)
-            || comparison.sequence == 0
-            || comparison.sequence > snapshot.sequence
-            || !comparison_keys.insert(comparison_key(comparison))
-        {
-            anyhow::bail!("invalid knowledge transport shadow comparison");
-        }
-        let expected_outcome = if comparison.equal {
-            KnowledgeTransportOutcomeV1::ShadowEqual
-        } else {
-            KnowledgeTransportOutcomeV1::ShadowMismatch
-        };
-        if !snapshot.counters.iter().any(|counter| {
-            counter.project_id == comparison.project_id
-                && counter.operation == comparison.operation
-                && counter.outcome == expected_outcome
-                && counter.last_sequence >= comparison.sequence
-        }) {
-            anyhow::bail!("knowledge transport shadow comparison has no matching counter");
         }
     }
     Ok(())
@@ -420,7 +342,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn records_bounded_operation_and_shadow_evidence_across_reopen() {
+    fn records_bounded_operation_evidence_across_reopen() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("knowledge-transport-observations.json");
         let observations = KnowledgeTransportObservationsV1::open(&path).unwrap();
@@ -432,12 +354,10 @@ mod tests {
             )
             .unwrap();
         observations
-            .record_shadow(
+            .record(
                 "p_1",
-                KnowledgeTransportOperationV1::ProvisionalOwnKnowledge,
-                Some("checkout_1"),
-                "snapshot_1",
-                "snapshot_1",
+                KnowledgeTransportOperationV1::PublishedGaps,
+                KnowledgeTransportOutcomeV1::Remote,
             )
             .unwrap();
         drop(observations);
@@ -446,34 +366,78 @@ mod tests {
         let snapshot = reopened.snapshot();
         assert_eq!(snapshot.sequence, 2);
         assert_eq!(snapshot.counters.len(), 2);
-        assert_eq!(snapshot.comparisons.len(), 1);
-        assert!(snapshot.comparisons[0].equal);
+    }
+
+    /// A file an older daemon wrote, with provisional counters and shadow
+    /// comparisons, loads with those rows dropped and the published rows
+    /// intact; the next write persists the pruned form.
+    #[test]
+    fn legacy_provisional_rows_are_dropped_on_load() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("knowledge-transport-observations.json");
+        let counter = |operation: &str, outcome: &str, sequence: u64| {
+            serde_json::json!({
+                "project_id": "p_1",
+                "operation": operation,
+                "outcome": outcome,
+                "count": 1,
+                "first_sequence": sequence,
+                "last_sequence": sequence,
+                "last_unix_secs": 1,
+            })
+        };
+        let legacy = serde_json::json!({
+            "version": 1,
+            "sequence": 4,
+            "counters": [
+                counter("published_knowledge", "remote", 1),
+                counter("provisional_own_knowledge", "remote", 2),
+                counter("provisional_own_knowledge", "shadow_equal", 3),
+                counter("provisional_all_gaps", "degraded", 4),
+            ],
+            "comparisons": [{
+                "project_id": "p_1",
+                "operation": "provisional_own_knowledge",
+                "workspace_id": "checkout_1",
+                "reference_snapshot_id": "s",
+                "transport_snapshot_id": "s",
+                "equal": true,
+                "sequence": 3,
+                "observed_at_unix_secs": 1,
+            }],
+        });
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+        let observations = KnowledgeTransportObservationsV1::open(&path).unwrap();
+        let snapshot = observations.snapshot();
+        assert_eq!(snapshot.sequence, 4);
+        assert_eq!(snapshot.counters.len(), 1);
+        assert_eq!(
+            snapshot.counters[0].operation,
+            KnowledgeTransportOperationV1::PublishedKnowledge
+        );
+        observations
+            .record(
+                "p_1",
+                KnowledgeTransportOperationV1::PublishedGaps,
+                KnowledgeTransportOutcomeV1::Remote,
+            )
+            .unwrap();
+        let persisted = std::fs::read_to_string(&path).unwrap();
+        assert!(!persisted.contains("provisional"), "{persisted}");
+        assert!(!persisted.contains("comparisons"), "{persisted}");
     }
 
     #[test]
-    fn latest_shadow_replaces_same_project_workspace_lane() {
-        let observations = KnowledgeTransportObservationsV1::in_memory();
-        observations
-            .record_shadow(
-                "p_1",
-                KnowledgeTransportOperationV1::ProvisionalAllGaps,
-                Some("checkout_1"),
-                "gap_1",
-                "gap_2",
-            )
-            .unwrap();
-        observations
-            .record_shadow(
-                "p_1",
-                KnowledgeTransportOperationV1::ProvisionalAllGaps,
-                Some("checkout_1"),
-                "gap_3",
-                "gap_3",
-            )
-            .unwrap();
-        let snapshot = observations.snapshot();
-        assert_eq!(snapshot.comparisons.len(), 1);
-        assert!(snapshot.comparisons[0].equal);
-        assert_eq!(snapshot.comparisons[0].sequence, 2);
+    fn a_never_provisioned_observation_file_opens_empty() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root
+            .path()
+            .join("absent/knowledge-transport-observations.json");
+        let observations = KnowledgeTransportObservationsV1::open(&path).unwrap();
+        assert_eq!(
+            observations.snapshot(),
+            KnowledgeTransportObservationSnapshotV1::default()
+        );
     }
 }

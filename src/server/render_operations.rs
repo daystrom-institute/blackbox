@@ -96,6 +96,10 @@ pub(crate) struct RenderOperationRecord {
     pub plan_bytes: usize,
     pub provider: Option<String>,
     pub dry_run: bool,
+    /// Always `published` for new operations. A record an older daemon
+    /// wrote for a provisional view loads as published: the view is history
+    /// on a settled operation and never rebuilds its plan.
+    #[serde(deserialize_with = "deserialize_recorded_view")]
     pub view: ProjectRenderViewV1,
     pub requested_scope: String,
     pub created_at_unix_secs: u64,
@@ -824,6 +828,17 @@ fn retain(index: &mut RenderOperationIndex) -> Vec<String> {
         dropped.push(index.operations.remove(position).operation_id);
     }
     dropped
+}
+
+fn deserialize_recorded_view<'de, D>(deserializer: D) -> Result<ProjectRenderViewV1, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    match raw.as_str() {
+        "published" | "own" | "all" => Ok(ProjectRenderViewV1::Published),
+        other => Err(serde::de::Error::unknown_variant(other, &["published"])),
+    }
 }
 
 fn load_index(path: &Path) -> Result<RenderOperationIndex> {

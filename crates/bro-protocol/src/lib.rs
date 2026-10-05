@@ -23,9 +23,9 @@ pub use fleetd::{
 };
 pub use transcript::{TodoItem, TodoItemStatus, TodoState, TranscriptItem};
 pub use worker::{
-    InvalidWorkerWorkspaceScope, InvalidWorkspaceBindingToken, KNOWLEDGE_SOURCE_URL_ENV, REDACTED,
-    SecretEnv, WORKSPACE_BINDING_ENV, WORKSPACE_BINDING_HEADER, WORKSPACE_SCOPE_ENV,
-    WorkerSpawnSpec, WorkerWorkspaceIdentity, WorkerWorkspaceScope, WorkspaceBindingToken,
+    InvalidWorkerWorkspaceScope, InvalidWorkspaceBindingToken, REDACTED, SecretEnv,
+    WORKSPACE_BINDING_ENV, WORKSPACE_BINDING_HEADER, WORKSPACE_SCOPE_ENV, WorkerSpawnSpec,
+    WorkerWorkspaceIdentity, WorkerWorkspaceScope, WorkspaceBindingToken,
     WorkspaceInspectionOutcome, WorkspaceInspectionRequest,
 };
 

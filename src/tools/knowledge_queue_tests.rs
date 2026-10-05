@@ -2,6 +2,7 @@ use super::*;
 use crate::knowledge::KnowledgeEntry;
 use crate::server::state::catalog_fixture::{CatalogFixture, knowledge_entry};
 use bbox_corpus_core::identity::PublishedScope;
+use std::collections::BTreeSet;
 
 const PROJECT: &str = "p_knowledge_queue";
 const ENTRY: &str = "1234567890abcdef";
@@ -175,9 +176,7 @@ async fn queued_knowledge_edits_compose_before_and_after_delivery_and_publicatio
     assert_eq!(entry.content, "delivered content");
     assert!(!entry.render, "an update composes on the delivered write");
     publish(&fixture, &server, &scope, "2", &[entry.clone()]);
-    server
-        .session_knowledge_view(Some(PROJECT), Some("published"))
-        .unwrap();
+    server.session_knowledge_view(Some(PROJECT)).unwrap();
     assert_eq!(
         server
             .state
@@ -402,9 +401,7 @@ async fn queued_knowledge_delete_is_a_tombstone_until_publication() {
             .is_err()
     );
     publish(&fixture, &restarted, &scope, "2", &[]);
-    restarted
-        .session_knowledge_view(Some(PROJECT), Some("published"))
-        .unwrap();
+    restarted.session_knowledge_view(Some(PROJECT)).unwrap();
     assert_eq!(
         restarted
             .state
@@ -688,9 +685,7 @@ async fn queued_knowledge_genesis_delete_does_not_retire_on_preexisting_absence(
         })
         .unwrap();
     publish(&fixture, &server, &scope, "1", &[]);
-    server
-        .session_knowledge_view(Some(PROJECT), Some("published"))
-        .unwrap();
+    server.session_knowledge_view(Some(PROJECT)).unwrap();
     assert_eq!(
         server
             .state
@@ -702,9 +697,7 @@ async fn queued_knowledge_genesis_delete_does_not_retire_on_preexisting_absence(
     );
     assert!(update_by_id(&server, &created.id, "after delete").is_err());
     publish(&fixture, &server, &scope, "2", &[created.clone()]);
-    server
-        .session_knowledge_view(Some(PROJECT), Some("published"))
-        .unwrap();
+    server.session_knowledge_view(Some(PROJECT)).unwrap();
     assert_eq!(
         server
             .state
@@ -736,9 +729,7 @@ async fn queued_knowledge_genesis_delete_does_not_retire_on_preexisting_absence(
             .unwrap();
     }
     publish(&fixture, &server, &scope, "3", &[]);
-    server
-        .session_knowledge_view(Some(PROJECT), Some("published"))
-        .unwrap();
+    server.session_knowledge_view(Some(PROJECT)).unwrap();
     assert_eq!(
         server
             .state
@@ -816,9 +807,7 @@ async fn queued_knowledge_acknowledged_create_delete_survives_delayed_publicatio
         .unwrap();
     drop(server);
     let server = queue_server(&fixture);
-    server
-        .session_knowledge_view(Some(PROJECT), Some("published"))
-        .unwrap();
+    server.session_knowledge_view(Some(PROJECT)).unwrap();
     assert_eq!(
         server
             .state
@@ -837,9 +826,7 @@ async fn queued_knowledge_acknowledged_create_delete_survives_delayed_publicatio
             .is_err()
     );
     publish(&fixture, &server, &scope, "2", &[created.clone()]);
-    server
-        .session_knowledge_view(Some(PROJECT), Some("published"))
-        .unwrap();
+    server.session_knowledge_view(Some(PROJECT)).unwrap();
     assert_eq!(
         server
             .state
@@ -858,9 +845,7 @@ async fn queued_knowledge_acknowledged_create_delete_survives_delayed_publicatio
             .is_err()
     );
     publish(&fixture, &server, &scope, "3", &[]);
-    server
-        .session_knowledge_view(Some(PROJECT), Some("published"))
-        .unwrap();
+    server.session_knowledge_view(Some(PROJECT)).unwrap();
     assert_eq!(
         server
             .state

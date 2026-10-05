@@ -15,14 +15,17 @@ use bbox_corpus_core::project_record::ProjectRecord;
 use bbox_knowledge::knowledge::{Knowledge, KnowledgeEntry};
 use bbox_knowledge::overlay::{load_published_snapshot, published_scope_hash};
 
+/// The only visibility a knowledge document is written under. The index
+/// field stays in the schema so stale documents from older daemons remain
+/// filterable until a full rebuild drops them.
+pub const PUBLISHED_KNOWLEDGE_VISIBILITY: &str = "published";
+
 #[derive(Debug, Clone)]
 pub struct KnowledgeIndexDocument {
     pub entry: KnowledgeEntry,
     pub entity_id: String,
     pub logical_ref: String,
-    pub visibility: String,
     pub scope_hash: Option<String>,
-    pub checkout_id: Option<String>,
     pub snapshot_id: Option<String>,
 }
 
@@ -33,9 +36,7 @@ impl KnowledgeIndexDocument {
             logical_ref: entity_id.clone(),
             entity_id,
             entry,
-            visibility: "published".into(),
             scope_hash: None,
-            checkout_id: None,
             snapshot_id: None,
         }
     }
@@ -80,12 +81,9 @@ pub fn build_knowledge_index_doc(
     doc.add_text(f.parser_version, PARSER_VERSION);
     doc.add_text(f.entity_id, &source.entity_id);
     doc.add_text(f.logical_ref, &source.logical_ref);
-    doc.add_text(f.knowledge_visibility, &source.visibility);
+    doc.add_text(f.knowledge_visibility, PUBLISHED_KNOWLEDGE_VISIBILITY);
     if let Some(scope_hash) = &source.scope_hash {
         doc.add_text(f.knowledge_scope_hash, scope_hash);
-    }
-    if let Some(checkout_id) = &source.checkout_id {
-        doc.add_text(f.knowledge_checkout_id, checkout_id);
     }
     if let Some(snapshot_id) = &source.snapshot_id {
         doc.add_text(f.knowledge_snapshot_id, snapshot_id);
@@ -114,8 +112,8 @@ pub fn apply_knowledge_replace(
     Ok(())
 }
 
-/// Replace every published or provisional document for one logical knowledge
-/// ref while leaving unrelated knowledge documents untouched.
+/// Replace every document for one logical knowledge ref while leaving
+/// unrelated knowledge documents untouched.
 pub fn apply_knowledge_logical_replace(
     writer: &mut IndexWriter,
     fields: FieldHandles,
@@ -133,8 +131,8 @@ pub fn apply_knowledge_logical_replace(
     Ok(())
 }
 
-/// Replace every published or provisional document for one managed project
-/// scope while leaving global knowledge and other repositories untouched.
+/// Replace every document for one managed project scope while leaving global
+/// knowledge and other repositories untouched.
 /// This is the convergence operation used when a pinned publisher ref moves.
 pub fn apply_knowledge_scope_replace(
     writer: &mut IndexWriter,
@@ -247,9 +245,7 @@ pub fn reindex_knowledge_store_with_access(
     writer: &mut IndexWriter,
     meta: &mut HashMap<String, FileMeta>,
 ) -> Result<u64> {
-    // Reindex owns the published generation only. Provisional documents are
-    // reconstructed from live checkout overlays and must survive an unrelated
-    // committed-store pass.
+    // Reindex owns the published generation.
     writer.delete_term(Term::from_field_text(
         fields.knowledge_visibility,
         "published",
@@ -357,9 +353,7 @@ pub fn reindex_knowledge_store_with_access(
                 entity_id: logical_ref.clone(),
                 logical_ref,
                 entry: published_entry.entry,
-                visibility: "published".into(),
                 scope_hash: Some(scope_hash.clone()),
-                checkout_id: None,
                 snapshot_id: Some(published.publisher_commit.clone()),
             }
         }));
@@ -510,7 +504,6 @@ mod tests {
             serde_json::to_string(&bbox_knowledge::knowledge::KnowledgeStore {
                 version: 1,
                 built_from: Default::default(),
-                provenance: Default::default(),
                 entries: Vec::new(),
             })
             .unwrap(),
@@ -539,7 +532,6 @@ mod tests {
             serde_json::to_string(&bbox_knowledge::knowledge::KnowledgeStore {
                 version: 1,
                 built_from: Default::default(),
-                provenance: Default::default(),
                 entries: vec![entry.clone()],
             })
             .unwrap(),
@@ -551,9 +543,7 @@ mod tests {
                 entity_id: knowledge_entity_id(&entry.id),
                 logical_ref: knowledge_entity_id(&entry.id),
                 entry,
-                visibility: "published".into(),
                 scope_hash: Some("scope-last-good".into()),
-                checkout_id: None,
                 snapshot_id: Some("commit-old".into()),
             },
             &knowledge_path,
@@ -726,7 +716,6 @@ mod tests {
             serde_json::to_string(&KnowledgeStore {
                 version: 1,
                 built_from: Default::default(),
-                provenance: Default::default(),
                 entries: vec![],
             })
             .unwrap(),
@@ -849,7 +838,6 @@ mod tests {
             serde_json::to_vec_pretty(&KnowledgeStore {
                 version: 1,
                 built_from: Default::default(),
-                provenance: Default::default(),
                 entries: vec![entry],
             })
             .unwrap(),

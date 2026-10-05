@@ -1,12 +1,9 @@
 //! Durable identity primitives for the checkout/knowledge seam.
 //!
-//! Slice 1a of
-//! `design/corpus/knowledge/checkout-identity-and-provisional-knowledge.md`.
-//! These are PURE, ADDITIVE primitives: minting and resolution helpers plus a
-//! reuse-safe checkout marker. Nothing here rewires how knowledge scope keys
-//! are actually chosen today — that wiring lands in later slices. The point of
-//! this slice is that the primitives exist, are correct, and are tested, so the
-//! provisional-lane and migration work can consume them.
+//! Design: `design/corpus/knowledge/checkout-identity-and-provisional-knowledge.md`
+//! (identity sections). These are pure primitives: minting and resolution
+//! helpers plus a reuse-safe checkout marker, consumed by checkout
+//! registration, the schema-epoch migration, and harness workspace identity.
 //!
 //! Two identity axes live here:
 //!

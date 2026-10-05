@@ -18,7 +18,6 @@
 use anyhow::{Context, Result, bail};
 use bbox_corpus_core::identity::PublishedScope;
 use bbox_corpus_core::project_catalog::{ProjectId, ProjectScope};
-use bbox_knowledge::overlay::ProvisionalMode;
 use bbox_project_render::transport::{
     PROJECT_RENDER_TRANSPORT_SCOPE, PROJECT_RENDER_TRANSPORT_VERSION,
     ProjectRenderProducerAuthorityV1, ProjectRenderViewV1, validate_render_operation_id,
@@ -172,10 +171,9 @@ pub(crate) fn owner_required_message(project_id: &str, detail: Option<&str>) -> 
 }
 
 /// View parameters of one owner render, reused to revalidate a completion.
-struct OwnerPlanRequest<'a> {
+struct OwnerPlanRequest {
     provider: Option<String>,
     dry_run: bool,
-    provisional: Option<&'a str>,
     requested_scope: String,
 }
 
@@ -206,29 +204,18 @@ impl BlackboxServer {
         ))
     }
 
-    fn owner_render_view_mode(&self, provisional: Option<&str>) -> Result<ProjectRenderViewV1> {
-        let has_checkout = self.authoritative_session_checkout().is_some()
-            || self.authoritative_session_workspace_binding().is_some();
-        Ok(match ProvisionalMode::parse(provisional, has_checkout)? {
-            ProvisionalMode::Published => ProjectRenderViewV1::Published,
-            ProvisionalMode::Own => ProjectRenderViewV1::Own,
-            ProvisionalMode::All => ProjectRenderViewV1::All,
-        })
-    }
-
     /// Build the path-free plan an owner applies, under one producer
     /// authority.
     fn owner_render_plan(
         &self,
         owner: &RenderOwner,
-        request: &OwnerPlanRequest<'_>,
+        request: &OwnerPlanRequest,
         authority: ProjectRenderProducerAuthorityV1,
     ) -> Result<(
         ProjectRenderPlanV1,
         super::knowledge_view::SessionKnowledgeView,
     )> {
-        let view_mode = self.owner_render_view_mode(request.provisional)?;
-        let view = self.session_knowledge_view(Some(&owner.project_id), request.provisional)?;
+        let view = self.session_knowledge_view(Some(&owner.project_id))?;
         let mut entries = view
             .items
             .iter()
@@ -252,7 +239,7 @@ impl BlackboxServer {
             producer: Some(authority),
             provider: request.provider.clone(),
             dry_run: request.dry_run,
-            view: view_mode,
+            view: ProjectRenderViewV1::Published,
             requested_scope: request.requested_scope.clone(),
             entries,
             diagnostics: view.diagnostics_text(),
@@ -280,16 +267,12 @@ impl BlackboxServer {
         let request = OwnerPlanRequest {
             provider: p.provider.clone(),
             dry_run: p.dry_run.unwrap_or(false),
-            provisional: p.provisional.as_deref(),
             requested_scope: requested_scope.clone(),
         };
-        // Resolve the view before any effect, so an unauthorized `own`
-        // refuses without rendering the global half.
-        self.owner_render_view_mode(request.provisional)?;
         // Global first: the project half is not issued until the global
         // half rendered.
         let global_result = if requested_scope == "both" {
-            let view = self.session_knowledge_view(Some(&owner.project_id), request.provisional)?;
+            let view = self.session_knowledge_view(Some(&owner.project_id))?;
             Some(
                 view.knowledge
                     .render(&RenderParams {
@@ -374,7 +357,6 @@ impl BlackboxServer {
         let request = OwnerPlanRequest {
             provider: record.provider.clone(),
             dry_run: record.dry_run,
-            provisional: Some(record.view.as_str()),
             requested_scope: record.requested_scope.clone(),
         };
         let diagnostics = runtime
@@ -388,7 +370,7 @@ impl BlackboxServer {
     fn revalidate_owner_completion(
         &self,
         record: &RenderOperationRecord,
-        request: &OwnerPlanRequest<'_>,
+        request: &OwnerPlanRequest,
     ) -> Result<RenderCompletionValidation> {
         let owner = match self.render_owner_for(&record.project_id)? {
             RenderOwnerSelection::Owner(owner) if owner.producer_id == record.producer_id => owner,
@@ -417,7 +399,7 @@ impl BlackboxServer {
     fn owner_render_response(
         &self,
         record: &RenderOperationRecord,
-        request: &OwnerPlanRequest<'_>,
+        request: &OwnerPlanRequest,
         global_result: Option<String>,
         diagnostics: Option<String>,
     ) -> Result<String> {

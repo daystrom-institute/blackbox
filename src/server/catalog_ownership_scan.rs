@@ -729,12 +729,12 @@ fn absolute_invariants(root: &Path, failures: &mut Vec<String>) -> anyhow::Resul
     // Plan 4.13 forbids new BuiltFromStamp variants.
     let built_from =
         std::fs::read_to_string(root.join("crates/bbox-corpus-core/src/built_from.rs"))?;
-    let variants = regex::Regex::new(r"(?m)^\s{4}(Published|CheckoutOverlay)\b")?
+    let variants = regex::Regex::new(r"(?m)^\s{4}[A-Z][A-Za-z]* \{")?
         .find_iter(&built_from)
         .count();
-    if variants != 2 {
+    if variants != 1 {
         failures.push(format!(
-            "BuiltFromStamp variant set changed: expected 2, found {variants}"
+            "BuiltFromStamp variant set changed: expected 1, found {variants}"
         ));
     }
 

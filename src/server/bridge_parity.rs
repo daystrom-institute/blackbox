@@ -28,16 +28,13 @@
 //!   capture is a fixed constant. That also pins `repo_id`, which is the
 //!   hash of the repository's first commit.
 //! - The checkout identity marker is pre-written rather than minted, so the
-//!   random `checkout_id` becomes a constant, and with it every overlay key
-//!   and provisional entity ref derived from it.
+//!   random `checkout_id` becomes a constant.
 //!
 //! Left over, and substituted by exact value:
 //! - the fixture root, because it is a per-run temporary directory;
 //! - the version-1 registry `project_id`, because it is the hash of that
 //!   per-run path;
-//! - `registered_at`, because the registry stamps wall-clock time;
-//! - the overlay working fingerprint, because it is derived from filesystem
-//!   metadata that no fixture controls.
+//! - `registered_at`, because the registry stamps wall-clock time.
 //!
 //! Each row DECLARES which of those four it expects. Substitution is
 //! self-policing in both directions: a declared substitution that never
@@ -104,8 +101,7 @@ mod harness {
     const GIT_DATE: &str = "2026-01-01T00:00:00+0000";
 
     /// Pre-written so the checkout identity is a constant rather than
-    /// `random_hex()`. Overlay keys, provisional entity refs, and every
-    /// snapshot id are derived from it.
+    /// `random_hex()`.
     const OWN_CHECKOUT_ID: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb01";
     const PEER_CHECKOUT_ID: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb02";
 
@@ -127,8 +123,6 @@ mod harness {
         RegistryProjectId,
         /// `registered_at`, stamped from wall-clock time at registration.
         RegisteredAt,
-        /// The overlay working fingerprint, derived from filesystem metadata.
-        WorkingFingerprint,
         /// `last_unix_secs` / `last_success_unix_secs` on a checkout
         /// observation: the wall-clock second a counter last moved. The
         /// counter key-space, the exact counts, and the sequences are all
@@ -152,7 +146,6 @@ mod harness {
                 Self::FixtureRoot => "<FIXTURE_ROOT>",
                 Self::RegistryProjectId => "<REGISTRY_PROJECT_ID>",
                 Self::RegisteredAt => "<REGISTERED_AT>",
-                Self::WorkingFingerprint => "<WORKING_FINGERPRINT>",
                 Self::ObservationWallClock => "<OBSERVED_AT_UNIX_SECS>",
                 Self::DaemonVersion => "blackboxd <DAEMON_VERSION>",
                 Self::HostStateDir => "<HOST_STATE_DIR>",
@@ -167,7 +160,6 @@ mod harness {
                 Self::FixtureRoot => "per-run temporary directory",
                 Self::RegistryProjectId => "hash of the per-run canonical fixture path",
                 Self::RegisteredAt => "registry stamps wall-clock time",
-                Self::WorkingFingerprint => "derived from filesystem metadata",
                 Self::ObservationWallClock => "wall-clock second a counter last moved",
                 Self::DaemonVersion => "CARGO_PKG_VERSION, moves every release",
                 Self::HostStateDir => "host state directory outside the fixture",
@@ -270,7 +262,6 @@ mod harness {
             project: None,
             project_id: None,
             write_dir: None,
-            provisional_checkout_id: None,
             task_id: None,
             session_id: None,
             provider: None,
@@ -367,10 +358,10 @@ mod harness {
             }
         }
 
-        /// Dirty both checkouts and drive the bridge overlay recompute for each,
-        /// so Own and All have real provisional content rather than a
-        /// hand-published snapshot.
-        fn recompute_overlays(&self) {
+        /// Dirty both checkouts with uncommitted edits, register them, and
+        /// pin the session to the base checkout. Every read stays published:
+        /// none of these working bytes may reach a captured response.
+        fn dirty_checkouts(&self) {
             write_knowledge(&self.base, &knowledge_entry("bp-shared", "OWN_CONTENT"));
             std::fs::remove_file(self.base.join(".bbox/knowledge/bp-deleted.json")).unwrap();
             write_gap(&self.base, &gap_note("gap-bb000001", "own gap title"));
@@ -382,8 +373,6 @@ mod harness {
                 self.server
                     .register_dark_knowledge_checkout(checkout)
                     .unwrap();
-                self.server.refresh_dark_knowledge_overlay(checkout);
-                self.server.refresh_dark_gap_overlay(checkout);
             }
             self.server.set_session_checkout_for_test(
                 self.registry_project_id.clone(),
@@ -424,12 +413,8 @@ mod harness {
         }
 
         /// The exact values behind each declared normalization.
-        ///
-        /// Working fingerprints are read back from the overlay stores rather
-        /// than guessed, so the substitution is exactly what the recompute
-        /// produced and cannot silently cover a different value.
         fn substitutions(&self) -> Vec<Substitution> {
-            let mut substitutions = vec![
+            vec![
                 substitution(
                     Normalization::FixtureRoot,
                     self.root.to_string_lossy().into_owned(),
@@ -472,32 +457,7 @@ mod harness {
                         .to_string(),
                     None,
                 ),
-            ];
-            let mut fingerprints = BTreeMap::new();
-            for snapshot in self.server.state.knowledge_overlays.read().snapshots() {
-                if let Some(stamp) = &snapshot.stamp {
-                    fingerprints
-                        .insert(stamp.checkout_id.clone(), stamp.working_fingerprint.clone());
-                }
-            }
-            for snapshot in self.server.state.gap_overlays.read().snapshots() {
-                if let Some(stamp) = &snapshot.stamp {
-                    fingerprints
-                        .insert(stamp.checkout_id.clone(), stamp.working_fingerprint.clone());
-                }
-            }
-            assert!(
-                !fingerprints.is_empty(),
-                "the overlay recompute produced no stamp, so the Own and All rows would be empty"
-            );
-            for (checkout_id, fingerprint) in fingerprints {
-                substitutions.push(substitution(
-                    Normalization::WorkingFingerprint,
-                    fingerprint,
-                    Some(&checkout_id),
-                ));
-            }
-            substitutions
+            ]
         }
     }
 
@@ -605,9 +565,9 @@ mod harness {
 
     /// One nondeterministic value and the placeholder that replaces it.
     ///
-    /// A normalization can have more than one instance (two checkouts produce
-    /// two working fingerprints), so the placeholder is per-instance while the
-    /// declaration a row makes stays at the normalization level.
+    /// A normalization can have more than one instance, so the placeholder is
+    /// per-instance while the declaration a row makes stays at the
+    /// normalization level.
     struct Substitution {
         normalization: Normalization,
         actual: String,
@@ -827,51 +787,30 @@ mod harness {
         )
     }
 
-    /// Published, Own, and All for both lanes, captured through the tools an
-    /// external consumer actually calls.
+    /// The knowledge and gap reads, captured through the tools an external
+    /// consumer actually calls. Both serve published content only.
     async fn view_rows(fixture: &BridgeFixture) -> Vec<Row> {
         let project = fixture.base.to_string_lossy().into_owned();
-        let mut rows = Vec::new();
-        for (name, mode) in [
-            ("published_knowledge", "published"),
-            ("own_knowledge", "own"),
-            ("all_knowledge", "all"),
-        ] {
-            let result = fixture
-                .server
-                .bbox_knowledge(Parameters(KnowledgeListParams {
-                    project: Some(project.clone()),
-                    provisional: Some(mode.to_string()),
-                    ..Default::default()
-                }))
-                .await;
-            rows.push(row(name, tool_row(&result), &[]));
-        }
-        for (name, mode) in [
-            ("published_gaps", "published"),
-            ("own_gaps", "own"),
-            ("all_gaps", "all"),
-        ] {
-            let result = fixture.server.bbox_gaps(Parameters(GapListParams {
+        let knowledge = fixture
+            .server
+            .bbox_knowledge(Parameters(KnowledgeListParams {
                 project: Some(project.clone()),
-                provisional: Some(mode.to_string()),
-                json: Some(true),
                 ..Default::default()
-            }));
-            rows.push(row(
-                name,
-                tool_row(&result),
-                if mode == "published" {
-                    &[Normalization::FixtureRoot]
-                } else {
-                    &[
-                        Normalization::FixtureRoot,
-                        Normalization::WorkingFingerprint,
-                    ]
-                },
-            ));
-        }
-        rows
+            }))
+            .await;
+        let gaps = fixture.server.bbox_gaps(Parameters(GapListParams {
+            project: Some(project),
+            json: Some(true),
+            ..Default::default()
+        }));
+        vec![
+            row("published_knowledge", tool_row(&knowledge), &[]),
+            row(
+                "published_gaps",
+                tool_row(&gaps),
+                &[Normalization::FixtureRoot],
+            ),
+        ]
     }
 
     async fn render_row(fixture: &BridgeFixture) -> Row {
@@ -1282,7 +1221,7 @@ mod harness {
         let memories = tempfile::tempdir().unwrap();
         pin_system_memory_catalog(memories.path());
         let fixture = BridgeFixture::new();
-        fixture.recompute_overlays();
+        fixture.dirty_checkouts();
 
         // Every row starts from a cold authorization cache, so the lease
         // counts the observation row captures are a property of the code
@@ -1312,11 +1251,7 @@ mod harness {
         let expected: BTreeSet<&str> = [
             "publisher_authorization",
             "published_knowledge",
-            "own_knowledge",
-            "all_knowledge",
             "published_gaps",
-            "own_gaps",
-            "all_gaps",
             "render",
             "project_administration",
             "watcher_carriers",

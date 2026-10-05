@@ -7,27 +7,17 @@ use bbox_providers::providers::{
     ProviderContext, truncate_label,
 };
 
-pub(crate) struct ProjectGraphVertexProvider {
-    provisional: bool,
-}
+pub(crate) struct ProjectGraphVertexProvider;
 
 impl ProjectGraphVertexProvider {
     pub(crate) fn published() -> Self {
-        Self { provisional: false }
-    }
-
-    pub(crate) fn provisional() -> Self {
-        Self { provisional: true }
+        Self
     }
 }
 
 impl InspectableEntityProvider for ProjectGraphVertexProvider {
     fn entity_type(&self) -> EntityType {
-        if self.provisional {
-            EntityType::ProvisionalProjectGraphVertex
-        } else {
-            EntityType::ProjectGraphVertex
-        }
+        EntityType::ProjectGraphVertex
     }
 
     fn owns_ref(&self, r: &EntityRef) -> bool {
@@ -37,7 +27,7 @@ impl InspectableEntityProvider for ProjectGraphVertexProvider {
     fn get_entity(&self, ctx: &ProviderContext<'_>, r: &EntityRef) -> Result<EntityView> {
         ctx.project_graph_resolver()
             .ok_or_else(|| anyhow!("project graph provider requires a request resolver"))?
-            .resolve_entity(r, ctx.provisional_mode())
+            .resolve_entity(r)
     }
 
     /// Three lanes, in priority order.

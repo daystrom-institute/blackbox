@@ -1,14 +1,9 @@
-//! Host-local checkout registry (design §3.3).
+//! Host-local checkout registry.
 //!
-//! Slice 2a of
-//! `design/corpus/knowledge/checkout-identity-and-provisional-knowledge.md`.
-//!
-//! The provisional-knowledge overlay serves cross-checkout visibility: "here is
-//! what every checkout on this machine has in flight." To do that the daemon
-//! must first ENUMERATE the checkouts that exist — a capability that does not
-//! exist today (the watcher and knowledge loader see only registered base
-//! roots). This registry is that census: a host-local index of the checkouts
-//! that have written provisional state, kept honest over time.
+//! A host-local census of the checkouts that have written repo-owned state on
+//! this machine, kept honest over time. The watcher, transaction recovery,
+//! render, and closeout use it to enumerate checkouts beyond the registered
+//! base roots.
 //!
 //! It is a discovery INDEX, not authority — the durable state lives in each
 //! checkout's own `.bbox/` on disk, and a lost registry costs a recompute, not
@@ -20,7 +15,7 @@
 //!   registered repo, see [`discover_checkout_dirs`]) re-enumerates even if the
 //!   registry file is lost, so it self-heals unconditionally.
 //! - ARBITRARY-location marker clones are re-findable only via the registry; if
-//!   it is also lost they re-register on their next provisional write.
+//!   it is also lost they re-register on their next checkout write.
 //!
 //! This slice ships the store and its pure lifecycle operations. Wiring it into
 //! the live write path, startup, the reconciliation loop, and the watcher is

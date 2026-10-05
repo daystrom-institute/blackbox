@@ -2834,9 +2834,8 @@ fn validate_repository_relative_git_path(path: &str, label: &str) -> Result<()> 
     Ok(())
 }
 
-/// The best common ancestor of two commit-ishes via `git merge-base <a> <b>`,
-/// used to compute a checkout's provisional overlay as a merge-base-relative
-/// diff against the published tree (design §4.1). Returns `None` when there is
+/// The best common ancestor of two commit-ishes via `git merge-base <a> <b>`.
+/// Returns `None` when there is
 /// no common ancestor (unrelated histories), a ref is unknown, or `root` is not
 /// a git repo.
 pub fn merge_base(root: &Path, a: &str, b: &str) -> Option<String> {

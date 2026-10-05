@@ -163,11 +163,6 @@ pub enum WorkspaceInspectionOutcome {
 /// rest of the session credentials.
 pub const WORKSPACE_BINDING_ENV: &str = "BRO_WORKSPACE_BINDING_TOKEN";
 
-/// Harness environment key carrying the daemon endpoint that owns provisional
-/// source intake for the bound workspace. This is trusted spawn configuration,
-/// not model input, and shell grandchildren scrub it with the session env.
-pub const KNOWLEDGE_SOURCE_URL_ENV: &str = "BRO_KNOWLEDGE_SOURCE_URL";
-
 /// Harness environment key carrying the serialized path-free published scope
 /// authorized by the daemon when it minted [`WORKSPACE_BINDING_ENV`].
 pub const WORKSPACE_SCOPE_ENV: &str = "BRO_WORKSPACE_PUBLISHED_SCOPE";

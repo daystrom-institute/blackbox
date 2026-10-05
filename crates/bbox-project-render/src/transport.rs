@@ -1,11 +1,17 @@
 //! Path-free project render plans and receipts exchanged with a checkout
 //! owner.
 //!
-//! A plan is the exact authorized knowledge snapshot for one project render.
+//! A plan is the exact authorized published knowledge for one project render.
 //! Its authority is either a live workspace binding (the bound harness
 //! locality client) or one producer-bound render operation (the collector
 //! that owns the checkout). Every receipt names the same authority and the
 //! exact bytes each fixed output received, and never a checkout path.
+//!
+//! A bound harness may apply its own checkout's uncommitted knowledge to a
+//! workspace plan before executing it ([`ProjectRenderPlanV1::with_local_overlay`]).
+//! Its receipt then names the overlay digest, and the daemon validates the
+//! receipt's authority and shape instead of the published projection bytes it
+//! no longer predicts.
 
 use std::collections::BTreeMap;
 
@@ -113,6 +119,8 @@ pub struct ProjectRenderPlanV1 {
     pub producer: Option<ProjectRenderProducerAuthorityV1>,
     pub provider: Option<String>,
     pub dry_run: bool,
+    /// Fixed `published` wire constant. Older plans could name a provisional
+    /// view; every reader now refuses anything but `published`.
     pub view: ProjectRenderViewV1,
     /// Normalized public request scope: `project` or `both`.
     pub requested_scope: String,
@@ -121,31 +129,19 @@ pub struct ProjectRenderPlanV1 {
     pub diagnostics: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+/// The knowledge view a plan renders. Plans carry only published knowledge;
+/// the single variant keeps the shared wire field stable for every reader.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProjectRenderViewV1 {
+    #[default]
     Published,
-    Own,
-    All,
 }
 
 impl ProjectRenderViewV1 {
-    pub fn parse(value: Option<&str>) -> Result<Self> {
-        match value.unwrap_or("own") {
-            "published" => Ok(Self::Published),
-            "own" => Ok(Self::Own),
-            "all" => Ok(Self::All),
-            value => anyhow::bail!(
-                "invalid project render provisional view {value:?}; expected published, own, or all"
-            ),
-        }
-    }
-
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Published => "published",
-            Self::Own => "own",
-            Self::All => "all",
         }
     }
 }
@@ -223,6 +219,10 @@ pub struct ProjectRenderReceiptV1 {
     /// completion. The receipt is then partial whatever its dispositions.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub incomplete: bool,
+    /// Digest of the local overlay a bound harness applied before executing
+    /// a workspace plan. Absent for every published-only execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_overlay_sha256: Option<String>,
     pub projections: Vec<ProjectRenderProjectionReceiptV1>,
 }
 
@@ -445,6 +445,41 @@ impl ProjectRenderPlanV1 {
         Ok(outputs)
     }
 
+    /// Apply one checkout's uncommitted knowledge to a workspace plan.
+    ///
+    /// Tombstoned ids leave the plan and upserts replace or add rows by id.
+    /// Every applied row is rebound to the plan's normalized project
+    /// authority, exactly as published rows are, so local bytes cannot widen
+    /// the render beyond its project. Producer plans are never overlaid.
+    pub fn with_local_overlay<'a>(
+        &self,
+        upserts: impl IntoIterator<Item = &'a KnowledgeEntry>,
+        tombstones: impl IntoIterator<Item = &'a str>,
+    ) -> Result<Self> {
+        if self.producer.is_some() {
+            anyhow::bail!("a producer render plan cannot take a local overlay");
+        }
+        let mut entries = self
+            .entries
+            .iter()
+            .map(|entry| (entry.id.clone(), entry.clone()))
+            .collect::<BTreeMap<_, _>>();
+        for id in tombstones {
+            entries.remove(id);
+        }
+        for entry in upserts {
+            let mut entry = entry.clone();
+            entry.scope = Scope::Project;
+            entry.project = Some(PROJECT_RENDER_TRANSPORT_SCOPE.into());
+            entry.project_id = Some(self.project_id.clone());
+            entries.insert(entry.id.clone(), entry);
+        }
+        let mut plan = self.clone();
+        plan.entries = entries.into_values().collect();
+        plan.validate()?;
+        Ok(plan)
+    }
+
     pub fn transport_bytes_and_sha256(&self) -> Result<(Vec<u8>, String)> {
         self.validate()?;
         let bytes = serde_json::to_vec(self)?;
@@ -628,6 +663,9 @@ impl ProjectRenderReceiptV1 {
         if serde_json::to_vec(self)?.len() > MAX_PROJECT_RENDER_RECEIPT_BYTES {
             anyhow::bail!("project render receipt exceeds its byte bound");
         }
+        if let Some(digest) = &self.local_overlay_sha256 {
+            return self.validate_overlaid_shape(plan, digest);
+        }
         let expected = plan.expected_projections(self.project_doc_nonempty)?;
         if self.projections.len() != expected.len() {
             anyhow::bail!("project render receipt has the wrong provider cardinality");
@@ -687,6 +725,88 @@ impl ProjectRenderReceiptV1 {
                 !projection.file_name.starts_with(".bbox/guidance/")
                     && projection.disposition == ProjectRenderDispositionV1::Written
             })
+        {
+            anyhow::bail!(
+                "project render receipt cannot publish an entrypoint before its satellites"
+            );
+        }
+        Ok(())
+    }
+
+    /// Validate a receipt whose plan took a local overlay. The daemon cannot
+    /// predict the overlaid bytes, so it checks what it can: workspace
+    /// authority, a well-formed digest, one entrypoint per selected provider
+    /// in order, guidance satellites after them, unique outputs, dispositions
+    /// coherent with the plan's dry-run intent, and no entrypoint published
+    /// over a failed satellite.
+    fn validate_overlaid_shape(&self, plan: &ProjectRenderPlanV1, digest: &str) -> Result<()> {
+        if plan.producer.is_some() || self.producer.is_some() {
+            anyhow::bail!("a producer render receipt cannot name a local overlay");
+        }
+        if digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            anyhow::bail!("project render receipt has an invalid local overlay digest");
+        }
+        let providers = validated_project_render_providers(plan.provider.as_deref())?;
+        if self.projections.len() < providers.len() {
+            anyhow::bail!("project render receipt has the wrong provider cardinality");
+        }
+        let (entrypoints, satellites) = self.projections.split_at(providers.len());
+        for (actual, provider) in entrypoints.iter().zip(&providers) {
+            if actual.provider != *provider || actual.file_name != project_target_file(provider)? {
+                anyhow::bail!(
+                    "project render receipt projection does not match provider {provider}"
+                );
+            }
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for satellite in satellites {
+            if !providers.contains(&satellite.provider.as_str())
+                || !satellite.file_name.starts_with(".bbox/guidance/")
+                || !seen.insert((satellite.provider.as_str(), satellite.file_name.as_str()))
+            {
+                anyhow::bail!("project render receipt has an invalid guidance satellite");
+            }
+        }
+        let mut satellites_published = true;
+        for projection in &self.projections {
+            let coherent = match projection.disposition {
+                ProjectRenderDispositionV1::Skipped => {
+                    projection.projection_sha256.is_none() && projection.projection_bytes.is_none()
+                }
+                ProjectRenderDispositionV1::DryRun | ProjectRenderDispositionV1::DryRunRefused => {
+                    plan.dry_run
+                }
+                ProjectRenderDispositionV1::Written
+                | ProjectRenderDispositionV1::Refused
+                | ProjectRenderDispositionV1::Conflict
+                | ProjectRenderDispositionV1::Failed => !plan.dry_run,
+            };
+            let digest_shaped = projection.projection_sha256.as_ref().is_none_or(|sha| {
+                sha.len() == 64
+                    && sha
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            });
+            if !coherent || !digest_shaped {
+                anyhow::bail!(
+                    "project render receipt has an invalid disposition for provider {}",
+                    projection.provider
+                );
+            }
+            if projection.file_name.starts_with(".bbox/guidance/")
+                && projection.disposition == ProjectRenderDispositionV1::Failed
+            {
+                satellites_published = false;
+            }
+        }
+        if !satellites_published
+            && entrypoints
+                .iter()
+                .any(|projection| projection.disposition == ProjectRenderDispositionV1::Written)
         {
             anyhow::bail!(
                 "project render receipt cannot publish an entrypoint before its satellites"

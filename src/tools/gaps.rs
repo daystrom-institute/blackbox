@@ -263,7 +263,7 @@ impl BlackboxServer {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("accepted publication runtime is unavailable"))?;
         for _ in 0..4 {
-            let view = self.session_gap_view(Some(project_id), Some("published"))?;
+            let view = self.session_gap_view(Some(project_id))?;
             after_snapshot();
             let queue = self.state.checkout_mutations.write();
             let current = match runtime.load_verified(&project) {
@@ -518,7 +518,7 @@ impl BlackboxServer {
     fn mint_gap_id(&self, raw: &str) -> anyhow::Result<String> {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
-        let view = self.session_gap_view(Some(raw), None)?;
+        let view = self.session_gap_view(Some(raw))?;
         loop {
             let mut h = DefaultHasher::new();
             std::time::SystemTime::now()
@@ -562,7 +562,7 @@ impl BlackboxServer {
         if self.state.project_authority.catalog_store().is_none() {
             return Ok(None);
         }
-        let view = self.session_gap_view(None, None)?;
+        let view = self.session_gap_view(None)?;
         let mut owners = view
             .gaps
             .all()
@@ -623,7 +623,7 @@ impl BlackboxServer {
         if !error.to_string().contains("Gap not found") {
             return error;
         }
-        let Ok(view) = self.session_gap_view(None, None) else {
+        let Ok(view) = self.session_gap_view(None) else {
             return error;
         };
         let Some(owner) = view
@@ -817,7 +817,6 @@ impl BlackboxServer {
         // under a flock. Run on the blocking pool, not a tokio worker.
         let server = self.clone();
         let result = Self::run_blocking("bbox_gap", move || {
-            let mut checkout = None;
             let raw_project = p
                 .project
                 .clone()
@@ -832,17 +831,13 @@ impl BlackboxServer {
                 if let Some(text) = server.enqueue_gap_file_via_checkout_owner(&p, &raw)? {
                     return Ok(text);
                 }
-                let (project, resolved_project_id, write_dir, resolved_checkout) =
+                let (project, resolved_project_id, write_dir, _resolved_checkout) =
                     server.resolve_gap_project(&raw)?;
                 p.project = Some(project);
                 p.project_id = resolved_project_id;
                 p.write_dir = write_dir;
-                checkout = resolved_checkout;
             }
             let (id, created) = server.state.gaps.write().file(&p)?;
-            if let Some(checkout) = checkout.as_ref() {
-                server.refresh_dark_gap_overlay(checkout);
-            }
             if created {
                 Ok(format!("Gap {id} filed (dedupe_key={})", p.dedupe_key))
             } else {
@@ -857,14 +852,13 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_gaps",
-        description = "List paginated gap summaries with typed filters. Exact id defaults to full detail when it fits; oversized records keep previews and exact recovery hints. Use id with body_limit for exact record JSON pages, or diagnostics_detail=true for exact visibility diagnostics. Continue body_cursor=body.next_cursor with unchanged filters."
+        description = "List paginated gap summaries with typed filters. Exact id defaults to full detail when it fits; oversized records keep previews and exact recovery hints. Use id with body_limit for exact record JSON pages, or diagnostics_detail=true for exact source diagnostics. Continue body_cursor=body.next_cursor with unchanged filters."
     )]
     pub(crate) fn bbox_gaps(&self, Parameters(p): Parameters<GapListParams>) -> CallToolResult {
         Self::run_with_structured("bbox_gaps", || {
             let mut p = p;
             let requested_project = p.project.clone();
-            let mut view =
-                self.session_gap_view(requested_project.as_deref(), p.provisional.as_deref())?;
+            let mut view = self.session_gap_view(requested_project.as_deref())?;
             let mut filter_diagnostics = Vec::new();
             if let Some(raw) = requested_project.as_deref() {
                 // Catalog-mode ledger arm (plan §8.2): path-only gaps still
@@ -944,34 +938,17 @@ impl BlackboxServer {
                 }
                 let body = super::body_page::json_body_page(
                     &serde_json::to_string(&selection)?,
-                    &serde_json::json!({"diagnostics":view.diagnostics,"degraded_overlays":view.degraded_overlays}),
+                    &serde_json::json!({"diagnostics":view.diagnostics}),
                     p.body_cursor.as_deref(),
                     p.body_limit,
                 )?;
-                return Ok(("Exact gap visibility diagnostics are in structuredContent.body; continue body.next_cursor with body_cursor and unchanged filters.".into(),serde_json::json!({"body":body})));
+                return Ok(("Exact gap source diagnostics are in structuredContent.body; continue body.next_cursor with body_cursor and unchanged filters.".into(),serde_json::json!({"body":body})));
             }
             let mut built_from =
                 view.built_from_for_refs(used_stamp_refs.iter().map(String::as_str));
             structured["built_from"] = serde_json::to_value(&built_from)?;
             let diagnostics = gap_diagnostic_preview(&view.diagnostics, p.debug);
             structured["diagnostics"] = serde_json::to_value(&diagnostics)?;
-            // Bounded structured degradation for `all` (plan §10.5): each
-            // checkout the survey omitted, as a typed row. Omitted entirely
-            // when nothing degraded, so bridge responses and healthy catalog
-            // responses keep their existing shape. `diagnostics` carries the
-            // same facts as human text.
-            if !view.degraded_overlays.is_empty() {
-                let overlays = serde_json::to_value(&view.degraded_overlays)?;
-                if serde_json::to_vec(&overlays)?.len() <= 2048 {
-                    structured["degraded"] = serde_json::json!({ "overlays": overlays });
-                } else {
-                    structured["degraded"] = serde_json::json!({
-                        "overlays_total":view.degraded_overlays.len(),
-                        "overlays_omitted":true,
-                        "detail_hint":"Repeat this filter scope with diagnostics_detail=true and body_limit=4096 for exact diagnostic pages"
-                    });
-                }
-            }
             structured = bbox_corpus_core::response_page::bound_page(structured, "rows")?;
             if structured.get("byte_limited").is_some() {
                 let used_refs = structured["rows"]
@@ -990,7 +967,7 @@ impl BlackboxServer {
             };
             if !p.json.unwrap_or(false) {
                 if !diagnostics.is_empty() {
-                    rendered.push_str("\n\nProvisional gap diagnostics:\n- ");
+                    rendered.push_str("\n\nGap source diagnostics:\n- ");
                     rendered.push_str(&diagnostics.join("\n- "));
                 }
                 rendered = view.append_built_from_table(rendered, &built_from);
@@ -1016,7 +993,6 @@ impl BlackboxServer {
             // path as filing so a recognized worktree redirects the rewritten
             // repo-owned file into the session's checkout. The gap's durable
             // project scope never changes; absent → today's behavior.
-            let mut checkout = None;
             let raw_project = p
                 .project
                 .clone()
@@ -1037,11 +1013,10 @@ impl BlackboxServer {
                 return Ok(text);
             }
             if let Some(raw) = raw_project {
-                let (project, _resolved_project_id, write_dir, resolved_checkout) =
+                let (project, _resolved_project_id, write_dir, _resolved_checkout) =
                     server.resolve_gap_project(&raw)?;
                 p.project = Some(project);
                 p.write_dir = write_dir;
-                checkout = resolved_checkout;
             }
             // Bind the store outcome first so the write guard is released
             // before the miss breadcrumb reads the served view (which takes
@@ -1053,9 +1028,6 @@ impl BlackboxServer {
                     return Err(server.explain_gap_mutation_miss("bbox_gap_resolve", &p.id, error));
                 }
             };
-            if let Some(checkout) = checkout.as_ref() {
-                server.refresh_dark_gap_overlay(checkout);
-            }
             Ok(result)
         })
         .await;
@@ -1076,7 +1048,6 @@ impl BlackboxServer {
         let server = self.clone();
         let result = Self::run_blocking("bbox_gap_update", move || {
             // Same write-targeting resolution as bbox_gap_resolve.
-            let mut checkout = None;
             let raw_project = p
                 .project
                 .clone()
@@ -1094,11 +1065,10 @@ impl BlackboxServer {
                 return Ok(text);
             }
             if let Some(raw) = raw_project {
-                let (project, _resolved_project_id, write_dir, resolved_checkout) =
+                let (project, _resolved_project_id, write_dir, _resolved_checkout) =
                     server.resolve_gap_project(&raw)?;
                 p.project = Some(project);
                 p.write_dir = write_dir;
-                checkout = resolved_checkout;
             }
             // Guard released before the breadcrumb reads the served view.
             let outcome = server.state.gaps.write().update(&p);
@@ -1108,9 +1078,6 @@ impl BlackboxServer {
                     return Err(server.explain_gap_mutation_miss("bbox_gap_update", &p.id, error));
                 }
             };
-            if let Some(checkout) = checkout.as_ref() {
-                server.refresh_dark_gap_overlay(checkout);
-            }
             Ok(result)
         })
         .await;
@@ -1294,9 +1261,7 @@ mod tests {
                             &bbox_corpus_core::project_catalog::ProjectId::parse("p_queue")
                                 .unwrap(),
                         );
-                        server
-                            .session_gap_view(Some("p_queue"), Some("published"))
-                            .unwrap();
+                        server.session_gap_view(Some("p_queue")).unwrap();
                     }
                 },
                 |gaps| {
@@ -1398,9 +1363,7 @@ mod tests {
         server.invalidate_catalog_published_content(
             &bbox_corpus_core::project_catalog::ProjectId::parse("p_queue").unwrap(),
         );
-        server
-            .session_gap_view(Some("p_queue"), Some("published"))
-            .unwrap();
+        server.session_gap_view(Some("p_queue")).unwrap();
         assert_eq!(
             server
                 .state
@@ -1634,7 +1597,6 @@ mod tests {
     fn gaps_structured(server: &BlackboxServer, selector: &str) -> serde_json::Value {
         let result = server.bbox_gaps(Parameters(GapListParams {
             project: Some(selector.to_string()),
-            provisional: Some("published".into()),
             json: Some(true),
             ..Default::default()
         }));
@@ -1728,7 +1690,7 @@ mod tests {
         }
         let diagnostics: serde_json::Value = serde_json::from_str(&diagnostics).unwrap();
         assert!(diagnostics["diagnostics"].is_array());
-        assert!(diagnostics["degraded_overlays"].is_array());
+        assert!(diagnostics.get("degraded_overlays").is_none());
         let invalid = server.bbox_gaps(Parameters(GapListParams {
             id: Some("gap-1234abcd".into()),
             diagnostics_detail: true,
@@ -2311,7 +2273,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bbox_gap_from_worktree_keys_base_writes_worktree_and_list_normalizes() {
+    async fn bbox_gap_from_worktree_writes_the_worktree_and_reads_stay_published() {
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path().join("repo");
         std::fs::create_dir_all(&base).unwrap();
@@ -2366,38 +2328,35 @@ mod tests {
             .iter()
             .find(|row| row.checkout_dir == wt)
             .cloned()
-            .expect("worktree registered for gap overlay");
+            .expect("worktree registered");
         let scope = row.published_scope().unwrap();
-        let snapshot = server
-            .state
-            .gap_overlays
-            .read()
-            .get(&scope, &row.checkout_id)
-            .cloned()
-            .expect("gap overlay published");
-        let id = snapshot.values.keys().next().unwrap().clone();
+        let id = std::fs::read_dir(worktree_canon.join(".bbox/gaps"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| name.strip_suffix(".json"))
+                    .map(str::to_owned)
+            })
+            .next()
+            .expect("one worktree gap file");
         server.set_session_checkout_for_test(
             row.project_id.clone().expect("checkout row project id"),
             scope,
             row.checkout_id.clone(),
             worktree_canon.clone(),
         );
-        let gap = {
-            let view = server.session_gap_view(Some(&wt), Some("own")).unwrap();
-            view.gaps.all().first().expect("one own gap").clone()
-        };
-        assert_eq!(
-            gap.project.as_deref(),
-            Some(base_canon.to_string_lossy().as_ref()),
-            "logical scope must be the registered base"
-        );
+        // The uncommitted worktree gap is not published, so even the session
+        // pinned to that checkout reads none.
         assert!(
-            gap.write_dir.is_none(),
-            "read view must not expose a host-local redirect"
-        );
-        assert_eq!(
-            gap.provisional_checkout_id.as_deref(),
-            Some(row.checkout_id.as_str())
+            server
+                .session_gap_view(Some(&wt))
+                .unwrap()
+                .gaps
+                .all()
+                .is_empty()
         );
         assert!(
             worktree_canon
@@ -2430,56 +2389,14 @@ mod tests {
                 .contains("session-authoritative update")
         );
 
-        let published = server.bbox_gaps(Parameters(GapListParams {
-            project: Some(wt.clone()),
-            provisional: Some("published".into()),
-            include_addressed: Some(true),
-            ..Default::default()
-        }));
-        assert_ne!(
-            published.is_error,
-            Some(true),
-            "published list failed: {published:?}"
-        );
-        assert!(format!("{:?}", published.content).contains("No gaps found"));
-
-        let list = server.bbox_gaps(Parameters(GapListParams {
-            project: Some(wt),
-            provisional: Some("own".into()),
-            include_addressed: Some(true),
-            ..Default::default()
-        }));
-        assert_ne!(list.is_error, Some(true), "bbox_gaps failed: {list:?}");
-        let body = format!("{:?}", list.content);
-        assert!(
-            body.contains("worktree gap"),
-            "worktree-scoped list should find the base-keyed gap: {body}"
-        );
-        assert!(body.contains("built_from=built_from_"), "{body}");
-        assert!(body.contains("working_fingerprint="), "{body}");
-        let structured = list
-            .structured_content
-            .expect("bbox_gaps structured response");
-        let reference = structured["rows"][0]["built_from_ref"]
-            .as_str()
-            .expect("row stamp reference");
-        assert!(structured["built_from"].get(reference).is_some());
-
-        let json_list = server.bbox_gaps(Parameters(GapListParams {
-            project: Some(worktree_canon.to_string_lossy().into_owned()),
-            provisional: Some("own".into()),
-            include_addressed: Some(true),
-            json: Some(true),
-            ..Default::default()
-        }));
-        assert_ne!(
-            json_list.is_error,
-            Some(true),
-            "json list failed: {json_list:?}"
-        );
-        let json_body = format!("{:?}", json_list.content);
-        assert!(json_body.contains("built_from_ref"), "{json_body}");
-        assert!(json_body.contains("built_from"), "{json_body}");
-        assert!(json_body.contains(reference), "{json_body}");
+        for project in [wt.clone(), worktree_canon.to_string_lossy().into_owned()] {
+            let list = server.bbox_gaps(Parameters(GapListParams {
+                project: Some(project),
+                include_addressed: Some(true),
+                ..Default::default()
+            }));
+            assert_ne!(list.is_error, Some(true), "bbox_gaps failed: {list:?}");
+            assert!(format!("{:?}", list.content).contains("No gaps found"));
+        }
     }
 }

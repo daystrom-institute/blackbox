@@ -68,7 +68,7 @@ impl ArtifactWatchCarrier {
 
     /// True for the native catalog carrier. Catalog reconciliation owns
     /// exactly these registrations and must leave the bridge `Selected` and
-    /// provisional `CheckoutId` registrations alone.
+    /// checkout `CheckoutId` registrations alone.
     pub fn is_attachment(&self) -> bool {
         matches!(self.attachment, ArtifactWatchAttachment::AttachmentId(_))
     }
@@ -265,7 +265,7 @@ impl BbxWatcher {
         self.register(carrier, false)
     }
 
-    /// Remove a provisional checkout root from the knowledge/gap watch set.
+    /// Remove a checkout root from the knowledge/gap watch set.
     /// Registered project roots retain their watch because they also carry
     /// artifact-install authority.
     pub fn unwatch_repo_store(&mut self, carrier: &ArtifactWatchCarrier) -> anyhow::Result<bool> {
@@ -402,7 +402,7 @@ impl BbxWatcher {
 
     /// Reconcile the native catalog registrations to exactly `desired`.
     ///
-    /// Bridge `Selected` and provisional `CheckoutId` registrations are left
+    /// Bridge `Selected` and checkout `CheckoutId` registrations are left
     /// untouched: this reconciler owns only the attachment-id lane. Removals
     /// are idempotent, and re-running with an unchanged desired set installs
     /// and removes nothing, so a duplicate post-commit event is a no-op.
@@ -1626,7 +1626,7 @@ mod tests {
     }
 
     #[test]
-    fn provisional_carrier_resolves_without_artifact_routing() {
+    fn checkout_carrier_resolves_without_artifact_routing() {
         let dir = tempdir().unwrap();
         let project = dir.path().canonicalize().unwrap().join("checkout");
         std::fs::create_dir_all(project.join(".bbox/knowledge")).unwrap();
@@ -2045,7 +2045,7 @@ mod tests {
     }
 
     /// Reconciliation owns the attachment lane only. A bridge `Selected`
-    /// registration and a provisional `CheckoutId` one survive a catalog
+    /// registration and a checkout `CheckoutId` one survive a catalog
     /// pass that names neither.
     #[test]
     fn catalog_reconciliation_leaves_bridge_registrations_alone() {

@@ -28,9 +28,8 @@ use bbox_project_graph::{
 /// op carries no borrow of the graph generation it was built from.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GraphVertexIndexDocument {
-    /// Q6: stamped on every graph vertex document, published and provisional
-    /// alike, so the query-side project filter is one exact term and never
-    /// parses the ref or consults the catalog mid-query.
+    /// Q6: stamped on every graph vertex document, so the query-side project
+    /// filter is one exact term and never consults the catalog mid-query.
     pub project_id: String,
     pub graph_id: String,
     /// Read-plane label (`published` in M9a).
@@ -256,9 +255,9 @@ pub fn graph_lane_count(
 }
 
 /// Collect every stored field of one lane's documents, ordered by tantivy
-/// document address. The reindex pass preserves graph lanes this way: like
-/// provisional knowledge, graph documents have no durable store the pass
-/// walks, so the pass carries them across `delete_all_documents`.
+/// document address. The reindex pass preserves graph lanes this way: graph
+/// documents have no durable store the pass walks, so the pass carries them
+/// across `delete_all_documents`.
 ///
 /// This is the REINDEX path only, and it is intentionally a full
 /// stored-document walk (O(all graph vertices) doc-store reads): a rebuild
@@ -575,20 +574,20 @@ mod tests {
     }
 
     #[test]
-    fn lane_replace_leaves_foreign_and_provisional_lanes_untouched() {
+    fn lane_replace_leaves_foreign_and_connector_lanes_untouched() {
         let (index, fields, reader) = open_index();
         let published = published_graph_vertex_documents(
             PROJECT,
             &generation(schema_with(annotated_schema()), &["Alpha"]),
             "generation-one",
         );
-        let mut provisional = published[0].clone();
-        provisional.graph_source = "provisional".into();
+        let mut connector = published[0].clone();
+        connector.graph_source = "connector".into();
         let mut foreign = published[0].clone();
         foreign.project_id = "p_0000000000000000000000000000ffff".into();
         let mut writer = index.writer(50_000_000).unwrap();
         apply_graph_lane_replace(&mut writer, fields, &published).unwrap();
-        apply_graph_lane_replace(&mut writer, fields, &[provisional]).unwrap();
+        apply_graph_lane_replace(&mut writer, fields, &[connector]).unwrap();
         apply_graph_lane_replace(&mut writer, fields, &[foreign]).unwrap();
         writer.commit().unwrap();
         writer.wait_merging_threads().unwrap();
@@ -610,7 +609,7 @@ mod tests {
 
         let searcher = reader.searcher();
         assert_eq!(
-            graph_lane_count(&searcher, fields, PROJECT, GRAPH, "provisional").unwrap(),
+            graph_lane_count(&searcher, fields, PROJECT, GRAPH, "connector").unwrap(),
             1
         );
         assert_eq!(

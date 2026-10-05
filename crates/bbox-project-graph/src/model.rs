@@ -475,13 +475,12 @@ impl GraphSource {
     /// The AUTHORITY-plane label for this source, used in diagnostics.
     ///
     /// Deliberately not the read-surface vocabulary: the read plane labels an
-    /// accepted checkout graph `published` (and a workspace's own uncommitted
-    /// one `provisional`), which is a visibility distinction this enum does
-    /// not carry. Do not wire this into tool output.
+    /// accepted checkout graph `published`, a distinction this enum does not
+    /// carry. Do not wire this into tool output.
     pub fn authority_label(self) -> &'static str {
         match self {
             Self::Committed => "project",
-            Self::LocalScratch => "provisional",
+            Self::LocalScratch => "local_scratch",
             Self::ConnectorManaged => "connector",
         }
     }

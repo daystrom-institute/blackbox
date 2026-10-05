@@ -894,10 +894,6 @@ pub(super) fn open_shared_state(
         publisher_refs: RwLock::new(bbox_indexing::publisher::PublisherRefStore::open(
             store_dir.join("publisher-refs.json"),
         )?),
-        knowledge_overlays: RwLock::new(bbox_knowledge::overlay::KnowledgeOverlayStore::default()),
-        gap_overlays: RwLock::new(bbox_gaps::overlay::GapOverlayStore::default()),
-        knowledge_overlay_refresh: parking_lot::Mutex::new(()),
-        gap_overlay_refresh: parking_lot::Mutex::new(()),
         path_fallback_cut: std::sync::atomic::AtomicBool::new(path_fallback_cut),
         knowledge_published_cache: RwLock::new(Default::default()),
         gap_published_cache: RwLock::new(Default::default()),

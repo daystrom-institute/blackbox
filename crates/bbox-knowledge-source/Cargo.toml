@@ -6,7 +6,6 @@ edition = "2024"
 [dependencies]
 bbox-code-source = { path = "../bbox-code-source" }
 bbox-corpus-core = { path = "../bbox-corpus-core" }
-bro-core = { path = "../bro-core" }
 hex = "0.4"
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"

@@ -806,14 +806,13 @@ pub(crate) fn sync_kb_project_roots(state: &SharedState) {
 
 /// Materialize knowledge bytes that are authorized for published vector ids.
 /// This must use the same committed publisher view as Tantivy. The central
-/// store also contains working-tree repo entries for overlay construction, so
-/// reading it directly would publish provisional bytes under `knowledge:*`.
+/// store also contains working-tree repo entries, so reading it directly
+/// would publish uncommitted bytes under `knowledge:*`.
 pub(crate) fn published_knowledge_for_embedding(
     state: &std::sync::Arc<SharedState>,
     project_dir: Option<&str>,
 ) -> anyhow::Result<Vec<crate::knowledge::KnowledgeEntry>> {
-    let view = super::BlackboxServer::new(state.clone())
-        .session_knowledge_view(project_dir, Some("published"))?;
+    let view = super::BlackboxServer::new(state.clone()).session_knowledge_view(project_dir)?;
     Ok(view.knowledge.all_entries().to_vec())
 }
 

@@ -133,7 +133,7 @@ pub(crate) struct DoctorReport {
     pub(crate) checkout_access: Option<bbox_indexing::checkout_access::CheckoutAccessHealth>,
     /// Complete path-free knowledge transport overlap evidence. The section
     /// below classifies the operator-relevant failures; JSON retains the
-    /// bounded per-project counters and latest shadow comparisons.
+    /// bounded per-project counters.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) knowledge_transport: Option<
         bbox_indexing::knowledge_transport_observations::KnowledgeTransportObservationSnapshotV1,
@@ -252,7 +252,6 @@ pub(crate) fn run(server: &crate::server::BlackboxServer) -> anyhow::Result<Doct
         sections.extend([
             accepted_publication_section(statuses),
             publisher_binding_section(statuses),
-            overlay_baseline_section(statuses),
             attachment_capability_section(statuses),
             artifact_watcher_section(statuses),
         ]);
@@ -286,7 +285,6 @@ pub(crate) fn section_names(state: &crate::server::state::SharedState) -> Vec<&'
         names.extend([
             "accepted_publication",
             "publisher_binding",
-            "overlay_baseline",
             "attachment_capability",
             "artifact_watcher",
         ]);
@@ -330,14 +328,12 @@ pub(crate) fn run_section(
         "projects" => projects_section(state),
         "accepted_publication"
         | "publisher_binding"
-        | "overlay_baseline"
         | "attachment_capability"
         | "artifact_watcher" => {
             let statuses = catalog_project_statuses(state).unwrap_or_default();
             match section {
                 "accepted_publication" => accepted_publication_section(&statuses),
                 "publisher_binding" => publisher_binding_section(&statuses),
-                "overlay_baseline" => overlay_baseline_section(&statuses),
                 "attachment_capability" => attachment_capability_section(&statuses),
                 _ => artifact_watcher_section(&statuses),
             }
@@ -554,41 +550,6 @@ fn publisher_binding_section(
     }
 }
 
-/// Last published overlay outcome per checkout, per lane.
-fn overlay_baseline_section(
-    statuses: &[crate::server::state::ProjectRuntimeStatus],
-) -> SectionReport {
-    let mut findings = Vec::new();
-    let mut fresh = 0;
-    for status in statuses {
-        for overlay in &status.overlays {
-            if overlay.outcome == "fresh" {
-                fresh += 1;
-                continue;
-            }
-            findings.push(Finding::warn(format!(
-                "project {} checkout {} {} overlay unavailable{}",
-                status.project_id,
-                overlay.checkout_id,
-                overlay.lane,
-                overlay
-                    .diagnostics
-                    .first()
-                    .map(|detail| format!(": {detail}"))
-                    .unwrap_or_default(),
-            )));
-        }
-    }
-
-    if findings.is_empty() && fresh > 0 {
-        findings.push(Finding::ok(format!("{fresh} checkout overlay(s) fresh")));
-    }
-    SectionReport {
-        section: "overlay_baseline",
-        findings,
-    }
-}
-
 /// Capability availability by attachment, straight from the catalog bits.
 ///
 /// An attachment with no recorded capability is the actionable case: it is
@@ -781,15 +742,6 @@ fn knowledge_transport_section(
         .iter()
         .map(|row| row.project_id.as_str())
         .collect::<std::collections::BTreeSet<_>>();
-    let parity_workspaces = marker
-        .rows
-        .iter()
-        .flat_map(|row| {
-            row.parity_workspace_ids
-                .iter()
-                .map(move |workspace_id| (row.project_id.as_str(), workspace_id.as_str()))
-        })
-        .collect::<std::collections::BTreeSet<_>>();
     let mut current = 0usize;
 
     match catalog {
@@ -856,27 +808,6 @@ fn knowledge_transport_section(
         }
     }
 
-    let mismatch_count = observations
-        .comparisons
-        .iter()
-        .filter(|comparison| {
-            comparison
-                .workspace_id
-                .as_deref()
-                .is_some_and(|workspace_id| {
-                    parity_workspaces.contains(&(comparison.project_id.as_str(), workspace_id))
-                })
-        })
-        .filter(|comparison| !comparison.equal)
-        .count();
-    if mismatch_count > 0 {
-        findings.push(Finding::action(
-            format!(
-                "{mismatch_count} latest covered-project knowledge transport shadow comparison(s) mismatch"
-            ),
-            "blackbox project-catalog knowledge-transport-cutover --preflight",
-        ));
-    }
     let remote_count = observations
         .counters
         .iter()
@@ -2064,7 +1995,6 @@ pub(crate) fn catalog_sections_for_test(state: &crate::server::state::SharedStat
     [
         accepted_publication_section(&statuses),
         publisher_binding_section(&statuses),
-        overlay_baseline_section(&statuses),
         attachment_capability_section(&statuses),
         artifact_watcher_section(&statuses),
     ]
@@ -2675,7 +2605,7 @@ mod tests {
         };
         KnowledgeTransportOperationCounterV1 {
             project_id: project_id.into(),
-            operation: KnowledgeTransportOperationV1::ProvisionalAllKnowledge,
+            operation: KnowledgeTransportOperationV1::PublishedKnowledge,
             outcome: KnowledgeTransportOutcomeV1::Degraded,
             count,
             first_sequence: 1,
@@ -3117,7 +3047,6 @@ mod catalog_health_tests {
         for name in [
             "accepted_publication",
             "publisher_binding",
-            "overlay_baseline",
             "attachment_capability",
             "artifact_watcher",
         ] {

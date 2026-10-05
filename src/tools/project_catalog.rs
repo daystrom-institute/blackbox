@@ -791,7 +791,6 @@ fn publisher_status_metadata_summary(raw: &str) -> serde_json::Value {
 /// demand; they are not a live filesystem authority check.
 fn publisher_health_summary(
     health: &crate::server::state::ProjectRuntimeStatus,
-    accepted_generation: Option<&str>,
 ) -> serde_json::Value {
     let mut attachments = health.attachments.clone();
     // Unusable bindings surface first, and every status stays counted even
@@ -822,34 +821,6 @@ fn publisher_health_summary(
         })
         .collect::<Vec<_>>();
 
-    let mut overlays = health.overlays.clone();
-    overlays
-        .sort_by(|a, b| (a.checkout_id.as_str(), a.lane).cmp(&(b.checkout_id.as_str(), b.lane)));
-    let stale = |overlay: &crate::server::state::CheckoutOverlayView| {
-        overlay
-            .accepted_generation
-            .as_deref()
-            .zip(accepted_generation)
-            .is_some_and(|(recorded, accepted)| recorded != accepted)
-    };
-    let degraded =
-        |overlay: &crate::server::state::CheckoutOverlayView| !overlay.diagnostics.is_empty();
-    let unavailable =
-        |overlay: &crate::server::state::CheckoutOverlayView| overlay.outcome != "fresh";
-    overlays.sort_by_key(|overlay| !unavailable(overlay) && !stale(overlay) && !degraded(overlay));
-    let overlay_total = overlays.len();
-    let overlay_rows = overlays[..overlay_total.min(PUBLISHER_STATUS_ROW_LIMIT)]
-        .iter()
-        .map(|row| {
-            json!({
-                "checkout_id": row.checkout_id,
-                "outcome": row.outcome,
-                "stale": stale(row),
-                "diagnostics_count": row.diagnostics.len(),
-            })
-        })
-        .collect::<Vec<_>>();
-
     json!({
         "catalog_authority": health.catalog_authority,
         "binding": {"status": health.binding.status},
@@ -863,20 +834,6 @@ fn publisher_health_summary(
                 "omitted": attachment_total - attachment_rows.len(),
                 "status_counts": attachment_status_counts,
                 "rows": attachment_rows,
-            })
-        },
-        "overlays": if overlay_total == 0 {
-            json!({"total": 0})
-        } else {
-            json!({
-                "evidence": "runtime_observation_not_filesystem_authority",
-                "total": overlay_total,
-                "returned": overlay_rows.len(),
-                "omitted": overlay_total - overlay_rows.len(),
-                "unavailable": overlays.iter().filter(|row| unavailable(row)).count(),
-                "stale": overlays.iter().filter(|row| stale(row)).count(),
-                "degraded": overlays.iter().filter(|row| degraded(row)).count(),
-                "rows": overlay_rows,
             })
         },
         "watcher": {
@@ -2097,13 +2054,7 @@ impl BlackboxServer {
             let runtime_health = server.state.project_runtime_status(project_id.as_str());
             let (health_summary, health_detail_source) = match &runtime_health {
                 Some(health) => (
-                    publisher_health_summary(
-                        health,
-                        status
-                            .content_stamp()
-                            .map(|stamp| stamp.generation_id())
-                            .as_deref(),
-                    ),
+                    publisher_health_summary(health),
                     serde_json::to_value(health)?,
                 ),
                 None => (serde_json::Value::Null, serde_json::Value::Null),
@@ -4837,7 +4788,6 @@ mod tests {
         let listed = server
             .bbox_project_graph_list(Parameters(crate::tools::graph::ProjectGraphListParams {
                 project: Some("p_candidate_tool".into()),
-                provisional: Some("published".into()),
                 limit: None,
                 offset: None,
                 expected_view_stamp: None,
@@ -4851,9 +4801,7 @@ mod tests {
                 crate::tools::graph::ProjectGraphDescribeParams {
                     project: "p_candidate_tool".into(),
                     graph_id: "governance-record".into(),
-                    provisional: Some("published".into()),
                     source: None,
-                    checkout_id: None,
                     expected_content_hash: None,
                     detail: None,
                     cursor: None,
@@ -4874,7 +4822,6 @@ mod tests {
             .bbox_inspect_entity(Parameters(crate::mcp_tools::inspect::InspectEntityParams {
                 entity_ref: "project_graph_vertex:p_candidate_tool:governance-record:record/case@2"
                     .into(),
-                provisional: Some("published".into()),
                 edge_types: None,
                 direction: Some("both".into()),
                 per_type_limit: Some(10),
@@ -5416,11 +5363,7 @@ mod tests {
         fn served_graph_generation(&self) -> serde_json::Value {
             let described = self
                 .server
-                .project_graph_describe_domain(
-                    &self.project_id,
-                    "governance-record",
-                    Some("published"),
-                )
+                .project_graph_describe_domain(&self.project_id, "governance-record")
                 .unwrap();
             serde_json::to_value(
                 described
@@ -6091,13 +6034,10 @@ mod tests {
         );
     }
 
-    /// Accepted-publication convergence indexes the published view only.
-    /// It never reads peer provisional snapshots, so a project whose peers
-    /// are unavailable does not record a degraded `all` read every time its
-    /// index converges. The positive control proves the fixture does reach
-    /// the degraded `all` path when a reader asks for it.
+    /// Accepted-publication convergence indexes the published view and a
+    /// published read records a remote published observation.
     #[tokio::test]
-    async fn published_index_convergence_never_reads_the_all_view() {
+    async fn published_index_convergence_indexes_the_published_view() {
         use crate::server::state::catalog_fixture::{COMMIT_ONE, CatalogFixture, knowledge_entry};
         use bbox_indexing::knowledge_transport_observations::KnowledgeTransportOperationV1;
 
@@ -6114,37 +6054,26 @@ mod tests {
         let mut server = fixture.server();
         cover_knowledge_transport_project(&mut server, "p_converge_published", scope);
         server.state.install_code_read_view_commit_hook();
-        let all_reads = |server: &BlackboxServer| {
-            server
-                .state
-                .knowledge_transport_observations
-                .snapshot()
-                .counters
-                .iter()
-                .filter(|counter| {
-                    counter.operation == KnowledgeTransportOperationV1::ProvisionalAllKnowledge
-                })
-                .map(|counter| counter.count)
-                .sum::<u64>()
-        };
 
         let project_id = ProjectId::parse("p_converge_published").unwrap();
         assert!(server.converge_published_knowledge_index(&project_id));
         server.state.index_writer.flush_blocking().unwrap();
         server.state.idx.write().reader_reload_for_test();
         assert!(index_search(&server, "published").contains("knowledge-a"));
-        assert_eq!(
-            all_reads(&server),
-            0,
-            "convergence must not read the all view"
-        );
 
         server
-            .session_knowledge_view(Some("p_converge_published"), Some("all"))
+            .session_knowledge_view(Some("p_converge_published"))
             .unwrap();
         assert!(
-            all_reads(&server) > 0,
-            "the fixture reaches the degraded all path"
+            server
+                .state
+                .knowledge_transport_observations
+                .snapshot()
+                .counters
+                .iter()
+                .any(|counter| counter.operation
+                    == KnowledgeTransportOperationV1::PublishedKnowledge),
+            "a published read records its remote observation"
         );
     }
 
@@ -6724,7 +6653,7 @@ mod tests {
     #[test]
     fn publisher_health_summary_bounds_synthetic_inventories() {
         use crate::server::state::{
-            AcceptedRuntimeView, AttachmentCapabilityView, BindingRuntimeView, CheckoutOverlayView,
+            AcceptedRuntimeView, AttachmentCapabilityView, BindingRuntimeView,
             ProjectRuntimeStatus, PublishedScopeView, WatcherRuntimeView,
         };
 
@@ -6741,30 +6670,6 @@ mod tests {
                 available: vec!["repo_knowledge"],
             })
             .collect::<Vec<_>>();
-        let overlay = |checkout: char,
-                       outcome: &'static str,
-                       generation: Option<&str>,
-                       diagnostics: usize| {
-            CheckoutOverlayView {
-                checkout_id: checkout.to_string(),
-                lane: "knowledge",
-                published_scope: published_scope.clone(),
-                outcome: outcome.into(),
-                accepted_generation: generation.map(str::to_owned),
-                diagnostics: (0..diagnostics)
-                    .map(|index| format!("diagnostic-{index}"))
-                    .collect(),
-            }
-        };
-        let overlays = vec![
-            overlay('b', "unavailable", Some("old"), 1),
-            overlay('a', "fresh", Some("new"), 0),
-            overlay('c', "fresh", Some("new"), 0),
-            overlay('d', "fresh", Some("new"), 0),
-            overlay('e', "fresh", Some("new"), 0),
-            overlay('f', "fresh", Some("new"), 0),
-            overlay('g', "fresh", Some("new"), 0),
-        ];
         let health = ProjectRuntimeStatus {
             project_id: "p_synthetic".into(),
             catalog_authority: "available",
@@ -6792,7 +6697,6 @@ mod tests {
                 status: "detached",
             },
             attachments,
-            overlays,
             watcher: WatcherRuntimeView {
                 watcher_running: true,
                 registered_attachments: (0..6).map(|index| format!("att_{index:032x}")).collect(),
@@ -6800,7 +6704,7 @@ mod tests {
             },
         };
 
-        let summary = publisher_health_summary(&health, Some("new"));
+        let summary = publisher_health_summary(&health);
         let serialized = serde_json::to_vec(&summary).unwrap();
         assert!(
             serialized.len() <= 2560,
@@ -6820,15 +6724,7 @@ mod tests {
             format!("att_{:032x}", 8)
         );
         assert_eq!(attachments["rows"][0]["status"], "detached");
-        let overlays = &summary["overlays"];
-        assert_eq!(overlays["total"], 7);
-        assert_eq!(overlays["returned"], 4);
-        assert_eq!(overlays["omitted"], 3);
-        assert_eq!(overlays["unavailable"], 1);
-        assert_eq!(overlays["stale"], 1);
-        assert_eq!(overlays["degraded"], 1);
-        assert_eq!(overlays["rows"][0]["checkout_id"], "b");
-        assert_eq!(overlays["rows"][0]["stale"], true);
+        assert!(summary.get("overlays").is_none());
         let registered = &summary["watcher"]["registered_attachments"];
         assert_eq!(registered["total"], 6);
         assert_eq!(registered["returned"], 4);

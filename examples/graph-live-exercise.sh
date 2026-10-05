@@ -6,11 +6,10 @@
 # state bundle, a throwaway Git project carrying committed knowledge and a
 # committed project graph, producer onboarding and committed-candidate
 # publication through the real collector, daemon-side acceptance through the
-# real merge gate, published-leg MCP reads over HTTP JSON-RPC, an operator
-# minted workspace binding, a real provisional capture of uncommitted working
-# edits, and the own-versus-published visibility contrast including per-graph
-# Invalid diagnostics. Every step prints PASS or FAIL and the run exits nonzero
-# if any step failed.
+# real merge gate, published-leg MCP reads over HTTP JSON-RPC, and the check
+# that uncommitted working edits, including a malformed row, never reach a
+# read. Every step prints PASS or FAIL and the run exits nonzero if any step
+# failed.
 #
 # Usage:
 #   examples/graph-live-exercise.sh
@@ -46,10 +45,8 @@ PRODUCER_ID="graph-exercise-producer"
 GRAPH_ID="governance-record"
 FIXTURE="$REPO_ROOT/crates/bbox-project-graph/tests/fixtures/$GRAPH_ID"
 
-# The uncommitted working edit the provisional leg must surface, and the
-# malformed row the Invalid diagnostics case appends afterwards. The malformed
-# row parses as JSON and names a real vertex type, so it reaches schema
-# validation instead of failing the file parse.
+# An uncommitted working edit and a malformed row. Neither is committed, so
+# neither may reach a read: every read is published-only.
 UNCOMMITTED_VERTEX='{"id":"record/case@3","type":"gov:Record","label":"Case record version 3","properties":{"status":"draft","version":3,"summary":"Uncommitted working record"}}'
 UNCOMMITTED_EDGE='{"from":"record/case@3","type":"gov:SUPERSEDES","to":"record/case@2","properties":{"prior_version":"record/case@2"}}'
 MALFORMED_VERTEX='{"id":"record/case@4","type":"gov:Record","label":"Malformed case record","properties":{"status":"active"}}'
@@ -59,8 +56,6 @@ CATALOG_EPOCH=""
 CHECKOUT_ID=""
 SOURCE_GENERATION=""
 PUBLISHED_SESSION=""
-BOUND_SESSION=""
-PROVISIONAL_REF=""
 PUBLISHED_VERTEX_COUNT=""
 PUBLISHED_EDGE_COUNT=""
 
@@ -188,20 +183,15 @@ stop_daemon() {
     rm -f "$PID_FILE"
 }
 
-# MCP session over streamable HTTP. The workspace binding, when present, rides
-# the initialize request: the daemon authenticates it there and pins it to the
-# session for every following call.
+# MCP session over streamable HTTP.
 mcp_session() {
-    local label="$1" binding="${2:-}"
+    local label="$1"
     local headers="$EVIDENCE/mcp-$label-init.headers"
     local body="$EVIDENCE/mcp-$label-init.body"
     local -a args=(-sS -D "$headers" -o "$body" -X POST "$MCP_URL"
         -H 'Content-Type: application/json'
         -H 'Accept: application/json, text/event-stream'
         --data '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"graph-live-exercise","version":"1"}}}')
-    if [ -n "$binding" ]; then
-        args+=(-H "x-blackbox-workspace-binding: $binding")
-    fi
     curl "${args[@]}" || return 1
     local session
     session="$(sed -n 's/^[Mm][Cc][Pp]-[Ss][Ee][Ss][Ss][Ii][Oo][Nn]-[Ii][Dd]:[[:space:]]*//p' "$headers" | tr -d '\r' | head -1)"
@@ -451,7 +441,7 @@ step_accept() {
 
 step_published_reads() {
     local project_arg
-    project_arg="$(jq -cn --arg project "$PROJECT_ID" '{project:$project,visibility:"published"}')"
+    project_arg="$(jq -cn --arg project "$PROJECT_ID" '{project:$project}')"
     mcp_call "$PUBLISHED_SESSION" bbox_project_graph_list "$project_arg" published-graph-list || {
         cat "$EVIDENCE/published-graph-list.json" >&2
         return 1
@@ -461,7 +451,6 @@ step_published_reads() {
         ($rows | length) == 1 and
         ($rows[0].source == "published") and
         ($rows[0].status == "valid") and
-        ($rows[0].checkout_id == null) and
         ($rows[0].vertex_count >= 17) and
         ($rows[0].edge_count >= 20) and
         (($rows[0].content_hash | length) == 64)
@@ -471,8 +460,8 @@ step_published_reads() {
         return 1
     }
     # The generation carries the committed rows plus the schema-derived meta
-    # vertices and edges, so the overlay contrast below is relative to this
-    # baseline rather than to the row count of the committed files.
+    # vertices and edges, so later checks compare against this baseline
+    # rather than against the row count of the committed files.
     PUBLISHED_VERTEX_COUNT="$(jq -r --arg graph "$GRAPH_ID" \
         '[.graphs[] | select(.graph_id == $graph)][0].vertex_count' "$EVIDENCE/published-graph-list.json")"
     PUBLISHED_EDGE_COUNT="$(jq -r --arg graph "$GRAPH_ID" \
@@ -480,7 +469,7 @@ step_published_reads() {
 
     local exact
     exact="$(jq -cn --arg project "$PROJECT_ID" --arg graph "$GRAPH_ID" \
-        '{project:$project,graph_id:$graph,visibility:"published"}')"
+        '{project:$project,graph_id:$graph}')"
     mcp_call "$PUBLISHED_SESSION" bbox_project_graph_describe "$exact" published-graph-describe || {
         cat "$EVIDENCE/published-graph-describe.json" >&2
         return 1
@@ -548,303 +537,51 @@ step_published_traversal() {
     note "inspect resolved the published claim and its cited evidence across gov:CITES in both directions"
 }
 
-step_mint_binding() {
-    (
-        cd "$CHECKOUT" || exit 1
-        HOME="$THROWAWAY/home" \
-            XDG_CONFIG_HOME="$THROWAWAY/config" \
-            XDG_DATA_HOME="$THROWAWAY/data" \
-            XDG_STATE_HOME="$THROWAWAY/xdg-state" \
-            "$BIN/bro" workspace-binding mint \
-            --project-root "$CHECKOUT" \
-            --daemon-url "http://127.0.0.1:$PORT"
-    ) > "$EVIDENCE/workspace-binding-mint.log" 2>&1 || {
-        cat "$EVIDENCE/workspace-binding-mint.log" >&2
-        return 1
-    }
-    local env_file="$CHECKOUT/.bbox/local/workspace-binding.env"
-    [ -f "$env_file" ] || {
-        echo "mint wrote no binding environment file" >&2
-        return 1
-    }
-    local mode
-    mode="$(stat -c '%a' "$env_file" 2>/dev/null || stat -f '%Lp' "$env_file")"
-    [ "$mode" = "600" ] || {
-        echo "binding environment file mode is $mode, expected 600" >&2
-        return 1
-    }
-    grep -q '^BRO_WORKSPACE_BINDING_TOKEN=' "$env_file" &&
-        grep -q '^BRO_KNOWLEDGE_SOURCE_URL=' "$env_file" &&
-        grep -q '^BRO_WORKSPACE_PUBLISHED_SCOPE=' "$env_file" || {
-        echo "binding environment file is missing one of the three variables" >&2
-        return 1
-    }
-    # The file is meant to be sourced, so the scope it carries has to survive a
-    # shell round-trip and still parse as the scope this checkout publishes.
-    local sourced_scope
-    sourced_scope="$(
-        set -a
-        # shellcheck disable=SC1091
-        . "$env_file"
-        set +a
-        printf '%s' "$BRO_WORKSPACE_PUBLISHED_SCOPE"
-    )"
-    printf '%s' "$sourced_scope" > "$EVIDENCE/sourced-scope.json"
-    jq -e --arg repo "$REPO_ID" '.repo_id == $repo and .bbox_root_relpath == "."' \
-        "$EVIDENCE/sourced-scope.json" >/dev/null || {
-        echo "the sourced binding scope is not the checkout's published scope" >&2
-        cat "$EVIDENCE/sourced-scope.json" >&2
-        return 1
-    }
-    note "minted a workspace binding for checkout $CHECKOUT_ID; the sourced scope round-trips"
-}
-
-# Load the minted binding the way the runbook documents. The capture verb
-# reads the same file itself; this is here for the MCP session, which presents
-# the token as a header.
-binding_token() {
-    (
-        set -a
-        # shellcheck disable=SC1091
-        . "$CHECKOUT/.bbox/local/workspace-binding.env"
-        set +a
-        printf '%s' "$BRO_WORKSPACE_BINDING_TOKEN"
-    )
-}
-
-# One provisional capture through the operator verb, which is the same client
-# construction a managed harness performs at session start.
-capture_once() {
-    local label="$1"
-    env \
-        "HOME=$THROWAWAY/home" \
-        "XDG_CONFIG_HOME=$THROWAWAY/config" \
-        "XDG_DATA_HOME=$THROWAWAY/data" \
-        "XDG_STATE_HOME=$THROWAWAY/xdg-state" \
-        "$BIN/bro" workspace-binding capture --project-root "$CHECKOUT" \
-        > "$EVIDENCE/$label.json" 2>"$EVIDENCE/$label.err"
-}
-
-step_provisional_capture() {
+step_uncommitted_edits_stay_unpublished() {
     local vertices="$CHECKOUT/.bbox/graphs/$GRAPH_ID/vertices.jsonl"
     local edges="$CHECKOUT/.bbox/graphs/$GRAPH_ID/edges.jsonl"
     printf '%s\n' "$UNCOMMITTED_VERTEX" >> "$vertices"
     printf '%s\n' "$UNCOMMITTED_EDGE" >> "$edges"
+    printf '%s\n' "$MALFORMED_VERTEX" >> "$vertices"
     [ -z "$(git -C "$CHECKOUT" status --porcelain -- .bbox/graphs)" ] && {
         echo "the working edit did not leave the graph tree dirty" >&2
         return 1
     }
-    capture_once provisional-capture || {
-        cat "$EVIDENCE/provisional-capture.err" >&2
-        return 1
-    }
-    jq -e '.status == "captured" and .reused == false and (.source_generation_id | length > 0)' \
-        "$EVIDENCE/provisional-capture.json" >/dev/null || {
-        cat "$EVIDENCE/provisional-capture.json" >&2
-        return 1
-    }
-    BOUND_SESSION="$(mcp_session bound "$(binding_token)")" || return 1
-    note "captured provisional generation $(jq -r '.source_generation_id' "$EVIDENCE/provisional-capture.json")"
-}
-
-step_own_visibility() {
-    # A cold read: this session has issued no knowledge or gap own read, so
-    # nothing but the capture's own finalize could have installed the overlay.
-    mcp_call "$BOUND_SESSION" bbox_project_graph_list '{"visibility":"own"}' own-graph-list-cold || {
-        cat "$EVIDENCE/own-graph-list-cold.json" >&2
-        return 1
-    }
-    jq -e --arg graph "$GRAPH_ID" --arg checkout "$CHECKOUT_ID" '
-        [.graphs[] | select(.graph_id == $graph)] as $rows |
-        ($rows | length) == 1 and
-        ($rows[0].source == "provisional") and
-        ($rows[0].checkout_id == $checkout)
-    ' "$EVIDENCE/own-graph-list-cold.json" >/dev/null || {
-        echo "a cold own read did not serve the captured generation" >&2
-        cat "$EVIDENCE/own-graph-list-cold.json" >&2
-        return 1
-    }
-    mcp_call "$BOUND_SESSION" bbox_knowledge '{"provisional":"own","limit":5}' own-knowledge || {
-        cat "$EVIDENCE/own-knowledge.json" >&2
-        return 1
-    }
-    mcp_call "$BOUND_SESSION" bbox_project_graph_list '{"visibility":"own"}' own-graph-list || {
-        cat "$EVIDENCE/own-graph-list.json" >&2
-        return 1
-    }
-    # One added fact vertex and one added fact edge. The edge count grows by
-    # more than one because a fact vertex also gains its schema-derived
-    # instance edge, so the overlay edge count is only asserted to grow.
-    jq -e --arg graph "$GRAPH_ID" --arg checkout "$CHECKOUT_ID" \
-        --argjson vertices "$((PUBLISHED_VERTEX_COUNT + 1))" \
-        --argjson edges "$PUBLISHED_EDGE_COUNT" '
-        [.graphs[] | select(.graph_id == $graph)] as $rows |
-        ($rows | length) == 1 and
-        ($rows[0].source == "provisional") and
-        ($rows[0].checkout_id == $checkout) and
-        ($rows[0].vertex_count == $vertices) and
-        ($rows[0].edge_count > $edges) and
-        ($rows[0].status == "valid")
-    ' "$EVIDENCE/own-graph-list.json" >/dev/null || {
-        echo "own visibility did not surface the overlay generation" >&2
-        cat "$EVIDENCE/own-graph-list.json" >&2
-        return 1
-    }
-
-    mcp_call "$BOUND_SESSION" bbox_project_graph_list '{"visibility":"published"}' bound-published-graph-list || {
-        cat "$EVIDENCE/bound-published-graph-list.json" >&2
-        return 1
-    }
-    jq -e --arg graph "$GRAPH_ID" --argjson vertices "$PUBLISHED_VERTEX_COUNT" '
-        [.graphs[] | select(.graph_id == $graph)] as $rows |
-        ($rows | length) == 1 and
-        ($rows[0].source == "published") and
-        ($rows[0].checkout_id == null) and
-        ($rows[0].vertex_count == $vertices)
-    ' "$EVIDENCE/bound-published-graph-list.json" >/dev/null || {
-        echo "published visibility leaked or lost the accepted generation" >&2
-        cat "$EVIDENCE/bound-published-graph-list.json" >&2
-        return 1
-    }
-
-    mcp_call "$BOUND_SESSION" bbox_project_graph_describe \
+    mcp_call "$PUBLISHED_SESSION" bbox_project_graph_validate \
         "$(jq -cn --arg project "$PROJECT_ID" --arg graph "$GRAPH_ID" \
-            '{project:$project,graph_id:$graph,visibility:"own"}')" own-graph-describe || {
-        cat "$EVIDENCE/own-graph-describe.json" >&2
-        return 1
-    }
-    jq -e --arg checkout "$CHECKOUT_ID" --argjson vertices "$((PUBLISHED_VERTEX_COUNT + 1))" '
-        .graphs[0].summary.source == "provisional" and
-        .graphs[0].summary.checkout_id == $checkout and
-        .graphs[0].summary.vertex_count == $vertices
-    ' "$EVIDENCE/own-graph-describe.json" >/dev/null || {
-        echo "own describe did not reflect the overlay" >&2
-        return 1
-    }
-    note "a cold own read already serves the overlay: $((PUBLISHED_VERTEX_COUNT + 1)) vertices against $PUBLISHED_VERTEX_COUNT published"
-}
-
-step_provisional_ref() {
-    local logical="project_graph_vertex:$PROJECT_ID:$GRAPH_ID:record/case@3"
-
-    mcp_call "$BOUND_SESSION" bbox_inspect_entity \
-        "$(jq -cn --arg ref "$logical" '{entity_ref:$ref,provisional:"own"}')" own-inspect || {
-        cat "$EVIDENCE/own-inspect.json" >&2
-        return 1
-    }
-    jq -e --arg checkout "$CHECKOUT_ID" --arg logical "$logical" '
-        .properties.source == "provisional" and
-        .properties.checkout_id == $checkout and
-        .properties.logical_ref == $logical and
-        .properties.label == "Case record version 3" and
-        (.entity_ref | startswith("provisional_project_graph_vertex:"))
-    ' "$EVIDENCE/own-inspect.json" >/dev/null || {
-        echo "own inspect did not report the vertex as provisional" >&2
-        cat "$EVIDENCE/own-inspect.json" >&2
-        return 1
-    }
-    PROVISIONAL_REF="$(jq -r '.entity_ref' "$EVIDENCE/own-inspect.json")"
-    [ -n "$PROVISIONAL_REF" ] || {
-        echo "own inspect returned no compound provisional ref" >&2
-        return 1
-    }
-    case "$PROVISIONAL_REF" in
-        *":$CHECKOUT_ID:$GRAPH_ID:record/case@3") ;;
-        *)
-            echo "compound ref does not name this checkout and vertex: $PROVISIONAL_REF" >&2
-            return 1
-            ;;
-    esac
-
-    mcp_call "$BOUND_SESSION" bbox_inspect_entity \
-        "$(jq -cn --arg ref "$PROVISIONAL_REF" '{entity_ref:$ref}')" compound-inspect || {
-        cat "$EVIDENCE/compound-inspect.json" >&2
-        return 1
-    }
-    jq -e --arg ref "$PROVISIONAL_REF" --arg checkout "$CHECKOUT_ID" '
-        .entity_ref == $ref and
-        .entity_type == "provisional_project_graph_vertex" and
-        .properties.label == "Case record version 3" and
-        .properties.checkout_id == $checkout and
-        ([.edges.out[] | select(.kind == "gov:SUPERSEDES")] | length) == 1
-    ' "$EVIDENCE/compound-inspect.json" >/dev/null || {
-        echo "the compound ref did not resolve the uncommitted vertex" >&2
-        cat "$EVIDENCE/compound-inspect.json" >&2
-        return 1
-    }
-
-    if mcp_call "$BOUND_SESSION" bbox_inspect_entity \
-        "$(jq -cn --arg ref "$logical" '{entity_ref:$ref,provisional:"published"}')" published-leak-check; then
-        if jq -e '[.. | strings | select(. == "Case record version 3")] | length >= 1' \
-            "$EVIDENCE/published-leak-check.json" >/dev/null 2>&1; then
-            echo "the uncommitted vertex leaked into published visibility" >&2
-            cat "$EVIDENCE/published-leak-check.json" >&2
-            return 1
-        fi
-    fi
-    grep -qi 'not_found\|not found' "$EVIDENCE/published-leak-check.json" || {
-        echo "published visibility did not refuse the uncommitted vertex" >&2
-        cat "$EVIDENCE/published-leak-check.json" >&2
-        return 1
-    }
-    note "record/case@3 resolves as $PROVISIONAL_REF in own and is absent from published"
-}
-
-step_invalid_diagnostics() {
-    printf '%s\n' "$MALFORMED_VERTEX" >> "$CHECKOUT/.bbox/graphs/$GRAPH_ID/vertices.jsonl"
-    capture_once invalid-capture || {
-        cat "$EVIDENCE/invalid-capture.err" >&2
-        return 1
-    }
-    # No knowledge read in between: the second capture's finalize is what makes
-    # this generation the one the own lane answers from.
-    mcp_call "$BOUND_SESSION" bbox_project_graph_validate \
-        "$(jq -cn --arg project "$PROJECT_ID" --arg graph "$GRAPH_ID" \
-            '{project:$project,graph_id:$graph,visibility:"own"}')" own-graph-validate || {
-        cat "$EVIDENCE/own-graph-validate.json" >&2
-        return 1
-    }
-    jq -e --arg checkout "$CHECKOUT_ID" '
-        .graphs[0].valid == false and
-        .graphs[0].source == "provisional" and
-        .graphs[0].checkout_id == $checkout and
-        (.graphs[0].errors | length) >= 1
-    ' "$EVIDENCE/own-graph-validate.json" >/dev/null || {
-        echo "own validate did not report per-graph Invalid diagnostics" >&2
-        cat "$EVIDENCE/own-graph-validate.json" >&2
-        return 1
-    }
-
-    mcp_call "$BOUND_SESSION" bbox_project_graph_list '{"visibility":"own"}' own-graph-list-invalid || {
-        cat "$EVIDENCE/own-graph-list-invalid.json" >&2
-        return 1
-    }
-    jq -e --arg graph "$GRAPH_ID" '
-        [.graphs[] | select(.graph_id == $graph)] as $rows |
-        ($rows | length) == 1 and
-        ($rows[0].status == "invalid") and
-        ($rows[0].source == "provisional")
-    ' "$EVIDENCE/own-graph-list-invalid.json" >/dev/null || {
-        echo "own list fell back to a published row instead of the Invalid overlay" >&2
-        cat "$EVIDENCE/own-graph-list-invalid.json" >&2
-        return 1
-    }
-
-    mcp_call "$BOUND_SESSION" bbox_project_graph_validate \
-        "$(jq -cn --arg project "$PROJECT_ID" --arg graph "$GRAPH_ID" \
-            '{project:$project,graph_id:$graph,visibility:"published"}')" published-graph-validate-after || {
-        cat "$EVIDENCE/published-graph-validate-after.json" >&2
+            '{project:$project,graph_id:$graph}')" graph-validate-after-edit || {
+        cat "$EVIDENCE/graph-validate-after-edit.json" >&2
         return 1
     }
     jq -e '
         .graphs[0].valid == true and
         .graphs[0].source == "published" and
         (.graphs[0].errors | length) == 0
-    ' "$EVIDENCE/published-graph-validate-after.json" >/dev/null || {
-        echo "the malformed overlay contaminated the published lane" >&2
+    ' "$EVIDENCE/graph-validate-after-edit.json" >/dev/null || {
+        echo "a working edit reached the published graph" >&2
+        cat "$EVIDENCE/graph-validate-after-edit.json" >&2
         return 1
     }
-    note "the malformed row surfaces as an Invalid provisional graph; published stays valid"
+    local logical="project_graph_vertex:$PROJECT_ID:$GRAPH_ID:record/case@3"
+    if mcp_call "$PUBLISHED_SESSION" bbox_inspect_entity \
+        "$(jq -cn --arg ref "$logical" '{entity_ref:$ref}')" uncommitted-inspect; then
+        if jq -e '[.. | strings | select(. == "Case record version 3")] | length >= 1' \
+            "$EVIDENCE/uncommitted-inspect.json" >/dev/null 2>&1; then
+            echo "the uncommitted vertex reached a read" >&2
+            cat "$EVIDENCE/uncommitted-inspect.json" >&2
+            return 1
+        fi
+    fi
+    grep -qi 'not_found\|not found' "$EVIDENCE/uncommitted-inspect.json" || {
+        echo "the read did not refuse the uncommitted vertex" >&2
+        cat "$EVIDENCE/uncommitted-inspect.json" >&2
+        return 1
+    }
+    if mcp_call "$PUBLISHED_SESSION" bbox_project_graph_list '{"provisional":"own"}' removed-parameter; then
+        echo "a removed visibility parameter was accepted" >&2
+        return 1
+    fi
+    note "uncommitted and malformed working rows stay out of every read; the graph stays valid"
 }
 
 step_teardown() {
@@ -888,11 +625,7 @@ run_step "committed candidate publication"       step_publish
 run_step "acceptance through the merge gate"     step_accept
 run_step "published graph list/describe/validate" step_published_reads
 run_step "published inspect"   step_published_traversal
-run_step "operator workspace binding mint"       step_mint_binding
-run_step "provisional capture of working edits"  step_provisional_capture
-run_step "own versus published visibility"       step_own_visibility
-run_step "provisional compound ref resolution"   step_provisional_ref
-run_step "per-graph Invalid diagnostics"         step_invalid_diagnostics
+run_step "uncommitted edits stay unpublished"    step_uncommitted_edits_stay_unpublished
 ABORT=0
 run_step "teardown"                              step_teardown
 

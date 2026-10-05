@@ -167,11 +167,10 @@ pub struct ProviderContext<'a> {
     /// cannot reopen a newer reader mid-request.
     searcher: Option<&'a tantivy::Searcher>,
     project_graph_resolver: Option<&'a dyn ProjectGraphEntityResolver>,
-    provisional: Option<&'a str>,
 }
 
 pub trait ProjectGraphEntityResolver: Send + Sync {
-    fn resolve_entity(&self, r: &EntityRef, provisional: Option<&str>) -> Result<EntityView>;
+    fn resolve_entity(&self, r: &EntityRef) -> Result<EntityView>;
 
     /// Tenant-owned evidence bindings touching `r`, in both directions.
     ///
@@ -185,8 +184,8 @@ pub trait ProjectGraphEntityResolver: Send + Sync {
     /// Each edge carries the `evidence.*` metadata family, with any endpoint
     /// the resolver could not observe left as `unresolved` for the read plane
     /// to refine.
-    fn evidence_edges(&self, r: &EntityRef, provisional: Option<&str>) -> Vec<Edge> {
-        let _ = (r, provisional);
+    fn evidence_edges(&self, r: &EntityRef) -> Vec<Edge> {
+        let _ = r;
         Vec::new()
     }
 }
@@ -200,7 +199,6 @@ impl<'a> ProviderContext<'a> {
             ext: None,
             searcher: None,
             project_graph_resolver: None,
-            provisional: None,
         }
     }
 
@@ -215,7 +213,6 @@ impl<'a> ProviderContext<'a> {
             ext: Some(ext),
             searcher: None,
             project_graph_resolver: None,
-            provisional: None,
         }
     }
 
@@ -237,10 +234,8 @@ impl<'a> ProviderContext<'a> {
     pub fn with_project_graph_resolver(
         mut self,
         resolver: &'a dyn ProjectGraphEntityResolver,
-        provisional: Option<&'a str>,
     ) -> Self {
         self.project_graph_resolver = Some(resolver);
-        self.provisional = provisional;
         self
     }
 
@@ -252,7 +247,6 @@ impl<'a> ProviderContext<'a> {
             ext: None,
             searcher: None,
             project_graph_resolver: None,
-            provisional: None,
         }
     }
 
@@ -276,16 +270,12 @@ impl<'a> ProviderContext<'a> {
         self.project_graph_resolver
     }
 
-    pub fn provisional_mode(&self) -> Option<&'a str> {
-        self.provisional
-    }
-
     /// Evidence bindings touching `r`. Empty when no project-graph resolver is
     /// bound, which is the correct reading for a context that cannot see the
     /// project graph at all.
     pub fn evidence_edges(&self, r: &EntityRef) -> Vec<Edge> {
         self.project_graph_resolver
-            .map(|resolver| resolver.evidence_edges(r, self.provisional))
+            .map(|resolver| resolver.evidence_edges(r))
             .unwrap_or_default()
     }
 
@@ -384,7 +374,6 @@ fn registry() -> &'static Vec<Box<dyn InspectableEntityProvider>> {
     REGISTRY.get_or_init(|| {
         let mut providers: Vec<Box<dyn InspectableEntityProvider>> = vec![
             Box::new(knowledge::KnowledgeProvider),
-            Box::new(knowledge::ProvisionalKnowledgeProvider),
             Box::new(system_memory::SystemMemoryProvider),
             Box::new(file::FileProvider),
             Box::new(project_file::ProjectFileProvider),

@@ -15,9 +15,6 @@ pub(super) async fn start_background_tasks(shared: Arc<SharedState>) -> anyhow::
     super::code_source::spawn_commit_observer(&shared);
     super::code_source::spawn_store_maintenance(&shared)?;
     super::history_activation::spawn_worker(&shared)?;
-    // Operator-minted workspace bindings are durable: re-arm the ones
-    // persisted under the knowledge-source store before anything can capture.
-    super::knowledge_source::restore_operator_workspace_bindings(&shared);
     configure_dispatch_path_env();
     spawn_vector_warmup_thread(shared.clone())?;
     spawn_code_read_view_refresher(shared.clone(), std::time::Duration::from_secs(60));
@@ -326,7 +323,7 @@ fn start_bbox_watcher(shared: &Arc<SharedState>) {
                         Ok(None) => {
                             tracing::warn!(
                                 checkout_id = %row.checkout_id,
-                                "provisional knowledge watcher has no registered project for scope"
+                                "checkout knowledge watcher has no registered project for scope"
                             );
                             continue;
                         }
@@ -334,7 +331,7 @@ fn start_bbox_watcher(shared: &Arc<SharedState>) {
                             tracing::warn!(
                                 checkout_id = %row.checkout_id,
                                 error = %error,
-                                "provisional knowledge watcher could not resolve project scope"
+                                "checkout knowledge watcher could not resolve project scope"
                             );
                             continue;
                         }
@@ -355,7 +352,7 @@ fn start_bbox_watcher(shared: &Arc<SharedState>) {
                         tracing::warn!(
                             checkout_id = %row.checkout_id,
                             error = %error,
-                            "provisional knowledge watcher rejected checkout carrier"
+                            "checkout knowledge watcher rejected checkout carrier"
                         );
                         continue;
                     }
@@ -364,7 +361,7 @@ fn start_bbox_watcher(shared: &Arc<SharedState>) {
                     tracing::warn!(
                         checkout_id = %row.checkout_id,
                         error = %err,
-                        "provisional knowledge watcher failed to start"
+                        "checkout knowledge watcher failed to start"
                     );
                 }
             }

@@ -17,9 +17,6 @@ use bbox_providers::providers::{self, EntityView, Neighborhood, NextHop, Provide
 #[serde(deny_unknown_fields)]
 pub struct InspectEntityParams {
     pub entity_ref: String,
-    /// Knowledge visibility policy: published, own, or all.
-    #[serde(default)]
-    pub provisional: Option<String>,
     pub edge_types: Option<String>,
     /// Edge direction: out, in, or both (default).
     pub direction: Option<String>,
@@ -234,7 +231,6 @@ pub fn inspect_entity(
     let full_neighborhood = if matches!(
         r.entity_type(),
         bbox_corpus_core::entity_ref::EntityType::ProjectGraphVertex
-            | bbox_corpus_core::entity_ref::EntityType::ProvisionalProjectGraphVertex
     ) {
         // The graph resolver already attached this vertex's evidence edges.
         entity.neighborhood.clone()
@@ -738,8 +734,6 @@ pub(super) fn is_identity_property(key: &str) -> bool {
                 | "generation"
                 | "graph_source"
                 | "graph_source_connector"
-                | "provisional"
-                | "visibility"
                 | "freshness"
         )
 }
@@ -880,7 +874,6 @@ mod tests {
             property_cursor: None,
             property_limit: None,
             entity_ref: "knowledge:missing".into(),
-            provisional: None,
             edge_types: None,
             direction: Some("sideways".into()),
             per_type_limit: None,
@@ -1170,7 +1163,6 @@ mod tests {
         );
         let mut params = InspectEntityParams {
             entity_ref: reference.to_string(),
-            provisional: None,
             edge_types: None,
             direction: None,
             per_type_limit: None,
@@ -1297,7 +1289,6 @@ mod tests {
             property_cursor: None,
             property_limit: None,
             entity_ref: "system_memory:sm-agentic-opening-sequence".into(),
-            provisional: None,
             edge_types: None,
             direction: None,
             per_type_limit: Some(0),
@@ -1340,7 +1331,6 @@ mod tests {
             property_cursor: None,
             property_limit: None,
             entity_ref: "system_memory:sm-agentic-opening-sequence".into(),
-            provisional: None,
             edge_types: None,
             direction: None,
             per_type_limit: None,

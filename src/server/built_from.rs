@@ -21,27 +21,6 @@ pub(crate) fn append_built_from_section(mut output: String, table: &BuiltFromTab
                 output.push_str(" commit=");
                 output.push_str(publisher_commit);
             }
-            BuiltFromStamp::CheckoutOverlay {
-                published_scope,
-                checkout_id,
-                publisher_commit,
-                checkout_head,
-                merge_base,
-                working_fingerprint,
-            } => {
-                output.push_str(" checkout_overlay scope=");
-                output.push_str(&format_scope(published_scope));
-                output.push_str(" checkout=");
-                output.push_str(checkout_id);
-                output.push_str(" publisher_commit=");
-                output.push_str(publisher_commit);
-                output.push_str(" checkout_head=");
-                output.push_str(checkout_head);
-                output.push_str(" merge_base=");
-                output.push_str(merge_base);
-                output.push_str(" working_fingerprint=");
-                output.push_str(working_fingerprint);
-            }
         }
         output.push('\n');
     }

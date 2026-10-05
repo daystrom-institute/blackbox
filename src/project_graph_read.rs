@@ -8,7 +8,6 @@ use bbox_edge_sidecar::edge_sidecar::Edge;
 use bbox_indexing::project_graph_view::{
     ProjectGraphRead, ProjectGraphValidity, ProjectGraphViewEntry,
 };
-use bbox_knowledge::overlay::ProvisionalMode;
 use bbox_project_graph::{
     EvidenceBinding, EvidenceEndpointObservation, EvidenceEndpointStatus, GraphAuthority,
     GraphGeneration, HintDirection, ProjectGraphVertex,
@@ -17,7 +16,6 @@ use bbox_providers::providers::{
     EntityView, Neighborhood, NextHopDirection, NextHopHint as ProviderNextHopHint,
     ProjectGraphEntityResolver, empty_neighborhood_view,
 };
-use bro_core::WorkspaceId;
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -82,14 +80,12 @@ impl GraphValidateDetail {
 }
 
 /// Precise variant selector for exact graph reads. Every field is one the
-/// list and describe summaries already expose: the authority plane, the
-/// checkout identity, and the generation content hash. Selection is applied
-/// after visibility filtering, so a selector can narrow the visible variant
-/// set but never widens authority past what the caller already sees.
+/// list and describe summaries already expose: the authority plane and the
+/// generation content hash. Selection narrows the visible variant set and
+/// never widens authority past what the caller already sees.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct GraphVariantSelector {
     pub source: Option<String>,
-    pub checkout_id: Option<String>,
     pub content_hash: Option<String>,
 }
 
@@ -97,43 +93,27 @@ impl GraphVariantSelector {
     /// Parses the adapter fields, validating the source vocabulary. Returns
     /// `None` when no field was supplied so unselected reads keep their
     /// single-variant-or-refuse contract.
-    pub(crate) fn parse(
-        source: Option<&str>,
-        checkout_id: Option<&str>,
-        content_hash: Option<&str>,
-    ) -> Result<Option<Self>> {
+    pub(crate) fn parse(source: Option<&str>, content_hash: Option<&str>) -> Result<Option<Self>> {
         if let Some(source) = source {
             match source {
-                "published" | "provisional" | "connector" => {}
+                "published" | "connector" => {}
                 other => bail!(
-                    "error.bad_input: invalid source {other:?}; expected published, provisional, or connector"
+                    "error.bad_input: invalid source {other:?}; expected published or connector"
                 ),
             }
         }
         let selector = Self {
             source: source.map(Into::into),
-            checkout_id: checkout_id.map(Into::into),
             content_hash: content_hash.map(Into::into),
         };
-        let empty = selector.source.is_none()
-            && selector.checkout_id.is_none()
-            && selector.content_hash.is_none();
+        let empty = selector.source.is_none() && selector.content_hash.is_none();
         Ok((!empty).then_some(selector))
     }
 
-    pub(crate) fn matches_parts(
-        &self,
-        source: &str,
-        checkout_id: Option<&str>,
-        content_hash: &str,
-    ) -> bool {
+    pub(crate) fn matches_parts(&self, source: &str, content_hash: &str) -> bool {
         self.source
             .as_deref()
             .map_or(true, |expected| expected == source)
-            && self
-                .checkout_id
-                .as_deref()
-                .map_or(true, |expected| Some(expected) == checkout_id)
             && self
                 .content_hash
                 .as_deref()
@@ -141,20 +121,13 @@ impl GraphVariantSelector {
     }
 
     fn matches_entry(&self, entry: &ProjectGraphViewEntry) -> bool {
-        self.matches_parts(
-            source_label(entry),
-            entry.generation.workspace_id.as_ref().map(|id| id.as_str()),
-            entry.generation.content_hash.as_str(),
-        )
+        self.matches_parts(source_label(entry), entry.generation.content_hash.as_str())
     }
 
     pub(crate) fn describe(&self) -> String {
         let mut parts = Vec::new();
         if let Some(source) = &self.source {
             parts.push(format!("source={source}"));
-        }
-        if let Some(checkout_id) = &self.checkout_id {
-            parts.push(format!("checkout_id={checkout_id}"));
         }
         if let Some(content_hash) = &self.content_hash {
             parts.push(format!("content_hash={content_hash}"));
@@ -167,14 +140,8 @@ impl GraphVariantSelector {
 /// the caller can copy the selector fields without another round trip.
 fn variant_identity(entry: &ProjectGraphViewEntry) -> String {
     format!(
-        "source={}, checkout_id={}, content_hash={}",
+        "source={}, content_hash={}",
         source_label(entry),
-        entry
-            .generation
-            .workspace_id
-            .as_ref()
-            .map(|id| id.as_str())
-            .unwrap_or("-"),
         entry.generation.content_hash
     )
 }
@@ -184,7 +151,6 @@ pub(crate) struct GraphSummary {
     pub graph_id: String,
     pub status: &'static str,
     pub source: &'static str,
-    pub checkout_id: Option<String>,
     /// Reflected counts: authored rows plus schema-as-data vertices/edges
     /// (vertex/edge type definitions) plus `meta:INSTANCE_OF` edges. Kept
     /// for compatibility with existing callers that read the full
@@ -265,7 +231,6 @@ pub(crate) struct GraphValidation {
     pub graph_id: String,
     pub valid: bool,
     pub source: &'static str,
-    pub checkout_id: Option<String>,
     /// Bounded page of validation error rows. The complete array stays
     /// recoverable through the `detail=errors` exact body read.
     pub errors: Vec<Value>,
@@ -286,9 +251,7 @@ pub(crate) struct GraphValidation {
 #[derive(Debug, Clone)]
 pub(crate) struct GraphDetailRead {
     pub project_id: String,
-    pub provisional_mode: &'static str,
     pub source: &'static str,
-    pub checkout_id: Option<String>,
     pub summary: GraphSummary,
     pub generation: bbox_indexing::project_graph_view::ProjectGraphGenerationIdentity,
     pub body: Value,
@@ -302,20 +265,10 @@ pub(crate) struct ResolvedGraphVertex {
     pub graph_id: String,
     pub vertex: ProjectGraphVertex,
     pub generation: bbox_indexing::project_graph_view::ProjectGraphGenerationIdentity,
-    pub provisional: bool,
-    pub checkout_id: Option<WorkspaceId>,
     pub graph: std::sync::Arc<GraphGeneration>,
 }
 
 impl BlackboxServer {
-    pub(crate) fn project_graph_list_domain(
-        &self,
-        project: Option<&str>,
-        provisional: Option<&str>,
-    ) -> Result<Vec<GraphSummary>> {
-        Ok(self.project_graph_inventory_domain(project, provisional)?.1)
-    }
-
     /// The complete visible inventory for one selection, deterministically
     /// ordered, plus a content-bound stamp over that inventory. The stamp
     /// lets list continuation refuse when the live view changed between
@@ -323,52 +276,24 @@ impl BlackboxServer {
     pub(crate) fn project_graph_inventory_domain(
         &self,
         project: Option<&str>,
-        provisional: Option<&str>,
-    ) -> Result<(ProvisionalMode, Vec<GraphSummary>, String)> {
-        let (project_id, mode, own) = self.graph_read_context(project, provisional)?;
+    ) -> Result<(Vec<GraphSummary>, String)> {
+        let project_id = self.graph_read_context(project)?;
         let views = self.state.project_graph_views.read();
-        let mut entries = match mode {
-            ProvisionalMode::Published => views.list_published(&project_id),
-            ProvisionalMode::Own => views.list_own(
-                &project_id,
-                own.as_ref()
-                    .ok_or_else(|| anyhow!("own visibility requires checkout authority"))?,
-            ),
-            ProvisionalMode::All => {
-                let mut entries = views.list_published(&project_id);
-                for overlay in views.provisional_for_project(&project_id) {
-                    entries.extend(overlay.graphs.values().filter_map(|value| match value {
-                        bbox_indexing::project_graph_view::ProjectGraphOverlayValue::Upsert(entry) => Some(entry.clone()),
-                        bbox_indexing::project_graph_view::ProjectGraphOverlayValue::Tombstone { .. } => None,
-                    }));
-                }
-                entries
-            }
-        };
+        let mut entries = views.list_published(&project_id);
         // Connector-managed source graphs are read-only projections accepted
-        // by the source projection store, not checkout state, so they are
-        // visible under every visibility policy rather than gated by a
-        // provisional opt-in.
+        // by the source projection store, visible beside the published ones.
         entries.extend(views.list_connector(&project_id));
         let mut summaries: Vec<GraphSummary> = entries.into_iter().map(summary).collect();
         summaries.sort_by(|a, b| {
-            (
-                &a.graph_id,
-                a.source,
-                &a.checkout_id,
-                a.status,
-                &a.content_hash,
-            )
-                .cmp(&(
-                    &b.graph_id,
-                    b.source,
-                    &b.checkout_id,
-                    b.status,
-                    &b.content_hash,
-                ))
+            (&a.graph_id, a.source, a.status, &a.content_hash).cmp(&(
+                &b.graph_id,
+                b.source,
+                b.status,
+                &b.content_hash,
+            ))
         });
-        let stamp = graph_view_stamp(&project_id, mode, &summaries);
-        Ok((mode, summaries, stamp))
+        let stamp = graph_view_stamp(&project_id, &summaries);
+        Ok((summaries, stamp))
     }
 
     /// The visible variants of one graph id under one selection,
@@ -379,12 +304,11 @@ impl BlackboxServer {
         &self,
         project: &str,
         graph_id: &str,
-        provisional: Option<&str>,
     ) -> Result<(Vec<GraphDescription>, String)> {
-        let (project_id, mode, _own) = self.graph_read_context(Some(project), provisional)?;
+        let project_id = self.graph_read_context(Some(project))?;
         let index = self.state.idx.read();
         let mut descriptions = self
-            .graph_entries(project, graph_id, provisional)?
+            .graph_entries(project, graph_id)?
             .into_iter()
             .map(|entry| {
                 let summary = summary(entry.clone());
@@ -398,20 +322,13 @@ impl BlackboxServer {
             })
             .collect::<Result<Vec<_>>>()?;
         descriptions.sort_by(|a, b| {
-            (
-                &a.summary.source,
-                &a.summary.checkout_id,
-                &a.summary.content_hash,
-                a.summary.status,
-            )
-                .cmp(&(
-                    &b.summary.source,
-                    &b.summary.checkout_id,
-                    &b.summary.content_hash,
-                    b.summary.status,
-                ))
+            (&a.summary.source, &a.summary.content_hash, a.summary.status).cmp(&(
+                &b.summary.source,
+                &b.summary.content_hash,
+                b.summary.status,
+            ))
         });
-        let stamp = graph_variant_stamp(&project_id, mode, graph_id, &descriptions)?;
+        let stamp = graph_variant_stamp(&project_id, graph_id, &descriptions)?;
         Ok((descriptions, stamp))
     }
 
@@ -422,18 +339,16 @@ impl BlackboxServer {
         &self,
         project: &str,
         graph_id: &str,
-        provisional: Option<&str>,
         selector: Option<&GraphVariantSelector>,
-    ) -> Result<(ProjectId, ProvisionalMode, ProjectGraphViewEntry)> {
-        let (project_id, mode, _own) = self.graph_read_context(Some(project), provisional)?;
-        let mut entries = self.graph_entries(project, graph_id, provisional)?;
+    ) -> Result<(ProjectId, ProjectGraphViewEntry)> {
+        let project_id = self.graph_read_context(Some(project))?;
+        let mut entries = self.graph_entries(project, graph_id)?;
         if let Some(selector) = selector {
             entries.retain(|entry| selector.matches_entry(entry));
             if entries.is_empty() {
                 bail!(
-                    "error.not_found: no visible variant of graph `{graph_id}` matches {} in {} visibility",
-                    selector.describe(),
-                    mode_name(mode)
+                    "error.not_found: no visible variant of graph `{graph_id}` matches {}",
+                    selector.describe()
                 );
             }
         }
@@ -444,11 +359,11 @@ impl BlackboxServer {
                 .collect::<Vec<_>>()
                 .join("; ");
             bail!(
-                "error.project_graph_ambiguous: exact read matched {} visible variants [{identities}]; select one with source, checkout_id, and expected_content_hash (or narrow provisional to published or own)",
+                "error.project_graph_ambiguous: exact read matched {} visible variants [{identities}]; select one with source and expected_content_hash",
                 entries.len()
             );
         }
-        Ok((project_id, mode, entries.remove(0)))
+        Ok((project_id, entries.remove(0)))
     }
 
     /// Exact schema/descriptor body for one graph generation. The adapter
@@ -457,12 +372,10 @@ impl BlackboxServer {
         &self,
         project: &str,
         graph_id: &str,
-        provisional: Option<&str>,
         detail: GraphDescribeDetail,
         selector: Option<&GraphVariantSelector>,
     ) -> Result<GraphDetailRead> {
-        let (project_id, mode, entry) =
-            self.single_graph_entry(project, graph_id, provisional, selector)?;
+        let (project_id, entry) = self.single_graph_entry(project, graph_id, selector)?;
         let summary = summary(entry.clone());
         let Some(graph) = entry.graph().cloned() else {
             bail!(
@@ -480,9 +393,7 @@ impl BlackboxServer {
         };
         Ok(GraphDetailRead {
             project_id: project_id.to_string(),
-            provisional_mode: mode_name(mode),
             source: summary.source,
-            checkout_id: summary.checkout_id.clone(),
             summary,
             generation,
             body,
@@ -493,20 +404,18 @@ impl BlackboxServer {
         &self,
         project: &str,
         graph_id: &str,
-        provisional: Option<&str>,
         selector: Option<&GraphVariantSelector>,
         error_offset: usize,
         error_limit: usize,
     ) -> Result<Vec<GraphValidation>> {
-        let (project_id, mode, _own) = self.graph_read_context(Some(project), provisional)?;
-        let mut entries = self.graph_entries(project, graph_id, provisional)?;
+        let project_id = self.graph_read_context(Some(project))?;
+        let mut entries = self.graph_entries(project, graph_id)?;
         if let Some(selector) = selector {
             entries.retain(|entry| selector.matches_entry(entry));
             if entries.is_empty() {
                 bail!(
-                    "error.not_found: no visible variant of graph `{graph_id}` matches {} in {} visibility",
-                    selector.describe(),
-                    mode_name(mode)
+                    "error.not_found: no visible variant of graph `{graph_id}` matches {}",
+                    selector.describe()
                 );
             }
         }
@@ -525,10 +434,8 @@ impl BlackboxServer {
                 let errors_total = error_values.len();
                 let error_stamp = graph_error_stamp(
                     &project_id,
-                    mode,
                     &entry.graph_id,
                     source,
-                    entry.generation.workspace_id.as_ref().map(|id| id.as_str()),
                     &entry.generation.content_hash,
                     &error_values,
                 )?;
@@ -544,11 +451,6 @@ impl BlackboxServer {
                     graph_id: entry.graph_id.clone(),
                     valid,
                     source,
-                    checkout_id: entry
-                        .generation
-                        .workspace_id
-                        .as_ref()
-                        .map(ToString::to_string),
                     errors,
                     errors_total,
                     errors_offset: error_offset,
@@ -567,11 +469,9 @@ impl BlackboxServer {
         &self,
         project: &str,
         graph_id: &str,
-        provisional: Option<&str>,
         selector: Option<&GraphVariantSelector>,
     ) -> Result<GraphDetailRead> {
-        let (project_id, mode, entry) =
-            self.single_graph_entry(project, graph_id, provisional, selector)?;
+        let (project_id, entry) = self.single_graph_entry(project, graph_id, selector)?;
         let summary = summary(entry.clone());
         let errors = match entry.validity.clone() {
             ProjectGraphValidity::Valid => Vec::new(),
@@ -580,9 +480,7 @@ impl BlackboxServer {
         let generation = entry.generation;
         Ok(GraphDetailRead {
             project_id: project_id.to_string(),
-            provisional_mode: mode_name(mode),
             source: summary.source,
-            checkout_id: summary.checkout_id.clone(),
             summary,
             generation,
             body: serde_json::to_value(&errors)?,
@@ -637,170 +535,41 @@ impl BlackboxServer {
     pub(crate) fn resolve_project_graph_vertex(
         &self,
         entity_ref: &EntityRef,
-        provisional: Option<&str>,
     ) -> Result<ResolvedGraphVertex> {
-        match entity_ref {
-            EntityRef::ProjectGraphVertex {
-                project_id,
-                graph_id,
-                vertex_id,
-            } => self.resolve_published_form_vertex(project_id, graph_id, vertex_id, provisional),
-            EntityRef::ProvisionalProjectGraphVertex {
-                scope_hash,
-                checkout_id,
-                graph_id,
-                vertex_id,
-            } => self.resolve_compound_vertex(scope_hash, checkout_id, graph_id, vertex_id),
-            _ => bail!("not a project graph vertex ref"),
-        }
-    }
-
-    fn resolve_published_form_vertex(
-        &self,
-        project: &str,
-        graph_id: &str,
-        vertex_id: &str,
-        provisional: Option<&str>,
-    ) -> Result<ResolvedGraphVertex> {
-        let (project_id, mode, own) = self.graph_read_context(Some(project), provisional)?;
+        let EntityRef::ProjectGraphVertex {
+            project_id,
+            graph_id,
+            vertex_id,
+        } = entity_ref
+        else {
+            bail!("not a project graph vertex ref");
+        };
+        let project_id = self.graph_read_context(Some(project_id))?;
         let views = self.state.project_graph_views.read();
-        // A project can hold connector-managed graphs before it has ever
-        // published one, so the published scope is optional here. It is only
-        // needed to render a provisional compound ref, and a connector graph
-        // never has one.
-        let scope_hash = views
-            .published_view(&project_id)
-            .map(|view| bbox_code_source::scope_hash(&view.scope));
         let mut candidates = Vec::new();
-        match mode {
-            ProvisionalMode::Published => {
-                push_read_candidate(&mut candidates, views.load_published(&project_id, graph_id))?
-            }
-            ProvisionalMode::Own => push_read_candidate(
-                &mut candidates,
-                views.load_own(&project_id, own.as_ref().unwrap(), graph_id),
-            )?,
-            ProvisionalMode::All => {
-                push_read_candidate(&mut candidates, views.load_published(&project_id, graph_id))?;
-                for overlay in views.provisional_for_project(&project_id) {
-                    if let Some(value) = overlay.graphs.get(graph_id)
-                        && let bbox_indexing::project_graph_view::ProjectGraphOverlayValue::Upsert(
-                            entry,
-                        ) = value
-                    {
-                        push_read_candidate(&mut candidates, read_entry(entry.clone()))?;
-                    }
-                }
-            }
-        }
+        push_read_candidate(&mut candidates, views.load_published(&project_id, graph_id))?;
         if candidates.is_empty() {
             push_read_candidate(&mut candidates, views.load_connector(&project_id, graph_id))?;
         }
-        if candidates.is_empty() && scope_hash.is_none() {
+        if candidates.is_empty() && views.published_view(&project_id).is_none() {
             bail!("error.not_found: project has no accepted graph generation");
         }
-        let scope_hash = scope_hash.unwrap_or_default();
-        let mut resolved = candidates
+        candidates
             .into_iter()
-            .filter_map(|entry| resolve_vertex(&project_id, &scope_hash, entry, vertex_id))
-            .collect::<Vec<_>>();
-        if resolved.is_empty() {
-            bail!(
-                "error.not_found: project graph vertex was not found in {} visibility",
-                mode_name(mode)
-            );
-        }
-        if mode == ProvisionalMode::All && resolved.len() > 1 {
-            let refs = resolved
-                .iter()
-                .map(|item| item.canonical_ref.render())
-                .collect::<Vec<_>>()
-                .join(", ");
-            bail!(
-                "error.project_graph_ambiguous: all visibility matched multiple generations: {refs}"
-            );
-        }
-        Ok(resolved.remove(0))
+            .find_map(|entry| resolve_vertex(&project_id, entry, vertex_id))
+            .ok_or_else(|| anyhow!("error.not_found: project graph vertex was not found"))
     }
 
-    fn resolve_compound_vertex(
-        &self,
-        scope_hash: &str,
-        checkout_id: &str,
-        graph_id: &str,
-        vertex_id: &str,
-    ) -> Result<ResolvedGraphVertex> {
-        let workspace_id = WorkspaceId::parse(checkout_id.to_string())?;
-        let views = self.state.project_graph_views.read();
-        for project in self
-            .state
-            .records_provider
-            .records_snapshot()
-            .records
-            .iter()
-        {
-            let project_id = project.project_id.clone();
-            let parsed = ProjectId::parse(project_id.clone())?;
-            let Some(overlay) = views.provisional_overlay(&parsed, &workspace_id) else {
-                continue;
-            };
-            if bbox_code_source::scope_hash(&overlay.scope) != scope_hash {
-                continue;
-            }
-            let Some(value) = overlay.graphs.get(graph_id) else {
-                bail!("error.not_found: provisional graph is not live");
-            };
-            let entry = match value {
-                bbox_indexing::project_graph_view::ProjectGraphOverlayValue::Upsert(entry) => {
-                    entry.clone()
-                }
-                bbox_indexing::project_graph_view::ProjectGraphOverlayValue::Tombstone {
-                    ..
-                } => bail!("error.not_found: provisional graph is tombstoned"),
-            };
-            return resolve_vertex(&parsed, scope_hash, entry, vertex_id)
-                .ok_or_else(|| anyhow!("error.not_found: provisional graph vertex is not live"));
-        }
-        bail!("error.not_found: provisional graph scope or checkout is not live")
-    }
-
-    fn graph_entries(
-        &self,
-        project: &str,
-        graph_id: &str,
-        provisional: Option<&str>,
-    ) -> Result<Vec<ProjectGraphViewEntry>> {
-        let (project_id, mode, own) = self.graph_read_context(Some(project), provisional)?;
+    fn graph_entries(&self, project: &str, graph_id: &str) -> Result<Vec<ProjectGraphViewEntry>> {
+        let project_id = self.graph_read_context(Some(project))?;
         let views = self.state.project_graph_views.read();
         let mut entries = Vec::new();
-        match mode {
-            ProvisionalMode::Published => {
-                push_read_candidate(&mut entries, views.load_published(&project_id, graph_id))?
-            }
-            ProvisionalMode::Own => push_read_candidate(
-                &mut entries,
-                views.load_own(&project_id, own.as_ref().unwrap(), graph_id),
-            )?,
-            ProvisionalMode::All => {
-                push_read_candidate(&mut entries, views.load_published(&project_id, graph_id))?;
-                for overlay in views.provisional_for_project(&project_id) {
-                    if let Some(
-                        bbox_indexing::project_graph_view::ProjectGraphOverlayValue::Upsert(entry),
-                    ) = overlay.graphs.get(graph_id)
-                    {
-                        entries.push(entry.clone());
-                    }
-                }
-            }
-        }
+        push_read_candidate(&mut entries, views.load_published(&project_id, graph_id))?;
         if entries.is_empty() {
             push_read_candidate(&mut entries, views.load_connector(&project_id, graph_id))?;
         }
         if entries.is_empty() {
-            bail!(
-                "error.not_found: graph `{graph_id}` was not found in {} visibility",
-                mode_name(mode)
-            );
+            bail!("error.not_found: graph `{graph_id}` was not found");
         }
         Ok(entries)
     }
@@ -811,17 +580,11 @@ impl BlackboxServer {
     /// entry, a thread, a commit) has no project of its own, so it borrows the
     /// caller's session project; without one there is no authorized scope and
     /// therefore no bindings to show.
-    fn evidence_project_for(
-        &self,
-        entity: &EntityRef,
-        provisional: Option<&str>,
-    ) -> Option<ProjectId> {
+    fn evidence_project_for(&self, entity: &EntityRef) -> Option<ProjectId> {
         if let Some(project) = bbox_project_graph::entity_project_scope(entity) {
             return ProjectId::parse(project.to_string()).ok();
         }
-        self.graph_read_context(None, provisional)
-            .ok()
-            .map(|(project_id, _, _)| project_id)
+        self.graph_read_context(None).ok()
     }
 
     /// The evidence edges touching `entity`, split by direction.
@@ -835,83 +598,50 @@ impl BlackboxServer {
         &self,
         project_id: &ProjectId,
         entity: &EntityRef,
-        provisional: Option<&str>,
     ) -> (Vec<Edge>, Vec<Edge>) {
-        // The read context is resolved BEFORE the view guard is taken and then
-        // threaded down. Re-deriving it under the lock would re-enter the same
-        // RwLock through validate_project_selection, which deadlocks the
-        // moment a writer is queued between the two acquisitions.
-        let Ok((_, mode, own)) = self.graph_read_context(Some(project_id.as_str()), provisional)
-        else {
+        // The project selection is validated BEFORE the view guard is taken.
+        // Re-deriving it under the lock would re-enter the same RwLock
+        // through validate_project_selection, which deadlocks the moment a
+        // writer is queued between the two acquisitions.
+        if self.graph_read_context(Some(project_id.as_str())).is_err() {
             return (Vec::new(), Vec::new());
-        };
+        }
         let views = self.state.project_graph_views.read();
-        let sets = match mode {
-            ProvisionalMode::Published => vec![views.evidence_published(project_id)],
-            ProvisionalMode::Own => match own.as_ref() {
-                Some(workspace) => vec![views.evidence_own(project_id, workspace)],
-                None => vec![views.evidence_published(project_id)],
-            },
-            ProvisionalMode::All => views.evidence_all(project_id),
-        };
+        let set = views.evidence_published(project_id);
         let mut forward = Vec::new();
         let mut reverse = Vec::new();
         let mut seen = BTreeSet::new();
-        for set in &sets {
-            for binding in set.forward(entity) {
-                if seen.insert((binding.binding_id.clone(), true)) {
-                    forward.push(evidence_edge(binding, &views, mode, own.as_ref()));
-                }
+        for binding in set.forward(entity) {
+            if seen.insert((binding.binding_id.clone(), true)) {
+                forward.push(evidence_edge(binding, &views));
             }
-            for binding in set.reverse(entity) {
-                if seen.insert((binding.binding_id.clone(), false)) {
-                    reverse.push(evidence_edge(binding, &views, mode, own.as_ref()));
-                }
+        }
+        for binding in set.reverse(entity) {
+            if seen.insert((binding.binding_id.clone(), false)) {
+                reverse.push(evidence_edge(binding, &views));
             }
         }
         (forward, reverse)
     }
 
-    fn graph_read_context(
-        &self,
-        project: Option<&str>,
-        provisional: Option<&str>,
-    ) -> Result<(ProjectId, ProvisionalMode, Option<WorkspaceId>)> {
-        let checkout = self.authoritative_session_checkout();
-        let binding = self.authoritative_session_workspace_binding();
-        let mode = ProvisionalMode::parse(provisional, checkout.is_some() || binding.is_some())?;
+    /// The project a graph read targets: the explicit selector, else the
+    /// session checkout's project. A workspace binding never selects a read.
+    fn graph_read_context(&self, project: Option<&str>) -> Result<ProjectId> {
         let selected = match project {
             Some(raw) => self.validate_project_selection(raw)?,
-            None => checkout
-                .as_ref()
+            None => self
+                .authoritative_session_checkout()
                 .map(|item| item.project_id.clone())
-                .or_else(|| binding.as_ref().map(|item| item.project_id.clone()))
                 .ok_or_else(|| anyhow!("project is required without session checkout authority"))?,
         };
-        let project_id = ProjectId::parse(selected)?;
-        let own = binding
-            .as_ref()
-            .filter(|item| item.project_id == project_id.as_str())
-            .map(|item| item.workspace_id.clone())
-            .or_else(|| {
-                checkout
-                    .as_ref()
-                    .filter(|item| item.project_id == project_id.as_str())
-                    .and_then(|item| WorkspaceId::parse(item.checkout_id.clone()).ok())
-            });
-        if mode == ProvisionalMode::Own && own.is_none() {
-            bail!(
-                "own visibility requires authoritative checkout authority for the selected project"
-            );
-        }
-        Ok((project_id, mode, own))
+        Ok(ProjectId::parse(selected)?)
     }
 }
 
 impl ProjectGraphEntityResolver for BlackboxServer {
-    fn resolve_entity(&self, r: &EntityRef, provisional: Option<&str>) -> Result<EntityView> {
-        let resolved = self.resolve_project_graph_vertex(r, provisional)?;
-        let mut properties = BTreeMap::from([
+    fn resolve_entity(&self, r: &EntityRef) -> Result<EntityView> {
+        let resolved = self.resolve_project_graph_vertex(r)?;
+        let properties = BTreeMap::from([
             ("id".into(), resolved.vertex.id.clone()),
             ("type".into(), resolved.vertex.type_name.clone()),
             ("label".into(), resolved.vertex.label.clone()),
@@ -928,9 +658,6 @@ impl ProjectGraphEntityResolver for BlackboxServer {
                 serde_json::to_string(&resolved.vertex.properties)?,
             ),
         ]);
-        if let Some(checkout) = resolved.checkout_id.as_ref() {
-            properties.insert("checkout_id".into(), checkout.to_string());
-        }
         let (forward, reverse) = graph_neighborhood(&resolved);
         let edge = |source: EntityRef, kind: String, target: EntityRef| Edge {
             source,
@@ -975,11 +702,9 @@ impl ProjectGraphEntityResolver for BlackboxServer {
         // Evidence edges are a separate family on the same neighborhood: they
         // are tenant assertions, not graph facts, so they never enter
         // graph_neighborhood and never round-trip through the graph documents.
-        // Bindings reference the LOGICAL vertex ref, so a provisional caller
-        // is matched on logical_ref while the edges it gets back are stated in
-        // whatever canonical form it asked with.
+        // Bindings reference the logical vertex ref.
         let (evidence_forward, evidence_reverse) =
-            self.evidence_neighborhood(&resolved.project_id, &resolved.logical_ref, provisional);
+            self.evidence_neighborhood(&resolved.project_id, &resolved.logical_ref);
         view.neighborhood
             .forward
             .extend(evidence_forward.into_iter().map(|mut edge| {
@@ -995,11 +720,11 @@ impl ProjectGraphEntityResolver for BlackboxServer {
         Ok(view)
     }
 
-    fn evidence_edges(&self, r: &EntityRef, provisional: Option<&str>) -> Vec<Edge> {
-        let Some(project_id) = self.evidence_project_for(r, provisional) else {
+    fn evidence_edges(&self, r: &EntityRef) -> Vec<Edge> {
+        let Some(project_id) = self.evidence_project_for(r) else {
             return Vec::new();
         };
-        let (forward, reverse) = self.evidence_neighborhood(&project_id, r, provisional);
+        let (forward, reverse) = self.evidence_neighborhood(&project_id, r);
         forward.into_iter().chain(reverse).collect()
     }
 }
@@ -1011,25 +736,11 @@ impl ProjectGraphEntityResolver for BlackboxServer {
 fn evidence_edge(
     binding: &EvidenceBinding,
     views: &bbox_indexing::project_graph_view::ProjectGraphViewCatalog,
-    mode: ProvisionalMode,
-    own: Option<&WorkspaceId>,
 ) -> Edge {
-    let source_status = observe_endpoint(
-        binding,
-        &binding.source,
-        binding.source_generation,
-        views,
-        mode,
-        own,
-    );
-    let target_status = observe_endpoint(
-        binding,
-        &binding.target,
-        binding.target_generation,
-        views,
-        mode,
-        own,
-    );
+    let source_status =
+        observe_endpoint(binding, &binding.source, binding.source_generation, views);
+    let target_status =
+        observe_endpoint(binding, &binding.target, binding.target_generation, views);
     Edge {
         source: binding.source.clone(),
         kind: binding.kind.clone(),
@@ -1051,8 +762,6 @@ fn observe_endpoint(
     endpoint: &EntityRef,
     expected_generation: Option<u64>,
     views: &bbox_indexing::project_graph_view::ProjectGraphViewCatalog,
-    mode: ProvisionalMode,
-    own: Option<&WorkspaceId>,
 ) -> EvidenceEndpointStatus {
     // Scope first: an endpoint in another project is unauthorized whatever its
     // liveness, and path traversal must never cross it.
@@ -1081,11 +790,7 @@ fn observe_endpoint(
             expected_generation,
         );
     };
-    let read = match (mode, own) {
-        (ProvisionalMode::Own, Some(workspace)) => views.load_own(&parsed, workspace, graph_id),
-        _ => views.load_published(&parsed, graph_id),
-    };
-    let observation = match read {
+    let observation = match views.load_published(&parsed, graph_id) {
         ProjectGraphRead::Valid(entry) | ProjectGraphRead::Invalid(entry) => match entry.graph() {
             Some(graph) if graph.vertices.contains_key(vertex_id) => {
                 EvidenceEndpointObservation::Present {
@@ -1094,18 +799,9 @@ fn observe_endpoint(
             }
             _ => EvidenceEndpointObservation::Absent,
         },
-        ProjectGraphRead::Missing | ProjectGraphRead::Tombstoned(_) => {
-            EvidenceEndpointObservation::Absent
-        }
+        ProjectGraphRead::Missing => EvidenceEndpointObservation::Absent,
     };
     bbox_project_graph::resolve_endpoint_status(observation, expected_generation)
-}
-
-fn read_entry(entry: ProjectGraphViewEntry) -> ProjectGraphRead {
-    match entry.validity {
-        ProjectGraphValidity::Valid => ProjectGraphRead::Valid(entry),
-        ProjectGraphValidity::Invalid { .. } => ProjectGraphRead::Invalid(entry),
-    }
 }
 
 fn push_read_candidate(
@@ -1113,7 +809,7 @@ fn push_read_candidate(
     read: ProjectGraphRead,
 ) -> Result<()> {
     match read {
-        ProjectGraphRead::Missing | ProjectGraphRead::Tombstoned(_) => Ok(()),
+        ProjectGraphRead::Missing => Ok(()),
         ProjectGraphRead::Valid(entry) | ProjectGraphRead::Invalid(entry) => {
             entries.push(entry);
             Ok(())
@@ -1123,7 +819,6 @@ fn push_read_candidate(
 
 fn resolve_vertex(
     project_id: &ProjectId,
-    scope_hash: &str,
     entry: ProjectGraphViewEntry,
     vertex_id: &str,
 ) -> Option<ResolvedGraphVertex> {
@@ -1134,25 +829,13 @@ fn resolve_vertex(
         graph_id: entry.graph_id.clone(),
         vertex_id: vertex_id.to_string(),
     };
-    let checkout_id = entry.generation.workspace_id.clone();
-    let canonical_ref = match checkout_id.as_ref() {
-        Some(checkout) => EntityRef::ProvisionalProjectGraphVertex {
-            scope_hash: scope_hash.to_string(),
-            checkout_id: checkout.to_string(),
-            graph_id: entry.graph_id.clone(),
-            vertex_id: vertex_id.to_string(),
-        },
-        None => logical_ref.clone(),
-    };
     Some(ResolvedGraphVertex {
-        canonical_ref,
+        canonical_ref: logical_ref.clone(),
         logical_ref,
         project_id: project_id.clone(),
         graph_id: entry.graph_id,
         vertex,
         generation: entry.generation,
-        provisional: checkout_id.is_some(),
-        checkout_id,
         graph,
     })
 }
@@ -1160,23 +843,10 @@ fn resolve_vertex(
 pub(crate) fn graph_neighborhood(
     resolved: &ResolvedGraphVertex,
 ) -> (Vec<(String, EntityRef)>, Vec<(String, EntityRef)>) {
-    let make_ref = |id: &str| match &resolved.canonical_ref {
-        EntityRef::ProvisionalProjectGraphVertex {
-            scope_hash,
-            checkout_id,
-            graph_id,
-            ..
-        } => EntityRef::ProvisionalProjectGraphVertex {
-            scope_hash: scope_hash.clone(),
-            checkout_id: checkout_id.clone(),
-            graph_id: graph_id.clone(),
-            vertex_id: id.to_string(),
-        },
-        _ => EntityRef::ProjectGraphVertex {
-            project_id: resolved.project_id.to_string(),
-            graph_id: resolved.graph_id.clone(),
-            vertex_id: id.to_string(),
-        },
+    let make_ref = |id: &str| EntityRef::ProjectGraphVertex {
+        project_id: resolved.project_id.to_string(),
+        graph_id: resolved.graph_id.clone(),
+        vertex_id: id.to_string(),
     };
     let forward = resolved
         .graph
@@ -1214,11 +884,7 @@ fn graph_retrieval_participation(
     let embeddings_enabled = graph
         .map(|graph| graph.schema.index_policy.embeddings_enabled)
         .unwrap_or(false);
-    // Published plane only: provisional overlays never embed in this
-    // milestone, so a provisional entry reports zero eligible rather than
-    // a phantom backlog.
     let projections = graph
-        .filter(|_| entry.generation.workspace_id.is_none())
         .map(|graph| bbox_project_graph::graph_embed_projections(graph))
         .unwrap_or_default();
     let mut embedded_vertex_count = Some(0usize);
@@ -1268,11 +934,6 @@ fn summary(entry: ProjectGraphViewEntry) -> GraphSummary {
             ProjectGraphValidity::Invalid { .. } => "invalid",
         },
         source,
-        checkout_id: entry
-            .generation
-            .workspace_id
-            .as_ref()
-            .map(ToString::to_string),
         vertex_count: entry.graph().map(|graph| graph.vertices.len()).unwrap_or(0),
         edge_count: entry.graph().map(|graph| graph.edges.len()).unwrap_or(0),
         authored_vertex_count: entry
@@ -1301,22 +962,14 @@ fn schema_summary(graph: &GraphGeneration) -> GraphSchemaSummary {
 /// removed, republished, or flipped valid/invalid changes the stamp, so a
 /// nonzero list offset carried across a view change refuses instead of
 /// paging a silently different inventory.
-fn graph_view_stamp(
-    project_id: &ProjectId,
-    mode: ProvisionalMode,
-    summaries: &[GraphSummary],
-) -> String {
+fn graph_view_stamp(project_id: &ProjectId, summaries: &[GraphSummary]) -> String {
     let mut hash = Sha256::new();
     hash.update(project_id.as_str().as_bytes());
-    hash.update([0]);
-    hash.update(mode_name(mode).as_bytes());
     hash.update([0]);
     for item in summaries {
         hash.update(item.graph_id.as_bytes());
         hash.update([0]);
         hash.update(item.source.as_bytes());
-        hash.update([0]);
-        hash.update(item.checkout_id.as_deref().unwrap_or("").as_bytes());
         hash.update([0]);
         hash.update(item.status.as_bytes());
         hash.update([0]);
@@ -1332,14 +985,11 @@ fn graph_view_stamp(
 /// continuation refuses instead of paging a silently different variant set.
 fn graph_variant_stamp(
     project_id: &ProjectId,
-    mode: ProvisionalMode,
     graph_id: &str,
     descriptions: &[GraphDescription],
 ) -> Result<String> {
     let mut hash = Sha256::new();
     hash.update(project_id.as_str().as_bytes());
-    hash.update([0]);
-    hash.update(mode_name(mode).as_bytes());
     hash.update([0]);
     hash.update(graph_id.as_bytes());
     hash.update([0]);
@@ -1354,27 +1004,20 @@ fn graph_variant_stamp(
 /// error pages refuse continuation when the selected variant, its graph, or
 /// its errors changed. The generation content hash alone is not enough: it
 /// names the accepted bytes, while this stamp also commits to the variant's
-/// authority plane, checkout identity, and the exact error rows a page walk
-/// is sampling.
+/// authority plane and the exact error rows a page walk is sampling.
 fn graph_error_stamp(
     project_id: &ProjectId,
-    mode: ProvisionalMode,
     graph_id: &str,
     source: &str,
-    checkout_id: Option<&str>,
     content_hash: &str,
     errors: &[Value],
 ) -> Result<String> {
     let mut hash = Sha256::new();
     hash.update(project_id.as_str().as_bytes());
     hash.update([0]);
-    hash.update(mode_name(mode).as_bytes());
-    hash.update([0]);
     hash.update(graph_id.as_bytes());
     hash.update([0]);
     hash.update(source.as_bytes());
-    hash.update([0]);
-    hash.update(checkout_id.unwrap_or("").as_bytes());
     hash.update([0]);
     hash.update(content_hash.as_bytes());
     hash.update([0]);
@@ -1385,14 +1028,12 @@ fn graph_error_stamp(
     Ok(format!("{:x}", hash.finalize()))
 }
 
-/// The read-plane authority label for one graph. Three values, one per
-/// authority plane: `published` for accepted project-authored facts,
-/// `provisional` for a checkout's own uncommitted graph, and `connector` for a
-/// connector-managed source projection, which no checkout lane can author.
+/// The read-plane authority label for one graph: `published` for accepted
+/// project-authored facts and `connector` for a connector-managed source
+/// projection, which no checkout lane can author.
 fn source_label(entry: &ProjectGraphViewEntry) -> &'static str {
     match entry.graph() {
         Some(graph) if graph.descriptor.authority == GraphAuthority::Connector => "connector",
-        _ if entry.generation.workspace_id.is_some() => "provisional",
         _ => "published",
     }
 }
@@ -1400,18 +1041,8 @@ fn source_label(entry: &ProjectGraphViewEntry) -> &'static str {
 fn resolved_source_label(resolved: &ResolvedGraphVertex) -> &'static str {
     if resolved.graph.descriptor.authority == GraphAuthority::Connector {
         "connector"
-    } else if resolved.provisional {
-        "provisional"
     } else {
         "published"
-    }
-}
-
-fn mode_name(mode: ProvisionalMode) -> &'static str {
-    match mode {
-        ProvisionalMode::Published => "published",
-        ProvisionalMode::Own => "own",
-        ProvisionalMode::All => "all",
     }
 }
 
@@ -1463,45 +1094,33 @@ mod tests {
         )
     }
 
-    fn identity(workspace: Option<&str>) -> ProjectGraphGenerationIdentity {
+    fn identity() -> ProjectGraphGenerationIdentity {
         ProjectGraphGenerationIdentity {
             accepted_generation: "1".into(),
             accepted_commit: String::new(),
             source_generation: None,
-            workspace_id: workspace.map(|id| WorkspaceId::parse(id.to_string()).unwrap()),
             content_hash: "d".repeat(64),
         }
     }
 
-    /// The read plane names three authority planes, and connector is distinct
-    /// from both project-authored ones.
+    /// The read plane names two authority planes: published project facts
+    /// and connector projections.
     #[test]
-    fn the_source_label_names_three_distinct_authority_planes() {
+    fn the_source_label_names_the_published_and_connector_planes() {
         let connector = ProjectGraphViewEntry::valid(
             "source-assets".into(),
-            identity(None),
+            identity(),
             generation(GraphAuthority::Connector, GraphSource::ConnectorManaged),
         );
         assert_eq!(source_label(&connector), "connector");
-        assert_eq!(summary(connector.clone()).source, "connector");
-        assert!(
-            summary(connector).checkout_id.is_none(),
-            "a connector projection is never checkout scoped"
-        );
+        assert_eq!(summary(connector).source, "connector");
 
         let published = ProjectGraphViewEntry::valid(
             "records".into(),
-            identity(None),
+            identity(),
             generation(GraphAuthority::Project, GraphSource::Committed),
         );
         assert_eq!(source_label(&published), "published");
-
-        let provisional = ProjectGraphViewEntry::valid(
-            "records".into(),
-            identity(Some("0123456789abcdef0123456789abcdef")),
-            generation(GraphAuthority::Project, GraphSource::Committed),
-        );
-        assert_eq!(source_label(&provisional), "provisional");
     }
 
     /// The compact describe summary names and counts the schema without
@@ -1519,7 +1138,7 @@ mod tests {
         assert!(!serialized.contains("remote_id"), "{serialized}");
     }
 
-    /// The list stamp binds project, mode, membership, and per-entry
+    /// The list stamp binds project, membership, and per-entry
     /// content: any of those changing must refuse a carried offset.
     #[test]
     fn view_stamp_binds_selection_membership_and_content() {
@@ -1528,7 +1147,6 @@ mod tests {
             graph_id: graph_id.into(),
             status: "valid",
             source: "published",
-            checkout_id: None,
             vertex_count: 1,
             edge_count: 0,
             authored_vertex_count: 1,
@@ -1538,30 +1156,14 @@ mod tests {
         let one = "1".repeat(64);
         let two = "2".repeat(64);
         let base = vec![entry("a", &one), entry("b", &two)];
-        let stamp = graph_view_stamp(&project, ProvisionalMode::Published, &base);
-        assert_eq!(
-            stamp,
-            graph_view_stamp(&project, ProvisionalMode::Published, &base)
-        );
-        assert_ne!(
-            stamp,
-            graph_view_stamp(&project, ProvisionalMode::All, &base)
-        );
+        let stamp = graph_view_stamp(&project, &base);
+        assert_eq!(stamp, graph_view_stamp(&project, &base));
         let other_project = ProjectId::parse("p_other").unwrap();
-        assert_ne!(
-            stamp,
-            graph_view_stamp(&other_project, ProvisionalMode::Published, &base)
-        );
+        assert_ne!(stamp, graph_view_stamp(&other_project, &base));
         let changed_content = vec![entry("a", &"3".repeat(64)), entry("b", &two)];
-        assert_ne!(
-            stamp,
-            graph_view_stamp(&project, ProvisionalMode::Published, &changed_content)
-        );
+        assert_ne!(stamp, graph_view_stamp(&project, &changed_content));
         let changed_membership = vec![entry("a", &one)];
-        assert_ne!(
-            stamp,
-            graph_view_stamp(&project, ProvisionalMode::Published, &changed_membership)
-        );
+        assert_ne!(stamp, graph_view_stamp(&project, &changed_membership));
     }
 
     /// The error stamp commits to the exact error rows and the selected
@@ -1573,28 +1175,10 @@ mod tests {
         let errors = vec![
             serde_json::json!({"code": "edge.missing_vertex", "file": "edges.jsonl", "line": 7, "message": "target is missing"}),
         ];
-        let stamp = graph_error_stamp(
-            &project,
-            ProvisionalMode::Own,
-            "g",
-            "provisional",
-            Some("workspace-one"),
-            &hash,
-            &errors,
-        )
-        .unwrap();
+        let stamp = graph_error_stamp(&project, "g", "published", &hash, &errors).unwrap();
         assert_eq!(
             stamp,
-            graph_error_stamp(
-                &project,
-                ProvisionalMode::Own,
-                "g",
-                "provisional",
-                Some("workspace-one"),
-                &hash,
-                &errors
-            )
-            .unwrap()
+            graph_error_stamp(&project, "g", "published", &hash, &errors).unwrap()
         );
         let changed = vec![serde_json::json!({
             "code": "edge.missing_vertex",
@@ -1604,59 +1188,17 @@ mod tests {
         })];
         assert_ne!(
             stamp,
-            graph_error_stamp(
-                &project,
-                ProvisionalMode::Own,
-                "g",
-                "provisional",
-                Some("workspace-one"),
-                &hash,
-                &changed
-            )
-            .unwrap()
+            graph_error_stamp(&project, "g", "published", &hash, &changed).unwrap()
         );
         assert_ne!(
             stamp,
-            graph_error_stamp(
-                &project,
-                ProvisionalMode::Own,
-                "g2",
-                "provisional",
-                Some("workspace-one"),
-                &hash,
-                &errors
-            )
-            .unwrap()
+            graph_error_stamp(&project, "g2", "published", &hash, &errors).unwrap()
         );
-        // Two checkouts can carry byte-identical graphs; the stamp must keep
-        // their error pages distinct so a continuation cannot cross variants.
+        // Repeating one content hash across authority planes is a hazard: the
+        // stamp stays bound to the selected plane.
         assert_ne!(
             stamp,
-            graph_error_stamp(
-                &project,
-                ProvisionalMode::Own,
-                "g",
-                "provisional",
-                Some("workspace-two"),
-                &hash,
-                &errors
-            )
-            .unwrap()
-        );
-        // Repeating one content hash across authority planes is the same
-        // hazard: the stamp stays bound to the selected plane.
-        assert_ne!(
-            stamp,
-            graph_error_stamp(
-                &project,
-                ProvisionalMode::Own,
-                "g",
-                "published",
-                None,
-                &hash,
-                &errors
-            )
-            .unwrap()
+            graph_error_stamp(&project, "g", "connector", &hash, &errors).unwrap()
         );
     }
 }

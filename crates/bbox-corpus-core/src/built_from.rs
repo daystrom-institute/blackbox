@@ -1,4 +1,4 @@
-//! Response-local provenance for mixed published and checkout-backed views.
+//! Response-local provenance for published views.
 //!
 //! These stamps describe the immutable inputs pinned while one response is
 //! assembled. They are deliberately separate from store load provenance and
@@ -19,14 +19,6 @@ pub enum BuiltFromStamp {
         published_scope: PublishedScope,
         published_ref: String,
         publisher_commit: String,
-    },
-    CheckoutOverlay {
-        published_scope: PublishedScope,
-        checkout_id: String,
-        publisher_commit: String,
-        checkout_head: String,
-        merge_base: String,
-        working_fingerprint: String,
     },
 }
 
@@ -97,24 +89,5 @@ mod tests {
         assert_eq!(first, "built_from_0");
         assert_eq!(second, first);
         assert_eq!(table.len(), 1);
-    }
-
-    #[test]
-    fn response_table_keeps_distinct_overlay_bytes_distinct() {
-        let overlay = |fingerprint: &str| BuiltFromStamp::CheckoutOverlay {
-            published_scope: scope(),
-            checkout_id: "checkout".into(),
-            publisher_commit: "abc123".into(),
-            checkout_head: "def456".into(),
-            merge_base: "abc123".into(),
-            working_fingerprint: fingerprint.into(),
-        };
-        let mut table = BuiltFromTable::default();
-
-        let clean = table.intern(overlay("clean"));
-        let dirty = table.intern(overlay("dirty"));
-
-        assert_ne!(clean, dirty);
-        assert_eq!(table.len(), 2);
     }
 }

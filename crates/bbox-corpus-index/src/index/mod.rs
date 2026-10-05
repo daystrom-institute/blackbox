@@ -143,8 +143,14 @@ pub struct FieldHandles {
     #[allow(dead_code)]
     pub entity_id: Field,
     pub logical_ref: Field,
+    /// Always `published` on documents this daemon writes. Older daemons
+    /// also wrote `provisional` documents, which search excludes and a full
+    /// rebuild drops.
     pub knowledge_visibility: Field,
     pub knowledge_scope_hash: Field,
+    /// Retired: only provisional documents carried a checkout id. The field
+    /// stays in the schema so existing indexes open unchanged.
+    #[allow(dead_code)]
     pub knowledge_checkout_id: Field,
     pub knowledge_snapshot_id: Field,
     pub parser_version: Field,
@@ -200,8 +206,7 @@ pub struct FieldHandles {
     /// describe participation report.
     pub graph_vertex_type: Field,
     pub graph_id: Field,
-    /// Read-surface authority plane label: `published` / `provisional` /
-    /// `connector`. Carries the plane so `doc_type` stays one value
+    /// Read-surface authority plane label: `published` / `connector`. Carries the plane so `doc_type` stays one value
     /// (`project_graph_vertex`) across planes.
     pub graph_source: Field,
     /// Connector plane only: the connector that manages the source graph.
@@ -1374,7 +1379,6 @@ pub const GRAPH_VERTEX_DOC_TYPE: &str = "project_graph_vertex";
 
 /// Read-plane labels stamped on `graph_source`.
 pub const GRAPH_SOURCE_PUBLISHED: &str = "published";
-pub const GRAPH_SOURCE_PROVISIONAL: &str = "provisional";
 pub const GRAPH_SOURCE_CONNECTOR: &str = "connector";
 
 pub fn build_schema() -> (Schema, FieldHandles) {

@@ -1136,3 +1136,99 @@ fn render_backups_are_bounded() {
         .count();
     assert_eq!(backups, MAX_RENDER_BACKUPS);
 }
+
+fn workspace_plan(dry_run: bool) -> ProjectRenderPlanV1 {
+    let mut plan = with_satellite(producer_plan(Some("claude"), dry_run));
+    plan.producer = None;
+    plan.workspace_id = "0123456789abcdef0123456789abcdef".into();
+    plan
+}
+
+#[test]
+fn the_render_view_is_a_fixed_published_wire_constant() {
+    let plan = workspace_plan(false);
+    let wire = serde_json::to_value(&plan).unwrap();
+    assert_eq!(wire["view"], "published");
+    for legacy in ["own", "all"] {
+        let mut stale = wire.clone();
+        stale["view"] = serde_json::json!(legacy);
+        assert!(serde_json::from_value::<ProjectRenderPlanV1>(stale).is_err());
+    }
+    let round_trip: ProjectRenderPlanV1 = serde_json::from_value(wire).unwrap();
+    assert_eq!(round_trip.view, ProjectRenderViewV1::Published);
+}
+
+#[test]
+fn a_local_overlay_replaces_adds_and_removes_rows_under_plan_authority() {
+    let plan = workspace_plan(false);
+    let mut changed = entry("leaf-inline", "LOCAL_CHANGED_MARKER");
+    changed.project = Some("/somewhere/else".into());
+    changed.project_id = Some("forged".into());
+    changed.scope = Scope::Global;
+    let added = entry("local-added", "LOCAL_ADDED_MARKER");
+    let overlaid = plan
+        .with_local_overlay([&changed, &added], ["leaf-satellite"])
+        .unwrap();
+    let ids = overlaid
+        .entries
+        .iter()
+        .map(|entry| entry.id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec!["leaf-inline", "local-added"]);
+    for entry in &overlaid.entries {
+        assert_eq!(entry.scope, Scope::Project);
+        assert_eq!(
+            entry.project.as_deref(),
+            Some(PROJECT_RENDER_TRANSPORT_SCOPE)
+        );
+        assert_eq!(entry.project_id.as_deref(), Some(PROJECT));
+    }
+    assert_eq!(overlaid.entries[0].content, "LOCAL_CHANGED_MARKER");
+    assert!(
+        producer_plan(None, false)
+            .with_local_overlay([&added], [])
+            .is_err()
+    );
+}
+
+#[test]
+fn an_overlaid_receipt_validates_by_shape_against_the_published_plan() {
+    let published = workspace_plan(false);
+    let overlay_entry = entry("local-added", "LOCAL_ADDED_MARKER");
+    let overlaid = published.with_local_overlay([&overlay_entry], []).unwrap();
+    let (_directory, root) = temp_root();
+    let mut receipt =
+        execute_workspace_render_plan(&overlaid, &root, &scope(), &overlaid.workspace_id, None)
+            .unwrap()
+            .receipt;
+    assert!(
+        fs::read_to_string(root.join("CLAUDE.md"))
+            .unwrap()
+            .contains("LOCAL_ADDED_MARKER")
+    );
+    // The published plan does not predict the overlaid bytes.
+    assert!(receipt.validate_against(&published).is_err());
+    receipt.local_overlay_sha256 = Some("a".repeat(64));
+    receipt.validate_against(&published).unwrap();
+
+    let mut malformed = receipt.clone();
+    malformed.local_overlay_sha256 = Some("not-a-digest".into());
+    assert!(malformed.validate_against(&published).is_err());
+    let mut wrong_provider = receipt.clone();
+    wrong_provider.projections[0].provider = "gemini".into();
+    assert!(wrong_provider.validate_against(&published).is_err());
+    let mut dry_run_plan = published.clone();
+    dry_run_plan.dry_run = true;
+    assert!(receipt.validate_against(&dry_run_plan).is_err());
+
+    let wire = serde_json::to_value(&receipt).unwrap();
+    assert_eq!(wire["local_overlay_sha256"], "a".repeat(64));
+    let mut published_only = receipt.clone();
+    published_only.local_overlay_sha256 = None;
+    assert!(
+        serde_json::to_value(&published_only)
+            .unwrap()
+            .get("local_overlay_sha256")
+            .is_none()
+    );
+}

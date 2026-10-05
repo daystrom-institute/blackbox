@@ -1,9 +1,13 @@
-//! Dark provisional knowledge overlays.
+//! Published knowledge snapshots and the local working-tree overlay.
 //!
-//! This module computes immutable checkout snapshots without merging them into
-//! the live knowledge store, index, render, or graph. That separation is
-//! the slice-3.3 behavior boundary: diagnostics become available while current
-//! retrieval remains unchanged until the visibility contract lands.
+//! Published snapshots come from committed trees: a publisher ref on the
+//! bridge, or exact committed sources for an accepted-publication build.
+//! Working-tree bytes are never part of a published snapshot.
+//!
+//! The local overlay is the one place uncommitted knowledge is read. A bound
+//! harness diffs its own checkout's `.bbox/knowledge` working files against
+//! the checkout's HEAD and applies the result to the published render plan
+//! it executes. Nothing here uploads, stores, or serves that overlay.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -11,37 +15,10 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use bbox_corpus_core::git;
 use bbox_corpus_core::identity::PublishedScope;
-use bbox_corpus_core::project_record::ResolvedCheckoutScope;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::knowledge::{KnowledgeEntry, Scope, StoredKnowledgeEntry};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProvisionalMode {
-    Published,
-    Own,
-    All,
-}
-
-impl ProvisionalMode {
-    pub fn parse(raw: Option<&str>, has_session_checkout: bool) -> Result<Self> {
-        match raw {
-            None if has_session_checkout => Ok(Self::Own),
-            None => Ok(Self::Published),
-            Some("published") => Ok(Self::Published),
-            Some("own") if has_session_checkout => Ok(Self::Own),
-            Some("own") => {
-                anyhow::bail!("provisional mode own requires authoritative checkout context")
-            }
-            Some("all") => Ok(Self::All),
-            Some(other) => {
-                anyhow::bail!("invalid provisional mode {other:?}; expected published, own, or all")
-            }
-        }
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct PublishedKnowledgeEntry {
@@ -142,12 +119,7 @@ pub struct PublishedKnowledgeSourceFile {
     pub source_bytes: Vec<u8>,
 }
 
-/// Immutable checkout bytes captured by the authority adapter.
-///
-/// The overlay layer deliberately cannot reopen checkout paths. Production
-/// callers build this snapshot through the checkout lease's confined,
-/// descriptor-relative reader and retain the lease until recomputation
-/// finishes. This closes the former read-dir-then-open symlink race.
+/// Working-tree knowledge bytes of one checkout, keyed by basename.
 #[derive(Debug, Clone, Default)]
 pub struct WorkingKnowledgeSnapshot {
     files: BTreeMap<String, Vec<u8>>,
@@ -164,54 +136,65 @@ impl WorkingKnowledgeSnapshot {
     pub fn empty() -> Self {
         Self::default()
     }
-}
 
-/// Immutable knowledge bytes at the verified merge base.
-///
-/// The local adapter fills this from the checkout object database. Remote
-/// transport verifies its ancestry and manifest before constructing the same
-/// type, leaving the overlay core independent of Git and host paths.
-#[derive(Debug, Clone, Default)]
-pub struct BaselineKnowledgeSnapshot {
-    files: BTreeMap<String, Vec<u8>>,
-}
-
-impl BaselineKnowledgeSnapshot {
-    pub fn new(files: BTreeMap<String, Vec<u8>>) -> Result<Self> {
-        for filename in files.keys() {
-            validate_snapshot_filename(filename, "knowledge")?;
+    /// Read the JSON members of one project's `.bbox/knowledge` directory.
+    /// Each member is opened without following a final symlink and read
+    /// under the same per-file and total bounds as a committed map. A
+    /// missing directory is an empty snapshot.
+    pub fn read_project_dir(project_root: &Path) -> Result<Self> {
+        let directory_path = project_root.join(".bbox/knowledge");
+        let Some(directory) =
+            bbox_corpus_core::json_store::NofollowDirectory::open_existing(&directory_path)?
+        else {
+            return Ok(Self::empty());
+        };
+        let mut names = Vec::new();
+        #[allow(clippy::disallowed_methods)]
+        // The harness reads its own bound checkout on a blocking task.
+        let entries = std::fs::read_dir(&directory_path)
+            .with_context(|| format!("listing {}", directory_path.display()))?;
+        for entry in entries {
+            let entry = entry?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if name.starts_with('.') || !name.ends_with(".json") {
+                continue;
+            }
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            names.push(name);
         }
-        Ok(Self { files })
+        if names.len() > MAX_LOCAL_ENTRIES {
+            anyhow::bail!("working knowledge exceeds its entry limit");
+        }
+        let mut files = BTreeMap::new();
+        let mut total_bytes = 0_usize;
+        for name in names {
+            let remaining = MAX_LOCAL_TOTAL_BYTES
+                .checked_sub(total_bytes)
+                .context("working knowledge exceeds its total byte limit")?;
+            let Some(bytes) = directory.read_regular(
+                &name,
+                MAX_LOCAL_FILE_BYTES.min(remaining),
+                "working knowledge",
+            )?
+            else {
+                continue;
+            };
+            total_bytes += bytes.len();
+            files.insert(name, bytes);
+        }
+        Self::new(files)
     }
-
-    pub fn empty() -> Self {
-        Self::default()
-    }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct OverlayKey {
-    pub published_scope: PublishedScope,
-    pub checkout_id: String,
-}
+const MAX_LOCAL_ENTRIES: usize = 100_000;
+const MAX_LOCAL_FILE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_LOCAL_TOTAL_BYTES: usize = 128 * 1024 * 1024;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OverlayStamp {
-    pub published_scope: PublishedScope,
-    pub checkout_id: String,
-    pub published_ref: String,
-    pub publisher_commit: String,
-    pub checkout_head: String,
-    pub merge_base: String,
-    pub working_fingerprint: String,
-    /// Accepted generation identity, catalog mode only. It makes overlay
-    /// invalidation explicit when published content advances without the
-    /// checkout moving. Absent on the bridge, where it is omitted from the
-    /// serialization entirely so snapshot ids stay byte-identical.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub accepted_generation: Option<String>,
-}
-
+/// One knowledge id's local change relative to the checkout's HEAD.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum OverlayValue {
@@ -222,226 +205,115 @@ pub enum OverlayValue {
     Tombstone,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OverlayStatus {
-    Valid,
-    Invalid,
-}
-
-pub const MAX_CONSECUTIVE_TRANSIENT_PRESERVATIONS: u8 = 3;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TransientPreservationOutcome {
-    Preserved { attempt: u8 },
-    Exhausted,
-    Superseded,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OverlayRecomputeErrorKind {
-    InvalidContent,
-    Transient,
-    /// The checkout cannot prove the baseline: it does not contain the
-    /// accepted commit, or the two histories share no merge base. This is a
-    /// structural authority fact, not retryable I/O noise, so it must never
-    /// be masked by preserving a prior valid snapshot (plan section 4.12).
-    BaselineUnavailable,
-}
-
-#[derive(Debug)]
-pub struct OverlayRecomputeError {
-    pub kind: OverlayRecomputeErrorKind,
-    diagnostic: String,
-}
-
-impl OverlayRecomputeError {
-    pub fn invalid_content(error: anyhow::Error) -> Self {
-        Self {
-            kind: OverlayRecomputeErrorKind::InvalidContent,
-            diagnostic: format!("{error:#}"),
-        }
-    }
-
-    pub fn transient(error: anyhow::Error) -> Self {
-        Self {
-            kind: OverlayRecomputeErrorKind::Transient,
-            diagnostic: format!("{error:#}"),
-        }
-    }
-
-    pub fn baseline_unavailable(error: anyhow::Error) -> Self {
-        Self {
-            kind: OverlayRecomputeErrorKind::BaselineUnavailable,
-            diagnostic: format!("{error:#}"),
-        }
-    }
-
-    /// True when this failure is a structural fact about authority rather
-    /// than a retryable condition. A caller must not preserve a prior
-    /// snapshot over one of these.
-    pub fn is_structural(&self) -> bool {
-        matches!(self.kind, OverlayRecomputeErrorKind::BaselineUnavailable)
-    }
-}
-
-impl std::fmt::Display for OverlayRecomputeError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.diagnostic)
-    }
-}
-
-impl std::error::Error for OverlayRecomputeError {}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OverlaySnapshot {
-    pub snapshot_id: String,
-    pub key: OverlayKey,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub stamp: Option<OverlayStamp>,
-    pub status: OverlayStatus,
-    #[serde(default)]
+/// Uncommitted knowledge of one checkout: every id whose working bytes
+/// differ from the checkout's HEAD, keyed by entry id.
+#[derive(Debug, Clone, Default)]
+pub struct LocalKnowledgeOverlay {
     pub values: BTreeMap<String, OverlayValue>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub diagnostics: Vec<String>,
 }
 
-impl OverlaySnapshot {
-    pub fn invalid(checkout: &ResolvedCheckoutScope, diagnostic: impl Into<String>) -> Self {
-        Self {
-            snapshot_id: String::new(),
-            key: OverlayKey {
-                published_scope: checkout.published_scope.clone(),
-                checkout_id: checkout.checkout_id.clone(),
-            },
-            stamp: None,
-            status: OverlayStatus::Invalid,
-            values: BTreeMap::new(),
-            diagnostics: vec![diagnostic.into()],
+impl LocalKnowledgeOverlay {
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    /// Content identity of the overlay: entry ids with their source-byte
+    /// hashes or tombstones, in id order.
+    pub fn digest(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(b"bbox-local-knowledge-overlay-v1\0");
+        for (entry_id, value) in &self.values {
+            hasher.update((entry_id.len() as u64).to_be_bytes());
+            hasher.update(entry_id.as_bytes());
+            match value {
+                OverlayValue::Upsert { content_hash, .. } => {
+                    hasher.update([1]);
+                    hasher.update((content_hash.len() as u64).to_be_bytes());
+                    hasher.update(content_hash.as_bytes());
+                }
+                OverlayValue::Tombstone => hasher.update([2]),
+            }
         }
-    }
-}
-
-#[derive(Debug, Default)]
-pub struct KnowledgeOverlayStore {
-    snapshots: BTreeMap<OverlayKey, OverlaySnapshot>,
-    requested_generations: BTreeMap<OverlayKey, u64>,
-    transient_preservations: BTreeMap<OverlayKey, u8>,
-    next_generation: u64,
-}
-
-impl KnowledgeOverlayStore {
-    /// Reserve a publication generation before doing filesystem work. A later
-    /// refresh for the same checkout invalidates older in-flight work.
-    pub fn begin_refresh(&mut self, key: OverlayKey) -> u64 {
-        self.next_generation = self
-            .next_generation
-            .checked_add(1)
-            .expect("knowledge overlay refresh generation exhausted");
-        let generation = self.next_generation;
-        self.requested_generations.insert(key, generation);
-        generation
+        hex_digest(hasher.finalize())
     }
 
-    /// Publish only when no newer refresh for this checkout was requested.
-    pub fn publish_if_latest(&mut self, generation: u64, snapshot: OverlaySnapshot) -> bool {
-        if self.requested_generations.get(&snapshot.key) != Some(&generation) {
-            return false;
-        }
-        self.transient_preservations.remove(&snapshot.key);
-        self.snapshots.insert(snapshot.key.clone(), snapshot);
-        true
-    }
-
-    /// Preserve one previously valid snapshot for a bounded transient window.
-    ///
-    /// A checkout that remains unreadable must not expose stale provisional
-    /// values forever. Successful or invalid publication resets the sequence;
-    /// callers replace the snapshot with an invalid empty value once this
-    /// method reports exhaustion.
-    pub fn preserve_transient_if_latest(
-        &mut self,
-        generation: u64,
-        mut snapshot: OverlaySnapshot,
-    ) -> TransientPreservationOutcome {
-        if self.requested_generations.get(&snapshot.key) != Some(&generation) {
-            return TransientPreservationOutcome::Superseded;
-        }
-        let attempt = self
-            .transient_preservations
-            .get(&snapshot.key)
-            .copied()
-            .unwrap_or_default()
-            .saturating_add(1);
-        if attempt > MAX_CONSECUTIVE_TRANSIENT_PRESERVATIONS {
-            return TransientPreservationOutcome::Exhausted;
-        }
-        self.transient_preservations
-            .insert(snapshot.key.clone(), attempt);
-        snapshot.diagnostics.push(format!(
-            "transient preservation attempt {attempt}/{MAX_CONSECUTIVE_TRANSIENT_PRESERVATIONS}"
-        ));
-        self.snapshots.insert(snapshot.key.clone(), snapshot);
-        TransientPreservationOutcome::Preserved { attempt }
-    }
-
-    /// Replace the complete snapshot for one checkout scope. Invalid snapshots
-    /// replace prior valid state instead of leaving stale values visible.
-    pub fn publish(&mut self, snapshot: OverlaySnapshot) {
-        let generation = self.begin_refresh(snapshot.key.clone());
-        let published = self.publish_if_latest(generation, snapshot);
-        debug_assert!(published);
-    }
-
-    pub fn get(
-        &self,
-        published_scope: &PublishedScope,
-        checkout_id: &str,
-    ) -> Option<&OverlaySnapshot> {
-        self.snapshots.get(&OverlayKey {
-            published_scope: published_scope.clone(),
-            checkout_id: checkout_id.to_string(),
+    pub fn upserts(&self) -> impl Iterator<Item = &KnowledgeEntry> {
+        self.values.values().filter_map(|value| match value {
+            OverlayValue::Upsert { entry, .. } => Some(entry.as_ref()),
+            OverlayValue::Tombstone => None,
         })
     }
 
-    pub fn snapshots(&self) -> impl Iterator<Item = &OverlaySnapshot> {
-        self.snapshots.values()
+    pub fn tombstones(&self) -> impl Iterator<Item = &str> {
+        self.values
+            .iter()
+            .filter(|(_, value)| matches!(value, OverlayValue::Tombstone))
+            .map(|(id, _)| id.as_str())
     }
+}
 
-    /// Remove one checkout scope after registry reconciliation or explicit
-    /// teardown. Provisional bytes are never retained after their checkout is
-    /// gone; the branch or live checkout is their only durable source.
-    pub fn remove(
-        &mut self,
-        published_scope: &PublishedScope,
-        checkout_id: &str,
-    ) -> Option<OverlaySnapshot> {
-        let key = OverlayKey {
-            published_scope: published_scope.clone(),
-            checkout_id: checkout_id.to_string(),
-        };
-        self.requested_generations.remove(&key);
-        self.transient_preservations.remove(&key);
-        self.snapshots.remove(&key)
-    }
+/// Diff one checkout's working knowledge against its own HEAD.
+///
+/// A checkout with no commit yet has an empty baseline. Working bytes equal
+/// to HEAD are already committed and carry no overlay value; a changed or
+/// new file is an upsert, and a file removed or retired since HEAD is a
+/// tombstone of that id.
+pub fn local_knowledge_overlay(
+    checkout_root: &Path,
+    scope: &PublishedScope,
+    working: &WorkingKnowledgeSnapshot,
+) -> Result<LocalKnowledgeOverlay> {
+    let baseline = match git::current_head(checkout_root) {
+        Some(head) => read_committed_map(checkout_root, &head, &knowledge_tree_dir(scope), None)?,
+        None => BTreeMap::new(),
+    };
+    local_overlay_from_maps(&baseline, &working.files)
+}
 
-    /// Remove every scope carried by one checkout. A monorepo checkout can
-    /// own several independently published `.bbox` roots.
-    pub fn remove_checkout(&mut self, checkout_id: &str) -> Vec<OverlaySnapshot> {
-        let keys = self
-            .snapshots
-            .keys()
-            .filter(|key| key.checkout_id == checkout_id)
-            .cloned()
-            .collect::<Vec<_>>();
-        self.requested_generations
-            .retain(|key, _| key.checkout_id != checkout_id);
-        self.transient_preservations
-            .retain(|key, _| key.checkout_id != checkout_id);
-        keys.into_iter()
-            .filter_map(|key| self.snapshots.remove(&key))
-            .collect()
+fn local_overlay_from_maps(
+    baseline: &BTreeMap<String, Vec<u8>>,
+    working: &BTreeMap<String, Vec<u8>>,
+) -> Result<LocalKnowledgeOverlay> {
+    validate_knowledge_map(working, "working")?;
+    let mut values = BTreeMap::new();
+    let paths = baseline
+        .keys()
+        .chain(working.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    for filename in paths {
+        match (baseline.get(&filename), working.get(&filename)) {
+            (Some(before), Some(after)) if before == after => {}
+            (_, Some(after)) => {
+                let stored: StoredKnowledgeEntry = serde_json::from_slice(after)
+                    .with_context(|| format!("parsing working knowledge file {filename}"))?;
+                let id = stored.id().to_string();
+                match stored.into_entry() {
+                    Some(entry) => {
+                        values.insert(
+                            id,
+                            OverlayValue::Upsert {
+                                entry: Box::new(entry),
+                                content_hash: sha256(after),
+                            },
+                        );
+                    }
+                    None => {
+                        values.insert(id, OverlayValue::Tombstone);
+                    }
+                }
+            }
+            (Some(_), None) => {
+                let id = Path::new(&filename)
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .with_context(|| format!("knowledge filename is not UTF-8: {filename}"))?;
+                values.insert(id.to_string(), OverlayValue::Tombstone);
+            }
+            (None, None) => {}
+        }
     }
+    Ok(LocalKnowledgeOverlay { values })
 }
 
 pub fn published_scope_hash(scope: &PublishedScope) -> String {
@@ -452,15 +324,6 @@ pub fn published_scope_hash(scope: &PublishedScope) -> String {
     hasher.update((scope.bbox_root_relpath().len() as u64).to_be_bytes());
     hasher.update(scope.bbox_root_relpath().as_bytes());
     hex_digest(hasher.finalize())
-}
-
-pub fn provisional_entity_ref(scope: &PublishedScope, checkout_id: &str, entry_id: &str) -> String {
-    bbox_corpus_core::entity_ref::EntityRef::ProvisionalKnowledge {
-        scope_hash: published_scope_hash(scope),
-        checkout_id: checkout_id.to_string(),
-        entry_id: entry_id.to_string(),
-    }
-    .to_string()
 }
 
 /// Load published knowledge only from the committed tree selected by the
@@ -670,350 +533,6 @@ pub fn load_published_knowledge_sources_at_commit(
     Ok(sources)
 }
 
-/// Recompute one checkout overlay. Every failure becomes an invalid empty
-/// snapshot so callers can publish it atomically and discard stale prior state.
-pub fn recompute_overlay(
-    publisher_root: &Path,
-    published_ref: &str,
-    checkout_root: &Path,
-    working: &WorkingKnowledgeSnapshot,
-    checkout: &ResolvedCheckoutScope,
-) -> OverlaySnapshot {
-    match recompute_overlay_result(
-        publisher_root,
-        published_ref,
-        checkout_root,
-        working,
-        checkout,
-    ) {
-        Ok(snapshot) => snapshot,
-        Err(err) => OverlaySnapshot::invalid(checkout, format!("{err:#}")),
-    }
-}
-
-/// Recompute one checkout overlay while preserving whether a failure came
-/// from invalid repository content or from transient Git and filesystem work.
-/// Accepted published content plus the identity that stamps it.
-///
-/// There is deliberately no publisher root and no alternate object
-/// database on this type or on the function that consumes it. Accepted
-/// publication supplies content truth and nothing else; ancestry may come
-/// only from the checkout the overlay is computed in (D-007, plan section
-/// 4.11). A caller cannot pass a peer repository here because the
-/// signature has nowhere to put one.
-#[derive(Debug, Clone, Copy)]
-pub struct CatalogOverlayPublished<'a> {
-    pub published_scope: &'a PublishedScope,
-    pub checkout_id: &'a str,
-    /// The accepted full ref, for response provenance only.
-    pub full_ref: &'a str,
-    /// Accepted commit P: the checkout must contain it.
-    pub accepted_commit: &'a str,
-    /// Accepted generation identity, so an advance invalidates overlays
-    /// even when the checkout has not moved.
-    pub accepted_generation: &'a str,
-    /// Repository-relative filename to the SHA-256 of its exact committed
-    /// bytes, projected from the accepted generation manifest. Accepted
-    /// generations record source digests, not source blobs, and identity is
-    /// all the diff needs.
-    pub published: &'a AcceptedPublishedDigests,
-}
-
-/// Catalog-mode overlay recompute (plan sections 4.11 and 6.7).
-///
-/// Published content arrives as accepted bytes; ancestry is proved inside
-/// `checkout_root` alone. Missing accepted commit P or an absent merge
-/// base is `BaselineUnavailable`: a structural statement that this
-/// checkout cannot position itself against accepted content, which a
-/// caller must surface rather than paper over with a stale snapshot.
-pub fn recompute_catalog_overlay_result(
-    published: CatalogOverlayPublished<'_>,
-    checkout_root: &Path,
-    working: &WorkingKnowledgeSnapshot,
-) -> std::result::Result<OverlaySnapshot, OverlayRecomputeError> {
-    let checkout_head = git::current_head(checkout_root)
-        .with_context(|| format!("checkout {} has no HEAD", checkout_root.display()))
-        .map_err(OverlayRecomputeError::transient)?;
-    // Containment first: without P in THIS object database there is no
-    // honest way to position the checkout against accepted content, and
-    // borrowing another repository to find one is the exact thing D-007
-    // forbids.
-    git::verify_commit_oid_with_alternate(checkout_root, published.accepted_commit, None)
-        .with_context(|| {
-            format!(
-                "checkout {} does not contain accepted commit {}",
-                checkout_root.display(),
-                published.accepted_commit
-            )
-        })
-        .map_err(OverlayRecomputeError::baseline_unavailable)?;
-    let merge_base = git::merge_base(checkout_root, &checkout_head, published.accepted_commit)
-        .with_context(|| {
-            format!(
-                "no merge base between checkout {} and accepted commit {}",
-                checkout_root.display(),
-                published.accepted_commit
-            )
-        })
-        .map_err(OverlayRecomputeError::baseline_unavailable)?;
-    let tree_dir = knowledge_tree_dir(published.published_scope);
-    // Baseline is read from the checkout at B, with no alternate.
-    let baseline = read_committed_map(checkout_root, &merge_base, &tree_dir, None)
-        .map_err(OverlayRecomputeError::transient)?;
-    let baseline =
-        BaselineKnowledgeSnapshot::new(baseline).map_err(OverlayRecomputeError::invalid_content)?;
-    recompute_catalog_overlay_from_sources(
-        published,
-        &checkout_head,
-        &merge_base,
-        &baseline,
-        working,
-    )
-}
-
-/// Compute a catalog overlay from already-verified source facts.
-///
-/// This function performs no filesystem or Git access. Both the checkout
-/// adapter and the remote source adapter converge here after acquiring and
-/// verifying the accepted generation, ancestry, baseline, and working bytes.
-pub fn recompute_catalog_overlay_from_sources(
-    published: CatalogOverlayPublished<'_>,
-    checkout_head: &str,
-    merge_base: &str,
-    baseline: &BaselineKnowledgeSnapshot,
-    working: &WorkingKnowledgeSnapshot,
-) -> std::result::Result<OverlaySnapshot, OverlayRecomputeError> {
-    let baseline = &baseline.files;
-    let working = &working.files;
-    validate_knowledge_map(baseline, "baseline").map_err(OverlayRecomputeError::invalid_content)?;
-    validate_knowledge_map(working, "working").map_err(OverlayRecomputeError::invalid_content)?;
-    let working_fingerprint = fingerprint_map(working);
-    let values = overlay_values_from_maps(&baseline, published.published, working)?;
-
-    let stamp = OverlayStamp {
-        published_scope: published.published_scope.clone(),
-        checkout_id: published.checkout_id.to_string(),
-        published_ref: published.full_ref.to_string(),
-        publisher_commit: published.accepted_commit.to_string(),
-        checkout_head: checkout_head.to_string(),
-        merge_base: merge_base.to_string(),
-        working_fingerprint,
-        accepted_generation: Some(published.accepted_generation.to_string()),
-    };
-    let snapshot_id = snapshot_id(&stamp, &values).map_err(OverlayRecomputeError::transient)?;
-    Ok(OverlaySnapshot {
-        snapshot_id,
-        key: OverlayKey {
-            published_scope: published.published_scope.clone(),
-            checkout_id: published.checkout_id.to_string(),
-        },
-        stamp: Some(stamp),
-        status: OverlayStatus::Valid,
-        values,
-        diagnostics: Vec::new(),
-    })
-}
-
-/// What the diff needs to know about published content: whether a file
-/// exists there, and whether the working bytes already equal it.
-///
-/// The bridge answers from committed bytes it read out of the publisher
-/// repository. The catalog answers from the accepted generation manifest,
-/// which records the SHA-256 of each committed source file rather than the
-/// bytes: content identity is what the diff actually needs, and hashes
-/// keep an accepted generation from having to carry every source blob.
-trait PublishedAuthority {
-    fn contains(&self, filename: &str) -> bool;
-    fn matches(&self, filename: &str, working: &[u8]) -> bool;
-}
-
-impl PublishedAuthority for BTreeMap<String, Vec<u8>> {
-    fn contains(&self, filename: &str) -> bool {
-        self.contains_key(filename)
-    }
-
-    fn matches(&self, filename: &str, working: &[u8]) -> bool {
-        self.get(filename).is_some_and(|bytes| bytes == working)
-    }
-}
-
-/// Repository-relative filename to the lowercase SHA-256 of its exact
-/// committed bytes, as recorded by an accepted generation manifest.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct AcceptedPublishedDigests(pub BTreeMap<String, String>);
-
-impl PublishedAuthority for AcceptedPublishedDigests {
-    fn contains(&self, filename: &str) -> bool {
-        self.0.contains_key(filename)
-    }
-
-    fn matches(&self, filename: &str, working: &[u8]) -> bool {
-        self.0
-            .get(filename)
-            .is_some_and(|digest| digest == &sha256(working))
-    }
-}
-
-/// The overlay diff shared by the bridge and catalog entry points.
-///
-/// Baseline comes from the checkout at the merge base, published comes
-/// from whichever authority the caller resolved, and working comes from
-/// the lease. Keeping one implementation is what makes the two entry
-/// points differ only in where published content and ancestry come from.
-fn overlay_values_from_maps(
-    baseline: &BTreeMap<String, Vec<u8>>,
-    published: &dyn PublishedAuthority,
-    working: &BTreeMap<String, Vec<u8>>,
-) -> std::result::Result<BTreeMap<String, OverlayValue>, OverlayRecomputeError> {
-    let mut paths = BTreeSet::new();
-    paths.extend(baseline.keys().cloned());
-    paths.extend(working.keys().cloned());
-    let mut values = BTreeMap::new();
-    let mut seen_ids = BTreeSet::new();
-    for filename in paths {
-        match (baseline.get(&filename), working.get(&filename)) {
-            (Some(before), Some(after)) if before == after => {}
-            (_, Some(after)) => {
-                // Equality at the pinned published ref is already integrated;
-                // suppress the provisional variant even for a cherry-pick or
-                // content-equivalent merge with different ancestry.
-                if published.matches(&filename, after) {
-                    continue;
-                }
-                let stored: StoredKnowledgeEntry = serde_json::from_slice(after)
-                    .with_context(|| format!("parsing working knowledge file {filename}"))
-                    .map_err(OverlayRecomputeError::invalid_content)?;
-                let stem = Path::new(&filename)
-                    .file_stem()
-                    .and_then(|stem| stem.to_str())
-                    .with_context(|| format!("knowledge filename is not UTF-8: {filename}"))
-                    .map_err(OverlayRecomputeError::invalid_content)?;
-                if stem != stored.id() {
-                    return Err(OverlayRecomputeError::invalid_content(anyhow::anyhow!(
-                        "knowledge filename/id mismatch: {filename} contains id {}",
-                        stored.id()
-                    )));
-                }
-                if !seen_ids.insert(stored.id().to_string()) {
-                    return Err(OverlayRecomputeError::invalid_content(anyhow::anyhow!(
-                        "duplicate knowledge id in checkout overlay: {}",
-                        stored.id()
-                    )));
-                }
-                // A retired working record is a deletion of whatever the
-                // published generation carries under this name.
-                let id = stored.id().to_string();
-                let Some(entry) = stored.into_entry() else {
-                    if published.contains(&filename) {
-                        values.insert(id, OverlayValue::Tombstone);
-                    }
-                    continue;
-                };
-                values.insert(
-                    entry.id.clone(),
-                    OverlayValue::Upsert {
-                        entry: Box::new(entry),
-                        content_hash: sha256(after),
-                    },
-                );
-            }
-            (Some(before), None) => {
-                let stem = Path::new(&filename)
-                    .file_stem()
-                    .and_then(|stem| stem.to_str())
-                    .with_context(|| format!("knowledge filename is not UTF-8: {filename}"))
-                    .map_err(OverlayRecomputeError::invalid_content)?;
-                let stored: StoredKnowledgeEntry = serde_json::from_slice(before)
-                    .with_context(|| format!("parsing baseline knowledge file {filename}"))
-                    .map_err(OverlayRecomputeError::invalid_content)?;
-                if stem != stored.id() {
-                    return Err(OverlayRecomputeError::invalid_content(anyhow::anyhow!(
-                        "baseline knowledge filename/id mismatch: {filename} contains id {}",
-                        stored.id()
-                    )));
-                }
-                if published.contains(&filename) {
-                    values.insert(stored.id().to_string(), OverlayValue::Tombstone);
-                }
-            }
-            (None, None) => {}
-        }
-    }
-    Ok(values)
-}
-pub fn recompute_overlay_result(
-    publisher_root: &Path,
-    published_ref: &str,
-    checkout_root: &Path,
-    working: &WorkingKnowledgeSnapshot,
-    checkout: &ResolvedCheckoutScope,
-) -> std::result::Result<OverlaySnapshot, OverlayRecomputeError> {
-    let publisher_commit = git::resolve_commit(publisher_root, published_ref)
-        .with_context(|| {
-            format!(
-                "published ref {published_ref} does not resolve in {}",
-                publisher_root.display()
-            )
-        })
-        .map_err(OverlayRecomputeError::transient)?;
-    let checkout_head = git::current_head(checkout_root)
-        .with_context(|| format!("checkout {} has no HEAD", checkout_root.display()))
-        .map_err(OverlayRecomputeError::transient)?;
-    let merge_base = git::merge_base_with_alternate(
-        checkout_root,
-        &checkout_head,
-        &publisher_commit,
-        Some(publisher_root),
-    )
-    .with_context(|| {
-        format!(
-            "no merge base between checkout {} and published commit {}",
-            checkout_root.display(),
-            publisher_commit
-        )
-    })
-    .map_err(OverlayRecomputeError::transient)?;
-    let tree_dir = knowledge_tree_dir(&checkout.published_scope);
-    let baseline = read_committed_map(checkout_root, &merge_base, &tree_dir, Some(publisher_root))
-        .map_err(OverlayRecomputeError::transient)?;
-    let published = read_committed_map(publisher_root, &publisher_commit, &tree_dir, None)
-        .map_err(OverlayRecomputeError::transient)?;
-    let working = &working.files;
-    validate_knowledge_map(&baseline, "baseline")
-        .map_err(OverlayRecomputeError::invalid_content)?;
-    validate_knowledge_map(&published, "published")
-        .map_err(OverlayRecomputeError::invalid_content)?;
-    validate_knowledge_map(working, "working").map_err(OverlayRecomputeError::invalid_content)?;
-    let working_fingerprint = fingerprint_map(working);
-
-    let values = overlay_values_from_maps(&baseline, &published, working)?;
-
-    let stamp = OverlayStamp {
-        published_scope: checkout.published_scope.clone(),
-        checkout_id: checkout.checkout_id.clone(),
-        published_ref: published_ref.to_string(),
-        publisher_commit,
-        checkout_head,
-        merge_base,
-        working_fingerprint,
-        // The bridge has no accepted generation; omitted from the
-        // serialization so snapshot ids are unchanged.
-        accepted_generation: None,
-    };
-    let snapshot_id = snapshot_id(&stamp, &values).map_err(OverlayRecomputeError::transient)?;
-    Ok(OverlaySnapshot {
-        snapshot_id,
-        key: OverlayKey {
-            published_scope: checkout.published_scope.clone(),
-            checkout_id: checkout.checkout_id.clone(),
-        },
-        stamp: Some(stamp),
-        status: OverlayStatus::Valid,
-        values,
-        diagnostics: Vec::new(),
-    })
-}
-
 fn validate_knowledge_map(files: &BTreeMap<String, Vec<u8>>, label: &str) -> Result<()> {
     let mut ids = BTreeSet::new();
     for (filename, bytes) in files {
@@ -1137,38 +656,6 @@ fn validate_snapshot_filename(filename: &str, label: &str) -> Result<()> {
     Ok(())
 }
 
-fn fingerprint_map(files: &BTreeMap<String, Vec<u8>>) -> String {
-    let mut hasher = Sha256::new();
-    for (path, bytes) in files {
-        hasher.update(path.as_bytes());
-        hasher.update([0]);
-        hasher.update(bytes);
-        hasher.update([0xff]);
-    }
-    hex_digest(hasher.finalize())
-}
-
-fn snapshot_id(stamp: &OverlayStamp, values: &BTreeMap<String, OverlayValue>) -> Result<String> {
-    let mut hasher = Sha256::new();
-    hasher.update(b"bbox-knowledge-overlay-v1\0");
-    hasher.update(serde_json::to_vec(stamp)?);
-    // Hash the byte-derived content hash instead of the parsed entry so a
-    // snapshot's identity follows the exact source bytes.
-    for (entry_id, value) in values {
-        hasher.update((entry_id.len() as u64).to_be_bytes());
-        hasher.update(entry_id.as_bytes());
-        match value {
-            OverlayValue::Upsert { content_hash, .. } => {
-                hasher.update([1]);
-                hasher.update((content_hash.len() as u64).to_be_bytes());
-                hasher.update(content_hash.as_bytes());
-            }
-            OverlayValue::Tombstone => hasher.update([2]),
-        }
-    }
-    Ok(hex_digest(hasher.finalize()))
-}
-
 fn sha256(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
@@ -1187,15 +674,6 @@ fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
 mod tests {
     use super::*;
     use crate::knowledge::{Category, Priority, Scope};
-
-    #[test]
-    fn explicit_own_requires_checkout_authority() {
-        assert!(ProvisionalMode::parse(Some("own"), false).is_err());
-        assert_eq!(
-            ProvisionalMode::parse(None, false).unwrap(),
-            ProvisionalMode::Published
-        );
-    }
 
     fn run(root: &Path, args: &[&str]) {
         let output = std::process::Command::new("git")
@@ -1242,23 +720,6 @@ mod tests {
         .unwrap();
     }
 
-    fn working_snapshot(root: &Path) -> WorkingKnowledgeSnapshot {
-        let dir = root.join(".bbox/knowledge");
-        let mut files = BTreeMap::new();
-        if dir.is_dir() {
-            for entry in std::fs::read_dir(dir).unwrap() {
-                let path = entry.unwrap().path();
-                if path.extension().and_then(|extension| extension.to_str()) == Some("json")
-                    && path.is_file()
-                {
-                    let filename = path.file_name().unwrap().to_str().unwrap().to_string();
-                    files.insert(filename, std::fs::read(path).unwrap());
-                }
-            }
-        }
-        WorkingKnowledgeSnapshot::new(files).unwrap()
-    }
-
     #[test]
     fn published_repo_entries_cannot_assert_global_or_catalog_scope() {
         let temp = tempfile::tempdir().unwrap();
@@ -1290,357 +751,107 @@ mod tests {
         assert_eq!(loaded.project_id, None);
     }
 
-    // ── Catalog overlay baseline path (plan section 13.4) ────────────
-
-    /// The catalog entry point takes accepted content, a checkout, and a
-    /// working snapshot. Nothing else. A publisher root or alternate
-    /// object database has nowhere to go, so borrowed ancestry is a
-    /// compile error rather than a review question (plan section 4.11).
-    const _CATALOG_ENTRY_POINT_TAKES_NO_PUBLISHER_ROOT: fn(
-        CatalogOverlayPublished<'_>,
-        &Path,
-        &WorkingKnowledgeSnapshot,
-    ) -> std::result::Result<
-        OverlaySnapshot,
-        OverlayRecomputeError,
-    > = recompute_catalog_overlay_result;
-
-    struct CatalogFixture {
-        _temp: tempfile::TempDir,
-        base: std::path::PathBuf,
-        worktree: std::path::PathBuf,
-        accepted_commit: String,
-        published: AcceptedPublishedDigests,
-        scope: PublishedScope,
+    fn committed_repo(temp: &tempfile::TempDir) -> std::path::PathBuf {
+        let root = temp.path().canonicalize().unwrap().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        run(&root, &["init", "-q", "-b", "main"]);
+        run(&root, &["config", "user.email", "t@example.com"]);
+        run(&root, &["config", "user.name", "Test"]);
+        root
     }
 
-    /// One published repository at an accepted commit, plus a worktree on
-    /// its own branch: the ordinary shape of a checkout positioning
-    /// itself against accepted content.
-    fn catalog_fixture() -> CatalogFixture {
+    #[test]
+    fn local_overlay_captures_uncommitted_upserts_and_tombstones() {
         let temp = tempfile::tempdir().unwrap();
-        let base = temp.path().join("repo");
-        std::fs::create_dir_all(&base).unwrap();
-        run(&base, &["init", "-q", "-b", "main"]);
-        run(&base, &["config", "user.email", "t@example.com"]);
-        run(&base, &["config", "user.name", "Test"]);
-        write_entry(&base, &entry("keep", "accepted"));
-        write_entry(&base, &entry("remove", "accepted"));
-        run(&base, &["add", ".bbox/knowledge"]);
-        run(&base, &["commit", "-q", "-m", "accepted"]);
-        let accepted_commit = git::current_head(&base).unwrap();
-        // Accepted published content is BYTES, captured at that commit,
-        // never re-read from a repository during recompute.
-        // The manifest records digests of the exact committed bytes.
-        let mut published = AcceptedPublishedDigests::default();
-        for id in ["keep", "remove"] {
-            published.0.insert(
-                format!("{id}.json"),
-                sha256(&std::fs::read(base.join(format!(".bbox/knowledge/{id}.json"))).unwrap()),
-            );
-        }
-        let worktree = temp.path().join("worktree");
-        run(
-            &base,
-            &[
-                "worktree",
-                "add",
-                "-q",
-                "-b",
-                "feature",
-                worktree.to_str().unwrap(),
-            ],
-        );
-        CatalogFixture {
-            _temp: temp,
-            base,
-            worktree,
-            accepted_commit,
-            published,
-            scope: PublishedScope::try_new("repo", ".").unwrap(),
-        }
-    }
-
-    impl CatalogFixture {
-        fn input(&self) -> CatalogOverlayPublished<'_> {
-            CatalogOverlayPublished {
-                published_scope: &self.scope,
-                checkout_id: "checkout-1",
-                full_ref: "refs/heads/main",
-                accepted_commit: &self.accepted_commit,
-                accepted_generation: "generation-1",
-                published: &self.published,
-            }
-        }
-
-        fn recompute(
-            &self,
-            root: &Path,
-        ) -> std::result::Result<OverlaySnapshot, OverlayRecomputeError> {
-            recompute_catalog_overlay_result(self.input(), root, &working_snapshot(root))
-        }
-    }
-
-    #[test]
-    fn catalog_overlay_diffs_the_checkout_against_accepted_content() {
-        let fixture = catalog_fixture();
-        write_entry(&fixture.worktree, &entry("keep", "changed"));
-        write_entry(&fixture.worktree, &entry("new", "untracked"));
-        std::fs::remove_file(fixture.worktree.join(".bbox/knowledge/remove.json")).unwrap();
-
-        let snapshot = fixture.recompute(&fixture.worktree).unwrap();
-        assert_eq!(snapshot.status, OverlayStatus::Valid);
-        assert!(matches!(
-            snapshot.values.get("keep"),
-            Some(OverlayValue::Upsert { .. })
-        ));
-        assert!(matches!(
-            snapshot.values.get("new"),
-            Some(OverlayValue::Upsert { .. })
-        ));
-        assert!(matches!(
-            snapshot.values.get("remove"),
-            Some(OverlayValue::Tombstone)
-        ));
-
-        let stamp = snapshot.stamp.unwrap();
-        assert_eq!(stamp.publisher_commit, fixture.accepted_commit);
-        // The baseline is the merge base inside this checkout, which for a
-        // branch off the accepted commit is the accepted commit itself.
-        assert_eq!(stamp.merge_base, fixture.accepted_commit);
-        assert_eq!(stamp.accepted_generation.as_deref(), Some("generation-1"));
-        assert_eq!(snapshot.key.checkout_id, "checkout-1");
-    }
-
-    #[test]
-    fn catalog_checkout_adapter_matches_source_neutral_core_byte_for_byte() {
-        let fixture = catalog_fixture();
-        write_entry(&fixture.worktree, &entry("keep", "changed"));
-        write_entry(&fixture.worktree, &entry("new", "untracked"));
-        std::fs::remove_file(fixture.worktree.join(".bbox/knowledge/remove.json")).unwrap();
-        let working = working_snapshot(&fixture.worktree);
-
-        let adapter =
-            recompute_catalog_overlay_result(fixture.input(), &fixture.worktree, &working).unwrap();
-        let checkout_head = git::current_head(&fixture.worktree).unwrap();
-        let merge_base =
-            git::merge_base(&fixture.worktree, &checkout_head, &fixture.accepted_commit).unwrap();
-        let baseline = read_committed_map(
-            &fixture.worktree,
-            &merge_base,
-            &knowledge_tree_dir(&fixture.scope),
-            None,
-        )
-        .unwrap();
-        let baseline = BaselineKnowledgeSnapshot::new(baseline).unwrap();
-        let direct = recompute_catalog_overlay_from_sources(
-            fixture.input(),
-            &checkout_head,
-            &merge_base,
-            &baseline,
-            &working,
-        )
-        .unwrap();
-
-        assert_eq!(
-            serde_json::to_value(adapter).unwrap(),
-            serde_json::to_value(direct).unwrap()
-        );
-    }
-
-    #[test]
-    fn catalog_overlay_suppresses_working_content_equal_to_accepted() {
-        let fixture = catalog_fixture();
-        // The checkout re-applies exactly what accepted content already
-        // holds: integrated, so no provisional variant.
-        write_entry(&fixture.worktree, &entry("keep", "accepted"));
-
-        let snapshot = fixture.recompute(&fixture.worktree).unwrap();
-        assert!(snapshot.values.is_empty(), "{:?}", snapshot.values);
-    }
-
-    #[test]
-    fn a_checkout_without_the_accepted_commit_is_structurally_unavailable() {
-        let fixture = catalog_fixture();
-        // A peer repository with its own unrelated history: it cannot
-        // contain the accepted commit, and there is no publisher root to
-        // borrow it from.
-        let peer = fixture._temp.path().join("peer");
-        std::fs::create_dir_all(&peer).unwrap();
-        run(&peer, &["init", "-q", "-b", "main"]);
-        run(&peer, &["config", "user.email", "t@example.com"]);
-        run(&peer, &["config", "user.name", "Test"]);
-        write_entry(&peer, &entry("keep", "peer"));
-        run(&peer, &["add", ".bbox/knowledge"]);
-        run(&peer, &["commit", "-q", "-m", "peer"]);
-
-        let error = fixture.recompute(&peer).unwrap_err();
-        assert_eq!(error.kind, OverlayRecomputeErrorKind::BaselineUnavailable);
-        assert!(
-            error.is_structural(),
-            "a caller must not preserve a prior snapshot over this"
-        );
-    }
-
-    #[test]
-    fn an_absent_merge_base_is_structurally_unavailable() {
-        let fixture = catalog_fixture();
-        // An orphan branch in the SAME repository: the accepted commit is
-        // present in the object database, but the two histories share no
-        // ancestor, so no baseline exists.
-        run(
-            &fixture.worktree,
-            &["checkout", "-q", "--orphan", "detached"],
-        );
-        write_entry(&fixture.worktree, &entry("keep", "orphan"));
-        run(&fixture.worktree, &["add", ".bbox/knowledge"]);
-        run(&fixture.worktree, &["commit", "-q", "-m", "orphan"]);
-
-        let error = fixture.recompute(&fixture.worktree).unwrap_err();
-        assert_eq!(error.kind, OverlayRecomputeErrorKind::BaselineUnavailable);
-        assert!(error.is_structural());
-    }
-
-    #[test]
-    fn catalog_overlay_positions_a_checkout_at_ahead_and_behind_accepted() {
-        let fixture = catalog_fixture();
-
-        // At the accepted commit: the merge base is that commit and the
-        // working tree matches accepted content.
-        let at = fixture.recompute(&fixture.worktree).unwrap();
-        assert_eq!(
-            at.stamp.as_ref().unwrap().merge_base,
-            fixture.accepted_commit
-        );
-        assert!(at.values.is_empty());
-
-        // Ahead: a new commit on the branch keeps the accepted commit as
-        // the merge base, and its committed change is still a provisional
-        // variant because accepted content has not moved.
-        write_entry(&fixture.worktree, &entry("keep", "ahead"));
-        run(&fixture.worktree, &["add", ".bbox/knowledge"]);
-        run(&fixture.worktree, &["commit", "-q", "-m", "ahead"]);
-        let ahead = fixture.recompute(&fixture.worktree).unwrap();
-        assert_eq!(
-            ahead.stamp.as_ref().unwrap().merge_base,
-            fixture.accepted_commit
-        );
-        assert!(matches!(
-            ahead.values.get("keep"),
-            Some(OverlayValue::Upsert { .. })
-        ));
-        assert_ne!(
-            ahead.stamp.as_ref().unwrap().checkout_head,
-            fixture.accepted_commit
-        );
-
-        // Behind: the base repository advances past the accepted commit,
-        // which does not move the overlay at all, because accepted content
-        // is authority and the checkout has not changed.
-        write_entry(&fixture.base, &entry("keep", "newer than accepted"));
-        run(&fixture.base, &["add", ".bbox/knowledge"]);
-        run(&fixture.base, &["commit", "-q", "-m", "past accepted"]);
-        let behind = fixture.recompute(&fixture.worktree).unwrap();
-        assert_eq!(
-            behind.stamp.as_ref().unwrap().merge_base,
-            fixture.accepted_commit
-        );
-    }
-
-    #[test]
-    fn invalid_working_content_is_content_invalid_not_structural() {
-        let fixture = catalog_fixture();
-        std::fs::write(
-            fixture.worktree.join(".bbox/knowledge/keep.json"),
-            b"{not json",
-        )
-        .unwrap();
-
-        let error = fixture.recompute(&fixture.worktree).unwrap_err();
-        assert_eq!(error.kind, OverlayRecomputeErrorKind::InvalidContent);
-        assert!(!error.is_structural());
-    }
-
-    #[test]
-    fn an_accepted_generation_change_changes_the_snapshot_identity() {
-        let fixture = catalog_fixture();
-        write_entry(&fixture.worktree, &entry("keep", "changed"));
-        let first = fixture.recompute(&fixture.worktree).unwrap();
-
-        let mut input = fixture.input();
-        input.accepted_generation = "generation-2";
-        let second = recompute_catalog_overlay_result(
-            input,
-            &fixture.worktree,
-            &working_snapshot(&fixture.worktree),
-        )
-        .unwrap();
-
-        // Same key, same values, different identity: an advance must be
-        // able to invalidate an overlay whose checkout never moved.
-        assert_eq!(first.key, second.key);
-        assert_ne!(first.snapshot_id, second.snapshot_id);
-    }
-
-    #[test]
-    fn overlay_captures_modifications_untracked_files_and_tombstones() {
-        let temp = tempfile::tempdir().unwrap();
-        let base = temp.path().join("repo");
-        std::fs::create_dir_all(&base).unwrap();
-        run(&base, &["init", "-q", "-b", "main"]);
-        run(&base, &["config", "user.email", "t@example.com"]);
-        run(&base, &["config", "user.name", "Test"]);
-        write_entry(&base, &entry("keep", "old"));
-        write_entry(&base, &entry("remove", "gone"));
-        run(&base, &["add", ".bbox/knowledge"]);
-        run(&base, &["commit", "-q", "-m", "seed"]);
-
-        let worktree = temp.path().join("worktree");
-        run(
-            &base,
-            &[
-                "worktree",
-                "add",
-                "-q",
-                "-b",
-                "feature",
-                worktree.to_str().unwrap(),
-            ],
-        );
-        write_entry(&worktree, &entry("keep", "changed"));
-        write_entry(&worktree, &entry("new", "untracked"));
-        std::fs::remove_file(worktree.join(".bbox/knowledge/remove.json")).unwrap();
+        let root = committed_repo(&temp);
+        write_entry(&root, &entry("keep", "committed"));
+        write_entry(&root, &entry("changed", "old"));
+        write_entry(&root, &entry("removed", "gone soon"));
+        run(&root, &["add", ".bbox/knowledge"]);
+        run(&root, &["commit", "-q", "-m", "seed"]);
+        write_entry(&root, &entry("changed", "new"));
+        write_entry(&root, &entry("added", "untracked"));
+        std::fs::remove_file(root.join(".bbox/knowledge/removed.json")).unwrap();
 
         let scope = PublishedScope::try_new("repo", ".").unwrap();
-        let checkout = ResolvedCheckoutScope {
-            project_id: "test-project".into(),
-            published_scope: scope,
-            checkout_id: "checkout".into(),
-            checkout_dir: worktree.to_string_lossy().into_owned(),
-            checkout_project_dir: worktree.to_string_lossy().into_owned(),
-            branch_ref: Some("refs/heads/feature".into()),
-        };
-        let working = working_snapshot(&worktree);
-        write_entry(&worktree, &entry("keep", "swapped-after-capture"));
-        let snapshot = recompute_overlay(&base, "refs/heads/main", &worktree, &working, &checkout);
-        assert_eq!(snapshot.status, OverlayStatus::Valid, "{snapshot:?}");
+        let working = WorkingKnowledgeSnapshot::read_project_dir(&root).unwrap();
+        let overlay = local_knowledge_overlay(&root, &scope, &working).unwrap();
+        assert!(!overlay.values.contains_key("keep"), "{overlay:?}");
         assert!(matches!(
-            snapshot.values.get("keep"),
+            overlay.values.get("changed"),
+            Some(OverlayValue::Upsert { entry, .. }) if entry.content == "new"
+        ));
+        assert!(matches!(
+            overlay.values.get("added"),
             Some(OverlayValue::Upsert { .. })
         ));
         assert!(matches!(
-            snapshot.values.get("new"),
-            Some(OverlayValue::Upsert { .. })
-        ));
-        assert!(matches!(
-            snapshot.values.get("remove"),
+            overlay.values.get("removed"),
             Some(OverlayValue::Tombstone)
         ));
-        assert!(matches!(
-            snapshot.values.get("keep"),
-            Some(OverlayValue::Upsert { entry, .. }) if entry.content == "changed"
-        ));
-        assert_eq!(snapshot.snapshot_id.len(), 64);
+        assert_eq!(overlay.digest().len(), 64);
+        assert_eq!(overlay.tombstones().collect::<Vec<_>>(), vec!["removed"]);
+    }
+
+    #[test]
+    fn local_overlay_is_empty_for_a_clean_or_absent_knowledge_lane() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = committed_repo(&temp);
+        let scope = PublishedScope::try_new("repo", ".").unwrap();
+        // Never provisioned: no commit and no knowledge directory.
+        let working = WorkingKnowledgeSnapshot::read_project_dir(&root).unwrap();
+        assert!(
+            local_knowledge_overlay(&root, &scope, &working)
+                .unwrap()
+                .is_empty()
+        );
+        write_entry(&root, &entry("clean", "committed"));
+        std::fs::write(root.join(".bbox/knowledge/.schema-epoch"), b"{}").unwrap();
+        run(&root, &["add", ".bbox/knowledge"]);
+        run(&root, &["commit", "-q", "-m", "seed"]);
+        let working = WorkingKnowledgeSnapshot::read_project_dir(&root).unwrap();
+        assert!(
+            local_knowledge_overlay(&root, &scope, &working)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn local_overlay_reads_a_nested_scope_and_rejects_invalid_working_records() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = committed_repo(&temp);
+        let project = root.join("svc");
+        write_entry(&project, &entry("nested", "committed"));
+        run(&root, &["add", "svc/.bbox/knowledge"]);
+        run(&root, &["commit", "-q", "-m", "seed"]);
+        let scope = PublishedScope::try_new("repo", "svc").unwrap();
+        let working = WorkingKnowledgeSnapshot::read_project_dir(&project).unwrap();
+        assert!(
+            local_knowledge_overlay(&root, &scope, &working)
+                .unwrap()
+                .is_empty()
+        );
+
+        std::fs::write(project.join(".bbox/knowledge/broken.json"), b"not json").unwrap();
+        let working = WorkingKnowledgeSnapshot::read_project_dir(&project).unwrap();
+        assert!(local_knowledge_overlay(&root, &scope, &working).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn working_snapshot_skips_symlinked_members() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        write_entry(&root, &entry("real", "content"));
+        std::fs::write(root.join("outside.json"), b"{}").unwrap();
+        std::os::unix::fs::symlink(
+            root.join("outside.json"),
+            root.join(".bbox/knowledge/linked.json"),
+        )
+        .unwrap();
+        let working = WorkingKnowledgeSnapshot::read_project_dir(&root).unwrap();
+        assert_eq!(working.files.keys().collect::<Vec<_>>(), vec!["real.json"]);
     }
 
     #[test]
@@ -1676,296 +887,6 @@ mod tests {
 
         let error = read_committed_map(&root, &commit, ".bbox/knowledge", None).unwrap_err();
         assert!(error.to_string().contains("bounded committed knowledge"));
-    }
-
-    #[test]
-    fn overlay_suppresses_content_already_at_published_ref() {
-        let temp = tempfile::tempdir().unwrap();
-        let base = temp.path().join("repo");
-        std::fs::create_dir_all(&base).unwrap();
-        run(&base, &["init", "-q", "-b", "main"]);
-        run(&base, &["config", "user.email", "t@example.com"]);
-        run(&base, &["config", "user.name", "Test"]);
-        write_entry(&base, &entry("same", "old"));
-        run(&base, &["add", ".bbox/knowledge"]);
-        run(&base, &["commit", "-q", "-m", "seed"]);
-
-        let worktree = temp.path().join("worktree");
-        run(
-            &base,
-            &[
-                "worktree",
-                "add",
-                "-q",
-                "-b",
-                "feature",
-                worktree.to_str().unwrap(),
-            ],
-        );
-        write_entry(&base, &entry("same", "promoted"));
-        run(&base, &["commit", "-q", "-am", "publish"]);
-        write_entry(&worktree, &entry("same", "promoted"));
-
-        let checkout = ResolvedCheckoutScope {
-            project_id: "test-project".into(),
-            published_scope: PublishedScope::try_new("repo", ".").unwrap(),
-            checkout_id: "checkout".into(),
-            checkout_dir: worktree.to_string_lossy().into_owned(),
-            checkout_project_dir: worktree.to_string_lossy().into_owned(),
-            branch_ref: Some("refs/heads/feature".into()),
-        };
-        let working = working_snapshot(&worktree);
-        let snapshot = recompute_overlay(&base, "refs/heads/main", &worktree, &working, &checkout);
-        assert_eq!(snapshot.status, OverlayStatus::Valid, "{snapshot:?}");
-        assert!(snapshot.values.is_empty());
-    }
-
-    #[test]
-    fn overlay_suppresses_tombstone_already_absent_at_published_ref() {
-        let temp = tempfile::tempdir().unwrap();
-        let base = temp.path().join("repo");
-        std::fs::create_dir_all(&base).unwrap();
-        run(&base, &["init", "-q", "-b", "main"]);
-        run(&base, &["config", "user.email", "t@example.com"]);
-        run(&base, &["config", "user.name", "Test"]);
-        write_entry(&base, &entry("gone", "published then removed"));
-        run(&base, &["add", ".bbox/knowledge"]);
-        run(&base, &["commit", "-q", "-m", "seed"]);
-
-        let worktree = temp.path().join("worktree");
-        run(
-            &base,
-            &[
-                "worktree",
-                "add",
-                "-q",
-                "-b",
-                "feature",
-                worktree.to_str().unwrap(),
-            ],
-        );
-        std::fs::remove_file(worktree.join(".bbox/knowledge/gone.json")).unwrap();
-        std::fs::remove_file(base.join(".bbox/knowledge/gone.json")).unwrap();
-        run(&base, &["add", ".bbox/knowledge"]);
-        run(&base, &["commit", "-q", "-m", "publish deletion"]);
-
-        let checkout = ResolvedCheckoutScope {
-            project_id: "test-project".into(),
-            published_scope: PublishedScope::try_new("repo", ".").unwrap(),
-            checkout_id: "checkout".into(),
-            checkout_dir: worktree.to_string_lossy().into_owned(),
-            checkout_project_dir: worktree.to_string_lossy().into_owned(),
-            branch_ref: Some("refs/heads/feature".into()),
-        };
-        let working = working_snapshot(&worktree);
-        let snapshot = recompute_overlay(&base, "refs/heads/main", &worktree, &working, &checkout);
-        assert_eq!(snapshot.status, OverlayStatus::Valid, "{snapshot:?}");
-        assert!(snapshot.values.is_empty(), "{snapshot:?}");
-    }
-
-    #[test]
-    fn overlay_reads_monorepo_scope_from_repo_relative_tree() {
-        let temp = tempfile::tempdir().unwrap();
-        let base = temp.path().join("repo");
-        let project = base.join("services/web");
-        std::fs::create_dir_all(&project).unwrap();
-        run(&base, &["init", "-q", "-b", "main"]);
-        run(&base, &["config", "user.email", "t@example.com"]);
-        run(&base, &["config", "user.name", "Test"]);
-        write_entry(&project, &entry("web", "old"));
-        run(&base, &["add", "services/web/.bbox/knowledge"]);
-        run(&base, &["commit", "-q", "-m", "seed"]);
-
-        let worktree = temp.path().join("worktree");
-        run(
-            &base,
-            &[
-                "worktree",
-                "add",
-                "-q",
-                "-b",
-                "feature",
-                worktree.to_str().unwrap(),
-            ],
-        );
-        let worktree_project = worktree.join("services/web");
-        write_entry(&worktree_project, &entry("web", "changed"));
-        let checkout = ResolvedCheckoutScope {
-            project_id: "test-project".into(),
-            published_scope: PublishedScope::try_new("repo", "services/web").unwrap(),
-            checkout_id: "checkout".into(),
-            checkout_dir: worktree.to_string_lossy().into_owned(),
-            checkout_project_dir: worktree_project.to_string_lossy().into_owned(),
-            branch_ref: Some("refs/heads/feature".into()),
-        };
-
-        let working = working_snapshot(&worktree_project);
-        let snapshot =
-            recompute_overlay(&project, "refs/heads/main", &worktree, &working, &checkout);
-        assert_eq!(snapshot.status, OverlayStatus::Valid, "{snapshot:?}");
-        assert!(matches!(
-            snapshot.values.get("web"),
-            Some(OverlayValue::Upsert { .. })
-        ));
-    }
-
-    #[test]
-    fn invalid_snapshot_replaces_previous_valid_state() {
-        let checkout = ResolvedCheckoutScope {
-            project_id: "test-project".into(),
-            published_scope: PublishedScope::try_new("repo", ".").unwrap(),
-            checkout_id: "checkout".into(),
-            checkout_dir: "/missing".into(),
-            checkout_project_dir: "/missing".into(),
-            branch_ref: None,
-        };
-        let mut store = KnowledgeOverlayStore::default();
-        let mut valid = OverlaySnapshot::invalid(&checkout, "first");
-        valid.status = OverlayStatus::Valid;
-        valid.values.insert("x".into(), OverlayValue::Tombstone);
-        store.publish(valid);
-        store.publish(OverlaySnapshot::invalid(&checkout, "broken"));
-        let current = store
-            .get(&checkout.published_scope, &checkout.checkout_id)
-            .unwrap();
-        assert_eq!(current.status, OverlayStatus::Invalid);
-        assert!(current.values.is_empty());
-    }
-
-    #[test]
-    fn recompute_classifies_invalid_content_separately_from_git_failures() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        let base = root.join("repo");
-        std::fs::create_dir_all(&base).unwrap();
-        run(&base, &["init", "-q", "-b", "main"]);
-        run(&base, &["config", "user.email", "test@example.com"]);
-        run(&base, &["config", "user.name", "Test"]);
-        write_entry(&base, &entry("seed", "published"));
-        run(&base, &["add", ".bbox/knowledge"]);
-        run(&base, &["commit", "-q", "-m", "seed"]);
-
-        let worktree = root.join("worktree");
-        run(
-            &base,
-            &[
-                "worktree",
-                "add",
-                "-q",
-                "-b",
-                "feature-classification",
-                worktree.to_str().unwrap(),
-            ],
-        );
-        let checkout = ResolvedCheckoutScope {
-            project_id: "test-project".into(),
-            published_scope: PublishedScope::try_new("repo", ".").unwrap(),
-            checkout_id: "checkout".into(),
-            checkout_dir: worktree.to_string_lossy().into_owned(),
-            checkout_project_dir: worktree.to_string_lossy().into_owned(),
-            branch_ref: Some("refs/heads/feature-classification".into()),
-        };
-
-        std::fs::write(worktree.join(".bbox/knowledge/broken.json"), b"{").unwrap();
-        let malformed_working = working_snapshot(&worktree);
-        let malformed = recompute_overlay_result(
-            &base,
-            "refs/heads/main",
-            &worktree,
-            &malformed_working,
-            &checkout,
-        )
-        .unwrap_err();
-        assert_eq!(malformed.kind, OverlayRecomputeErrorKind::InvalidContent);
-
-        let mut missing_checkout = checkout;
-        missing_checkout.checkout_dir = root.join("missing").to_string_lossy().into_owned();
-        missing_checkout.checkout_project_dir = missing_checkout.checkout_dir.clone();
-        let missing_root = root.join("missing");
-        let transient = recompute_overlay_result(
-            &base,
-            "refs/heads/main",
-            &missing_root,
-            &WorkingKnowledgeSnapshot::empty(),
-            &missing_checkout,
-        )
-        .unwrap_err();
-        assert_eq!(transient.kind, OverlayRecomputeErrorKind::Transient);
-    }
-
-    #[test]
-    fn stale_refresh_cannot_overwrite_newer_snapshot() {
-        let checkout = ResolvedCheckoutScope {
-            project_id: "test-project".into(),
-            published_scope: PublishedScope::try_new("repo", ".").unwrap(),
-            checkout_id: "checkout".into(),
-            checkout_dir: "/missing".into(),
-            checkout_project_dir: "/missing".into(),
-            branch_ref: None,
-        };
-        let key = OverlayKey {
-            published_scope: checkout.published_scope.clone(),
-            checkout_id: checkout.checkout_id.clone(),
-        };
-        let mut store = KnowledgeOverlayStore::default();
-        let stale = store.begin_refresh(key.clone());
-        let current = store.begin_refresh(key);
-
-        assert!(store.publish_if_latest(current, OverlaySnapshot::invalid(&checkout, "current")));
-        assert!(!store.publish_if_latest(stale, OverlaySnapshot::invalid(&checkout, "stale")));
-        assert_eq!(
-            store
-                .get(&checkout.published_scope, &checkout.checkout_id)
-                .unwrap()
-                .diagnostics,
-            ["current"]
-        );
-    }
-
-    #[test]
-    fn transient_preservation_expires_and_success_resets_the_bound() {
-        let checkout = ResolvedCheckoutScope {
-            project_id: "test-project".into(),
-            published_scope: PublishedScope::try_new("repo", ".").unwrap(),
-            checkout_id: "checkout".into(),
-            checkout_dir: "/missing".into(),
-            checkout_project_dir: "/missing".into(),
-            branch_ref: None,
-        };
-        let key = OverlayKey {
-            published_scope: checkout.published_scope.clone(),
-            checkout_id: checkout.checkout_id.clone(),
-        };
-        let prior = OverlaySnapshot {
-            snapshot_id: "prior".into(),
-            key: key.clone(),
-            stamp: None,
-            status: OverlayStatus::Valid,
-            values: BTreeMap::new(),
-            diagnostics: Vec::new(),
-        };
-        let mut store = KnowledgeOverlayStore::default();
-        store.publish(prior.clone());
-        for attempt in 1..=MAX_CONSECUTIVE_TRANSIENT_PRESERVATIONS {
-            let generation = store.begin_refresh(key.clone());
-            assert_eq!(
-                store.preserve_transient_if_latest(generation, prior.clone()),
-                TransientPreservationOutcome::Preserved { attempt }
-            );
-        }
-        let exhausted = store.begin_refresh(key.clone());
-        assert_eq!(
-            store.preserve_transient_if_latest(exhausted, prior.clone()),
-            TransientPreservationOutcome::Exhausted
-        );
-
-        let recovered = store.begin_refresh(key.clone());
-        assert!(store.publish_if_latest(recovered, prior.clone()));
-        let after_reset = store.begin_refresh(key);
-        assert_eq!(
-            store.preserve_transient_if_latest(after_reset, prior),
-            TransientPreservationOutcome::Preserved { attempt: 1 }
-        );
     }
 
     #[test]

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, OnceLock};
 
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 use rmcp::handler::server::router::tool::ToolRouter;
 use serde::Serialize;
 use tokio::sync::broadcast;
@@ -124,7 +124,7 @@ pub(crate) struct SharedState {
     /// Injected project-record authority handed to every runtime consumer that
     /// only enumerates records (index writer, index selectors, providers).
     pub(crate) records_provider: Arc<dyn bbox_corpus_core::project_record::ProjectRecordsProvider>,
-    /// Host-local discovery index for scope-aware checkout overlays.
+    /// Host-local discovery index of checkouts that carry repo-owned state.
     pub(crate) checkout_registry: Arc<RwLock<bbox_indexing::checkout_registry::CheckoutRegistry>>,
     /// Bounded, path-free evidence for every checkout lease acquisition and
     /// denial. Broker instances share this handle while authority adapters
@@ -134,9 +134,9 @@ pub(crate) struct SharedState {
     /// Single daemon-owned checkout authority. Every checkout consumer reuses
     /// this broker so counters and authority state cannot diverge per call.
     pub(crate) checkout_access: Arc<bbox_indexing::checkout_access::CheckoutAccessBroker>,
-    /// Durable operation and shadow-parity evidence for knowledge transport.
-    /// Checkout observations prove the absence of local leases; this store
-    /// proves the remote result matched its overlap reference.
+    /// Durable operation evidence for knowledge transport. Checkout
+    /// observations prove the absence of local leases; this store records
+    /// which reads were served remotely.
     pub(crate) knowledge_transport_observations:
         bbox_indexing::knowledge_transport_observations::KnowledgeTransportObservationsV1,
     /// Bound-workspace render plans this daemon issued; a confirmed issuance
@@ -144,14 +144,6 @@ pub(crate) struct SharedState {
     pub(crate) render_issuances: bbox_indexing::render_issuances::RenderIssuancesV1,
     /// Host-local symbolic branch pins defining published truth per scope.
     pub(crate) publisher_refs: RwLock<bbox_indexing::publisher::PublisherRefStore>,
-    /// Session-authorized provisional snapshots keyed by scope and checkout.
-    pub(crate) knowledge_overlays: RwLock<bbox_knowledge::overlay::KnowledgeOverlayStore>,
-    /// Gap-store provisional snapshots using the same scope and checkout keys.
-    pub(crate) gap_overlays: RwLock<bbox_gaps::overlay::GapOverlayStore>,
-    /// Serializes checkout recomputation through publication and index
-    /// convergence so an older refresh cannot finish after a newer one.
-    pub(crate) knowledge_overlay_refresh: Mutex<()>,
-    pub(crate) gap_overlay_refresh: Mutex<()>,
     /// Monotonic local migration gate. Once true, path strings remain input
     /// selectors only and can never regain project-scope authority.
     pub(crate) path_fallback_cut: AtomicBool,
@@ -190,8 +182,8 @@ pub(crate) struct SharedState {
             super::gap_view::CatalogPublishedGapCacheEntry,
         >,
     >,
-    /// Accepted project graphs plus whole-graph provisional overlays. B2 read
-    /// tools consume this source-neutral catalog without reopening transport.
+    /// Accepted project graphs and connector projections. Read tools consume
+    /// this source-neutral catalog without reopening transport.
     pub(crate) project_graph_views:
         RwLock<bbox_indexing::project_graph_view::ProjectGraphViewCatalog>,
     /// Successful publisher authority resolutions are memoized briefly.
@@ -382,46 +374,6 @@ impl SharedState {
         self.records_provider
             .records_snapshot()
             .registered_project_ids()
-    }
-
-    /// Classify one catalog Published project against its strict knowledge
-    /// transport row. Any non-`Uncovered` state remains a no-fallback
-    /// boundary; `Current` alone may serve newly selected remote state.
-    pub(crate) fn knowledge_transport_coverage_for_project(
-        &self,
-        project_id: &str,
-    ) -> anyhow::Result<
-        Option<bbox_indexing::knowledge_transport_cutover::KnowledgeTransportRuntimeCoverageV1>,
-    > {
-        let Some(store) = self.project_authority.catalog_store() else {
-            return Ok(None);
-        };
-        let project_id =
-            bbox_corpus_core::project_catalog::ProjectId::parse(project_id.to_string())?;
-        let snapshot = store.snapshot()?;
-        let Some(project) = snapshot.catalog().projects.get(&project_id) else {
-            return Ok(None);
-        };
-        if !matches!(
-            project.scope,
-            bbox_corpus_core::project_catalog::ProjectScope::Published(_)
-        ) {
-            return Ok(None);
-        }
-        let assignments = self
-            .code_sources
-            .producer_auth()
-            .repo_assignment_producers();
-        let accepted = self
-            .accepted_publications
-            .as_ref()
-            .and_then(|runtime| runtime.load_verified(&project_id).ok());
-        Ok(Some(self.knowledge_transport_cutover.classify_project(
-            snapshot.catalog(),
-            &assignments,
-            &project_id,
-            accepted.as_ref(),
-        )))
     }
 
     /// Attach the daemon read-view publisher to the index writer's commit
@@ -694,12 +646,6 @@ impl SharedState {
                 )
                 .unwrap(),
             ),
-            knowledge_overlays: RwLock::new(
-                bbox_knowledge::overlay::KnowledgeOverlayStore::default(),
-            ),
-            gap_overlays: RwLock::new(bbox_gaps::overlay::GapOverlayStore::default()),
-            knowledge_overlay_refresh: Mutex::new(()),
-            gap_overlay_refresh: Mutex::new(()),
             path_fallback_cut: AtomicBool::new(path_fallback_cut),
             knowledge_published_cache: RwLock::new(BTreeMap::new()),
             gap_published_cache: RwLock::new(BTreeMap::new()),
@@ -1077,8 +1023,8 @@ mod clause_one_exit_proof {
         let fixture = fixture_with_content();
         let (populated, recordless) = twin(&fixture);
 
-        let expected = populated.session_knowledge_view(None, None).unwrap();
-        let actual = recordless.session_knowledge_view(None, None).unwrap();
+        let expected = populated.session_knowledge_view(None).unwrap();
+        let actual = recordless.session_knowledge_view(None).unwrap();
         let ids = expected
             .knowledge
             .all_entries()
@@ -1095,8 +1041,8 @@ mod clause_one_exit_proof {
             "published knowledge must not vary with the attached-row view"
         );
 
-        let expected = populated.session_gap_view(None, None).unwrap();
-        let actual = recordless.session_gap_view(None, None).unwrap();
+        let expected = populated.session_gap_view(None).unwrap();
+        let actual = recordless.session_gap_view(None).unwrap();
         assert_eq!(
             serde_json::to_string(actual.gaps.all()).unwrap(),
             serde_json::to_string(expected.gaps.all()).unwrap(),
@@ -1362,8 +1308,8 @@ mod clause_one_exit_proof {
         executed.push("collected activation and view refresh");
 
         // The two content-domain reads, compared as structured responses.
-        let expected = populated.session_knowledge_view(None, None).unwrap();
-        let actual = recordless.session_knowledge_view(None, None).unwrap();
+        let expected = populated.session_knowledge_view(None).unwrap();
+        let actual = recordless.session_knowledge_view(None).unwrap();
         let ids = expected
             .knowledge
             .all_entries()
@@ -1380,8 +1326,8 @@ mod clause_one_exit_proof {
         );
         executed.push("published knowledge");
 
-        let expected = populated.session_gap_view(None, None).unwrap();
-        let actual = recordless.session_gap_view(None, None).unwrap();
+        let expected = populated.session_gap_view(None).unwrap();
+        let actual = recordless.session_gap_view(None).unwrap();
         assert_eq!(
             serde_json::to_string(actual.gaps.all()).unwrap(),
             serde_json::to_string(expected.gaps.all()).unwrap(),
@@ -1488,7 +1434,6 @@ mod committed_bytes_parity_tests {
         let mut gap = gap_note("gap-11111111", "title");
         gap.project = Some("/host/local/path".into());
         gap.write_dir = Some("/host/local/write".into());
-        gap.provisional_checkout_id = Some("checkout-1".into());
 
         let bytes = committed_gap_note_bytes(&gap).unwrap();
         let text = String::from_utf8(bytes.clone()).unwrap();
@@ -1498,7 +1443,6 @@ mod committed_bytes_parity_tests {
         let decoded: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert!(decoded["project"].is_null());
         assert!(decoded["write_dir"].is_null());
-        assert!(decoded["provisional_checkout_id"].is_null());
     }
 
     /// The asymmetry itself: the fixture's published source bytes must be
@@ -1837,7 +1781,6 @@ pub(crate) struct ProjectRuntimeStatus {
     pub(crate) accepted: AcceptedRuntimeView,
     pub(crate) binding: BindingRuntimeView,
     pub(crate) attachments: Vec<AttachmentCapabilityView>,
-    pub(crate) overlays: Vec<CheckoutOverlayView>,
     pub(crate) watcher: WatcherRuntimeView,
 }
 
@@ -1926,22 +1869,6 @@ pub(crate) struct AttachmentCapabilityView {
 }
 
 /// The last published overlay outcome for one checkout.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub(crate) struct CheckoutOverlayView {
-    pub(crate) checkout_id: String,
-    pub(crate) lane: &'static str,
-    pub(crate) published_scope: PublishedScopeView,
-    /// `fresh` or `unavailable`.
-    pub(crate) outcome: &'static str,
-    /// The accepted generation this overlay was computed against, when the
-    /// stamp carries one. A mismatch against the accepted content stamp is
-    /// what makes staleness explicit.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) accepted_generation: Option<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub(crate) diagnostics: Vec<String>,
-}
-
 /// Whether this process runs a watcher for the project's attachments.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct WatcherRuntimeView {
@@ -2045,7 +1972,6 @@ impl SharedState {
             },
             // Empty because unknown, never because denied.
             attachments: Vec::new(),
-            overlays: Vec::new(),
             watcher: WatcherRuntimeView {
                 watcher_running: false,
                 registered_attachments: Vec::new(),
@@ -2152,53 +2078,6 @@ impl SharedState {
             })
             .collect::<Vec<_>>();
 
-        let checkout_ids = rows
-            .iter()
-            .map(|row| row.checkout_id.as_str())
-            .collect::<std::collections::BTreeSet<_>>();
-        let mut overlays = Vec::new();
-        for snapshot in self.knowledge_overlays.read().snapshots() {
-            if !checkout_ids.contains(snapshot.key.checkout_id.as_str()) {
-                continue;
-            }
-            overlays.push(CheckoutOverlayView {
-                checkout_id: snapshot.key.checkout_id.clone(),
-                lane: "knowledge",
-                published_scope: PublishedScopeView::from_scope(&snapshot.key.published_scope),
-                outcome: match snapshot.status {
-                    bbox_knowledge::overlay::OverlayStatus::Valid => "fresh",
-                    bbox_knowledge::overlay::OverlayStatus::Invalid => "unavailable",
-                },
-                accepted_generation: snapshot
-                    .stamp
-                    .as_ref()
-                    .and_then(|stamp| stamp.accepted_generation.clone()),
-                diagnostics: snapshot.diagnostics.clone(),
-            });
-        }
-        for snapshot in self.gap_overlays.read().snapshots() {
-            if !checkout_ids.contains(snapshot.key.checkout_id.as_str()) {
-                continue;
-            }
-            overlays.push(CheckoutOverlayView {
-                checkout_id: snapshot.key.checkout_id.clone(),
-                lane: "gaps",
-                published_scope: PublishedScopeView::from_scope(&snapshot.key.published_scope),
-                outcome: match snapshot.status {
-                    bbox_gaps::overlay::GapOverlayStatus::Valid => "fresh",
-                    bbox_gaps::overlay::GapOverlayStatus::Invalid => "unavailable",
-                },
-                accepted_generation: snapshot
-                    .stamp
-                    .as_ref()
-                    .and_then(|stamp| stamp.accepted_generation.clone()),
-                diagnostics: snapshot.diagnostics.clone(),
-            });
-        }
-        overlays.sort_by(|left, right| {
-            (left.checkout_id.as_str(), left.lane).cmp(&(right.checkout_id.as_str(), right.lane))
-        });
-
         let watcher = self.watcher_runtime_view(&rows);
 
         Some(ProjectRuntimeStatus {
@@ -2208,7 +2087,6 @@ impl SharedState {
             accepted,
             binding,
             attachments,
-            overlays,
             watcher,
         })
     }
@@ -2954,7 +2832,6 @@ pub(crate) mod catalog_fixture {
             project: None,
             project_id: None,
             write_dir: None,
-            provisional_checkout_id: None,
             task_id: None,
             session_id: None,
             provider: None,
@@ -3139,18 +3016,10 @@ mod clause_two_proof_a {
         assert_denied(&server, "mutation", &text_of(&eject));
     }
 
-    /// Row 2, overlay half: `own` visibility needs `KnowledgeGapOverlayRead`
-    /// and degrades with the typed overlay error rather than serving a
-    /// snapshot it could not compute.
-    ///
-    /// The row is driven through a real session checkout on a real
-    /// attachment deliberately. Calling `own` with no session context
-    /// refuses one gate EARLIER, on missing authoritative context, and would
-    /// have made this row pass without the overlay lease ever being
-    /// attempted: a green test proving nothing about the capability it
-    /// claims to cover.
+    /// Row 2 with a session pinned to the denied checkout: the read stays
+    /// published and never asks the broker for the checkout.
     #[test]
-    fn own_overlay_degrades_without_opening_a_checkout() {
+    fn a_pinned_session_reads_published_without_opening_a_checkout() {
         let (fixture, scope, checkout) = denied_fixture();
         let server = fixture.server();
         server.set_session_checkout_for_test(
@@ -3159,26 +3028,15 @@ mod clause_two_proof_a {
             CHECKOUT_ID.into(),
             checkout.clone(),
         );
+        let before = observation_sequence(&server);
 
-        let error = server
-            .session_knowledge_view(None, Some("own"))
-            .err()
-            .expect("own cannot answer without its overlay lease");
-        let refusal = format!("{error:#}");
-
-        assert!(
-            refusal.contains("error.provisional_overlay_unavailable"),
-            "own must degrade with its typed overlay error: {refusal}"
-        );
-        assert_denied(&server, "own overlay", &refusal);
-
-        // Published content is unaffected: the accepted generation needs no
-        // checkout at all, which is the degradation the table promises.
         assert!(
             server
-                .session_knowledge_view(None, Some("published"))
+                .session_knowledge_view(None)
                 .is_ok_and(|view| !view.knowledge.all_entries().is_empty())
         );
+        assert_eq!(observation_sequence(&server), before);
+        assert_eq!(granted_leases(&server), 0);
     }
 
     /// Rows 2 (published read), 6 (plan), and the corpus half of the table:
@@ -3192,14 +3050,14 @@ mod clause_two_proof_a {
         let before = observation_sequence(&server);
 
         let knowledge = server
-            .session_knowledge_view(None, None)
+            .session_knowledge_view(None)
             .expect("published knowledge serves from accepted content");
         assert!(
             !knowledge.knowledge.all_entries().is_empty(),
             "the row is vacuous unless accepted content actually served"
         );
         let gaps = server
-            .session_gap_view(None, None)
+            .session_gap_view(None)
             .expect("published gaps serve from accepted content");
         assert!(!gaps.gaps.all().is_empty(), "accepted gaps served");
 
@@ -3303,7 +3161,7 @@ mod clause_three_exit_proof {
         let (_fixture, server) = remote_only();
 
         let knowledge = server
-            .session_knowledge_view(None, None)
+            .session_knowledge_view(None)
             .expect("published knowledge serves without any checkout");
         assert!(
             knowledge
@@ -3315,7 +3173,7 @@ mod clause_three_exit_proof {
         );
 
         let gaps = server
-            .session_gap_view(None, None)
+            .session_gap_view(None)
             .expect("published gaps serve without any checkout");
         assert!(
             gaps.gaps.all().iter().any(|gap| gap.id == "gap-11111111"),
@@ -3354,22 +3212,16 @@ mod clause_three_exit_proof {
         assert_attachment_required("catalog mutation", &text_of(&eject));
     }
 
-    /// `own` has no honest answer without a checkout of one's own, and says
-    /// so with the typed overlay code rather than serving published content
-    /// relabelled as provisional.
+    /// A project with no checkout anywhere still serves its accepted
+    /// knowledge: no read needs a checkout.
     #[test]
-    fn own_returns_provisional_overlay_unavailable() {
+    fn a_remote_only_project_serves_published_knowledge() {
         let (_fixture, server) = remote_only();
 
-        let error = server
-            .session_knowledge_view(None, Some("own"))
-            .err()
-            .expect("own cannot answer for a project with no checkout");
-
-        assert!(
-            format!("{error:#}").contains("checkout"),
-            "own degrades on the absent checkout: {error:#}"
-        );
+        let view = server
+            .session_knowledge_view(None)
+            .expect("published reads need no checkout");
+        assert!(!view.knowledge.all_entries().is_empty());
     }
 
     /// Capability status reports AVAILABILITY and invents no denial counts.
@@ -3515,7 +3367,6 @@ mod clause_three_exit_proof {
         // Everything catalog-derived is empty because it is UNKNOWN. None
         // of it is a denial; nothing was attempted (plan 4.17).
         assert!(poisoned.attachments.is_empty());
-        assert!(poisoned.overlays.is_empty());
         assert!(poisoned.watcher.capable_but_unregistered.is_empty());
         assert_eq!(
             server.state.checkout_access.health().sequence,

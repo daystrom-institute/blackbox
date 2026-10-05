@@ -50,7 +50,7 @@ fn workspace_project_render_plan(
         anyhow::bail!("project render locality requires scope=project or scope=both");
     }
 
-    let view = server.session_knowledge_view(Some(&grant.project_id), p.provisional.as_deref())?;
+    let view = server.session_knowledge_view(Some(&grant.project_id))?;
     let mut entries = view
         .items
         .iter()
@@ -74,7 +74,7 @@ fn workspace_project_render_plan(
         producer: None,
         provider: p.provider.clone(),
         dry_run: p.dry_run.unwrap_or(false),
-        view: ProjectRenderViewV1::parse(p.provisional.as_deref())?,
+        view: ProjectRenderViewV1::Published,
         requested_scope: requested_scope.to_string(),
         entries,
         diagnostics: view.diagnostics_text(),
@@ -87,7 +87,6 @@ fn workspace_project_render_plan(
             scope: Some("global".into()),
             dry_run: Some(plan.dry_run),
             global_plan: None,
-            provisional: None,
             operation: None,
             scope_project: None,
             locality: None,
@@ -257,7 +256,7 @@ impl BlackboxServer {
                         ));
                     }
                     let view = server
-                        .session_knowledge_view(Some(&project_id), p.provisional.as_deref())?;
+                        .session_knowledge_view(Some(&project_id))?;
                     p.scope_project = Some(project_id.clone());
                     let broker = &server.state.checkout_access;
                     let lease = crate::server::checkout_access::acquire_catalog_project_lease(
@@ -287,7 +286,6 @@ impl BlackboxServer {
                     }
                     let view = server.session_knowledge_view(
                         Some(&durable_scope),
-                        p.provisional.as_deref(),
                     )?;
                     let mut render = |root: &std::path::Path| {
                         p.project = Some(root.to_string_lossy().into_owned());
@@ -320,7 +318,7 @@ impl BlackboxServer {
             } else {
                 let scope_project = p.scope_project.as_deref().or(p.project.as_deref());
                 let view =
-                    server.session_knowledge_view(scope_project, p.provisional.as_deref())?;
+                    server.session_knowledge_view(scope_project)?;
                 let rendered = view.knowledge.render(&p)?;
                 if p.global_plan.is_some() {
                     // A host-applied global render plan is a JSON document the
@@ -340,7 +338,6 @@ impl BlackboxServer {
             };
             let view = server.session_knowledge_view(
                 p.scope_project.as_deref().or(p.project.as_deref()),
-                p.provisional.as_deref(),
             )?;
             match view.diagnostics_text() {
                 Some(diagnostics) => Ok(format!("{rendered}\n{diagnostics}")),
@@ -407,8 +404,6 @@ mod tests {
     use bbox_corpus_core::identity::PublishedScope;
     use bbox_corpus_core::project_record::ResolvedCheckoutScope;
     use bbox_knowledge::knowledge::{Category, KnowledgeEntry, Priority, Scope};
-    use bbox_knowledge::overlay::{OverlayKey, OverlaySnapshot, OverlayStatus, OverlayValue};
-    use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::Arc;
@@ -545,42 +540,14 @@ mod tests {
             .unwrap();
         let scope = PublishedScope::try_new(repo_id.repo_id, ".").unwrap();
         let own_id = "own-visibility";
-        let peer_id = "peer-visibility";
-        let mut own_values = BTreeMap::new();
-        own_values.insert(
-            "visible".into(),
-            OverlayValue::Upsert {
-                entry: Box::new(knowledge_entry(
-                    "visible",
-                    format!("OWN_REVIEW {}", source_file.display()),
-                )),
-                content_hash: "own-hash".into(),
-            },
+        // An uncommitted edit in the checkout itself: no read may serve it.
+        write_knowledge_entry(
+            &project,
+            &knowledge_entry(
+                "visible",
+                format!("UNCOMMITTED_REVIEW {}", source_file.display()),
+            ),
         );
-        let mut peer_values = BTreeMap::new();
-        peer_values.insert(
-            "visible".into(),
-            OverlayValue::Upsert {
-                entry: Box::new(knowledge_entry(
-                    "visible",
-                    format!("PEER_REVIEW {}", source_file.display()),
-                )),
-                content_hash: "peer-hash".into(),
-            },
-        );
-        for (checkout_id, values) in [(own_id, own_values), (peer_id, peer_values)] {
-            state.knowledge_overlays.write().publish(OverlaySnapshot {
-                snapshot_id: format!("snapshot-{checkout_id}"),
-                key: OverlayKey {
-                    published_scope: scope.clone(),
-                    checkout_id: checkout_id.into(),
-                },
-                stamp: None,
-                status: OverlayStatus::Valid,
-                values,
-                diagnostics: Vec::new(),
-            });
-        }
         let own_checkout = ResolvedCheckoutScope {
             project_id: record.project_id,
             published_scope: scope.clone(),
@@ -641,8 +608,11 @@ mod tests {
         assert_eq!(p.scope_project, None);
     }
 
+    /// A workspace-bound session's render plan carries only published
+    /// knowledge, even with an uncommitted edit in the bound checkout; the
+    /// harness overlays its own working files locally.
     #[tokio::test]
-    async fn render_locality_plan_preserves_published_own_and_all_views() {
+    async fn render_locality_plan_is_published_only_for_a_bound_workspace() {
         let temp = tempfile::tempdir().unwrap();
         let fixture = visibility_fixture(&temp);
         let workspace_id = bro_core::WorkspaceId::parse("b".repeat(32)).unwrap();
@@ -663,52 +633,39 @@ mod tests {
                 .is_ok()
         );
 
-        for (view, expected, absent) in [
-            (
-                "published",
-                vec!["PUBLISHED_REVIEW"],
-                vec!["OWN_REVIEW", "PEER_REVIEW"],
-            ),
-            (
-                "own",
-                vec!["OWN_REVIEW"],
-                vec!["PUBLISHED_REVIEW", "PEER_REVIEW"],
-            ),
-            (
-                "all",
-                vec!["PUBLISHED_REVIEW", "OWN_REVIEW", "PEER_REVIEW"],
-                vec![],
-            ),
-        ] {
-            let fetched = fetch_render_plan_for_test(
-                &fixture.server,
-                RenderParams {
-                    provider: Some("claude".into()),
-                    project: Some(BOUND_WORKSPACE_RENDER_SELECTOR.into()),
-                    scope: Some("project".into()),
-                    dry_run: Some(true),
-                    global_plan: None,
-                    provisional: Some(view.into()),
-                    operation: None,
-                    scope_project: None,
-                    locality: None,
-                },
-            )
-            .await;
-            let plan = fetched.plan;
-            assert_eq!(plan.view.as_str(), view);
-            let content = plan
-                .entries
-                .iter()
-                .map(|entry| entry.content.as_str())
-                .collect::<Vec<_>>()
-                .join("\n");
-            for marker in expected {
-                assert!(content.contains(marker), "view={view}: {content}");
-            }
-            for marker in absent {
-                assert!(!content.contains(marker), "view={view}: {content}");
-            }
+        let fetched = fetch_render_plan_for_test(
+            &fixture.server,
+            RenderParams {
+                provider: Some("claude".into()),
+                project: Some(BOUND_WORKSPACE_RENDER_SELECTOR.into()),
+                scope: Some("project".into()),
+                dry_run: Some(true),
+                global_plan: None,
+                operation: None,
+                scope_project: None,
+                locality: None,
+            },
+        )
+        .await;
+        let plan = fetched.plan;
+        assert_eq!(plan.view, ProjectRenderViewV1::Published);
+        let content = plan
+            .entries
+            .iter()
+            .map(|entry| entry.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(content.contains("PUBLISHED_REVIEW"), "{content}");
+        assert!(!content.contains("UNCOMMITTED_REVIEW"), "{content}");
+
+        for removed in ["provisional", "visibility"] {
+            let refused = serde_json::from_value::<RenderParams>(serde_json::json!({
+                "project": BOUND_WORKSPACE_RENDER_SELECTOR,
+                removed: "own",
+            }))
+            .unwrap_err()
+            .to_string();
+            assert!(refused.contains("unknown field"), "{refused}");
         }
     }
 }
@@ -997,7 +954,7 @@ mod catalog_render_tests {
         assert!(!expected.as_os_str().is_empty());
 
         let view = server
-            .session_knowledge_view(None, None)
+            .session_knowledge_view(None)
             .expect("session knowledge view");
         assert_eq!(view.knowledge.store_path(), expected.as_path());
     }
@@ -1078,7 +1035,6 @@ mod catalog_render_tests {
             .bbox_render(Parameters(RenderParams {
                 project: Some(PROJECT.into()),
                 scope: Some("project".into()),
-                provisional: Some("published".into()),
                 ..Default::default()
             }))
             .await;
@@ -1123,7 +1079,6 @@ mod catalog_render_tests {
             .bbox_render(Parameters(RenderParams {
                 project: Some(BOUND_WORKSPACE_RENDER_SELECTOR.into()),
                 scope: Some("project".into()),
-                provisional: Some("published".into()),
                 ..Default::default()
             }))
             .await;
@@ -1139,7 +1094,6 @@ mod catalog_render_tests {
                 scope: Some("project".into()),
                 dry_run: Some(false),
                 global_plan: None,
-                provisional: Some("published".into()),
                 operation: None,
                 scope_project: None,
                 locality: None,
@@ -1178,7 +1132,6 @@ mod catalog_render_tests {
                 scope: Some("project".into()),
                 dry_run: Some(false),
                 global_plan: None,
-                provisional: Some("published".into()),
                 operation: None,
                 scope_project: None,
                 locality: Some(ProjectRenderLocalityRequestV1::Complete {
@@ -1210,7 +1163,6 @@ mod catalog_render_tests {
                 scope: Some("project".into()),
                 dry_run: Some(false),
                 global_plan: None,
-                provisional: Some("published".into()),
                 operation: None,
                 scope_project: None,
                 locality: Some(ProjectRenderLocalityRequestV1::Complete {
@@ -1271,7 +1223,6 @@ mod catalog_render_tests {
                 scope: Some("project".into()),
                 dry_run: Some(false),
                 global_plan: None,
-                provisional: Some("published".into()),
                 operation: None,
                 scope_project: None,
                 locality: None,
@@ -1348,7 +1299,6 @@ mod catalog_render_tests {
             project: Some(BOUND_WORKSPACE_RENDER_SELECTOR.into()),
             scope: Some("project".into()),
             dry_run: Some(false),
-            provisional: Some("published".into()),
             ..Default::default()
         };
         let complete = |plan_sha256: &str, receipt, issued_at_ms| RenderParams {
@@ -1471,7 +1421,6 @@ mod catalog_render_tests {
                 project: Some(BOUND_WORKSPACE_RENDER_SELECTOR.into()),
                 scope: Some("project".into()),
                 dry_run: Some(true),
-                provisional: Some("published".into()),
                 ..Default::default()
             },
         )
@@ -1521,7 +1470,6 @@ mod catalog_render_tests {
             .bbox_render(Parameters(RenderParams {
                 project: Some(PROJECT.into()),
                 scope: Some("project".into()),
-                provisional: Some("published".into()),
                 ..Default::default()
             }))
             .await;

@@ -3,12 +3,6 @@ use anyhow::Context;
 use crate::embed_queue;
 use crate::server::BlackboxServer;
 
-/// The view checkout-overlay index reconciliation reads: accepted content
-/// plus every checkout overlay the daemon itself observes.
-const INDEX_VIEW_WITH_OVERLAYS: &str = "all";
-/// The view accepted-publication index convergence reads.
-const INDEX_VIEW_PUBLISHED: &str = "published";
-
 impl BlackboxServer {
     pub(crate) fn sync_knowledge_entry_to_index(&self, entry_id: &str) -> anyhow::Result<()> {
         let logical_ref = crate::index::knowledge_entity_id(entry_id);
@@ -55,25 +49,6 @@ impl BlackboxServer {
         Ok(())
     }
 
-    /// Reconcile one logical ref from the overlay/publisher view without
-    /// requiring the mutable base store to contain a checkout-authored entry.
-    pub(crate) fn sync_knowledge_logical_ref_for_project(
-        &self,
-        entry_id: &str,
-        project: &str,
-    ) -> anyhow::Result<()> {
-        let logical_ref = crate::index::knowledge_entity_id(entry_id);
-        let documents = self.knowledge_documents_for_project(project, Some(&logical_ref))?;
-        enqueue_knowledge_documents(&documents);
-        self.state
-            .index_writer
-            .enqueue(crate::index::IndexWriteOp::ReplaceKnowledgeLogical {
-                logical_ref,
-                documents,
-            });
-        Ok(())
-    }
-
     /// Reconcile one complete managed scope when its pinned publisher commit
     /// moves. This removes published ids that disappeared and replaces only
     /// that scope, preserving globals and unrelated projects.
@@ -82,30 +57,9 @@ impl BlackboxServer {
         scope: &bbox_corpus_core::identity::PublishedScope,
         project: &str,
     ) -> anyhow::Result<()> {
-        self.replace_knowledge_scope_in_index(scope, project, INDEX_VIEW_WITH_OVERLAYS)
-    }
-
-    /// Reconcile one catalog project's scope from its accepted content
-    /// alone. Accepted-publication convergence uses this: it indexes what
-    /// every reader is served, and never reads peer provisional snapshots,
-    /// whose leases may have expired long before the next convergence.
-    pub(crate) fn sync_published_knowledge_scope_to_index(
-        &self,
-        scope: &bbox_corpus_core::identity::PublishedScope,
-        project: &str,
-    ) -> anyhow::Result<()> {
-        self.replace_knowledge_scope_in_index(scope, project, INDEX_VIEW_PUBLISHED)
-    }
-
-    fn replace_knowledge_scope_in_index(
-        &self,
-        scope: &bbox_corpus_core::identity::PublishedScope,
-        project: &str,
-        view: &str,
-    ) -> anyhow::Result<()> {
         let scope_hash = bbox_knowledge::overlay::published_scope_hash(scope);
         let documents = self
-            .knowledge_documents_for_view(project, None, view)?
+            .knowledge_documents_for_project(project, None)?
             .into_iter()
             .filter(|document| document.scope_hash.as_deref() == Some(scope_hash.as_str()))
             .collect::<Vec<_>>();
@@ -136,41 +90,23 @@ impl BlackboxServer {
         project: &str,
         logical_ref: Option<&str>,
     ) -> anyhow::Result<Vec<crate::index::KnowledgeIndexDocument>> {
-        self.knowledge_documents_for_view(project, logical_ref, INDEX_VIEW_WITH_OVERLAYS)
-    }
-
-    fn knowledge_documents_for_view(
-        &self,
-        project: &str,
-        logical_ref: Option<&str>,
-        view: &str,
-    ) -> anyhow::Result<Vec<crate::index::KnowledgeIndexDocument>> {
         Ok(self
-            .session_knowledge_view(Some(project), Some(view))?
+            .session_knowledge_view(Some(project))?
             .items
             .into_iter()
             .filter(|item| {
                 logical_ref.is_none_or(|logical_ref| item.metadata.logical_ref == logical_ref)
             })
-            .map(|item| {
-                let provisional = item.entity_ref.starts_with("provisional_knowledge:");
-                crate::index::KnowledgeIndexDocument {
-                    entry: item.entry,
-                    entity_id: item.entity_ref,
-                    logical_ref: item.metadata.logical_ref,
-                    visibility: if provisional {
-                        "provisional".into()
-                    } else {
-                        "published".into()
-                    },
-                    scope_hash: item
-                        .metadata
-                        .published_scope
-                        .as_ref()
-                        .map(bbox_knowledge::overlay::published_scope_hash),
-                    checkout_id: item.metadata.checkout_id,
-                    snapshot_id: item.metadata.overlay_snapshot_id,
-                }
+            .map(|item| crate::index::KnowledgeIndexDocument {
+                entry: item.entry,
+                entity_id: item.entity_ref,
+                logical_ref: item.metadata.logical_ref,
+                scope_hash: item
+                    .metadata
+                    .published_scope
+                    .as_ref()
+                    .map(bbox_knowledge::overlay::published_scope_hash),
+                snapshot_id: None,
             })
             .collect())
     }
@@ -207,16 +143,12 @@ fn enqueue_knowledge_documents(documents: &[crate::index::KnowledgeIndexDocument
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
     use std::path::Path;
     use std::process::Command;
     use std::sync::Arc;
 
     use bbox_corpus_core::identity::PublishedScope;
     use bbox_knowledge::knowledge::{Category, KnowledgeEntry, Priority, Scope};
-    use bbox_knowledge::overlay::{
-        OverlayKey, OverlaySnapshot, OverlayStatus, OverlayValue, provisional_entity_ref,
-    };
 
     use crate::server::state::SharedState;
 
@@ -265,9 +197,9 @@ mod tests {
         .unwrap();
     }
 
-    fn managed_overlay_fixture(
+    fn managed_published_fixture(
         temp: &tempfile::TempDir,
-    ) -> (BlackboxServer, PublishedScope, String, String, String) {
+    ) -> (BlackboxServer, PublishedScope, String, String) {
         let root = temp.path().canonicalize().unwrap();
         let project = root.join("repo");
         std::fs::create_dir_all(&project).unwrap();
@@ -302,31 +234,9 @@ mod tests {
             .unwrap();
         let server = BlackboxServer::new(state.clone());
         let scope = PublishedScope::try_new(repo_id.repo_id, ".").unwrap();
-        let checkout_id = "embedding-checkout";
-        let provisional = knowledge_entry("shared", "provisional embedding marker");
-        let mut values = BTreeMap::new();
-        values.insert(
-            provisional.id.clone(),
-            OverlayValue::Upsert {
-                content_hash: crate::index::knowledge_chunk_hash(&provisional),
-                entry: Box::new(provisional),
-            },
-        );
-        state.knowledge_overlays.write().publish(OverlaySnapshot {
-            snapshot_id: "embedding-snapshot".into(),
-            key: OverlayKey {
-                published_scope: scope.clone(),
-                checkout_id: checkout_id.into(),
-            },
-            stamp: None,
-            status: OverlayStatus::Valid,
-            values,
-            diagnostics: Vec::new(),
-        });
         let project = project.to_string_lossy().into_owned();
         let published_ref = crate::index::knowledge_entity_id("shared");
-        let provisional_ref = provisional_entity_ref(&scope, checkout_id, "shared");
-        (server, scope, project, published_ref, provisional_ref)
+        (server, scope, project, published_ref)
     }
 
     struct FixedProvider;
@@ -405,27 +315,9 @@ mod tests {
     }
 
     #[test]
-    fn logical_ref_sync_enqueues_exact_published_and_provisional_entities() {
-        let temp = tempfile::tempdir().unwrap();
-        let (server, _scope, project, published_ref, provisional_ref) =
-            managed_overlay_fixture(&temp);
-        let (queue, vectors) = install_isolated_knowledge_queue(&temp.path().join("vectors"));
-
-        server
-            .sync_knowledge_logical_ref_for_project("shared", &project)
-            .unwrap();
-
-        let ids = wait_for_vector_entities(&vectors, &[&published_ref, &provisional_ref]);
-        assert!(ids.contains(&published_ref), "{ids:?}");
-        assert!(ids.contains(&provisional_ref), "{ids:?}");
-        queue.shutdown();
-    }
-
-    #[test]
     fn scope_sync_enqueues_every_surviving_exact_entity() {
         let temp = tempfile::tempdir().unwrap();
-        let (server, scope, project, published_ref, provisional_ref) =
-            managed_overlay_fixture(&temp);
+        let (server, scope, project, published_ref) = managed_published_fixture(&temp);
         let survivor_ref = crate::index::knowledge_entity_id("survivor");
         let (queue, vectors) = install_isolated_knowledge_queue(&temp.path().join("vectors"));
 
@@ -433,11 +325,13 @@ mod tests {
             .sync_knowledge_scope_to_index(&scope, &project)
             .unwrap();
 
-        let ids =
-            wait_for_vector_entities(&vectors, &[&published_ref, &provisional_ref, &survivor_ref]);
+        let ids = wait_for_vector_entities(&vectors, &[&published_ref, &survivor_ref]);
         assert!(ids.contains(&published_ref), "{ids:?}");
-        assert!(ids.contains(&provisional_ref), "{ids:?}");
         assert!(ids.contains(&survivor_ref), "{ids:?}");
+        assert!(
+            ids.iter().all(|id| !id.starts_with("provisional_")),
+            "{ids:?}"
+        );
         queue.shutdown();
     }
 }

@@ -189,13 +189,14 @@ pub struct CheckoutContext {
     /// primary key and the GC identity, so it is strong-random and NOT
     /// path-derived: a replacement checkout at the same path mints a fresh one.
     /// `None` on resolutions that predate minting or when the marker could not
-    /// be written; `checkout_dir` remains the transitional fallback until the
-    /// overlay consumes this (design §3.2). Host-local — never travels.
+    /// be written; `checkout_dir` remains the transitional fallback (design
+    /// §3.2). Host-local — never travels.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkout_id: Option<String>,
 }
 
-/// Scope-aware checkout descriptor consumed by the provisional overlay.
+/// Scope-aware checkout descriptor for checkout-targeted writes and
+/// registration.
 /// Paths are host-local; `published_scope` and `checkout_id` are the stable
 /// keys. The checkout top owns the reuse-safe marker while
 /// `checkout_project_dir` projects a monorepo subproject into that checkout.

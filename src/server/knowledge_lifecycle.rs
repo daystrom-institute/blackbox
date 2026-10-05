@@ -11,7 +11,7 @@ use bbox_indexing::checkout_registry::{
 use bbox_knowledge::knowledge::{KnowledgeEntry, Scope};
 use bbox_knowledge::repo_io::KnowledgeRepoCarrier;
 
-use super::{BlackboxServer, KnowledgeOverlayRefreshOutcome};
+use super::BlackboxServer;
 
 #[derive(Debug, Default)]
 pub(crate) struct KnowledgeCheckoutReconcileReport {
@@ -397,34 +397,6 @@ impl BlackboxServer {
         )
     }
 
-    pub(crate) fn acquire_authorized_overlay_access(
-        &self,
-        publisher: &AuthorizedPublisher,
-        checkout: &ResolvedCheckoutScope,
-    ) -> Result<(
-        bbox_indexing::checkout_access::ValidatedCheckoutLease,
-        bbox_indexing::checkout_access::ValidatedCheckoutLease,
-    )> {
-        let publisher_lease = self.acquire_authorized_publisher_lease(publisher)?;
-        let checkout_lease = self
-            .state
-            .checkout_access
-            .acquire(bbox_indexing::checkout_access::CheckoutAccessRequest {
-                project_id: checkout.project_id.clone(),
-                attachment:
-                    bbox_indexing::checkout_access::CheckoutAttachmentSelector::CheckoutId(
-                        checkout.checkout_id.clone(),
-                    ),
-                expected_scope: Some(checkout.published_scope.clone()),
-                kind: bbox_indexing::checkout_access::CheckoutAccessKind::KnowledgeGapOverlayRead,
-                intent: bbox_indexing::checkout_access::CheckoutAccessIntent::Read,
-                source_lane:
-                    bbox_indexing::checkout_access::CheckoutAccessSourceLane::LegacyCheckoutRegistry,
-            })
-            .map_err(anyhow::Error::new)?;
-        Ok((publisher_lease, checkout_lease))
-    }
-
     pub(crate) fn path_fallback_is_cut(&self) -> bool {
         self.state
             .path_fallback_cut
@@ -436,36 +408,25 @@ impl BlackboxServer {
         raw_ref: &str,
     ) -> Result<ExistingKnowledgeMutation> {
         let parsed = bbox_corpus_core::entity_ref::EntityRef::parse(raw_ref);
-        let (id, provisional_checkout) = match parsed {
-            Ok(bbox_corpus_core::entity_ref::EntityRef::Knowledge { id }) => (id, None),
-            Ok(bbox_corpus_core::entity_ref::EntityRef::ProvisionalKnowledge {
-                checkout_id,
-                entry_id,
-                ..
-            }) => (entry_id, Some(checkout_id)),
+        let id = match parsed {
+            Ok(bbox_corpus_core::entity_ref::EntityRef::Knowledge { id }) => id,
             Ok(other) => anyhow::bail!("knowledge mutation requires a knowledge ref, got {other}"),
-            Err(_) => (
-                raw_ref.trim_start_matches("knowledge:").trim().to_string(),
-                None,
-            ),
+            Err(_) => raw_ref.trim_start_matches("knowledge:").trim().to_string(),
         };
         if id.is_empty() {
             anyhow::bail!("knowledge entry id is required");
         }
         // Global entries live in the host store and do not depend on the
-        // session project's publisher or overlay health. Resolve them before
-        // preparing the project-scoped own view so an unrelated broken scope
-        // cannot block a global update or forget.
-        let authoritative_global = if provisional_checkout.is_none() {
-            self.state
-                .kb
-                .read()
-                .entry(&id)
-                .filter(|entry| entry.scope == Scope::Global)
-                .cloned()
-        } else {
-            None
-        };
+        // session project's publisher health. Resolve them before preparing
+        // the project-scoped view so an unrelated broken scope cannot block a
+        // global update or forget.
+        let authoritative_global = self
+            .state
+            .kb
+            .read()
+            .entry(&id)
+            .filter(|entry| entry.scope == Scope::Global)
+            .cloned();
         if let Some(entry) = authoritative_global {
             return Ok(ExistingKnowledgeMutation {
                 id,
@@ -475,9 +436,6 @@ impl BlackboxServer {
             });
         }
         let Some(checkout) = self.authoritative_session_checkout() else {
-            if provisional_checkout.is_some() {
-                anyhow::bail!("provisional knowledge mutation requires session checkout authority");
-            }
             if self.path_fallback_is_cut()
                 && self
                     .state
@@ -497,12 +455,6 @@ impl BlackboxServer {
                 checkout: None,
             });
         };
-        if provisional_checkout
-            .as_deref()
-            .is_some_and(|candidate| candidate != checkout.checkout_id)
-        {
-            anyhow::bail!("provisional knowledge ref does not belong to the session checkout");
-        }
         if self
             .state
             .knowledge_transport_cutover
@@ -523,9 +475,7 @@ impl BlackboxServer {
                 checkout.checkout_id
             );
         }
-        self.refresh_dark_knowledge_overlay(&checkout);
-        let view =
-            self.session_knowledge_view(Some(&checkout.checkout_project_dir), Some("own"))?;
+        let view = self.session_knowledge_view(Some(&checkout.checkout_project_dir))?;
         let item = view
             .items
             .into_iter()
@@ -555,15 +505,6 @@ impl BlackboxServer {
             seed: Some(item.entry),
             checkout: Some((*checkout).clone()),
         })
-    }
-
-    pub(crate) fn finish_existing_knowledge_mutation(
-        &self,
-        checkout: Option<&ResolvedCheckoutScope>,
-    ) {
-        if let Some(checkout) = checkout {
-            self.refresh_dark_knowledge_overlay(checkout);
-        }
     }
 
     pub(crate) fn recover_abandoned_dark_knowledge_transactions(&self) -> usize {
@@ -676,7 +617,7 @@ impl BlackboxServer {
     /// Persisted rows are hints only. Every row must still exist, carry the
     /// same checkout marker, pass the conservative write resolver, and resolve
     /// to its recorded published scope. Discoverable worktrees are then added
-    /// back before every surviving overlay is recomputed.
+    /// back and every surviving checkout is watched.
     pub(crate) fn reconcile_dark_knowledge_checkouts(
         &self,
     ) -> Result<KnowledgeCheckoutReconcileReport> {
@@ -733,24 +674,6 @@ impl BlackboxServer {
             .reconcile(|row| valid.contains(&registry_key(row)))?;
         drop(lifecycle);
 
-        let mut affected_scopes = BTreeSet::new();
-        {
-            let mut overlays = self.state.knowledge_overlays.write();
-            for row in &dropped {
-                if let Some(scope) = row.published_scope() {
-                    overlays.remove(&scope, &row.checkout_id);
-                    affected_scopes.insert(scope);
-                }
-            }
-        }
-        {
-            let mut overlays = self.state.gap_overlays.write();
-            for row in &dropped {
-                if let Some(scope) = row.published_scope() {
-                    overlays.remove(&scope, &row.checkout_id);
-                }
-            }
-        }
         if let Some(watcher) = self.state.bbox_watcher.lock().unwrap().as_mut() {
             for row in &dropped {
                 let Some(carrier) = stale_watch_carriers.get(&registry_key(row)).cloned() else {
@@ -877,12 +800,7 @@ impl BlackboxServer {
                 }
             }
             self.watch_resolved_dark_knowledge_checkout(&checkout);
-            self.refresh_dark_knowledge_overlay(&checkout);
-            self.refresh_dark_gap_overlay(&checkout);
             refreshed += 1;
-        }
-        for scope in affected_scopes {
-            self.reconcile_knowledge_scope_index(&scope);
         }
 
         Ok(KnowledgeCheckoutReconcileReport {
@@ -892,7 +810,7 @@ impl BlackboxServer {
         })
     }
 
-    /// Remove registry and overlay state immediately after a successful
+    /// Remove registry and watcher state immediately after a successful
     /// checkout teardown. Periodic reconciliation remains the safety net for
     /// removals performed outside the daemon closeout endpoint.
     pub(crate) fn deregister_dark_knowledge_checkout(&self, checkout_id: &str) -> Result<usize> {
@@ -944,21 +862,10 @@ impl BlackboxServer {
                 }
             }
         }
-        let mut affected_scopes = rows
+        let affected_scopes = rows
             .iter()
             .filter_map(CheckoutRow::published_scope)
             .collect::<BTreeSet<_>>();
-        for snapshot in self
-            .state
-            .knowledge_overlays
-            .write()
-            .remove_checkout(checkout_id)
-        {
-            affected_scopes.insert(snapshot.key.published_scope);
-        }
-        for snapshot in self.state.gap_overlays.write().remove_checkout(checkout_id) {
-            affected_scopes.insert(snapshot.key.published_scope);
-        }
         for scope in affected_scopes {
             // A successful closeout may have advanced the publisher ref. Drop
             // the committed-tree cache before rebuilding so promotion is
@@ -986,27 +893,8 @@ impl BlackboxServer {
         for scope in &scopes {
             self.invalidate_published_knowledge_cache(scope);
         }
-        let mut refreshed_scopes = BTreeSet::new();
-        let mut fallback_scopes = BTreeSet::new();
-        for row in rows {
-            if let Ok(Some(checkout)) = self.resolve_registered_checkout(&row) {
-                refreshed_scopes.insert(checkout.published_scope.clone());
-                let outcome = self.refresh_dark_knowledge_overlay(&checkout);
-                if matches!(
-                    outcome,
-                    KnowledgeOverlayRefreshOutcome::PreservedTransient
-                        | KnowledgeOverlayRefreshOutcome::Superseded
-                ) {
-                    fallback_scopes.insert(checkout.published_scope.clone());
-                }
-                self.refresh_dark_gap_overlay(&checkout);
-            }
-        }
-        for scope in scopes.difference(&refreshed_scopes) {
-            fallback_scopes.insert(scope.clone());
-        }
-        for scope in fallback_scopes {
-            self.reconcile_knowledge_scope_index(&scope);
+        for scope in &scopes {
+            self.reconcile_knowledge_scope_index(scope);
         }
         scopes.len()
     }
@@ -1267,7 +1155,7 @@ impl BlackboxServer {
                 tracing::warn!(
                     checkout_id = %checkout.checkout_id,
                     error = %err,
-                    "provisional knowledge watcher rejected checkout carrier"
+                    "checkout knowledge watcher rejected checkout carrier"
                 );
                 return;
             }
@@ -1282,7 +1170,7 @@ impl BlackboxServer {
                 tracing::warn!(
                     checkout_id = %checkout.checkout_id,
                     error = %err,
-                    "provisional knowledge watcher registration failed"
+                    "checkout knowledge watcher registration failed"
                 );
             }
         }
@@ -1613,7 +1501,6 @@ mod tests {
     use super::*;
     use crate::server::state::SharedState;
     use bbox_knowledge::knowledge::{Category, Priority};
-    use bbox_knowledge::overlay::{OverlayStatus, OverlayValue, provisional_entity_ref};
 
     #[test]
     fn reconciliation_deletes_only_definitively_stale_checkout_errors() {
@@ -1651,49 +1538,6 @@ mod tests {
             "git {args:?}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-    }
-
-    fn write_test_knowledge(root: &Path, id: &str, content: &str) {
-        let entry = KnowledgeEntry {
-            render_placement: Default::default(),
-            id: id.into(),
-            title: id.into(),
-            content: content.into(),
-            cluster: None,
-            category: Category::Memory,
-            scope: Scope::Project,
-            project: None,
-            project_id: None,
-            providers: Vec::new(),
-            priority: Priority::Standard,
-            render: false,
-            created_at: "2026-07-21T00:00:00Z".into(),
-            updated_at: "2026-07-21T00:00:00Z".into(),
-            recall_count: 0,
-            last_recalled: None,
-        };
-        let dir = root.join(".bbox/knowledge");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join(format!("{id}.json")),
-            serde_json::to_vec_pretty(&entry).unwrap(),
-        )
-        .unwrap();
-    }
-
-    fn indexed_entity_count(server: &BlackboxServer, entity_ref: &str) -> usize {
-        use tantivy::collector::Count;
-        use tantivy::query::TermQuery;
-        use tantivy::schema::{IndexRecordOption, Term};
-
-        let index = server.state.idx.read();
-        let reader = index.index_handle().reader().unwrap();
-        let searcher = reader.searcher();
-        let query = TermQuery::new(
-            Term::from_field_text(index.field_handles().entity_id, entity_ref),
-            IndexRecordOption::Basic,
-        );
-        searcher.search(&query, &Count).unwrap()
     }
 
     fn fixture() -> (
@@ -1815,27 +1659,10 @@ mod tests {
         assert!(registry.get(&old_worktree_id, &scope).is_none());
         assert!(registry.get(replacement_id, &scope).is_some());
         drop(registry);
-        assert!(
-            server
-                .state
-                .knowledge_overlays
-                .read()
-                .get(&scope, &old_worktree_id)
-                .is_none(),
-            "a replacement checkout cannot inherit the old overlay"
-        );
-        assert!(
-            server
-                .state
-                .knowledge_overlays
-                .read()
-                .get(&scope, replacement_id)
-                .is_some()
-        );
     }
 
     #[test]
-    fn explicit_teardown_removes_every_scope_and_overlay() {
+    fn explicit_teardown_removes_every_scope() {
         let (_temp, server, _base, worktree, scope) = fixture();
         server.reconcile_dark_knowledge_checkouts().unwrap();
         let checkout_id = bbox_corpus_core::identity::ensure_checkout_id(&worktree).unwrap();
@@ -1858,18 +1685,10 @@ mod tests {
                 .get(&checkout_id, &scope)
                 .is_none()
         );
-        assert!(
-            server
-                .state
-                .knowledge_overlays
-                .read()
-                .get(&scope, &checkout_id)
-                .is_none()
-        );
     }
 
     #[test]
-    fn global_mutations_bypass_broken_project_publisher_and_overlay() {
+    fn global_mutations_bypass_broken_project_publisher() {
         let (_temp, server, base, worktree, scope) = fixture();
         let global = KnowledgeEntry {
             render_placement: Default::default(),
@@ -1910,17 +1729,10 @@ mod tests {
             .find(|project| project.canonical_path == base.to_string_lossy())
             .unwrap()
             .project_id;
-        server.set_session_checkout_for_test(project_id, scope, "broken-overlay".into(), worktree);
-        let checkout = server.authoritative_session_checkout().unwrap();
-        server.state.knowledge_overlays.write().publish(
-            bbox_knowledge::overlay::OverlaySnapshot::invalid(
-                &checkout,
-                "deliberately broken overlay",
-            ),
-        );
+        server.set_session_checkout_for_test(project_id, scope, "broken-checkout".into(), worktree);
         assert!(
             server
-                .session_knowledge_view(Some(base.to_str().unwrap()), Some("own"))
+                .session_knowledge_view(Some(base.to_str().unwrap()))
                 .is_err(),
             "fixture must have broken project publisher authority"
         );
@@ -1969,403 +1781,6 @@ mod tests {
             "updated global content"
         );
         assert!(kb.entry("global-forget").is_none());
-    }
-
-    #[test]
-    fn closeout_refresh_recomputes_knowledge_overlay_after_publisher_advances() {
-        let (_temp, server, base, worktree, scope) = fixture();
-        server.reconcile_dark_knowledge_checkouts().unwrap();
-        let checkout_id = bbox_corpus_core::identity::ensure_checkout_id(&worktree).unwrap();
-
-        write_test_knowledge(&worktree, "closeout-refresh", "closeout convergence");
-        let row = server
-            .state
-            .checkout_registry
-            .read()
-            .get(&checkout_id, &scope)
-            .cloned()
-            .unwrap();
-        let checkout = server.resolve_registered_checkout(&row).unwrap().unwrap();
-        server.refresh_dark_knowledge_overlay(&checkout);
-        assert!(matches!(
-            server
-                .state
-                .knowledge_overlays
-                .read()
-                .get(&scope, &checkout_id)
-                .and_then(|snapshot| snapshot.values.get("closeout-refresh")),
-            Some(OverlayValue::Upsert { .. })
-        ));
-
-        git(&worktree, &["add", ".bbox/knowledge/closeout-refresh.json"]);
-        git(&worktree, &["commit", "-q", "-m", "publish knowledge"]);
-        git(&base, &["merge", "-q", "--ff-only", "bro-fleet/lifecycle"]);
-
-        assert_eq!(
-            server.refresh_published_knowledge_for_checkout(&checkout_id),
-            1
-        );
-        let refreshed = server
-            .state
-            .knowledge_overlays
-            .read()
-            .get(&scope, &checkout_id)
-            .cloned()
-            .unwrap();
-        assert_eq!(refreshed.status, OverlayStatus::Valid);
-        assert!(
-            refreshed.values.is_empty(),
-            "promoted knowledge must leave the provisional overlay immediately"
-        );
-    }
-
-    #[test]
-    fn closeout_transient_overlay_refresh_reconciles_current_publisher_index() {
-        let (_temp, server, base, worktree, scope) = fixture();
-        server.reconcile_dark_knowledge_checkouts().unwrap();
-        let checkout_id = bbox_corpus_core::identity::ensure_checkout_id(&worktree).unwrap();
-        let row = server
-            .state
-            .checkout_registry
-            .read()
-            .get(&checkout_id, &scope)
-            .cloned()
-            .unwrap();
-        let checkout = server.resolve_registered_checkout(&row).unwrap().unwrap();
-
-        write_test_knowledge(&worktree, "closeout-fallback", "CURRENT PUBLISHER FALLBACK");
-        server.refresh_dark_knowledge_overlay(&checkout);
-        git(
-            &worktree,
-            &["add", ".bbox/knowledge/closeout-fallback.json"],
-        );
-        git(&worktree, &["commit", "-q", "-m", "publish fallback"]);
-        git(&base, &["merge", "-q", "--ff-only", "bro-fleet/lifecycle"]);
-
-        let transaction_root = worktree.join(".bbox/local/knowledge-transactions");
-        std::fs::create_dir_all(&transaction_root).unwrap();
-        std::fs::write(transaction_root.join("pending.json"), b"{}").unwrap();
-        assert_eq!(
-            server.refresh_published_knowledge_for_checkout(&checkout_id),
-            1
-        );
-        server.state.index_writer.flush_blocking().unwrap();
-
-        let preserved = server
-            .state
-            .knowledge_overlays
-            .read()
-            .get(&scope, &checkout_id)
-            .cloned()
-            .unwrap();
-        assert_eq!(preserved.status, OverlayStatus::Valid);
-        assert!(
-            preserved
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.contains("refresh degraded"))
-        );
-        let hits = server
-            .state
-            .idx
-            .read()
-            .hybrid_bm25_hits("CURRENT PUBLISHER FALLBACK", 10, Some("knowledge"))
-            .unwrap();
-        assert!(
-            hits.iter().any(|hit| {
-                hit.entity_id == crate::index::knowledge_entity_id("closeout-fallback")
-            }),
-            "fallback reconcile must index the current publisher commit: {hits:?}"
-        );
-    }
-
-    #[test]
-    fn transient_refresh_preserves_valid_overlay_but_malformed_content_replaces_it() {
-        let (_temp, server, base, worktree, scope) = fixture();
-        server.reconcile_dark_knowledge_checkouts().unwrap();
-        let checkout_id = bbox_corpus_core::identity::ensure_checkout_id(&worktree).unwrap();
-        let row = server
-            .state
-            .checkout_registry
-            .read()
-            .get(&checkout_id, &scope)
-            .cloned()
-            .unwrap();
-        let checkout = server.resolve_registered_checkout(&row).unwrap().unwrap();
-        let prior = server
-            .state
-            .knowledge_overlays
-            .read()
-            .get(&scope, &checkout_id)
-            .cloned()
-            .unwrap();
-        assert_eq!(prior.status, OverlayStatus::Valid);
-
-        let lifecycle = server
-            .state
-            .checkout_access
-            .lifecycle_mutation_guard()
-            .unwrap();
-        assert_eq!(
-            server.refresh_dark_knowledge_overlay(&checkout),
-            KnowledgeOverlayRefreshOutcome::PreservedTransient
-        );
-        let preserved = server
-            .state
-            .knowledge_overlays
-            .read()
-            .get(&scope, &checkout_id)
-            .cloned()
-            .unwrap();
-        assert_eq!(preserved.status, OverlayStatus::Valid);
-        assert_eq!(preserved.snapshot_id, prior.snapshot_id);
-        assert_eq!(preserved.values.len(), prior.values.len());
-        assert!(
-            preserved
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.contains("refresh degraded"))
-        );
-        drop(lifecycle);
-        let degraded_view = server
-            .session_knowledge_view(Some(base.to_str().unwrap()), Some("all"))
-            .unwrap();
-        assert!(
-            degraded_view
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.contains("refresh degraded"))
-        );
-
-        std::fs::write(worktree.join(".bbox/knowledge/broken.json"), b"{").unwrap();
-        assert_eq!(
-            server.refresh_dark_knowledge_overlay(&checkout),
-            KnowledgeOverlayRefreshOutcome::Invalid
-        );
-        let invalid = server
-            .state
-            .knowledge_overlays
-            .read()
-            .get(&scope, &checkout_id)
-            .cloned()
-            .unwrap();
-        assert_eq!(invalid.status, OverlayStatus::Invalid);
-        assert!(invalid.values.is_empty());
-        assert!(
-            invalid
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.contains("broken.json"))
-        );
-    }
-
-    #[test]
-    fn repeated_transient_refresh_eventually_invalidates_stale_overlay() {
-        let (_temp, server, _base, worktree, scope) = fixture();
-        server.reconcile_dark_knowledge_checkouts().unwrap();
-        let checkout_id = bbox_corpus_core::identity::ensure_checkout_id(&worktree).unwrap();
-        let row = server
-            .state
-            .checkout_registry
-            .read()
-            .get(&checkout_id, &scope)
-            .cloned()
-            .unwrap();
-        let checkout = server.resolve_registered_checkout(&row).unwrap().unwrap();
-        let lifecycle = server
-            .state
-            .checkout_access
-            .lifecycle_mutation_guard()
-            .unwrap();
-
-        for _ in 0..bbox_knowledge::overlay::MAX_CONSECUTIVE_TRANSIENT_PRESERVATIONS {
-            assert_eq!(
-                server.refresh_dark_knowledge_overlay(&checkout),
-                KnowledgeOverlayRefreshOutcome::PreservedTransient
-            );
-        }
-        assert_eq!(
-            server.refresh_dark_knowledge_overlay(&checkout),
-            KnowledgeOverlayRefreshOutcome::Invalid
-        );
-        let invalid = server
-            .state
-            .knowledge_overlays
-            .read()
-            .get(&scope, &checkout_id)
-            .cloned()
-            .unwrap();
-        assert_eq!(invalid.status, OverlayStatus::Invalid);
-        assert!(invalid.values.is_empty());
-        assert!(
-            invalid
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.contains("refresh limit exceeded"))
-        );
-        drop(lifecycle);
-    }
-
-    #[test]
-    fn malformed_peer_overlay_preserves_published_knowledge_in_static_index() {
-        let (_temp, server, base, worktree, scope) = fixture();
-        server.reconcile_dark_knowledge_checkouts().unwrap();
-        let checkout_id = bbox_corpus_core::identity::ensure_checkout_id(&worktree).unwrap();
-        let row = server
-            .state
-            .checkout_registry
-            .read()
-            .get(&checkout_id, &scope)
-            .cloned()
-            .unwrap();
-        let checkout = server.resolve_registered_checkout(&row).unwrap().unwrap();
-
-        write_test_knowledge(
-            &worktree,
-            "peer-removed-after-invalid",
-            "PEER REMOVED AFTER INVALID",
-        );
-        assert_eq!(
-            server.refresh_dark_knowledge_overlay(&checkout),
-            KnowledgeOverlayRefreshOutcome::Converged
-        );
-        server.state.index_writer.flush_blocking().unwrap();
-        let peer_ref = provisional_entity_ref(&scope, &checkout_id, "peer-removed-after-invalid");
-        assert_eq!(indexed_entity_count(&server, &peer_ref), 1);
-
-        write_test_knowledge(
-            &base,
-            "published-survives-peer-invalid",
-            "PUBLISHED SURVIVES PEER INVALID",
-        );
-        git(
-            &base,
-            &[
-                "add",
-                ".bbox/knowledge/published-survives-peer-invalid.json",
-            ],
-        );
-        git(&base, &["commit", "-q", "-m", "publish static fixture"]);
-        server.invalidate_published_knowledge_cache(&scope);
-        server
-            .sync_knowledge_scope_to_index(&scope, base.to_str().unwrap())
-            .unwrap();
-        server.state.index_writer.flush_blocking().unwrap();
-
-        std::fs::write(
-            worktree.join(".bbox/knowledge/peer-removed-after-invalid.json"),
-            b"{",
-        )
-        .unwrap();
-        assert_eq!(
-            server.refresh_dark_knowledge_overlay(&checkout),
-            KnowledgeOverlayRefreshOutcome::Invalid
-        );
-        server.state.index_writer.flush_blocking().unwrap();
-
-        let hits = server
-            .state
-            .idx
-            .read()
-            .hybrid_bm25_hits("PUBLISHED SURVIVES PEER INVALID", 10, Some("knowledge"))
-            .unwrap();
-        assert!(
-            hits.iter().any(|hit| {
-                hit.entity_id
-                    == crate::index::knowledge_entity_id("published-survives-peer-invalid")
-            }),
-            "malformed peer content must not clear published static knowledge: {hits:?}"
-        );
-        assert_eq!(
-            indexed_entity_count(&server, &peer_ref),
-            0,
-            "scope reconciliation must remove the stale provisional document"
-        );
-    }
-
-    #[test]
-    fn invalid_publisher_authority_replaces_prior_valid_overlay() {
-        let (_temp, server, base, worktree, scope) = fixture();
-        server.reconcile_dark_knowledge_checkouts().unwrap();
-        let checkout_id = bbox_corpus_core::identity::ensure_checkout_id(&worktree).unwrap();
-        let row = server
-            .state
-            .checkout_registry
-            .read()
-            .get(&checkout_id, &scope)
-            .cloned()
-            .unwrap();
-        let checkout = server.resolve_registered_checkout(&row).unwrap().unwrap();
-        assert_eq!(
-            server
-                .state
-                .knowledge_overlays
-                .read()
-                .get(&scope, &checkout_id)
-                .unwrap()
-                .status,
-            OverlayStatus::Valid
-        );
-
-        write_test_knowledge(&base, "authority-visible", "AUTHORITY VISIBLE CONTENT");
-        git(&base, &["add", ".bbox/knowledge/authority-visible.json"]);
-        git(&base, &["commit", "-q", "-m", "publish authority fixture"]);
-        server.invalidate_published_knowledge_cache(&scope);
-        server
-            .sync_knowledge_scope_to_index(&scope, base.to_str().unwrap())
-            .unwrap();
-        server.state.index_writer.flush_blocking().unwrap();
-        let before = server
-            .state
-            .idx
-            .read()
-            .hybrid_bm25_hits("AUTHORITY VISIBLE CONTENT", 10, Some("knowledge"))
-            .unwrap();
-        assert!(before.iter().any(|hit| {
-            hit.entity_id == crate::index::knowledge_entity_id("authority-visible")
-        }));
-
-        std::fs::write(
-            base.join(".bbox/config.toml"),
-            "[project]\nrepo_id = \"different-publisher-scope\"\n",
-        )
-        .unwrap();
-        git(&base, &["add", ".bbox/config.toml"]);
-        git(&base, &["commit", "-q", "-m", "change publisher scope"]);
-        server.invalidate_published_knowledge_cache(&scope);
-
-        assert_eq!(
-            server.refresh_dark_knowledge_overlay(&checkout),
-            KnowledgeOverlayRefreshOutcome::Invalid
-        );
-        let invalid = server
-            .state
-            .knowledge_overlays
-            .read()
-            .get(&scope, &checkout_id)
-            .cloned()
-            .unwrap();
-        assert_eq!(invalid.status, OverlayStatus::Invalid);
-        assert!(invalid.values.is_empty());
-        assert!(
-            invalid
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.contains("no publisher"))
-        );
-        server.state.index_writer.flush_blocking().unwrap();
-        let after = server
-            .state
-            .idx
-            .read()
-            .hybrid_bm25_hits("AUTHORITY VISIBLE CONTENT", 10, Some("knowledge"))
-            .unwrap();
-        assert!(
-            after.iter().all(|hit| {
-                hit.entity_id != crate::index::knowledge_entity_id("authority-visible")
-            }),
-            "invalid publisher authority must clear static scope documents: {after:?}"
-        );
     }
 
     #[test]

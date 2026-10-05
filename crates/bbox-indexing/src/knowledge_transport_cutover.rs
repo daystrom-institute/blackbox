@@ -7,7 +7,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use bbox_config::config::Config;
 use bbox_corpus_core::identity::PublishedScope;
@@ -15,10 +14,7 @@ use bbox_corpus_core::json_store::{
     NofollowDirectory, acquire_store_lock_nofollow, atomic_write_bytes_locked,
 };
 use bbox_corpus_core::project_catalog::{ProjectId, ProjectScope};
-use bbox_knowledge_source_store::{
-    KnowledgeSourceStore, ReadyProvisionalWorkspace, ReadyPublicationCandidate,
-    ReadyPublicationFile, StoreLimits,
-};
+use bbox_knowledge_source_store::{KnowledgeSourceStore, ReadyPublicationCandidate, StoreLimits};
 use serde::{Deserialize, Serialize};
 
 use crate::accepted_publication_runtime::{
@@ -48,6 +44,10 @@ pub const KNOWLEDGE_TRANSPORT_CUTOVER_RECEIPT_FILE: &str =
     "knowledge-transport-cutover-receipt.json";
 pub const MAX_KNOWLEDGE_TRANSPORT_CUTOVER_MARKER_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_KNOWLEDGE_TRANSPORT_CUTOVER_RECEIPT_BYTES: usize = 1024 * 1024;
+
+/// Serialized empty evidence list, committed by every new marker row for the
+/// retired workspace parity and shadow observation evidence.
+const EMPTY_EVIDENCE_LIST: &[u8] = b"[]";
 
 const CUTOVER_CAPABILITIES: [CheckoutAccessKind; 4] = [
     CheckoutAccessKind::PublisherConfigTreeRead,
@@ -124,18 +124,6 @@ pub struct KnowledgeTransportPublicationParityV1 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct KnowledgeTransportWorkspaceParityV1 {
-    pub workspace_id: String,
-    pub source_generation_id: String,
-    pub sequence: u64,
-    pub accepted_generation_id: String,
-    pub lease_expires_unix_secs: u64,
-    pub knowledge_snapshot_id: String,
-    pub gap_snapshot_id: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct KnowledgeTransportProjectEvidenceV1 {
     pub project_id: ProjectId,
     pub scope: PublishedScope,
@@ -146,10 +134,6 @@ pub struct KnowledgeTransportProjectEvidenceV1 {
     pub publication_parity: Option<KnowledgeTransportPublicationParityV1>,
     pub prepared_upload_count: u64,
     pub unfinished_finalize_journal_count: u64,
-    pub expired_workspace_ids: Vec<String>,
-    pub workspace_parity: Vec<KnowledgeTransportWorkspaceParityV1>,
-    pub shadow_comparisons:
-        Vec<crate::knowledge_transport_observations::KnowledgeTransportShadowComparisonV1>,
     pub capability_baselines: Vec<KnowledgeTransportCapabilityBaselineV1>,
     pub observation_window_start_sequence: u64,
     pub observation_window_end_sequence: u64,
@@ -169,6 +153,9 @@ pub struct PredictedKnowledgeTransportCutoverRowV1 {
     pub source_generation_id: String,
     pub source_generation_sha256: String,
     pub publication_parity_commitment: Sha256ValueV1,
+    /// Workspace parity and shadow evidence belonged to the retired
+    /// provisional lane. New rows carry an empty id list and commitments to
+    /// an empty evidence list; the fields stay so durable markers decode.
     pub parity_workspace_ids: Vec<String>,
     pub workspace_parity_commitment: Sha256ValueV1,
     pub shadow_observation_commitment: Sha256ValueV1,
@@ -1063,12 +1050,6 @@ fn project_evidence_base(
     target_counters: &[CheckoutAccessTargetCounter],
     observations: &KnowledgeTransportObservationSnapshotV1,
 ) -> KnowledgeTransportProjectEvidenceV1 {
-    let shadow_comparisons = observations
-        .comparisons
-        .iter()
-        .filter(|comparison| comparison.project_id == project_id.as_str())
-        .cloned()
-        .collect::<Vec<_>>();
     let observation_window_start_sequence = observations
         .counters
         .iter()
@@ -1084,9 +1065,6 @@ fn project_evidence_base(
         publication_parity: None,
         prepared_upload_count: 0,
         unfinished_finalize_journal_count: 0,
-        expired_workspace_ids: Vec::new(),
-        workspace_parity: Vec::new(),
-        shadow_comparisons,
         capability_baselines: capability_baselines(project_id, target_counters),
         observation_window_start_sequence,
         observation_window_end_sequence: observations.sequence,
@@ -1131,8 +1109,7 @@ fn capture_project_evidence(
         Ok(parity) => evidence.publication_parity = Some(parity),
         Err(cause) => evidence.defects.push(cause.to_string()),
     }
-    if let Err(cause) =
-        capture_project_source_readiness(&mut evidence, accepted, source_store, observations)
+    if let Err(cause) = capture_project_source_readiness(&mut evidence, source_store, observations)
     {
         evidence.defects.push(cause.to_string());
     }
@@ -1163,12 +1140,9 @@ fn capture_project_evidence(
 
 fn capture_project_source_readiness(
     evidence: &mut KnowledgeTransportProjectEvidenceV1,
-    accepted: &AcceptedPublicationRuntime,
     source_store: Option<&KnowledgeSourceStore>,
     observations: &KnowledgeTransportObservationSnapshotV1,
 ) -> CutoverResult<()> {
-    use crate::knowledge_transport_observations::KnowledgeTransportOperationV1 as Operation;
-
     let source_store = source_store.ok_or_else(|| {
         error(
             "error.knowledge_transport_cutover_source_missing",
@@ -1176,15 +1150,10 @@ fn capture_project_source_readiness(
         )
     })?;
     let readiness = source_store
-        .project_cutover_readiness(evidence.project_id.as_str(), now_unix_secs())
+        .project_cutover_readiness(evidence.project_id.as_str())
         .map_err(|cause| error("error.knowledge_transport_cutover_source_readiness", cause))?;
     evidence.prepared_upload_count = readiness.prepared_upload_count;
     evidence.unfinished_finalize_journal_count = readiness.unfinished_finalize_journal_count;
-    evidence.expired_workspace_ids = readiness
-        .expired_workspace_ids
-        .into_iter()
-        .map(|workspace| workspace.as_str().to_string())
-        .collect();
     if evidence.prepared_upload_count != 0 {
         evidence.defects.push(format!(
             "{} knowledge-source uploads remain prepared",
@@ -1197,46 +1166,6 @@ fn capture_project_source_readiness(
             evidence.unfinished_finalize_journal_count
         ));
     }
-    if !evidence.expired_workspace_ids.is_empty() {
-        evidence.defects.push(format!(
-            "{} selected provisional workspaces are expired",
-            evidence.expired_workspace_ids.len()
-        ));
-    }
-
-    let verified = accepted
-        .load_verified(&evidence.project_id)
-        .map_err(|cause| error("error.knowledge_transport_cutover_accepted", cause))?;
-    for workspace in readiness.selected_workspaces {
-        match capture_workspace_parity(&evidence.scope, &verified, workspace) {
-            Ok(parity) => evidence.workspace_parity.push(parity),
-            Err(cause) => evidence.defects.push(cause.to_string()),
-        }
-    }
-    evidence
-        .workspace_parity
-        .sort_by(|left, right| left.workspace_id.cmp(&right.workspace_id));
-    let selected_workspace_ids = evidence
-        .workspace_parity
-        .iter()
-        .map(|workspace| workspace.workspace_id.as_str())
-        .collect::<BTreeSet<_>>();
-    evidence.shadow_comparisons.retain(|comparison| {
-        comparison
-            .workspace_id
-            .as_deref()
-            .is_some_and(|workspace_id| {
-                selected_workspace_ids.contains(workspace_id)
-                    && matches!(
-                        comparison.operation,
-                        Operation::ProvisionalOwnKnowledge
-                            | Operation::ProvisionalOwnGaps
-                            | Operation::ProvisionalAllKnowledge
-                            | Operation::ProvisionalAllGaps
-                    )
-            })
-    });
-
     validate_overlap_observations(evidence, observations);
     Ok(())
 }
@@ -1261,79 +1190,6 @@ fn validate_overlap_observations(
             ));
         }
     }
-    if !evidence.workspace_parity.is_empty()
-        && !has_operation_counter(
-            observations,
-            evidence.project_id.as_str(),
-            Operation::WatcherRefresh,
-            Outcome::Local,
-        )
-    {
-        evidence
-            .defects
-            .push("no local watcher refresh was observed for selected overlap workspaces".into());
-    }
-
-    for parity in &evidence.workspace_parity {
-        for (operation, expected_snapshot_id) in [
-            (
-                Operation::ProvisionalOwnKnowledge,
-                parity.knowledge_snapshot_id.as_str(),
-            ),
-            (
-                Operation::ProvisionalOwnGaps,
-                parity.gap_snapshot_id.as_str(),
-            ),
-            (
-                Operation::ProvisionalAllKnowledge,
-                parity.knowledge_snapshot_id.as_str(),
-            ),
-            (
-                Operation::ProvisionalAllGaps,
-                parity.gap_snapshot_id.as_str(),
-            ),
-        ] {
-            if !has_operation_counter(
-                observations,
-                evidence.project_id.as_str(),
-                operation,
-                Outcome::Local,
-            ) {
-                evidence.defects.push(format!(
-                    "workspace {} has no local {operation:?} overlap observation",
-                    parity.workspace_id
-                ));
-            }
-            if !has_operation_counter(
-                observations,
-                evidence.project_id.as_str(),
-                operation,
-                Outcome::ShadowEqual,
-            ) {
-                evidence.defects.push(format!(
-                    "workspace {} has no equal {operation:?} overlap observation",
-                    parity.workspace_id
-                ));
-            }
-            let comparison = evidence.shadow_comparisons.iter().find(|comparison| {
-                comparison.operation == operation
-                    && comparison.workspace_id.as_deref() == Some(parity.workspace_id.as_str())
-            });
-            match comparison {
-                Some(comparison)
-                    if comparison.equal
-                        && comparison.transport_snapshot_id == expected_snapshot_id => {}
-                Some(_) => evidence.defects.push(format!(
-                    "workspace {} {operation:?} shadow evidence does not match the reopened remote snapshot",
-                    parity.workspace_id
-                )),
-                None => evidence.defects.push(format!(
-                    "workspace {} has no current {operation:?} shadow comparison",
-                    parity.workspace_id
-                )),
-            }
-        }
-    }
 }
 
 fn has_operation_counter(
@@ -1348,150 +1204,6 @@ fn has_operation_counter(
             && counter.outcome == outcome
             && counter.count != 0
     })
-}
-
-fn capture_workspace_parity(
-    scope: &PublishedScope,
-    verified: &VerifiedAcceptedPublication,
-    source: ReadyProvisionalWorkspace,
-) -> CutoverResult<KnowledgeTransportWorkspaceParityV1> {
-    let accepted = verified.content_stamp();
-    if source.project_id != accepted.project_id().as_str()
-        || &source.descriptor.scope != scope
-        || source.descriptor.accepted_generation != accepted.generation_id()
-        || source.descriptor.accepted_commit != accepted.accepted_commit()
-    {
-        return Err(error(
-            "error.knowledge_transport_cutover_provisional_stale",
-            "selected provisional workspace does not target the current accepted publication",
-        ));
-    }
-    let workspace_id = source.descriptor.workspace_id.as_str().to_string();
-    let baseline_knowledge = bbox_knowledge::overlay::BaselineKnowledgeSnapshot::new(
-        provisional_file_map(&source.baseline_knowledge, "knowledge")
-            .map_err(|cause| error("error.knowledge_transport_cutover_workspace", cause))?,
-    )
-    .map_err(|cause| error("error.knowledge_transport_cutover_workspace", cause))?;
-    let working_knowledge = bbox_knowledge::overlay::WorkingKnowledgeSnapshot::new(
-        provisional_file_map(&source.working_knowledge, "knowledge")
-            .map_err(|cause| error("error.knowledge_transport_cutover_workspace", cause))?,
-    )
-    .map_err(|cause| error("error.knowledge_transport_cutover_workspace", cause))?;
-    let knowledge_digests = bbox_knowledge::overlay::AcceptedPublishedDigests(
-        verified
-            .knowledge_manifest()
-            .iter()
-            .filter_map(|(filename, manifest)| {
-                Some((
-                    basename(filename.as_str())?,
-                    manifest.source_content_sha256.as_str().to_string(),
-                ))
-            })
-            .collect(),
-    );
-    let knowledge = bbox_knowledge::overlay::recompute_catalog_overlay_from_sources(
-        bbox_knowledge::overlay::CatalogOverlayPublished {
-            published_scope: scope,
-            checkout_id: &workspace_id,
-            full_ref: accepted.full_ref(),
-            accepted_commit: accepted.accepted_commit(),
-            accepted_generation: accepted.generation_id(),
-            published: &knowledge_digests,
-        },
-        &source.descriptor.checkout_head,
-        &source.descriptor.merge_base,
-        &baseline_knowledge,
-        &working_knowledge,
-    )
-    .map_err(|cause| error("error.knowledge_transport_cutover_workspace", cause))?;
-    if knowledge.status != bbox_knowledge::overlay::OverlayStatus::Valid {
-        return Err(error(
-            "error.knowledge_transport_cutover_workspace_invalid",
-            format!(
-                "workspace {workspace_id} knowledge overlay is not valid: {}",
-                knowledge.diagnostics.join("; ")
-            ),
-        ));
-    }
-
-    let baseline_gaps = bbox_gaps::overlay::BaselineGapSnapshot::new(
-        provisional_file_map(&source.baseline_gaps, "gap")
-            .map_err(|cause| error("error.knowledge_transport_cutover_workspace", cause))?,
-    )
-    .map_err(|cause| error("error.knowledge_transport_cutover_workspace", cause))?;
-    let working_gaps = bbox_gaps::overlay::WorkingGapSnapshot::new(
-        provisional_file_map(&source.working_gaps, "gap")
-            .map_err(|cause| error("error.knowledge_transport_cutover_workspace", cause))?,
-    )
-    .map_err(|cause| error("error.knowledge_transport_cutover_workspace", cause))?;
-    let gap_digests = bbox_gaps::overlay::AcceptedPublishedGapDigests(
-        verified
-            .gap_manifest()
-            .iter()
-            .filter_map(|(filename, manifest)| {
-                Some((
-                    basename(filename.as_str())?,
-                    manifest.source_content_sha256.as_str().to_string(),
-                ))
-            })
-            .collect(),
-    );
-    let gaps = bbox_gaps::overlay::recompute_catalog_overlay_from_sources(
-        bbox_gaps::overlay::CatalogGapOverlayPublished {
-            published_scope: scope,
-            checkout_id: &workspace_id,
-            full_ref: accepted.full_ref(),
-            accepted_commit: accepted.accepted_commit(),
-            accepted_generation: accepted.generation_id(),
-            published: &gap_digests,
-        },
-        &source.descriptor.checkout_head,
-        &source.descriptor.merge_base,
-        &baseline_gaps,
-        &working_gaps,
-    )
-    .map_err(|cause| error("error.knowledge_transport_cutover_workspace", cause))?;
-    if gaps.status != bbox_gaps::overlay::GapOverlayStatus::Valid {
-        return Err(error(
-            "error.knowledge_transport_cutover_workspace_invalid",
-            format!(
-                "workspace {workspace_id} gap overlay is not valid: {}",
-                gaps.diagnostics.join("; ")
-            ),
-        ));
-    }
-
-    Ok(KnowledgeTransportWorkspaceParityV1 {
-        workspace_id,
-        source_generation_id: source.source_generation_id,
-        sequence: source.descriptor.sequence,
-        accepted_generation_id: source.descriptor.accepted_generation,
-        lease_expires_unix_secs: source.lease_expires_unix_secs,
-        knowledge_snapshot_id: knowledge.snapshot_id,
-        gap_snapshot_id: gaps.snapshot_id,
-    })
-}
-
-fn provisional_file_map(
-    files: &[ReadyPublicationFile],
-    lane: &str,
-) -> anyhow::Result<BTreeMap<String, Vec<u8>>> {
-    let mut mapped = BTreeMap::new();
-    for file in files {
-        let filename = basename(&file.manifest.repository_relative_filename)
-            .ok_or_else(|| anyhow::anyhow!("provisional {lane} filename has no basename"))?;
-        if mapped.insert(filename, file.source_bytes.clone()).is_some() {
-            anyhow::bail!("provisional {lane} snapshot contains duplicate basenames");
-        }
-    }
-    Ok(mapped)
-}
-
-fn basename(repository_relative: &str) -> Option<String> {
-    Path::new(repository_relative)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .map(str::to_owned)
 }
 
 fn capture_publication_parity(
@@ -1721,11 +1433,6 @@ fn predicted_marker(
                     "a proposed row has no publication parity evidence",
                 )
             })?;
-            let parity_workspace_ids = project
-                .workspace_parity
-                .iter()
-                .map(|workspace| workspace.workspace_id.clone())
-                .collect::<Vec<_>>();
             Ok(PredictedKnowledgeTransportCutoverRowV1 {
                 project_id: project.project_id.clone(),
                 scope: project.scope.clone(),
@@ -1745,17 +1452,9 @@ fn predicted_marker(
                         error("error.knowledge_transport_cutover_artifact", cause)
                     })?,
                 ),
-                parity_workspace_ids,
-                workspace_parity_commitment: Sha256ValueV1::digest(
-                    &serde_json::to_vec(&project.workspace_parity).map_err(|cause| {
-                        error("error.knowledge_transport_cutover_artifact", cause)
-                    })?,
-                ),
-                shadow_observation_commitment: Sha256ValueV1::digest(
-                    &serde_json::to_vec(&project.shadow_comparisons).map_err(|cause| {
-                        error("error.knowledge_transport_cutover_artifact", cause)
-                    })?,
-                ),
+                parity_workspace_ids: Vec::new(),
+                workspace_parity_commitment: Sha256ValueV1::digest(EMPTY_EVIDENCE_LIST),
+                shadow_observation_commitment: Sha256ValueV1::digest(EMPTY_EVIDENCE_LIST),
                 capability_baselines: project.capability_baselines.clone(),
                 observation_window_start_sequence: project.observation_window_start_sequence,
                 observation_window_end_sequence: project.observation_window_end_sequence,
@@ -2234,13 +1933,6 @@ fn validate_timestamp(value: &str, operation: &str) -> CutoverResult<()> {
     Ok(())
 }
 
-fn now_unix_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
 fn count_status(
     projects: &[KnowledgeTransportProjectEvidenceV1],
     status: KnowledgeTransportCoverageStatusV1,
@@ -2320,73 +2012,8 @@ mod tests {
         (catalog, scope, row)
     }
 
-    fn overlap_evidence(
-        observations: &KnowledgeTransportObservationSnapshotV1,
-    ) -> KnowledgeTransportProjectEvidenceV1 {
-        let mut evidence = project_evidence_base(
-            &project_id(),
-            &PublishedScope::try_new("repo", ".").unwrap(),
-            Some("producer-1".into()),
-            KnowledgeTransportCoverageStatusV1::Proposed,
-            &[],
-            observations,
-        );
-        evidence.workspace_parity = vec![KnowledgeTransportWorkspaceParityV1 {
-            workspace_id: "workspace-1".into(),
-            source_generation_id: format!("kws_{}", "d".repeat(64)),
-            sequence: 7,
-            accepted_generation_id: "a".repeat(64),
-            lease_expires_unix_secs: u64::MAX,
-            knowledge_snapshot_id: "knowledge-snapshot".into(),
-            gap_snapshot_id: "gap-snapshot".into(),
-        }];
-        evidence
-    }
-
     #[test]
-    fn overlap_gate_requires_every_selected_workspace_lane_and_reopened_identity() {
-        let observations = KnowledgeTransportObservationsV1::in_memory();
-        for operation in [Operation::PublishedKnowledge, Operation::PublishedGaps] {
-            observations
-                .record(project_id().as_str(), operation, Outcome::Remote)
-                .unwrap();
-        }
-        observations
-            .record(
-                project_id().as_str(),
-                Operation::WatcherRefresh,
-                Outcome::Local,
-            )
-            .unwrap();
-        for (operation, snapshot_id) in [
-            (Operation::ProvisionalOwnKnowledge, "knowledge-snapshot"),
-            (Operation::ProvisionalOwnGaps, "gap-snapshot"),
-            (Operation::ProvisionalAllKnowledge, "knowledge-snapshot"),
-            (Operation::ProvisionalAllGaps, "gap-snapshot"),
-        ] {
-            observations
-                .record(project_id().as_str(), operation, Outcome::Local)
-                .unwrap();
-            observations
-                .record_shadow(
-                    project_id().as_str(),
-                    operation,
-                    Some("workspace-1"),
-                    snapshot_id,
-                    snapshot_id,
-                )
-                .unwrap();
-        }
-        let snapshot = observations.snapshot();
-        let mut evidence = overlap_evidence(&snapshot);
-
-        validate_overlap_observations(&mut evidence, &snapshot);
-
-        assert!(evidence.defects.is_empty(), "{:?}", evidence.defects);
-    }
-
-    #[test]
-    fn overlap_gate_refuses_absent_and_stale_workspace_evidence() {
+    fn overlap_gate_requires_both_remote_published_views() {
         let observations = KnowledgeTransportObservationsV1::in_memory();
         observations
             .record(
@@ -2395,49 +2022,37 @@ mod tests {
                 Outcome::Remote,
             )
             .unwrap();
+        let snapshot = observations.snapshot();
+        let mut evidence = project_evidence_base(
+            &project_id(),
+            &PublishedScope::try_new("repo", ".").unwrap(),
+            Some("producer-1".into()),
+            KnowledgeTransportCoverageStatusV1::Proposed,
+            &[],
+            &snapshot,
+        );
+        validate_overlap_observations(&mut evidence, &snapshot);
+        assert_eq!(evidence.defects.len(), 1, "{:?}", evidence.defects);
+        assert!(evidence.defects[0].contains("PublishedGaps"));
+
         observations
             .record(
                 project_id().as_str(),
-                Operation::ProvisionalOwnKnowledge,
-                Outcome::Local,
-            )
-            .unwrap();
-        observations
-            .record_shadow(
-                project_id().as_str(),
-                Operation::ProvisionalOwnKnowledge,
-                Some("workspace-1"),
-                "stale-local",
-                "stale-remote",
+                Operation::PublishedGaps,
+                Outcome::Remote,
             )
             .unwrap();
         let snapshot = observations.snapshot();
-        let mut evidence = overlap_evidence(&snapshot);
-
+        let mut evidence = project_evidence_base(
+            &project_id(),
+            &PublishedScope::try_new("repo", ".").unwrap(),
+            Some("producer-1".into()),
+            KnowledgeTransportCoverageStatusV1::Proposed,
+            &[],
+            &snapshot,
+        );
         validate_overlap_observations(&mut evidence, &snapshot);
-
-        assert!(
-            evidence
-                .defects
-                .iter()
-                .any(|defect| defect.contains("PublishedGaps"))
-        );
-        assert!(
-            evidence
-                .defects
-                .iter()
-                .any(|defect| defect.contains("watcher refresh"))
-        );
-        assert!(evidence.defects.iter().any(|defect| {
-            defect.contains("ProvisionalOwnKnowledge")
-                && defect.contains("reopened remote snapshot")
-        }));
-        assert!(
-            evidence
-                .defects
-                .iter()
-                .any(|defect| defect.contains("ProvisionalAllGaps"))
-        );
+        assert!(evidence.defects.is_empty(), "{:?}", evidence.defects);
     }
 
     #[test]
@@ -2896,7 +2511,7 @@ mod tests {
                 .pin_ready_publication_candidate(&finalized.source_generation_id)
                 .unwrap();
             let candidate = pinned.candidate();
-            let files = |files: &[ReadyPublicationFile]| {
+            let files = |files: &[bbox_knowledge_source_store::ReadyPublicationFile]| {
                 files
                     .iter()
                     .map(|file| PublishSourceFile {

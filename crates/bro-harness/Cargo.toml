@@ -35,7 +35,6 @@ bbox-refactor = { path = "../bbox-refactor" }
 bbox-corpus-core = { path = "../bbox-corpus-core" }
 bbox-knowledge = { path = "../bbox-knowledge" }
 bbox-gaps = { path = "../bbox-gaps" }
-bbox-knowledge-source-client = { path = "../bbox-knowledge-source-client" }
 bbox-util = { path = "../bbox-util" }
 lsp-types = "0.94.1"
 

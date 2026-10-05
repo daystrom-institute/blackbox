@@ -1869,7 +1869,6 @@ fn fixture_gap_note(id: &str, title: &str) -> bbox_gaps::gaps::GapNote {
         project: None,
         project_id: None,
         write_dir: None,
-        provisional_checkout_id: None,
         task_id: None,
         session_id: None,
         provider: None,

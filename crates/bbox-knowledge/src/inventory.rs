@@ -1,7 +1,6 @@
 //! Schema-epoch inventory for the durable-key migration (design §3.5).
 //!
-//! Slice 1c of
-//! `design/corpus/knowledge/checkout-identity-and-provisional-knowledge.md`.
+//! Design: `design/corpus/knowledge/checkout-identity-and-provisional-knowledge.md`.
 //!
 //! The identity contract retargets project-scoped durable knowledge from the
 //! host-local path key (`entry.project`, an absolute path string) to the

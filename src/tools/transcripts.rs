@@ -312,8 +312,7 @@ impl BlackboxServer {
                     .run_reindex_pass(false, true)
                     .map_err(|e| anyhow::anyhow!("Auto-index failed: {e}"))?;
             }
-            let knowledge_view =
-                server.session_knowledge_view(p.project.as_deref(), p.provisional.as_deref())?;
+            let knowledge_view = server.session_knowledge_view(p.project.as_deref())?;
             let read_view = server.state.code_read_view.read().clone();
             let provider_ctx = server
                 .provider_context()
