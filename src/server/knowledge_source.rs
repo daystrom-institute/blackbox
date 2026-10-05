@@ -50,6 +50,9 @@ const WORKSPACE_BINDING_TTL_SECS: u64 = 24 * 60 * 60;
 /// How often a live task's binding has its expiry pushed out. Well inside
 /// the TTL so one missed tick never expires a working session.
 const WORKSPACE_BINDING_RENEW_INTERVAL_SECS: u64 = 60 * 60;
+/// Store-root file of the retired operator-minted bindings. Removed once at
+/// startup; nothing reads it.
+const RETIRED_OPERATOR_BINDINGS_FILENAME: &str = "operator-workspace-bindings.json";
 
 fn workspace_binding_token_sha256(secret: &str) -> [u8; 32] {
     use sha2::Digest as _;
@@ -151,6 +154,7 @@ impl bbox_indexing::checkout_access::CheckoutAccessPolicy for KnowledgeTransport
 impl KnowledgeSourceRuntime {
     pub(crate) fn open(config: &crate::config::Config) -> Result<Self> {
         let root = config.paths.state_dir.join("knowledge-sources");
+        retire_provisional_state(&root);
         let store = Arc::new(KnowledgeSourceStore::open(
             root,
             checked_store_limits(config)?,
@@ -445,6 +449,49 @@ fn install_workspace_binding_hashed(
         }
     });
     Ok(())
+}
+
+/// Remove the state of the retired provisional snapshot transport from one
+/// knowledge-source store root before the store opens: the provisional
+/// generation tree, its finalize journals, and the operator binding records.
+/// Idempotent and bounded to those fixed members. A failure is logged and
+/// never stops the daemon; the store never reads the leftover state, and the
+/// next start retries. Blobs only provisional manifests referenced are
+/// unreferenced from here on, and store maintenance reclaims them after the
+/// blob grace period.
+fn retire_provisional_state(root: &std::path::Path) {
+    match bbox_knowledge_source_store::retire_provisional_state(root) {
+        Ok(report) if report.removed_directory || report.removed_journals > 0 => {
+            tracing::info!(
+                removed_directory = report.removed_directory,
+                removed_journals = report.removed_journals,
+                "removed retired provisional knowledge-source state"
+            );
+        }
+        Ok(_) => {}
+        Err(error) => tracing::warn!(
+            error = %format!("{error:#}"),
+            "retired provisional knowledge-source state was not removed; it is never read"
+        ),
+    }
+    let bindings = root.join(RETIRED_OPERATOR_BINDINGS_FILENAME);
+    match std::fs::symlink_metadata(&bindings) {
+        Ok(metadata) if !metadata.is_dir() => match std::fs::remove_file(&bindings) {
+            Ok(()) => tracing::info!("removed retired operator workspace binding records"),
+            Err(error) => tracing::warn!(
+                error = %error,
+                "retired operator workspace binding records were not removed; they are never read"
+            ),
+        },
+        Ok(_) => tracing::warn!(
+            "retired operator workspace binding path is a directory; left in place, never read"
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => tracing::warn!(
+            error = %error,
+            "retired operator workspace binding records could not be inspected"
+        ),
+    }
 }
 
 impl crate::orchestration::WorkspaceBindingAuthority for DaemonWorkspaceBindingAuthority {
@@ -1083,6 +1130,50 @@ mod tests {
     use super::*;
     use crate::server::producer_auth::ProducerAuthRuntime;
     use crate::server::state::catalog_fixture::CatalogFixture;
+
+    /// First start on a deployed daemon: the retired provisional store, its
+    /// journals, and the operator binding records are removed before the
+    /// store opens; a second start finds nothing and changes nothing; the
+    /// store then opens and maintains without reading any of it.
+    #[test]
+    fn startup_removes_retired_provisional_state_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("knowledge-sources");
+        // Never provisioned: an absent root is not an error.
+        retire_provisional_state(&root);
+        assert!(!root.exists());
+
+        let legacy = root.join("provisional/generations/p_one/0123456789abcdef0123456789abcdef");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("current.json"), b"{\"legacy\":true}").unwrap();
+        std::fs::create_dir_all(root.join("provisional/uploads")).unwrap();
+        std::fs::create_dir_all(root.join("journals")).unwrap();
+        std::fs::write(
+            root.join("journals/provisional-kws_legacy.json"),
+            b"{\"kind\":\"provisional\"}",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(RETIRED_OPERATOR_BINDINGS_FILENAME),
+            b"{\"version\":1,\"bindings\":[]}",
+        )
+        .unwrap();
+
+        retire_provisional_state(&root);
+        assert!(!root.join("provisional").exists());
+        assert!(!root.join("journals/provisional-kws_legacy.json").exists());
+        assert!(!root.join(RETIRED_OPERATOR_BINDINGS_FILENAME).exists());
+
+        // Idempotent: the second start is a no-op.
+        retire_provisional_state(&root);
+        let store = KnowledgeSourceStore::open(&root, StoreLimits::default()).unwrap();
+        store.maintain(&std::collections::BTreeSet::new()).unwrap();
+        assert!(!root.join("provisional").exists());
+    }
 
     /// The publication manifest route admits every lane, including the
     /// configuration lane, and refuses an unknown segment.

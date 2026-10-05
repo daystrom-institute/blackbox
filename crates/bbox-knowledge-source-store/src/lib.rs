@@ -1,7 +1,7 @@
 //! Durable resumable intake for knowledge publication candidates.
 //!
 //! Directories and journals an older store kept for provisional workspace
-//! snapshots are never read.
+//! snapshots are never read; [`retire_provisional_state`] removes them.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -37,9 +37,83 @@ const MAX_MANIFEST_BYTES: usize = 512 * 1024 * 1024;
 const MAX_JOURNAL_BYTES: usize = 128 * 1024;
 const MISSING_PAGE_SIZE: usize = 1_000;
 const PUBLICATION_JOURNAL_PREFIX: &str = "publication-";
-/// Journal-name prefix an older store used for provisional workspace
-/// snapshots. Journal scans skip it.
+/// Store member and journal-name prefix an older store used for provisional
+/// workspace snapshots. Scans skip both; only [`retire_provisional_state`]
+/// touches them.
+const RETIRED_PROVISIONAL_MEMBER: &str = "provisional";
 const RETIRED_PROVISIONAL_JOURNAL_PREFIX: &str = "provisional-";
+
+/// What one [`retire_provisional_state`] pass removed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProvisionalRetirementReport {
+    /// The legacy `provisional` store member existed and was removed.
+    pub removed_directory: bool,
+    /// Legacy `journals/provisional-*.json` files removed.
+    pub removed_journals: u64,
+}
+
+/// Remove the state an older store kept for provisional workspace snapshots:
+/// the `provisional` member under `root` and every regular
+/// `journals/provisional-*.json`. Nothing else is touched, so publications,
+/// blobs, and publication journals survive; blobs only those snapshots
+/// referenced become unreferenced and the maintenance grace sweep reclaims
+/// them.
+///
+/// A symlink at `provisional` is unlinked and never followed, and the
+/// recursive removal of a directory does not follow symlinks inside it. The
+/// pass is idempotent: an absent root or absent members report nothing
+/// removed. It runs before [`KnowledgeSourceStore::open`].
+// Startup migration path; runs before the listener binds, off any tokio
+// worker.
+#[allow(clippy::disallowed_methods)]
+pub fn retire_provisional_state(root: &Path) -> Result<ProvisionalRetirementReport> {
+    let mut report = ProvisionalRetirementReport::default();
+    let member = root.join(RETIRED_PROVISIONAL_MEMBER);
+    match fs::symlink_metadata(&member) {
+        Ok(metadata) => {
+            if metadata.is_dir() {
+                fs::remove_dir_all(&member)
+                    .with_context(|| format!("removing {}", member.display()))?;
+            } else {
+                fs::remove_file(&member)
+                    .with_context(|| format!("removing {}", member.display()))?;
+            }
+            sync_parent(&member)?;
+            report.removed_directory = true;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspecting {}", member.display()));
+        }
+    }
+    let journals = root.join("journals");
+    let entries = match fs::read_dir(&journals) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(report),
+        Err(error) => {
+            return Err(error).with_context(|| format!("reading {}", journals.display()));
+        }
+    };
+    for entry in entries {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !name.starts_with(RETIRED_PROVISIONAL_JOURNAL_PREFIX) || !name.ends_with(".json") {
+            continue;
+        }
+        let path = entry.path();
+        if !fs::symlink_metadata(&path)?.is_file() {
+            continue;
+        }
+        fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
+        report.removed_journals += 1;
+    }
+    if report.removed_journals > 0 {
+        fs::File::open(&journals)?.sync_all()?;
+    }
+    Ok(report)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StoreLimits {
@@ -4708,10 +4782,101 @@ mod tests {
         outside
     }
 
-    /// Legacy provisional state is present but never read: open, recovery,
-    /// readiness, and maintenance all succeed over malformed legacy records,
-    /// and maintenance reclaims a blob only a legacy provisional manifest
-    /// referenced while keeping every publication-referenced blob.
+    #[test]
+    fn retiring_provisional_state_on_an_absent_root_removes_nothing() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("never-created");
+        assert_eq!(
+            retire_provisional_state(&root).unwrap(),
+            ProvisionalRetirementReport::default()
+        );
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn retiring_provisional_state_on_a_never_provisioned_store_removes_nothing() {
+        let (_temporary, root, store) = test_store(StoreLimits::default());
+        let generation = finalized_publication(&store);
+        drop(store);
+        assert!(!root.join("provisional").exists());
+        assert_eq!(
+            retire_provisional_state(&root).unwrap(),
+            ProvisionalRetirementReport::default()
+        );
+        let store = KnowledgeSourceStore::open(&root, StoreLimits::default()).unwrap();
+        assert_eq!(
+            store
+                .publication_status(&publication_authority().producer_id, &generation)
+                .unwrap()
+                .state,
+            SourceGenerationStateV1::Ready
+        );
+    }
+
+    #[test]
+    fn retiring_legacy_provisional_state_is_exact_and_idempotent() {
+        let (temporary, root, store) = test_store(StoreLimits::default());
+        let generation = finalized_publication(&store);
+        drop(store);
+        let outside = outside_target(&temporary);
+        write_legacy_provisional_state(&root, &outside);
+        // A non-regular journal under the retired prefix is left alone.
+        fs::create_dir_all(root.join("journals/provisional-directory.json")).unwrap();
+        let publication_journal = root.join("journals").join(journal_filename(&generation));
+        assert!(publication_journal.exists());
+
+        let report = retire_provisional_state(&root).unwrap();
+        assert_eq!(
+            report,
+            ProvisionalRetirementReport {
+                removed_directory: true,
+                removed_journals: 2,
+            }
+        );
+        assert!(!root.join("provisional").exists());
+        assert!(
+            outside.join("keep.json").exists(),
+            "symlink target survives"
+        );
+        assert!(publication_journal.exists());
+        assert!(root.join("journals/provisional-directory.json").is_dir());
+        assert!(root.join("publications/generations").is_dir());
+        assert_eq!(
+            retire_provisional_state(&root).unwrap(),
+            ProvisionalRetirementReport::default()
+        );
+
+        let store = KnowledgeSourceStore::open(&root, StoreLimits::default()).unwrap();
+        assert_eq!(
+            store
+                .publication_status(&publication_authority().producer_id, &generation)
+                .unwrap()
+                .state,
+            SourceGenerationStateV1::Ready
+        );
+    }
+
+    #[test]
+    fn a_symlinked_provisional_member_is_unlinked_not_followed() {
+        let (temporary, root, store) = test_store(StoreLimits::default());
+        drop(store);
+        let outside = outside_target(&temporary);
+        std::os::unix::fs::symlink(&outside, root.join("provisional")).unwrap();
+        let report = retire_provisional_state(&root).unwrap();
+        assert!(report.removed_directory);
+        assert!(fs::symlink_metadata(root.join("provisional")).is_err());
+        assert!(outside.join("keep.json").exists());
+    }
+
+    /// Before cleanup runs (or when it failed), legacy provisional state is
+    /// present but never read: open, recovery, readiness, and maintenance
+    /// all succeed over malformed legacy records, and maintenance reclaims a
+    /// blob only a legacy provisional manifest referenced while keeping
+    /// every publication-referenced blob.
     #[test]
     fn legacy_provisional_state_is_never_read_and_its_blobs_are_reclaimed() {
         let limits = StoreLimits {
