@@ -9,7 +9,10 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use fleetd::paths::{FleetdPaths, default_state_dir};
-use fleetd::server::{Fleetd, bind_listener, bind_tcp_listener, build_identity, serve, serve_tcp};
+use fleetd::server::{
+    Fleetd, TcpBindBackoff, bind_listener, build_identity, serve, serve_tcp_retrying,
+    validate_tcp_listen_address,
+};
 
 const USAGE: &str = "\
 fleetd - the per-machine blackbox fleet supervisor
@@ -30,6 +33,9 @@ OPTIONS:
                         local tunnels. A non-loopback address also requires
                         --allow-nonloopback-tcp and MUST be protected by an
                         encrypted, ACL-restricted transport such as a tailnet.
+                        When the address cannot be bound, fleetd keeps serving
+                        its Unix socket and retries the bind with backoff
+                        (1s doubling to 60s).
     --allow-nonloopback-tcp
                         Explicitly allow --listen-tcp on a non-loopback IP.
     -h, --help          Print this help.
@@ -114,11 +120,13 @@ async fn main() -> anyhow::Result<()> {
     // other loads it. Hardening (private, non-symlink, single-hardlink,
     // owner-only) is enforced inside ServiceToken.
     let token = bro_rpc::ServiceToken::load_or_create(&paths.token)?;
+    // A TCP address the operator has not granted is a configuration error
+    // and stops startup. Whether a granted address can be bound right now is
+    // not: the listener task retries, and the Unix listener serves meanwhile.
+    if let Some(address) = options.listen_tcp {
+        validate_tcp_listen_address(address, options.allow_nonloopback_tcp)?;
+    }
     let listener = bind_listener(&paths.socket).await?;
-    let tcp_listener = match options.listen_tcp {
-        Some(address) => Some(bind_tcp_listener(address, options.allow_nonloopback_tcp).await?),
-        None => None,
-    };
     let state = Fleetd::new(token, build_identity());
 
     let build = build_identity();
@@ -128,12 +136,15 @@ async fn main() -> anyhow::Result<()> {
         build_id = %build.build_id,
         "fleetd listening"
     );
-    if let Some(listener) = tcp_listener.as_ref() {
-        tracing::info!(address = %listener.local_addr()?, "fleetd TCP listener enabled");
-    }
 
     let serving = tokio::spawn(serve(state.clone(), listener));
-    let serving_tcp = tcp_listener.map(|listener| tokio::spawn(serve_tcp(state.clone(), listener)));
+    let serving_tcp = options.listen_tcp.map(|address| {
+        tokio::spawn(serve_tcp_retrying(
+            state.clone(),
+            address,
+            TcpBindBackoff::default(),
+        ))
+    });
     wait_for_shutdown().await;
 
     tracing::info!(

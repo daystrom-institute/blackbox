@@ -38,6 +38,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use bro_protocol::{
     DaemonToFleetd, FLEETD_PROTOCOL_VERSION, FleetdToDaemon, SessionState, WORKSPACE_BINDING_ENV,
@@ -202,6 +203,16 @@ pub async fn bind_tcp_listener(
     address: SocketAddr,
     allow_nonloopback: bool,
 ) -> anyhow::Result<TcpListener> {
+    validate_tcp_listen_address(address, allow_nonloopback)?;
+    Ok(TcpListener::bind(address).await?)
+}
+
+/// Refuse a TCP listen address the operator has not granted. This is a
+/// configuration error, decided once at startup, and never retried.
+pub fn validate_tcp_listen_address(
+    address: SocketAddr,
+    allow_nonloopback: bool,
+) -> anyhow::Result<()> {
     if address.ip().is_unspecified() || address.ip().is_multicast() {
         anyhow::bail!(
             "refusing fleetd TCP listener {address}; bind one concrete loopback or encrypted-interface address, never wildcard or multicast"
@@ -212,7 +223,54 @@ pub async fn bind_tcp_listener(
             "refusing non-loopback fleetd TCP listener {address}; pass --allow-nonloopback-tcp only for an encrypted, ACL-restricted transport such as a tailnet"
         );
     }
-    Ok(TcpListener::bind(address).await?)
+    Ok(())
+}
+
+/// Delay between TCP bind attempts: doubles from `initial` up to `max`.
+#[derive(Debug, Clone, Copy)]
+pub struct TcpBindBackoff {
+    pub initial: Duration,
+    pub max: Duration,
+}
+
+impl Default for TcpBindBackoff {
+    fn default() -> Self {
+        Self {
+            initial: Duration::from_secs(1),
+            max: Duration::from_secs(60),
+        }
+    }
+}
+
+/// Serve the TCP owner listener on an already validated address, binding it
+/// whenever the address is available. A bind failure is an environment
+/// condition (the interface that carries the address is down, or the port is
+/// still held), so it is retried with bounded backoff and never ends the
+/// process: the Unix listener and every supervised session keep running.
+pub async fn serve_tcp_retrying(state: Arc<Fleetd>, address: SocketAddr, backoff: TcpBindBackoff) {
+    let mut delay = backoff.initial;
+    let mut attempt: u64 = 0;
+    loop {
+        attempt += 1;
+        match TcpListener::bind(address).await {
+            Ok(listener) => {
+                tracing::info!(%address, attempt, "fleetd TCP listener enabled");
+                serve_tcp(state, listener).await;
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %address,
+                    %error,
+                    attempt,
+                    retry_in_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                    "fleetd TCP listener unavailable; the Unix listener keeps serving"
+                );
+                tokio::time::sleep(delay).await;
+                delay = delay.saturating_mul(2).min(backoff.max);
+            }
+        }
+    }
 }
 
 /// Accept connections forever, serving each on its own task.

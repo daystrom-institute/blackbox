@@ -23,7 +23,10 @@ use bro_protocol::{
     WorkspaceInspectionOutcome, WorkspaceInspectionRequest,
 };
 use bro_rpc::{BuildIdentity, Envelope, HandshakeOptions, NegotiatedIo, ServiceToken};
-use fleetd::server::{Fleetd, bind_listener, bind_tcp_listener, build_identity, serve, serve_tcp};
+use fleetd::server::{
+    Fleetd, TcpBindBackoff, bind_listener, bind_tcp_listener, build_identity, serve, serve_tcp,
+    serve_tcp_retrying, validate_tcp_listen_address,
+};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpStream, UnixStream};
 
@@ -186,6 +189,73 @@ async fn start_fleetd_tcp() -> TcpHarness {
         root,
         address,
         state,
+    }
+}
+
+/// A TCP address that cannot be bound yet does not stop fleetd: the Unix
+/// listener serves throughout, and the TCP listener comes up on its own once
+/// the address is free.
+#[tokio::test]
+async fn tcp_bind_failure_is_retried_while_the_unix_listener_serves() {
+    let harness = start_fleetd().await;
+    let occupier = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("occupy a port");
+    let address = occupier.local_addr().expect("occupied address");
+    let serving = tokio::spawn(serve_tcp_retrying(
+        harness.state.clone(),
+        address,
+        TcpBindBackoff {
+            initial: Duration::from_millis(20),
+            max: Duration::from_millis(80),
+        },
+    ));
+
+    // Several bind attempts fail while the port is held.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert!(
+        !serving.is_finished(),
+        "a failed bind must not end the task"
+    );
+    FakeDaemon::connect(&harness.socket)
+        .await
+        .expect("the Unix listener serves while TCP is unavailable");
+
+    drop(occupier);
+    let mut listening = false;
+    for _ in 0..100 {
+        if TcpStream::connect(address).await.is_ok() {
+            listening = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        listening,
+        "the TCP listener must come up once the address is free"
+    );
+    FakeDaemon::connect_tcp(address)
+        .await
+        .expect("the recovered TCP listener serves the owner handshake");
+    assert!(!serving.is_finished());
+    serving.abort();
+}
+
+#[test]
+fn ungranted_tcp_addresses_are_refused_without_binding() {
+    for (address, allow_nonloopback) in [
+        ("0.0.0.0:7265", true),
+        ("[::]:7265", true),
+        ("224.0.0.1:7265", true),
+        ("192.0.2.10:7265", false),
+    ] {
+        assert!(
+            validate_tcp_listen_address(address.parse().unwrap(), allow_nonloopback).is_err(),
+            "{address}"
+        );
+    }
+    for (address, allow_nonloopback) in [("127.0.0.1:7265", false), ("192.0.2.10:7265", true)] {
+        validate_tcp_listen_address(address.parse().unwrap(), allow_nonloopback).unwrap();
     }
 }
 

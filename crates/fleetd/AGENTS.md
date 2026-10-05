@@ -32,6 +32,13 @@ into a binary that changes a few times a year is the fix.
   no `bbox-*`, no tantivy, no V8. The script asserts on the resolved
   `cargo tree` graph, not on `Cargo.toml`, so a transitive arrival fails too.
   Run it whenever you touch a manifest here.
+- **A TCP address that cannot be bound never ends the process.** Whether the
+  operator granted the address (loopback, or non-loopback with the explicit
+  opt-in; never wildcard or multicast) is validated once at startup and is
+  fatal. Whether a granted address can be bound right now is an environment
+  condition: the listener task retries with bounded backoff while the Unix
+  listener and every supervised session keep running. Exiting on a bind
+  failure turns a missing interface into a supervisor restart loop.
 - **Single owner connection, generation-fenced.** Each accepted connection
   gets a fresh, never-reused generation; authenticating installs it as owner
   and fences the previous one. Two mechanisms enforce this and BOTH are
