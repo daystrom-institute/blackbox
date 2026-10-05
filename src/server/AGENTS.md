@@ -1,25 +1,32 @@
 # src/server: daemon bootstrap, wire MCP head, surfaces
 
-- The wire head extracts `?surface=` AND `?project=` once at `initialize`.
-  The surface resolves against the configured surface table
-  (`config.surfaces`); its visible tool set is computed once and pinned in a
-  per-session OnceLock that get_tool / list_tools / call_tool read. The
-  project selector resolves through the Read-intent resolver (alias / id /
-  path → base canonical path, literal fallback) into its own OnceLock.
-- Because scope is pinned at `initialize`, the wire head supports handshake
-  protocol revisions only (`supported_protocol_versions`, `get_info`) and
-  refuses `server/discover`. The SDK routes any supported no-handshake
-  revision to a stateless path that never calls `initialize`, which would
-  serve the default surface with no project or workspace binding. Widen the
-  supported set only together with per-request scope resolution.
+- Request scope is the surface with its visible tool set, the project
+  selector and the workspace binding grant. `resolve_request_scope` derives
+  all of it from transport context (`?surface=`, `?project=`, the workspace
+  binding header): the surface against the configured surface table
+  (`config.surfaces`), the project through the Read-intent resolver (alias /
+  id / path → base canonical path, literal fallback). `initialize` resolves
+  once and pins the result in the session handler's OnceLocks, which
+  get_tool / list_tools / call_tool read. A request reaching an unpinned
+  handler is served by a fresh instance bound to that request's own scope
+  (`scoped_for`); it never falls back to `default` when the request names
+  something else, and the shared handler stays unpinned.
+- The wire head supports handshake protocol revisions only
+  (`supported_protocol_versions`, `get_info`) and refuses `server/discover`.
+  The SDK routes any supported no-handshake revision to a stateless path
+  that never calls `initialize`. `get_tool` has no request context and
+  resolves `default` on that path, and unpinned resolution pays the blocking
+  project probe on every call. Widening the supported set is a deliberate
+  gate, never a side effect of an SDK bump.
 - Tool results are built through `BlackboxServer::tool_result`, which leaves
   the result-type discriminator absent: the same value is serialized on the
   legacy MCP wire, in `/control/*` replies and for the response budget.
-- An unknown surface must abort initialize BEFORE any session slot is set:
-  a refused surface that still pins would leave a half-initialized session
-  answering tool lists.
-- Resolution at initialize does blocking fs/git probes → blocking pool, like
-  every other resolver call site.
+- A refused scope (unknown surface, unauthenticated binding) must fail
+  BEFORE any slot is set: resolution returns the whole scope or an error,
+  and `pin_scope` sets every slot together, so no half-initialized handler
+  answers tool lists.
+- Scope resolution does blocking fs/git probes → blocking pool, like every
+  other resolver call site.
 - Startup ordering in open.rs is load-bearing and documented inline: repo-
   owned stores (knowledge, gaps) load their committed files BEFORE any save
   can run, or the in-memory set purges the repo's files; alias
