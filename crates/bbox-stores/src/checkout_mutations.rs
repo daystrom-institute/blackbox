@@ -17,9 +17,10 @@
 //! existing reader keep their two terminal states.
 //!
 //! An operator may discard a row that still needs attention, or requeue a
-//! failed or conflicted one. Discard settles the row as failed with a
-//! `discarded` record, so a daemon without the field still reads it as
-//! terminal; the checkout is untouched. Requeue returns a row to pending
+//! failed or conflicted one. Discard settles the row as a plain failed row
+//! with a `discarded` record that keeps whatever conflict or blocking
+//! predecessor it carried, so a daemon without the field reads it as a
+//! settled failure and nothing more; the checkout is untouched. Requeue returns a row to pending
 //! only while it is the newest row on its path and the publication still
 //! matches the base it was computed from, so a redelivery can never
 //! overwrite content that moved underneath it.
@@ -112,6 +113,10 @@ pub struct PendingCheckoutMutation {
     pub discarded: Option<MutationDiscard>,
 }
 
+/// A discarded row is `failed` with nothing else set: the conflict and the
+/// blocking predecessor it may have carried move in here, so a daemon that
+/// does not know this record reads the row as a plain terminal failure
+/// rather than as a conflict to list or a chain break to repair.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MutationDiscard {
     pub at: String,
@@ -119,6 +124,12 @@ pub struct MutationDiscard {
     /// The attention state the row had when it was discarded, as the
     /// attention report names states.
     pub prior_state: String,
+    /// The conflict the row carried, when it was conflicted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conflict: Option<MutationConflict>,
+    /// The predecessor the row was blocked behind, when it was blocked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_by: Option<String>,
 }
 
 /// Why an operator reconciliation did not happen. Each is a precondition
@@ -961,9 +972,9 @@ impl CheckoutMutations {
     }
 
     /// Settle the rows of [`Self::discard_plan`] as failed with a discard
-    /// record. The checkout is untouched; the rows stop counting as
-    /// outstanding, so the next edit of the path starts from the accepted
-    /// publication again. Returns the plan that was applied.
+    /// record and nothing else set. The checkout is untouched; the rows stop
+    /// counting as outstanding, so the next edit of the path starts from the
+    /// accepted publication again. Returns the plan that was applied.
     pub fn discard(
         &mut self,
         mutation_id: &str,
@@ -989,6 +1000,8 @@ impl CheckoutMutations {
                 at: now.to_string(),
                 audit_reason: audit_reason.to_string(),
                 prior_state,
+                conflict: row.conflict.take(),
+                blocked_by: row.blocked_by.take(),
             });
         }
         Ok(plan)
@@ -2291,6 +2304,8 @@ mod tests {
                 at: "2026-08-12T00:03:00Z".into(),
                 audit_reason: "wrong edit".into(),
                 prior_state: "pending".into(),
+                conflict: None,
+                blocked_by: None,
             })
         );
         assert_eq!(store.attention_state(&second), Some("discarded"));
@@ -2474,14 +2489,50 @@ mod tests {
         assert!(row.mutation.guard.is_some());
     }
 
-    /// A discarded row is written with status failed, so a daemon that does
-    /// not know the discard field still reads it as terminal.
+    /// A discarded row is written as a plain failed row plus the discard
+    /// record, whatever it was before: a daemon that does not know the
+    /// record reads a pending, conflicted or blocked row alike as a settled
+    /// failure, never as a conflict to list or a chain break to repair.
     #[test]
-    fn a_discarded_row_persists_as_failed() {
+    fn a_discarded_row_persists_as_a_plain_failed_row() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mutations.json");
         let mut store = CheckoutMutations::open(&path).unwrap();
         store.enqueue(mutation("cm-00000000000000c1")).unwrap();
+        let config = ".bbox/mcp.json";
+        let head = store
+            .enqueue_guarded(
+                scope(),
+                config.into(),
+                Some("{\"a\":1}".into()),
+                Some("{}"),
+                Some("{}".into()),
+                "head".into(),
+                "2026-08-12T00:00:00Z".into(),
+            )
+            .unwrap();
+        let tail = store
+            .enqueue_guarded(
+                scope(),
+                config.into(),
+                Some("{\"a\":2}".into()),
+                Some("{\"a\":1}"),
+                Some("{}".into()),
+                "tail".into(),
+                "2026-08-12T00:00:01Z".into(),
+            )
+            .unwrap();
+        store
+            .ack_with_observation(
+                &head.mutation_id,
+                CHECKOUT_MUTATION_OUTCOME_CONFLICTED,
+                Some("precondition".into()),
+                None,
+                Some("x".repeat(64)),
+                "2026-08-12T00:00:30Z",
+            )
+            .unwrap();
+        assert_eq!(store.attention_state(&tail.mutation_id), Some("blocked"));
         store
             .discard(
                 "cm-00000000000000c1",
@@ -2490,18 +2541,56 @@ mod tests {
                 "2026-08-12T00:01:00Z",
             )
             .unwrap();
-        let snapshot = store.snapshot().unwrap();
-        let raw: serde_json::Value = serde_json::to_value(&snapshot).unwrap();
-        assert_eq!(raw["mutations"][0]["status"], "failed");
-        assert_eq!(raw["mutations"][0]["discarded"]["prior_state"], "pending");
-        let mut without_field = raw.clone();
-        without_field["mutations"][0]
-            .as_object_mut()
+        let plan = store
+            .discard(
+                &head.mutation_id,
+                true,
+                "abandon the chain",
+                "2026-08-12T00:01:00Z",
+            )
+            .unwrap();
+        assert_eq!(
+            plan.mutation_ids,
+            vec![head.mutation_id.clone(), tail.mutation_id.clone()]
+        );
+        let discarded_head = store.get(&head.mutation_id).unwrap();
+        assert!(discarded_head.conflict.is_none() && discarded_head.blocked_by.is_none());
+        let record = discarded_head.discarded.as_ref().unwrap();
+        assert_eq!(record.prior_state, "conflicted");
+        assert_eq!(
+            record.conflict,
+            Some(MutationConflict {
+                observed_sha256: Some("x".repeat(64)),
+            })
+        );
+        let record = store
+            .get(&tail.mutation_id)
             .unwrap()
-            .remove("discarded");
+            .discarded
+            .as_ref()
+            .unwrap();
+        assert_eq!(record.prior_state, "blocked");
+        assert_eq!(
+            record.blocked_by.as_deref(),
+            Some(head.mutation_id.as_str())
+        );
+        assert!(store.get(&tail.mutation_id).unwrap().blocked_by.is_none());
+
+        let raw: serde_json::Value = serde_json::to_value(&store.snapshot().unwrap()).unwrap();
+        let mut without_field = raw.clone();
+        for row in without_field["mutations"].as_array_mut().unwrap() {
+            assert_eq!(row["status"], "failed");
+            assert!(row.get("conflict").is_none() && row.get("blocked_by").is_none());
+            row.as_object_mut().unwrap().remove("discarded");
+        }
         let older: CheckoutMutationStore = serde_json::from_value(without_field).unwrap();
-        assert_eq!(older.mutations[0].status, CheckoutMutationStatus::Failed);
-        assert!(older.mutations[0].discarded.is_none());
+        let older = CheckoutMutations::from_snapshot(older);
+        for id in ["cm-00000000000000c1", &head.mutation_id, &tail.mutation_id] {
+            assert_eq!(older.attention_state(id), Some("failed"), "{id}");
+        }
+        // Nothing for the older daemon's chain repair to pick as a break
+        // row either: the chain has no outstanding row left.
+        assert!(older.outstanding_intents().next().is_none());
     }
 
     #[test]
