@@ -226,6 +226,40 @@ pub fn validate_tcp_listen_address(
     Ok(())
 }
 
+/// The TCP listen addresses fleetd serves: every `--listen-tcp` flag in order,
+/// or, when no flag is given, the comma-separated environment value. Flags
+/// replace the environment list rather than adding to it. The same address
+/// twice is refused, since the second bind could never succeed.
+pub fn resolve_tcp_listen_addresses(
+    environment: Option<&str>,
+    flags: &[String],
+) -> anyhow::Result<Vec<SocketAddr>> {
+    let (source, values): (&str, Vec<&str>) = if flags.is_empty() {
+        (
+            "BLACKBOX_FLEETD_LISTEN_TCP",
+            environment
+                .unwrap_or_default()
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .collect(),
+        )
+    } else {
+        ("--listen-tcp", flags.iter().map(String::as_str).collect())
+    };
+    let mut addresses = Vec::with_capacity(values.len());
+    for value in values {
+        let address: SocketAddr = value
+            .parse()
+            .map_err(|error| anyhow::anyhow!("invalid {source} address `{value}`: {error}"))?;
+        if addresses.contains(&address) {
+            anyhow::bail!("{source} names {address} more than once");
+        }
+        addresses.push(address);
+    }
+    Ok(addresses)
+}
+
 /// Delay between TCP bind attempts: doubles from `initial` up to `max`.
 #[derive(Debug, Clone, Copy)]
 pub struct TcpBindBackoff {

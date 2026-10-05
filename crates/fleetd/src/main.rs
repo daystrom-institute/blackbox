@@ -10,15 +10,15 @@ use std::path::PathBuf;
 
 use fleetd::paths::{FleetdPaths, default_state_dir};
 use fleetd::server::{
-    Fleetd, TcpBindBackoff, bind_listener, build_identity, serve, serve_tcp_retrying,
-    validate_tcp_listen_address,
+    Fleetd, TcpBindBackoff, bind_listener, build_identity, resolve_tcp_listen_addresses, serve,
+    serve_tcp_retrying, validate_tcp_listen_address,
 };
 
 const USAGE: &str = "\
 fleetd - the per-machine blackbox fleet supervisor
 
 USAGE:
-    fleetd [--state-dir <path>] [--listen-tcp <ip:port> [--allow-nonloopback-tcp]]
+    fleetd [--state-dir <path>] [--listen-tcp <ip:port>]... [--allow-nonloopback-tcp]
 
 OPTIONS:
     --state-dir <path>  Directory holding fleetd.sock and fleetd.token.
@@ -29,13 +29,16 @@ OPTIONS:
                         no daemon config: a daemon whose paths.state_dir or
                         paths.bro_home is set in its config file needs a
                         matching --state-dir here.
-    --listen-tcp <addr> Optional TCP owner listener. Loopback is allowed for
+    --listen-tcp <addr> Optional TCP owner listener; repeat the flag to serve
+                        several addresses. Loopback is allowed for
                         local tunnels. A non-loopback address also requires
                         --allow-nonloopback-tcp and MUST be protected by an
                         encrypted, ACL-restricted transport such as a tailnet.
-                        When the address cannot be bound, fleetd keeps serving
-                        its Unix socket and retries the bind with backoff
-                        (1s doubling to 60s).
+                        When an address cannot be bound, fleetd keeps serving
+                        its Unix socket and every other address, and retries
+                        that bind with backoff (1s doubling to 60s). With no
+                        flag, BLACKBOX_FLEETD_LISTEN_TCP supplies a
+                        comma-separated list.
     --allow-nonloopback-tcp
                         Explicitly allow --listen-tcp on a non-loopback IP.
     -h, --help          Print this help.
@@ -44,19 +47,14 @@ OPTIONS:
 
 struct Options {
     state_dir: Option<PathBuf>,
-    listen_tcp: Option<SocketAddr>,
+    listen_tcp: Vec<SocketAddr>,
     allow_nonloopback_tcp: bool,
 }
 
 fn parse_options() -> anyhow::Result<Options> {
     let mut args = std::env::args().skip(1);
     let mut state_dir = None;
-    let mut listen_tcp = std::env::var("BLACKBOX_FLEETD_LISTEN_TCP")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .map(|value| value.parse::<SocketAddr>())
-        .transpose()
-        .map_err(|error| anyhow::anyhow!("invalid BLACKBOX_FLEETD_LISTEN_TCP: {error}"))?;
+    let mut listen_tcp_flags = Vec::new();
     let mut allow_nonloopback_tcp = std::env::var("BLACKBOX_FLEETD_ALLOW_NONLOOPBACK_TCP")
         .ok()
         .is_some_and(|value| matches!(value.trim(), "1" | "true" | "yes"));
@@ -72,9 +70,7 @@ fn parse_options() -> anyhow::Result<Options> {
                 let value = args
                     .next()
                     .ok_or_else(|| anyhow::anyhow!("--listen-tcp requires an ip:port"))?;
-                listen_tcp = Some(value.parse().map_err(|error| {
-                    anyhow::anyhow!("invalid --listen-tcp address `{value}`: {error}")
-                })?);
+                listen_tcp_flags.push(value);
             }
             "--allow-nonloopback-tcp" => allow_nonloopback_tcp = true,
             "-h" | "--help" => {
@@ -89,7 +85,11 @@ fn parse_options() -> anyhow::Result<Options> {
             other => anyhow::bail!("unrecognized argument `{other}`\n\n{USAGE}"),
         }
     }
-    if allow_nonloopback_tcp && listen_tcp.is_none() {
+    let listen_tcp = resolve_tcp_listen_addresses(
+        std::env::var("BLACKBOX_FLEETD_LISTEN_TCP").ok().as_deref(),
+        &listen_tcp_flags,
+    )?;
+    if allow_nonloopback_tcp && listen_tcp.is_empty() {
         anyhow::bail!("--allow-nonloopback-tcp requires --listen-tcp");
     }
     Ok(Options {
@@ -123,8 +123,8 @@ async fn main() -> anyhow::Result<()> {
     // A TCP address the operator has not granted is a configuration error
     // and stops startup. Whether a granted address can be bound right now is
     // not: the listener task retries, and the Unix listener serves meanwhile.
-    if let Some(address) = options.listen_tcp {
-        validate_tcp_listen_address(address, options.allow_nonloopback_tcp)?;
+    for address in &options.listen_tcp {
+        validate_tcp_listen_address(*address, options.allow_nonloopback_tcp)?;
     }
     let listener = bind_listener(&paths.socket).await?;
     let state = Fleetd::new(token, build_identity());
@@ -138,13 +138,19 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let serving = tokio::spawn(serve(state.clone(), listener));
-    let serving_tcp = options.listen_tcp.map(|address| {
-        tokio::spawn(serve_tcp_retrying(
-            state.clone(),
-            address,
-            TcpBindBackoff::default(),
-        ))
-    });
+    // One task per address: each binds, retries and serves on its own, so an
+    // address that is unavailable never delays or stops another.
+    let serving_tcp: Vec<_> = options
+        .listen_tcp
+        .iter()
+        .map(|address| {
+            tokio::spawn(serve_tcp_retrying(
+                state.clone(),
+                *address,
+                TcpBindBackoff::default(),
+            ))
+        })
+        .collect();
     wait_for_shutdown().await;
 
     tracing::info!(
@@ -152,7 +158,7 @@ async fn main() -> anyhow::Result<()> {
         "shutting down; signalling supervised children"
     );
     serving.abort();
-    if let Some(serving_tcp) = serving_tcp {
+    for serving_tcp in serving_tcp {
         serving_tcp.abort();
     }
     state.registry().kill_all();

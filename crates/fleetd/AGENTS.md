@@ -36,8 +36,9 @@ into a binary that changes a few times a year is the fix.
   operator granted the address (loopback, or non-loopback with the explicit
   opt-in; never wildcard or multicast) is validated once at startup and is
   fatal. Whether a granted address can be bound right now is an environment
-  condition: the listener task retries with bounded backoff while the Unix
-  listener and every supervised session keep running. Exiting on a bind
+  condition: each address has its own listener task, which retries with
+  bounded backoff while the Unix listener, every other address and every
+  supervised session keep running. Exiting on a bind
   failure turns a missing interface into a supervisor restart loop.
 - **Single owner connection, generation-fenced.** Each accepted connection
   gets a fresh, never-reused generation; authenticating installs it as owner

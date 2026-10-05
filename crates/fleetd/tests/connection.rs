@@ -24,8 +24,9 @@ use bro_protocol::{
 };
 use bro_rpc::{BuildIdentity, Envelope, HandshakeOptions, NegotiatedIo, ServiceToken};
 use fleetd::server::{
-    Fleetd, TcpBindBackoff, bind_listener, bind_tcp_listener, build_identity, serve, serve_tcp,
-    serve_tcp_retrying, validate_tcp_listen_address,
+    Fleetd, TcpBindBackoff, bind_listener, bind_tcp_listener, build_identity,
+    resolve_tcp_listen_addresses, serve, serve_tcp, serve_tcp_retrying,
+    validate_tcp_listen_address,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpStream, UnixStream};
@@ -239,6 +240,95 @@ async fn tcp_bind_failure_is_retried_while_the_unix_listener_serves() {
         .expect("the recovered TCP listener serves the owner handshake");
     assert!(!serving.is_finished());
     serving.abort();
+}
+
+/// Each listen address has its own listener task: one that cannot be bound
+/// does not keep another from serving.
+#[tokio::test]
+async fn an_unavailable_tcp_address_does_not_stop_another_from_serving() {
+    let harness = start_fleetd().await;
+    let occupier = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("occupy a port");
+    let unavailable = occupier.local_addr().expect("occupied address");
+    let free = {
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("reserve a port");
+        probe.local_addr().expect("reserved address")
+    };
+    let backoff = TcpBindBackoff {
+        initial: Duration::from_millis(20),
+        max: Duration::from_millis(80),
+    };
+    let tasks: Vec<_> = [unavailable, free]
+        .into_iter()
+        .map(|address| tokio::spawn(serve_tcp_retrying(harness.state.clone(), address, backoff)))
+        .collect();
+
+    let mut listening = false;
+    for _ in 0..100 {
+        if TcpStream::connect(free).await.is_ok() {
+            listening = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(listening, "the available address must be served");
+    FakeDaemon::connect_tcp(free)
+        .await
+        .expect("the available address serves the owner handshake");
+    assert!(tasks.iter().all(|task| !task.is_finished()));
+    for task in tasks {
+        task.abort();
+    }
+    drop(occupier);
+}
+
+#[test]
+fn listen_addresses_come_from_repeated_flags_or_the_environment_list() {
+    let flags = |values: &[&str]| values.iter().map(|v| v.to_string()).collect::<Vec<_>>();
+    let parsed = |values: &[&str]| {
+        values
+            .iter()
+            .map(|v| v.parse::<std::net::SocketAddr>().unwrap())
+            .collect::<Vec<_>>()
+    };
+
+    assert!(resolve_tcp_listen_addresses(None, &[]).unwrap().is_empty());
+    assert!(
+        resolve_tcp_listen_addresses(Some("  "), &[])
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        resolve_tcp_listen_addresses(Some("127.0.0.1:7265"), &[]).unwrap(),
+        parsed(&["127.0.0.1:7265"])
+    );
+    assert_eq!(
+        resolve_tcp_listen_addresses(Some("127.0.0.1:7265, 192.0.2.10:7265"), &[]).unwrap(),
+        parsed(&["127.0.0.1:7265", "192.0.2.10:7265"])
+    );
+    // Flags replace the environment list and keep their order.
+    assert_eq!(
+        resolve_tcp_listen_addresses(
+            Some("127.0.0.1:7265"),
+            &flags(&["192.0.2.10:7265", "192.0.2.11:7265"])
+        )
+        .unwrap(),
+        parsed(&["192.0.2.10:7265", "192.0.2.11:7265"])
+    );
+    for (environment, given) in [
+        (None, flags(&["127.0.0.1:7265", "127.0.0.1:7265"])),
+        (Some("127.0.0.1:7265,127.0.0.1:7265"), flags(&[])),
+        (None, flags(&["not-an-address"])),
+        (Some("127.0.0.1"), flags(&[])),
+    ] {
+        assert!(
+            resolve_tcp_listen_addresses(environment, &given).is_err(),
+            "{environment:?} {given:?}"
+        );
+    }
 }
 
 #[test]
