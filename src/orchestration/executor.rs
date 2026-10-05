@@ -240,6 +240,7 @@ impl HarnessExecutor for LocalExecutor {
         // now that the seam is async; before the cutover the whole spawn path
         // was synchronous and this ran on the calling worker.
         let raw_bin = spec.bin_override.clone().unwrap_or_else(|| provider.bin());
+        ensure_absolute_bin_executable(&raw_bin).await?;
         let bin = tokio::task::spawn_blocking({
             let raw_bin = raw_bin.clone();
             move || providers::resolve_bin(&raw_bin)
@@ -464,4 +465,64 @@ fn spawn_control_writer(
         }
         let _ = stdin.shutdown().await;
     });
+}
+/// An absolute worker binary path names one specific executable, so there is
+/// nothing to resolve and nothing to fall back to: it must exist and be
+/// executable on this host, or the spawn fails naming the path.
+async fn ensure_absolute_bin_executable(bin: &str) -> anyhow::Result<()> {
+    if !std::path::Path::new(bin).is_absolute() {
+        return Ok(());
+    }
+    let executable = match tokio::fs::metadata(bin).await {
+        Ok(metadata) => {
+            use std::os::unix::fs::PermissionsExt;
+            metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+        }
+        Err(_) => false,
+    };
+    anyhow::ensure!(
+        executable,
+        "harness_bin_unavailable: {bin} is missing or not executable on the executing host"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod absolute_bin_tests {
+    use super::ensure_absolute_bin_executable;
+
+    async fn write_file(path: &std::path::Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::write(path, "#!/bin/sh\nexit 0\n").await.unwrap();
+        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_absolute_worker_binary_must_exist_and_be_executable() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing-harness");
+        let plain = dir.path().join("not-executable");
+        let runnable = dir.path().join("runnable");
+        write_file(&plain, 0o644).await;
+        write_file(&runnable, 0o755).await;
+
+        for refused in [&missing, &plain, &dir.path().to_path_buf()] {
+            let error = ensure_absolute_bin_executable(refused.to_str().unwrap())
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.starts_with("harness_bin_unavailable: "), "{error}");
+            assert!(error.contains(refused.to_str().unwrap()), "{error}");
+        }
+        ensure_absolute_bin_executable(runnable.to_str().unwrap())
+            .await
+            .unwrap();
+        // A bare name or relative path is resolved later, as before.
+        ensure_absolute_bin_executable("bro-harness").await.unwrap();
+        ensure_absolute_bin_executable("./relative/harness")
+            .await
+            .unwrap();
+    }
 }

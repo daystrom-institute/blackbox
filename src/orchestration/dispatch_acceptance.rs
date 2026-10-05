@@ -646,4 +646,28 @@ mod acceptance {
         await_file(&child.join("stdin"), "plain follow-up").await;
         assert_eq!(plane.finish(&resumed_task).await["status"], "completed");
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_absolute_harness_binary_that_is_missing_fails_the_dispatch_by_name() {
+        let plane = Plane::start().await;
+        let cwd = plane.cwd();
+        let missing = plane.root.join("no-such-harness");
+        // SAFETY: the plane holds the process-wide test environment guard for
+        // its whole lifetime, so no other test reads this variable meanwhile.
+        unsafe { std::env::set_var("BRO_HARNESS_BIN", &missing) };
+
+        let result = plane
+            .server
+            .bro_exec(call(json!({ "prompt": "never runs", "provider": "glm", "cwd": cwd })))
+            .await;
+        let exec = parsed(&result);
+        let task = exec["taskId"].as_str().expect("taskId").to_string();
+        let waited = plane.wait(&task, 20.0).await;
+        assert_eq!(waited["status"], "failed", "{waited}");
+        let text = waited.to_string();
+        assert!(text.contains("harness_bin_unavailable"), "{text}");
+        assert!(text.contains("no-such-harness"), "{text}");
+        // Nothing ran in its place.
+        assert!(child_dirs(&plane.root).is_empty());
+    }
 }
