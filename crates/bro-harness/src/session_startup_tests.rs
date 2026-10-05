@@ -109,6 +109,25 @@ async fn build_with_runtime(
     instruction_fs: Option<Arc<dyn crate::instruction_io::InstructionFs>>,
     callback: crate::emit::EventCallback,
 ) -> Result<Session> {
+    build_with_kind(
+        cli,
+        root,
+        compaction_models,
+        instruction_fs,
+        callback,
+        TransportKind::Anthropic,
+    )
+    .await
+}
+
+async fn build_with_kind(
+    cli: &Cli,
+    root: &Path,
+    compaction_models: Arc<StdMutex<Vec<String>>>,
+    instruction_fs: Option<Arc<dyn crate::instruction_io::InstructionFs>>,
+    callback: crate::emit::EventCallback,
+    kind: TransportKind,
+) -> Result<Session> {
     let store = SessionStore::open_in(root, None, cli.session_id.as_deref(), cli.resume.as_deref())
         .unwrap();
     let event_log = Arc::new(EventLog::at_path(
@@ -125,7 +144,7 @@ async fn build_with_runtime(
         Some(BTreeMap::new()),
         Some(BTreeMap::new()),
         Some(SessionBuildRuntime {
-            kind: TransportKind::Anthropic,
+            kind,
             tx: Box::new(StartupTransport {
                 snapshot: json!([]),
                 compaction_models,
@@ -838,4 +857,154 @@ async fn edit_discipline_defaults_to_free_and_never_guesses_an_unknown_value() {
     let wire = wire_names(&legacy);
     assert!(wire.contains(&"file_edit".to_string()), "{wire:?}");
     assert!(wire.contains(&"file_write".to_string()), "{wire:?}");
+}
+
+#[tokio::test]
+async fn structured_edit_discipline_refuses_apply_patch_where_the_transport_offers_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let build = |extra: &'static [&'static str], id: &'static str| {
+        let root = root.clone();
+        async move {
+            let mut args = vec![
+                "bro-harness",
+                "--cwd",
+                root.to_str().unwrap(),
+                "--system-prompt",
+                "",
+                "--session-id",
+                id,
+                "--model",
+                "gpt-5.5",
+            ];
+            args.extend(extra);
+            build_with_kind(
+                &Cli::try_parse_from(args).unwrap(),
+                &root,
+                Arc::default(),
+                None,
+                Arc::new(|_| {}),
+                TransportKind::OpenAiResponses,
+            )
+            .await
+            .unwrap()
+        }
+    };
+
+    // A grammar transport offers apply_patch to a free session.
+    let free = build(&[], "grammar-free").await;
+    assert!(
+        free.reg
+            .manifest()
+            .iter()
+            .any(|(name, _)| name == "apply_patch")
+            || wire_names(&free).contains(&"apply_patch".to_string()),
+        "the grammar transport must offer apply_patch for this test to mean anything"
+    );
+
+    let structured = build(&["--edit-discipline", "structured"], "grammar-structured").await;
+    let wire = wire_names(&structured);
+    let manifest: Vec<String> = structured
+        .reg
+        .manifest()
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    for tool in crate::edit_discipline::RAW_EDIT_TOOLS {
+        assert!(!wire.contains(&tool.to_string()), "{wire:?}");
+        assert!(!manifest.contains(&tool.to_string()), "{manifest:?}");
+    }
+    let refused = structured
+        .reg
+        .dispatch(
+            "apply_patch",
+            json!("*** Begin Patch\n*** End Patch"),
+            &structured.cx,
+        )
+        .await;
+    assert_eq!(refused.into_content().0, refusal_of("apply_patch"));
+}
+
+#[tokio::test]
+async fn structured_edit_discipline_still_applies_edit_sets_and_holds_across_cells() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let fixture = root.join("notes.txt");
+    std::fs::write(&fixture, "alpha\nbeta\n").unwrap();
+    let mut session = try_build(
+        &discipline_cli(&root, &["--edit-discipline", "structured"], false),
+        &root,
+    )
+    .await
+    .unwrap();
+    session.cx.root = root.clone();
+
+    // The supported path works, on a non-source text file.
+    let applied = session
+        .reg
+        .dispatch(
+            "exec",
+            json!({"source": r#"
+const es = await edits.begin();
+await edits.replaceText({ es, file: "notes.txt", find: "beta", replace: "gamma" });
+const result = await edits.apply({ es });
+text(JSON.stringify(result));
+"#}),
+            &session.cx,
+        )
+        .await;
+    let output = applied.into_content().0;
+    assert_eq!(
+        std::fs::read_to_string(&fixture).unwrap(),
+        "alpha\ngamma\n",
+        "{output}"
+    );
+
+    // Two fresh cells running at once and a cell that yielded and was waited
+    // on all meet the same refusal.
+    let probe = r#"
+try { await tools.file_write({ file_path: "notes.txt", content: "raw" }); text("no error"); }
+catch (e) { text(e.message); }
+"#;
+    let (first, second) = tokio::join!(
+        session
+            .reg
+            .dispatch("exec", json!({ "source": probe }), &session.cx),
+        session
+            .reg
+            .dispatch("exec", json!({ "source": probe }), &session.cx),
+    );
+    for output in [first.into_content().0, second.into_content().0] {
+        assert!(output.contains(&refusal_of("file_write")), "{output}");
+    }
+    let yielded = session
+        .reg
+        .dispatch(
+            "exec",
+            json!({"source": format!(
+                "// @exec: {{\"yield_time_ms\": 1}}\nawait new Promise((resolve) => setTimeout(resolve, 300));{probe}"
+            )}),
+            &session.cx,
+        )
+        .await
+        .into_content()
+        .0;
+    let cell_id = yielded
+        .split("cell ID ")
+        .nth(1)
+        .and_then(|rest| rest.split('.').next())
+        .unwrap_or_else(|| panic!("the cell did not yield: {yielded}"))
+        .to_string();
+    let waited = session
+        .reg
+        .dispatch(
+            "wait",
+            json!({ "cell_id": cell_id, "yield_time_ms": 5000 }),
+            &session.cx,
+        )
+        .await
+        .into_content()
+        .0;
+    assert!(waited.contains(&refusal_of("file_write")), "{waited}");
+    assert_eq!(std::fs::read_to_string(&fixture).unwrap(), "alpha\ngamma\n");
 }
