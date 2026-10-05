@@ -218,7 +218,7 @@ audit left as open corrections for tools still served are implemented:
 | `bbox_project_publisher_status` | `detail_limit` is validated with its `detail`; the last acceptance attempt carries explicit truncation markers |
 | `bbox_thread` | Explicit `detail=summary` works; `detail=metadata` recovers topic, sessions and edges exactly |
 | `bro_allocator_probe` | Contradictory clear and update fields are refused before any write |
-| `bbox_doctor` | Summary pages rank every collected finding by `offset` and `limit` and never truncate a message or repair command; sections collect only when selected. Whether catalog producers still cap findings before the report was not re-verified |
+| `bbox_doctor` | Catalog producers emit every finding; summary pages rank them by `offset` and `limit` without truncating a message or repair command, and exact body pages recover the complete report |
 
 Evidence for this table is source inspection of the adapters and their
 parameter types, not a rerun of the isolated HTTP probe; the probe's last
