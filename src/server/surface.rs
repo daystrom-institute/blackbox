@@ -359,6 +359,17 @@ mod tests {
             .iter()
             .map(|t| t.name.to_string())
             .collect();
+        // Every served tool is classified exactly once, so adding a tool
+        // fails here until it is placed on the agent-facing surfaces or kept
+        // to `ops`.
+        for name in &universe {
+            let placements = usize::from(KEEP.contains(&name.as_str()))
+                + usize::from(OPS_ONLY.contains(&name.as_str()));
+            assert_eq!(
+                placements, 1,
+                "tool {name} must be listed in exactly one of KEEP (agent-facing surfaces) or OPS_ONLY (ops surface only)"
+            );
+        }
         let surfaces = crate::config::default_surfaces();
         let ops = visible_tool_set(&surfaces["ops"], &universe);
         for name in KEEP.iter().chain(OPS_ONLY) {
