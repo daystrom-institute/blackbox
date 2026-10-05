@@ -3,7 +3,7 @@
 # carrying live orchestration state.
 #
 # The protected resource is live orchestration state (running bro tasks,
-# bro_wait / bro_when_* long-polls, sessions still writing threads / notes /
+# bro_wait / bro_when_* long-polls, sessions still writing threads /
 # knowledge), not build capacity. The daemon
 # exposes a cheap JSON probe plus an operator-togglable admission drain
 # (src/server/drain.rs); this script turns them into a gate an external
@@ -140,8 +140,6 @@ if not raw:
         if window > 0 and writes["total"]:
             for t in writes["threads"]:
                 print(f"  thread {t['id']}  {t.get('status')}  last_activity={t['last_activity']}  {t.get('topic','')[:60]}")
-            for n in writes["notes"]:
-                print(f"  note   {n['id']}  {n.get('kind')}  updated_at={n['updated_at']}")
             for k in writes["knowledge"]:
                 print(f"  kb     {k['id']}  updated_at={k['updated_at']}  {k.get('title','')[:60]}")
         print("blocking: " + "; ".join(blocking))
