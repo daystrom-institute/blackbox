@@ -624,10 +624,6 @@ fn read_child_directories(path: &Path, allowed_files: &[&str]) -> Result<Vec<Pat
 /// one and must pass over it.
 const ATOMIC_REPLACE_TEMP_PREFIX: &str = ".bbox-store-";
 
-fn read_regular_json_files(path: &Path) -> Result<Vec<PathBuf>> {
-    read_regular_json_files_except(path, None)
-}
-
 /// Regular JSON members of `path`, sorted. Members whose name starts with
 /// `skipped_prefix` are passed over without inspection; any other non-regular
 /// or non-JSON member is malformed state.
