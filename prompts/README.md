@@ -56,4 +56,4 @@ See [`agents/`](agents/README.md). Lens prompts referenced by brofiles/orchestra
   behavior, so the brofile stays a thin pointer (`prompts/agents/<lens>.md`).
 - Gap-filing prompts must reuse existing gap kinds (`mcp_surface`,
   `tooling`, `workflow`, `agent`, `docs_runbook`, `refactor_primitive`,
-  `ontology`, `eval_coverage`, `packet_ast`) — never coin a new kind.
+  `ontology`, `eval_coverage`); never coin a new kind.

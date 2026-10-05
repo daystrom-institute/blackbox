@@ -416,6 +416,7 @@ impl BlackboxServer {
         p: &GapFileParams,
         raw: &str,
     ) -> anyhow::Result<Option<String>> {
+        crate::gaps::parse_filing_gap_kind(&p.gap_kind)?;
         let Some((project_id, scope)) = self.covered_project_scope(raw) else {
             return Ok(None);
         };
@@ -1198,6 +1199,34 @@ mod tests {
             rows.iter().any(|gap| gap.id == "gap-ffffffff"),
             "filing dedupe must see the intervening publication"
         );
+    }
+
+    #[tokio::test]
+    async fn owner_lane_gap_filing_refuses_packet_ast_before_queueing() {
+        use crate::server::state::catalog_fixture::CatalogFixture;
+        let fixture = CatalogFixture::new();
+        let scope = CatalogFixture::scope(".");
+        fixture.add_published_project("p_queue", &scope);
+        fixture.install_publication("p_queue", &scope, &"1".repeat(40), &[], &[]);
+        let server = fixture.server();
+        let mut params = gap_params("p_queue".into());
+        params.gap_kind = "packet_ast".into();
+        params.dedupe_key = "packet_ast/test-domain/owner-lane".into();
+        // The kind is refused before coverage is consulted, so the refusal
+        // does not depend on which carrier the project would have used.
+        let error = server
+            .enqueue_gap_file_via_checkout_owner(&params, "p_queue")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("gap_kind must be one of"), "{error}");
+        assert!(!error.contains("packet_ast"), "{error}");
+        assert_eq!(server.state.checkout_mutations.read().pending_count(), 0);
+
+        params.gap_kind = "tooling".into();
+        params.dedupe_key = "tooling/test-domain/owner-lane".into();
+        server
+            .enqueue_gap_file_via_checkout_owner(&params, "p_queue")
+            .expect("a current kind passes the filing gate");
     }
 
     #[tokio::test]

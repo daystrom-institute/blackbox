@@ -118,7 +118,7 @@ Do not file a gap for:
 ```text
 bbox_gap(
   title="Short human-readable gap title",
-  gap_kind="tooling|mcp_surface|docs_runbook|workflow|agent|ontology|refactor_primitive|eval_coverage|packet_ast",
+  gap_kind="tooling|mcp_surface|docs_runbook|workflow|agent|ontology|refactor_primitive|eval_coverage",
   domain="harness/<area>",
   wanted_capability="Reusable harness/substrate capability wanted.",
   missing_primitive="Concrete missing or wrong-shaped primitive, if known.",

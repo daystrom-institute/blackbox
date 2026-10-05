@@ -98,7 +98,7 @@ interactive operating experience, not more product work.
 > `bbox_gaps`, then file one gap per distinct issue with `bbox_gap` when that
 > tool is available. Use the existing gap kinds; do not coin a new kind:
 > `mcp_surface`, `tooling`, `workflow`, `agent`, `docs_runbook`,
-> `refactor_primitive`, `ontology`, `eval_coverage`, `packet_ast`.
+> `refactor_primitive`, `ontology`, `eval_coverage`.
 >
 > If something is more like durable local/project knowledge, operator/process
 > feedback, or environment follow-up than a gap, record it as a thread note

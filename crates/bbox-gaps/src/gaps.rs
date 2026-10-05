@@ -45,7 +45,8 @@ pub const GAP_NOTE_TYPE: &str = "blackbox.gap_note.v1";
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum GapKind {
-    /// Predicate a rule AST cannot express.
+    /// Predicate a rule AST cannot express. Stored records keep this kind;
+    /// new filings refuse it because the rule engine it names is gone.
     PacketAst,
     /// Missing CLI / shell / refactor helper.
     Tooling,
@@ -225,6 +226,25 @@ fn parse_gap_kind(value: &str) -> Result<GapKind> {
             variants_list(<GapKind as strum::VariantNames>::VARIANTS)
         )
     })
+}
+
+/// Parse the kind of a new `bbox_gap` filing. Every stored kind stays
+/// readable through `parse_gap_kind`; a new gap cannot be filed as
+/// `packet_ast`. Envelope ingest (`GapNote::from_envelope`) stays permissive:
+/// it re-validates stored records on update and reads host-dropped spool
+/// files, which are never turned into rejections by this rule.
+pub fn parse_filing_gap_kind(value: &str) -> Result<GapKind> {
+    match GapKind::from_str(value.trim()) {
+        Ok(kind) if kind != GapKind::PacketAst => Ok(kind),
+        _ => {
+            let accepted: Vec<&str> = <GapKind as strum::VariantNames>::VARIANTS
+                .iter()
+                .copied()
+                .filter(|name| *name != GapKind::PacketAst.as_ref())
+                .collect();
+            anyhow::bail!("gap_kind must be one of: {}", variants_list(&accepted))
+        }
+    }
 }
 
 fn parse_impact(value: Option<&str>) -> Result<GapImpact> {
@@ -1541,7 +1561,7 @@ impl GapStore {
         if p.title.trim().is_empty() {
             anyhow::bail!("'title' is required and cannot be empty");
         }
-        let gap_kind = parse_gap_kind(&p.gap_kind)?;
+        let gap_kind = parse_filing_gap_kind(&p.gap_kind)?;
         if p.domain.trim().is_empty() {
             anyhow::bail!("'domain' is required and cannot be empty");
         }
@@ -3528,6 +3548,54 @@ mod tests {
         p.gap_kind = "nonsense".into();
         let err = store.file(&p).unwrap_err().to_string();
         assert!(err.contains("gap_kind must be one of"));
+    }
+
+    #[test]
+    fn packet_ast_is_refused_for_new_filings_and_kept_for_stored_records() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let mut store = GapStore::open(&root.join("gaps.json")).unwrap();
+        let mut p = file_params("x", "packet_ast/d/s");
+        p.gap_kind = "packet_ast".into();
+        let err = store.file(&p).unwrap_err().to_string();
+        assert!(err.contains("gap_kind must be one of"), "{err}");
+        assert!(!err.contains("packet_ast"), "{err}");
+        assert!(err.contains("tooling"), "{err}");
+        assert!(store.query(&GapListParams::default()).is_empty());
+
+        // A record stored under the kind still loads, filters and resolves.
+        let stored = GapNote::from_envelope(
+            &serde_json::json!({
+                "type": GAP_NOTE_TYPE,
+                "title": "Stored packet gap",
+                "gap_kind": "packet_ast",
+                "domain": "legacy/rules",
+                "wanted_capability": "A predicate the removed rule engine lacked.",
+                "dedupe_key": "packet_ast/legacy/stored",
+            }),
+            GapStore::gen_id(),
+            GapStore::now_iso(),
+        )
+        .unwrap();
+        assert_eq!(stored.gap_kind, GapKind::PacketAst);
+        let id = stored.id.clone();
+        store.ingest(stored).unwrap();
+        let filtered = store.query(&GapListParams {
+            gap_kind: Some("packet_ast".into()),
+            ..Default::default()
+        });
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, id);
+        store
+            .resolve(&GapResolveParams {
+                id: id.clone(),
+                resolution: "addressed".into(),
+                note: None,
+                superseded_by: None,
+                project: None,
+                write_dir: None,
+            })
+            .unwrap();
     }
 
     #[test]
