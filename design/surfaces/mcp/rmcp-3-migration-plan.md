@@ -221,7 +221,21 @@ path for current clients. No tasks/resources yet.
    wait. The daemon removes the variable from the environment a worker
    inherits; it reaches a worker only through an explicit account or
    per-dispatch env. The harness connection to the daemon exercises the
-   modern path once both gates are on.
+   modern path once both gates are on. Expected sequences with the flag
+   set to `auto` and a budget that admits the probe:
+   - Daemon gate on: `server/discover` answered, then every request
+     sessionless at 2026-07-28; no `initialize`, no session id.
+   - Daemon gate off: `server/discover` refused with HTTP 400 and
+     `-32022` naming the supported handshake revisions, then a second
+     connection with the 2025-06-18 handshake. The SDK reports that
+     refusal as no compatible version rather than as a legacy peer, so
+     the harness makes the second connection itself, only for that
+     outcome of a probing lifecycle and inside the same startup budget.
+   - A peer that rejects the method (`-32601`): handshake on the same
+     connection, by the SDK.
+   - An unknown surface: refused on whichever request reaches the
+     handler first (the probe with the gate on, the handshake after the
+     `-32022` with it off) and the server is unavailable.
 8. `BBOX_MCP_SESSION_KEEPALIVE_SECS` becomes legacy-only; document.
 
 Validation: per-request scope extraction covered by unit tests at the

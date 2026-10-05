@@ -14,7 +14,7 @@
 //! Lifecycle: every connection uses the `initialize` handshake at 2025-06-18
 //! unless `BRO_HARNESS_MCP_HTTP_LIFECYCLE=auto`, which makes HTTP servers
 //! probe `server/discover` first and fall back to the handshake when the
-//! peer rejects it or stays silent. The probe is used only for a server
+//! peer rejects it, serves no sessionless revision, or stays silent. The probe is used only for a server
 //! whose `startup_timeout_ms` is at least 20 s, since the SDK waits a fixed
 //! 10 s on a silent peer before falling back. Stdio servers always use the
 //! handshake. Code that reads a connection must hold for both: a sessionless
@@ -316,6 +316,34 @@ fn http_lifecycle(
     }
 }
 
+/// Serve one connection under `lifecycle`, connecting again with the
+/// handshake when discovery finds no common sessionless revision. A peer that
+/// knows `server/discover` but serves only handshake revisions refuses the
+/// probe as an unsupported version; the SDK reports that as no compatible
+/// version instead of falling back, and the refused exchange has used up the
+/// transport, so the handshake needs a new one.
+async fn serve_with_handshake_fallback<T, E, A>(
+    mut connect: impl FnMut() -> anyhow::Result<T>,
+    lifecycle: ClientLifecycleMode,
+) -> anyhow::Result<rmcp::service::RunningService<rmcp::RoleClient, ClientConfig>>
+where
+    T: rmcp::transport::IntoTransport<rmcp::RoleClient, E, A>,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    let probes = lifecycle != ClientLifecycleMode::Initialize;
+    match legacy_client_config()
+        .serve_with_lifecycle(connect()?, lifecycle)
+        .await
+    {
+        Err(rmcp::service::ClientInitializeError::NoCompatibleProtocolVersion { .. }) if probes => {
+            Ok(legacy_client_config()
+                .serve_with_lifecycle(connect()?, ClientLifecycleMode::Initialize)
+                .await?)
+        }
+        served => Ok(served?),
+    }
+}
+
 /// Start one persistent connection to a remote (stdio/http/sse) MCP server.
 /// InProcess servers have no rmcp connection and are handled by the caller.
 async fn start_remote_server(
@@ -335,15 +363,19 @@ async fn start_remote_server(
                 .await?
         }
         McpServerConfig::Http { url, headers, .. } => {
-            let transport =
-                StreamableHttpClientTransport::from_config(http_transport_config(url, headers)?);
             let lifecycle = http_lifecycle(
                 std::env::var(HTTP_LIFECYCLE_ENV).ok().as_deref(),
                 std::time::Duration::from_millis(startup_timeout_ms),
             );
-            legacy_client_config()
-                .serve_with_lifecycle(transport, lifecycle)
-                .await?
+            serve_with_handshake_fallback(
+                || {
+                    Ok(StreamableHttpClientTransport::from_config(
+                        http_transport_config(url, headers)?,
+                    ))
+                },
+                lifecycle,
+            )
+            .await?
         }
         McpServerConfig::Sse { .. } => anyhow::bail!("legacy SSE MCP transport is unsupported"),
         McpServerConfig::InProcess { .. } => {
@@ -543,6 +575,8 @@ mod tests {
     enum Discovery {
         Answered,
         Rejected,
+        /// Known method, but no sessionless revision is served.
+        Unsupported,
         Ignored,
     }
 
@@ -555,50 +589,69 @@ mod tests {
         startup_budget: std::time::Duration,
     ) -> Vec<Value> {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-        let (client, server) = tokio::io::duplex(16 * 1024);
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let captured = requests.clone();
-        let peer = tokio::spawn(async move {
-            let (read, mut write) = tokio::io::split(server);
-            let mut lines = tokio::io::BufReader::new(read).lines();
-            while let Some(line) = lines.next_line().await.unwrap() {
-                let request: Value = serde_json::from_str(&line).unwrap();
-                captured.lock().unwrap().push(request.clone());
-                let id = request["id"].clone();
-                let reply = match (request["method"].as_str().unwrap(), discovery) {
-                    ("server/discover", Discovery::Answered) => serde_json::json!({
-                        "jsonrpc":"2.0","id":id,"result":{
-                            "resultType":"complete",
-                            "supportedVersions":["2025-06-18","2026-07-28"],
-                            "capabilities":{"tools":{}},
-                            "ttlMs":1000,"cacheScope":"private"}}),
-                    ("server/discover", Discovery::Rejected) => serde_json::json!({
-                        "jsonrpc":"2.0","id":id,
-                        "error":{"code":-32601,"message":"Method not found"}}),
-                    ("server/discover", Discovery::Ignored) => continue,
-                    ("initialize", _) => serde_json::json!({
-                        "jsonrpc":"2.0","id":id,"result":{
-                            "protocolVersion":request["params"]["protocolVersion"],
-                            "capabilities":{"tools":{}},
-                            "serverInfo":{"name":"fixture","version":"1"}}}),
-                    ("tools/list", _) => serde_json::json!({
-                        "jsonrpc":"2.0","id":id,"result":{
-                            "resultType":"complete","tools":[],
-                            "ttlMs":1000,"cacheScope":"private"}}),
-                    ("notifications/initialized", _) => continue,
-                    (method, _) => panic!("unexpected fixture method {method}"),
-                };
-                write
-                    .write_all(format!("{reply}\n").as_bytes())
-                    .await
-                    .unwrap();
+        let peers = Arc::new(std::sync::Mutex::new(Vec::new()));
+        // Each connection gets its own peer; all of them record into one log.
+        let connect = {
+            let requests = requests.clone();
+            let peers = peers.clone();
+            move || {
+                let (client, server) = tokio::io::duplex(16 * 1024);
+                let captured = requests.clone();
+                peers.lock().unwrap().push(tokio::spawn(async move {
+                    let (read, mut write) = tokio::io::split(server);
+                    let mut lines = tokio::io::BufReader::new(read).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let request: Value = serde_json::from_str(&line).unwrap();
+                        captured.lock().unwrap().push(request.clone());
+                        let id = request["id"].clone();
+                        let reply = match (request["method"].as_str().unwrap(), discovery) {
+                            ("server/discover", Discovery::Answered) => serde_json::json!({
+                                "jsonrpc":"2.0","id":id,"result":{
+                                    "resultType":"complete",
+                                    "supportedVersions":["2025-06-18","2026-07-28"],
+                                    "capabilities":{"tools":{}},
+                                    "ttlMs":1000,"cacheScope":"private"}}),
+                            ("server/discover", Discovery::Rejected) => serde_json::json!({
+                                "jsonrpc":"2.0","id":id,
+                                "error":{"code":-32601,"message":"Method not found"}}),
+                            ("server/discover", Discovery::Unsupported) => serde_json::json!({
+                                "jsonrpc":"2.0","id":id,
+                                "error":{"code":-32022,"message":"Unsupported protocol version",
+                                    "data":{"supported":["2024-11-05","2025-03-26","2025-06-18"],
+                                        "requested":"2026-07-28"}}}),
+                            ("server/discover", Discovery::Ignored) => continue,
+                            ("initialize", _) => serde_json::json!({
+                                "jsonrpc":"2.0","id":id,"result":{
+                                    "protocolVersion":request["params"]["protocolVersion"],
+                                    "capabilities":{"tools":{}},
+                                    "serverInfo":{"name":"fixture","version":"1"}}}),
+                            ("tools/list", _) => serde_json::json!({
+                                "jsonrpc":"2.0","id":id,"result":{
+                                    "resultType":"complete","tools":[],
+                                    "ttlMs":1000,"cacheScope":"private"}}),
+                            ("notifications/initialized", _) => continue,
+                            (method, _) => panic!("unexpected fixture method {method}"),
+                        };
+                        if write
+                            .write_all(format!("{reply}\n").as_bytes())
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                }));
+                Ok(client)
             }
-        });
+        };
         let conn = tokio::time::timeout(startup_budget, async {
-            let running = legacy_client_config()
-                .serve_with_lifecycle(client, http_lifecycle(Some("auto"), startup_budget))
-                .await
-                .unwrap();
+            let running = serve_with_handshake_fallback(
+                connect,
+                http_lifecycle(Some("auto"), startup_budget),
+            )
+            .await
+            .unwrap();
             let conn = remote::ServerConn::new(running, "fixture".into(), 5_000);
             assert!(conn.list_tools().await.unwrap().is_empty());
             conn
@@ -606,7 +659,9 @@ mod tests {
         .await
         .expect("the connection starts inside its startup budget");
         drop(conn);
-        peer.abort();
+        for peer in peers.lock().unwrap().drain(..) {
+            peer.abort();
+        }
         let seen = requests.lock().unwrap().clone();
         seen
     }
@@ -643,6 +698,78 @@ mod tests {
                 .is_none(),
             "{}",
             requests[3]
+        );
+    }
+
+    /// A peer that knows discovery but serves only handshake revisions
+    /// refuses the probe as an unsupported version. That is this daemon with
+    /// its modern lifecycle off, and it must still connect.
+    #[tokio::test]
+    async fn auto_reconnects_with_the_handshake_when_no_sessionless_revision_is_served() {
+        let requests = auto_lifecycle_requests(Discovery::Unsupported, ROOMY).await;
+        assert_eq!(methods(&requests)[0], "server/discover");
+        assert_eq!(methods(&requests)[1..], HANDSHAKE);
+        assert_eq!(requests[1]["params"]["protocolVersion"], "2025-06-18");
+    }
+
+    /// Connects under `lifecycle` to peers that refuse discovery as an
+    /// unsupported version and fail the handshake, and returns how many
+    /// connections were made before the error came back.
+    async fn connections_before_a_failed_handshake(lifecycle: ClientLifecycleMode) -> usize {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let connect = {
+            let connections = connections.clone();
+            move || {
+                connections.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let (client, server) = tokio::io::duplex(16 * 1024);
+                tokio::spawn(async move {
+                    let (read, mut write) = tokio::io::split(server);
+                    let mut lines = tokio::io::BufReader::new(read).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let request: Value = serde_json::from_str(&line).unwrap();
+                        let error = match request["method"].as_str().unwrap() {
+                            "server/discover" => serde_json::json!({
+                                "code":-32022,"message":"Unsupported protocol version",
+                                "data":{"supported":["2025-06-18"],"requested":"2026-07-28"}}),
+                            _ => serde_json::json!({"code":-32603,"message":"handshake refused"}),
+                        };
+                        let reply =
+                            serde_json::json!({"jsonrpc":"2.0","id":request["id"],"error":error});
+                        if write
+                            .write_all(format!("{reply}\n").as_bytes())
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+                Ok(client)
+            }
+        };
+        let served = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            serve_with_handshake_fallback(connect, lifecycle),
+        )
+        .await
+        .expect("a refused connection fails promptly");
+        assert!(served.is_err(), "a refused handshake is an error");
+        connections.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The second connection exists only for a probe that found no common
+    /// revision. A handshake that fails is never retried, and when the
+    /// handshake after such a probe fails too, that failure is the result.
+    #[tokio::test]
+    async fn only_a_probe_without_a_common_revision_earns_one_more_connection() {
+        assert_eq!(
+            connections_before_a_failed_handshake(ClientLifecycleMode::Initialize).await,
+            1
+        );
+        assert_eq!(
+            connections_before_a_failed_handshake(http_lifecycle(Some("auto"), ROOMY)).await,
+            2
         );
     }
 
