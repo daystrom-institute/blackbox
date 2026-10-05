@@ -193,7 +193,9 @@ pub struct ShellSessions {
     /// Sessions removed from the map by shutdown whose processes are still
     /// being stopped. They stay visible to observers as running until their
     /// terminal state is published, so shutdown never reads as an empty set
-    /// while cleanup is pending.
+    /// while cleanup is pending. Finished entries are dropped only when a
+    /// snapshot is taken: a registry nobody observes keeps them until it is
+    /// dropped itself.
     draining: Vec<(String, Arc<ShellSession>)>,
 }
 
@@ -206,36 +208,49 @@ impl ShellSessions {
     /// A complete snapshot of the sessions an observer should know about,
     /// sorted by id and bounded. Call it under the registry lock and do
     /// nothing else there: no I/O, no emit.
+    ///
+    /// Admission bounds the registered sessions, not the ones shutdown is
+    /// still stopping, so both together can exceed the bound. Registered
+    /// sessions are all listed; sessions being stopped take only the room
+    /// left over.
     pub fn summaries(&mut self) -> Vec<ShellSessionSummary> {
         self.draining
             .retain(|(_, session)| session.state.borrow().is_none());
         let now = Instant::now();
+        let summary = |id: &String, session: &ShellSession, running: bool| ShellSessionSummary {
+            id: id.clone(),
+            command: session
+                .command
+                .chars()
+                .take(MAX_SUMMARIZED_COMMAND_CHARS)
+                .collect(),
+            elapsed_ms: now
+                .saturating_duration_since(session.started)
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64,
+            running,
+        };
+        // Ids are `sh-<counter>`: shorter first, then lexical, is numeric order.
+        let by_id = |a: &ShellSessionSummary, b: &ShellSessionSummary| {
+            (a.id.len(), &a.id).cmp(&(b.id.len(), &b.id))
+        };
         let mut rows: Vec<ShellSessionSummary> = self
             .map
             .iter()
-            .map(|(id, session)| (id, session, session.state.borrow().is_none()))
-            .chain(
-                self.draining
-                    .iter()
-                    .map(|(id, session)| (id, session, true)),
-            )
-            .map(|(id, session, running)| ShellSessionSummary {
-                id: id.clone(),
-                command: session
-                    .command
-                    .chars()
-                    .take(MAX_SUMMARIZED_COMMAND_CHARS)
-                    .collect(),
-                elapsed_ms: now
-                    .saturating_duration_since(session.started)
-                    .as_millis()
-                    .min(u128::from(u64::MAX)) as u64,
-                running,
-            })
+            .map(|(id, session)| summary(id, session, session.state.borrow().is_none()))
             .collect();
-        // Ids are `sh-<counter>`: shorter first, then lexical, is numeric order.
-        rows.sort_by(|a, b| (a.id.len(), &a.id).cmp(&(b.id.len(), &b.id)));
+        rows.sort_by(by_id);
         rows.truncate(MAX_SUMMARIZED_SHELL_SESSIONS);
+        let room = MAX_SUMMARIZED_SHELL_SESSIONS - rows.len();
+        let mut draining: Vec<ShellSessionSummary> = self
+            .draining
+            .iter()
+            .map(|(id, session)| summary(id, session, true))
+            .collect();
+        draining.sort_by(by_id);
+        draining.truncate(room);
+        rows.extend(draining);
+        rows.sort_by(by_id);
         rows
     }
 
@@ -1527,6 +1542,61 @@ mod tests {
         let mut registry = ShellSessions::default();
         assert!(registry.summaries().is_empty());
         assert_eq!(MAX_SUMMARIZED_SHELL_SESSIONS, MAX_LIVE_SESSIONS);
+    }
+
+    /// A registered session with no process behind it. The returned sender
+    /// keeps its state open, so it reads as running.
+    fn idle_session() -> (Arc<ShellSession>, watch::Sender<Option<TerminalState>>) {
+        let (controls, _) = mpsc::unbounded_channel();
+        let (state_tx, state) = watch::channel(None);
+        let session = Arc::new(ShellSession {
+            controls,
+            state,
+            stdin: Arc::new(tokio::sync::Mutex::new(None)),
+            stdout: Arc::new(Mutex::new(OutBuf::default())),
+            stderr: Arc::new(Mutex::new(OutBuf::default())),
+            command: "sleep 600".to_string(),
+            started: Instant::now(),
+            hard_deadline: None,
+            progress: Arc::new(PromiseProgress::new()),
+            output_filter: Mutex::new(None),
+            filter_change: Mutex::new(None),
+        });
+        (session, state_tx)
+    }
+
+    #[test]
+    fn sessions_being_stopped_never_crowd_registered_ones_out_of_a_snapshot() {
+        let mut registry = ShellSessions::default();
+        let mut open = Vec::new();
+        let mut admit = |registry: &mut ShellSessions| {
+            let (session, state) = idle_session();
+            registry.counter += 1;
+            registry
+                .map
+                .insert(format!("sh-{}", registry.counter), session);
+            open.push(state);
+        };
+        // A full registry is shut down without waiting for its processes,
+        // then filled again but for three slots.
+        for _ in 0..MAX_LIVE_SESSIONS {
+            admit(&mut registry);
+        }
+        assert_eq!(registry.shutdown_all(), MAX_LIVE_SESSIONS);
+        for _ in 0..MAX_LIVE_SESSIONS - 3 {
+            admit(&mut registry);
+        }
+
+        let rows = registry.summaries();
+        assert_eq!(rows.len(), MAX_SUMMARIZED_SHELL_SESSIONS);
+        let ids: Vec<&str> = rows.iter().map(|row| row.id.as_str()).collect();
+        // Every registered session is listed, the three oldest sessions
+        // being stopped fill the rest, and the whole is in id order.
+        let mut expected: Vec<String> = (1..=3).map(|n| format!("sh-{n}")).collect();
+        expected
+            .extend((MAX_LIVE_SESSIONS + 1..=2 * MAX_LIVE_SESSIONS - 3).map(|n| format!("sh-{n}")));
+        assert_eq!(ids, expected);
+        assert!(rows.iter().all(|row| row.running));
     }
 
     fn cx() -> ToolCx {

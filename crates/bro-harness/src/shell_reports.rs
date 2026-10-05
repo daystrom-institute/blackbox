@@ -7,6 +7,9 @@
 //!
 //! The contract, shared with the daemon side:
 //!
+//! - There is one publisher per process, not one per session object: a
+//!   second one on the same event stream would publish its own registry's
+//!   set under a newer sequence and hide the first.
 //! - Reports are change-driven. One is sent when the process starts (an empty
 //!   set for a new process, including a resumed session's), and after that
 //!   only when a shell session starts, ends or is removed. There is no timer.
