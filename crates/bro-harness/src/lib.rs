@@ -21,6 +21,7 @@ pub mod code_mode;
 pub mod compaction;
 pub mod context;
 pub mod diagnostics;
+pub mod edit_discipline;
 pub mod emit;
 pub mod event_log;
 pub mod hooks;

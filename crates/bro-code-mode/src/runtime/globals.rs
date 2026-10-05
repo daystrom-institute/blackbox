@@ -5,6 +5,7 @@ use super::callbacks::exit_callback;
 use super::callbacks::image_callback;
 use super::callbacks::load_callback;
 use super::callbacks::notify_callback;
+use super::callbacks::refused_tool_callback;
 use super::callbacks::set_timeout_callback;
 use super::callbacks::store_callback;
 use super::callbacks::text_callback;
@@ -68,7 +69,48 @@ fn build_tools_object<'s>(
             return Err(format!("failed to install tool {}", tool.canonical_name));
         }
     }
+    install_refused_tools(scope, tools)?;
     Ok(tools)
+}
+
+/// Local addition (not vendored): a name the host refuses by policy is absent
+/// from the catalog, so `tools.<name>` would otherwise fail as a missing
+/// JavaScript property before any host code could explain why. Each refused
+/// name gets a non-enumerable function that throws its reason. It is not a
+/// tool: it has no index, no schema and no `ALL_TOOLS` entry, and it never
+/// replaces an admitted tool of the same name.
+fn install_refused_tools<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    tools: v8::Local<'s, v8::Object>,
+) -> Result<(), String> {
+    let refused_tools = scope
+        .get_slot::<RuntimeState>()
+        .map(|state| state.refused_tools.clone())
+        .unwrap_or_default();
+    for refused in refused_tools {
+        let name = v8::String::new(scope, &refused.name)
+            .ok_or_else(|| "failed to allocate refused tool name".to_string())?;
+        if tools.has_own_property(scope, name.into()) == Some(true) {
+            continue;
+        }
+        let reason = v8::String::new(scope, &refused.reason)
+            .ok_or_else(|| "failed to allocate refused tool reason".to_string())?;
+        let function = v8::FunctionTemplate::builder(refused_tool_callback)
+            .data(reason.into())
+            .build(scope)
+            .get_function(scope)
+            .ok_or_else(|| "failed to create refused tool function".to_string())?;
+        if tools.define_own_property(
+            scope,
+            name.into(),
+            function.into(),
+            v8::PropertyAttribute::DONT_ENUM,
+        ) != Some(true)
+        {
+            return Err(format!("failed to install refusal for {}", refused.name));
+        }
+    }
+    Ok(())
 }
 
 /// Globals the runtime owns; a namespace global may not shadow them.

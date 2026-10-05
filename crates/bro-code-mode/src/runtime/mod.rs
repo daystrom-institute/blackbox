@@ -33,9 +33,21 @@ pub struct ExecuteRequest {
     pub context_id: Option<u64>,
     pub tool_call_id: String,
     pub enabled_tools: Vec<ToolDefinition>,
+    /// Local addition (not vendored): names the host refuses by policy. They
+    /// are not tools: a cell that reaches for one gets the reason as an error.
+    pub refused_tools: Vec<RefusedTool>,
     pub source: String,
     pub yield_time_ms: Option<u64>,
     pub max_output_tokens: Option<usize>,
+}
+
+/// Local addition (not vendored): a `tools.<name>` property that exists only
+/// to explain why the host refuses that name. It has no schema, no enabled-tool
+/// index and no `ALL_TOOLS` entry, and calling it never reaches the host.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RefusedTool {
+    pub name: String,
+    pub reason: String,
 }
 
 #[derive(Clone, Debug)]
@@ -208,6 +220,7 @@ pub(crate) fn spawn_runtime(
     let config = RuntimeConfig {
         tool_call_id: request.tool_call_id,
         enabled_tools,
+        refused_tools: request.refused_tools,
         source: request.source,
         stored_values,
     };
@@ -234,6 +247,7 @@ pub(crate) fn spawn_runtime(
 struct RuntimeConfig {
     tool_call_id: String,
     enabled_tools: Vec<EnabledToolMetadata>,
+    refused_tools: Vec<RefusedTool>,
     source: String,
     stored_values: HashMap<String, JsonValue>,
 }
@@ -245,6 +259,7 @@ pub(super) struct RuntimeState {
     stored_values: HashMap<String, JsonValue>,
     stored_value_writes: HashMap<String, JsonValue>,
     enabled_tools: Vec<EnabledToolMetadata>,
+    refused_tools: Vec<RefusedTool>,
     next_tool_call_id: u64,
     next_timeout_id: u64,
     tool_call_id: String,
@@ -303,6 +318,7 @@ fn run_runtime(
         stored_values: config.stored_values,
         stored_value_writes: HashMap::new(),
         enabled_tools: config.enabled_tools,
+        refused_tools: config.refused_tools,
         next_tool_call_id: 1,
         next_timeout_id: 1,
         tool_call_id: config.tool_call_id,
@@ -485,6 +501,7 @@ mod tests {
             context_id: None,
             tool_call_id: "call_1".to_string(),
             enabled_tools: Vec::new(),
+            refused_tools: Vec::new(),
             source: source.to_string(),
             yield_time_ms: Some(1),
             max_output_tokens: None,

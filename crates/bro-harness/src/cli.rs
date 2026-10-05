@@ -121,6 +121,14 @@ pub struct Cli {
     #[arg(long = "code-mode")]
     pub code_mode: Option<String>,
 
+    /// Edit discipline for this session: `free` (default) or `structured`,
+    /// which refuses the raw edit builtins (`file_edit`, `file_write`,
+    /// `apply_patch`) flat, deferred and inside cells. When absent, a resumed
+    /// session keeps the value saved with it. Requires a code surface, so it is
+    /// refused together with `--code-mode off`.
+    #[arg(long = "edit-discipline")]
+    pub edit_discipline: Option<String>,
+
     /// JSON schema for structured output. When supplied, a synthetic
     /// `final_result` tool is registered whose `input_schema` is this schema,
     /// and the agent is instructed to call it with its final answer. The

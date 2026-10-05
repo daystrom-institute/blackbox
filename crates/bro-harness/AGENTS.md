@@ -30,6 +30,17 @@ the daemon boundary contract is `design/bro-harness/harness-process-boundary.md`
   then delivers them afresh; compaction invalidates delivery. Never infer
   authority from strings in arbitrary file contents or historical tool results.
   Shell remains an explicit escape hatch outside structured path discovery.
+- **Edit discipline is session state, enforced by removal plus an explained
+  refusal.** `--edit-discipline structured` drops `file_edit`, `file_write`
+  and `apply_patch` from the builtin set before the registry, the deferred
+  catalog and the cell callable set are derived, so no allow list restores
+  them and nothing else is granted. The same name-to-reason map
+  (`edit_discipline.rs`) reaches flat dispatch, `HostTools` and the cell
+  runtime, which installs a non-enumerable throwing property for each refused
+  name: a missing JavaScript property would never reach the host. The value is
+  saved in the snapshot and restored on resume without the flag; an unknown
+  explicit or saved value is an error, and `structured` with no code surface
+  refuses to start. Shell is not covered.
 - **Instruction-document I/O is bounded.** Startup discovery, resume
   restoration, boundary refresh, and structured checks each return within one
   operation deadline (`BRO_HARNESS_INSTRUCTION_READ_TIMEOUT_MS`, default 10 s)

@@ -1161,6 +1161,7 @@ mod tests {
             context_id: None,
             tool_call_id: "call_1".to_string(),
             enabled_tools: Vec::new(),
+            refused_tools: Vec::new(),
             source: source.to_string(),
             yield_time_ms: Some(1),
             max_output_tokens: None,
@@ -1863,6 +1864,64 @@ mod tests {
             }
         ));
         assert!(!service.has_outstanding_work().await);
+    }
+
+    // Local addition (not vendored).
+    #[tokio::test]
+    async fn refused_tool_names_throw_their_reason_and_stay_out_of_the_catalog() {
+        let service = CodeModeService::new();
+        let response = execute(
+            &service,
+            ExecuteRequest {
+                refused_tools: vec![crate::RefusedTool {
+                    name: "file_edit".to_string(),
+                    reason: "file_edit is refused: use edits.apply".to_string(),
+                }],
+                source: r#"
+                    const seen = [];
+                    for (const call of [() => tools.file_edit({}), () => tools["file_edit"]({})]) {
+                        try { await call(); seen.push("no error"); } catch (e) { seen.push(e.message); }
+                    }
+                    let unknown;
+                    try { await tools.never_admitted({}); unknown = "no error"; } catch (e) { unknown = e.constructor.name; }
+                    text(JSON.stringify({
+                        seen,
+                        unknown,
+                        enumerable: Object.keys(tools).includes("file_edit"),
+                        listed: ALL_TOOLS.some((tool) => JSON.stringify(tool).includes("file_edit")),
+                    }));
+                "#
+                .into(),
+                yield_time_ms: None,
+                ..execute_request("")
+            },
+        )
+        .await;
+        let RuntimeResponse::Result {
+            content_items,
+            error_text,
+            ..
+        } = response
+        else {
+            panic!("cell did not finish: {response:?}");
+        };
+        assert_eq!(error_text, None);
+        let text = format!("{content_items:?}");
+        assert_eq!(
+            text.matches("file_edit is refused: use edits.apply")
+                .count(),
+            2,
+            "{text}"
+        );
+        assert!(
+            text.contains(r#"\"unknown\":\"TypeError\""#)
+                || text.contains(r#""unknown":"TypeError""#),
+            "{text}"
+        );
+        assert!(
+            text.contains("enumerable") && !text.contains("true"),
+            "{text}"
+        );
     }
 
     #[tokio::test]

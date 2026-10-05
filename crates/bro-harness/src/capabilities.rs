@@ -26,9 +26,20 @@ pub struct HostTools {
     tools: HashMap<String, Arc<dyn Tool>>,
     cx: ToolCx,
     execution: Arc<tokio::sync::RwLock<()>>,
+    /// Names session policy refuses, with the reason a call to one returns.
+    refusals: HashMap<String, String>,
 }
 
 impl HostTools {
+    /// Explain calls to names the session refuses by policy instead of
+    /// reporting them as unavailable. A refused name that is also present in
+    /// the callable set stays callable: policy removes tools before this seam
+    /// is built, and this map only explains what is absent.
+    pub fn with_refusals(mut self, refusals: impl IntoIterator<Item = (String, String)>) -> Self {
+        self.refusals = refusals.into_iter().collect();
+        self
+    }
+
     /// Build the host-tool seam from a pre-filtered built-in set + the session
     /// context. `filtered_builtins` MUST already have had the session's
     /// `ToolFilter` applied by the caller; capability/control tools
@@ -57,6 +68,7 @@ impl HostTools {
             tools,
             cx,
             execution,
+            refusals: HashMap::new(),
         }
     }
 }
@@ -90,13 +102,16 @@ impl ToolCapability for HostTools {
         let tool = self.tools.get(&invocation.name).ok_or_else(|| {
             // Unknown OR filtered-out → fail closed (no in-box route around the
             // ToolFilter, §4.5).
-            BroError::new(
-                "tool_unavailable",
-                format!(
-                    "host tool '{}' is not available in-box (unknown or denied)",
-                    invocation.name
+            match self.refusals.get(&invocation.name) {
+                Some(reason) => BroError::new("tool_refused", reason.clone()),
+                None => BroError::new(
+                    "tool_unavailable",
+                    format!(
+                        "host tool '{}' is not available in-box (unknown or denied)",
+                        invocation.name
+                    ),
                 ),
-            )
+            }
         })?;
         let mut cx = self.cx.clone();
         cx.cancellation = cancellation;

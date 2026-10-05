@@ -13,6 +13,21 @@ use super::value::throw_type_error;
 use super::value::v8_value_to_json;
 use super::value::v8_value_to_json_preserving_functions;
 
+/// Local addition (not vendored): the function behind a refused tool name.
+/// Its data is the refusal reason; calling it throws that reason and touches
+/// no host state.
+pub(super) fn refused_tool_callback(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    _retval: v8::ReturnValue<v8::Value>,
+) {
+    let reason = args.data().to_rust_string_lossy(scope);
+    if let Some(message) = v8::String::new(scope, &reason) {
+        let error = v8::Exception::error(scope, message);
+        scope.throw_exception(error);
+    }
+}
+
 pub(super) fn tool_callback(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments,

@@ -183,6 +183,8 @@ impl CodeModeSessionDelegate for HarnessDelegate {
 struct CodeModeSurface {
     service: CodeModeService,
     catalog: Vec<ToolDefinition>,
+    /// Names session policy refuses; every cell explains them the same way.
+    refused: Vec<bro_code_mode::RefusedTool>,
     notifications: Arc<NotificationBuffer>,
     /// Local addition (not vendored): the active sampling step's queued-input
     /// preemption signal. `exec`/`wait` snapshot it at call admission so every
@@ -192,7 +194,11 @@ struct CodeModeSurface {
 }
 
 impl CodeModeSurface {
-    fn new(seam: Arc<dyn ToolCapability>, catalog: Vec<ToolDefinition>) -> Self {
+    fn new(
+        seam: Arc<dyn ToolCapability>,
+        catalog: Vec<ToolDefinition>,
+        refused: Vec<bro_code_mode::RefusedTool>,
+    ) -> Self {
         let notifications = Arc::new(NotificationBuffer::default());
         let delegate = Arc::new(HarnessDelegate {
             seam,
@@ -201,6 +207,7 @@ impl CodeModeSurface {
         Self {
             service: CodeModeService::with_delegate(delegate),
             catalog,
+            refused,
             notifications,
             step_preempt: Mutex::new(None),
         }
@@ -242,6 +249,19 @@ impl CodeModeToolSession {
         seam: Arc<dyn ToolCapability>,
         mode: CodeMode,
         namespaces: &BTreeMap<String, ToolNamespaceDescription>,
+    ) -> Self {
+        Self::with_refusals(callable, seam, mode, namespaces, Vec::new())
+    }
+
+    /// Like [`new`](Self::new), with names the session refuses by policy.
+    /// Each is a `(name, reason)` pair: the name stays out of the catalog and
+    /// a cell that calls it gets the reason as an error.
+    pub fn with_refusals(
+        callable: &[Arc<dyn Tool>],
+        seam: Arc<dyn ToolCapability>,
+        mode: CodeMode,
+        namespaces: &BTreeMap<String, ToolNamespaceDescription>,
+        refusals: Vec<(String, String)>,
     ) -> Self {
         let mut seen: std::collections::HashMap<String, Arc<dyn Tool>> =
             std::collections::HashMap::new();
@@ -287,7 +307,11 @@ impl CodeModeToolSession {
             /*code_mode_only*/ mode == CodeMode::Only,
             false,
         );
-        let surface = Arc::new(CodeModeSurface::new(seam, catalog));
+        let refused = refusals
+            .into_iter()
+            .map(|(name, reason)| bro_code_mode::RefusedTool { name, reason })
+            .collect();
+        let surface = Arc::new(CodeModeSurface::new(seam, catalog, refused));
         let tools = vec![
             Arc::new(ExecTool {
                 surface: surface.clone(),
@@ -427,6 +451,7 @@ impl Tool for ExecTool {
             context_id: Some(cx.instruction_generation),
             tool_call_id: "exec".to_string(),
             enabled_tools: self.surface.catalog.clone(),
+            refused_tools: self.surface.refused.clone(),
             source: parsed.code,
             yield_time_ms: parsed.yield_time_ms,
             max_output_tokens: parsed.max_output_tokens,

@@ -89,6 +89,9 @@ pub struct Registry {
     /// Prior flat activation promises remain evidence even if restoration is
     /// explicitly cleared or current catalog/policy removes a tool.
     resume_required: std::collections::BTreeSet<String>,
+    /// Names session policy refuses, with the reason a call to one returns.
+    /// A refused name is never registered, advertised or loadable.
+    refusals: HashMap<String, String>,
 }
 
 impl Registry {
@@ -211,6 +214,7 @@ impl Registry {
             tools,
             activated,
             resume_required: Default::default(),
+            refusals: HashMap::new(),
             execution: Arc::new(tokio::sync::RwLock::new(())),
         })
     }
@@ -385,6 +389,12 @@ impl Registry {
         self.execution = execution;
     }
 
+    /// Explain calls to names the session refuses by policy. Only names with
+    /// no registered tool are affected.
+    pub fn set_refusals(&mut self, refusals: impl IntoIterator<Item = (String, String)>) {
+        self.refusals = refusals.into_iter().collect();
+    }
+
     pub async fn dispatch(&self, name: &str, input: Value, cx: &ToolCx) -> ToolResult {
         self.start_dispatch(name, input, cx).wait().await
     }
@@ -397,9 +407,12 @@ impl Registry {
         cx: &ToolCx,
     ) -> bro_tools::InvocationHandle {
         let Some(entry) = self.tools.get(name) else {
-            return bro_tools::InvocationHandle::completed(ToolResult::Error(format!(
-                "unknown tool: {name}"
-            )));
+            return bro_tools::InvocationHandle::completed(ToolResult::Error(
+                match self.refusals.get(name) {
+                    Some(reason) => reason.clone(),
+                    None => format!("unknown tool: {name}"),
+                },
+            ));
         };
         // Cell controls must remain callable while nested work owns the gate:
         // exec and wait may themselves await a nested call or cancel it.

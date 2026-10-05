@@ -604,3 +604,238 @@ async fn production_resume_instruction_timeout_fails_before_session_resume() {
     );
     wait_instruction_workers_exit(&fs).await;
 }
+
+fn discipline_cli(root: &Path, extra: &[&str], resume: bool) -> Cli {
+    let mut args = vec![
+        "bro-harness",
+        "--cwd",
+        root.to_str().unwrap(),
+        "--system-prompt",
+        "",
+    ];
+    if resume {
+        args.extend(["--resume", "discipline"]);
+    } else {
+        args.extend(["--session-id", "discipline", "--model", "gpt-5.5"]);
+    }
+    args.extend(extra);
+    Cli::try_parse_from(args).unwrap()
+}
+
+async fn try_build(cli: &Cli, root: &Path) -> Result<Session> {
+    build_with_runtime(cli, root, Arc::default(), None, Arc::new(|_| {})).await
+}
+
+fn wire_names(session: &Session) -> Vec<String> {
+    session
+        .reg
+        .wire_specs()
+        .into_iter()
+        .map(|spec| spec.name)
+        .collect()
+}
+
+fn refusal_of(tool: &str) -> String {
+    crate::edit_discipline::EditDiscipline::Structured
+        .refusal(tool)
+        .unwrap()
+}
+
+#[tokio::test]
+async fn structured_edit_discipline_refuses_raw_edit_tools_flat_deferred_and_in_cells() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let fixture = root.join("fixture.txt");
+    std::fs::write(&fixture, "original bytes\n").unwrap();
+
+    // An allow list naming the raw tools cannot bring them back.
+    let mut session = try_build(
+        &discipline_cli(
+            &root,
+            &[
+                "--edit-discipline",
+                "structured",
+                "--allow-tools",
+                "file_edit,file_write,apply_patch,file_read,exec,wait",
+            ],
+            false,
+        ),
+        &root,
+    )
+    .await
+    .unwrap();
+    session.cx.root = root.clone();
+    let wire = wire_names(&session);
+    assert!(wire.contains(&"file_read".to_string()), "{wire:?}");
+    assert!(wire.contains(&"exec".to_string()), "{wire:?}");
+    let manifest: Vec<String> = session.reg.manifest().into_iter().map(|(n, _)| n).collect();
+    for tool in crate::edit_discipline::RAW_EDIT_TOOLS {
+        assert!(!wire.contains(&tool.to_string()), "{wire:?}");
+        assert!(!manifest.contains(&tool.to_string()), "{manifest:?}");
+        // A flat call explains the refusal instead of reporting an unknown tool.
+        let flat = session
+            .reg
+            .dispatch(
+                tool,
+                json!({"file_path":"fixture.txt","content":"changed","old_string":"original","new_string":"changed"}),
+                &session.cx,
+            )
+            .await;
+        assert!(flat.is_error());
+        assert_eq!(flat.into_content().0, refusal_of(tool));
+    }
+    let unknown = session
+        .reg
+        .dispatch("never_registered", json!({}), &session.cx)
+        .await;
+    assert_eq!(unknown.into_content().0, "unknown tool: never_registered");
+
+    // Inside a cell, dot and bracket access both reach the same refusal, and
+    // the names stay out of the cell catalog.
+    let cell = session
+        .reg
+        .dispatch(
+            "exec",
+            json!({"source": r#"
+const names = ["file_edit", "file_write", "apply_patch"];
+const seen = [];
+for (const name of names) {
+  for (const call of [() => tools[name]({file_path: "fixture.txt", content: "changed"}),
+                      () => (name === "file_edit" ? tools.file_edit : name === "file_write" ? tools.file_write : tools.apply_patch)({file_path: "fixture.txt", content: "changed"})]) {
+    try { await call(); seen.push("no error"); } catch (e) { seen.push(e.message); }
+  }
+}
+text(JSON.stringify({
+  seen,
+  listed: ALL_TOOLS.filter((tool) => names.includes(tool.name)).length,
+  enumerable: Object.keys(tools).filter((name) => names.includes(name)).length,
+}));
+"#}),
+            &session.cx,
+        )
+        .await;
+    let output = cell.into_content().0;
+    for tool in crate::edit_discipline::RAW_EDIT_TOOLS {
+        assert_eq!(output.matches(&refusal_of(tool)).count(), 2, "{output}");
+    }
+    assert!(!output.contains("no error"), "{output}");
+    assert!(
+        output.contains(r#"\"listed\":0"#) || output.contains(r#""listed":0"#),
+        "{output}"
+    );
+    assert!(
+        output.contains(r#"\"enumerable\":0"#) || output.contains(r#""enumerable":0"#),
+        "{output}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&fixture).unwrap(),
+        "original bytes\n"
+    );
+}
+
+#[tokio::test]
+async fn edit_discipline_is_saved_with_the_session_and_restored_without_the_flag() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let mut initial = try_build(
+        &discipline_cli(&root, &["--edit-discipline", "structured"], false),
+        &root,
+    )
+    .await
+    .unwrap();
+    initial.persist().await.unwrap();
+    drop(initial);
+
+    // A routine resume passes neither the flag nor a deny list.
+    let mut resumed = try_build(&discipline_cli(&root, &[], true), &root)
+        .await
+        .unwrap();
+    assert_eq!(
+        resumed.edit_discipline,
+        crate::edit_discipline::EditDiscipline::Structured
+    );
+    assert!(!wire_names(&resumed).contains(&"file_edit".to_string()));
+    resumed.persist().await.unwrap();
+    drop(resumed);
+
+    // The saved session cannot be resumed without a code surface.
+    let refused = try_build(&discipline_cli(&root, &["--code-mode", "off"], true), &root)
+        .await
+        .err()
+        .expect("structured without a code surface must not start")
+        .to_string();
+    assert!(
+        refused.contains("edit_discipline 'structured'"),
+        "{refused}"
+    );
+    assert!(refused.contains("code_mode 'off'"), "{refused}");
+
+    // An explicit value replaces the saved one and is saved in turn.
+    let mut freed = try_build(
+        &discipline_cli(&root, &["--edit-discipline", "free"], true),
+        &root,
+    )
+    .await
+    .unwrap();
+    assert!(wire_names(&freed).contains(&"file_edit".to_string()));
+    freed.persist().await.unwrap();
+    drop(freed);
+    let reopened = try_build(&discipline_cli(&root, &[], true), &root)
+        .await
+        .unwrap();
+    assert_eq!(
+        reopened.edit_discipline,
+        crate::edit_discipline::EditDiscipline::Free
+    );
+}
+
+#[tokio::test]
+async fn edit_discipline_defaults_to_free_and_never_guesses_an_unknown_value() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+
+    // Structured needs a code surface on a fresh session too.
+    let refused = try_build(
+        &discipline_cli(
+            &root,
+            &["--edit-discipline", "structured", "--code-mode", "off"],
+            false,
+        ),
+        &root,
+    )
+    .await
+    .err()
+    .expect("structured with code mode off must not start")
+    .to_string();
+    assert!(refused.contains("code_mode 'off'"), "{refused}");
+    let unknown = try_build(
+        &discipline_cli(&root, &["--edit-discipline", "strict"], false),
+        &root,
+    )
+    .await
+    .err()
+    .expect("an unknown discipline must not start")
+    .to_string();
+    assert!(
+        unknown.contains("unknown edit discipline 'strict'"),
+        "{unknown}"
+    );
+
+    // A snapshot written before the field existed resumes as free, with
+    // today's surface.
+    crate::session::write_atomic(
+        &root.join("discipline.json"),
+        &json!({"transport":"anthropic", "model":"gpt-5.5", "snapshot":[]}).to_string(),
+    )
+    .unwrap();
+    let legacy = try_build(&discipline_cli(&root, &[], true), &root)
+        .await
+        .unwrap();
+    assert_eq!(
+        legacy.edit_discipline,
+        crate::edit_discipline::EditDiscipline::Free
+    );
+    let wire = wire_names(&legacy);
+    assert!(wire.contains(&"file_edit".to_string()), "{wire:?}");
+    assert!(wire.contains(&"file_write".to_string()), "{wire:?}");
+}

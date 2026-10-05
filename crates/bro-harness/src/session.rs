@@ -39,6 +39,8 @@ pub struct Restored {
     pub transport: String,
     pub model: Option<String>,
     pub code_mode: Option<String>,
+    /// Absent in snapshots written before the field existed.
+    pub edit_discipline: Option<String>,
     pub service_tier: Option<String>,
     pub effort: Option<String>,
     pub snapshot: Value,
@@ -279,6 +281,7 @@ pub struct SaveState<'a> {
     pub transport: &'a str,
     pub model: &'a str,
     pub code_mode: &'a str,
+    pub edit_discipline: &'a str,
     pub service_tier: Option<&'a str>,
     pub effort: Option<&'a str>,
     pub snapshot: Value,
@@ -496,6 +499,7 @@ impl SessionStore {
             "transport":state.transport,
             "model":state.model,
             "code_mode":state.code_mode,
+            "edit_discipline":state.edit_discipline,
             "service_tier":state.service_tier,
             "effort":state.effort,
             "snapshot":state.snapshot,
@@ -635,10 +639,18 @@ fn parse_restored(body: &str) -> Result<Restored> {
             .is_none_or(|mode| matches!(mode, "off" | "optional" | "only")),
         "invalid persisted code_mode"
     );
+    let edit_discipline = optional_string(object, "edit_discipline")?;
+    anyhow::ensure!(
+        edit_discipline
+            .as_deref()
+            .is_none_or(|value| matches!(value, "free" | "structured")),
+        "invalid persisted edit_discipline"
+    );
     Ok(Restored {
         transport: transport.to_owned(),
         model: optional_string(object, "model")?,
         code_mode,
+        edit_discipline,
         service_tier: optional_string(object, "service_tier")?,
         effort: optional_string(object, "effort")?,
         snapshot: snapshot.clone(),
@@ -855,6 +867,7 @@ mod tests {
             transport: "anthropic",
             model: "synthetic-model",
             code_mode: "optional",
+            edit_discipline: "structured",
             service_tier: Some("priority"),
             effort: Some("high"),
             snapshot: json!([{"role":"user","content":[{"type":"text","text":"hello"}]}]),
@@ -918,6 +931,7 @@ mod tests {
         assert_eq!(restored.side, state().side);
         assert_eq!(restored.model.as_deref(), Some("synthetic-model"));
         assert_eq!(restored.code_mode.as_deref(), Some("optional"));
+        assert_eq!(restored.edit_discipline.as_deref(), Some("structured"));
         assert_eq!(restored.service_tier.as_deref(), Some("priority"));
         assert_eq!(restored.effort.as_deref(), Some("high"));
         assert_eq!(restored.last_event_seq, 7);
@@ -1134,6 +1148,8 @@ mod tests {
             ("side", json!([])),
             ("model", json!(4)),
             ("code_mode", json!("invalid")),
+            ("edit_discipline", json!("strict")),
+            ("edit_discipline", json!(true)),
             ("service_tier", json!(false)),
             ("effort", json!(false)),
             ("effort", json!("")),
@@ -1176,6 +1192,7 @@ mod tests {
         assert!(restored.side.is_null());
         assert_eq!(restored.model, None);
         assert_eq!(restored.code_mode, None);
+        assert_eq!(restored.edit_discipline, None);
         assert_eq!(restored.service_tier, None);
         assert_eq!(restored.effort, None);
     }

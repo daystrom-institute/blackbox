@@ -858,6 +858,7 @@ struct Session {
     /// persisted in the session file and restored on resume so the surface
     /// shape stays consistent with any `exec` cells already in the transcript.
     code_mode: crate::code_mode::CodeMode,
+    edit_discipline: crate::edit_discipline::EditDiscipline,
     code_mode_session: Option<crate::code_mode::CodeModeToolSession>,
     remote_outcome_sources: Vec<Arc<dyn Tool>>,
     retain_background_work: bool,
@@ -1223,6 +1224,10 @@ impl Session {
         tx.set_session_id(store.id.clone());
         let restored_model = store.restored.as_ref().and_then(|r| r.model.clone());
         let restored_code_mode = store.restored.as_ref().and_then(|r| r.code_mode.clone());
+        let restored_edit_discipline = store
+            .restored
+            .as_ref()
+            .and_then(|r| r.edit_discipline.clone());
         let restored_service_tier = store.restored.as_ref().and_then(|r| r.service_tier.clone());
         let restored_effort = store.restored.as_ref().and_then(|r| r.effort.clone());
         // Loop-level side cells restored from a prior turn. Each cell
@@ -1423,6 +1428,29 @@ impl Session {
             .map(|v| crate::code_mode::CodeMode::parse_or_default(&v))
             .unwrap_or_default();
 
+        // Resolved edit discipline: explicit --edit-discipline wins; on resume
+        // the value saved with the session applies (the daemon does not pass
+        // it again); otherwise `free`. Structured editing happens inside cells,
+        // so it cannot hold without a code surface. Both are checked here,
+        // before any catalog is built, model request sent or tool run.
+        let edit_discipline = crate::edit_discipline::EditDiscipline::resolve(
+            cli.edit_discipline.as_deref(),
+            restored_edit_discipline.as_deref(),
+        )
+        .map_err(|error| anyhow::anyhow!(error))?;
+        if edit_discipline == crate::edit_discipline::EditDiscipline::Structured
+            && !code_mode.enables_code_surface()
+        {
+            anyhow::bail!(
+                "edit_discipline 'structured' cannot be combined with code_mode '{}': structured \
+                 edits are made inside exec cells, which that code mode removes",
+                code_mode.as_str()
+            );
+        }
+        // The refused names leave the builtin set before any surface is
+        // derived from it, so no allow list can bring one back.
+        builtins.retain(|tool| edit_discipline.refusal(tool.name()).is_none());
+
         let dispatch_gate = Arc::new(tokio::sync::RwLock::new(()));
         let mut cm_callable: Vec<Arc<dyn Tool>> = builtins
             .iter()
@@ -1448,17 +1476,20 @@ impl Session {
                     .filter(|t| tool_filter.permits(t.name())),
             );
             cm_callable = bro_tools::prune_tool_dependencies(cm_callable);
-            let cm_seam: Arc<dyn bro_capabilities::ToolCapability> =
-                Arc::new(crate::capabilities::HostTools::with_dispatch_gate(
+            let cm_seam: Arc<dyn bro_capabilities::ToolCapability> = Arc::new(
+                crate::capabilities::HostTools::with_dispatch_gate(
                     cm_callable.clone(),
                     cx.clone(),
                     dispatch_gate.clone(),
-                ));
-            let cm_session = crate::code_mode::CodeModeToolSession::new(
+                )
+                .with_refusals(edit_discipline.refusals()),
+            );
+            let cm_session = crate::code_mode::CodeModeToolSession::with_refusals(
                 &cm_callable,
                 cm_seam,
                 code_mode,
                 &crate::bindings::namespace_descriptions(),
+                edit_discipline.refusals(),
             );
             builtins.extend(cm_session.tools());
             code_mode_session = Some(cm_session);
@@ -1502,6 +1533,7 @@ impl Session {
             code_mode.defers_builtins(),
         )?;
         reg.set_dispatch_gate(dispatch_gate);
+        reg.set_refusals(edit_discipline.refusals());
         if restored_snapshot {
             // Receipts are independent evidence, even when an explicit saved
             // activation list is empty. Neither source can erase the other.
@@ -1624,6 +1656,7 @@ impl Session {
             tx,
             reg,
             code_mode,
+            edit_discipline,
             code_mode_session,
             remote_outcome_sources,
             retain_background_work: cli.input_format.as_deref() == Some("stream-json")
@@ -3188,6 +3221,7 @@ impl Session {
         let transport = self.tx.name().to_owned();
         let model = self.base_opts.model.clone();
         let code_mode = self.code_mode.as_str().to_owned();
+        let edit_discipline = self.edit_discipline.as_str();
         let service_tier = self.base_opts.service_tier.clone();
         let effort = self.base_opts.effort.clone();
         let snapshot = self.tx.snapshot();
@@ -3215,6 +3249,7 @@ impl Session {
                     transport: &transport,
                     model: &model,
                     code_mode: &code_mode,
+                    edit_discipline,
                     service_tier: service_tier.as_deref(),
                     effort: effort.as_deref(),
                     snapshot,
@@ -4516,6 +4551,7 @@ mod tests {
         let session = Session {
             tx: Box::new(mock),
             code_mode: crate::code_mode::CodeMode::Optional,
+            edit_discipline: crate::edit_discipline::EditDiscipline::Free,
             code_mode_session: None,
             remote_outcome_sources: Vec::new(),
             retain_background_work: true,
