@@ -15,6 +15,14 @@
 //! blocked rather than letting them bypass it. A conflict is recorded as a
 //! failed outcome with the owner's observed state, so the lifecycle and every
 //! existing reader keep their two terminal states.
+//!
+//! An operator may discard a row that still needs attention, or requeue a
+//! failed or conflicted one. Discard settles the row as failed with a
+//! `discarded` record, so a daemon without the field still reads it as
+//! terminal; the checkout is untouched. Requeue returns a row to pending
+//! only while it is the newest row on its path and the publication still
+//! matches the base it was computed from, so a redelivery can never
+//! overwrite content that moved underneath it.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -97,6 +105,74 @@ pub struct PendingCheckoutMutation {
     /// other bytes. The publication, not this intent, is authoritative.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reconciled: Option<MutationReconciliation>,
+    /// Settled by an operator instead of by delivery or publication. The
+    /// status is `failed` so that every reader treats the row as terminal;
+    /// this records that the failure was chosen, by whom and from what.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discarded: Option<MutationDiscard>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MutationDiscard {
+    pub at: String,
+    pub audit_reason: String,
+    /// The attention state the row had when it was discarded, as the
+    /// attention report names states.
+    pub prior_state: String,
+}
+
+/// Why an operator reconciliation did not happen. Each is a precondition
+/// the caller can see in the attention listing, never a store fault.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReconcileRefusal {
+    UnknownMutation,
+    /// The row's attention state is not one the action accepts; carries the
+    /// state the row has.
+    StateNotEligible(String),
+    /// Later rows on the same path still need attention; carries their ids.
+    /// Discard accepts them with `cascade`; requeue never does.
+    NewerRowsOnPath(Vec<String>),
+    /// Requeue only: the accepted publication for the path no longer
+    /// matches the base this row was computed from.
+    PublicationMoved,
+    /// Requeue only: the row tracks no publication base, and the caller
+    /// supplied none, so the precondition cannot be checked.
+    BaseUnknown,
+}
+
+impl std::fmt::Display for ReconcileRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownMutation => formatter.write_str("no such checkout mutation"),
+            Self::StateNotEligible(state) => {
+                write!(
+                    formatter,
+                    "the mutation is {state}, which this action does not accept"
+                )
+            }
+            Self::NewerRowsOnPath(ids) => write!(
+                formatter,
+                "later mutations on the same path still need attention: {}",
+                ids.join(", ")
+            ),
+            Self::PublicationMoved => formatter.write_str(
+                "the accepted publication for the path no longer matches the base this \
+                 mutation was computed from",
+            ),
+            Self::BaseUnknown => formatter.write_str(
+                "the mutation tracks no publication base, so the precondition cannot be checked",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ReconcileRefusal {}
+
+/// What a discard would settle: the row named and, with `cascade`, the
+/// later rows on its path that go with it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DiscardPlan {
+    pub mutation_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -140,6 +216,8 @@ pub enum CheckoutMutationProgress {
     /// Applied, then superseded: its chain broke and the owner published
     /// other bytes for the path, which the edit base now starts from.
     Reconciled,
+    /// Settled by an operator; the checkout was never touched for it.
+    Discarded,
     Failed,
 }
 
@@ -163,6 +241,12 @@ impl StoreSnapshot for CheckoutMutations {
 }
 
 impl CheckoutMutations {
+    /// A queue over a snapshot, for rehearsing a mutation without applying
+    /// it to the live queue.
+    pub fn from_snapshot(store: CheckoutMutationStore) -> Self {
+        Self { store }
+    }
+
     pub fn open(store_path: &Path) -> Result<Self> {
         let store = if store_path.exists() {
             let raw = std::fs::read_to_string(store_path)
@@ -202,6 +286,7 @@ impl CheckoutMutations {
             blocked_by: None,
             owner_unsupported_at: None,
             reconciled: None,
+            discarded: None,
         });
         Ok(true)
     }
@@ -400,6 +485,17 @@ impl CheckoutMutations {
     /// blocked behind a predecessor; settled rows are only counted. Rows carry
     /// digests, never file content.
     pub fn attention_report(&self, scope: &PublishedScope) -> serde_json::Value {
+        self.attention_report_filtered(scope, None, None)
+    }
+
+    /// [`Self::attention_report`] listing only the rows at `path` and in
+    /// one of `states`, when given. Counts always cover the whole scope.
+    pub fn attention_report_filtered(
+        &self,
+        scope: &PublishedScope,
+        path: Option<&str>,
+        states: Option<&[&str]>,
+    ) -> serde_json::Value {
         let digest = |content: &str| {
             use sha2::Digest as _;
             format!("{:x}", sha2::Sha256::digest(content.as_bytes()))
@@ -412,19 +508,14 @@ impl CheckoutMutations {
             .iter()
             .filter(|row| &row.mutation.scope == scope)
         {
-            let state = match row.status {
-                CheckoutMutationStatus::Pending => "pending",
-                CheckoutMutationStatus::Applied => match &row.publication {
-                    _ if row.reconciled.is_some() => "superseded",
-                    Some(publication) if !publication.observed => "applied_unobserved",
-                    _ => "settled",
-                },
-                CheckoutMutationStatus::Failed if row.conflict.is_some() => "conflicted",
-                CheckoutMutationStatus::Failed if row.blocked_by.is_some() => "blocked",
-                CheckoutMutationStatus::Failed => "failed",
-            };
+            let state = attention_state(row);
             *counts.entry(state).or_default() += 1;
-            if matches!(state, "settled" | "superseded") {
+            if !needs_attention(state) {
+                continue;
+            }
+            if path.is_some_and(|path| row.mutation.relative_path != path)
+                || states.is_some_and(|states| !states.contains(&state))
+            {
                 continue;
             }
             rows.push(serde_json::json!({
@@ -447,6 +538,7 @@ impl CheckoutMutations {
                 })),
                 "blocked_by": row.blocked_by,
                 "owner_unsupported_at": row.owner_unsupported_at,
+                "discarded": row.discarded,
             }));
         }
         serde_json::json!({ "counts": counts, "rows": rows })
@@ -654,6 +746,7 @@ impl CheckoutMutations {
                 on_path(row)
                     && row.status == CheckoutMutationStatus::Failed
                     && row.blocked_by.is_none()
+                    && row.discarded.is_none()
             })
             .map(|row| row.mutation.mutation_id.clone())
         else {
@@ -787,6 +880,7 @@ impl CheckoutMutations {
             blocked_by: None,
             owner_unsupported_at: None,
             reconciled: None,
+            discarded: None,
         });
         Ok(mutation)
     }
@@ -815,6 +909,150 @@ impl CheckoutMutations {
         )
     }
 
+    /// The attention state of one row, as the attention report names it.
+    pub fn attention_state(&self, mutation_id: &str) -> Option<&'static str> {
+        self.get(mutation_id).map(attention_state)
+    }
+
+    /// Later rows on the same scope and path that still need attention,
+    /// in queue order.
+    fn newer_attention_rows_on_path(&self, index: usize) -> Vec<String> {
+        let row = &self.store.mutations[index];
+        self.store.mutations[index + 1..]
+            .iter()
+            .filter(|later| {
+                later.mutation.scope == row.mutation.scope
+                    && later.mutation.relative_path == row.mutation.relative_path
+                    && needs_attention(attention_state(later))
+            })
+            .map(|later| later.mutation.mutation_id.clone())
+            .collect()
+    }
+
+    fn index_of(&self, mutation_id: &str) -> Result<usize, ReconcileRefusal> {
+        self.store
+            .mutations
+            .iter()
+            .position(|row| row.mutation.mutation_id == mutation_id)
+            .ok_or(ReconcileRefusal::UnknownMutation)
+    }
+
+    /// What [`Self::discard`] would settle. Any row that needs attention
+    /// can be discarded, but only as the newest such row on its path unless
+    /// `cascade` takes the later ones with it: a discarded predecessor
+    /// under live successors would make their bases a fiction.
+    pub fn discard_plan(
+        &self,
+        mutation_id: &str,
+        cascade: bool,
+    ) -> Result<DiscardPlan, ReconcileRefusal> {
+        let index = self.index_of(mutation_id)?;
+        let state = attention_state(&self.store.mutations[index]);
+        if !needs_attention(state) {
+            return Err(ReconcileRefusal::StateNotEligible(state.to_string()));
+        }
+        let newer = self.newer_attention_rows_on_path(index);
+        if !newer.is_empty() && !cascade {
+            return Err(ReconcileRefusal::NewerRowsOnPath(newer));
+        }
+        let mut mutation_ids = vec![mutation_id.to_string()];
+        mutation_ids.extend(newer);
+        Ok(DiscardPlan { mutation_ids })
+    }
+
+    /// Settle the rows of [`Self::discard_plan`] as failed with a discard
+    /// record. The checkout is untouched; the rows stop counting as
+    /// outstanding, so the next edit of the path starts from the accepted
+    /// publication again. Returns the plan that was applied.
+    pub fn discard(
+        &mut self,
+        mutation_id: &str,
+        cascade: bool,
+        audit_reason: &str,
+        now: &str,
+    ) -> Result<DiscardPlan, ReconcileRefusal> {
+        let plan = self.discard_plan(mutation_id, cascade)?;
+        for row in &mut self.store.mutations {
+            if !plan.mutation_ids.contains(&row.mutation.mutation_id) {
+                continue;
+            }
+            let prior_state = attention_state(row).to_string();
+            row.status = CheckoutMutationStatus::Failed;
+            row.last_error = Some(format!("discarded by operator: {audit_reason}"));
+            if row.acked_at.is_none() {
+                row.acked_at = Some(now.to_string());
+            }
+            if let Some(publication) = &mut row.publication {
+                publication.observed = true;
+            }
+            row.discarded = Some(MutationDiscard {
+                at: now.to_string(),
+                audit_reason: audit_reason.to_string(),
+                prior_state,
+            });
+        }
+        Ok(plan)
+    }
+
+    /// Return a failed or conflicted row to pending so the owner is sent it
+    /// again. `published` is the accepted publication's current content for
+    /// the path (`None` when the caller could not determine it): a tracked
+    /// row requeues only while it still matches the base the row was
+    /// computed from, compared as the row's lane compares (exact bytes for a
+    /// guarded row, JSON equivalence otherwise). A row that tracks no base
+    /// requeues only as the newest row on its path, since nothing else can
+    /// show that a redelivery would not overwrite later content. Blocked and
+    /// discarded rows are re-issued, never requeued.
+    pub fn requeue(
+        &mut self,
+        mutation_id: &str,
+        published: Option<Option<&str>>,
+    ) -> Result<(), ReconcileRefusal> {
+        let index = self.index_of(mutation_id)?;
+        let state = attention_state(&self.store.mutations[index]);
+        if !matches!(state, "failed" | "conflicted") {
+            return Err(ReconcileRefusal::StateNotEligible(state.to_string()));
+        }
+        let newer = self.newer_attention_rows_on_path(index);
+        if !newer.is_empty() {
+            return Err(ReconcileRefusal::NewerRowsOnPath(newer));
+        }
+        let row = &self.store.mutations[index];
+        match (&row.publication, published) {
+            (Some(publication), Some(published)) => {
+                let same = if row.mutation.guard.is_some() {
+                    same_bytes
+                } else {
+                    same_json
+                };
+                if !same(publication.base_content_json.as_deref(), published) {
+                    return Err(ReconcileRefusal::PublicationMoved);
+                }
+            }
+            (Some(_), None) => return Err(ReconcileRefusal::BaseUnknown),
+            (None, _) => {
+                let later_on_path = self.store.mutations[index + 1..].iter().any(|later| {
+                    later.mutation.scope == row.mutation.scope
+                        && later.mutation.relative_path == row.mutation.relative_path
+                        && later.discarded.is_none()
+                });
+                if later_on_path {
+                    return Err(ReconcileRefusal::PublicationMoved);
+                }
+            }
+        }
+        let row = &mut self.store.mutations[index];
+        row.status = CheckoutMutationStatus::Pending;
+        row.conflict = None;
+        row.last_error = None;
+        row.acked_at = None;
+        row.ack_content_sha256 = None;
+        if let Some(publication) = &mut row.publication {
+            publication.observed = false;
+        }
+        Ok(())
+    }
+
     pub fn get(&self, mutation_id: &str) -> Option<&PendingCheckoutMutation> {
         self.store
             .mutations
@@ -835,6 +1073,9 @@ impl CheckoutMutations {
                 Some(publication) if publication.observed => CheckoutMutationProgress::Published,
                 _ => CheckoutMutationProgress::Delivered,
             },
+            CheckoutMutationStatus::Failed if row.discarded.is_some() => {
+                CheckoutMutationProgress::Discarded
+            }
             CheckoutMutationStatus::Failed if row.conflict.is_some() => {
                 CheckoutMutationProgress::Conflicted
             }
@@ -908,6 +1149,7 @@ impl CheckoutMutations {
                 blocked_by: None,
                 owner_unsupported_at: None,
                 reconciled: None,
+                discarded: None,
             });
         }
         let ids = rows
@@ -995,6 +1237,27 @@ impl CheckoutMutations {
         self.enqueue(mutation)?;
         Ok(id)
     }
+}
+
+/// The attention state of a row, as the attention report names states.
+fn attention_state(row: &PendingCheckoutMutation) -> &'static str {
+    match row.status {
+        CheckoutMutationStatus::Pending => "pending",
+        CheckoutMutationStatus::Applied => match &row.publication {
+            _ if row.reconciled.is_some() => "superseded",
+            Some(publication) if !publication.observed => "applied_unobserved",
+            _ => "settled",
+        },
+        CheckoutMutationStatus::Failed if row.discarded.is_some() => "discarded",
+        CheckoutMutationStatus::Failed if row.conflict.is_some() => "conflicted",
+        CheckoutMutationStatus::Failed if row.blocked_by.is_some() => "blocked",
+        CheckoutMutationStatus::Failed => "failed",
+    }
+}
+
+/// Whether the attention report lists rows in this state.
+fn needs_attention(state: &str) -> bool {
+    !matches!(state, "settled" | "superseded" | "discarded")
 }
 
 fn epoch_of(mutation: &CheckoutMutationV1) -> String {
@@ -1956,6 +2219,289 @@ mod tests {
         assert_eq!(store.pending_count(), 0);
         assert_eq!(store.failed().len(), 1);
         assert_eq!(store.failed()[0].last_error.as_deref(), Some("disk full"));
+    }
+
+    fn settle(store: &mut CheckoutMutations, id: &str, outcome: &str) {
+        assert!(
+            store
+                .ack(
+                    id,
+                    outcome,
+                    Some("owner said no".into()),
+                    None,
+                    "2026-08-12T00:01:00Z"
+                )
+                .unwrap()
+        );
+    }
+
+    /// Discard settles a row without touching the checkout: it leaves the
+    /// attention listing and the write overlay, stays terminal for every
+    /// reader, and takes later rows on its path only when asked to.
+    #[test]
+    fn discard_settles_a_row_and_cascades_only_when_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = CheckoutMutations::open(&dir.path().join("mutations.json")).unwrap();
+        let path = ".bbox/gaps/gap-0000d15c.json";
+        let first = store
+            .enqueue_tracked_writes(
+                scope(),
+                vec![(path.into(), "{\"v\":1}".into(), None)],
+                "first".into(),
+                "2026-08-12T00:00:00Z".into(),
+            )
+            .unwrap()
+            .remove(0);
+        settle(&mut store, &first, "failed");
+        let second = store
+            .enqueue_tracked_writes(
+                scope(),
+                vec![(path.into(), "{\"v\":2}".into(), Some("{\"v\":1}".into()))],
+                "second".into(),
+                "2026-08-12T00:02:00Z".into(),
+            )
+            .unwrap()
+            .remove(0);
+        // Another path is never part of a cascade.
+        store.enqueue(mutation("cm-00000000000000aa")).unwrap();
+
+        assert_eq!(
+            store.discard_plan(&first, false),
+            Err(ReconcileRefusal::NewerRowsOnPath(vec![second.clone()]))
+        );
+        assert_eq!(
+            store.discard_plan(&first, true).unwrap().mutation_ids,
+            vec![first.clone(), second.clone()]
+        );
+        assert_eq!(
+            store.discard_plan("cm-ffffffffffffffff", true),
+            Err(ReconcileRefusal::UnknownMutation)
+        );
+
+        // The newest row on its path needs no cascade.
+        let plan = store
+            .discard(&second, false, "wrong edit", "2026-08-12T00:03:00Z")
+            .unwrap();
+        assert_eq!(plan.mutation_ids, vec![second.clone()]);
+        let row = store.get(&second).unwrap();
+        assert_eq!(row.status, CheckoutMutationStatus::Failed);
+        assert_eq!(
+            row.discarded,
+            Some(MutationDiscard {
+                at: "2026-08-12T00:03:00Z".into(),
+                audit_reason: "wrong edit".into(),
+                prior_state: "pending".into(),
+            })
+        );
+        assert_eq!(store.attention_state(&second), Some("discarded"));
+        assert_eq!(
+            store.progress(&second),
+            Some(CheckoutMutationProgress::Discarded)
+        );
+        // Gone from delivery and from the overlay; still counted.
+        assert!(store.poll(&BTreeSet::from([scope()]), true).mutations.len() == 1);
+        assert!(
+            store
+                .outstanding_intents()
+                .all(|row| row.mutation.mutation_id != second)
+        );
+        assert_eq!(
+            store.write_base(&scope(), path, Some("{\"v\":1}")).unwrap(),
+            Some("{\"v\":1}".into())
+        );
+        let report = store.attention_report(&scope());
+        assert_eq!(report["counts"]["discarded"], 1);
+        assert!(
+            report["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row["mutation_id"] != second)
+        );
+        // Settled twice is refused, as is a settled row.
+        assert_eq!(
+            store.discard_plan(&second, false),
+            Err(ReconcileRefusal::StateNotEligible("discarded".into()))
+        );
+        // The failed predecessor is now the newest attention row on its path.
+        assert_eq!(
+            store.discard_plan(&first, false).unwrap().mutation_ids,
+            vec![first.clone()]
+        );
+    }
+
+    /// Requeue returns a failed or conflicted row to pending only while the
+    /// publication still matches its base and nothing newer sits on its
+    /// path; blocked rows are re-issued, not requeued.
+    #[test]
+    fn requeue_needs_an_unmoved_publication_and_no_newer_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = CheckoutMutations::open(&dir.path().join("mutations.json")).unwrap();
+        let path = ".bbox/knowledge/k-1.json";
+        let tracked = store
+            .enqueue_tracked_writes(
+                scope(),
+                vec![(path.into(), "{\"v\":2}".into(), Some("{\"v\":1}".into()))],
+                "edit".into(),
+                "2026-08-12T00:00:00Z".into(),
+            )
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            store.requeue(&tracked, Some(Some("{\"v\":1}"))),
+            Err(ReconcileRefusal::StateNotEligible("pending".into()))
+        );
+        settle(&mut store, &tracked, "failed");
+        assert_eq!(
+            store.requeue(&tracked, None),
+            Err(ReconcileRefusal::BaseUnknown)
+        );
+        assert_eq!(
+            store.requeue(&tracked, Some(Some("{\"v\":9}"))),
+            Err(ReconcileRefusal::PublicationMoved)
+        );
+        // JSON-equivalent publication is the same base for an unguarded row.
+        store.requeue(&tracked, Some(Some("{ \"v\": 1 }"))).unwrap();
+        let row = store.get(&tracked).unwrap();
+        assert_eq!(row.status, CheckoutMutationStatus::Pending);
+        assert_eq!(row.attempts, 1);
+        assert!(row.last_error.is_none() && row.acked_at.is_none());
+        assert!(!row.publication.as_ref().unwrap().observed);
+        assert_eq!(
+            store.poll(&BTreeSet::from([scope()]), true).mutations.len(),
+            1
+        );
+
+        // A newer attention row on the path refuses the requeue.
+        settle(&mut store, &tracked, "failed");
+        let newer = store
+            .enqueue_tracked_writes(
+                scope(),
+                vec![(path.into(), "{\"v\":3}".into(), Some("{\"v\":1}".into()))],
+                "later".into(),
+                "2026-08-12T00:05:00Z".into(),
+            )
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            store.requeue(&tracked, Some(Some("{\"v\":1}"))),
+            Err(ReconcileRefusal::NewerRowsOnPath(vec![newer.clone()]))
+        );
+        store
+            .discard(&newer, false, "superseded", "2026-08-12T00:06:00Z")
+            .unwrap();
+        store.requeue(&tracked, Some(Some("{\"v\":1}"))).unwrap();
+
+        // An untracked row has no base: it requeues only with nothing newer
+        // on its path at all.
+        let mut legacy = mutation("cm-00000000000000b1");
+        legacy.relative_path = ".bbox/gaps/gap-legacy01.json".into();
+        store.enqueue(legacy.clone()).unwrap();
+        settle(&mut store, "cm-00000000000000b1", "failed");
+        store.requeue("cm-00000000000000b1", None).unwrap();
+        settle(&mut store, "cm-00000000000000b1", "failed");
+        let mut later = mutation("cm-00000000000000b2");
+        later.relative_path = legacy.relative_path.clone();
+        store.enqueue(later).unwrap();
+        settle(&mut store, "cm-00000000000000b2", "applied");
+        assert_eq!(
+            store.requeue("cm-00000000000000b1", None),
+            Err(ReconcileRefusal::PublicationMoved)
+        );
+
+        // A guarded conflict requeues on exact bytes; its blocked successor
+        // does not requeue at all.
+        let config = ".bbox/mcp.json";
+        let head = store
+            .enqueue_guarded(
+                scope(),
+                config.into(),
+                Some("{\"a\":1}".into()),
+                Some("{}"),
+                Some("{}".into()),
+                "head".into(),
+                "2026-08-12T00:10:00Z".into(),
+            )
+            .unwrap();
+        let tail = store
+            .enqueue_guarded(
+                scope(),
+                config.into(),
+                Some("{\"a\":2}".into()),
+                Some("{\"a\":1}"),
+                Some("{}".into()),
+                "tail".into(),
+                "2026-08-12T00:11:00Z".into(),
+            )
+            .unwrap();
+        store
+            .ack_with_observation(
+                &head.mutation_id,
+                CHECKOUT_MUTATION_OUTCOME_CONFLICTED,
+                Some("precondition".into()),
+                None,
+                Some("x".repeat(64)),
+                "2026-08-12T00:12:00Z",
+            )
+            .unwrap();
+        assert_eq!(store.attention_state(&tail.mutation_id), Some("blocked"));
+        assert_eq!(
+            store.requeue(&tail.mutation_id, Some(Some("{}"))),
+            Err(ReconcileRefusal::StateNotEligible("blocked".into()))
+        );
+        assert_eq!(
+            store.requeue(&head.mutation_id, Some(Some("{}"))),
+            Err(ReconcileRefusal::NewerRowsOnPath(vec![
+                tail.mutation_id.clone()
+            ]))
+        );
+        store
+            .discard(
+                &tail.mutation_id,
+                false,
+                "re-issue later",
+                "2026-08-12T00:13:00Z",
+            )
+            .unwrap();
+        assert_eq!(
+            store.requeue(&head.mutation_id, Some(Some("{ }"))),
+            Err(ReconcileRefusal::PublicationMoved)
+        );
+        store.requeue(&head.mutation_id, Some(Some("{}"))).unwrap();
+        let row = store.get(&head.mutation_id).unwrap();
+        assert_eq!(row.status, CheckoutMutationStatus::Pending);
+        assert!(row.conflict.is_none());
+        assert!(row.mutation.guard.is_some());
+    }
+
+    /// A discarded row is written with status failed, so a daemon that does
+    /// not know the discard field still reads it as terminal.
+    #[test]
+    fn a_discarded_row_persists_as_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mutations.json");
+        let mut store = CheckoutMutations::open(&path).unwrap();
+        store.enqueue(mutation("cm-00000000000000c1")).unwrap();
+        store
+            .discard(
+                "cm-00000000000000c1",
+                false,
+                "noise",
+                "2026-08-12T00:01:00Z",
+            )
+            .unwrap();
+        let snapshot = store.snapshot().unwrap();
+        let raw: serde_json::Value = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(raw["mutations"][0]["status"], "failed");
+        assert_eq!(raw["mutations"][0]["discarded"]["prior_state"], "pending");
+        let mut without_field = raw.clone();
+        without_field["mutations"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("discarded");
+        let older: CheckoutMutationStore = serde_json::from_value(without_field).unwrap();
+        assert_eq!(older.mutations[0].status, CheckoutMutationStatus::Failed);
+        assert!(older.mutations[0].discarded.is_none());
     }
 
     #[test]

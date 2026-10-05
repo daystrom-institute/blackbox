@@ -332,6 +332,7 @@ mod tests {
         "bbox_project_publisher_bind",
         "bbox_project_publisher_advance",
         "bbox_project_publisher_status",
+        "bbox_project_checkout_mutation_reconcile",
         "bbox_project_graph_list",
         "bbox_project_graph_describe",
         "bbox_project_graph_validate",

@@ -7,6 +7,7 @@ pub(crate) mod candidate_acceptance;
 #[cfg(test)]
 pub(crate) mod catalog_ownership_scan;
 pub(crate) mod checkout_access;
+pub(crate) mod checkout_mutation_reconcile;
 pub(crate) mod code_source;
 pub(crate) mod connector_grants;
 mod conversation_enrollment;

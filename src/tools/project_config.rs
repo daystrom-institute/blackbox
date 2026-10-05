@@ -496,6 +496,7 @@ impl SharedState {
                 row.blocked_by.as_deref().unwrap_or("unknown")
             ),
             CheckoutMutationProgress::Failed => "The owner could not apply it and left its bytes unchanged. Resolve the reported cause in the owning checkout, then re-issue the edit".to_string(),
+            CheckoutMutationProgress::Discarded => "Discarded by an operator; the owner's file was never changed for it. Re-issue the edit from the accepted configuration if it is still wanted".to_string(),
         };
         Ok(ProjectConfigMutationStatus {
             mutation_id: mutation_id.to_string(),

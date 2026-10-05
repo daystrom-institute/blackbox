@@ -460,7 +460,9 @@ impl BlackboxServer {
 /// the view layer already consumes. The manifest supplies the content hash
 /// of the exact committed bytes, matching what a publisher-root read of the
 /// same commit would produce.
-fn published_gaps_from_accepted(verified: &VerifiedAcceptedPublication) -> PublishedGapSnapshot {
+pub(crate) fn published_gaps_from_accepted(
+    verified: &VerifiedAcceptedPublication,
+) -> PublishedGapSnapshot {
     let content_stamp = verified.content_stamp();
     let mut gaps = BTreeMap::new();
     for manifest in verified.gap_manifest().values() {

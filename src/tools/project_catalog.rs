@@ -460,6 +460,47 @@ pub(crate) struct ProjectPublisherStatusParams {
     /// Exact detail page byte budget, 4..=4096. Requires detail.
     #[serde(default)]
     pub detail_limit: Option<usize>,
+    /// checkout_mutations detail only: list rows at this scope-relative path
+    /// only. Counts still cover the whole project.
+    #[serde(default)]
+    pub detail_path: Option<String>,
+    /// checkout_mutations detail only: list rows in these states only
+    /// (pending, applied_unobserved, failed, conflicted, blocked). Counts
+    /// still cover the whole project.
+    #[serde(default)]
+    pub detail_states: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CheckoutMutationReconcileAction {
+    /// Settle the row without touching the checkout. Any row the listing
+    /// shows can be discarded.
+    Discard,
+    /// Send a failed or conflicted row to the owner again.
+    Requeue,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct CheckoutMutationReconcileParams {
+    pub project_id: String,
+    pub mutation_id: String,
+    pub action: CheckoutMutationReconcileAction,
+    /// The row's state as the checkout_mutations listing showed it. A row
+    /// whose state has since changed is refused.
+    pub expected_state: String,
+    /// The row's postimage_sha256 as the listing showed it; absent for a
+    /// delete. A row whose postimage differs is refused.
+    #[serde(default)]
+    pub expected_postimage_sha256: Option<String>,
+    /// Discard only: also discard the later rows on the same path that still
+    /// need attention. Without it a row with such successors is refused and
+    /// the refusal names them.
+    #[serde(default)]
+    pub cascade: bool,
+    #[serde(default)]
+    pub dry_run: bool,
+    pub audit_reason: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -720,6 +761,28 @@ fn validate_publisher_status_detail(p: &ProjectPublisherStatusParams) -> anyhow:
         anyhow::bail!(
             "error.project_publisher_status_detail_limit: detail_limit must be between 4 and 4096"
         );
+    }
+    if (p.detail_path.is_some() || p.detail_states.is_some())
+        && p.detail != Some(ProjectPublisherStatusDetail::CheckoutMutations)
+    {
+        anyhow::bail!(
+            "error.project_publisher_status_detail_filter: detail_path and detail_states require detail=checkout_mutations"
+        );
+    }
+    if let Some(states) = &p.detail_states {
+        const LISTED: [&str; 5] = [
+            "pending",
+            "applied_unobserved",
+            "failed",
+            "conflicted",
+            "blocked",
+        ];
+        if states.is_empty() || states.iter().any(|state| !LISTED.contains(&state.as_str())) {
+            anyhow::bail!(
+                "error.project_publisher_status_detail_filter: detail_states takes one or more of {}",
+                LISTED.join(", ")
+            );
+        }
     }
     Ok(())
 }
@@ -2019,8 +2082,178 @@ impl BlackboxServer {
     }
 
     #[tool(
+        name = "bbox_project_checkout_mutation_reconcile",
+        description = "Operator reconciliation of one queued checkout mutation that bbox_project_publisher_status(detail=checkout_mutations) listed. discard settles the row without touching the checkout: it leaves the listing and the write overlay and the next edit of its path starts from the accepted publication; any listed row can be discarded, but a row with later listed rows on its path is refused unless cascade=true discards them with it. requeue sends a failed or conflicted row to the owner again, and is refused when later rows on the path still need attention, when the accepted publication for the path no longer matches the base the row was computed from, or when that cannot be checked; blocked and discarded rows are re-issued through the edit tools, never requeued. expected_state and expected_postimage_sha256 must match the listing or the call is refused. dry_run reports what would change. Durable before it answers; nothing here changes the owner's files. Returns error.project_catalog_inactive while the version-1 registry is the runtime authority."
+    )]
+    pub(crate) async fn bbox_project_checkout_mutation_reconcile(
+        &self,
+        Parameters(p): Parameters<CheckoutMutationReconcileParams>,
+    ) -> CallToolResult {
+        let Some(store) = self.catalog_store() else {
+            return Self::err_text(&catalog_inactive());
+        };
+        let server = self.clone();
+        let dry_run = p.dry_run;
+        let result = Self::run_blocking("bbox_project_checkout_mutation_reconcile", move || {
+            use crate::checkout_mutations::ReconcileRefusal;
+            use crate::server::checkout_mutation_reconcile::PublishedPathContent;
+            use bbox_stores::store_persister::StoreSnapshot as _;
+
+            let audit_reason = bounded_audit_reason(&p.audit_reason)?;
+            let project_id = parse_project_id(&p.project_id)?;
+            let state = store.snapshot().map_err(|error| anyhow::anyhow!("{error}"))?;
+            let Some(project) = state.catalog().projects.get(&project_id) else {
+                anyhow::bail!(
+                    "error.project_catalog_admin_unknown_project: {project_id} is not in the catalog"
+                );
+            };
+            let bbox_corpus_core::project_catalog::ProjectScope::Published(scope) = &project.scope
+            else {
+                anyhow::bail!(
+                    "error.checkout_mutation_unknown: {project_id} has no published scope, so it \
+                     queues no checkout mutations"
+                );
+            };
+            // The row the operator saw must be the row that is here: same
+            // project, same state, same postimage.
+            let (relative_path, prior_state) = {
+                let queue = server.state.checkout_mutations.read();
+                let row = queue.get(&p.mutation_id).ok_or_else(|| {
+                    anyhow::anyhow!("error.checkout_mutation_unknown: no mutation {}", p.mutation_id)
+                })?;
+                anyhow::ensure!(
+                    &row.mutation.scope == scope,
+                    "error.checkout_mutation_unknown: {} is not a mutation of {project_id}",
+                    p.mutation_id
+                );
+                let current = queue
+                    .attention_state(&p.mutation_id)
+                    .expect("the row was found above");
+                anyhow::ensure!(
+                    current == p.expected_state,
+                    "error.checkout_mutation_state_changed: {} is {current}, not {}; list it \
+                     again before reconciling",
+                    p.mutation_id,
+                    p.expected_state
+                );
+                anyhow::ensure!(
+                    row.mutation.target_sha256().as_deref()
+                        == p.expected_postimage_sha256.as_deref(),
+                    "error.checkout_mutation_postimage_mismatch: {} does not carry the postimage \
+                     named; list it again before reconciling",
+                    p.mutation_id
+                );
+                (row.mutation.relative_path.clone(), current)
+            };
+            let refused = |refusal: ReconcileRefusal| {
+                anyhow::anyhow!("error.checkout_mutation_reconcile_refused: {refusal}")
+            };
+            let now = bbox_util::util::now_iso();
+            let mut response = json!({
+                "status": if p.dry_run { "dry_run" } else { "ok" },
+                "project_id": project_id.as_str(),
+                "mutation_id": p.mutation_id,
+                "relative_path": relative_path,
+                "action": match p.action {
+                    CheckoutMutationReconcileAction::Discard => "discard",
+                    CheckoutMutationReconcileAction::Requeue => "requeue",
+                },
+                "prior_state": prior_state,
+                "dry_run": p.dry_run,
+                "audit_reason": audit_reason,
+            });
+            match p.action {
+                CheckoutMutationReconcileAction::Discard => {
+                    let plan = if p.dry_run {
+                        server
+                            .state
+                            .checkout_mutations
+                            .read()
+                            .discard_plan(&p.mutation_id, p.cascade)
+                            .map_err(refused)?
+                    } else {
+                        let mut queue = server.state.checkout_mutations.write();
+                        // Re-checked under the write lock: the read above
+                        // was a different critical section.
+                        anyhow::ensure!(
+                            queue.attention_state(&p.mutation_id) == Some(prior_state),
+                            "error.checkout_mutation_state_changed: {} changed while reconciling",
+                            p.mutation_id
+                        );
+                        queue
+                            .discard(&p.mutation_id, p.cascade, &audit_reason, &now)
+                            .map_err(refused)?
+                    };
+                    response["discarded"] = json!(plan.mutation_ids);
+                    response["next_step"] = json!(
+                        "the next edit of this path starts from the accepted publication; \
+                         re-issue the edit through the knowledge, gap or configuration tool if \
+                         it is still wanted"
+                    );
+                }
+                CheckoutMutationReconcileAction::Requeue => {
+                    let published = match server.state.published_path_content(
+                        &project_id,
+                        scope,
+                        &relative_path,
+                    )? {
+                        PublishedPathContent::Known(content) => Some(content),
+                        PublishedPathContent::UnknownLane => None,
+                    };
+                    let published = published.as_ref().map(Option::as_deref);
+                    if p.dry_run {
+                        // The same checks requeue makes, on a copy, so a dry
+                        // run reports the refusal a real call would get.
+                        let mut rehearsal = crate::checkout_mutations::CheckoutMutations::from_snapshot(
+                            server.state.checkout_mutations.read().snapshot()?,
+                        );
+                        rehearsal
+                            .requeue(&p.mutation_id, published)
+                            .map_err(refused)?;
+                    } else {
+                        let mut queue = server.state.checkout_mutations.write();
+                        anyhow::ensure!(
+                            queue.attention_state(&p.mutation_id) == Some(prior_state),
+                            "error.checkout_mutation_state_changed: {} changed while reconciling",
+                            p.mutation_id
+                        );
+                        queue.requeue(&p.mutation_id, published).map_err(refused)?;
+                    }
+                    response["state"] = json!("pending");
+                    response["next_step"] = json!(
+                        "the owning checkout's collector receives the mutation on its next poll"
+                    );
+                }
+            }
+            if !p.dry_run {
+                tracing::info!(
+                    tool = "bbox_project_checkout_mutation_reconcile",
+                    project_id = %project_id,
+                    mutation_id = %p.mutation_id,
+                    action = response["action"].as_str().unwrap_or(""),
+                    audit_reason = %audit_reason,
+                    "catalog administration mutation"
+                );
+            }
+            Ok(serde_json::to_string_pretty(&response)?)
+        })
+        .await;
+        // Durable before the answer: an operator who read "ok" must not find
+        // the row back in its old state after a restart.
+        if !dry_run
+            && result.is_error != Some(true)
+            && let Err(error) = self.state.persist_checkout_mutations_durable().await
+        {
+            return Self::err_text(&format!(
+                "error.checkout_mutation_persist: the change is in memory but not yet durable: {error}"
+            ));
+        }
+        result
+    }
+
+    #[tool(
         name = "bbox_project_publisher_status",
-        description = "Read one catalog project's accepted-publication status: state, scope/ref/commit identity, typed source binding, advance availability, the generation_id and pointer_sha256 identities, and the latest candidate acceptance attempt. pointer_written_unix_secs is the pointer file's modification time: the last pointer write (accept, bind or rollback), not strictly the last accept, and a restored store carries the restore time. last_candidate is the newest candidate stored for the project (status stored, none or unavailable; source generation, producer, ref, commit, state, creation time, diagnostic) with served_by_pointer saying whether the accepted pointer serves it; it is read from durable state and survives a daemon restart. Default health and connector sections are compact bounded summaries that keep stale, unavailable, queued, and partial signals visible with total, status, and omission counts; recorded rows are observations, not live filesystem authority. Oversized summary strings become explicit size-and-truncation markers (diagnostics keep a bounded prefix) whose exact bytes live only in detail pages. detail=health returns the complete runtime view, detail=connector the complete connector view, detail=acceptance the latest candidate acceptance attempt, and detail=checkout_mutations the project's queued checkout edits that are pending, applied but not yet published, failed, conflicted, or blocked (ids, paths, digests and state counts, never file content) as exact bounded body pages; replay detail.body.next_cursor while the body is unchanged. Connector detail requires a connector-scoped project and checkout_mutations detail a published one. Observational, path-free, and takes no checkout lease; see design/daemon-runtime/publisher-auto-advance.md for deep mechanics. Returns error.project_catalog_inactive while the version-1 registry is the runtime authority."
+        description = "Read one catalog project's accepted-publication status: state, scope/ref/commit identity, typed source binding, advance availability, the generation_id and pointer_sha256 identities, and the latest candidate acceptance attempt. pointer_written_unix_secs is the pointer file's modification time: the last pointer write (accept, bind or rollback), not strictly the last accept, and a restored store carries the restore time. last_candidate is the newest candidate stored for the project (status stored, none or unavailable; source generation, producer, ref, commit, state, creation time, diagnostic) with served_by_pointer saying whether the accepted pointer serves it; it is read from durable state and survives a daemon restart. Default health and connector sections are compact bounded summaries that keep stale, unavailable, queued, and partial signals visible with total, status, and omission counts; recorded rows are observations, not live filesystem authority. Oversized summary strings become explicit size-and-truncation markers (diagnostics keep a bounded prefix) whose exact bytes live only in detail pages. detail=health returns the complete runtime view, detail=connector the complete connector view, detail=acceptance the latest candidate acceptance attempt, and detail=checkout_mutations the project's queued checkout edits that are pending, applied but not yet published, failed, conflicted, or blocked (ids, paths, digests and state counts, never file content; detail_path and detail_states narrow the rows, counts stay whole) as exact bounded body pages; replay detail.body.next_cursor while the body is unchanged. Connector detail requires a connector-scoped project and checkout_mutations detail a published one. Observational, path-free, and takes no checkout lease; see design/daemon-runtime/publisher-auto-advance.md for deep mechanics. Returns error.project_catalog_inactive while the version-1 registry is the runtime authority."
     )]
     pub(crate) async fn bbox_project_publisher_status(
         &self,
@@ -2130,13 +2363,27 @@ impl BlackboxServer {
                             "error.project_publisher_status_detail_unavailable: checkout_mutations detail requires a published project"
                         );
                     };
-                    let report = server.state.checkout_mutations.read().attention_report(scope);
+                    let states = p
+                        .detail_states
+                        .as_ref()
+                        .map(|states| states.iter().map(String::as_str).collect::<Vec<_>>());
+                    let report = server
+                        .state
+                        .checkout_mutations
+                        .read()
+                        .attention_report_filtered(
+                            scope,
+                            p.detail_path.as_deref(),
+                            states.as_deref(),
+                        );
                     Some((
                         "checkout_mutations",
                         super::body_page::json_body_page(
                             &format!(
-                                "publisher-status:{project_id}:{}:checkout_mutations",
-                                state.epoch()
+                                "publisher-status:{project_id}:{}:checkout_mutations:{}:{}",
+                                state.epoch(),
+                                p.detail_path.as_deref().unwrap_or(""),
+                                states.as_deref().unwrap_or(&[]).join(",")
                             ),
                             &report,
                             p.detail_cursor.as_deref(),
@@ -6248,7 +6495,7 @@ mod tests {
                     project_id: project_id.into(),
                     detail: Some(detail),
                     detail_cursor: cursor,
-                    detail_limit: None,
+                    ..Default::default()
                 }))
                 .await;
             assert_ne!(result.is_error, Some(true), "{}", error_text(&result));
@@ -6490,6 +6737,338 @@ mod tests {
         );
         assert_eq!(rows[2]["last_error"], "disk full");
         assert_eq!(rows[2]["attempts"], 1);
+    }
+
+    /// The listing narrows by path and by state while its counts stay whole,
+    /// and refuses a filter without the detail or with an unknown state.
+    #[tokio::test]
+    async fn checkout_mutation_listing_filters_rows_and_keeps_counts() {
+        let (fixture, scope, _installed) = publisher_health_fixture("p_mutation_filters", 1);
+        let server = fixture.server();
+        let now = || "2026-08-12T00:00:00Z".to_string();
+        let gap = |name: &str| format!(".bbox/gaps/{name}.json");
+        let (first, second) = {
+            let mut queue = server.state.checkout_mutations.write();
+            let mut tracked = |name: &str| {
+                queue
+                    .enqueue_tracked_writes(
+                        scope.clone(),
+                        vec![(gap(name), "{}".to_string(), None)],
+                        "filter test".into(),
+                        now(),
+                    )
+                    .unwrap()
+                    .remove(0)
+            };
+            let first = tracked("gap-000000f1");
+            let second = tracked("gap-000000f2");
+            assert!(
+                queue
+                    .ack(&second, "failed", Some("disk full".into()), None, &now())
+                    .unwrap()
+            );
+            (first, second)
+        };
+        let listing = |path: Option<&str>, states: Option<Vec<&str>>| {
+            let server = server.clone();
+            let path = path.map(str::to_owned);
+            let states = states.map(|states| states.iter().map(|s| s.to_string()).collect());
+            async move {
+                server
+                    .bbox_project_publisher_status(Parameters(ProjectPublisherStatusParams {
+                        project_id: "p_mutation_filters".into(),
+                        detail: Some(ProjectPublisherStatusDetail::CheckoutMutations),
+                        detail_path: path,
+                        detail_states: states,
+                        ..Default::default()
+                    }))
+                    .await
+            }
+        };
+        let ids = |result: &CallToolResult| -> Vec<String> {
+            let body: serde_json::Value = serde_json::from_str(&error_text(result)).unwrap();
+            let report: serde_json::Value =
+                serde_json::from_str(body["detail"]["body"]["text"].as_str().unwrap()).unwrap();
+            assert_eq!(report["counts"], json!({"failed": 1, "pending": 1}));
+            report["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["mutation_id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let all = listing(None, None).await;
+        assert_eq!(ids(&all), vec![first.clone(), second.clone()]);
+        let by_state = listing(None, Some(vec!["failed"])).await;
+        assert_eq!(ids(&by_state), vec![second.clone()]);
+        let by_path = listing(Some(&gap("gap-000000f1")), None).await;
+        assert_eq!(ids(&by_path), vec![first.clone()]);
+        let none = listing(Some(&gap("gap-000000f1")), Some(vec!["failed"])).await;
+        assert!(ids(&none).is_empty());
+
+        let unknown_state = listing(None, Some(vec!["settled"])).await;
+        assert_eq!(unknown_state.is_error, Some(true));
+        assert!(error_text(&unknown_state).contains("detail_filter"));
+        let without_detail = server
+            .bbox_project_publisher_status(Parameters(ProjectPublisherStatusParams {
+                project_id: "p_mutation_filters".into(),
+                detail_states: Some(vec!["pending".into()]),
+                ..Default::default()
+            }))
+            .await;
+        assert_eq!(without_detail.is_error, Some(true));
+        assert!(error_text(&without_detail).contains("require detail=checkout_mutations"));
+    }
+
+    /// Discard and requeue through the tool: each is checked against what
+    /// the listing showed, refused for the wrong row state, rehearsed by
+    /// dry_run, and visible in the listing afterwards.
+    #[tokio::test]
+    async fn checkout_mutation_reconcile_discards_and_requeues_listed_rows() {
+        use sha2::Digest as _;
+
+        let (fixture, scope, _installed) = publisher_health_fixture("p_reconcile", 1);
+        let server = fixture.server();
+        let now = || "2026-08-12T00:00:00Z".to_string();
+        let gap = |name: &str| format!(".bbox/gaps/{name}.json");
+        let digest = |content: &str| format!("{:x}", sha2::Sha256::digest(content.as_bytes()));
+        let (unobserved, failed, moved) = {
+            let mut queue = server.state.checkout_mutations.write();
+            let mut tracked = |name: &str, content: &str, base: Option<&str>| {
+                queue
+                    .enqueue_tracked_writes(
+                        scope.clone(),
+                        vec![(gap(name), content.to_string(), base.map(str::to_owned))],
+                        "reconcile test".into(),
+                        now(),
+                    )
+                    .unwrap()
+                    .remove(0)
+            };
+            let unobserved = tracked("gap-000000c1", "{\"v\":2}", Some("{\"v\":1}"));
+            // The publication has no gap at this path, which is the base
+            // this row was computed from.
+            let failed = tracked("gap-000000c2", "{\"v\":4}", None);
+            // This row's base names content the publication does not hold.
+            let moved = tracked("gap-000000c3", "{\"v\":5}", Some("{\"v\":1}"));
+            assert!(
+                queue
+                    .ack(&unobserved, "applied", None, None, &now())
+                    .unwrap()
+            );
+            for id in [&failed, &moved] {
+                assert!(
+                    queue
+                        .ack(id, "failed", Some("disk full".into()), None, &now())
+                        .unwrap()
+                );
+            }
+            (unobserved, failed, moved)
+        };
+        let reconcile = |mutation_id: &str,
+                         action: CheckoutMutationReconcileAction,
+                         expected_state: &str,
+                         postimage: Option<String>,
+                         cascade: bool,
+                         dry_run: bool,
+                         audit_reason: &str| {
+            let server = server.clone();
+            let params = CheckoutMutationReconcileParams {
+                project_id: "p_reconcile".into(),
+                mutation_id: mutation_id.into(),
+                action,
+                expected_state: expected_state.into(),
+                expected_postimage_sha256: postimage,
+                cascade,
+                dry_run,
+                audit_reason: audit_reason.into(),
+            };
+            async move {
+                server
+                    .bbox_project_checkout_mutation_reconcile(Parameters(params))
+                    .await
+            }
+        };
+        use CheckoutMutationReconcileAction::{Discard, Requeue};
+        let four = Some(digest("{\"v\":4}"));
+
+        // Refusals name their precondition and change nothing.
+        let refusals = [
+            (
+                reconcile(&failed, Requeue, "failed", four.clone(), false, false, "").await,
+                "audit_reason is required",
+            ),
+            (
+                reconcile(
+                    &failed,
+                    Requeue,
+                    "pending",
+                    four.clone(),
+                    false,
+                    false,
+                    "retry",
+                )
+                .await,
+                "error.checkout_mutation_state_changed",
+            ),
+            (
+                reconcile(
+                    &failed,
+                    Requeue,
+                    "failed",
+                    Some("0".repeat(64)),
+                    false,
+                    false,
+                    "retry",
+                )
+                .await,
+                "error.checkout_mutation_postimage_mismatch",
+            ),
+            (
+                reconcile(
+                    "cm-ffffffffffffffff",
+                    Discard,
+                    "failed",
+                    None,
+                    false,
+                    false,
+                    "x",
+                )
+                .await,
+                "error.checkout_mutation_unknown",
+            ),
+            (
+                reconcile(
+                    &unobserved,
+                    Requeue,
+                    "applied_unobserved",
+                    Some(digest("{\"v\":2}")),
+                    false,
+                    false,
+                    "retry",
+                )
+                .await,
+                "which this action does not accept",
+            ),
+            (
+                reconcile(
+                    &moved,
+                    Requeue,
+                    "failed",
+                    Some(digest("{\"v\":5}")),
+                    false,
+                    false,
+                    "retry",
+                )
+                .await,
+                "no longer matches the base",
+            ),
+        ];
+        for (result, expected) in &refusals {
+            assert_eq!(result.is_error, Some(true), "{}", error_text(result));
+            assert!(
+                error_text(result).contains(expected),
+                "{}",
+                error_text(result)
+            );
+        }
+        {
+            let queue = server.state.checkout_mutations.read();
+            assert_eq!(queue.attention_state(&failed), Some("failed"));
+            assert_eq!(queue.attention_state(&moved), Some("failed"));
+            assert_eq!(
+                queue.attention_state(&unobserved),
+                Some("applied_unobserved")
+            );
+        }
+
+        // A dry run reports the plan and leaves the row as it was.
+        let rehearsed = reconcile(
+            &failed,
+            Requeue,
+            "failed",
+            four.clone(),
+            false,
+            true,
+            "retry",
+        )
+        .await;
+        assert_ne!(rehearsed.is_error, Some(true), "{}", error_text(&rehearsed));
+        let body: serde_json::Value = serde_json::from_str(&error_text(&rehearsed)).unwrap();
+        assert_eq!(body["status"], "dry_run");
+        assert_eq!(body["state"], "pending");
+        assert_eq!(
+            server
+                .state
+                .checkout_mutations
+                .read()
+                .attention_state(&failed),
+            Some("failed")
+        );
+
+        // Requeue: the row is pending again and the owner would be sent it.
+        let requeued =
+            reconcile(&failed, Requeue, "failed", four, false, false, "disk freed").await;
+        assert_ne!(requeued.is_error, Some(true), "{}", error_text(&requeued));
+        let body: serde_json::Value = serde_json::from_str(&error_text(&requeued)).unwrap();
+        assert_eq!(body["status"], "ok");
+        assert_eq!(body["prior_state"], "failed");
+        {
+            let queue = server.state.checkout_mutations.read();
+            assert_eq!(queue.attention_state(&failed), Some("pending"));
+            let poll = queue.poll(&std::collections::BTreeSet::from([scope.clone()]), true);
+            assert!(poll.mutations.iter().any(|m| m.mutation_id == failed));
+        }
+
+        // Discard: gone from the listing and the overlay, counted as discarded.
+        let discarded = reconcile(
+            &unobserved,
+            Discard,
+            "applied_unobserved",
+            Some(digest("{\"v\":2}")),
+            false,
+            false,
+            "owner published a different fix",
+        )
+        .await;
+        assert_ne!(discarded.is_error, Some(true), "{}", error_text(&discarded));
+        let body: serde_json::Value = serde_json::from_str(&error_text(&discarded)).unwrap();
+        assert_eq!(body["discarded"], json!([unobserved.clone()]));
+        {
+            let mut queue = server.state.checkout_mutations.write();
+            assert_eq!(queue.attention_state(&unobserved), Some("discarded"));
+            assert_eq!(
+                queue
+                    .write_base(&scope, &gap("gap-000000c1"), Some("{\"v\":1}"))
+                    .unwrap(),
+                Some("{\"v\":1}".into())
+            );
+        }
+        let text = page_publisher_status_detail(
+            &server,
+            "p_reconcile",
+            ProjectPublisherStatusDetail::CheckoutMutations,
+        )
+        .await;
+        let report: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            report["counts"],
+            json!({"discarded": 1, "failed": 1, "pending": 1})
+        );
+        assert!(
+            report["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row["mutation_id"] != unobserved.as_str())
+        );
+
+        // The change survived the durable persist: a fresh queue over the
+        // file reads the discard.
+        let path = server.state.store_dir.join("checkout-mutations.json");
+        let reopened = crate::checkout_mutations::CheckoutMutations::open(&path).unwrap();
+        assert_eq!(reopened.attention_state(&unobserved), Some("discarded"));
+        assert_eq!(reopened.attention_state(&failed), Some("pending"));
     }
 
     /// A project with no published scope has no checkout mutation queue.

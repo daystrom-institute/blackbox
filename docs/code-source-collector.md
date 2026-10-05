@@ -200,7 +200,22 @@ applied but not yet seen in publication, failed, conflicted, or blocked behind
 a predecessor. Each row carries the edit's id, path, mode, state, attempts,
 last error, enqueue and acknowledgement times, and the digests of its content,
 its acknowledged content and its publication base; file content is never
-returned. Settled edits are counted, not listed.
+returned. Settled edits are counted, not listed. `detail_path` and
+`detail_states` narrow the listed rows; the counts stay whole.
+
+`bbox_project_checkout_mutation_reconcile` is the operator's way out when a
+listed edit will never settle on its own. `discard` settles the edit without
+touching the checkout: it leaves the listing and the write overlay, and the
+next edit of its path starts from the accepted publication again; an edit
+with later listed edits on its path is refused unless `cascade` discards them
+with it. `requeue` sends a failed or conflicted edit to the owner again, and
+is refused while later edits on the path still need attention or when the
+accepted publication for the path no longer matches the base the edit was
+computed from. Both take the row's `state` and `postimage_sha256` from the
+listing and refuse a row that has since changed, both are durable before they
+answer, and neither changes a file in the owning checkout. A discarded edit is
+stored as failed with a discard record, so an older daemon reads it as
+settled.
 
 The configured root must be the main Git worktree for its clone. The committed
 scope at the observed `HEAD` must match the configured scope. Symlinks,
