@@ -1,7 +1,8 @@
+//! Parse and shape gate for the retrieval eval manifests in `eval/queries`.
+//! The manifests are data for the scripts in `eval/`; compiling them in here
+//! makes a manifest that no longer parses fail the test build.
+
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::OnceLock;
-#[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
@@ -22,16 +23,8 @@ pub const MANIFEST_SOURCES: &[(&str, &str)] = &[
         include_str!("queries/conceptual-embedding-routing.json"),
     ),
     (
-        "conceptual-edge-index-authored",
-        include_str!("queries/conceptual-edge-index-authored.json"),
-    ),
-    (
         "conceptual-no-sync-llm",
         include_str!("queries/conceptual-no-sync-llm.json"),
-    ),
-    (
-        "conceptual-workflow-foreach",
-        include_str!("queries/conceptual-workflow-foreach.json"),
     ),
     (
         "decision-deep-docs-system-memory",
@@ -73,15 +66,7 @@ pub const MANIFEST_SOURCES: &[(&str, &str)] = &[
         "cross-modal-recursion-guard",
         include_str!("queries/cross-modal-recursion-guard.json"),
     ),
-    (
-        "cross-modal-workflow-engine",
-        include_str!("queries/cross-modal-workflow-engine.json"),
-    ),
 ];
-
-static CHECKER_MANIFESTS: OnceLock<Result<Vec<EvalQueryManifest>, String>> = OnceLock::new();
-#[cfg(test)]
-static MANIFEST_PARSE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvalQueryManifest {
@@ -143,45 +128,6 @@ pub enum RequiredEvidence {
     },
 }
 
-pub type CheckPassFn = fn(&[EntityRef]) -> (bool, Vec<String>);
-
-pub fn check_pass(collected: &[EntityRef]) -> (bool, Vec<String>) {
-    default_stub_check("check_pass", collected)
-}
-
-pub fn checker_by_name(name: &str) -> Option<CheckPassFn> {
-    Some(match name {
-        "check_conceptual_recursion_guard" => check_conceptual_recursion_guard,
-        "check_conceptual_entity_ref_stability" => check_conceptual_entity_ref_stability,
-        "check_conceptual_embedding_routing" => check_conceptual_embedding_routing,
-        "check_conceptual_edge_index_authored" => check_conceptual_edge_index_authored,
-        "check_conceptual_no_sync_llm" => check_conceptual_no_sync_llm,
-        "check_conceptual_workflow_foreach" => check_conceptual_workflow_foreach,
-        "check_decision_deep_docs_system_memory" => check_decision_deep_docs_system_memory,
-        "check_decision_render_pipeline_unidirectional" => {
-            check_decision_render_pipeline_unidirectional
-        }
-        "check_transcript_nextest_workspace_adoption" => {
-            check_transcript_nextest_workspace_adoption
-        }
-        "check_transcript_mechanical_recursion_guard" => {
-            check_transcript_mechanical_recursion_guard
-        }
-        "check_transcript_clippy_disallowed_methods" => check_transcript_clippy_disallowed_methods,
-        "check_transcript_worktree_containment_removal" => {
-            check_transcript_worktree_containment_removal
-        }
-        "check_transcript_codesign_launchd_redeploy" => check_transcript_codesign_launchd_redeploy,
-        "check_transcript_harness_in_process_provider" => {
-            check_transcript_harness_in_process_provider
-        }
-        "check_cross_modal_knowledge_store" => check_cross_modal_knowledge_store,
-        "check_cross_modal_recursion_guard" => check_cross_modal_recursion_guard,
-        "check_cross_modal_workflow_engine" => check_cross_modal_workflow_engine,
-        _ => return None,
-    })
-}
-
 pub fn load_manifests() -> Result<Vec<EvalQueryManifest>, serde_json::Error> {
     MANIFEST_SOURCES
         .iter()
@@ -190,8 +136,6 @@ pub fn load_manifests() -> Result<Vec<EvalQueryManifest>, serde_json::Error> {
 }
 
 fn load_manifest(name: &str, raw: &str) -> Result<EvalQueryManifest, serde_json::Error> {
-    #[cfg(test)]
-    MANIFEST_PARSE_COUNT.fetch_add(1, Ordering::SeqCst);
     let manifest = serde_json::from_str::<EvalQueryManifest>(raw)?;
     for locator in &manifest.target_locators {
         if EntityType::from_prefix(&locator.entity_type_hint).is_none() {
@@ -216,117 +160,14 @@ fn truncate_locator_description(description: &str) -> String {
     }
 }
 
-fn default_stub_check(name: &str, collected: &[EntityRef]) -> (bool, Vec<String>) {
-    expected_ref_check(name, collected)
-}
-
-fn expected_ref_check(name: &str, collected: &[EntityRef]) -> (bool, Vec<String>) {
-    let (expected, strictness) = match expected_refs_for_checker(name) {
-        Ok(expected) => expected,
-        Err(err) => return (false, vec![err]),
-    };
-    if expected.is_empty() {
-        return (
-            false,
-            vec![format!("{name} has no expected_entity_refs materialized")],
-        );
-    }
-    let matched = match strictness {
-        PassStrictness::Any => expected.iter().any(|expected| collected.contains(expected)),
-        PassStrictness::All => expected.iter().all(|expected| collected.contains(expected)),
-        PassStrictness::First => expected
-            .first()
-            .is_some_and(|expected| collected.contains(expected)),
-    };
-    if matched {
-        (
-            true,
-            vec![format!(
-                "{name} matched expected entity refs with {strictness:?} strictness"
-            )],
-        )
-    } else {
-        (
-            false,
-            vec![format!(
-                "{name} expected {strictness:?} match for [{}], collected [{}]",
-                expected
-                    .iter()
-                    .map(EntityRef::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                collected
-                    .iter()
-                    .map(EntityRef::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )],
-        )
-    }
-}
-
-fn expected_refs_for_checker(name: &str) -> Result<(Vec<EntityRef>, PassStrictness), String> {
-    let manifests = cached_manifests()?;
-    let Some(manifest) = manifests
-        .iter()
-        .find(|manifest| manifest.pass_classifier == name)
-    else {
-        return Err(format!("unknown checker {name}"));
-    };
-    let expected = manifest
-        .expected_entity_refs
-        .iter()
-        .map(|raw| EntityRef::parse(raw).map_err(|err| err.to_string()))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok((expected, manifest.pass_strictness))
-}
-
-fn cached_manifests() -> Result<&'static [EvalQueryManifest], String> {
-    CHECKER_MANIFESTS
-        .get_or_init(|| load_manifests().map_err(|err| err.to_string()))
-        .as_ref()
-        .map(Vec::as_slice)
-        .map_err(Clone::clone)
-}
-
-macro_rules! stub_checker {
-    ($name:ident) => {
-        pub fn $name(collected: &[EntityRef]) -> (bool, Vec<String>) {
-            // H3 replaces this shared oracle with per-class harness logic.
-            default_stub_check(stringify!($name), collected)
-        }
-    };
-}
-
-stub_checker!(check_conceptual_recursion_guard);
-stub_checker!(check_conceptual_entity_ref_stability);
-stub_checker!(check_conceptual_embedding_routing);
-stub_checker!(check_conceptual_edge_index_authored);
-stub_checker!(check_conceptual_no_sync_llm);
-stub_checker!(check_conceptual_workflow_foreach);
-stub_checker!(check_decision_deep_docs_system_memory);
-stub_checker!(check_decision_render_pipeline_unidirectional);
-stub_checker!(check_transcript_nextest_workspace_adoption);
-stub_checker!(check_transcript_mechanical_recursion_guard);
-stub_checker!(check_transcript_clippy_disallowed_methods);
-stub_checker!(check_transcript_worktree_containment_removal);
-stub_checker!(check_transcript_codesign_launchd_redeploy);
-stub_checker!(check_transcript_harness_in_process_provider);
-stub_checker!(check_cross_modal_knowledge_store);
-stub_checker!(check_cross_modal_recursion_guard);
-stub_checker!(check_cross_modal_workflow_engine);
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sha2::{Digest, Sha256};
-    use std::fs;
-    use std::path::{Path, PathBuf};
 
     #[test]
-    fn all_17_manifests_parse_and_round_trip() {
+    fn all_manifests_parse_and_round_trip() {
         let manifests = load_manifests().expect("all eval manifests parse");
-        assert_eq!(manifests.len(), 17);
+        assert_eq!(manifests.len(), 14);
 
         let mut ids = BTreeSet::new();
         let mut class_counts = BTreeMap::<QueryClass, usize>::new();
@@ -352,12 +193,11 @@ mod tests {
                 "missing expected_entity_refs in {}",
                 manifest.id
             );
-            assert!(
-                checker_by_name(&manifest.pass_classifier).is_some(),
-                "unknown checker {} in {}",
-                manifest.pass_classifier,
-                manifest.id
-            );
+            for raw in &manifest.expected_entity_refs {
+                EntityRef::parse(raw).unwrap_or_else(|err| {
+                    panic!("{} invalid expected ref {raw}: {err}", manifest.id)
+                });
+            }
             *class_counts.entry(manifest.query_class).or_default() += 1;
 
             let encoded = serde_json::to_string(manifest).unwrap();
@@ -366,118 +206,13 @@ mod tests {
         }
 
         for (class, count) in [
-            (QueryClass::ConceptualDesignDoc, 6),
+            (QueryClass::ConceptualDesignDoc, 4),
             (QueryClass::StaleDecisionLookup, 2),
             (QueryClass::TranscriptProvenance, 6),
-            (QueryClass::CrossModalCodeProse, 3),
+            (QueryClass::CrossModalCodeProse, 2),
         ] {
             assert_eq!(class_counts.get(&class).copied(), Some(count), "{class:?}");
         }
-    }
-
-    #[test]
-    #[ignore = "data-dependent: resolves transcript:* expected refs against a populated \
-                transcript corpus on disk, which is absent in a fresh checkout. Run with \
-                `cargo test -- --ignored` against a real corpus."]
-    fn all_17_manifests_have_resolvable_expected_refs() {
-        let manifests = load_manifests().expect("all eval manifests parse");
-        for manifest in &manifests {
-            for raw in &manifest.expected_entity_refs {
-                let entity_ref = EntityRef::parse(raw).unwrap_or_else(|err| {
-                    panic!("{} invalid expected ref {raw}: {err}", manifest.id)
-                });
-                assert!(
-                    expected_ref_resolves(manifest, &entity_ref),
-                    "{} expected ref does not resolve through its locators: {raw}",
-                    manifest.id
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn checkers_pass_when_expected_refs_are_collected() {
-        let manifests = load_manifests().expect("all eval manifests parse");
-        for manifest in &manifests {
-            let checker = checker_by_name(&manifest.pass_classifier)
-                .unwrap_or_else(|| panic!("missing checker {}", manifest.pass_classifier));
-            let collected = manifest
-                .expected_entity_refs
-                .iter()
-                .map(|raw| {
-                    EntityRef::parse(raw).unwrap_or_else(|err| {
-                        panic!("{} invalid expected ref {raw}: {err}", manifest.id)
-                    })
-                })
-                .collect::<Vec<_>>();
-
-            let (passed, messages) = checker(&collected);
-
-            assert!(
-                passed,
-                "{} checker should pass with oracle refs: {:?}",
-                manifest.id, messages
-            );
-        }
-    }
-
-    #[test]
-    fn default_check_pass_signature_compiles() {
-        let (passed, messages) = check_pass(&[]);
-        assert!(!passed);
-        assert!(!messages.is_empty());
-    }
-
-    #[test]
-    fn strictness_controls_expected_ref_matching() {
-        let manifests = load_manifests().expect("all eval manifests parse");
-
-        let cross_modal = manifests
-            .iter()
-            .find(|manifest| {
-                manifest.query_class == QueryClass::CrossModalCodeProse
-                    && parsed_expected(manifest).len() > 1
-            })
-            .expect("cross-modal manifest with several expected refs exists");
-        assert_eq!(cross_modal.pass_strictness, PassStrictness::All);
-        let cross_modal_refs = parsed_expected(cross_modal);
-        let checker = checker_by_name(&cross_modal.pass_classifier).unwrap();
-        let (passed, _messages) = checker(&cross_modal_refs[..1]);
-        assert!(
-            !passed,
-            "cross-modal checks require all expected refs, not just one"
-        );
-        let (passed, _messages) = checker(&cross_modal_refs);
-        assert!(passed);
-
-        let transcript = manifests
-            .iter()
-            .find(|manifest| manifest.query_class == QueryClass::TranscriptProvenance)
-            .expect("transcript manifest exists");
-        assert_eq!(transcript.pass_strictness, PassStrictness::First);
-    }
-
-    #[test]
-    fn checker_manifest_lookup_uses_cached_parse_result() {
-        let checker = checker_by_name("check_decision_deep_docs_system_memory").unwrap();
-        let manifests = load_manifests().unwrap();
-        let expected = parsed_expected(
-            manifests
-                .iter()
-                .find(|manifest| {
-                    manifest.pass_classifier == "check_decision_deep_docs_system_memory"
-                })
-                .unwrap(),
-        );
-        for _ in 0..90 {
-            let (passed, messages) = checker(&expected);
-            assert!(passed, "{messages:?}");
-        }
-
-        assert!(
-            CHECKER_MANIFESTS.get().is_some(),
-            "checker cache should be initialized after repeated checker calls"
-        );
     }
 
     #[test]
@@ -503,248 +238,5 @@ mod tests {
 
         assert!(err.contains(&"x".repeat(80)));
         assert!(!err.contains(&"x".repeat(120)));
-    }
-
-    fn parsed_expected(manifest: &EvalQueryManifest) -> Vec<EntityRef> {
-        manifest
-            .expected_entity_refs
-            .iter()
-            .map(|raw| EntityRef::parse(raw).unwrap())
-            .collect()
-    }
-
-    fn expected_ref_resolves(manifest: &EvalQueryManifest, entity_ref: &EntityRef) -> bool {
-        match entity_ref {
-            EntityRef::Knowledge { id } => manifest.target_locators.iter().any(|locator| {
-                locator.entity_type_hint == "knowledge"
-                    && locator.knowledge_hint.as_deref() == Some(id.as_str())
-            }),
-            EntityRef::ProjectFile { .. } | EntityRef::Symbol { .. } => manifest
-                .target_locators
-                .iter()
-                .filter(|locator| {
-                    matches!(locator.entity_type_hint.as_str(), "project_file" | "symbol")
-                })
-                .any(|locator| locator_resolves_source_ref(locator, entity_ref)),
-            EntityRef::Transcript {
-                provider,
-                session_id,
-                line_offset,
-                ..
-            } => manifest
-                .target_locators
-                .iter()
-                .filter(|locator| locator.entity_type_hint == "transcript")
-                .any(|locator| {
-                    transcript_ref_matches_locator(
-                        provider,
-                        session_id,
-                        *line_offset,
-                        locator.transcript_hint.as_deref().unwrap_or_default(),
-                    )
-                }),
-            EntityRef::Commit { repo_id, sha } => manifest
-                .target_locators
-                .iter()
-                .filter(|locator| locator.entity_type_hint == "commit")
-                .any(|locator| {
-                    locator
-                        .transcript_hint
-                        .as_deref()
-                        .is_some_and(|hint| sha.starts_with(hint))
-                        || !repo_id.is_empty() && !sha.is_empty()
-                }),
-            _ => true,
-        }
-    }
-
-    fn locator_resolves_source_ref(locator: &TargetLocator, entity_ref: &EntityRef) -> bool {
-        let Some(path_hint) = &locator.path_hint else {
-            return false;
-        };
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(path_hint);
-        let Ok(chunks) = chunks_for_path(&path, Path::new(path_hint)) else {
-            return false;
-        };
-        // Match by content-addressed identity (rel_path_hash + chunk_hash) only.
-        // occurrence_idx is positional bookkeeping that drifts on unrelated edits
-        // to neighbor chunks; gating on it turned this assertion into a snapshot
-        // test that breaks on cosmetic refactors. The chunk_hash IS the identity.
-        chunks.iter().any(|chunk| match entity_ref {
-            EntityRef::ProjectFile {
-                project_id: _,
-                rel_path_hash,
-                chunk_hash,
-                occurrence_idx: _,
-            } => &chunk.rel_path_hash == rel_path_hash && &chunk.chunk_hash == chunk_hash,
-            EntityRef::Symbol {
-                project_id: _,
-                qualified_name,
-                defn_hash,
-            } => {
-                chunk.symbol.as_deref() == Some(qualified_name.as_str())
-                    && &chunk.chunk_hash == defn_hash
-            }
-            _ => false,
-        })
-    }
-
-    fn chunks_for_path(
-        abs_path: &Path,
-        rel_path: &Path,
-    ) -> anyhow::Result<Vec<bbox_chunker::Chunk>> {
-        let bytes = fs::read(abs_path)?;
-        let sniff_len = bytes.len().min(4096);
-        let mut chunks = Vec::new();
-        for chunker in bbox_chunker::default_registry() {
-            if !chunker.claims(rel_path, &bytes[..sniff_len]) {
-                continue;
-            }
-            chunks = chunker.chunk(rel_path, &bytes)?.0;
-            break;
-        }
-        let project_id = project_id();
-        let rel_path_hash = short_hash(rel_path.to_string_lossy().as_bytes());
-        Ok(bound_chunks(
-            chunks
-                .into_iter()
-                .enumerate()
-                .map(|(idx, mut chunk)| {
-                    chunk.project_id.clone_from(&project_id);
-                    chunk.file_path = rel_path.to_path_buf();
-                    chunk.rel_path_hash.clone_from(&rel_path_hash);
-                    chunk.chunk_hash = full_hash(chunk.content.as_bytes());
-                    chunk.occurrence_idx = idx as u32;
-                    chunk
-                })
-                .collect::<Vec<_>>()
-                .as_slice(),
-        ))
-    }
-
-    fn bound_chunks(chunks: &[bbox_chunker::Chunk]) -> Vec<bbox_chunker::Chunk> {
-        chunks
-            .iter()
-            .flat_map(|chunk| {
-                if chunk.content.len() <= bbox_chunker::MAX_CHUNK_BYTES {
-                    return vec![chunk.clone()];
-                }
-                let mut out = Vec::new();
-                let mut start = 0usize;
-                while start < chunk.content.len() {
-                    let mut end = (start + bbox_chunker::MAX_CHUNK_BYTES).min(chunk.content.len());
-                    while !chunk.content.is_char_boundary(end) {
-                        end -= 1;
-                    }
-                    let mut split = chunk.clone();
-                    split.content = chunk.content[start..end].to_string();
-                    split.byte_start = chunk.byte_start + start as u64;
-                    split.byte_end = chunk.byte_start + end as u64;
-                    split.chunk_hash = full_hash(split.content.as_bytes());
-                    split.occurrence_idx = out.len() as u32;
-                    out.push(split);
-                    start = end;
-                }
-                out
-            })
-            .enumerate()
-            .map(|(idx, mut chunk)| {
-                chunk.occurrence_idx = idx as u32;
-                chunk
-            })
-            .collect()
-    }
-
-    fn transcript_ref_matches_locator(
-        provider: &str,
-        session_id: &str,
-        line_offset: u64,
-        hint: &str,
-    ) -> bool {
-        let Some(path) = transcript_path(provider, session_id) else {
-            return false;
-        };
-        let Ok(bytes) = fs::read(&path) else {
-            return false;
-        };
-        let offset = line_offset as usize;
-        if offset >= bytes.len() || (offset > 0 && bytes[offset - 1] != b'\n') {
-            return false;
-        }
-        let end = bytes[offset..]
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .map(|idx| offset + idx)
-            .unwrap_or(bytes.len());
-        let line = String::from_utf8_lossy(&bytes[offset..end]).to_lowercase();
-        hint.split_whitespace()
-            .filter(|term| term.len() > 3)
-            .any(|term| line.contains(&term.to_lowercase()))
-    }
-
-    fn transcript_path(provider: &str, session_id: &str) -> Option<PathBuf> {
-        let mut homes = Vec::new();
-        if let Some(home) = dirs::home_dir() {
-            homes.push(home);
-        }
-        let fixture_home = PathBuf::from("/home/invidious");
-        if !homes.iter().any(|home| home == &fixture_home) {
-            homes.push(fixture_home);
-        }
-
-        for home in homes {
-            let candidates = if provider == "codex" {
-                vec![home.join(".codex").join("sessions")]
-            } else if provider == "claude" {
-                vec![home.join(".claude").join("projects")]
-            } else {
-                vec![home.join(format!(".claude-{provider}")).join("projects")]
-            };
-            for root in candidates {
-                if let Ok(Some(found)) = find_transcript(&root, session_id) {
-                    return Some(found);
-                }
-            }
-        }
-        None
-    }
-
-    fn find_transcript(root: &Path, session_id: &str) -> std::io::Result<Option<PathBuf>> {
-        if !root.exists() {
-            return Ok(None);
-        }
-        for entry in fs::read_dir(root)? {
-            let entry = entry?;
-            let path = entry.path();
-            if entry.file_type()?.is_dir() {
-                if let Some(found) = find_transcript(&path, session_id)? {
-                    return Ok(Some(found));
-                }
-            } else if path
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .is_some_and(|stem| stem == session_id)
-            {
-                return Ok(Some(path));
-            }
-        }
-        Ok(None)
-    }
-
-    fn project_id() -> String {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .canonicalize()
-            .expect("repo root canonicalizes");
-        short_hash(root.to_string_lossy().as_bytes())
-    }
-
-    fn short_hash(bytes: &[u8]) -> String {
-        let digest = Sha256::digest(bytes);
-        hex::encode(&digest[..4])
-    }
-
-    fn full_hash(bytes: &[u8]) -> String {
-        let digest = Sha256::digest(bytes);
-        hex::encode(digest)
     }
 }

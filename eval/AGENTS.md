@@ -1,13 +1,14 @@
 # eval — search/agentic eval suite
 
 - **`expected_entity_refs` are content-addressed and rot by design**:
-  symbol `defn_hash` and project_file `chunk_hash`/occurrence_idx shift
-  with any content change, file move, or chunker reflow. Run
-  `eval/scripts/refresh_expected_refs.sh` (report) / `--apply` (rewrite)
-  before trusting ANY ranking metric — 24/30 manifests were stale by
-  2026-06 and zeroed every sweep. Manifests are `include_str!` into
-  `eval/check.rs` (`MANIFEST_SOURCES`), so a new query file must be added
-  there and parse failures break the build, not the run.
+  a project_file `chunk_hash` and occurrence index shift with any content
+  change, file move, or chunker reflow, and stale refs zero every ranking
+  metric. Run `eval/scripts/refresh_expected_refs.sh` (report) /
+  `--apply` (rewrite) before trusting any ranking metric. Manifests are
+  `include_str!` into `eval/check.rs` (`MANIFEST_SOURCES`), a test-only
+  parse and shape gate: a new query file must be added there, and a
+  manifest that does not parse or carries an unparseable ref fails the
+  test build, not the run.
 - **Refresh derives against the BASE checkout, writes to the CURRENT
   checkout.** Refs embed the registered base's project_id and the daemon
   indexes base content, so `project_dir` must be the base; but a worktree
