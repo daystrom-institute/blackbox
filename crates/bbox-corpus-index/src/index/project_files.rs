@@ -614,6 +614,51 @@ impl PublicationResult {
     }
 }
 
+/// Commit the writer with the staged publications' commitments in the
+/// commit payload. On a failed commit the staged publications are rolled
+/// back; on success the result is marked committed and the caller finalizes
+/// it.
+pub fn commit_snapshot_publications(
+    index: &Index,
+    writer: &mut IndexWriter,
+    edges_dir: &Path,
+    mut publication: PublicationResult,
+) -> Result<(PublicationResult, String)> {
+    let attempt = (|| -> Result<String> {
+        let prior_payload = index
+            .load_metas()
+            .context("loading prior index payload before snapshot commit")?
+            .payload;
+        let current = publication.pending_commitments();
+        let commitments = bbox_edge_sidecar::snapshot::carry_forward_commitments(
+            edges_dir,
+            prior_payload.as_deref(),
+            &current,
+        )?;
+        let mut prepared = writer.prepare_commit()?;
+        let payload = commitments.join(",");
+        if !payload.is_empty() {
+            prepared.set_payload(&payload);
+        }
+        prepared.commit()?;
+        Ok(payload)
+    })();
+
+    let payload = match attempt {
+        Ok(payload) => payload,
+        Err(error) => {
+            if let Err(cleanup) = publication.rollback_pending() {
+                return Err(error).context(format!(
+                    "snapshot commit failed and rollback also failed: {cleanup:#}"
+                ));
+            }
+            return Err(error);
+        }
+    };
+    publication.mark_commit_succeeded();
+    Ok((publication, payload))
+}
+
 #[derive(Debug)]
 pub struct CollectedIndexResult {
     pub snapshot_id: String,

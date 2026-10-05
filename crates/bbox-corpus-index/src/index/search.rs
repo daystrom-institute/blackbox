@@ -1816,7 +1816,7 @@ impl TranscriptIndex {
             !full,
         )?;
 
-        let project_stats = project_files::index_projects_with_access(
+        let mut project_stats = project_files::index_projects_with_access(
             &self.config,
             project_access,
             f,
@@ -1907,7 +1907,22 @@ impl TranscriptIndex {
             purged += 1;
         }
 
-        writer.commit()?;
+        // Publish what the project pass staged (Git history, its ingest
+        // cursor, snapshots) and commit, in the order the writer actor uses.
+        let edges_dir = bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(
+            &self.config.projects_path,
+        );
+        let (publication, commit_payload) = project_files::commit_snapshot_publications(
+            &self.index,
+            &mut writer,
+            &edges_dir,
+            project_stats.publication.publish()?,
+        )?;
+        publication.finalize_publications()?;
+        bbox_edge_sidecar::snapshot::prune_receipt_closeouts_after_commit(
+            &edges_dir,
+            (!commit_payload.is_empty()).then_some(commit_payload.as_str()),
+        )?;
         if full {
             writer.wait_merging_threads()?;
         }
@@ -2239,6 +2254,73 @@ mod agentic_project_file_tests {
         assert!(hits.contains("**git**"), "{hits}");
         assert!(hits.contains("**message**"), "{hits}");
         assert!(hits.contains("**searchable**"), "{hits}");
+    }
+
+    /// The helper publishes what the project pass stages, so the Git ingest
+    /// cursor is durable and a later pass finds no commit left to ingest.
+    #[test]
+    fn a_second_pass_after_the_helper_ingests_no_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        run_git(&repo, &["init"]);
+        run_git(&repo, &["config", "user.name", "Test User"]);
+        run_git(&repo, &["config", "user.email", "test@example.test"]);
+        std::fs::write(repo.join("README.md"), "one\n").unwrap();
+        run_git(&repo, &["add", "README.md"]);
+        run_git(&repo, &["commit", "-m", "first cursor fixture commit"]);
+        std::fs::write(repo.join("README.md"), "two\n").unwrap();
+        run_git(&repo, &["add", "README.md"]);
+        run_git(&repo, &["commit", "-m", "second cursor fixture commit"]);
+
+        let projects_path = dir.path().join("projects.json");
+        let project = register_test_project(&projects_path, &repo);
+        let mut index = TranscriptIndex::open_or_create_with_records(
+            &dir.path().join("index"),
+            Vec::new(),
+            None,
+            projects_path,
+            dir.path().join("knowledge.json"),
+            dir.path().join("threads.json"),
+            std::sync::Arc::new(
+                crate::index::StaticProjectRecordsProvider::from_bridge_records(
+                    vec![project.clone()],
+                    0,
+                ),
+            ),
+        )
+        .unwrap();
+        let identity =
+            bbox_corpus_core::code_project_identity::CodeProjectIdentity::from_bridge_record(
+                &project,
+            )
+            .unwrap();
+        let access = [project_files::ProjectIndexAccess {
+            identity: &identity,
+            project: Some(&project),
+            local_root: Some(&repo),
+            git_root: Some(&repo),
+        }];
+        index
+            .build_index_with_project_access(false, &access)
+            .unwrap();
+
+        let mut writer: IndexWriter = index.index.writer(100_000_000).unwrap();
+        let mut meta = load_meta(&index.config.meta_path).unwrap_or_default();
+        let stats = project_files::index_projects_with_access(
+            &index.config,
+            &access,
+            index.fields,
+            &mut writer,
+            &mut meta,
+            false,
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            stats.indexed_commits, 0,
+            "the helper left the Git ingest cursor unpublished"
+        );
     }
 
     fn run_git(root: &Path, args: &[&str]) {

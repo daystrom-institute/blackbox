@@ -40,6 +40,7 @@ use bbox_knowledge::knowledge::KnowledgeEntry;
 use bbox_threads::threads::Thread;
 
 use super::knowledge_docs::KnowledgeIndexDocument;
+use super::project_files::commit_snapshot_publications;
 use super::reindex::{FullRebuildCause, conservative_log_merge_policy, execute_reindex_pass};
 use super::{FieldHandles, ReindexConfig, StatsCache, TranscriptIndex};
 use crate::checkout_access::{
@@ -397,47 +398,6 @@ impl Drop for ReindexActivityGuard {
     fn drop(&mut self) {
         self.0.store(PUBLICATION_IDLE, Ordering::Release);
     }
-}
-
-fn commit_snapshot_publications(
-    index: &Index,
-    writer: &mut IndexWriter,
-    edges_dir: &Path,
-    mut publication: super::project_files::PublicationResult,
-) -> Result<(super::project_files::PublicationResult, String)> {
-    let attempt = (|| -> Result<String> {
-        let prior_payload = index
-            .load_metas()
-            .context("loading prior index payload before snapshot commit")?
-            .payload;
-        let current = publication.pending_commitments();
-        let commitments = bbox_edge_sidecar::snapshot::carry_forward_commitments(
-            edges_dir,
-            prior_payload.as_deref(),
-            &current,
-        )?;
-        let mut prepared = writer.prepare_commit()?;
-        let payload = commitments.join(",");
-        if !payload.is_empty() {
-            prepared.set_payload(&payload);
-        }
-        prepared.commit()?;
-        Ok(payload)
-    })();
-
-    let payload = match attempt {
-        Ok(payload) => payload,
-        Err(error) => {
-            if let Err(cleanup) = publication.rollback_pending() {
-                return Err(error).context(format!(
-                    "snapshot commit failed and rollback also failed: {cleanup:#}"
-                ));
-            }
-            return Err(error);
-        }
-    };
-    publication.mark_commit_succeeded();
-    Ok((publication, payload))
 }
 
 /// Derived effective source for one catalog project at planning time
