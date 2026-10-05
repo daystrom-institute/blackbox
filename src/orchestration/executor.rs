@@ -468,7 +468,9 @@ fn spawn_control_writer(
 }
 /// An absolute worker binary path names one specific executable, so there is
 /// nothing to resolve and nothing to fall back to: it must exist and be
-/// executable on this host, or the spawn fails naming the path.
+/// executable on this host, or the spawn fails naming the path. "Executable"
+/// means any execute bit is set: a file this user cannot execute for another
+/// reason still passes here and fails at spawn.
 async fn ensure_absolute_bin_executable(bin: &str) -> anyhow::Result<()> {
     if !std::path::Path::new(bin).is_absolute() {
         return Ok(());
