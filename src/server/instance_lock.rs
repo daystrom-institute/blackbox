@@ -478,9 +478,26 @@ pub fn acquire_instance_lock(state_dir: &Path) -> Result<InstanceLockGuard, Inst
     acquire_root(&root, &claimed)
 }
 
+/// How long a contended claim waits before its one retry. An offline probe
+/// (`held_instance_lock_covering`) holds a shared lock for an instant; a
+/// second daemon holds its lock for its lifetime.
+const INSTANCE_LOCK_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(50);
+
 fn acquire_root(
     root: &InstanceRoot,
     claimed: &[InstanceRoot],
+) -> Result<InstanceLockGuard, InstanceLockError> {
+    acquire_root_with_pause(root, claimed, || {
+        std::thread::sleep(INSTANCE_LOCK_RETRY_PAUSE)
+    })
+}
+
+/// Claim one root. A contended first attempt is retried once after `pause`,
+/// so a probe's momentary shared lock is not reported as another daemon.
+fn acquire_root_with_pause(
+    root: &InstanceRoot,
+    claimed: &[InstanceRoot],
+    pause: impl FnOnce(),
 ) -> Result<InstanceLockGuard, InstanceLockError> {
     let path = root.lock_path();
     let unavailable = |source: anyhow::Error| InstanceLockError::Unavailable {
@@ -498,7 +515,12 @@ fn acquire_root(
         )));
     }
 
-    match file.try_lock_exclusive() {
+    let mut attempt = FileExt::try_lock_exclusive(&file);
+    if attempt.as_ref().is_err_and(is_lock_contended) {
+        pause();
+        attempt = FileExt::try_lock_exclusive(&file);
+    }
+    match attempt {
         Ok(()) => Ok(InstanceLockGuard { file, path }),
         Err(error) if is_lock_contended(&error) => Err(InstanceLockError::AlreadyHeld {
             root: root.clone(),
@@ -517,7 +539,13 @@ fn acquire_root(
 /// candidates are the sibling lock of `path` and, for every ancestor, the
 /// lock inside it and the lock beside it. A candidate is only ever opened if
 /// it already exists; the probe takes a shared lock for an instant and
-/// releases it, so it never creates a lock file and never keeps a claim.
+/// releases it, so it never creates a lock file and never keeps a claim. A
+/// daemon claiming a root in that instant retries once (`acquire_root`).
+///
+/// The candidates are found by name, so any program holding an exclusive
+/// lock on a file with one of those names in an ancestor directory is
+/// reported as a holder; the returned path says which file it is. An error
+/// names the candidate that could not be probed.
 pub fn held_instance_lock_covering(path: &Path) -> std::io::Result<Option<PathBuf>> {
     let path = canonical_root_path(path);
     let sibling = |root: &Path| -> Option<PathBuf> {
@@ -531,21 +559,24 @@ pub fn held_instance_lock_covering(path: &Path) -> std::io::Result<Option<PathBu
         candidates.extend(sibling(ancestor));
     }
     for candidate in candidates {
+        let failed = |error: std::io::Error| {
+            std::io::Error::new(error.kind(), format!("{}: {error}", candidate.display()))
+        };
         match std::fs::symlink_metadata(&candidate) {
             Ok(metadata) if metadata.file_type().is_file() => {}
             Ok(_) => continue,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error),
+            Err(error) => return Err(failed(error)),
         }
         let file = match File::open(&candidate) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error),
+            Err(error) => return Err(failed(error)),
         };
         match FileExt::try_lock_shared(&file) {
-            Ok(()) => FileExt::unlock(&file)?,
+            Ok(()) => FileExt::unlock(&file).map_err(failed)?,
             Err(error) if is_lock_contended(&error) => return Ok(Some(candidate)),
-            Err(error) => return Err(error),
+            Err(error) => return Err(failed(error)),
         }
     }
     Ok(None)
@@ -561,6 +592,45 @@ fn is_lock_contended(error: &std::io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An offline probe holds a shared lock for an instant. A claim that
+    /// meets it retries once after its pause and succeeds; a lock still held
+    /// after the pause is another daemon.
+    #[test]
+    fn a_claim_retries_once_past_a_momentary_shared_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = state_root(&dir);
+        let instance_root = InstanceRoot::state_root(root.clone());
+        let claimed = vec![instance_root.clone()];
+        std::fs::write(instance_lock_path(&root), b"").unwrap();
+
+        // Released during the pause: the retry claims the root.
+        let probe = File::open(instance_lock_path(&root)).unwrap();
+        FileExt::try_lock_shared(&probe).unwrap();
+        let mut paused = 0;
+        let guard = acquire_root_with_pause(&instance_root, &claimed, || {
+            paused += 1;
+            FileExt::unlock(&probe).unwrap();
+        })
+        .expect("the retry claims a root a probe released");
+        assert_eq!(paused, 1);
+        drop(guard);
+
+        // Still held after the pause: refused as before, after one pause.
+        let holder = File::open(instance_lock_path(&root)).unwrap();
+        FileExt::try_lock_shared(&holder).unwrap();
+        let mut paused = 0;
+        let error = acquire_root_with_pause(&instance_root, &claimed, || paused += 1)
+            .expect_err("a lock held across the pause is another holder");
+        assert_eq!(error.code(), "error.daemon_instance_locked");
+        assert_eq!(paused, 1);
+        drop(holder);
+
+        // Uncontended: no pause at all.
+        let mut paused = 0;
+        acquire_root_with_pause(&instance_root, &claimed, || paused += 1).unwrap();
+        assert_eq!(paused, 0);
+    }
 
     #[test]
     fn a_held_lock_covering_a_store_is_found_from_the_store_path_alone() {

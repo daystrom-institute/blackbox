@@ -73,7 +73,11 @@
   (existing lock files only, an instant shared lock, nothing kept):
   `producer-claims revoke` refuses while any instance lock covering the
   claims store is held, since its per-store lock is keyed to a projects path
-  the CLI and the daemon can resolve differently.
+  the CLI and the daemon can resolve differently. Because of that instant
+  shared lock, a daemon's contended claim retries once after a short pause
+  before it reports another holder; candidates are matched by file name, so
+  any holder of a lock file with those names in an ancestor directory blocks
+  the revoke and is named in its refusal.
 - `run_blocking`'s per-call log line (`tool`, `elapsed_ms`, `bytes`) is the
   only built-in tool telemetry; keep it intact when wrapping handlers.
 - MCP response budgets cover the serialized result, including text escaping

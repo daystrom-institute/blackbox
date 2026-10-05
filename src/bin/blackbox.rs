@@ -839,7 +839,7 @@ fn revoke_producer_claim(
                 "error.project_catalog_cli_lock",
                 format!(
                     "could not probe the daemon instance locks covering the producer claims \
-                     store {}: {error}",
+                     store {} (candidate and cause: {error})",
                     path.display()
                 ),
             ));
