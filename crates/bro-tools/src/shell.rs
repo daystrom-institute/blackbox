@@ -903,23 +903,20 @@ struct ShellRunInput {
     /// Hard-kill deadline in milliseconds. When set, the process is killed if
     /// it runs longer than this (honored across subsequent shell_poll calls).
     timeout_ms: Option<u64>,
-    /// Cooperative yield in milliseconds. If the command has not finished by
-    /// then, returns partial output plus a `session_id` (the process keeps
-    /// running); resume with shell_poll. When omitted, defaults to a short
-    /// cooperative yield so long commands do not stall the agent loop. Set to
-    /// 0 only when you deliberately want to block until completion/timeout.
+    /// Milliseconds to wait for exit before returning partial output plus a
+    /// `session_id` (the process keeps running; continue with shell_poll).
+    /// Defaults to about 1 second; 0 blocks until exit or timeout_ms.
     yield_time_ms: Option<u64>,
     /// Budget for this stdout/stderr page, in approximate tokens (~4 bytes each;
-    /// default 2000, maximum 3000). Retained output is read in stream order.
-    /// When output_pending=true, keep calling shell_poll with session_id even
-    /// after running=false. Output loss is reported separately.
+    /// default 2000, maximum 3000; 0 returns metadata only). Retained output is
+    /// read in stream order. Output loss is reported separately.
     max_output_tokens: Option<usize>,
     /// Initial stdin (at most 1 MiB). When omitted, the command's stdin is
     /// /dev/null, so commands that read stdin see EOF immediately. When set
     /// (an empty string opens an initially empty pipe), stdin is a pipe that
     /// stays open for shell_poll to feed more, unless close_stdin is set.
-    /// Writes wait at most 5 seconds or the invocation yield budget;
-    /// partial/error writes are reported as input_error.
+    /// Writes wait at most 5 seconds or the yield budget; partial/error
+    /// writes are reported as input_error.
     stdin: Option<String>,
     /// Close (EOF) the stdin pipe after writing `stdin`. Required for
     /// commands that read until EOF (e.g. `cat`, `sort`) to terminate when
@@ -927,14 +924,13 @@ struct ShellRunInput {
     #[serde(default)]
     close_stdin: bool,
     /// Extra environment variables for the process, merged onto the inherited
-    /// environment (these win on conflict). Cleaner than inlining `FOO=bar` in
-    /// the command for things like `PORT`, `RUST_LOG`, etc.
+    /// environment (these win on conflict).
     #[serde(default)]
     env: HashMap<String, String>,
     /// Optional post-capture line filter. Patterns are regexes; matching lines
-    /// are kept and non-matching lines are dropped from the returned stream.
-    /// The child process is not wrapped, so exit_code remains the real command
-    /// exit status.
+    /// are kept and non-matching lines are dropped from the returned stream
+    /// (lines over 256 KiB are excluded and counted). The child process is not
+    /// wrapped, so exit_code remains the real command exit status.
     output_filter: Option<ShellOutputFilterInput>,
 }
 
@@ -946,7 +942,7 @@ impl Tool for ShellRun {
         "shell_run"
     }
     fn description(&self) -> &str {
-        "Run a shell command in the worktree (bash -lc). Returns {exit_code, stdout, stderr, running, timed_out}. Long commands yield by default after ~1s with running=true + session_id; set yield_time_ms to wait that many ms for exit, or 0 to block until exit/timeout. Continue shell_poll until running=false and output_pending=false; completed commands retain unread output. timeout_ms hard-kills a runaway; max_output_tokens caps each stream (default 2000, maximum 3000; prefix pages retain remaining output; zero is metadata-only). output_filter keeps complete matching stdout/stderr lines after capture (lines over 256 KiB are excluded and counted) without changing the real exit_code. Omitted stdin means /dev/null (commands reading stdin see EOF); pass stdin to feed initial input through a pipe, or stdin=\"\" to keep an empty pipe open for shell_poll; close_stdin sends EOF; env injects variables. Refuses categorically destructive commands."
+        "Run a shell command in the worktree (bash -lc). Returns {exit_code, stdout, stderr, running, timed_out}. A command still running after yield_time_ms returns running=true plus a session_id: continue with shell_poll until running=false and output_pending=false (an exited command may still hold unread output). Refuses categorically destructive commands."
     }
     fn input_schema(&self) -> Value {
         schema_for::<ShellRunInput>()
@@ -1110,8 +1106,7 @@ impl Tool for ShellRun {
 
 #[derive(Deserialize, JsonSchema)]
 struct ShellPollInput {
-    /// Session id from shell_run or shell_poll. Continue while running=true
-    /// or output_pending=true, including output retained after process exit.
+    /// Session id from shell_run or shell_poll.
     session_id: String,
     /// Optional stdin (at most 1 MiB); waits at most 5 seconds or the yield
     /// budget. Partial/error writes are reported as input_error. Only sessions
@@ -1146,7 +1141,7 @@ impl Tool for ShellPoll {
         "shell_poll"
     }
     fn description(&self) -> &str {
-        "Resume a running shell session from shell_run: optionally feed stdin (only when shell_run passed stdin, e.g. stdin=\"\"; otherwise stdin is /dev/null and writes report input_error), close stdin, send signal=int|term|kill, and wait up to yield_time_ms for exit. Defaults to 5000ms; set yield_time_ms=0 to block until exit/timeout. Returns {exit_code, stdout, stderr, running, timed_out}; running=false means the process exited; keep polling while output_pending=true to receive remaining output. Output pages consume only returned text; overflow retains the newest 8 MiB per stream and reports dropped_bytes. output_filter changes apply to unselected lines; cached page remainders keep their prior selection. Output byte counters describe buffer bytes, not source offsets. If still running, poll again or use shell_kill. The originating timeout_ms still applies."
+        "Continue a shell session from shell_run: optionally write stdin, close it or send a signal, then wait up to yield_time_ms for exit. Returns {exit_code, stdout, stderr, running, timed_out}. Keep polling while running=true or output_pending=true, or use shell_kill. Output pages consume only returned text; overflow retains the newest 8 MiB per stream and reports dropped_bytes. Output byte counters describe buffer bytes, not source offsets. The originating timeout_ms still applies."
     }
     fn input_schema(&self) -> Value {
         schema_for::<ShellPollInput>()
@@ -1245,9 +1240,8 @@ impl Tool for ShellPoll {
 struct ShellKillInput {
     /// Session id to terminate.
     session_id: String,
-    /// Signal to send first: "term" (SIGTERM, default, graceful), "int"
-    /// (SIGINT), or "kill" (SIGKILL, immediate). If the process hasn't exited
-    /// within grace_ms, it is force-killed (SIGKILL).
+    /// Signal to send first: "term" (SIGTERM, default), "int" (SIGINT), or
+    /// "kill" (SIGKILL, immediate).
     signal: Option<String>,
     /// Grace window in ms to wait for exit after the signal before
     /// force-killing (default 2000).
@@ -1268,7 +1262,7 @@ impl Tool for ShellKill {
         "shell_kill"
     }
     fn description(&self) -> &str {
-        "Terminate a running shell session. Sends signal (term|int|kill, default term), waits up to grace_ms for graceful exit, then force-kills. Returns terminal process facts plus a bounded output page; poll while output_pending=true to finish reading. output_filter can override the originating post-capture line filter for the final drain. Use this to stop a dev server or watch process you started with shell_run + yield_time_ms."
+        "Terminate a running shell session: send a signal, wait up to grace_ms, then force-kill. Returns terminal process facts plus a bounded output page; poll while output_pending=true to finish reading. Use this to stop a dev server or watch process started with shell_run."
     }
     fn input_schema(&self) -> Value {
         schema_for::<ShellKillInput>()
