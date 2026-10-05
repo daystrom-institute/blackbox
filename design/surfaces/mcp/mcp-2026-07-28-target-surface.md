@@ -130,7 +130,7 @@ converge: locality-first says the corpus plane keeps only shared mutable
 state and coordination points, and the 2026-07-28 revision gives exactly
 those things their idiomatic protocol shapes (catalogs -> resources,
 coordination -> tasks/listen). The remote-daemon consequences are folded
-into the relevant sections below (spill-as-resource, stateless as
+into the relevant sections below (in-band oversize errors, stateless as
 deployment prerequisite, corpus-plane-only authority, reconcile-on-reconnect,
 fleetd task ownership, auth) and collected in the Decisions section.
 
@@ -144,7 +144,8 @@ fleetd task ownership, auth) and collected in the Decisions section.
    (tasks, resources) are projections that accelerate capable clients, not
    replacements that fork the contract.
 3. **Resources are the browse plane.** Catalogs with durable IDs and JSON
-   bodies (brofiles, teams, artifacts, live tasks) get
+   bodies (brofiles, artifact installation receipts, catalog projects and
+   their graphs, live tasks) get
    URI-addressable read projections with protocol cursor pagination. Writes
    stay tools; MCP resources are read-only, which matches our mutation
    tools' existing audit/gating shape.
@@ -157,11 +158,22 @@ fleetd task ownership, auth) and collected in the Decisions section.
 
 ### The collision
 
-Today's wire head pins `surface`, `surface_project`, and `session_checkout`
-in per-session OnceLocks at `initialize`, extracted from `?surface=` /
-`?project=` query params (`src/server/handler.rs`). Under 2026-07-28 there
-is no `initialize`, and rmcp 3.0 builds a fresh handler per request. Handler-
-held session state must move out.
+Today's wire head pins `surface`, its visible tool set, `surface_project`,
+`session_checkout`, and the authenticated workspace binding in per-session
+OnceLocks at `initialize`, extracted from the `?surface=` / `?project=`
+query params and the workspace binding header (`src/server/handler.rs`).
+Under 2026-07-28 there is no `initialize`, and rmcp 3 builds a fresh handler
+per request. Handler-held session state must move out.
+
+The SDK does not wait for that move: `StreamableHttpService` routes
+`server/discover` and any request carrying 2026-07-28 per-request metadata to
+its stateless path whenever the handler supports that revision, including
+under `with_legacy_session_mode(true)`. A handler that pins scope at
+`initialize` would answer those requests on the `default` surface with no
+project and no workspace binding. The wire head therefore supports handshake
+revisions only until scope is per-request: `supported_protocol_versions()`
+is the gate, and the SDK refuses everything else with JSON-RPC `-32022`
+before a handler runs.
 
 ### The resolution
 
@@ -180,7 +192,10 @@ Scope channels, ranked by client reach:
 1. **URL query params** (canonical, today's mechanism). Works with every
    client that lets you configure a URL, needs zero client cooperation.
 2. **Static headers** (`headers:` map in client config). Also rides every
-   request; no advantage for surface/project, available if ever needed.
+   request; no advantage for surface/project. The workspace binding header
+   is the one header channel in use: it carries managed-workspace authority
+   for a supervised harness session and is authenticated on receipt, so it
+   must be re-authenticated per request once nothing is pinned.
 3. **Custom `_meta` keys**. Spec-legal (unknown keys round-trip) but only
    where we control request construction: bro-harness children. Possible
    harness-internal lane later, never the primary.
@@ -191,6 +206,11 @@ Scope channels, ranked by client reach:
   per-request resolution is a map lookup, and each surface's visible tool
   set can be computed once. Surface resolution cost is unchanged in
   practice.
+- Raw `?project=` stays a surface/filter selector. Managed-workspace
+  authority comes only from the workspace binding header and covers exactly
+  the render locality exchange and project write routing; knowledge, gap and
+  graph reads are published-only and never consult it. Per-request
+  resolution keeps those two channels separate.
 - The OnceLock session-pinning footgun class is deleted: no pinned pair to
   forget to pass (gap-310c36b6), no half-initialized session answering tool
   lists.
@@ -219,7 +239,10 @@ Scope channels, ranked by client reach:
 Implement for 2026-07-28 compliance (servers MUST). rmcp derives a default
 from `get_info()`; we override `supported_protocol_versions()` and advertise
 the tasks extension in `capabilities.extensions` once Phase 2 lands.
-Discover is also where surface denial becomes visible early.
+Discover is also where surface denial becomes visible early. While the wire
+head supports handshake revisions only, `discover` is refused and a modern
+client falls back to `initialize`; the refusal carries the supported
+revisions so the fallback is deterministic.
 
 ## Tasks projection (SEP-2663)
 
@@ -261,10 +284,20 @@ than a few seconds". By that rule:
 
 | Tool today | Why it is task-shaped |
 | --- | --- |
-| `bbox_reindex` (full) | Index builds are the canonical long job; today a background actor with no client-visible handle |
-| `bbox_reembed` | Embedding rebuilds run minutes to hours on large partitions |
-| `bbox_edge_compact(apply)` / `bbox_storage_gc(apply)` | Storage maintenance over many projects; dry-run stays a tool, apply becomes a task |
-| `bbox_project_register` | Registration is instant but schedules background indexing; the follow-through deserves a task handle |
+| `bbox_reindex` | Queues a full or incremental index update and returns after admission; the queued work has no client-visible handle, and `wait=true` blocks instead |
+| `bbox_reembed` | Requests an embedding rebuild for a route; rebuilds run minutes to hours on large partitions and are observed only through `bbox_embed_status` |
+| `bbox_storage_gc(apply)` | Staged storage GC over daemon-owned storage; preview stays a tool, apply becomes a task whose result is the receipt the tool already returns |
+| `bbox_edge_compact(apply)` | Per-project legacy sidecar compaction with a backup; same preview/apply split |
+| `bbox_project_register` | Admission is instant but schedules corpus indexing, locally or through the checkout-host collector the path routes to; pending work is reused on repeat calls, which is a task handle in all but name |
+
+Not task candidates: the project catalog administration tools
+(`bbox_project_promote`, `bbox_project_scope_migrate`,
+`bbox_project_rename`, `bbox_project_publisher_bind`,
+`bbox_project_publisher_advance`). They are synchronous pair transactions
+that either commit or refuse with typed recovery coordinates; a task handle
+would add a lifecycle they do not have. Graph reads
+(`bbox_project_graph_list` / `describe` / `validate`) are bounded reads, and
+`bbox_render` completes inside its locality exchange.
 
 The pattern worth naming: `bro_exec` and the background maintenance tools
 each implement task-handle-over-tools independently. The extension collapses
@@ -323,24 +356,38 @@ as tools:
 
 ```
 blackbox://brofile/{name}
-blackbox://team/{name}
-blackbox://artifact/{kind}/{name}
+blackbox://artifact/{kind}/{name}                   (installation receipt)
 blackbox://task/{id}                                (live task state)
-blackbox://project/{project}/artifact/{kind}/{name} (explicit project encoding)
+blackbox://project/{project_id}                     (catalog project)
+blackbox://project/{project_id}/graph/{graph_id}    (published project graph)
 blackbox://skills/onboard-project/SKILL.md
 ```
+
+`blackbox://skills/onboard-project/SKILL.md` is served today through
+resources, prompts and the `io.modelcontextprotocol/skills` extension; it is
+the only resource the daemon lists. Brofiles are the only installable
+artifact kind: the other kinds are retired, their receipts stay readable
+with an explicit kind, and they get no catalog of their own.
 
 The classification rule for resource candidacy: a durable ID plus a JSON
 body that clients currently enumerate through a bounded list tool. Beyond
 these catalogs:
 
 - **Durable stores:** `blackbox://knowledge/{id}`, `blackbox://thread/{id}`,
-  `blackbox://gap/{id}`, `blackbox://note/{id}`,
-  `blackbox://project/{id}`, `blackbox://provider/{name}`.
+  `blackbox://gap/{id}`, `blackbox://provider/{name}`. Knowledge, gap and
+  graph resources serve the published plane only, exactly as the tools do;
+  a resource read never consults a workspace binding.
 - **`blackbox://sm/{id}`** (system memories). Agents fetch `sm-*` runbooks
   constantly via free-text `bbox_knowledge` when they already know the ID;
   direct URI read is cheaper and deterministic. Probably the highest-traffic
-  resource we would serve.
+  resource we would serve. It is the same identity `bbox_knowledge` returns
+  as a `system_memory:<id>` ref for `bbox_inspect_entity`.
+- **Project catalog and graphs.** `bbox_project_catalog_list` / `_get` and
+  `bbox_project_graph_list` / `_describe` enumerate durable ids in bounded
+  pages pinned by a catalog epoch or view stamp. The resource projection
+  carries the same stamp so a changed catalog rejects a stale cursor instead
+  of mixing pages. `bbox_project_publisher_status` is a live view of one
+  project's accepted publication and fits `ttlMs` rather than a catalog.
 - **Live views with `ttlMs`:** `blackbox://roster`,
   `blackbox://dashboard`. `resourceSubscriptions` is a listen opt-in type,
   so subscribing to `blackbox://roster` yields push roster updates
@@ -348,45 +395,46 @@ these catalogs:
   with a standard mechanism any MCP client can consume.
 - **`blackbox://session/{id}`** descriptors (metadata only; message bodies
   stay tool-paginated since `resources/read` has no intra-resource cursor).
-- **`blackbox://skills/onboard-project/SKILL.md`** is the instance-specific
-  onboarding skill served through resources, prompts, and the
-  `io.modelcontextprotocol/skills` extension.
-- **`blackbox://spill/{id}`** (over-cap response payloads). See the spill
-  paragraph below: with a remote daemon this stops being optional.
 
 What stays a tool: search/query surfaces (ephemeral result sets are not
 durable objects), all mutations, anything parameterized ad hoc.
 
-- Catalog boundary: the four catalogs plus live tasks. Threads are
+- Catalog boundary: brofiles, artifact receipts, catalog projects with
+  their graphs, and live tasks. Threads are
   borderline (cheap read projection, composes with subscriptions).
   Transcripts and sessions are searchable corpora, not enumerable catalogs;
   they stay tool-served.
 - Project scoping is explicit in the URI for project-owned objects, not
-  resolved against the session's `?project=`: a client scoped to project A
-  may legitimately read project B's artifacts, and URI-addressability beats
-  scope-channel switching.
+  resolved against the request's `?project=`: a client scoped to project A
+  may legitimately read project B's graphs, and URI-addressability beats
+  scope-channel switching. The URI names the stable `project_id`, never a
+  host path: catalog projects can exist with no attachment the daemon can
+  see.
 - Governance: add a `resources` key to the same `[surfaces.<name>]`
   configuration table (not a separate table; operators think in surfaces,
   not planes). `list_resources` / `read_resource` consult the same
   per-request surface resolution.
 - Pagination: `resources/list` and `resources/templates/list` carry protocol
   cursors, descriptor-only listing (progressive disclosure; `resources/read`
-  fetches one full body), plus `ttlMs`/`cacheScope`. This relieves the
-  chronic over-cap list-tool pattern (`bbox_artifact_list`) that the 80KB
-  cap's bytes telemetry exists to flag.
+  fetches one full body), plus `ttlMs`/`cacheScope`. The list tools already
+  serve bounded summary pages (`next_offset`, byte budgets) with exact
+  detail behind body cursors; the protocol cursor is the standard projection
+  of those same pages, not a second pagination scheme.
+- `resources/read` has no intra-resource cursor, so a body larger than the
+  response budget is not a resource: the descriptor points at the tool's
+  exact-body pages instead.
 - `resourcesListChanged` over listen on catalog mutation (artifact install,
-  brofile upsert).
+  brofile upsert, catalog project admission).
 
-### Spill becomes a resource
+### Oversize results never leave the response
 
-The 80KB cap's spill envelope (`src/server/response.rs`) writes over-cap
-payloads to the daemon's disk with the explicit rationale that every client
-of this localhost daemon has file-read tools to recover the full payload.
-With a remote daemon that rationale is false: the client cannot read the
-daemon's disk. Spilled payloads must be served back over MCP as
-`blackbox://spill/{id}` resources. The corpus move converts the resource
-plane from a nice browse projection into a correctness requirement for the
-cap.
+The response budget covers the serialized result, including text escaping
+and structured content. A result over the budget is an explicit
+`response_too_large` tool error naming the bytes, the cap and the bounded
+read to use; nothing is written to daemon disk for the caller to fetch.
+Producers own pagination and exact-detail reads, clients own any local
+persistence. This already holds for a remote daemon, so the resource plane
+is a browse projection and carries no recovery duty for the cap.
 
 ## Cache hints and tools/list hygiene (SEP-2549)
 
@@ -399,16 +447,17 @@ cap.
   list/read endpoints, not `tools/call`. For the large-response tools
   (`bro_dashboard`, `bbox_hybrid_search`), converge on a
   uniform `{items, next_cursor, total_estimate}` envelope instead of per-tool
-  bespoke limit params. The 80KB cap + spill envelope stays regardless.
+  bespoke limit params. The 80KB response budget stays regardless.
 - structuredContent going forward: 2026-07-28 allows any JSON value, so new
   or changed tools should ship `outputSchema` + `structuredContent`. No mass
   retrofit of existing tools.
 
 ## MRTR approval gates (SEP-2322)
 
-Operator-confirmation flows today are "dispatch, get refused, re-dispatch
-with a flag" (destructive admin ops, RX-V1
-operator-authority flags). MRTR lets a tool return `InputRequiredResult`
+Operator-confirmation flows today are "preview or get refused, then call
+again with the apply or force flag" (`bbox_storage_gc` and
+`bbox_edge_compact` apply, `bbox_project_unregister` with `force`,
+`bbox_project_eject` after `dry_run`, the publisher pointer moves). MRTR lets a tool return `InputRequiredResult`
 with an elicitation; the client answers and retries the original request
 with `inputResponses`. Elicitation UX already exists client-side in
 2025-11-25 form, so this is a transport upgrade, not a new client capability
@@ -437,9 +486,10 @@ MRTR rounds.
    inherit scope filtering from the transport (no new plumbing).
 5. The design must hold with the corpus daemon on another machine
    (locality-first decomposition). Consequences folded into this doc:
-   spill-as-resource, stateless as deployment prerequisite for the corpus
-   move, corpus-plane-only checkout authority, reconcile-on-reconnect
-   listen semantics, fleetd location-independent task handles.
+   oversize results as in-band errors, stateless as deployment prerequisite
+   for the corpus move, corpus-plane-only checkout authority,
+   reconcile-on-reconnect listen semantics, fleetd location-independent
+   task handles.
 6. Tasks/listen early adoption endorsed (2026-08-04): the Brodex harness
    pair goes first mover on the tasks extension rather than waiting for
    Claude Code / Codex. Their inertia is structural (Claude Code shipped

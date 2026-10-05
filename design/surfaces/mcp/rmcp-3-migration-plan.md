@@ -74,14 +74,14 @@ plan.
 | Coupling | Where | 3.0 impact |
 | --- | --- | --- |
 | `StreamableHttpService` + `LocalSessionManager`, `with_stateful_mode(true)`, keepalive from `BBOX_MCP_SESSION_KEEPALIVE_SECS` | `src/server/mcp.rs` (`build_http_app`) | `with_stateful_mode` renamed to `with_legacy_session_mode`; `NeverSessionManager` available for stateless |
-| Per-session OnceLocks (`surface`, `surface_tools`, `surface_project`, `session_checkout`) pinned at `initialize` | `src/server/handler.rs`, `src/server/state.rs` | The one hard collision. No `initialize` in 2026-07-28; fresh handler per request. Phase 1 rework |
+| Per-session OnceLocks (`surface`, `surface_tools`, `surface_project`, `session_checkout`, `session_workspace_binding`) pinned at `initialize` | `src/server/handler.rs`, `src/server/state.rs` | The one hard collision. No `initialize` in 2026-07-28; fresh handler per request. Phase 1 rework |
 | Manual `ServerHandler` impl (`call_tool` -> `tool_router.call`, surface-filtered `list_tools`/`get_tool`) | `src/server/handler.rs` | Return types widen to `CallToolResponse` etc. (`.into()`); surface filtering logic itself is version-agnostic |
 | `#[tool]` macros across `src/tools/*.rs` | `src/tools/` | Free: macro users need no MRTR changes |
 | Progress notifications (`context.meta.get_progress_token()`, `peer.send_notification(ProgressNotification)`) | `src/server/progress.rs`, `src/tools/dispatch.rs` | Survives (request-scoped progress stays on the response stream). `Meta` -> `RequestMetaObject` rename |
 | App-level cancellation (`bro_cancel` = SIGTERM + store transition) | `src/tools/dispatch.rs` | No protocol cancellation for tools today; tasks extension adds `tasks/cancel` in Phase 2 |
 | Client: harness child -> daemon, `StreamableHttpClientTransport` | `crates/bro-harness/src/mcp.rs` | Same; the one client pair we own end to end (proving ground) |
-| 80KB response cap + spill envelope | `src/server/response.rs` | Orthogonal while loopback, but the spill-to-daemon-disk rationale ("every client has file-read tools") is a localhost assumption. Phase 4 serves spills as `blackbox://spill/{id}`; required before the corpus daemon goes remote |
-| Capabilities: `enable_tools()` only; no resources/prompts/subscriptions | `src/server/handler.rs` (`get_info`) | Greenfield for Phase 4 resource projection |
+| 80KB response budget; oversize is an in-band `response_too_large` tool error | `src/server/response.rs` | Orthogonal: nothing is written to daemon disk, so the budget holds unchanged for a remote daemon |
+| Capabilities: tools, plus resources, prompts and the `io.modelcontextprotocol/skills` extension serving the one onboarding skill; no subscriptions | `src/server/handler.rs` (`get_info`) | Phase 4 resource projection extends the existing `list_resources` / `read_resource` |
 | `StreamableHttpService<S, M>` bound | `src/server/mcp.rs` | Now requires `S: ServerHandler` (was `Service<RoleServer>`); we already impl `ServerHandler` |
 | Zero auth (loopback trust) | transport layer, implicitly | Fine until the corpus daemon leaves the machine; Q8 picks the auth story (bearer + TLS minimum) before locality-first slice 6 |
 
@@ -292,14 +292,14 @@ slice independently of Phase 2, not task notifications.
   `list_resources` / `read_resource` consult the same per-request surface
   resolution.
 - Protocol cursor pagination + `ttl_ms`/`cache_scope` on list/read.
-- Catalogs: brofiles, teams, artifacts, live tasks;
-  threads optional.
+- Catalogs: brofiles, artifact receipts, catalog projects with their
+  graphs, live tasks; threads optional.
 
 ## Phase 5: MRTR approval gates (opportunistic)
 
 - `InputRequiredResult` with elicitation for operator-confirmation flows
-  (destructive admin, RX-V1 flags), gated on client
-  elicitation support.
+  (the preview/apply maintenance and project administration tools), gated
+  on client elicitation support.
 - If state ever crosses MRTR rounds statelessly, adopt rmcp's
   `request-state` feature (HMAC codec) for integrity.
 - Codex's 2026-09-10 source supplies concrete continuation cases to verify:
@@ -332,11 +332,10 @@ This plan interlocks at two points:
   session affinity (restarts, LB, replicas); the 2026-07-28 stateless wire
   head plus `NeverSessionManager` is the affinity-free shape. Order:
   decomposition slices 1-4, our Phases 0-1, then slice 6.
-- **Slice 6 requires the Q8 auth decision and spill-as-resource.** Zero
-  auth and disk-spill recovery are loopback assumptions; both must be
-  resolved (bearer + TLS minimum, `blackbox://spill/{id}`) before the
-  daemon serves non-local clients. Spill-as-resource pulls a small piece
-  of Phase 4 forward into the slice-6 prerequisite list.
+- **Slice 6 requires the Q8 auth decision.** Zero auth is a loopback
+  assumption; it must be resolved (bearer + TLS minimum) before the daemon
+  serves non-local clients. Oversize results are in-band errors, so the
+  response budget adds nothing to the slice-6 prerequisite list.
 
 ## Client-support tripwire
 
