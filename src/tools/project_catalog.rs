@@ -752,6 +752,22 @@ fn publisher_acceptance_summary(value: &serde_json::Value) -> serde_json::Value 
     }
 }
 
+/// The newest stored candidate as the default response carries it. Every
+/// field is an id, a ref, a commit, a state or a time; only the diagnostic is
+/// free text, so only it is bounded. detail=health carries it exactly.
+fn publisher_last_candidate_summary(
+    candidate: &crate::server::state::LastCandidateRuntimeView,
+) -> serde_json::Value {
+    let mut summary = serde_json::to_value(candidate).unwrap_or(serde_json::Value::Null);
+    if let (Some(fields), Some(diagnostic)) = (summary.as_object_mut(), &candidate.diagnostic) {
+        fields.insert(
+            "diagnostic".into(),
+            publisher_status_bounded_text(diagnostic),
+        );
+    }
+    summary
+}
+
 /// Bound a decision-relevant diagnostic string without lying about what
 /// happened. Values inside the limit keep the plain string shape callers
 /// already parse; an oversized value keeps a short prefix plus the exact
@@ -2004,7 +2020,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_project_publisher_status",
-        description = "Read one catalog project's accepted-publication status: state, scope/ref/commit identity, typed source binding, advance availability, the generation_id and pointer_sha256 identities, and the latest candidate acceptance attempt. Default health and connector sections are compact bounded summaries that keep stale, unavailable, queued, and partial signals visible with total, status, and omission counts; recorded rows are observations, not live filesystem authority. Oversized summary strings become explicit size-and-truncation markers (diagnostics keep a bounded prefix) whose exact bytes live only in detail pages. detail=health returns the complete runtime view, detail=connector the complete connector view, detail=acceptance the latest candidate acceptance attempt, and detail=checkout_mutations the project's queued checkout edits that are pending, applied but not yet published, failed, conflicted, or blocked (ids, paths, digests and state counts, never file content) as exact bounded body pages; replay detail.body.next_cursor while the body is unchanged. Connector detail requires a connector-scoped project and checkout_mutations detail a published one. Observational, path-free, and takes no checkout lease; see design/daemon-runtime/publisher-auto-advance.md for deep mechanics. Returns error.project_catalog_inactive while the version-1 registry is the runtime authority."
+        description = "Read one catalog project's accepted-publication status: state, scope/ref/commit identity, typed source binding, advance availability, the generation_id and pointer_sha256 identities, and the latest candidate acceptance attempt. pointer_written_unix_secs is the pointer file's modification time: the last pointer write (accept, bind or rollback), not strictly the last accept, and a restored store carries the restore time. last_candidate is the newest candidate stored for the project (status stored, none or unavailable; source generation, producer, ref, commit, state, creation time, diagnostic) with served_by_pointer saying whether the accepted pointer serves it; it is read from durable state and survives a daemon restart. Default health and connector sections are compact bounded summaries that keep stale, unavailable, queued, and partial signals visible with total, status, and omission counts; recorded rows are observations, not live filesystem authority. Oversized summary strings become explicit size-and-truncation markers (diagnostics keep a bounded prefix) whose exact bytes live only in detail pages. detail=health returns the complete runtime view, detail=connector the complete connector view, detail=acceptance the latest candidate acceptance attempt, and detail=checkout_mutations the project's queued checkout edits that are pending, applied but not yet published, failed, conflicted, or blocked (ids, paths, digests and state counts, never file content) as exact bounded body pages; replay detail.body.next_cursor while the body is unchanged. Connector detail requires a connector-scoped project and checkout_mutations detail a published one. Observational, path-free, and takes no checkout lease; see design/daemon-runtime/publisher-auto-advance.md for deep mechanics. Returns error.project_catalog_inactive while the version-1 registry is the runtime authority."
     )]
     pub(crate) async fn bbox_project_publisher_status(
         &self,
@@ -2166,6 +2182,12 @@ impl BlackboxServer {
                 "pointer_sha256": status.binding_stamp().map(|stamp| stamp.pointer_sha256()),
                 "diagnostic": status.failure().map(|failure| failure.code()),
                 "epoch": state.epoch(),
+                "pointer_written_unix_secs": runtime_health
+                    .as_ref()
+                    .and_then(|health| health.accepted.pointer_written_unix_secs),
+                "last_candidate": runtime_health
+                    .as_ref()
+                    .map(|health| publisher_last_candidate_summary(&health.last_candidate)),
                 "acceptance": publisher_acceptance_summary(&acceptance_detail),
                 "health": health_summary,
                 "detail_hint": "detail=health, detail=connector or detail=acceptance returns exact bounded pages; replay detail.body.next_cursor while the body is unchanged",
@@ -5498,6 +5520,72 @@ mod tests {
         );
     }
 
+    /// A pointer that verifies as current while a newer Ready candidate sits
+    /// unaccepted is reported as lagging by publisher status and by doctor,
+    /// from the stored candidate record rather than the in-process attempt.
+    #[tokio::test]
+    async fn status_and_doctor_report_a_pointer_behind_the_last_stored_candidate() {
+        use crate::server::state::catalog_fixture::{COMMIT_ONE, COMMIT_TWO};
+
+        crate::init_system_memory_for_tests();
+        let fixture = AcceptanceFixture::new("p_accept_lag");
+        let before = fixture.status().await;
+        assert_eq!(before["last_candidate"]["status"], "none");
+        assert!(before["pointer_written_unix_secs"].is_null(), "{before}");
+
+        let first = fixture.stage_candidate("knowledge-a", "first", COMMIT_ONE);
+        assert!(fixture.accept(&first).accepted());
+        let served = fixture.status().await;
+        assert!(served["pointer_written_unix_secs"].as_u64().unwrap() > 0);
+        assert_eq!(served["last_candidate"]["status"], "stored");
+        assert_eq!(served["last_candidate"]["source_generation_id"], first);
+        assert_eq!(served["last_candidate"]["served_by_pointer"], true);
+        let accepted_section = |server: &crate::server::BlackboxServer| {
+            crate::doctor::run(server)
+                .unwrap()
+                .sections
+                .into_iter()
+                .find(|section| section.section == "accepted_publication")
+                .unwrap()
+        };
+        let healthy = serde_json::to_string(&accepted_section(&fixture.server)).unwrap();
+        assert!(!healthy.contains("is not served"), "{healthy}");
+
+        // Stored, never accepted: the pointer stays on the first commit.
+        let second = fixture.stage_candidate("knowledge-a", "second", COMMIT_TWO);
+        let lagging = fixture.status().await;
+        assert_eq!(lagging["accepted_state"], "current");
+        assert_eq!(lagging["accepted_commit"], COMMIT_ONE);
+        assert_eq!(
+            lagging["pointer_written_unix_secs"],
+            served["pointer_written_unix_secs"]
+        );
+        let candidate = &lagging["last_candidate"];
+        assert_eq!(candidate["source_generation_id"], second);
+        assert_eq!(candidate["publisher_commit"], COMMIT_TWO);
+        assert_eq!(candidate["full_ref"], "refs/heads/main");
+        assert_eq!(candidate["producer_id"], "producer-a");
+        assert_eq!(candidate["state"], "ready");
+        assert_eq!(candidate["served_by_pointer"], false);
+        assert!(candidate["created_unix_secs"].as_u64().unwrap() > 0);
+        assert_eq!(
+            lagging["acceptance"]["last_attempt"]["source_generation_id"], first,
+            "the in-process attempt still names the accepted candidate: {lagging}"
+        );
+
+        let report = serde_json::to_string(&accepted_section(&fixture.server)).unwrap();
+        assert!(report.contains("is not served"), "{report}");
+        assert!(report.contains(&second), "{report}");
+        assert!(report.contains(COMMIT_ONE), "{report}");
+
+        // Accepting it clears both.
+        assert!(fixture.accept(&second).accepted());
+        let caught_up = fixture.status().await;
+        assert_eq!(caught_up["last_candidate"]["served_by_pointer"], true);
+        let report = serde_json::to_string(&accepted_section(&fixture.server)).unwrap();
+        assert!(!report.contains("is not served"), "{report}");
+    }
+
     #[tokio::test]
     async fn establish_ignores_the_checked_out_attachment_branch() {
         use crate::server::state::catalog_fixture::COMMIT_ONE;
@@ -6858,8 +6946,10 @@ mod tests {
                 generation_id: None,
                 generation_sha256: None,
                 last_verified_unix_secs: None,
+                pointer_written_unix_secs: None,
                 diagnostic: None,
             },
+            last_candidate: crate::server::state::LastCandidateRuntimeView::absent("none"),
             binding: BindingRuntimeView {
                 source_kind: Some("attachment"),
                 attachment_id: Some("att_00000000000000000000000000000000".into()),

@@ -202,6 +202,26 @@ as exact bounded pages. The ledger is in-process and bounded: it answers "what
 did acceptance just do". The durable answer is the pointer itself, whose
 producer binding names the exact source generation it serves.
 
+Two durable facts say whether the pointer lags, and both read the same before
+and after a restart:
+
+- `pointer_written_unix_secs` is the modification time of the pointer file.
+  It is the last pointer write (an accept, a bind, or a rollback), not
+  strictly the last accept, and a store restored from a backup carries the
+  restore time. No time is stored in the pointer, so `pointer_sha256` does
+  not depend on it.
+- `last_candidate` is the newest candidate in the knowledge-source store for
+  the project: `status` (`stored`, `none`, `unavailable`), source generation,
+  producer, ref, commit, state, creation time, diagnostic, and
+  `served_by_pointer`. A pointer bound to a producer serves the candidate
+  whose source generation it names; a pointer bound to an attachment serves a
+  candidate with the same ref and commit.
+
+`bbox_doctor` reports a project whose newest stored candidate is Ready or
+Failed and is not served by the pointer, whatever the pointer's own state. A
+candidate that never arrives leaves no stored record, so a silent producer is
+not visible from these two facts.
+
 Each acceptance logs one `catalog administration mutation` line with
 `tool = "candidate_acceptance"` and an audit reason of the form
 `acceptance:<establish|advance> producer=<id> source=<generation>`. Operator

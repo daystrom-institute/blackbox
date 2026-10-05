@@ -150,7 +150,11 @@ establishes the accepted pointer, and every later candidate on the same ref
 advances it. Graph, knowledge, gap, and configuration lanes ride the same
 accepted generation. `bbox_project_publisher_status` is read-only and reports
 the accepted generation plus `acceptance.last_attempt`, which names why the
-latest candidate was or was not accepted.
+latest candidate was or was not accepted. It also reports
+`pointer_written_unix_secs` (when the pointer file was last written) and
+`last_candidate` (the newest stored candidate and whether the pointer serves
+it); `bbox_doctor` flags a Ready or Failed newest candidate the pointer does
+not serve.
 
 A candidate from a different producer or ref, or at a new scope after a scope
 migration, waits for an operator move, and so does serving an earlier

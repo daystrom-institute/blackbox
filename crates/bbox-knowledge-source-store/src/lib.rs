@@ -1515,6 +1515,54 @@ impl KnowledgeSourceStore {
         Ok(lane_less)
     }
 
+    /// The candidate stored most recently for one project, by its creation
+    /// time, whatever its state and whichever producer uploaded it. `None`
+    /// when the project has no stored candidate. Observational: it takes no
+    /// mutation lock, so a generation retired between the index read and the
+    /// record read is passed over rather than reported as damage.
+    pub fn latest_publication_candidate(
+        &self,
+        project_id: &str,
+    ) -> Result<Option<StoredPublicationCandidateV1>> {
+        validate_project_id(project_id)?;
+        let index_dir = self.root.join("publications/generation-index");
+        let mut latest: Option<StoredPublicationCandidateV1> = None;
+        for path in read_regular_json_files(&index_dir)? {
+            let Some(index) = read_json::<PublicationGenerationIndexV1>(
+                &index_dir,
+                &file_name(&path)?,
+                MAX_GENERATION_RECORD_BYTES,
+                "publication generation index",
+            )?
+            else {
+                continue;
+            };
+            if index.version != STORE_VERSION || index.project_id != project_id {
+                continue;
+            }
+            let source = match self
+                .load_publication_generation(&index.project_id, &index.source_generation_id)
+            {
+                Ok(source) => source,
+                Err(error)
+                    if error.downcast_ref::<StoreRequestError>()
+                        == Some(&StoreRequestError::NotFound) =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let newer = latest.as_ref().is_none_or(|held| {
+                (source.created_unix_secs, source.created_unix_nanos)
+                    > (held.created_unix_secs, held.created_unix_nanos)
+            });
+            if newer {
+                latest = Some(source);
+            }
+        }
+        Ok(latest)
+    }
+
     /// Capture the source-store facts that must be quiet and replayable before
     /// one Published project can cross the strict knowledge-transport boundary.
     /// The mutation lock makes uploads and journals one coherent observation.
@@ -4427,6 +4475,50 @@ mod tests {
 
     fn config_manifest_entries() -> Vec<SourceFileManifestEntryV1> {
         config_files().into_iter().map(|(entry, _)| entry).collect()
+    }
+
+    #[test]
+    fn the_latest_candidate_is_the_newest_stored_for_that_project() {
+        let (_temporary, _root, store) = test_store(StoreLimits::default());
+        let authority = publication_authority();
+        assert_eq!(
+            store
+                .latest_publication_candidate(&authority.project_id)
+                .unwrap(),
+            None
+        );
+
+        let (first, _, _) = publication_fixture();
+        let first_generation = upload_candidate(&store, first.clone(), &[]);
+        let latest = store
+            .latest_publication_candidate(&authority.project_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.source_generation_id, first_generation);
+        assert_eq!(latest.state, SourceGenerationStateV1::Ready);
+
+        let mut second = first;
+        second.publisher_commit = "2".repeat(40);
+        let second_generation = upload_candidate(&store, second.clone(), &[]);
+        assert_ne!(second_generation, first_generation);
+        let latest = store
+            .latest_publication_candidate(&authority.project_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.source_generation_id, second_generation);
+        assert_eq!(latest.descriptor.publisher_commit, second.publisher_commit);
+        assert_eq!(latest.producer_id, authority.producer_id);
+        assert!(latest.created_unix_secs > 0);
+
+        // Candidates are per project.
+        assert_eq!(
+            store.latest_publication_candidate("project-b").unwrap(),
+            None
+        );
+        assert_store_error(
+            store.latest_publication_candidate("../project-a"),
+            StoreRequestError::InvalidInput,
+        );
     }
 
     #[test]

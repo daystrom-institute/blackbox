@@ -1143,6 +1143,28 @@ impl AcceptedPublicationRuntime {
         Ok(status.with_scope(catalog_scope))
     }
 
+    /// Seconds since the unix epoch at the last write of the project's
+    /// pointer file, read from the file's modification time. `None` when the
+    /// project has no pointer file or the time cannot be read.
+    ///
+    /// This is the last pointer WRITE, which is an accept, a bind, or a
+    /// rollback; it is not strictly the last accept. A store restored from a
+    /// backup or copied between hosts carries the restore time. Nothing is
+    /// stored in the pointer for it, so the pointer hash does not depend on
+    /// time.
+    pub fn pointer_written_unix_secs(&self, project_id: &ProjectId) -> Option<u64> {
+        let metadata = std::fs::symlink_metadata(self.paths.pointer(project_id)).ok()?;
+        if !metadata.is_file() {
+            return None;
+        }
+        metadata
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|elapsed| elapsed.as_secs())
+    }
+
     /// The pre-bind scan (plan section 5.4). It verifies every supplied
     /// project under one lock acquisition and retains status only, so peak
     /// memory stays one decoded generation regardless of catalog size.
@@ -1997,6 +2019,31 @@ mod tests {
             serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         pointer[field] = serde_json::Value::String(value.to_string());
         fs::write(&path, serde_json::to_vec_pretty(&pointer).unwrap()).unwrap();
+    }
+
+    /// The pointer write time is the pointer file's modification time: absent
+    /// without a pointer, and whatever the file carries otherwise.
+    #[test]
+    fn pointer_write_time_is_the_pointer_file_modification_time() {
+        let fixture = fixture();
+        let project_id = project("p_written");
+        let runtime = fixture.runtime();
+        assert_eq!(runtime.pointer_written_unix_secs(&project_id), None);
+
+        publish(&fixture.paths, &project_id, COMMIT_ONE, "accepted", None);
+        let stamped = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        fs::File::options()
+            .write(true)
+            .open(fixture.paths.pointer(&project_id))
+            .unwrap()
+            .set_modified(stamped)
+            .unwrap();
+        assert_eq!(
+            runtime.pointer_written_unix_secs(&project_id),
+            Some(1_700_000_000)
+        );
+        // Another project's pointer says nothing about this one.
+        assert_eq!(runtime.pointer_written_unix_secs(&project("p_other")), None);
     }
 
     #[test]

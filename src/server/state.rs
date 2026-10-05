@@ -1789,6 +1789,7 @@ pub(crate) struct ProjectRuntimeStatus {
     pub(crate) catalog_scope: Option<PublishedScopeView>,
     pub(crate) accepted: AcceptedRuntimeView,
     pub(crate) binding: BindingRuntimeView,
+    pub(crate) last_candidate: LastCandidateRuntimeView,
     pub(crate) attachments: Vec<AttachmentCapabilityView>,
     pub(crate) watcher: WatcherRuntimeView,
 }
@@ -1833,9 +1834,61 @@ pub(crate) struct AcceptedRuntimeView {
     /// Seconds since the unix epoch at the last pointer verification.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) last_verified_unix_secs: Option<u64>,
+    /// Seconds since the unix epoch at the last write of the pointer file,
+    /// from the file's modification time. It is the last accept, bind, or
+    /// rollback, not strictly the last accept, and a restored store carries
+    /// the restore time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) pointer_written_unix_secs: Option<u64>,
     /// The stable code of whatever refused, when the state is not Current.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) diagnostic: Option<String>,
+}
+
+/// The candidate stored most recently for the project, read from the durable
+/// knowledge-source store, so it is the same before and after a restart.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct LastCandidateRuntimeView {
+    /// `stored`, `none` when the project has no stored candidate, or
+    /// `unavailable` when the source store could not be read.
+    pub(crate) status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) source_generation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) producer_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) full_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) publisher_commit: Option<String>,
+    /// The stored generation state, such as `ready` or `failed`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) state: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) created_unix_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) diagnostic: Option<String>,
+    /// Whether the accepted pointer serves this candidate: the pointer's
+    /// producer binding names its source generation, or, for a pointer bound
+    /// to an attachment, the accepted ref and commit equal the candidate's.
+    /// Present only for a stored candidate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) served_by_pointer: Option<bool>,
+}
+
+impl LastCandidateRuntimeView {
+    pub(crate) fn absent(status: &'static str) -> Self {
+        Self {
+            status,
+            source_generation_id: None,
+            producer_id: None,
+            full_ref: None,
+            publisher_commit: None,
+            state: None,
+            created_unix_secs: None,
+            diagnostic: None,
+            served_by_pointer: None,
+        }
+    }
 }
 
 /// Which attachment the pointer names, and whether it is still usable.
@@ -1936,7 +1989,11 @@ impl SharedState {
             project_id: project_id.as_str().to_string(),
             catalog_authority: "unavailable",
             catalog_scope: None,
-            accepted: AcceptedRuntimeView::project(accepted_status.as_ref()),
+            accepted: AcceptedRuntimeView::project(
+                accepted_status.as_ref(),
+                self.pointer_written_unix_secs(project_id),
+            ),
+            last_candidate: self.last_candidate_view(project_id, accepted_status.as_ref()),
             binding: BindingRuntimeView {
                 // The pointer's own bytes are readable; whether the
                 // attachment it names is still attached is a CATALOG
@@ -2016,7 +2073,11 @@ impl SharedState {
             .accepted_publications
             .as_ref()
             .and_then(|runtime| runtime.status(&parsed, catalog_scope.as_ref()).ok());
-        let accepted = AcceptedRuntimeView::project(accepted_status.as_ref());
+        let accepted = AcceptedRuntimeView::project(
+            accepted_status.as_ref(),
+            self.pointer_written_unix_secs(&parsed),
+        );
+        let last_candidate = self.last_candidate_view(&parsed, accepted_status.as_ref());
 
         let rows = snapshot
             .attachments()
@@ -2095,9 +2156,73 @@ impl SharedState {
             catalog_scope: catalog_scope.as_ref().map(PublishedScopeView::from_scope),
             accepted,
             binding,
+            last_candidate,
             attachments,
             watcher,
         })
+    }
+
+    fn pointer_written_unix_secs(
+        &self,
+        project_id: &bbox_corpus_core::project_catalog::ProjectId,
+    ) -> Option<u64> {
+        self.accepted_publications
+            .as_ref()
+            .and_then(|runtime| runtime.pointer_written_unix_secs(project_id))
+    }
+
+    /// The newest stored candidate for the project and whether the accepted
+    /// pointer serves it. The knowledge-source store is its own durable
+    /// store, so this is read whether or not the catalog pair is readable.
+    fn last_candidate_view(
+        &self,
+        project_id: &bbox_corpus_core::project_catalog::ProjectId,
+        accepted_status: Option<
+            &bbox_indexing::accepted_publication_runtime::AcceptedPublicationStatus,
+        >,
+    ) -> LastCandidateRuntimeView {
+        use bbox_knowledge_source::SourceGenerationStateV1 as State;
+
+        let candidate = match self
+            .knowledge_sources
+            .store()
+            .latest_publication_candidate(project_id.as_str())
+        {
+            Ok(Some(candidate)) => candidate,
+            Ok(None) => return LastCandidateRuntimeView::absent("none"),
+            Err(_) => return LastCandidateRuntimeView::absent("unavailable"),
+        };
+        let bound_generation = accepted_status
+            .and_then(|status| status.binding_stamp())
+            .and_then(|stamp| stamp.source().source_generation_id());
+        let served_by_pointer = match bound_generation {
+            Some(bound) => bound == candidate.source_generation_id,
+            None => accepted_status
+                .and_then(|status| status.content_stamp())
+                .is_some_and(|stamp| {
+                    stamp.full_ref() == candidate.descriptor.full_ref
+                        && stamp.accepted_commit() == candidate.descriptor.publisher_commit
+                }),
+        };
+        LastCandidateRuntimeView {
+            status: "stored",
+            source_generation_id: Some(candidate.source_generation_id),
+            producer_id: Some(candidate.producer_id),
+            full_ref: Some(candidate.descriptor.full_ref),
+            publisher_commit: Some(candidate.descriptor.publisher_commit),
+            state: Some(match candidate.state {
+                State::ReceivingManifest => "receiving_manifest",
+                State::MissingBlobs => "missing_blobs",
+                State::Ready => "ready",
+                State::Superseded => "superseded",
+                State::Retired => "retired",
+                State::Expired => "expired",
+                State::Failed => "failed",
+            }),
+            created_unix_secs: Some(candidate.created_unix_secs),
+            diagnostic: candidate.diagnostic,
+            served_by_pointer: Some(served_by_pointer),
+        }
     }
 
     fn watcher_runtime_view(
@@ -2153,6 +2278,7 @@ impl SharedState {
 impl AcceptedRuntimeView {
     fn project(
         status: Option<&bbox_indexing::accepted_publication_runtime::AcceptedPublicationStatus>,
+        pointer_written_unix_secs: Option<u64>,
     ) -> Self {
         use bbox_indexing::accepted_publication_runtime::{
             AcceptedPublicationScopeAgreement as Agreement, AcceptedPublicationState as State,
@@ -2172,6 +2298,7 @@ impl AcceptedRuntimeView {
                 generation_id: None,
                 generation_sha256: None,
                 last_verified_unix_secs: None,
+                pointer_written_unix_secs,
                 diagnostic: None,
             };
         };
@@ -2201,6 +2328,7 @@ impl AcceptedRuntimeView {
                 .duration_since(std::time::UNIX_EPOCH)
                 .ok()
                 .map(|elapsed| elapsed.as_secs()),
+            pointer_written_unix_secs,
             diagnostic: status.failure().map(|failure| failure.code().to_string()),
         }
     }

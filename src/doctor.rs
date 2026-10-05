@@ -426,11 +426,16 @@ fn accepted_publication_section(
             "current" => status.accepted.scope_agreement == "refresh_required",
             _ => true,
         };
+        let unserved = unserved_candidate_finding(status);
         if !notable {
-            current += 1;
+            match unserved {
+                Some(finding) => findings.push(finding),
+                None => current += 1,
+            }
             continue;
         }
         let project = &status.project_id;
+        findings.extend(unserved);
         findings.push(match status.accepted.state {
             // Serving old accepted truth under its old scope until a
             // scope move at the new scope clears the bridge (plan 4.9).
@@ -485,6 +490,57 @@ fn accepted_publication_section(
         section: "accepted_publication",
         findings,
     }
+}
+
+/// A pointer that verifies says nothing about how far it lags. The newest
+/// stored candidate does: a Ready or Failed candidate the pointer does not
+/// serve means publication stopped short of the pointer, whatever the
+/// pointer's own state. Candidates in any other state are not reported;
+/// they are in flight or were deliberately set aside.
+fn unserved_candidate_finding(
+    status: &crate::server::state::ProjectRuntimeStatus,
+) -> Option<Finding> {
+    let candidate = &status.last_candidate;
+    if candidate.served_by_pointer != Some(false) {
+        return None;
+    }
+    let state = candidate.state?;
+    if !matches!(state, "ready" | "failed") {
+        return None;
+    }
+    let project = &status.project_id;
+    let generation = candidate
+        .source_generation_id
+        .as_deref()
+        .unwrap_or("unknown");
+    let commit = candidate.publisher_commit.as_deref().unwrap_or("unknown");
+    let stored = candidate
+        .created_unix_secs
+        .map(|secs| format!(", stored at unix time {secs}"))
+        .unwrap_or_default();
+    let serving = match (
+        status.accepted.accepted_commit.as_deref(),
+        status.accepted.pointer_written_unix_secs,
+    ) {
+        (Some(accepted), Some(written)) => format!(
+            "the accepted pointer serves commit {accepted} and was last written at unix \
+             time {written}"
+        ),
+        (Some(accepted), None) => format!("the accepted pointer serves commit {accepted}"),
+        (None, _) => "no accepted pointer serves anything".to_string(),
+    };
+    let diagnostic = candidate
+        .diagnostic
+        .as_deref()
+        .map(|text| format!(" ({})", text.chars().take(200).collect::<String>()))
+        .unwrap_or_default();
+    Some(Finding::action(
+        format!(
+            "project {project} last stored candidate {generation} (commit {commit}, state \
+             {state}{stored}){diagnostic} is not served: {serving}"
+        ),
+        publisher_status_call(project),
+    ))
 }
 
 /// Whether a project can ever hold an accepted publication: it needs a
