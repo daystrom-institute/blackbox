@@ -14,9 +14,12 @@
 //! Lifecycle: every connection uses the `initialize` handshake at 2025-06-18
 //! unless `BRO_HARNESS_MCP_HTTP_LIFECYCLE=auto`, which makes HTTP servers
 //! probe `server/discover` first and fall back to the handshake when the
-//! peer rejects it, serves no sessionless revision, or stays silent. The probe is used only for a server
-//! whose `startup_timeout_ms` is at least 20 s, since the SDK waits a fixed
-//! 10 s on a silent peer before falling back. Stdio servers always use the
+//! peer rejects it, serves no sessionless revision, or stays silent. The
+//! probe is used only for a server whose `startup_timeout_ms` is at least
+//! 20 s, since the SDK waits a fixed 10 s on a silent peer before falling
+//! back. A peer that serves both lifecycles and rejects the probe with a
+//! modern rejection code (a missing required client capability or a header
+//! mismatch) is not retried with the handshake. Stdio servers always use the
 //! handshake. Code that reads a connection must hold for both: a sessionless
 //! peer has no session id, and its results carry a `resultType`.
 //!

@@ -236,6 +236,12 @@ path for current clients. No tasks/resources yet.
    - An unknown surface: refused on whichever request reaches the
      handler first (the probe with the gate on, the handshake after the
      `-32022` with it off) and the server is unavailable.
+   - A peer that serves both lifecycles and rejects the probe with a
+     modern rejection code (`MISSING_REQUIRED_CLIENT_CAPABILITY` or
+     `HEADER_MISMATCH`): no handshake follows and the server is
+     unavailable, although it would have connected without the flag. This
+     daemon never answers this client that way; it is the one known
+     non-fallback.
 8. `BBOX_MCP_SESSION_KEEPALIVE_SECS` becomes legacy-only; document.
 
 Validation: per-request scope extraction covered by unit tests at the
