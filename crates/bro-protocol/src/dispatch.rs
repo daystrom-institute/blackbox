@@ -55,6 +55,10 @@ pub struct DispatchSpec {
     /// restores the persisted value, but `ResumeSpec.service_tier` can override
     /// it for a specific continuation.
     pub service_tier: Option<String>,
+    /// Per-dispatch tool argument defaults, forwarded to the daemon as
+    /// `ExecParams.tool_defaults`. Keys are `<flavor>:<tool-pattern>.<param>`;
+    /// the daemon merges them over the ambient and brofile defaults.
+    pub tool_defaults: Option<BTreeMap<String, serde_json::Value>>,
 }
 
 impl DispatchSpec {
@@ -69,6 +73,7 @@ impl DispatchSpec {
             name: None,
             code_mode: None,
             service_tier: None,
+            tool_defaults: None,
         }
     }
 }
@@ -90,6 +95,10 @@ pub struct ResumeSpec {
     /// the restored session/brofile/harness default; `Some("default")` clears
     /// back to standard routing while still persisting that choice.
     pub service_tier: Option<String>,
+    /// Per-dispatch tool argument defaults for this continuation, forwarded
+    /// to the daemon as `ResumeParams.tool_defaults`. They apply to this
+    /// resumed invocation only.
+    pub tool_defaults: Option<BTreeMap<String, serde_json::Value>>,
 }
 
 impl ResumeSpec {
@@ -108,6 +117,7 @@ impl ResumeSpec {
             name: None,
             env_overrides: None,
             service_tier: None,
+            tool_defaults: None,
         }
     }
 }

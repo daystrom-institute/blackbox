@@ -1531,6 +1531,9 @@ fn dispatch_body(spec: &DispatchSpec) -> Value {
     if let Some(name) = &spec.name {
         body["display_name"] = Value::String(name.clone());
     }
+    if let Some(tool_defaults) = &spec.tool_defaults {
+        body["tool_defaults"] = json!(tool_defaults);
+    }
     body
 }
 
@@ -1552,6 +1555,9 @@ fn resume_body(spec: &ResumeSpec) -> Value {
     }
     if let Some(service_tier) = &spec.service_tier {
         body["service_tier"] = Value::String(service_tier.clone());
+    }
+    if let Some(tool_defaults) = &spec.tool_defaults {
+        body["tool_defaults"] = json!(tool_defaults);
     }
     body
 }
@@ -2254,6 +2260,24 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some(SERVICE_TIER_PRIORITY)
         );
+    }
+
+    #[test]
+    fn dispatch_and_resume_bodies_carry_tool_defaults_only_when_set() {
+        let defaults = std::collections::BTreeMap::from([
+            ("default:shell_run.timeout_ms".to_string(), json!(30000)),
+            ("pin:fixture.label".to_string(), json!("synthetic")),
+        ]);
+        let mut dispatch = DispatchSpec::new(Provider::Glm, "hi");
+        let mut resume = ResumeSpec::new(Provider::Glm, "sess-1", "continue");
+        // Absent ⇒ no key, so the daemon applies ambient and brofile defaults.
+        assert!(dispatch_body(&dispatch).get("tool_defaults").is_none());
+        assert!(resume_body(&resume).get("tool_defaults").is_none());
+
+        dispatch.tool_defaults = Some(defaults.clone());
+        resume.tool_defaults = Some(defaults.clone());
+        assert_eq!(dispatch_body(&dispatch)["tool_defaults"], json!(defaults));
+        assert_eq!(resume_body(&resume)["tool_defaults"], json!(defaults));
     }
 
     #[test]
