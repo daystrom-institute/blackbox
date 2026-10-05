@@ -22,6 +22,7 @@ clients.
 - [MCP Surface and Internals Shedding Plan](mcp-shedding-plan.md)
 - [rmcp 3.0 Migration Plan](rmcp-3-migration-plan.md)
 - [MCP Response and Contract Audit](mcp-response-and-contract-audit.md)
+- [MCP Surviving Surface Inventory](mcp-surviving-surface-inventory.md)
 - [MCP Audit Coverage](mcp-audit-coverage.md)
 - [Roadmap elision](roadmap-retirement.md)
 
