@@ -41,7 +41,10 @@ pub use edits::{EditEvent, EditSink};
 pub use invocation::{InvocationHandle, InvocationReceipt, start_tool_invocation};
 pub use promise::{PromiseProgress, StreamKind};
 pub use safety::SafetyPolicy;
-pub use shell::{ShellKill, ShellList, ShellPoll, ShellRun, ShellSessions};
+pub use shell::{
+    ShellKill, ShellList, ShellPoll, ShellRun, ShellSessionChanges, ShellSessionSummary,
+    ShellSessions,
+};
 pub use todo::{TodoItem, TodoList, TodoStatus, TodoWrite};
 pub use tool::{
     FreeformGrammar, InstructionAccess, InstructionPaths, InstructionPolicy, Tool, ToolAnnotations,

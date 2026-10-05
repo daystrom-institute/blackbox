@@ -1024,3 +1024,295 @@ catch (e) { text(e.message); }
     assert!(waited.contains(&refusal_of("file_write")), "{waited}");
     assert_eq!(std::fs::read_to_string(&fixture).unwrap(), "alpha\ngamma\n");
 }
+
+async fn reporting_session(root: &Path) -> (Session, Arc<StdMutex<Vec<Value>>>) {
+    let events = Arc::new(StdMutex::new(Vec::new()));
+    let sink = events.clone();
+    let mut session = build_with_runtime(
+        &discipline_cli(root, &[], false),
+        root,
+        Arc::default(),
+        None,
+        Arc::new(move |event| sink.lock().unwrap().push(event)),
+    )
+    .await
+    .unwrap();
+    session.cx.root = root.to_path_buf();
+    (session, events)
+}
+
+fn shell_reports(events: &StdMutex<Vec<Value>>) -> Vec<Value> {
+    events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| event["type"] == "harness_shell_sessions")
+        .cloned()
+        .collect()
+}
+
+/// The newest report, once one satisfies `wanted`. Reports are change-driven,
+/// so this waits for the publisher instead of polling the registry.
+async fn await_shell_report(
+    events: &StdMutex<Vec<Value>>,
+    what: &str,
+    wanted: impl Fn(&Value) -> bool,
+) -> Value {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        if let Some(report) = shell_reports(events).last().filter(|report| wanted(report)) {
+            return report.clone();
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no shell report where {what}: {:?}",
+            shell_reports(events)
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+fn running_ids(report: &Value) -> Vec<String> {
+    report["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|session| session["running"] == true)
+        .map(|session| session["id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn shell_session_reports_follow_start_exit_kill_and_removal_without_polling() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let (session, events) = reporting_session(&root).await;
+
+    // One report at process start: this process has no shell sessions.
+    let initial = shell_reports(&events);
+    assert_eq!(initial.len(), 1, "{initial:?}");
+    assert_eq!(initial[0]["sessions"], json!([]));
+    assert_eq!(initial[0]["session_id"], "discipline");
+    assert!(initial[0]["seq"].as_u64().is_some());
+
+    // A command that outlives its yield is reported running, with a bounded
+    // command head and nothing of its output.
+    // The command prints OUTPUT-MARKER without containing that text itself.
+    let long_command = format!(
+        "printf 'OUT%s' PUT-MARKER; sleep 30 # {}",
+        "\u{00e9}".repeat(300)
+    );
+    let started = session
+        .reg
+        .dispatch(
+            "shell_run",
+            json!({ "command": long_command, "yield_time_ms": 50 }),
+            &session.cx,
+        )
+        .await
+        .into_content()
+        .0;
+    let started: Value = serde_json::from_str(&started).unwrap();
+    let long_id = started["session_id"].as_str().unwrap().to_string();
+    let report = await_shell_report(&events, "the long command is running", |report| {
+        running_ids(report) == vec![long_id.clone()]
+    })
+    .await;
+    let row = &report["sessions"][0];
+    assert_eq!(row["command"].as_str().unwrap().chars().count(), 120);
+    assert!(row["elapsed_ms"].as_u64().is_some());
+    assert!(!report.to_string().contains("OUTPUT-MARKER"), "{report}");
+
+    // A second command exits by itself. Nobody polls it; the report still
+    // says it stopped running, and it stays listed while its output is unread.
+    let quick = session
+        .reg
+        .dispatch(
+            "shell_run",
+            json!({ "command": "sleep 0.4; echo done", "yield_time_ms": 1 }),
+            &session.cx,
+        )
+        .await
+        .into_content()
+        .0;
+    let quick: Value = serde_json::from_str(&quick).unwrap();
+    let quick_id = quick["session_id"].as_str().unwrap().to_string();
+    let report = await_shell_report(&events, "the quick command exited unpolled", |report| {
+        report["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|session| session["id"] == quick_id.as_str() && session["running"] == false)
+    })
+    .await;
+    assert_eq!(running_ids(&report), vec![long_id.clone()]);
+
+    // Reading its output removes it, which is reported too.
+    session
+        .reg
+        .dispatch(
+            "shell_poll",
+            json!({ "session_id": quick_id, "yield_time_ms": 0 }),
+            &session.cx,
+        )
+        .await;
+    await_shell_report(&events, "the quick command is gone", |report| {
+        report["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|session| session["id"] != quick_id.as_str())
+    })
+    .await;
+
+    // Killing the long command ends with an empty report.
+    session
+        .reg
+        .dispatch("shell_kill", json!({ "session_id": long_id }), &session.cx)
+        .await;
+    let last = await_shell_report(&events, "no session is running", |report| {
+        running_ids(report).is_empty()
+    })
+    .await;
+
+    // Reports carry strictly increasing sequence numbers, and the event log
+    // holds the same reports under the same numbers.
+    let reports = shell_reports(&events);
+    let seqs: Vec<u64> = reports
+        .iter()
+        .map(|report| report["seq"].as_u64().unwrap())
+        .collect();
+    assert!(seqs.windows(2).all(|pair| pair[0] < pair[1]), "{seqs:?}");
+    session.event_log.flush_blocking_checked().unwrap();
+    let logged = std::fs::read_to_string(session.event_log.path()).unwrap();
+    let logged: Vec<u64> = logged
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .map(|line| line["event"].clone())
+        .filter(|event| event["type"] == "harness_shell_sessions")
+        .map(|event| event["seq"].as_u64().unwrap())
+        .collect();
+    assert_eq!(logged, seqs);
+    assert_eq!(*seqs.last().unwrap(), last["seq"].as_u64().unwrap());
+}
+
+#[tokio::test]
+async fn shell_session_reports_never_read_empty_while_shutdown_is_still_reaping() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let (session, events) = reporting_session(&root).await;
+    for _ in 0..2 {
+        session
+            .reg
+            .dispatch(
+                "shell_run",
+                json!({ "command": "sleep 30", "yield_time_ms": 20 }),
+                &session.cx,
+            )
+            .await;
+    }
+    await_shell_report(&events, "two commands are running", |report| {
+        running_ids(report).len() == 2
+    })
+    .await;
+    let before = shell_reports(&events).len();
+
+    bro_tools::shell::shutdown_shell_sessions(&session.cx).await;
+    await_shell_report(&events, "shutdown finished", |report| {
+        report["sessions"] == json!([])
+    })
+    .await;
+
+    // Every report between the shutdown and the final empty one still showed
+    // the sessions being stopped as running: none of them claimed an empty
+    // set while a process was pending.
+    let reports = shell_reports(&events);
+    let (last, during) = reports[before..].split_last().unwrap();
+    assert_eq!(last["sessions"], json!([]));
+    for report in during {
+        assert!(!running_ids(report).is_empty(), "{report}");
+    }
+    assert!(session.cx.shell_sessions.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_command_consumed_before_the_publisher_wakes_adds_no_report() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let (session, events) = reporting_session(&root).await;
+    // Runs to completion inside its own call: started, exited and removed
+    // before the invocation returns.
+    for _ in 0..5 {
+        let result = session
+            .reg
+            .dispatch(
+                "shell_run",
+                json!({ "command": "true", "yield_time_ms": 0 }),
+                &session.cx,
+            )
+            .await
+            .into_content()
+            .0;
+        assert!(result.contains("\"running\":false"), "{result}");
+    }
+    // Give the publisher every chance to speak, then require the picture to
+    // have ended where it began: any reports in between came in pairs.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let reports = shell_reports(&events);
+    assert_eq!(reports.last().unwrap()["sessions"], json!([]));
+    assert!(
+        reports.len() <= 1 + 2 * 5,
+        "more reports than transitions: {reports:?}"
+    );
+    for pair in reports.windows(2) {
+        assert_ne!(
+            pair[0]["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|session| (session["id"].clone(), session["running"].clone()))
+                .collect::<Vec<_>>(),
+            pair[1]["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|session| (session["id"].clone(), session["running"].clone()))
+                .collect::<Vec<_>>(),
+            "two consecutive reports show the same picture"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_shell_command_started_inside_a_cell_is_reported_like_a_flat_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let (session, events) = reporting_session(&root).await;
+    let cell = session
+        .reg
+        .dispatch(
+            "exec",
+            json!({"source": r#"
+const started = await tools.shell_run({ command: "sleep 30", yield_time_ms: 20 });
+text(started.session_id);
+"#}),
+            &session.cx,
+        )
+        .await
+        .into_content()
+        .0;
+    let report = await_shell_report(&events, "the nested command is running", |report| {
+        running_ids(report).len() == 1
+    })
+    .await;
+    let id = running_ids(&report).remove(0);
+    assert!(cell.contains(&id), "{cell}");
+    session
+        .reg
+        .dispatch("shell_kill", json!({ "session_id": id }), &session.cx)
+        .await;
+    await_shell_report(&events, "the nested command stopped", |report| {
+        running_ids(report).is_empty()
+    })
+    .await;
+}

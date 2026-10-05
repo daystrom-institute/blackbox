@@ -78,6 +78,11 @@ Domain home for the dispatch plane. Boundary contract:
 - **Reports are change-driven, never periodic.** The worker publishes one
   when its process starts and when a shell session starts, ends or is
   removed, and at no other time. Do not add a timer-driven publisher.
+- **Order reports by sequence, never by arrival.** The worker stamps an
+  event with its sequence and then writes it, with no lock spanning both, so
+  two emitters in one worker can put lines on stdout out of sequence order.
+  A report that arrives after a newer one is stale and is ignored for that
+  reason; do not replace the sequence check with arrival order.
 - **The report sequence is the session's event sequence.** It only has to
   increase within one task: a task is one worker process, re-adoption after
   a daemon restart keeps that process and its counter, and a resumed session

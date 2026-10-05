@@ -129,14 +129,116 @@ impl Drop for InvocationGuard {
     }
 }
 
+/// Raised whenever the set of shell sessions, or whether one of them is
+/// running, may have changed: a session was admitted, a supervisor published
+/// a terminal state, a retained entry was removed, or the registry shut down.
+/// It carries no data and does no work, so raising it is safe wherever those
+/// transitions happen, with or without the registry lock held. One waiter
+/// reads the registry afterwards; several changes may coalesce into one wake.
+#[derive(Default)]
+pub struct ShellSessionChanges {
+    version: std::sync::atomic::AtomicU64,
+    notify: tokio::sync::Notify,
+}
+
+impl ShellSessionChanges {
+    fn raise(&self) {
+        self.version
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.notify.notify_one();
+    }
+
+    /// The change counter. Read it before taking a snapshot, then pass it to
+    /// [`changed`](Self::changed) to wait for anything newer.
+    pub fn version(&self) -> u64 {
+        self.version.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Wait until a change newer than `seen` was raised and return its
+    /// version. A change raised before the call is not lost.
+    pub async fn changed(&self, seen: u64) -> u64 {
+        loop {
+            let notified = self.notify.notified();
+            let version = self.version();
+            if version != seen {
+                return version;
+            }
+            notified.await;
+        }
+    }
+}
+
+/// One shell session as an outside observer may see it: no output, no stdin,
+/// no environment, and only the head of its command line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShellSessionSummary {
+    pub id: String,
+    pub command: String,
+    pub elapsed_ms: u64,
+    /// True until the supervisor has published the session's terminal state.
+    /// An exited session retained for unread output is not running.
+    pub running: bool,
+}
+
+/// Bounds of a [`ShellSessions::summaries`] snapshot.
+pub const MAX_SUMMARIZED_SHELL_SESSIONS: usize = MAX_LIVE_SESSIONS;
+pub const MAX_SUMMARIZED_COMMAND_CHARS: usize = 120;
+
 /// Entries include exited commands whose final output has not been consumed.
 #[derive(Default)]
 pub struct ShellSessions {
     map: HashMap<String, Arc<ShellSession>>,
     counter: u64,
+    changes: Arc<ShellSessionChanges>,
+    /// Sessions removed from the map by shutdown whose processes are still
+    /// being stopped. They stay visible to observers as running until their
+    /// terminal state is published, so shutdown never reads as an empty set
+    /// while cleanup is pending.
+    draining: Vec<(String, Arc<ShellSession>)>,
 }
 
 impl ShellSessions {
+    /// The change signal for this registry.
+    pub fn changes(&self) -> Arc<ShellSessionChanges> {
+        self.changes.clone()
+    }
+
+    /// A complete snapshot of the sessions an observer should know about,
+    /// sorted by id and bounded. Call it under the registry lock and do
+    /// nothing else there: no I/O, no emit.
+    pub fn summaries(&mut self) -> Vec<ShellSessionSummary> {
+        self.draining
+            .retain(|(_, session)| session.state.borrow().is_none());
+        let now = Instant::now();
+        let mut rows: Vec<ShellSessionSummary> = self
+            .map
+            .iter()
+            .map(|(id, session)| (id, session, session.state.borrow().is_none()))
+            .chain(
+                self.draining
+                    .iter()
+                    .map(|(id, session)| (id, session, true)),
+            )
+            .map(|(id, session, running)| ShellSessionSummary {
+                id: id.clone(),
+                command: session
+                    .command
+                    .chars()
+                    .take(MAX_SUMMARIZED_COMMAND_CHARS)
+                    .collect(),
+                elapsed_ms: now
+                    .saturating_duration_since(session.started)
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64,
+                running,
+            })
+            .collect();
+        // Ids are `sh-<counter>`: shorter first, then lexical, is numeric order.
+        rows.sort_by(|a, b| (a.id.len(), &a.id).cmp(&(b.id.len(), &b.id)));
+        rows.truncate(MAX_SUMMARIZED_SHELL_SESSIONS);
+        rows
+    }
+
     pub fn len(&self) -> usize {
         self.map.len()
     }
@@ -154,7 +256,8 @@ impl ShellSessions {
         for session in self.map.values() {
             let _ = session.controls.send(Control::Cancel);
         }
-        self.map.clear();
+        self.draining.extend(self.map.drain());
+        self.changes.raise();
         count
     }
 }
@@ -203,6 +306,7 @@ async fn supervise(
     readers: Vec<JoinHandle<()>>,
     kill_at: Option<Instant>,
     cleanup_on_exit: bool,
+    changes: Option<Arc<ShellSessionChanges>>,
 ) {
     let mut terminal = TerminalState::default();
     let mut grace_at = None;
@@ -329,6 +433,11 @@ async fn supervise(
     }
     owned.active = false;
     state.send_replace(Some(terminal));
+    // Natural exit, timeout, kill and cancel all end here, so observers learn
+    // of every terminal transition without anyone polling the session.
+    if let Some(changes) = changes {
+        changes.raise();
+    }
 }
 
 async fn terminal_state(session: &ShellSession) -> TerminalState {
@@ -493,7 +602,10 @@ fn session_result_inner(
     }
     let result = output_receipt(session, max_tokens, cx.output_budget, result, cleanup);
     if !running && result["output_pending"] == false {
-        cx.shell_sessions.lock().unwrap().map.remove(id);
+        let mut sessions = cx.shell_sessions.lock().unwrap();
+        if sessions.map.remove(id).is_some() {
+            sessions.changes.raise();
+        }
     }
     ToolResult::Json(result)
 }
@@ -635,7 +747,14 @@ fn output_receipt(
 /// The caller can persist these receipts when an interrupted turn had yielded
 /// commands whose originating invocation already returned.
 pub async fn shutdown_shell_sessions(cx: &ToolCx) -> Vec<Value> {
-    let sessions: Vec<_> = cx.shell_sessions.lock().unwrap().map.drain().collect();
+    let sessions: Vec<_> = {
+        let mut registry = cx.shell_sessions.lock().unwrap();
+        let sessions: Vec<_> = registry.map.drain().collect();
+        // Still visible to observers as running until each one is reaped.
+        registry.draining.extend(sessions.iter().cloned());
+        registry.changes.raise();
+        sessions
+    };
     for (_, session) in &sessions {
         let _ = session.controls.send(Control::Cancel);
     }
@@ -1067,8 +1186,15 @@ impl Tool for ShellRun {
             sessions.counter += 1;
             let id = format!("sh-{}", sessions.counter);
             sessions.map.insert(id.clone(), session.clone());
+            sessions.changes.raise();
             tokio::spawn(supervise(
-                owned, control_rx, state_tx, readers, kill_at, false,
+                owned,
+                control_rx,
+                state_tx,
+                readers,
+                kill_at,
+                false,
+                Some(sessions.changes.clone()),
             ));
             (id, session)
         };
@@ -1372,6 +1498,37 @@ impl Tool for ShellList {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn a_change_raised_before_the_wait_is_not_lost_and_bursts_coalesce() {
+        let changes = ShellSessionChanges::default();
+        let seen = changes.version();
+        // Raised before anyone waits: the next wait returns at once.
+        changes.raise();
+        changes.raise();
+        changes.raise();
+        let seen = tokio::time::timeout(Duration::from_secs(5), changes.changed(seen))
+            .await
+            .expect("an earlier change must wake the waiter");
+        assert_eq!(seen, changes.version());
+        // Nothing newer: the wait parks until the next change.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), changes.changed(seen))
+                .await
+                .is_err()
+        );
+        changes.raise();
+        tokio::time::timeout(Duration::from_secs(5), changes.changed(seen))
+            .await
+            .expect("a later change must wake the waiter");
+    }
+
+    #[test]
+    fn summaries_are_empty_for_a_new_registry_and_bounded_by_the_session_cap() {
+        let mut registry = ShellSessions::default();
+        assert!(registry.summaries().is_empty());
+        assert_eq!(MAX_SUMMARIZED_SHELL_SESSIONS, MAX_LIVE_SESSIONS);
+    }
+
     fn cx() -> ToolCx {
         ToolCx {
             tool_observations: Default::default(),
@@ -1455,7 +1612,7 @@ mod tests {
         let (sender, receipt) = watch::channel(None);
         // Both child.wait and the empty reader drain are already ready when
         // supervision starts. The accepted cancellation must still be applied.
-        supervise(owned, receiver, sender, Vec::new(), None, false).await;
+        supervise(owned, receiver, sender, Vec::new(), None, false, None).await;
         let terminal = receipt.borrow().clone().unwrap();
         assert_eq!(terminal.exit_code, Some(0));
         assert!(terminal.cancelled);

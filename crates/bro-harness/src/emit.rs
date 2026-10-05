@@ -213,6 +213,29 @@ impl Emitter {
         }));
     }
 
+    /// `harness_shell_sessions`: the worker's retained shell sessions, as a
+    /// complete snapshot. Telemetry for the supervising daemon, which judges a
+    /// report by its `seq`. Carries ids, command heads, ages and running
+    /// flags only: never output, stdin or environment.
+    pub fn shell_sessions(&self, sessions: &[bro_tools::ShellSessionSummary]) {
+        let sessions: Vec<Value> = sessions
+            .iter()
+            .map(|session| {
+                json!({
+                    "id": session.id,
+                    "command": session.command,
+                    "elapsed_ms": session.elapsed_ms,
+                    "running": session.running,
+                })
+            })
+            .collect();
+        self.write_line(json!({
+            "type": "harness_shell_sessions",
+            "session_id": self.session_id,
+            "sessions": sessions,
+        }));
+    }
+
     /// `system/init` for bidirectional mode, advertising the in-stream slash
     /// commands the harness accepts (currently `/compact`) so a driver knows the
     /// control surface (NDJSON_FORMAT.md §system/init `slash_commands`).

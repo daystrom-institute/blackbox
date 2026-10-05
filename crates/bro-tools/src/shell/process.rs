@@ -154,6 +154,7 @@ pub(crate) async fn run_supervised_command(
         readers,
         Some(kill_at),
         true,
+        None,
     ));
     let mut cancellation_sent = false;
     let terminal = loop {

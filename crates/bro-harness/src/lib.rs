@@ -33,5 +33,6 @@ pub mod project_doc;
 pub mod registry;
 pub mod report;
 pub mod session;
+pub mod shell_reports;
 pub mod transport;
 pub mod worker_local_env;

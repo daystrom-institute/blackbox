@@ -862,6 +862,9 @@ struct Session {
     code_mode_session: Option<crate::code_mode::CodeModeToolSession>,
     remote_outcome_sources: Vec<Arc<dyn Tool>>,
     retain_background_work: bool,
+    /// Publishes the shell registry's state to the event plane. Held for its
+    /// lifetime only: dropping the session stops it.
+    _shell_reports: crate::shell_reports::ShellReports,
     cx: ToolCx,
     reference_context_item: Option<crate::context::TurnContextItem>,
     hooks: HookEngine,
@@ -1659,6 +1662,7 @@ impl Session {
             edit_discipline,
             code_mode_session,
             remote_outcome_sources,
+            _shell_reports: crate::shell_reports::ShellReports::inert(),
             retain_background_work: cli.input_format.as_deref() == Some("stream-json")
                 && !cli.exit_when_idle,
             cx,
@@ -1726,6 +1730,14 @@ impl Session {
             session.persist().await?;
             transition?;
         }
+        // The first shell-session report goes out once the build can no
+        // longer fail, and before any tool can run: an empty set for this
+        // process, whatever an earlier process of the session last reported.
+        // A build that fails must leave no event behind.
+        session._shell_reports = crate::shell_reports::ShellReports::start(
+            &session.cx.shell_sessions,
+            session.emitter.clone(),
+        );
         Ok(session)
     }
 
@@ -4555,6 +4567,7 @@ mod tests {
             code_mode_session: None,
             remote_outcome_sources: Vec::new(),
             retain_background_work: true,
+            _shell_reports: crate::shell_reports::ShellReports::inert(),
             output_schema: None,
             reg: Registry::new(
                 vec![

@@ -30,6 +30,17 @@ the daemon boundary contract is `design/bro-harness/harness-process-boundary.md`
   then delivers them afresh; compaction invalidates delivery. Never infer
   authority from strings in arbitrary file contents or historical tool results.
   Shell remains an explicit escape hatch outside structured path discovery.
+- **Shell-session reports are telemetry on the same event plane.**
+  `harness_shell_sessions` is a complete snapshot of the shell registry (ids,
+  command heads cut to 120 characters, ages, running flags; never output,
+  stdin or environment). One publisher task (`shell_reports.rs`) sends one
+  when a session build has succeeded and then only when the registry's change
+  signal fires: a session admitted, a terminal state published, an entry
+  removed, shutdown. No timer; a snapshot that shows the same picture as the
+  last one sent is not sent. The registry lock is held only to copy the
+  snapshot out and the emitter is never called under it. Sessions being
+  stopped by shutdown stay listed as running until they are reaped. A build
+  that fails emits no report, so it leaves no event log behind.
 - **Edit discipline is session state, enforced by removal plus an explained
   refusal.** `--edit-discipline structured` drops `file_edit`, `file_write`
   and `apply_patch` from the builtin set before the registry, the deferred
