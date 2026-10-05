@@ -439,6 +439,23 @@ pub struct ReadyPointerViewV1 {
     pub repo_head: String,
 }
 
+/// A repository whose ready pointer the validating loader refused. The
+/// listing reports it beside the readable pointers instead of failing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MalformedReadyPointerV1 {
+    pub repo_history_id: RepoHistoryId,
+    pub error: String,
+}
+
+/// Every repository's ready pointer: the ones that read, and the ones that
+/// did not.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ReadyPointerListingV1 {
+    pub pointers: Vec<ReadyPointerViewV1>,
+    pub malformed: Vec<MalformedReadyPointerV1>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct GenerationIndexV1 {
@@ -1516,11 +1533,13 @@ impl GitSourceStore {
     }
 
     /// Every repository's ready pointer as a listing view, each read through
-    /// the validating loader. Retirement and activation also revalidate the
-    /// pointer against its generation under the mutation lock; this read
-    /// does not.
-    pub fn current_ready_pointers(&self) -> Result<Vec<ReadyPointerViewV1>> {
-        let mut pointers = Vec::new();
+    /// the validating loader. A pointer the loader refuses is reported under
+    /// `malformed` with its repository and the reason, and the listing goes
+    /// on to the other repositories. Retirement and activation also
+    /// revalidate a pointer against its generation under the mutation lock;
+    /// this read does not.
+    pub fn current_ready_pointers(&self) -> Result<ReadyPointerListingV1> {
+        let mut listing = ReadyPointerListingV1::default();
         for repo_dir in read_directories(&self.root.join("repos"))? {
             let Some(repo_history_id) = repo_dir
                 .file_name()
@@ -1533,17 +1552,27 @@ impl GitSourceStore {
             if NofollowDirectory::open_existing(&history_dir)?.is_none() {
                 continue;
             }
-            if let Some(pointer) = load_history_ready_pointer(&history_dir)? {
-                pointers.push(ReadyPointerViewV1 {
+            match load_history_ready_pointer(&history_dir) {
+                Ok(Some(pointer)) => listing.pointers.push(ReadyPointerViewV1 {
                     repo_history_id,
                     source_generation_id: pointer.source_generation_id,
                     producer_id: pointer.producer_id,
                     repo_head: pointer.repo_head,
-                });
+                }),
+                Ok(None) => {}
+                Err(error) => listing.malformed.push(MalformedReadyPointerV1 {
+                    repo_history_id,
+                    error: format!("ready pointer is malformed or unreadable: {error:#}"),
+                }),
             }
         }
-        pointers.sort_by(|left, right| left.repo_history_id.cmp(&right.repo_history_id));
-        Ok(pointers)
+        listing
+            .pointers
+            .sort_by(|left, right| left.repo_history_id.cmp(&right.repo_history_id));
+        listing
+            .malformed
+            .sort_by(|left, right| left.repo_history_id.cmp(&right.repo_history_id));
+        Ok(listing)
     }
 
     /// Retire one repository's ready pointer under the same lock and
@@ -1560,7 +1589,13 @@ impl GitSourceStore {
     ) -> Result<Option<String>> {
         let _guard = self.lock_mutation()?;
         let history_dir = self.repo_history_root(repo_history_id)?;
-        let Some(pointer) = load_history_ready_pointer(&history_dir)? else {
+        let Some(pointer) = load_history_ready_pointer(&history_dir).with_context(|| {
+            format!(
+                "ready pointer of repository {} is malformed or unreadable",
+                repo_history_id.as_str()
+            )
+        })?
+        else {
             return Ok(None);
         };
         let source = self.load_generation(repo_history_id, &pointer.source_generation_id)?;
@@ -3401,7 +3436,7 @@ mod tests {
         let namespace = CommitNamespace::parse("repo-a").unwrap();
         let (_, generation) = ingest_fixture(&store, &history, &namespace, fixture_for('1', '2'));
 
-        let pointers = store.current_ready_pointers().unwrap();
+        let pointers = store.current_ready_pointers().unwrap().pointers;
         assert_eq!(pointers.len(), 1);
         assert_eq!(pointers[0].repo_history_id, history);
         assert_eq!(pointers[0].source_generation_id, generation);
@@ -3409,7 +3444,7 @@ mod tests {
 
         let retired = store.retire_current_ready_pointer(&history).unwrap();
         assert_eq!(retired.as_deref(), Some(generation.as_str()));
-        assert!(store.current_ready_pointers().unwrap().is_empty());
+        assert!(store.current_ready_pointers().unwrap().pointers.is_empty());
         assert!(store.current_ready_source_ids().unwrap().is_empty());
         assert_eq!(
             store
@@ -3831,7 +3866,7 @@ mod tests {
 
         let retired = store.retire_current_ready_pointer(&history).unwrap();
         assert_eq!(retired.as_deref(), Some(generation_a.as_str()));
-        assert!(store.current_ready_pointers().unwrap().is_empty());
+        assert!(store.current_ready_pointers().unwrap().pointers.is_empty());
         assert_eq!(acceptance_counter(&store, &history), Some(2));
 
         // A replay of the completed upload stays a no-op: no pointer, and
@@ -3839,7 +3874,7 @@ mod tests {
         store
             .finalize_history_upload("producer-a", &completed_a)
             .unwrap();
-        assert!(store.current_ready_pointers().unwrap().is_empty());
+        assert!(store.current_ready_pointers().unwrap().pointers.is_empty());
         assert_eq!(
             stored_source(&store, &history, &generation_a).state,
             GitHistorySourceStateV1::Superseded
@@ -3973,21 +4008,45 @@ mod tests {
     }
 
     /// The listing and the retirement read the pointer through the same
-    /// validating loader as acceptance: a malformed pointer is refused by
-    /// both and is never removed.
+    /// validating loader as acceptance. A malformed pointer is never removed:
+    /// retirement refuses it naming the repository, and the listing reports
+    /// it as malformed while still listing every other repository.
     #[test]
-    fn a_malformed_pointer_is_refused_by_listing_and_retirement() {
+    fn a_malformed_pointer_is_named_and_does_not_hide_other_repositories() {
         let temp = tempfile::tempdir().unwrap();
         let store = history_store(&temp.path().canonicalize().unwrap().join("git-sources"));
         let (history, namespace) = history_ids();
         ingest_fixture(&store, &history, &namespace, fixture_for('1', '2'));
+        let other = RepoHistoryId::parse("rh_00000000000000000000000000000002").unwrap();
+        let (_, other_generation) =
+            ingest_fixture(&store, &other, &namespace, fixture_for('1', '3'));
         let mut pointer = serde_json::to_value(ready_pointer(&store, &history)).unwrap();
         pointer["accepted_sequence"] = serde_json::json!(0);
         let raw = serde_json::to_string(&pointer).unwrap();
         write_ready_pointer(&store, &history, &raw);
 
-        assert!(store.current_ready_pointers().is_err());
-        assert!(store.retire_current_ready_pointer(&history).is_err());
+        let listing = store.current_ready_pointers().unwrap();
+        assert_eq!(listing.pointers.len(), 1);
+        assert_eq!(listing.pointers[0].repo_history_id, other);
+        assert_eq!(listing.pointers[0].source_generation_id, other_generation);
+        assert_eq!(listing.malformed.len(), 1);
+        assert_eq!(listing.malformed[0].repo_history_id, history);
+        assert!(
+            listing.malformed[0]
+                .error
+                .contains("ready pointer is malformed"),
+            "{}",
+            listing.malformed[0].error
+        );
+
+        let refused = store.retire_current_ready_pointer(&history).unwrap_err();
+        let message = format!("{refused:#}");
+        assert!(message.contains(history.as_str()), "{message}");
+        assert!(message.contains("ready pointer"), "{message}");
+        assert_eq!(
+            request_error(&refused),
+            Some(StoreRequestError::InvalidState)
+        );
         let on_disk = fs::read_to_string(
             store
                 .repo_history_root(&history)
@@ -3996,6 +4055,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(on_disk, raw);
+        // The readable repository's pointer still retires.
+        assert_eq!(
+            store
+                .retire_current_ready_pointer(&other)
+                .unwrap()
+                .as_deref(),
+            Some(other_generation.as_str())
+        );
     }
 
     #[test]

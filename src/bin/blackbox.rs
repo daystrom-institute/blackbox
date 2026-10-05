@@ -1396,8 +1396,17 @@ fn serialize_result(value: &impl Serialize) -> Result<serde_json::Value, Command
 #[derive(Serialize)]
 struct GitHistoryActivationsListResult {
     ready_pointers: Vec<GitHistoryReadyPointerRow>,
+    /// Repositories whose ready pointer could not be read; listed so one
+    /// bad pointer does not hide every other repository's rows.
+    malformed_ready_pointers: Vec<GitHistoryMalformedReadyPointerRow>,
     journals: Vec<GitHistoryActivationJournalRow>,
     deadletters: Vec<GitHistoryDeadletterRow>,
+}
+
+#[derive(Serialize)]
+struct GitHistoryMalformedReadyPointerRow {
+    repo_history_id: String,
+    error: String,
 }
 
 #[derive(Serialize)]
@@ -1485,10 +1494,20 @@ fn execute_git_history_activations_list(
 ) -> Result<serde_json::Value, CommandFailure> {
     let store = open_git_history_store(args.config, args.store)?;
     let now = unix_now_secs();
+    let ready = store
+        .current_ready_pointers()
+        .map_err(git_history_cli_store_failure)?;
     let result = GitHistoryActivationsListResult {
-        ready_pointers: store
-            .current_ready_pointers()
-            .map_err(git_history_cli_store_failure)?
+        malformed_ready_pointers: ready
+            .malformed
+            .into_iter()
+            .map(|malformed| GitHistoryMalformedReadyPointerRow {
+                repo_history_id: malformed.repo_history_id.as_str().to_string(),
+                error: malformed.error,
+            })
+            .collect(),
+        ready_pointers: ready
+            .pointers
             .into_iter()
             .map(|pointer| GitHistoryReadyPointerRow {
                 repo_history_id: pointer.repo_history_id.as_str().to_string(),
@@ -2267,6 +2286,84 @@ mod tests {
             .finalize_history_upload("producer-a", &begin.upload_id)
             .unwrap()
             .source_generation_id
+    }
+
+    /// One malformed ready pointer is reported for its repository and does
+    /// not hide the other repositories' pointers or dead letters.
+    #[test]
+    fn git_history_activations_list_reports_a_malformed_pointer_and_keeps_listing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap().join("git-sources");
+        let store = bbox_git_source_store::GitSourceStore::open(
+            &root,
+            bbox_git_source_store::StoreLimits::default(),
+        )
+        .unwrap();
+        let namespace =
+            bbox_corpus_core::project_catalog::CommitNamespace::parse("repo-cli").unwrap();
+        let broken = parse_repo_history_id("rh_00000000000000000000000000000061").unwrap();
+        let healthy = parse_repo_history_id("rh_00000000000000000000000000000062").unwrap();
+        install_cli_history_source(&store, &broken, &namespace, &"1".repeat(40));
+        let generation = install_cli_history_source(&store, &healthy, &namespace, &"2".repeat(40));
+        store
+            .record_activation_deadletter(
+                &healthy,
+                "producer-a",
+                &generation,
+                "repo_history_not_found",
+                None,
+            )
+            .unwrap();
+        drop(store);
+        let pointer_path = root
+            .join("repos")
+            .join(broken.as_str())
+            .join("history")
+            .join("current-ready.json");
+        let mut pointer: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&pointer_path).unwrap()).unwrap();
+        pointer["accepted_sequence"] = serde_json::json!(0);
+        std::fs::write(&pointer_path, serde_json::to_vec(&pointer).unwrap()).unwrap();
+
+        let listed = execute_git_history_activations_list(ActivationsListArgs {
+            config: None,
+            store: Some(root.clone()),
+        })
+        .unwrap();
+        let ready = listed["ready_pointers"].as_array().unwrap();
+        assert_eq!(ready.len(), 1, "{listed}");
+        assert_eq!(ready[0]["repo_history_id"], healthy.as_str());
+        let malformed = listed["malformed_ready_pointers"].as_array().unwrap();
+        assert_eq!(malformed.len(), 1, "{listed}");
+        assert_eq!(malformed[0]["repo_history_id"], broken.as_str());
+        assert!(
+            malformed[0]["error"]
+                .as_str()
+                .unwrap()
+                .contains("ready pointer is malformed"),
+            "{listed}"
+        );
+        assert_eq!(listed["deadletters"].as_array().unwrap().len(), 1);
+
+        // Retiring the broken pointer refuses, naming the repository.
+        let refused = execute_git_history_activations_drop(ActivationsDropArgs {
+            config: None,
+            store: Some(root),
+            repo_history: broken.as_str().to_string(),
+            retire_ready_pointer: true,
+        })
+        .unwrap_err();
+        assert!(
+            refused.message.contains(broken.as_str()),
+            "{}",
+            refused.message
+        );
+        assert!(
+            refused.message.contains("ready pointer"),
+            "{}",
+            refused.message
+        );
+        assert!(pointer_path.exists());
     }
 
     #[test]

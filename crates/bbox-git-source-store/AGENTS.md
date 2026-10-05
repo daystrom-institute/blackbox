@@ -30,9 +30,12 @@
   interrupted upload resumed with a checkpoint older than the retired
   pointer's. Retirement does not touch the counter, so sequences stay
   unique. Every read of `current-ready.json`, including the pointer listing
-  and retirement, goes through the one validating loader; a malformed
-  pointer is refused, never listed and never removed. No tool clears one:
-  that is a manual edit of the store with the daemon stopped.
+  and retirement, goes through the one validating loader. A malformed
+  pointer is never treated as current and never removed: acceptance and
+  retirement refuse it, retirement naming the repository, and the listing
+  reports it as malformed for its repository while still listing the
+  others. No tool clears one: that is a manual edit of the store with the
+  daemon stopped.
 - Upload records and history pointers without acceptance fields are legacy
   state, never reinterpreted: a legacy pointer is a baseline below every new
   acceptance and a completed legacy upload never gains one. Allocation
