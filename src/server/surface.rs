@@ -395,7 +395,7 @@ mod tests {
     }
 
     #[test]
-    fn a_surface_decides_the_visible_set_and_the_catalog_lookup_does_not() {
+    fn a_surface_decides_the_visible_set_and_the_session_catalog_lookup() {
         let tmp = tempfile::TempDir::new().unwrap();
         let srv = BlackboxServer::new(Arc::new(SharedState::for_test(tmp.path())));
         let readonly = srv.surface_tools_for("readonly").unwrap();
@@ -406,10 +406,10 @@ mod tests {
         // A surface missing from the table has no visible set at all.
         assert!(srv.surface_tools_for("missing").is_none());
 
-        // The catalog lookup serves the SDK's schema reads and is the same
-        // for every caller; visibility is applied where requests arrive.
+        // A session's catalog lookup is bound to its surface.
         assert!(srv.surface.set(Arc::from("readonly")).is_ok());
-        assert!(srv.get_tool("bbox_learn").is_some());
+        assert!(srv.get_tool("bbox_hybrid_search").is_some());
+        assert!(srv.get_tool("bbox_learn").is_none());
         assert!(srv.get_tool("bbox_roadmap").is_none());
     }
 

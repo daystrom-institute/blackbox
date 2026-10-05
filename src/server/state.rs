@@ -124,6 +124,11 @@ pub(crate) struct SharedState {
     /// Injected project-record authority handed to every runtime consumer that
     /// only enumerates records (index writer, index selectors, providers).
     pub(crate) records_provider: Arc<dyn bbox_corpus_core::project_record::ProjectRecordsProvider>,
+    /// Whether the wire head serves the sessionless MCP lifecycle
+    /// (`daemon.mcp_modern_lifecycle`), fixed when the daemon opens. The SDK
+    /// keeps per-process answers derived from it, so it never follows a
+    /// later configuration change.
+    pub(crate) mcp_modern_lifecycle: std::sync::atomic::AtomicBool,
     /// Resolved `?project=` selectors reused across sessionless MCP requests.
     pub(crate) project_selector_cache: super::handler::ProjectSelectorCache,
     /// Host-local discovery index of checkouts that carry repo-owned state.
@@ -636,6 +641,7 @@ impl SharedState {
             // accepted-publication runtime.
             accepted_publications: None,
             records_provider,
+            mcp_modern_lifecycle: Default::default(),
             project_selector_cache: Default::default(),
             checkout_registry,
             checkout_access_observations,

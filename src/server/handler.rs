@@ -86,6 +86,11 @@ const PROJECT_SELECTOR_CACHE_ENTRIES: usize = 256;
 /// authority epoch it was resolved under is current and it is younger than
 /// [`PROJECT_SELECTOR_TTL`]. Workspace bindings are never cached: they are
 /// authenticated on every request.
+///
+/// The resolved project of a sessionless request is read by the dispatch
+/// admission fingerprint and by nothing that filters or targets a write. A
+/// reader that does either makes a stale entry matter more than it does
+/// here, and this cache must be reconsidered with it.
 #[derive(Default)]
 pub(crate) struct ProjectSelectorCache {
     entries: parking_lot::Mutex<std::collections::HashMap<String, CachedProjectSelector>>,
@@ -321,7 +326,9 @@ impl BlackboxServer {
     }
 
     fn modern_lifecycle_enabled(&self) -> bool {
-        self.state.config.read().daemon.mcp_modern_lifecycle
+        self.state
+            .mcp_modern_lifecycle
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Whether `initialize` bound this handler to a session scope.
@@ -459,12 +466,20 @@ impl ServerHandler for BlackboxServer {
         Ok(self.get_info())
     }
 
-    /// The served definition of one tool, whatever the caller's surface. The
-    /// SDK calls this without a request, on a handler it built for the
-    /// purpose, to read an input schema for header validation, and caches the
-    /// answer for the process. It is a catalog lookup, never an authorization
-    /// point: `list_tools` and `call_tool` apply the request's surface.
+    /// The served definition of one tool. The SDK calls this without a
+    /// request, on a handler it built for the purpose, to read an input
+    /// schema for header validation, and caches the answer for the process.
+    /// It reaches here for any request whose own version header names a
+    /// sessionless revision, before it refuses a revision this server does
+    /// not support. With the modern lifecycle off the lookup therefore stays
+    /// bound to this handler's surface, as it always was. With it on, a
+    /// sessionless request has no handler-bound surface and the lookup is the
+    /// whole catalog: `list_tools` and `call_tool` apply the request's
+    /// surface, and this answer is never an authorization point.
     fn get_tool(&self, name: &str) -> Option<rmcp::model::Tool> {
+        if !self.modern_lifecycle_enabled() && !self.session_tools().contains(name) {
+            return None;
+        }
         self.tool_router.get(name).cloned()
     }
 
@@ -831,12 +846,30 @@ mod tests {
     }
 
     #[test]
+    fn the_catalog_lookup_is_bound_to_the_handler_surface_unless_modern() {
+        let (_dir, server) = test_server();
+        // An unpinned handler resolves `default`, which hides operator tools.
+        assert!(server.get_tool("bbox_thread_list").is_some());
+        assert!(server.get_tool("bbox_doctor").is_none());
+        assert!(server.get_tool("no_such_tool").is_none());
+        server
+            .state
+            .mcp_modern_lifecycle
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(server.get_tool("bbox_doctor").is_some());
+        assert!(server.get_tool("no_such_tool").is_none());
+    }
+
+    #[test]
     fn modern_revisions_are_supported_only_when_enabled() {
         let (_dir, server) = test_server();
         let legacy = server.supported_protocol_versions();
         assert!(!legacy.contains(&ProtocolVersion::V_2026_07_28));
         assert!(!legacy.contains(&ProtocolVersion::LATEST_WITH_INITIALIZE));
-        server.state.config.write().daemon.mcp_modern_lifecycle = true;
+        server
+            .state
+            .mcp_modern_lifecycle
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         let modern = server.supported_protocol_versions();
         assert!(modern.contains(&ProtocolVersion::V_2026_07_28));
         assert!(

@@ -882,6 +882,7 @@ pub(super) fn open_shared_state(
         project_authority,
         accepted_publications,
         records_provider,
+        mcp_modern_lifecycle: cfg.daemon.mcp_modern_lifecycle.into(),
         project_selector_cache: Default::default(),
         checkout_registry,
         checkout_access_observations,

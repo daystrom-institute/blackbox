@@ -29,9 +29,20 @@
   supported no-handshake revision to a stateless path that never calls
   `initialize`; widening the supported set is this gate, never a side effect
   of an SDK bump.
-- `get_tool` has no request context, so it is a catalog lookup and never a
-  visibility decision. Visibility is decided where scope is known:
-  `list_tools` and `call_tool`.
+- The gate is read once when the daemon opens (`SharedState`); changing it
+  needs a daemon restart. The SDK keeps per-process answers derived from it
+  (the tool schema cache), so a live flip would half-apply.
+- `get_tool` has no request context and is never a visibility decision;
+  `list_tools` and `call_tool` decide visibility where scope is known. The
+  SDK calls it to read an input schema for parameter-header validation, for
+  any request whose own version header names a sessionless revision, before
+  it refuses an unsupported revision. Gate off, the lookup stays bound to
+  the handler's surface. Gate on, it is the whole catalog: a sessionless
+  caller on any surface can learn whether its parameter headers agree with
+  the schema of a tool it cannot list or call. That is accepted because
+  tool schemas are published with the source and no served schema carries a
+  header annotation; a schema that gains one for a restricted tool reopens
+  the question.
 - `scoped_for` reuses a resolved `?project=` selector from
   `ProjectSelectorCache`, keyed by the raw selector and valid for one
   project authority epoch and a short TTL, so a sessionless request does not

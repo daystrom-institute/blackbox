@@ -274,11 +274,23 @@ mod tests {
     async fn modern_request(
         uri: &str,
         method: &str,
+        params: serde_json::Value,
+        extra_headers: &[(&str, &str)],
+    ) -> (StatusCode, serde_json::Value) {
+        sessionless_request(true, uri, method, params, extra_headers).await
+    }
+
+    async fn sessionless_request(
+        modern_lifecycle: bool,
+        uri: &str,
+        method: &str,
         mut params: serde_json::Value,
         extra_headers: &[(&str, &str)],
     ) -> (StatusCode, serde_json::Value) {
         let (app, state) = test_app_with_state();
-        state.config.write().daemon.mcp_modern_lifecycle = true;
+        state
+            .mcp_modern_lifecycle
+            .store(modern_lifecycle, std::sync::atomic::Ordering::Relaxed);
         params["_meta"] = modern_meta();
         let body = serde_json::json!({
             "jsonrpc": "2.0", "id": 1, "method": method, "params": params,
@@ -322,6 +334,36 @@ mod tests {
             .iter()
             .map(|tool| tool["name"].as_str().unwrap())
             .collect()
+    }
+
+    /// With the modern lifecycle off, a sessionless request is refused as an
+    /// unsupported revision, and the refusal says nothing about the tool it
+    /// named: an operator tool, a visible tool and a tool that does not exist
+    /// answer alike, with or without parameter headers.
+    #[tokio::test]
+    async fn a_refused_sessionless_call_does_not_distinguish_tools() {
+        let call = |tool: &'static str, headers: Vec<(&'static str, &'static str)>| async move {
+            let mut headers = headers;
+            headers.push(("mcp-name", tool));
+            sessionless_request(
+                false,
+                "/mcp?surface=readonly",
+                "tools/call",
+                serde_json::json!({ "name": tool, "arguments": { "format": "summary" } }),
+                &headers,
+            )
+            .await
+        };
+        let (status, missing) = call("no_such_tool", vec![]).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{missing}");
+        assert_eq!(missing["error"]["code"], -32022, "{missing}");
+        for tool in ["bbox_doctor", "bbox_thread_list", "no_such_tool"] {
+            for headers in [vec![], vec![("mcp-param-format", "bogus")]] {
+                let (tool_status, reply) = call(tool, headers.clone()).await;
+                assert_eq!(tool_status, status, "{tool} {headers:?}: {reply}");
+                assert_eq!(reply, missing, "{tool} {headers:?}");
+            }
+        }
     }
 
     /// With the modern lifecycle on, discovery names the sessionless revision
@@ -438,7 +480,9 @@ mod tests {
     #[tokio::test]
     async fn the_handshake_answer_is_unchanged_when_the_modern_lifecycle_is_enabled() {
         let (app, state) = test_app_with_state();
-        state.config.write().daemon.mcp_modern_lifecycle = true;
+        state
+            .mcp_modern_lifecycle
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         for requested in ["2026-07-28", "2025-11-25", "2025-06-18"] {
             let response = app
                 .clone()
