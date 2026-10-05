@@ -440,13 +440,17 @@ pub(crate) enum ProjectPublisherStatusDetail {
     Connector,
     /// The latest candidate acceptance attempt.
     Acceptance,
+    /// Checkout mutations of a published project that are pending, applied
+    /// but not yet seen in publication, failed, conflicted, or blocked.
+    CheckoutMutations,
 }
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub(crate) struct ProjectPublisherStatusParams {
     pub project_id: String,
     /// Opt-in exact diagnostic detail. `health` always exists; `connector`
-    /// requires a connector-scoped project.
+    /// requires a connector-scoped project and `checkout_mutations` a
+    /// published one.
     #[serde(default)]
     pub detail: Option<ProjectPublisherStatusDetail>,
     /// Continuation from detail.body.next_cursor. A changed selector, catalog
@@ -2000,7 +2004,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_project_publisher_status",
-        description = "Read one catalog project's accepted-publication status: state, scope/ref/commit identity, typed source binding, advance availability, the generation_id and pointer_sha256 identities, and the latest candidate acceptance attempt. Default health and connector sections are compact bounded summaries that keep stale, unavailable, queued, and partial signals visible with total, status, and omission counts; recorded rows are observations, not live filesystem authority. Oversized summary strings become explicit size-and-truncation markers (diagnostics keep a bounded prefix) whose exact bytes live only in detail pages. detail=health returns the complete runtime view, detail=connector the complete connector view, and detail=acceptance the latest candidate acceptance attempt as exact bounded body pages; replay detail.body.next_cursor while the body is unchanged. Connector detail requires a connector-scoped project. Observational, path-free, and takes no checkout lease; see design/daemon-runtime/publisher-auto-advance.md for deep mechanics. Returns error.project_catalog_inactive while the version-1 registry is the runtime authority."
+        description = "Read one catalog project's accepted-publication status: state, scope/ref/commit identity, typed source binding, advance availability, the generation_id and pointer_sha256 identities, and the latest candidate acceptance attempt. Default health and connector sections are compact bounded summaries that keep stale, unavailable, queued, and partial signals visible with total, status, and omission counts; recorded rows are observations, not live filesystem authority. Oversized summary strings become explicit size-and-truncation markers (diagnostics keep a bounded prefix) whose exact bytes live only in detail pages. detail=health returns the complete runtime view, detail=connector the complete connector view, detail=acceptance the latest candidate acceptance attempt, and detail=checkout_mutations the project's queued checkout edits that are pending, applied but not yet published, failed, conflicted, or blocked (ids, paths, digests and state counts, never file content) as exact bounded body pages; replay detail.body.next_cursor while the body is unchanged. Connector detail requires a connector-scoped project and checkout_mutations detail a published one. Observational, path-free, and takes no checkout lease; see design/daemon-runtime/publisher-auto-advance.md for deep mechanics. Returns error.project_catalog_inactive while the version-1 registry is the runtime authority."
     )]
     pub(crate) async fn bbox_project_publisher_status(
         &self,
@@ -2104,6 +2108,26 @@ impl BlackboxServer {
                         p.detail_limit,
                     )?,
                 )),
+                Some(ProjectPublisherStatusDetail::CheckoutMutations) => {
+                    let Some(scope) = catalog_scope else {
+                        anyhow::bail!(
+                            "error.project_publisher_status_detail_unavailable: checkout_mutations detail requires a published project"
+                        );
+                    };
+                    let report = server.state.checkout_mutations.read().attention_report(scope);
+                    Some((
+                        "checkout_mutations",
+                        super::body_page::json_body_page(
+                            &format!(
+                                "publisher-status:{project_id}:{}:checkout_mutations",
+                                state.epoch()
+                            ),
+                            &report,
+                            p.detail_cursor.as_deref(),
+                            p.detail_limit,
+                        )?,
+                    ))
+                }
                 Some(ProjectPublisherStatusDetail::Connector) => {
                     let Some(source) = &connector_detail_source else {
                         anyhow::bail!(
@@ -6274,6 +6298,155 @@ mod tests {
         assert_eq!(body["health"]["binding"]["status"], "detached");
         assert_eq!(body["generation_id"], installed.generation_id);
         assert_eq!(body["pointer_sha256"], installed.pointer_sha256);
+    }
+
+    /// The checkout mutation detail lists every row of the project's scope
+    /// that still needs attention, with digests and never content, counts the
+    /// settled ones, and leaves other scopes out.
+    #[tokio::test]
+    async fn publisher_status_lists_checkout_mutations_that_need_attention() {
+        use crate::server::state::catalog_fixture::CatalogFixture;
+        use sha2::Digest as _;
+
+        let (fixture, scope, _installed) = publisher_health_fixture("p_mutations", 1);
+        let server = fixture.server();
+        let other_scope = CatalogFixture::scope("other");
+        let now = || "2026-08-12T00:00:00Z".to_string();
+        let gap = |name: &str| format!(".bbox/gaps/{name}.json");
+        let (pending, unobserved, settled, failed) = {
+            let mut queue = server.state.checkout_mutations.write();
+            let mut tracked = |name: &str, content: &str, base: Option<&str>| {
+                queue
+                    .enqueue_tracked_writes(
+                        scope.clone(),
+                        vec![(gap(name), content.to_string(), base.map(str::to_owned))],
+                        "status test".into(),
+                        now(),
+                    )
+                    .unwrap()
+                    .remove(0)
+            };
+            let pending = tracked("gap-000000a1", "{\"secret\":\"pending-body\"}", None);
+            let unobserved = tracked("gap-000000a2", "{\"v\":2}", Some("{\"v\":1}"));
+            let settled = tracked("gap-000000a3", "{\"v\":3}", None);
+            let failed = tracked("gap-000000a4", "{\"v\":4}", None);
+            queue
+                .enqueue_file_mutation(
+                    other_scope.clone(),
+                    gap("gap-000000b1"),
+                    "write",
+                    Some("{}".into()),
+                    "another project".into(),
+                    now(),
+                )
+                .unwrap();
+            for id in [&unobserved, &settled] {
+                assert!(queue.ack(id, "applied", None, None, &now()).unwrap());
+            }
+            assert!(
+                queue
+                    .ack(&failed, "failed", Some("disk full".into()), None, &now())
+                    .unwrap()
+            );
+            assert!(queue.observe_publication(&scope, &gap("gap-000000a3"), Some("{\"v\":3}")));
+            (pending, unobserved, settled, failed)
+        };
+
+        let text = page_publisher_status_detail(
+            &server,
+            "p_mutations",
+            ProjectPublisherStatusDetail::CheckoutMutations,
+        )
+        .await;
+        assert!(!text.contains("pending-body"), "rows never carry content");
+        let report: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            report["counts"],
+            json!({"applied_unobserved": 1, "failed": 1, "pending": 1, "settled": 1})
+        );
+        let rows = report["rows"].as_array().unwrap();
+        let states: Vec<(&str, &str)> = rows
+            .iter()
+            .map(|row| {
+                (
+                    row["mutation_id"].as_str().unwrap(),
+                    row["state"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            states,
+            vec![
+                (pending.as_str(), "pending"),
+                (unobserved.as_str(), "applied_unobserved"),
+                (failed.as_str(), "failed"),
+            ]
+        );
+        assert!(
+            rows.iter()
+                .all(|row| row["mutation_id"] != settled.as_str())
+        );
+        assert_eq!(rows[0]["relative_path"], gap("gap-000000a1"));
+        assert_eq!(rows[0]["attempts"], 0);
+        assert_eq!(
+            rows[1]["postimage_sha256"],
+            format!("{:x}", sha2::Sha256::digest(b"{\"v\":2}"))
+        );
+        assert_eq!(
+            rows[1]["publication_base"]["sha256"],
+            format!("{:x}", sha2::Sha256::digest(b"{\"v\":1}"))
+        );
+        assert_eq!(
+            rows[0]["publication_base"]["sha256"],
+            serde_json::Value::Null
+        );
+        assert_eq!(rows[2]["last_error"], "disk full");
+        assert_eq!(rows[2]["attempts"], 1);
+    }
+
+    /// A project with no published scope has no checkout mutation queue.
+    #[tokio::test]
+    async fn checkout_mutation_detail_requires_a_published_project() {
+        use crate::server::state::catalog_fixture::CatalogFixture;
+
+        use bbox_corpus_core::project_catalog::CorpusProject;
+
+        let fixture = CatalogFixture::new();
+        let project_id = ProjectId::parse("p_legacy_mutations").unwrap();
+        fixture
+            .store()
+            .transact(fixture.epoch(), |catalog, _attachments| {
+                catalog.projects.insert(
+                    project_id.clone(),
+                    CorpusProject {
+                        project_id: project_id.clone(),
+                        scope: ProjectScope::LegacyLocal,
+                        operator_aliases: Default::default(),
+                        nominated_aliases: Default::default(),
+                        display_name: "legacy local".into(),
+                        created_at: "2026-08-01T00:00:00Z".into(),
+                        registered_at_compat: None,
+                        repo_history: None,
+                        languages: Default::default(),
+                    },
+                );
+                Ok(())
+            })
+            .unwrap();
+        let result = fixture
+            .server()
+            .bbox_project_publisher_status(Parameters(ProjectPublisherStatusParams {
+                project_id: "p_legacy_mutations".into(),
+                detail: Some(ProjectPublisherStatusDetail::CheckoutMutations),
+                ..Default::default()
+            }))
+            .await;
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            error_text(&result).contains("error.project_publisher_status_detail_unavailable"),
+            "{}",
+            error_text(&result)
+        );
     }
 
     /// Exact health detail reconstructs the complete runtime view and a

@@ -394,6 +394,64 @@ impl CheckoutMutations {
         }
     }
 
+    /// The mutations of one scope that still need attention, oldest first,
+    /// with the count of every state. A row is listed while it is pending,
+    /// applied but not yet seen in publication, failed, conflicted, or
+    /// blocked behind a predecessor; settled rows are only counted. Rows carry
+    /// digests, never file content.
+    pub fn attention_report(&self, scope: &PublishedScope) -> serde_json::Value {
+        let digest = |content: &str| {
+            use sha2::Digest as _;
+            format!("{:x}", sha2::Sha256::digest(content.as_bytes()))
+        };
+        let mut counts = std::collections::BTreeMap::<&'static str, u64>::new();
+        let mut rows = Vec::new();
+        for row in self
+            .store
+            .mutations
+            .iter()
+            .filter(|row| &row.mutation.scope == scope)
+        {
+            let state = match row.status {
+                CheckoutMutationStatus::Pending => "pending",
+                CheckoutMutationStatus::Applied => match &row.publication {
+                    _ if row.reconciled.is_some() => "superseded",
+                    Some(publication) if !publication.observed => "applied_unobserved",
+                    _ => "settled",
+                },
+                CheckoutMutationStatus::Failed if row.conflict.is_some() => "conflicted",
+                CheckoutMutationStatus::Failed if row.blocked_by.is_some() => "blocked",
+                CheckoutMutationStatus::Failed => "failed",
+            };
+            *counts.entry(state).or_default() += 1;
+            if matches!(state, "settled" | "superseded") {
+                continue;
+            }
+            rows.push(serde_json::json!({
+                "mutation_id": row.mutation.mutation_id,
+                "relative_path": row.mutation.relative_path,
+                "mode": row.mutation.mode,
+                "state": state,
+                "guarded": row.mutation.guard.is_some(),
+                "attempts": row.attempts,
+                "last_error": row.last_error,
+                "enqueued_at": row.mutation.enqueued_at,
+                "acked_at": row.acked_at,
+                "postimage_sha256": row.mutation.target_sha256(),
+                "ack_content_sha256": row.ack_content_sha256,
+                "publication_base": row.publication.as_ref().map(|publication| serde_json::json!({
+                    "sha256": publication.base_content_json.as_deref().map(digest),
+                })),
+                "conflict": row.conflict.as_ref().map(|conflict| serde_json::json!({
+                    "observed_sha256": conflict.observed_sha256,
+                })),
+                "blocked_by": row.blocked_by,
+                "owner_unsupported_at": row.owner_unsupported_at,
+            }));
+        }
+        serde_json::json!({ "counts": counts, "rows": rows })
+    }
+
     /// The scope a mutation targets, regardless of status. Ack handlers
     /// check it against the producer grant before accepting the outcome.
     pub fn scope_of(&self, mutation_id: &str) -> Option<PublishedScope> {
@@ -659,8 +717,9 @@ impl CheckoutMutations {
         {
             anyhow::bail!(
                 "error.checkout_mutation_conflict: published content changed while mutation {} \
-                 is awaiting publication; reconcile that mutation in the owning checkout and \
-                 publish it before retrying",
+                 is awaiting publication; inspect it with \
+                 bbox_project_publisher_status(detail=checkout_mutations), reconcile it in the \
+                 owning checkout and publish it before retrying",
                 latest.mutation.mutation_id
             );
         }

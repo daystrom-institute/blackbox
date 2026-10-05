@@ -191,6 +191,14 @@ acknowledgement of an already settled edit answers `already_settled` only
 after the settlement is durable in the daemon's queue, so a settlement that
 failed to persist is retried by the repeat rather than reported as done.
 
+`bbox_project_publisher_status(project_id, detail="checkout_mutations")` lists
+a published project's queued edits that still need attention: pending,
+applied but not yet seen in publication, failed, conflicted, or blocked behind
+a predecessor. Each row carries the edit's id, path, mode, state, attempts,
+last error, enqueue and acknowledgement times, and the digests of its content,
+its acknowledged content and its publication base; file content is never
+returned. Settled edits are counted, not listed.
+
 The configured root must be the main Git worktree for its clone. The committed
 scope at the observed `HEAD` must match the configured scope. Symlinks,
 submodules, special files, `.bbox`, build output, and unsupported or oversized
