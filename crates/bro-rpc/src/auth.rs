@@ -137,7 +137,7 @@ fn ensure_private_directory(path: &Path) -> Result<(), ServiceTokenError> {
 /// otherwise plant a hardlink pointing at a file they control and swap its
 /// content underneath an already-open descriptor).
 #[allow(clippy::disallowed_methods)]
-fn validate_private_file(path: &Path) -> Result<(), ServiceTokenError> {
+pub fn validate_private_file(path: &Path) -> Result<(), ServiceTokenError> {
     let metadata = std::fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err(ServiceTokenError::UnsafeFile);

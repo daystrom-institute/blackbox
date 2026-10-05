@@ -489,6 +489,8 @@ mod smoke {
         };
         assert!(error.contains("TLS handshake with fleetd"), "{error}");
         assert!(error.contains(&other), "{error}");
+        // The presented certificate's digest is in the same line.
+        assert!(error.contains(&fingerprint), "{error}");
 
         // A plaintext dial of the TLS listener never completes the protocol
         // handshake.
@@ -496,6 +498,39 @@ mod smoke {
             .spawn(spec_for(&stub, "tls-plain", "tls-plain-task", &log, &root))
             .await;
         assert!(plaintext.is_err(), "plaintext against a TLS listener must fail");
+    }
+
+    /// A key that is readable by others stops fleetd at startup when it is
+    /// asked to serve with it; the process never listens.
+    #[tokio::test]
+    async fn fleetd_refuses_to_start_with_a_readable_private_key() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = tmp.path().join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let init = std::process::Command::new(fleetd_binary())
+            .args(["identity", "init", "--state-dir"])
+            .arg(&state)
+            .output()
+            .expect("run fleetd identity init");
+        assert!(init.status.success(), "{}", String::from_utf8_lossy(&init.stderr));
+        std::fs::set_permissions(state.join("fleetd-tls.key"), std::fs::Permissions::from_mode(0o644)).unwrap();
+        let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = reservation.local_addr().unwrap();
+        drop(reservation);
+        let output = std::process::Command::new(fleetd_binary())
+            .arg("--state-dir")
+            .arg(&state)
+            .arg("--listen-tcp")
+            .arg(address.to_string())
+            .arg("--tls-identity-dir")
+            .arg(&state)
+            .output()
+            .expect("run fleetd");
+        assert!(!output.status.success(), "fleetd must not start with a readable key");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("refusing the fleetd private key"), "{stderr}");
+        assert!(!state.join("fleetd.sock").exists(), "nothing listened");
     }
 
     #[tokio::test]

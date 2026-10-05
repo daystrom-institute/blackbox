@@ -163,6 +163,14 @@ impl PinnedFingerprint {
         digest.as_slice() == self.0
     }
 
+    fn digest_hex(certificate: &[u8]) -> String {
+        use sha2::Digest as _;
+        sha2::Sha256::digest(certificate)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
     pub fn to_hex(&self) -> String {
         self.0.iter().map(|byte| format!("{byte:02x}")).collect()
     }
@@ -196,9 +204,13 @@ impl rustls::client::danger::ServerCertVerifier for PinnedServerVerifier {
         if self.fingerprint.matches(end_entity.as_ref()) {
             Ok(rustls::client::danger::ServerCertVerified::assertion())
         } else {
-            Err(rustls::Error::InvalidCertificate(
-                rustls::CertificateError::ApplicationVerificationFailure,
-            ))
+            // Both digests in one line: a wrong value pinned and a
+            // regenerated fleetd identity look the same otherwise.
+            Err(rustls::Error::General(format!(
+                "fleetd presented a certificate with SHA-256 {}, pinned {}",
+                PinnedFingerprint::digest_hex(end_entity.as_ref()),
+                self.fingerprint.to_hex()
+            )))
         }
     }
 
@@ -339,7 +351,7 @@ impl FleetdConfig {
             }
             return Ok(Self::in_state_dir(state_dir));
         };
-        let (address, resolved_endpoint) = if let Some(address) = endpoint.strip_prefix("tls://") {
+        let resolved_endpoint = if let Some(address) = endpoint.strip_prefix("tls://") {
             validate_tcp_address(endpoint, address)?;
             let fingerprint = tls_fingerprint.ok_or_else(|| {
                 anyhow::anyhow!(
@@ -348,13 +360,10 @@ impl FleetdConfig {
             })?;
             let fingerprint = PinnedFingerprint::parse(fingerprint)?;
             tls_server_name(address)?;
-            (
-                address,
-                FleetdEndpoint::Tls {
-                    address: address.to_string(),
-                    fingerprint,
-                },
-            )
+            FleetdEndpoint::Tls {
+                address: address.to_string(),
+                fingerprint,
+            }
         } else if let Some(address) = endpoint.strip_prefix("tcp://") {
             validate_tcp_address(endpoint, address)?;
             if tls_fingerprint.is_some() {
@@ -362,13 +371,12 @@ impl FleetdConfig {
                     "daemon.fleetd_tls_fingerprint is set but the fleetd endpoint `{endpoint}` is plaintext; use tls://host:port or drop the fingerprint"
                 );
             }
-            (address, FleetdEndpoint::Tcp(address.to_string()))
+            FleetdEndpoint::Tcp(address.to_string())
         } else {
             anyhow::bail!(
                 "unsupported fleetd endpoint `{endpoint}`; expected tls://host:port, tcp://host:port, or omit it for the state-local Unix socket"
             );
         };
-        let _ = address;
         let token = token_file.ok_or_else(|| {
             anyhow::anyhow!(
                 "remote fleetd endpoint `{endpoint}` requires daemon.fleetd_token_file or BLACKBOX_FLEETD_TOKEN_FILE"
@@ -2506,10 +2514,15 @@ mod tests {
                 .is_ok()
         );
         let other = rustls::pki_types::CertificateDer::from(b"another certificate".to_vec());
+        let refused = verifier
+            .verify_server_cert(&other, &[], &name, &[], now)
+            .unwrap_err()
+            .to_string();
+        // The refusal names what was presented and what is pinned.
+        assert!(refused.contains(&pin), "{refused}");
         assert!(
-            verifier
-                .verify_server_cert(&other, &[], &name, &[], now)
-                .is_err()
+            refused.contains(&PinnedFingerprint::digest_hex(other.as_ref())),
+            "{refused}"
         );
         // Names are accepted for IPs and DNS hosts alike; only the pin decides.
         tls_server_name("fleet.lan:7265").unwrap();

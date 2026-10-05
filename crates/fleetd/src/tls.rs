@@ -70,8 +70,18 @@ impl Identity {
         Self::load(paths)
     }
 
-    /// Load an identity written by [`Identity::generate`].
+    /// Load an identity written by [`Identity::generate`]. The key is held
+    /// to the token file's rules (a regular file, owned by this uid, one
+    /// link, no group or other bits): a key that was made readable, replaced
+    /// by a symlink or hardlinked elsewhere is refused, and so is a listener
+    /// that would serve with it.
     pub fn load(paths: &IdentityPaths) -> anyhow::Result<Self> {
+        bro_rpc::validate_private_file(&paths.private_key).map_err(|error| {
+            anyhow::anyhow!(
+                "refusing the fleetd private key {}: {error}; it must be a regular file owned by this user, with one link and mode 0600",
+                paths.private_key.display()
+            )
+        })?;
         let certificate = CertificateDer::from_pem_file(&paths.certificate).map_err(|error| {
             anyhow::anyhow!(
                 "reading the fleetd certificate {}: {error}",
@@ -104,9 +114,15 @@ impl Identity {
     /// certificate is requested: the bearer token authenticates the daemon
     /// inside the channel, as it does over the Unix socket.
     pub fn acceptor(&self) -> anyhow::Result<tokio_rustls::TlsAcceptor> {
-        let config = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(vec![self.certificate.clone()], self.private_key.clone_key())?;
+        // The provider is named, never resolved from the process: a second
+        // provider feature arriving in the graph would otherwise turn every
+        // TLS start into a panic.
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()?
+        .with_no_client_auth()
+        .with_single_cert(vec![self.certificate.clone()], self.private_key.clone_key())?;
         Ok(tokio_rustls::TlsAcceptor::from(Arc::new(config)))
     }
 }
@@ -204,6 +220,34 @@ mod tests {
         assert_eq!(
             Identity::load(&paths).unwrap().fingerprint(),
             generated.fingerprint()
+        );
+    }
+
+    #[test]
+    #[allow(clippy::disallowed_methods)] // the test tampers with the files it made
+    fn a_key_that_is_readable_by_others_or_a_symlink_is_refused_at_load() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = IdentityPaths::in_dir(dir.path());
+        Identity::generate(&paths, &[]).unwrap();
+
+        std::fs::set_permissions(&paths.private_key, std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+        let error = match Identity::load(&paths) {
+            Ok(_) => panic!("a group or other readable key must be refused"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("refusing the fleetd private key"), "{error}");
+        std::fs::set_permissions(&paths.private_key, std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+        Identity::load(&paths).unwrap();
+
+        let moved = dir.path().join("elsewhere.key");
+        std::fs::rename(&paths.private_key, &moved).unwrap();
+        std::os::unix::fs::symlink(&moved, &paths.private_key).unwrap();
+        assert!(
+            Identity::load(&paths).is_err(),
+            "a symlinked key must be refused"
         );
     }
 
