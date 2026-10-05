@@ -11,6 +11,13 @@
   handler is served by a fresh instance bound to that request's own scope
   (`scoped_for`); it never falls back to `default` when the request names
   something else, and the shared handler stays unpinned.
+- Every MCP method resolves or checks request scope, including the ones
+  whose answer does not vary by surface (resources, prompts, `skills/list`):
+  a request naming an unknown surface or an unauthenticated binding is
+  refused on all of them, never served a partial catalog.
+- Catalog listings (tools, resources, prompts) are stable in order and carry
+  `ttlMs` and `cacheScope: private` only for a peer on a revision without a
+  handshake. A handshake-revision peer receives the listing without them.
 - The wire head supports handshake protocol revisions only
   (`supported_protocol_versions`, `get_info`) and refuses `server/discover`.
   The SDK routes any supported no-handshake revision to a stateless path

@@ -5,11 +5,11 @@ use crate::server::{self, BlackboxServer};
 
 use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, CustomRequest, CustomResult, DiscoverResult,
-    ErrorCode, GetPromptRequestParams, GetPromptResponse, GetPromptResult, InitializeRequestParams,
-    InitializeResult, ListPromptsResult, ListResourcesResult, ListToolsResult,
-    PaginatedRequestParams, Prompt, PromptArgument, PromptMessage, ProtocolVersion,
-    ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
+    CacheScope, CallToolRequestParams, CallToolResponse, CustomRequest, CustomResult,
+    DiscoverResult, ErrorCode, GetPromptRequestParams, GetPromptResponse, GetPromptResult,
+    InitializeRequestParams, InitializeResult, ListPromptsResult, ListResourcesResult,
+    ListToolsResult, PaginatedRequestParams, Prompt, PromptArgument, PromptMessage,
+    ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
     ResourceContents, Role, ServerCapabilities, ServerConfig,
 };
 use rmcp::service::RequestContext;
@@ -214,6 +214,20 @@ impl BlackboxServer {
         Ok(std::borrow::Cow::Owned(server))
     }
 
+    /// Refuse a request whose own transport context names a scope this
+    /// daemon will not serve (an unknown surface, an unauthenticated
+    /// workspace binding). Methods whose answer does not vary by scope call
+    /// this so a misconfigured client is refused on every method, never
+    /// served a partial catalog.
+    async fn refuse_unservable_scope(
+        &self,
+        context: &RequestContext<RoleServer>,
+    ) -> Result<(), ErrorData> {
+        self.scoped_for(context.extensions.get::<http::request::Parts>())
+            .await
+            .map(|_| ())
+    }
+
     fn unpinned_clone(&self) -> Self {
         Self {
             embed_status_snapshots: self.embed_status_snapshots.clone(),
@@ -225,6 +239,23 @@ impl BlackboxServer {
             session_checkout: Default::default(),
             session_workspace_binding: Default::default(),
         }
+    }
+}
+
+/// How long a client may treat a catalog listing as fresh. A surface's tool
+/// set, the resource list and the prompt list are fixed for the daemon's
+/// lifetime, so the bound only limits how long a client keeps a listing
+/// across a daemon restart.
+const CATALOG_LIST_TTL_MS: u64 = 300_000;
+
+/// Cache hints for a catalog listing. They exist only in revisions without
+/// a handshake; a client on a handshake revision receives the listing as it
+/// always has. Listings depend on the caller's surface, so they are private.
+fn catalog_cache_hints(version: Option<&ProtocolVersion>) -> (Option<u64>, Option<CacheScope>) {
+    if version.is_some_and(|version| !version.has_initialize()) {
+        (Some(CATALOG_LIST_TTL_MS), Some(CacheScope::Private))
+    } else {
+        (None, None)
     }
 }
 
@@ -303,14 +334,19 @@ impl ServerHandler for BlackboxServer {
             .scoped_for(context.extensions.get::<http::request::Parts>())
             .await?;
         let visible = server.session_tools();
+        // The router lists tools sorted by name, so the listing is stable
+        // across requests and prompt caches keyed on it stay valid.
         let tools = self
             .tool_router
             .list_all()
             .into_iter()
             .filter(|t| visible.contains(t.name.as_ref()))
             .collect();
+        let (ttl_ms, cache_scope) = catalog_cache_hints(context.protocol_version().as_ref());
         Ok(ListToolsResult {
             tools,
+            ttl_ms,
+            cache_scope,
             ..Default::default()
         })
     }
@@ -318,14 +354,18 @@ impl ServerHandler for BlackboxServer {
     async fn list_resources(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, ErrorData> {
+        self.refuse_unservable_scope(&context).await?;
+        let (ttl_ms, cache_scope) = catalog_cache_hints(context.protocol_version().as_ref());
         Ok(ListResourcesResult {
             resources: vec![
                 Resource::new(ONBOARDING_SKILL_URI, "onboard-project/SKILL.md")
                     .with_description(ONBOARDING_SKILL_DESCRIPTION)
                     .with_mime_type("text/markdown"),
             ],
+            ttl_ms,
+            cache_scope,
             ..Default::default()
         })
     }
@@ -333,8 +373,9 @@ impl ServerHandler for BlackboxServer {
     async fn read_resource(
         &self,
         request: ReadResourceRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResponse, ErrorData> {
+        self.refuse_unservable_scope(&context).await?;
         if request.uri != ONBOARDING_SKILL_URI {
             return Err(ErrorData::resource_not_found(
                 format!("resource not found: {}", request.uri),
@@ -351,8 +392,10 @@ impl ServerHandler for BlackboxServer {
     async fn list_prompts(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ListPromptsResult, ErrorData> {
+        self.refuse_unservable_scope(&context).await?;
+        let (ttl_ms, cache_scope) = catalog_cache_hints(context.protocol_version().as_ref());
         Ok(ListPromptsResult {
             prompts: vec![Prompt::new(
                 ONBOARDING_SKILL_NAME,
@@ -363,6 +406,8 @@ impl ServerHandler for BlackboxServer {
                         .with_required(false),
                 ]),
             )],
+            ttl_ms,
+            cache_scope,
             ..Default::default()
         })
     }
@@ -370,8 +415,9 @@ impl ServerHandler for BlackboxServer {
     async fn get_prompt(
         &self,
         request: GetPromptRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<GetPromptResponse, ErrorData> {
+        self.refuse_unservable_scope(&context).await?;
         if request.name != ONBOARDING_SKILL_NAME {
             return Err(ErrorData::invalid_params(
                 format!("unknown prompt: {}", request.name),
@@ -397,8 +443,9 @@ impl ServerHandler for BlackboxServer {
     async fn on_custom_request(
         &self,
         request: CustomRequest,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CustomResult, ErrorData> {
+        self.refuse_unservable_scope(&context).await?;
         if request.method != "skills/list" {
             return Err(ErrorData::new(
                 ErrorCode::METHOD_NOT_FOUND,
@@ -533,6 +580,41 @@ mod tests {
         let scoped = server.scoped_for(Some(&ops)).await.unwrap();
         assert_eq!(scoped.session_surface(), "readonly");
         assert!(!scoped.session_tools().contains("bro_exec"));
+    }
+
+    #[test]
+    fn catalog_cache_hints_exist_only_without_a_handshake() {
+        for version in [
+            None,
+            Some(ProtocolVersion::V_2025_03_26),
+            Some(ProtocolVersion::V_2025_06_18),
+            Some(ProtocolVersion::LATEST_WITH_INITIALIZE),
+        ] {
+            assert_eq!(
+                catalog_cache_hints(version.as_ref()),
+                (None, None),
+                "{version:?}"
+            );
+        }
+        assert_eq!(
+            catalog_cache_hints(Some(&ProtocolVersion::V_2026_07_28)),
+            (Some(CATALOG_LIST_TTL_MS), Some(CacheScope::Private))
+        );
+    }
+
+    #[test]
+    fn the_tool_catalog_lists_in_name_order() {
+        let (_dir, server) = test_server();
+        let names: Vec<String> = server
+            .tool_router
+            .list_all()
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted);
+        assert!(names.len() > 1);
     }
 
     #[tokio::test]
