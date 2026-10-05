@@ -41,6 +41,33 @@ Domain home for the dispatch plane. Boundary contract:
   cockpit sets no per-dispatch defaults of its own, so its grants come from
   the brofile lane unless a caller fills the spec field.
 
+## Worker telemetry is not conversation
+
+- A `harness_shell_sessions` envelope reports the worker's retained shell
+  sessions. Supervision handles it apart from every other event: it never
+  changes `tool_running`, loop hashes or compaction evidence, because the
+  worker publishes it while a shell tool is still running. A report is
+  accepted only when it is well formed, within the session and command-head
+  bounds, and newer than the one held; anything else leaves the state as it
+  was, so a bad report never reads as an empty one. The accepted sequence and
+  the daemon-local receipt time are stored with it and a duplicate never
+  moves them. A report loaded from a persisted record is history until this
+  daemon process accepts a newer one. No stored report means unknown, not
+  empty. Session ids are bounded as well.
+- **A report is not activity.** Accepting one leaves the event count and
+  `last_event_at_ms` alone; its receipt time lives on the stored observation
+  (`received_at_ms`). The idle notice is computed from conversation events
+  only, so a worker blocked in one long shell command goes idle whatever its
+  reports do, which is the case the stored report exists to explain.
+- **Reports are change-driven, never periodic.** The worker publishes one
+  when its process starts and when a shell session starts, ends or is
+  removed, and at no other time. Do not add a timer-driven publisher.
+- **The report sequence is the session's event sequence.** It only has to
+  increase within one task: a task is one worker process, re-adoption after
+  a daemon restart keeps that process and its counter, and a resumed session
+  is a new task with fresh supervision state, so a new worker process never
+  reports under an existing task's held sequence.
+
 ## Allocator binary eligibility follows the executor boundary
 
 - Harness provider binaries are resolved on the host that actually spawns the

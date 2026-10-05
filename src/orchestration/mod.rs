@@ -3897,9 +3897,13 @@ fn ingest_harness_event(
             };
             provider.parse_event(&evt, &mut sink);
             apply_cwd_updates_from_event(&mut inner, &evt);
-            inner
-                .supervision
-                .observe_event(&evt, &sink, &supervision::config(), now_ms());
+            // A shell-session report names its session. One addressed to a
+            // different session than this task's is not this worker's state.
+            if !supervision::is_foreign_shell_sessions_event(&evt, &inner.session_id) {
+                inner
+                    .supervision
+                    .observe_event(&evt, &sink, &supervision::config(), now_ms());
+            }
             apply_sink_updates(&mut inner, sink);
             // A terminal `result` event with `is_error: true` fails the task and
             // preserves the message in stderr. A controlled harness turn may

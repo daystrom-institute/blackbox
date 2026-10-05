@@ -40,6 +40,10 @@ mod acceptance {
              : > \"$out/ready\"\n\
              while IFS= read -r line; do\n\
              \x20 printf '%s\\n' \"$line\" >> \"$out/stdin\"\n\
+             \x20 case \"$line\" in *REPORT_SHELLS*)\n\
+             \x20   printf '{{\"type\":\"harness_shell_sessions\",\"session_id\":\"%s\",\"seq\":5,\"sessions\":[{{\"id\":\"sh-1\",\"command\":\"sleep 600\",\"elapsed_ms\":1500,\"running\":true}}]}}\\n' \"$session\"\n\
+             \x20   printf '{{\"type\":\"harness_shell_sessions\",\"session_id\":\"another-session\",\"seq\":6,\"sessions\":[]}}\\n';;\n\
+             \x20 esac\n\
              \x20 case \"$line\" in *FINISH*)\n\
              \x20   printf '{{\"type\":\"result\",\"is_error\":false,\"result\":\"stub ok\",\"session_id\":\"%s\"}}\\n' \"$session\"\n\
              \x20   exit 0;;\n\
@@ -669,5 +673,68 @@ mod acceptance {
         assert!(text.contains("no-such-harness"), "{text}");
         // Nothing ran in its place.
         assert!(child_dirs(&plane.root).is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_shell_session_report_reaches_supervision_through_fleetd() {
+        let mut plane = Plane::start().await;
+        let cwd = plane.cwd();
+        let (task, _, child) = plane
+            .exec(json!({ "prompt": "first turn", "provider": "glm", "cwd": cwd }))
+            .await;
+        await_file(&child.join("stdin"), "first turn").await;
+        // The stub answers with one report for its own session and one that
+        // names a different session.
+        plane.steer(&task, "REPORT_SHELLS");
+        let held = {
+            let deadline = tokio::time::Instant::now() + super::smoke::DEADLINE;
+            loop {
+                let observed = plane
+                    .state
+                    .task_store
+                    .read()
+                    .get(&task)
+                    .expect("task")
+                    .inner
+                    .lock()
+                    .supervision
+                    .shell_sessions
+                    .clone();
+                if let Some(observed) = observed {
+                    break observed;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the report never reached supervision"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        };
+        assert_eq!(held.seq, 5);
+        assert!(held.observed_this_run);
+        assert_eq!(held.sessions.len(), 1);
+        assert_eq!(held.sessions[0].command, "sleep 600");
+        assert!(held.sessions[0].running);
+
+        // The report naming another session is never observed: it carried a
+        // higher sequence and an empty set and would have replaced the real
+        // one. An envelope from a different session also fails the task, as
+        // any such envelope does.
+        let failed = plane.wait(&task, 20.0).await;
+        assert_eq!(failed["status"], "failed", "{failed}");
+        assert!(failed.to_string().contains("session fork detected"), "{failed}");
+        let after = plane
+            .state
+            .task_store
+            .read()
+            .get(&task)
+            .expect("task")
+            .inner
+            .lock()
+            .supervision
+            .shell_sessions
+            .clone()
+            .expect("observation kept");
+        assert_eq!((after.seq, after.sessions.len()), (5, 1));
     }
 }

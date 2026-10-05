@@ -152,6 +152,84 @@ pub struct SupervisionState {
     pub alerts: Vec<SupervisionAlert>,
     #[serde(default)]
     pub last_alert_at_ms: BTreeMap<String, u64>,
+    /// The worker's latest accepted report of its retained shell sessions.
+    /// `None` means no report was ever accepted, which is unknown visibility,
+    /// not an empty set. Absent in records written before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell_sessions: Option<ShellSessionsObservation>,
+}
+
+/// Type tag of the harness envelope that reports a worker's shell sessions.
+pub const SHELL_SESSIONS_EVENT: &str = "harness_shell_sessions";
+/// Bounds a report must respect to be accepted. They mirror the worker's
+/// session cap and the command head it publishes.
+pub const MAX_OBSERVED_SHELL_SESSIONS: usize = 32;
+pub const MAX_SHELL_COMMAND_HEAD_CHARS: usize = 120;
+/// Worker session ids are short counters (`sh-<n>`); the bound keeps one
+/// field from growing the persisted record.
+pub const MAX_SHELL_SESSION_ID_CHARS: usize = 64;
+
+/// One shell session as the worker reported it. `elapsed_ms` is the worker's
+/// own monotonic age at the moment of the report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellSessionObservation {
+    pub id: String,
+    pub command: String,
+    pub elapsed_ms: u64,
+    pub running: bool,
+}
+
+/// A complete, accepted shell-session report and the anchors needed to
+/// estimate age later: the session sequence it carried and the daemon-local
+/// time it was first received. A duplicate delivery never moves either.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellSessionsObservation {
+    pub seq: u64,
+    pub received_at_ms: u64,
+    pub sessions: Vec<ShellSessionObservation>,
+    /// True once this daemon process accepted the report itself. A report
+    /// loaded from a persisted record describes a worker this process has not
+    /// heard from yet, so it is history until a newer one arrives.
+    #[serde(skip)]
+    pub observed_this_run: bool,
+}
+
+/// Whether `event` is a shell-session report addressed to a different session
+/// than `session_id`. Such a report must not be observed at all.
+pub fn is_foreign_shell_sessions_event(event: &Value, session_id: &str) -> bool {
+    event.get("type").and_then(Value::as_str) == Some(SHELL_SESSIONS_EVENT)
+        && event
+            .get("session_id")
+            .and_then(Value::as_str)
+            .is_some_and(|reported| reported != session_id)
+}
+
+/// Decode a shell-session report strictly. Anything missing, mistyped or over
+/// a bound yields `None`, so a bad report can never read as an empty one.
+fn decode_shell_sessions(event: &Value) -> Option<(u64, Vec<ShellSessionObservation>)> {
+    let seq = event.get("seq")?.as_u64()?;
+    let rows = event.get("sessions")?.as_array()?;
+    if rows.len() > MAX_OBSERVED_SHELL_SESSIONS {
+        return None;
+    }
+    let mut sessions = Vec::with_capacity(rows.len());
+    for row in rows {
+        let id = row.get("id")?.as_str()?;
+        let command = row.get("command")?.as_str()?;
+        if id.is_empty()
+            || id.chars().count() > MAX_SHELL_SESSION_ID_CHARS
+            || command.chars().count() > MAX_SHELL_COMMAND_HEAD_CHARS
+        {
+            return None;
+        }
+        sessions.push(ShellSessionObservation {
+            id: id.to_string(),
+            command: command.to_string(),
+            elapsed_ms: row.get("elapsed_ms")?.as_u64()?,
+            running: row.get("running")?.as_bool()?,
+        });
+    }
+    Some((seq, sessions))
 }
 
 impl Default for SupervisionConfig {
@@ -175,6 +253,33 @@ impl Default for SupervisionConfig {
 }
 
 impl SupervisionState {
+    /// Accept a shell-session report when it is well formed and newer than the
+    /// one held. A malformed or over-limit report, a duplicate and an older
+    /// report all leave the state exactly as it was. An accepted report
+    /// replaces the held one and records its own receipt time. It is not
+    /// conversation activity: the event count and `last_event_at_ms`, which
+    /// the idle notice is computed from, stay as they were. Returns whether
+    /// the report was accepted.
+    fn observe_shell_sessions(&mut self, event: &Value, now_ms: u64) -> bool {
+        let Some((seq, sessions)) = decode_shell_sessions(event) else {
+            return false;
+        };
+        if self
+            .shell_sessions
+            .as_ref()
+            .is_some_and(|held| seq <= held.seq)
+        {
+            return false;
+        }
+        self.shell_sessions = Some(ShellSessionsObservation {
+            seq,
+            received_at_ms: now_ms,
+            sessions,
+            observed_this_run: true,
+        });
+        true
+    }
+
     pub fn observe_event(
         &mut self,
         event: &Value,
@@ -183,6 +288,16 @@ impl SupervisionState {
         now_ms: u64,
     ) {
         if !self.enabled {
+            return;
+        }
+
+        // A shell-session report is telemetry about the worker, not a step of
+        // the conversation. It is handled entirely here: it never changes
+        // `tool_running`, loop hashes or compaction evidence, which a report
+        // published while a shell tool is still running would otherwise
+        // corrupt.
+        if event.get("type").and_then(Value::as_str) == Some(SHELL_SESSIONS_EVENT) {
+            self.observe_shell_sessions(event, now_ms);
             return;
         }
 
@@ -628,6 +743,7 @@ impl Default for SupervisionState {
             token_baseline: None,
             alerts: Vec::new(),
             last_alert_at_ms: BTreeMap::new(),
+            shell_sessions: None,
         }
     }
 }
@@ -883,6 +999,7 @@ fn token_burn_ratio(total_tokens: u64, baseline: Option<u64>) -> Option<f64> {
 mod tests {
     use super::*;
     use crate::orchestration::providers::{EventSink, Usage};
+    use serde_json::json;
 
     // Tests pass `SupervisionConfig::default()` everywhere a cfg is required.
     // The new regression test at the bottom of the mod is the only caller that
@@ -1542,5 +1659,209 @@ mod tests {
             amber, 1,
             "caller-supplied cfg with loop_amber_count=2 should trip amber on the second event"
         );
+    }
+
+    fn shell_report(seq: u64, sessions: Value) -> Value {
+        json!({
+            "type": SHELL_SESSIONS_EVENT,
+            "session_id": "synthetic-session",
+            "seq": seq,
+            "sessions": sessions,
+        })
+    }
+
+    fn one_running() -> Value {
+        json!([{ "id": "sh-1", "command": "sleep 600", "elapsed_ms": 1500, "running": true }])
+    }
+
+    #[test]
+    fn a_shell_session_report_is_telemetry_and_keeps_tool_running() {
+        let mut state = SupervisionState::default();
+        state.observe_event(&tool_call_event(), &sink_without_usage(), &cfg(), 1_000);
+        assert_eq!(state.tool_running, Some(true));
+        let hashes = state.recent_hashes.len();
+
+        // The report arrives between the tool dispatch and its result.
+        state.observe_event(
+            &shell_report(7, one_running()),
+            &sink_without_usage(),
+            &cfg(),
+            2_000,
+        );
+        assert_eq!(
+            state.tool_running,
+            Some(true),
+            "a report is not a tool result"
+        );
+        assert_eq!(
+            state.recent_hashes.len(),
+            hashes,
+            "a report adds no loop evidence"
+        );
+        assert!(state.compaction_times_ms.is_empty());
+        // The report is not conversation activity. The clock the idle notice
+        // runs on still reads the tool dispatch, so a worker that only reports
+        // shell transitions goes idle exactly as it would have.
+        assert_eq!(state.last_event_at_ms, Some(1_000));
+        assert_eq!(state.event_count, 1);
+        let idle_with_report = state.snapshot(&cfg(), 400_000);
+        let mut without_report = state.clone();
+        without_report.shell_sessions = None;
+        let idle_without_report = without_report.snapshot(&cfg(), 400_000);
+        assert_eq!(idle_with_report["idle_seconds"], 399);
+        assert_eq!(
+            idle_with_report["idle_seconds"],
+            idle_without_report["idle_seconds"]
+        );
+        assert_eq!(
+            idle_with_report["seconds_since_last_event"],
+            idle_without_report["seconds_since_last_event"]
+        );
+        let held = state.shell_sessions.clone().expect("report accepted");
+        assert_eq!((held.seq, held.received_at_ms), (7, 2_000));
+        assert!(held.observed_this_run);
+        assert_eq!(
+            held.sessions,
+            vec![ShellSessionObservation {
+                id: "sh-1".into(),
+                command: "sleep 600".into(),
+                elapsed_ms: 1500,
+                running: true,
+            }]
+        );
+
+        // An ordinary event afterwards still ends the tool as before.
+        state.observe_event(&text_event(), &sink_without_usage(), &cfg(), 3_000);
+        assert_eq!(state.tool_running, Some(false));
+        assert_eq!(state.shell_sessions.as_ref().unwrap().seq, 7);
+    }
+
+    #[test]
+    fn stale_duplicate_malformed_and_oversized_reports_change_nothing() {
+        let mut state = SupervisionState::default();
+        assert!(state.observe_shell_sessions(&shell_report(10, one_running()), 1_000));
+        let accepted = state.clone();
+
+        let too_many: Vec<Value> = (0..=MAX_OBSERVED_SHELL_SESSIONS)
+            .map(|n| json!({ "id": format!("sh-{n}"), "command": "true", "elapsed_ms": 1, "running": true }))
+            .collect();
+        let long_head = "é".repeat(MAX_SHELL_COMMAND_HEAD_CHARS + 1);
+        let long_id = "s".repeat(MAX_SHELL_SESSION_ID_CHARS + 1);
+        let rejected = [
+            // Duplicate and older deliveries never re-anchor the age.
+            shell_report(10, json!([])),
+            shell_report(9, json!([])),
+            // Newer sequence, but not a well-formed report.
+            json!({ "type": SHELL_SESSIONS_EVENT, "seq": 11 }),
+            json!({ "type": SHELL_SESSIONS_EVENT, "sessions": [] }),
+            shell_report(11, json!("none")),
+            shell_report(
+                11,
+                json!([{ "id": "sh-1", "command": "x", "elapsed_ms": 1 }]),
+            ),
+            shell_report(
+                11,
+                json!([{ "id": "", "command": "x", "elapsed_ms": 1, "running": true }]),
+            ),
+            shell_report(
+                11,
+                json!([{ "id": "sh-1", "command": "x", "elapsed_ms": -1, "running": true }]),
+            ),
+            shell_report(
+                11,
+                json!([{ "id": "sh-1", "command": long_head, "elapsed_ms": 1, "running": true }]),
+            ),
+            shell_report(
+                11,
+                json!([{ "id": long_id, "command": "x", "elapsed_ms": 1, "running": true }]),
+            ),
+            shell_report(11, Value::Array(too_many)),
+        ];
+        for (index, event) in rejected.iter().enumerate() {
+            state.observe_event(event, &sink_without_usage(), &cfg(), 5_000 + index as u64);
+            assert_eq!(state.shell_sessions, accepted.shell_sessions, "{event}");
+            assert_eq!(state.event_count, accepted.event_count, "{event}");
+            assert_eq!(state.last_event_at_ms, accepted.last_event_at_ms, "{event}");
+        }
+
+        // A command head of exactly the bound, in multi-byte characters, and an
+        // observed empty set are both valid.
+        let exact = "é".repeat(MAX_SHELL_COMMAND_HEAD_CHARS);
+        assert!(state.observe_shell_sessions(
+            &shell_report(
+                11,
+                json!([{ "id": "sh-2", "command": exact, "elapsed_ms": 0, "running": false }])
+            ),
+            6_000
+        ));
+        assert!(state.observe_shell_sessions(&shell_report(12, json!([])), 7_000));
+        let held = state.shell_sessions.as_ref().unwrap();
+        assert_eq!(
+            (held.seq, held.received_at_ms, held.sessions.len()),
+            (12, 7_000, 0)
+        );
+    }
+
+    #[test]
+    fn shell_session_observations_persist_and_load_as_history() {
+        // A record written before the field existed loads with no observation.
+        let old: SupervisionState =
+            serde_json::from_value(json!({ "enabled": true, "event_count": 3 })).unwrap();
+        assert_eq!(old.shell_sessions, None);
+        assert!(
+            serde_json::to_value(&old)
+                .unwrap()
+                .get("shell_sessions")
+                .is_none()
+        );
+
+        let mut state = SupervisionState::default();
+        assert!(state.observe_shell_sessions(&shell_report(4, one_running()), 1_000));
+        let restored: SupervisionState =
+            serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+        let held = restored
+            .shell_sessions
+            .clone()
+            .expect("observation persisted");
+        assert_eq!((held.seq, held.received_at_ms), (4, 1_000));
+        assert_eq!(
+            held.sessions,
+            state.shell_sessions.as_ref().unwrap().sessions
+        );
+        assert!(
+            !held.observed_this_run,
+            "a loaded report is history until a newer one arrives"
+        );
+
+        // The replayed duplicate does not re-anchor or promote it; a newer
+        // report from the worker does.
+        let mut restored = restored;
+        assert!(!restored.observe_shell_sessions(&shell_report(4, one_running()), 9_000));
+        assert_eq!(
+            restored.shell_sessions.as_ref().unwrap().received_at_ms,
+            1_000
+        );
+        assert!(!restored.shell_sessions.as_ref().unwrap().observed_this_run);
+        assert!(restored.observe_shell_sessions(&shell_report(5, json!([])), 9_500));
+        assert!(restored.shell_sessions.as_ref().unwrap().observed_this_run);
+    }
+
+    #[test]
+    fn a_report_for_another_session_is_recognized_as_foreign() {
+        let event = shell_report(1, json!([]));
+        assert!(!is_foreign_shell_sessions_event(
+            &event,
+            "synthetic-session"
+        ));
+        assert!(is_foreign_shell_sessions_event(&event, "another-session"));
+        // Other events, and a report without a session id, are never foreign.
+        assert!(!is_foreign_shell_sessions_event(
+            &text_event(),
+            "another-session"
+        ));
+        assert!(!is_foreign_shell_sessions_event(
+            &json!({ "type": SHELL_SESSIONS_EVENT, "seq": 1, "sessions": [] }),
+            "another-session"
+        ));
     }
 }
