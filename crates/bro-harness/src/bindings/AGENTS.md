@@ -69,8 +69,11 @@ Footguns that bit:
 
 - **Planner-emitted NEW files arrive as whole-content `0..0` edits against
   the empty-file hash** (v1's create idiom — its apply created missing
-  files). Convert them to `creates` (→ `edits.createFile`), or the algebra
-  stale_span-bounces them against a file that does not exist yet.
+  files). Convert them to `creates` (→ `edits.createFile`, or
+  `edits.createFiles` for a transform's whole `creates` array in one
+  all-or-nothing call), or the algebra stale_span-bounces them against a file
+  that does not exist yet. A refused `edits.createFiles` batch queues nothing
+  and names at most a fixed number of colliding paths, with the full count.
 - **Transforms are NOT idempotent over their own output.** A re-call after a
   successful apply hits the planner's target-exists refusal — that is the
   DONE signal, not a retry. Without that framing an agent shell-deletes the

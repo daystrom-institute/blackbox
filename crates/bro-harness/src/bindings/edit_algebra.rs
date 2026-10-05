@@ -641,7 +641,7 @@ impl Tool for EditsCreateFiles {
                 return Err(format!(
                     "EditSet `{es}` refused the whole batch, nothing queued; {} offending path(s): {}",
                     offending.len(),
-                    offending.join(", ")
+                    bounded_collision_list(&offending)
                 ));
             }
             set.creates.extend(files);
@@ -684,6 +684,34 @@ fn create_batch_collisions(set: &EditSetState, files: &[CreateFile]) -> Vec<Stri
         }
     }
     offending
+}
+
+/// How many offending paths a refused batch names, and how much of each. A
+/// batch may hold a thousand paths of any length; the refusal states the full
+/// count and shows enough to act on without growing with the batch.
+const MAX_REPORTED_COLLISIONS: usize = 16;
+const MAX_REPORTED_COLLISION_CHARS: usize = 160;
+
+fn bounded_collision_list(offending: &[String]) -> String {
+    let mut shown: Vec<String> = offending
+        .iter()
+        .take(MAX_REPORTED_COLLISIONS)
+        .map(|entry| {
+            if entry.chars().count() <= MAX_REPORTED_COLLISION_CHARS {
+                return entry.clone();
+            }
+            // Keep the tail: it carries the file name and the reason.
+            let skip = entry.chars().count() - MAX_REPORTED_COLLISION_CHARS;
+            format!("...{}", entry.chars().skip(skip).collect::<String>())
+        })
+        .collect();
+    if offending.len() > MAX_REPORTED_COLLISIONS {
+        shown.push(format!(
+            "and {} more not listed",
+            offending.len() - MAX_REPORTED_COLLISIONS
+        ));
+    }
+    shown.join(", ")
 }
 
 /// `edits.deleteFile` — queue deletion of an existing file.
@@ -1862,6 +1890,66 @@ mod tests {
             ToolResult::Error(e) => e,
             other => panic!("expected error, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn create_files_collision_refusal_stays_bounded_for_a_large_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (store, cx) = set_up(&root);
+        let es = begin_es(&store, &cx).await;
+        // 400 long paths, each given twice: 400 collisions in one batch.
+        let stem = "deep/".repeat(60);
+        let paths: Vec<String> = (0..400).map(|n| format!("{stem}file-{n:04}.txt")).collect();
+        let doubled: Vec<&str> = paths
+            .iter()
+            .chain(paths.iter())
+            .map(String::as_str)
+            .collect();
+        let error = error_of(
+            create_files(&store, &cx, json!({ "es": es, "files": batch(&doubled) })).await,
+        );
+        // The full count is stated, the first entries are shown with the file
+        // name and reason intact, and the rest are counted, not listed.
+        assert!(error.contains("400 offending path(s)"), "{error}");
+        assert!(
+            error.contains("file-0000.txt (repeated in this batch)"),
+            "{error}"
+        );
+        assert!(
+            error.contains(&format!(
+                "file-{:04}.txt (repeated in this batch)",
+                MAX_REPORTED_COLLISIONS - 1
+            )),
+            "{error}"
+        );
+        assert!(
+            !error.contains(&format!("file-{MAX_REPORTED_COLLISIONS:04}.txt")),
+            "{error}"
+        );
+        assert!(
+            error.contains(&format!(
+                "and {} more not listed",
+                400 - MAX_REPORTED_COLLISIONS
+            )),
+            "{error}"
+        );
+        assert!(
+            error.len() < MAX_REPORTED_COLLISIONS * (MAX_REPORTED_COLLISION_CHARS * 4 + 8) + 512,
+            "refusal grew with the batch: {} bytes",
+            error.len()
+        );
+        assert!(!error.contains("SECRET-BODY"), "{error}");
+        // Nothing was queued by the refused batch.
+        let queued = json_of(
+            create_files(
+                &store,
+                &cx,
+                json!({ "es": es, "files": batch(&["only.txt"]) }),
+            )
+            .await,
+        );
+        assert_eq!(queued, json!({ "es": es, "creates": 1 }));
     }
 
     #[tokio::test]
