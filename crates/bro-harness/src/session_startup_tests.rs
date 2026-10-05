@@ -463,6 +463,21 @@ async fn build_discovering(
     resume: bool,
     fs: &Arc<crate::instruction_io::testing::GatedFs>,
 ) -> (Result<Session>, Arc<StdMutex<Vec<Value>>>) {
+    build_discovering_within(base, resume, fs, INSTRUCTION_BUDGET).await
+}
+
+/// `budget` bounds each instruction phase. A build that stalls a read on
+/// purpose uses the short test budget so its timeout arrives quickly. A build
+/// that must find its documents uses the production default: its discovery
+/// does real filesystem work, and a short budget there would time how fast
+/// the machine is, since a startup timeout is not an error and simply leaves
+/// the session without documents.
+async fn build_discovering_within(
+    base: &Path,
+    resume: bool,
+    fs: &Arc<crate::instruction_io::testing::GatedFs>,
+    budget: std::time::Duration,
+) -> (Result<Session>, Arc<StdMutex<Vec<Value>>>) {
     let events = Arc::new(StdMutex::new(Vec::new()));
     let sink = events.clone();
     let vars = BTreeMap::from([
@@ -472,7 +487,7 @@ async fn build_discovering(
         ),
         (
             crate::instruction_io::TIMEOUT_ENV.to_owned(),
-            INSTRUCTION_BUDGET.as_millis().to_string(),
+            budget.as_millis().to_string(),
         ),
     ]);
     let cli = discovering_cli(base, resume);
@@ -592,7 +607,8 @@ async fn production_resume_instruction_timeout_fails_before_session_resume() {
     let (_dir, base) = discovering_workspace();
     let document = base.join("project/AGENTS.md");
     let fs = crate::instruction_io::testing::GatedFs::new();
-    let (initial, _) = build_discovering(&base, false, &fs).await;
+    let (initial, _) =
+        build_discovering_within(&base, false, &fs, crate::instruction_io::DEFAULT_TIMEOUT).await;
     let mut initial = initial.unwrap();
     assert!(!initial.scoped_project_docs.active_documents().is_empty());
     initial.persist().await.unwrap();
