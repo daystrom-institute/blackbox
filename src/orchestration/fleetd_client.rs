@@ -3054,3 +3054,4 @@ mod tests {
 }
 
 include!("fleetd_smoke.rs");
+include!("dispatch_acceptance.rs");

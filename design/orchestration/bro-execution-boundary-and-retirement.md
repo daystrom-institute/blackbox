@@ -402,7 +402,7 @@ Do not delete similarly named Rust `atomic` primitives, harness hooks, refactor
 | Gate | Required evidence |
 | --- | --- |
 | Bro independence | MCP and Fleet launch/resume/steer/interrupt/cancel/wait/result work with no workflow/atom/Badgey/reaction installation. Waiting launches no additional tasks. |
-| Routing and safety | Explicit and implicit provider/account behavior, Astra selection, worker cwd, global templates, scoped tool defaults and deny filters remain correct. |
+| Routing and safety | Explicit and implicit provider/account behavior, model and effort selection, worker cwd, scoped tool defaults and deny filters remain correct; legacy team records load without executing. |
 | Transport | fleetd reconnect, child survival, fenced owners, replay acknowledgement and bounded retention remain correct; keep `scripts/acceptance-fleetd-deps.sh`. |
 | Legacy data | Mixed current/legacy task records retain current tasks and ownership; old artifact/catalog receipts load without executing retired kinds; interrupted migration resumes safely. |
 | Historical corpus | Slack and native search/context/messages survive removal/restart with unchanged visibility constraints. |

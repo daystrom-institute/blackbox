@@ -34,7 +34,7 @@ mod smoke {
 
     /// Every wait is bounded so a broken assumption fails the test instead of
     /// hanging the suite.
-    const DEADLINE: Duration = Duration::from_secs(20);
+    pub(super) const DEADLINE: Duration = Duration::from_secs(20);
 
     /// Locate the `fleetd` binary cargo built alongside this test binary.
     ///
@@ -60,14 +60,14 @@ mod smoke {
     }
 
     /// A running `fleetd` child plus the paths it derived from its state dir.
-    struct FleetdProcess {
+    pub(super) struct FleetdProcess {
         child: std::process::Child,
         state_dir: PathBuf,
         tcp_address: Option<std::net::SocketAddr>,
     }
 
     impl FleetdProcess {
-        async fn start(state_dir: &Path) -> Self {
+        pub(super) async fn start(state_dir: &Path) -> Self {
             std::fs::create_dir_all(state_dir).expect("state dir");
             let socket = state_dir.join("fleetd.sock");
             let child = std::process::Command::new(fleetd_binary())
@@ -124,7 +124,7 @@ mod smoke {
             panic!("fleetd did not bind tcp://{tcp_address} within the deadline");
         }
 
-        fn config(&self) -> FleetdConfig {
+        pub(super) fn config(&self) -> FleetdConfig {
             let mut config = FleetdConfig::in_state_dir(&self.state_dir);
             // Never let an ambient BLACKBOX_FLEETD_BIN from the developer's shell
             // point this at a different supervisor, and never let the executor
@@ -649,7 +649,7 @@ mod smoke {
         drop(fleetd);
     }
 
-    fn tool_text(result: &rmcp::model::CallToolResult) -> String {
+    pub(super) fn tool_text(result: &rmcp::model::CallToolResult) -> String {
         result
             .content
             .iter()
