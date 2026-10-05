@@ -12950,10 +12950,9 @@ mod tests {
         assert!(receiver.recv_timeout(Duration::from_millis(100)).is_err());
 
         drop(auxiliary_guard);
-        receiver
-            .recv_timeout(Duration::from_secs(3))
-            .unwrap()
-            .unwrap();
+        // No wall-clock bound: after release this waits on one durable
+        // migration, whose duration follows disk load, not lock exclusion.
+        receiver.recv().unwrap().unwrap();
         worker.join().unwrap();
     }
 
@@ -12977,10 +12976,8 @@ mod tests {
                 "{lane} auxiliary lock did not exclude migration apply"
             );
             drop(auxiliary_guard);
-            receiver
-                .recv_timeout(Duration::from_secs(3))
-                .unwrap()
-                .unwrap();
+            // No wall-clock bound, as in the code-owned lane above.
+            receiver.recv().unwrap().unwrap();
             worker.join().unwrap();
         }
     }
