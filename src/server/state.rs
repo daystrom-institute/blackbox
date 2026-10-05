@@ -1867,13 +1867,31 @@ pub(crate) struct LastCandidateRuntimeView {
     pub(crate) created_unix_secs: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) diagnostic: Option<String>,
-    /// Whether the accepted pointer serves this candidate: the pointer's
-    /// producer binding names its source generation, or, for a pointer bound
-    /// to an attachment, the accepted ref and commit equal the candidate's.
-    /// Present only for a stored candidate.
+    /// Whether the accepted pointer serves this candidate. A pointer bound
+    /// to a producer serves exactly the source generation its binding names.
+    /// A pointer bound to an attachment names no generation, so for it this
+    /// means only that the pointer serves the same ref and commit; every
+    /// candidate on that commit reads as served. Present only for a stored
+    /// candidate.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) served_by_pointer: Option<bool>,
+    /// How many generation index entries could not be decoded. Their project
+    /// is unknown, so a candidate behind one is missing from this answer and
+    /// from every other project's.
+    #[serde(skip_serializing_if = "is_zero_count")]
+    pub(crate) unreadable_index_entry_count: usize,
+    /// The first few of those entries' file names.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) unreadable_index_entries: Vec<String>,
 }
+
+fn is_zero_count(count: &usize) -> bool {
+    *count == 0
+}
+
+/// How many unreadable index entry names a status carries; the count is
+/// always exact.
+const UNREADABLE_INDEX_ENTRY_NAME_LIMIT: usize = 8;
 
 impl LastCandidateRuntimeView {
     pub(crate) fn absent(status: &'static str) -> Self {
@@ -1887,7 +1905,16 @@ impl LastCandidateRuntimeView {
             created_unix_secs: None,
             diagnostic: None,
             served_by_pointer: None,
+            unreadable_index_entry_count: 0,
+            unreadable_index_entries: Vec::new(),
         }
+    }
+
+    fn with_unreadable_index_entries(mut self, mut entries: Vec<String>) -> Self {
+        self.unreadable_index_entry_count = entries.len();
+        entries.truncate(UNREADABLE_INDEX_ENTRY_NAME_LIMIT);
+        self.unreadable_index_entries = entries;
+        self
     }
 }
 
@@ -2183,14 +2210,18 @@ impl SharedState {
     ) -> LastCandidateRuntimeView {
         use bbox_knowledge_source::SourceGenerationStateV1 as State;
 
-        let candidate = match self
+        let latest = match self
             .knowledge_sources
             .store()
             .latest_publication_candidate(project_id.as_str())
         {
-            Ok(Some(candidate)) => candidate,
-            Ok(None) => return LastCandidateRuntimeView::absent("none"),
+            Ok(latest) => latest,
             Err(_) => return LastCandidateRuntimeView::absent("unavailable"),
+        };
+        let unreadable = latest.unreadable_index_entries;
+        let Some(candidate) = latest.candidate else {
+            return LastCandidateRuntimeView::absent("none")
+                .with_unreadable_index_entries(unreadable);
         };
         let bound_generation = accepted_status
             .and_then(|status| status.binding_stamp())
@@ -2222,7 +2253,10 @@ impl SharedState {
             created_unix_secs: Some(candidate.created_unix_secs),
             diagnostic: candidate.diagnostic,
             served_by_pointer: Some(served_by_pointer),
+            unreadable_index_entry_count: 0,
+            unreadable_index_entries: Vec::new(),
         }
+        .with_unreadable_index_entries(unreadable)
     }
 
     fn watcher_runtime_view(

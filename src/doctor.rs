@@ -372,6 +372,44 @@ fn accepted_publication_section(
 ) -> SectionReport {
     let mut findings = Vec::new();
     let mut current = 0;
+    // The generation index is one directory for every project, so entries
+    // it cannot decode are the same list on every status: report it once.
+    if let Some(candidate) = statuses
+        .iter()
+        .map(|status| &status.last_candidate)
+        .find(|candidate| candidate.unreadable_index_entry_count > 0)
+    {
+        findings.push(Finding::warn(format!(
+            "{} stored candidate index entr{} could not be decoded ({}{}); a candidate behind \
+             one is invisible to every project's last-candidate check",
+            candidate.unreadable_index_entry_count,
+            if candidate.unreadable_index_entry_count == 1 {
+                "y"
+            } else {
+                "ies"
+            },
+            candidate.unreadable_index_entries.join(", "),
+            if candidate.unreadable_index_entry_count > candidate.unreadable_index_entries.len() {
+                ", ..."
+            } else {
+                ""
+            },
+        )));
+    }
+    let unchecked = statuses
+        .iter()
+        .filter(|status| status.last_candidate.status == "unavailable")
+        .map(|status| status.project_id.as_str())
+        .collect::<Vec<_>>();
+    if !unchecked.is_empty() {
+        findings.push(Finding::warn(format!(
+            "the last stored candidate could not be read for {} project(s) ({}{}); whether \
+             their accepted pointers lag is unknown",
+            unchecked.len(),
+            unchecked[..unchecked.len().min(8)].join(", "),
+            if unchecked.len() > 8 { ", ..." } else { "" },
+        )));
+    }
     for status in statuses {
         // An unreadable catalog pair is reported FIRST, then the accepted
         // state is reported BESIDE it. Both facts, not one: the catalog and
@@ -430,6 +468,9 @@ fn accepted_publication_section(
         if !notable {
             match unserved {
                 Some(finding) => findings.push(finding),
+                // Not counted as current: the check that could contradict
+                // it did not run. The project is named in the finding above.
+                None if status.last_candidate.status == "unavailable" => {}
                 None => current += 1,
             }
             continue;
@@ -495,8 +536,11 @@ fn accepted_publication_section(
 /// A pointer that verifies says nothing about how far it lags. The newest
 /// stored candidate does: a Ready or Failed candidate the pointer does not
 /// serve means publication stopped short of the pointer, whatever the
-/// pointer's own state. Candidates in any other state are not reported;
-/// they are in flight or were deliberately set aside.
+/// pointer's own state. A Ready one is an action, since acceptance refused
+/// it or never ran and an operator move can serve it. A Failed one is a
+/// warning: nothing serves it, and the producer's next upload replaces it.
+/// Candidates in any other state are not reported; they are in flight or
+/// were deliberately set aside.
 fn unserved_candidate_finding(
     status: &crate::server::state::ProjectRuntimeStatus,
 ) -> Option<Finding> {
@@ -534,13 +578,15 @@ fn unserved_candidate_finding(
         .as_deref()
         .map(|text| format!(" ({})", text.chars().take(200).collect::<String>()))
         .unwrap_or_default();
-    Some(Finding::action(
-        format!(
-            "project {project} last stored candidate {generation} (commit {commit}, state \
-             {state}{stored}){diagnostic} is not served: {serving}"
-        ),
-        publisher_status_call(project),
-    ))
+    let message = format!(
+        "project {project} last stored candidate {generation} (commit {commit}, state \
+         {state}{stored}){diagnostic} is not served: {serving}"
+    );
+    Some(if state == "ready" {
+        Finding::action(message, publisher_status_call(project))
+    } else {
+        Finding::warn(format!("{message}; the producer's next upload replaces it"))
+    })
 }
 
 /// Whether a project can ever hold an accepted publication: it needs a
@@ -2844,6 +2890,92 @@ mod catalog_health_tests {
             report
         );
         assert!(recovered.contains("p_health_34"));
+    }
+
+    /// The last-candidate check changes what a current pointer is reported
+    /// as: an unread candidate is said so and not counted as current, a
+    /// Ready unserved candidate is an action, a Failed one is a warning, and
+    /// undecodable index entries are reported once for all projects.
+    #[test]
+    fn the_last_candidate_check_qualifies_a_current_pointer() {
+        use crate::server::state::LastCandidateRuntimeView;
+
+        crate::init_system_memory_for_tests();
+        let fixture = CatalogFixture::new();
+        let scope = CatalogFixture::scope(".");
+        fixture.add_published_project(PROJECT, &scope);
+        fixture.install_publication(
+            PROJECT,
+            &scope,
+            COMMIT_ONE,
+            &[knowledge_entry("k1", "a")],
+            &[],
+        );
+        let server = fixture.server();
+        let current = status(&server);
+        assert_eq!(current.accepted.state, "current");
+        assert_eq!(current.last_candidate.status, "none");
+        let healthy = accepted_publication_section(std::slice::from_ref(&current));
+        assert_eq!(healthy.worst(), FindingLevel::Ok);
+
+        let mut unread = current.clone();
+        unread.last_candidate = LastCandidateRuntimeView::absent("unavailable");
+        let section = accepted_publication_section(std::slice::from_ref(&unread));
+        assert_eq!(section.worst(), FindingLevel::Warn);
+        let text = serde_json::to_string(&section).unwrap();
+        assert!(
+            text.contains("could not be read for 1 project(s)"),
+            "{text}"
+        );
+        assert!(text.contains(PROJECT), "{text}");
+        assert!(!text.contains("serve their current"), "{text}");
+
+        let unserved = |state: &'static str| {
+            let mut status = current.clone();
+            status.last_candidate = LastCandidateRuntimeView {
+                status: "stored",
+                source_generation_id: Some(format!("kps_{}", "2".repeat(64))),
+                producer_id: Some("producer-a".into()),
+                full_ref: Some("refs/heads/main".into()),
+                publisher_commit: Some(COMMIT_TWO.into()),
+                state: Some(state),
+                created_unix_secs: Some(1_700_000_000),
+                diagnostic: None,
+                served_by_pointer: Some(false),
+                unreadable_index_entry_count: 0,
+                unreadable_index_entries: Vec::new(),
+            };
+            accepted_publication_section(&[status])
+        };
+        let ready = unserved("ready");
+        assert_eq!(ready.worst(), FindingLevel::Action);
+        assert!(ready.findings[0].next.is_some());
+        let failed = unserved("failed");
+        assert_eq!(failed.worst(), FindingLevel::Warn);
+        assert!(failed.findings[0].next.is_none());
+        assert!(failed.findings[0].message.contains("is not served"));
+        // In flight or set aside: not reported, still current.
+        assert_eq!(unserved("superseded").worst(), FindingLevel::Ok);
+
+        let mut damaged = current.clone();
+        damaged.last_candidate.unreadable_index_entry_count = 2;
+        damaged.last_candidate.unreadable_index_entries = vec!["kps_bad.json".into()];
+        let section = accepted_publication_section(&[damaged.clone(), damaged]);
+        let named = section
+            .findings
+            .iter()
+            .filter(|finding| finding.message.contains("could not be decoded"))
+            .collect::<Vec<_>>();
+        assert_eq!(named.len(), 1, "{:?}", section.findings);
+        assert!(
+            named[0]
+                .message
+                .contains("2 stored candidate index entries")
+        );
+        assert!(named[0].message.contains("kps_bad.json, ..."));
+        // The projects' own candidates were read: nothing says they went
+        // unchecked, and the index finding is the section's only one.
+        assert_eq!(section.findings.len(), 1, "{:?}", section.findings);
     }
 
     /// Accepted Current, and the section says so without inventing findings.

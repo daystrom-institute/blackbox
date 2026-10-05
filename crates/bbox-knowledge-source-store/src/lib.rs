@@ -619,6 +619,11 @@ fn read_child_directories(path: &Path, allowed_files: &[&str]) -> Result<Vec<Pat
     Ok(directories)
 }
 
+/// Name prefix of the temporary member an atomic replace stages in its target
+/// directory before the rename. A scan that takes no mutation lock can see
+/// one and must pass over it.
+const ATOMIC_REPLACE_TEMP_PREFIX: &str = ".bbox-store-";
+
 fn read_regular_json_files(path: &Path) -> Result<Vec<PathBuf>> {
     read_regular_json_files_except(path, None)
 }
@@ -897,6 +902,17 @@ pub struct StoredPublicationCandidateV1 {
     pub created_unix_nanos: u128,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diagnostic: Option<String>,
+}
+
+/// What [`KnowledgeSourceStore::latest_publication_candidate`] found.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LatestPublicationCandidateV1 {
+    /// `None` when the project has no stored candidate.
+    pub candidate: Option<StoredPublicationCandidateV1>,
+    /// File names of generation index entries that could not be decoded,
+    /// sorted. Their project is unknown, so a candidate behind one is
+    /// missing from every project's answer.
+    pub unreadable_index_entries: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1482,7 +1498,10 @@ impl KnowledgeSourceStore {
         // published. The lane-bearing candidate is the current one, so a
         // lane-less match is only the fallback.
         let mut lane_less = None;
-        for path in read_regular_json_files(&self.root.join("publications/generation-index"))? {
+        for path in read_regular_json_files_except(
+            &self.root.join("publications/generation-index"),
+            Some(ATOMIC_REPLACE_TEMP_PREFIX),
+        )? {
             let index = read_json::<PublicationGenerationIndexV1>(
                 &self.root.join("publications/generation-index"),
                 &file_name(&path)?,
@@ -1516,26 +1535,34 @@ impl KnowledgeSourceStore {
     }
 
     /// The candidate stored most recently for one project, by its creation
-    /// time, whatever its state and whichever producer uploaded it. `None`
-    /// when the project has no stored candidate. Observational: it takes no
-    /// mutation lock, so a generation retired between the index read and the
-    /// record read is passed over rather than reported as damage.
+    /// time, whatever its state and whichever producer uploaded it.
+    ///
+    /// Observational: it takes no mutation lock. A staged atomic-replace
+    /// member is passed over, and so is a generation retired between the
+    /// index read and the record read. An index entry that cannot be decoded
+    /// belongs to an unknown project, so it is named in the result instead
+    /// of failing the read for every project.
     pub fn latest_publication_candidate(
         &self,
         project_id: &str,
-    ) -> Result<Option<StoredPublicationCandidateV1>> {
+    ) -> Result<LatestPublicationCandidateV1> {
         validate_project_id(project_id)?;
         let index_dir = self.root.join("publications/generation-index");
-        let mut latest: Option<StoredPublicationCandidateV1> = None;
-        for path in read_regular_json_files(&index_dir)? {
-            let Some(index) = read_json::<PublicationGenerationIndexV1>(
+        let mut latest = LatestPublicationCandidateV1::default();
+        for path in read_regular_json_files_except(&index_dir, Some(ATOMIC_REPLACE_TEMP_PREFIX))? {
+            let name = file_name(&path)?;
+            let index = match read_json::<PublicationGenerationIndexV1>(
                 &index_dir,
-                &file_name(&path)?,
+                &name,
                 MAX_GENERATION_RECORD_BYTES,
                 "publication generation index",
-            )?
-            else {
-                continue;
+            ) {
+                Ok(Some(index)) => index,
+                Ok(None) => continue,
+                Err(_) => {
+                    latest.unreadable_index_entries.push(name);
+                    continue;
+                }
             };
             if index.version != STORE_VERSION || index.project_id != project_id {
                 continue;
@@ -1552,12 +1579,12 @@ impl KnowledgeSourceStore {
                 }
                 Err(error) => return Err(error),
             };
-            let newer = latest.as_ref().is_none_or(|held| {
+            let newer = latest.candidate.as_ref().is_none_or(|held| {
                 (source.created_unix_secs, source.created_unix_nanos)
                     > (held.created_unix_secs, held.created_unix_nanos)
             });
             if newer {
-                latest = Some(source);
+                latest.candidate = Some(source);
             }
         }
         Ok(latest)
@@ -4485,7 +4512,7 @@ mod tests {
             store
                 .latest_publication_candidate(&authority.project_id)
                 .unwrap(),
-            None
+            LatestPublicationCandidateV1::default()
         );
 
         let (first, _, _) = publication_fixture();
@@ -4493,6 +4520,7 @@ mod tests {
         let latest = store
             .latest_publication_candidate(&authority.project_id)
             .unwrap()
+            .candidate
             .unwrap();
         assert_eq!(latest.source_generation_id, first_generation);
         assert_eq!(latest.state, SourceGenerationStateV1::Ready);
@@ -4504,6 +4532,7 @@ mod tests {
         let latest = store
             .latest_publication_candidate(&authority.project_id)
             .unwrap()
+            .candidate
             .unwrap();
         assert_eq!(latest.source_generation_id, second_generation);
         assert_eq!(latest.descriptor.publisher_commit, second.publisher_commit);
@@ -4512,13 +4541,57 @@ mod tests {
 
         // Candidates are per project.
         assert_eq!(
-            store.latest_publication_candidate("project-b").unwrap(),
+            store
+                .latest_publication_candidate("project-b")
+                .unwrap()
+                .candidate,
             None
         );
         assert_store_error(
             store.latest_publication_candidate("../project-a"),
             StoreRequestError::InvalidInput,
         );
+    }
+
+    /// Neither unlocked scan of the generation index fails on a member an
+    /// atomic replace has staged there, and one undecodable entry is named
+    /// without hiding the candidates beside it.
+    #[test]
+    fn index_scans_pass_over_staged_members_and_name_undecodable_entries() {
+        let (_temporary, root, store) = test_store(StoreLimits::default());
+        let authority = publication_authority();
+        let (descriptor, _, _) = publication_fixture();
+        let generation = upload_candidate(&store, descriptor.clone(), &[]);
+        let index_dir = root.join("publications/generation-index");
+
+        fs::write(index_dir.join(".bbox-store-4242-7.tmp"), b"{\"partial\":").unwrap();
+        let latest = store
+            .latest_publication_candidate(&authority.project_id)
+            .unwrap();
+        assert_eq!(latest.candidate.unwrap().source_generation_id, generation);
+        assert!(latest.unreadable_index_entries.is_empty());
+        let probed = store
+            .probe_publication(
+                &authority,
+                &descriptor.full_ref,
+                &descriptor.publisher_commit,
+                descriptor.object_format,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(probed.source_generation_id, generation);
+
+        let undecodable = format!("kps_{}.json", "f".repeat(64));
+        fs::write(index_dir.join(&undecodable), b"{not json").unwrap();
+        let latest = store
+            .latest_publication_candidate(&authority.project_id)
+            .unwrap();
+        assert_eq!(latest.candidate.unwrap().source_generation_id, generation);
+        assert_eq!(latest.unreadable_index_entries, vec![undecodable.clone()]);
+        // A project with no candidate still learns that an entry is unreadable.
+        let other = store.latest_publication_candidate("project-b").unwrap();
+        assert_eq!(other.candidate, None);
+        assert_eq!(other.unreadable_index_entries, vec![undecodable]);
     }
 
     #[test]

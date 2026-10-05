@@ -217,10 +217,17 @@ and after a restart:
   whose source generation it names; a pointer bound to an attachment serves a
   candidate with the same ref and commit.
 
-`bbox_doctor` reports a project whose newest stored candidate is Ready or
-Failed and is not served by the pointer, whatever the pointer's own state. A
-candidate that never arrives leaves no stored record, so a silent producer is
-not visible from these two facts.
+`bbox_doctor` reports a project whose newest stored candidate is not served
+by the pointer, whatever the pointer's own state: an action for a Ready
+candidate (acceptance refused it or never ran, and an operator move can serve
+it), a warning for a Failed one (the producer's next upload replaces it).
+A project whose candidate could not be read is named and not counted as
+serving its current generation. The candidate read takes no lock: it passes
+over a staged atomic-replace member and a generation retired mid-scan, and a
+generation index entry it cannot decode is reported once for all projects
+rather than failing the read, since its project is unknown. A candidate that
+never arrives leaves no stored record, so a silent producer is not visible
+from these two facts.
 
 Each acceptance logs one `catalog administration mutation` line with
 `tool = "candidate_acceptance"` and an audit reason of the form
