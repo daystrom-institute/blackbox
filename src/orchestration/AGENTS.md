@@ -98,6 +98,13 @@ Domain home for the dispatch plane. Boundary contract:
   (`received_at_ms`). The idle notice is computed from conversation events
   only, so a worker blocked in one long shell command goes idle whatever its
   reports do, which is the case the stored report exists to explain.
+- **The stored report is shown where idleness is.** The full supervision
+  snapshot carries it as `shell_sessions` whenever one is stored; the green
+  response carries it only alongside `idle_seconds`, so a quiet worker's
+  response says which commands it is still waiting on and a busy one stays
+  the bare sentinel. The field states the report's own age
+  (`report_age_seconds`) and whether this daemon process received it
+  (`from_this_run`); row ages are as of the report.
 - **Reports are change-driven, never periodic.** The worker publishes one
   when its process starts and when a shell session starts, ends or is
   removed, and at no other time. Do not add a timer-driven publisher.

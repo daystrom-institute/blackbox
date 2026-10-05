@@ -194,6 +194,22 @@ pub struct ShellSessionsObservation {
     pub observed_this_run: bool,
 }
 
+impl ShellSessionsObservation {
+    /// The report as a response field. `report_age_seconds` is how long ago
+    /// this daemon received it, and `from_this_run` is false for a report
+    /// restored from a persisted record, which describes the worker as it
+    /// was before this daemon process started. Every age inside the rows is
+    /// as of the report, not as of now.
+    fn response_json(&self, now_ms: u64) -> Value {
+        serde_json::json!({
+            "seq": self.seq,
+            "report_age_seconds": now_ms.saturating_sub(self.received_at_ms) / 1000,
+            "from_this_run": self.observed_this_run,
+            "sessions": self.sessions,
+        })
+    }
+}
+
 /// Whether `event` is a shell-session report addressed to a different session
 /// than `session_id`. Such a report must not be observed at all.
 pub fn is_foreign_shell_sessions_event(event: &Value, session_id: &str) -> bool {
@@ -467,6 +483,9 @@ impl SupervisionState {
             obj["idle_seconds"] = Value::from(idle);
             obj["idle_notice"] = Value::from(idle_notice(idle, self.tool_running));
         }
+        if let Some(report) = &self.shell_sessions {
+            obj["shell_sessions"] = report.response_json(now_ms);
+        }
 
         let compactions_in_window = self.compactions_within_window(cfg, now_ms);
         obj["compactions_in_window"] = Value::from(compactions_in_window);
@@ -508,6 +527,11 @@ impl SupervisionState {
             if let Some(idle) = self.idle_seconds(cfg, now_ms) {
                 obj["idle_seconds"] = Value::from(idle);
                 obj["tool_running"] = serde_json::to_value(self.tool_running).unwrap();
+                // The stored shell report is what explains an idle worker:
+                // which commands it is still waiting on.
+                if let Some(report) = &self.shell_sessions {
+                    obj["shell_sessions"] = report.response_json(now_ms);
+                }
             }
             return obj;
         }
@@ -1672,6 +1696,61 @@ mod tests {
 
     fn one_running() -> Value {
         json!([{ "id": "sh-1", "command": "sleep 600", "elapsed_ms": 1500, "running": true }])
+    }
+
+    #[test]
+    fn the_stored_shell_report_rides_the_idle_response_and_the_full_snapshot() {
+        let mut state = SupervisionState::default();
+        state.observe_event(&tool_call_event(), &sink_without_usage(), &cfg(), 0);
+        // Not idle yet and nothing stored: no field either way.
+        assert!(
+            state
+                .snapshot_for_response(&cfg(), 1_000)
+                .get("shell_sessions")
+                .is_none()
+        );
+        assert!(
+            state
+                .snapshot(&cfg(), 1_000)
+                .get("shell_sessions")
+                .is_none()
+        );
+
+        state.observe_event(
+            &shell_report(7, one_running()),
+            &sink_without_usage(),
+            &cfg(),
+            2_000,
+        );
+        // Still below the idle threshold: the green response stays the bare
+        // sentinel, the full snapshot carries the report.
+        let green = state.snapshot_for_response(&cfg(), 3_000);
+        assert!(green.get("shell_sessions").is_none(), "{green}");
+        let full = state.snapshot(&cfg(), 3_000);
+        assert_eq!(full["shell_sessions"]["seq"], 7);
+        assert_eq!(full["shell_sessions"]["report_age_seconds"], 1);
+        assert_eq!(full["shell_sessions"]["from_this_run"], true);
+        assert_eq!(full["shell_sessions"]["sessions"][0]["id"], "sh-1");
+        assert_eq!(full["shell_sessions"]["sessions"][0]["running"], true);
+
+        // Idle: the report rides along with the idle figures, which it does
+        // not change.
+        let idle = state.snapshot_for_response(&cfg(), 400_000);
+        assert_eq!(idle["ok"], true);
+        assert_eq!(idle["idle_seconds"], 400);
+        assert_eq!(idle["tool_running"], true);
+        assert_eq!(idle["shell_sessions"]["seq"], 7);
+        assert_eq!(idle["shell_sessions"]["report_age_seconds"], 398);
+        assert_eq!(
+            idle["shell_sessions"]["sessions"].as_array().unwrap().len(),
+            1
+        );
+
+        // A report restored from a record is marked as history.
+        let restored: SupervisionState =
+            serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+        let idle = restored.snapshot_for_response(&cfg(), 400_000);
+        assert_eq!(idle["shell_sessions"]["from_this_run"], false);
     }
 
     #[test]
