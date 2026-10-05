@@ -48,7 +48,7 @@ pub struct ProjectUnregisterParams {
     /// canonical_path, or an absolute path resolving to a registered project.
     pub project: String,
     /// Remove the registry entry even when project-scoped state
-    /// (knowledge, threads, notes, pins, ...) still references it.
+    /// (knowledge, threads, gaps, Slack bindings and links) still references it.
     /// Default false: the call refuses with the live ref counts so the
     /// caller can migrate or accept the orphaning explicitly.
     #[serde(default)]

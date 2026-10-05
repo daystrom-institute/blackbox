@@ -43,7 +43,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_reindex",
-        description = "Queue a full or incremental search-index update. Returns after admission by default; wait=true is for internal migrations that require completion."
+        description = "Queue a full or incremental search-index update. Returns after admission by default; wait=true is for internal migrations that require completion. Never indexes project graphs: a pass only carries existing graph documents forward, and a graph becomes searchable when its published view is installed."
     )]
     pub(crate) async fn bbox_reindex(
         &self,
