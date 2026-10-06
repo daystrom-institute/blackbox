@@ -49,10 +49,23 @@
 #   --json                 print the raw probe JSON instead of the summary
 #   --url URL              daemon base URL (default $BBOX_URL, else
 #                          http://127.0.0.1:${BBOX_PORT:-7264})
+#   --admin-token-file F   file holding the daemon's admin token, sent as
+#                          Authorization: Bearer on every /admin call (default
+#                          $BBOX_ADMIN_TOKEN_FILE, else
+#                          $HOME/.local/state/blackbox/admin.token, the file
+#                          converge.sh reads). The daemon admits /admin/* from
+#                          loopback or with this bearer; a file that is
+#                          missing or not a 64-hex token is an error (exit 2),
+#                          never a silent unauthenticated call.
 #
 # EXIT CODES
-#   0  quiescent (safe to converge)             2  daemon unreachable / bad probe
-#   1  orchestration active (would sandbag)     3  --drain timed out still active
+#   0  quiescent (safe to converge)             2  daemon unreachable, refused
+#   1  orchestration active (would sandbag)        or bad probe; admin token
+#   3  --drain timed out still active              file unreadable
+#
+# A non-2xx answer from the daemon is printed with its status and body, so a
+# refused bearer (401, a rotated or unreadable admin token on either side)
+# is visible at the first call.
 #
 # Dependencies: bash, curl, python3 (no jq).
 
@@ -66,8 +79,9 @@ REASON=""
 RELEASE_ON_TIMEOUT=0
 RAW_JSON=0
 URL="${BBOX_URL:-http://127.0.0.1:${BBOX_PORT:-7264}}"
+ADMIN_TOKEN_FILE="${BBOX_ADMIN_TOKEN_FILE:-$HOME/.local/state/blackbox/admin.token}"
 
-usage() { sed -n '2,60p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,70p' "$0" | sed 's/^# \{0,1\}//'; }
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -81,6 +95,7 @@ while [ $# -gt 0 ]; do
         --release-on-timeout) RELEASE_ON_TIMEOUT=1 ;;
         --json) RAW_JSON=1 ;;
         --url) URL="$2"; shift ;;
+        --admin-token-file) ADMIN_TOKEN_FILE="$2"; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "converge-gate: unknown argument: $1" >&2; usage >&2; exit 2 ;;
     esac
@@ -88,14 +103,43 @@ while [ $# -gt 0 ]; do
 done
 URL="${URL%/}"
 
+# The admin token is read once, before any call, so a missing or malformed
+# file fails the whole run instead of letting one call go out without it.
+if [ ! -r "$ADMIN_TOKEN_FILE" ]; then
+    echo "converge-gate: admin token file missing or unreadable: $ADMIN_TOKEN_FILE (pass --admin-token-file or set BBOX_ADMIN_TOKEN_FILE)" >&2
+    exit 2
+fi
+ADMIN_TOKEN="$(tr -d '\n' < "$ADMIN_TOKEN_FILE")"
+if ! [[ "$ADMIN_TOKEN" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "converge-gate: admin token file $ADMIN_TOKEN_FILE does not hold a 64-hex token" >&2
+    exit 2
+fi
+# curl reads the header from a config file on fd 3, so the token never
+# appears on a command line. A non-2xx answer is reported with its status
+# and body instead of being swallowed by -f.
+admin_curl() {
+    local out code body
+    out=$(curl -sS --max-time 10 -K /dev/fd/3 -w $'\n%{http_code}' "$@" \
+        3< <(printf 'header = "Authorization: Bearer %s"\n' "$ADMIN_TOKEN")) || return $?
+    code="${out##*$'\n'}"
+    body="${out%$'\n'*}"
+    if [ "$code" -lt 200 ] || [ "$code" -ge 300 ]; then
+        echo "converge-gate: daemon answered HTTP $code: ${body:-<empty body>}" >&2
+        if [ "$code" = 401 ]; then
+            echo "converge-gate: the admin bearer was refused; the token in $ADMIN_TOKEN_FILE does not match the daemon's admin_token_file (rotated, or unreadable on the daemon side: see its log)" >&2
+        fi
+        return 22
+    fi
+    printf '%s' "$body"
+}
+
 probe() {
-    curl -fsS --max-time 10 \
-        "$URL/admin/orchestration-activity?writes_window_minutes=$WRITES_WINDOW"
+    admin_curl "$URL/admin/orchestration-activity?writes_window_minutes=$WRITES_WINDOW"
 }
 
 drain_post() {
     # $1 = true|false
-    python3 - "$1" "$REASON" <<'PY' | curl -fsS --max-time 10 -X POST \
+    python3 - "$1" "$REASON" <<'PY' | admin_curl -X POST \
         -H 'content-type: application/json' --data-binary @- "$URL/admin/drain"
 import json, sys
 draining = sys.argv[1] == "true"
@@ -165,7 +209,8 @@ fetch_probe() {
 
 case "$MODE" in
     status)
-        fetch_probe | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin), indent=2))'
+        snapshot=$(fetch_probe)
+        printf '%s' "$snapshot" | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin), indent=2))'
         exit 0
         ;;
     clear)

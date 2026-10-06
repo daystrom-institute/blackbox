@@ -31,12 +31,14 @@ active (drain is left set unless `--release-on-timeout`).
 
 ## Probe: `GET /admin/orchestration-activity`
 
-Loopback-only admin route (same trust model as `/admin/runtime-metrics`).
-Cheap: in-memory reads only, no I/O. Query: `writes_window_minutes`
-(default 10, clamped to 24h).
+Admin route (same trust model as `/admin/runtime-metrics`): admitted from a
+loopback peer, or from anywhere with `Authorization: Bearer <admin token>`,
+the token in the daemon's `admin_token_file`. Cheap: in-memory reads only,
+no I/O. Query: `writes_window_minutes` (default 10, clamped to 24h).
 
 ```bash
-curl -s "http://127.0.0.1:${BBOX_PORT:-7264}/admin/orchestration-activity?writes_window_minutes=10"
+curl -s -H "Authorization: Bearer $(cat ~/.local/state/blackbox/admin.token)" \
+  "http://127.0.0.1:${BBOX_PORT:-7264}/admin/orchestration-activity?writes_window_minutes=10"
 ```
 
 Payload shape:
@@ -63,6 +65,8 @@ Long-poll waiters are RAII-registered inside `bro_wait`,
 ## Drain: `GET|POST /admin/drain`
 
 ```bash
+# From the daemon host over loopback; from anywhere else add
+# -H "Authorization: Bearer $(cat ~/.local/state/blackbox/admin.token)".
 curl -s http://127.0.0.1:7264/admin/drain
 curl -s -X POST -H 'content-type: application/json' \
   -d '{"draining": true, "reason": "converge 1.2.3", "set_by": "me"}' \
@@ -93,6 +97,11 @@ file by hand only takes effect at the next daemon start.
 
 `scripts/converge-gate [--drain|--clear|--status] [--timeout S] [--interval S]
 [--writes-window MIN] [--reason TEXT] [--release-on-timeout] [--json]
-[--url URL]`. Daemon URL defaults to `$BBOX_URL`, else
-`http://127.0.0.1:${BBOX_PORT:-7264}`. Dependencies: bash, curl, python3
-(no jq). The header of the script carries the same reference.
+[--url URL] [--admin-token-file F]`. Daemon URL defaults to `$BBOX_URL`, else
+`http://127.0.0.1:${BBOX_PORT:-7264}`. Every `/admin` call carries
+`Authorization: Bearer` with the token from `--admin-token-file` (default
+`$BBOX_ADMIN_TOKEN_FILE`, else `$HOME/.local/state/blackbox/admin.token`, the
+file `converge.sh` reads); a missing or malformed token file exits 2 before
+any call is made, and a non-2xx answer is printed with its status and body,
+so a refused bearer (401) names itself at the first drain. Dependencies: bash, curl, python3 (no jq). The header of
+the script carries the same reference.

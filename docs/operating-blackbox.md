@@ -64,6 +64,13 @@ install -m 755 target/release/{bbox-code-collector,bbox-transcript-collector} ~/
 Kickstart the collectors after installing them. New sessions pick up a new
 `bro-harness` without a restart.
 
+Gate the roll with `scripts/converge-gate --drain` and reopen admission with
+`scripts/converge-gate --clear` (`docs/converge-gate.md`). The daemon admits
+`/admin/*` from loopback or with the admin bearer, so from the operator host
+the script sends `Authorization: Bearer` from `--admin-token-file` (default
+`~/.local/state/blackbox/admin.token`, the file `converge.sh` reads) and
+refuses to run without it.
+
 ### Offline project-catalog administration
 
 The `blackbox project-catalog` commands do not contact or restart the daemon.
