@@ -26,7 +26,8 @@ Important state/config env vars:
   `BBOX_MCP_SESSION_KEEPALIVE_SECS`, `BBOX_MCP_MODERN_LIFECYCLE` (serve
   MCP 2026-07-28 sessionless requests and `server/discover`; default off,
   read at daemon start),
-  `BLACKBOX_SHUTDOWN_GRACE_SECS`,
+  `BLACKBOX_SHUTDOWN_GRACE_SECS`, `BLACKBOX_ADMIN_TOKEN_FILE` (bearer that admits
+  non-loopback peers to `/admin/*`; without it the plane is loopback-only),
   `BBOX_CONTEXT_CEILING_RATIO` (legacy roster telemetry threshold; default
   0.8, must be in `(0, 1]`, read once per process). Ordinary MCP status,
   wait and dashboard replies omit context telemetry. Explicit status debug
