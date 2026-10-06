@@ -156,8 +156,11 @@ own MCP server automatically whenever `service_token_file` is set (an
 `Authorization` header in their MCP config that refers to the
 `BLACKBOX_MCP_BEARER` variable in their environment, scrubbed from shell
 children). CLIs on an operator host present the token in
-`[client].token_file` (`BLACKBOX_CLIENT_TOKEN_FILE`); an MCP client such
-as a Claude configuration sends its own `Authorization: Bearer` header.
+`[client].token_file` (`BLACKBOX_CLIENT_TOKEN_FILE`); a token file that is
+set but cannot be read makes `bro mcp call` and `bro tail` fail at once and
+leaves the Fleet client sending nothing, so with the gate on every one of
+its calls is refused with 401 (the warning names the file). An MCP client
+such as a Claude configuration sends its own `Authorization: Bearer` header.
 
 ### Checkout authority
 

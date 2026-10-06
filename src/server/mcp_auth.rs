@@ -151,6 +151,20 @@ impl McpAuth {
     }
 }
 
+/// The credentials of an `Authorization` value in the `Bearer` scheme: the
+/// scheme name is case-insensitive (RFC 7235) and is followed by exactly one
+/// space; anything else is not a bearer at all.
+fn bearer_credentials(value: &str) -> Option<&str> {
+    let (scheme, credentials) = value.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("bearer")
+        || credentials.is_empty()
+        || credentials.starts_with(' ')
+    {
+        return None;
+    }
+    Some(credentials)
+}
+
 /// The layer over `/mcp` and `/control/*`.
 pub(crate) async fn authenticate_mcp_request(
     State(auth): State<McpAuth>,
@@ -167,8 +181,7 @@ pub(crate) async fn authenticate_mcp_request(
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .map(str::trim);
+        .and_then(bearer_credentials);
     if auth.admits(peer, bearer) {
         return next.run(request).await;
     }
@@ -323,10 +336,26 @@ mod tests {
                 (StatusCode::UNAUTHORIZED, true),
                 "{method} {uri} wrong bearer"
             );
+            let mut two_spaces = request(method.clone(), uri, Some(REMOTE), None, body);
+            two_spaces.headers_mut().insert(
+                header::AUTHORIZATION,
+                format!("Bearer  {secret}").parse().unwrap(),
+            );
+            assert_eq!(
+                status(&app, two_spaces).await,
+                (StatusCode::UNAUTHORIZED, true),
+                "{method} {uri} two spaces"
+            );
+            let mut lowercase = request(method.clone(), uri, Some(REMOTE), None, body);
+            lowercase.headers_mut().insert(
+                header::AUTHORIZATION,
+                format!("bearer {secret}").parse().unwrap(),
+            );
             for admitted in [
                 request(method.clone(), uri, Some(LOOPBACK), None, body),
                 request(method.clone(), uri, Some(TRUSTED), None, body),
                 request(method.clone(), uri, Some(REMOTE), Some(&secret), body),
+                lowercase,
             ] {
                 let (status, _) = status(&app, admitted).await;
                 assert_ne!(status, StatusCode::UNAUTHORIZED, "{method} {uri} admitted");
@@ -410,6 +439,18 @@ mod tests {
         for bad in ["", "lan", "192.168.0.0/33", "2001:db8::/129", "10.0.0.0/-1"] {
             assert!(PeerNetwork::parse(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn the_bearer_scheme_is_case_insensitive_with_exactly_one_space() {
+        assert_eq!(bearer_credentials("Bearer abc"), Some("abc"));
+        assert_eq!(bearer_credentials("bearer abc"), Some("abc"));
+        assert_eq!(bearer_credentials("BEARER abc"), Some("abc"));
+        assert_eq!(bearer_credentials("Bearer  abc"), None);
+        assert_eq!(bearer_credentials("Bearer"), None);
+        assert_eq!(bearer_credentials("Bearer "), None);
+        assert_eq!(bearer_credentials("Basic abc"), None);
+        assert_eq!(bearer_credentials("abc"), None);
     }
 
     #[test]
