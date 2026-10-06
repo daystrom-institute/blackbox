@@ -34,6 +34,7 @@ pub async fn run() -> anyhow::Result<()> {
     // (or `daemon.executor = "local"`) is the explicit escape back to
     // daemon-child workers. Installing here also arms fleetd re-adoption, which
     // starts once the listener is bound and background state is restored.
+    crate::orchestration::configure_worker_mcp_bearer(cfg.daemon.service_token_file.as_deref())?;
     crate::orchestration::install_configured_harness_executor(
         cfg.daemon.executor,
         store_dir.clone(),
@@ -62,7 +63,7 @@ pub async fn run() -> anyhow::Result<()> {
 
     // MCP service
     let ct = CancellationToken::new();
-    let app = build_http_app(shared.clone(), &cfg, &ct);
+    let app = build_http_app(shared.clone(), &cfg, &ct)?;
 
     // Bind address resolved above (hoisted so SharedState gets the
     // loopback flag). Default `127.0.0.1`; BBOX_BIND=0.0.0.0 opens

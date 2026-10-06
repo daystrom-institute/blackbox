@@ -140,6 +140,25 @@ The `/admin/*` HTTP plane requires a loopback peer or
 file configured via `daemon.admin_token_file` (`BLACKBOX_ADMIN_TOKEN_FILE`);
 with no token configured it is loopback-only.
 
+The `/mcp` and `/control/*` planes are open to any peer the Host allowlist
+admits until `daemon.mcp_require_bearer` (`BBOX_MCP_REQUIRE_BEARER=1`) is
+on. Then every request whose peer is neither loopback nor inside
+`daemon.mcp_trusted_peer_networks` (`BBOX_MCP_TRUSTED_PEER_NETWORKS`, a
+comma-separated list of addresses or `address/prefix`) must carry
+`Authorization: Bearer <token>` matching the daemon service token in
+`daemon.service_token_file` (`BLACKBOX_SERVICE_TOKEN_FILE`); a refused
+request gets a bare 401. The peer is the accepted connection's address:
+behind an ingress it is the ingress, so a trusted network admits a direct
+client (the worker host on the dispatch path) and never anything that
+arrived through the ingress. With the gate on, the daemon must load the
+token at startup or it does not start. Workers present the bearer to their
+own MCP server automatically whenever `service_token_file` is set (an
+`Authorization` header in their MCP config that refers to the
+`BLACKBOX_MCP_BEARER` variable in their environment, scrubbed from shell
+children). CLIs on an operator host present the token in
+`[client].token_file` (`BLACKBOX_CLIENT_TOKEN_FILE`); an MCP client such
+as a Claude configuration sends its own `Authorization: Bearer` header.
+
 ### Checkout authority
 
 A daemon that holds no project checkout (the containerized corpus daemon,

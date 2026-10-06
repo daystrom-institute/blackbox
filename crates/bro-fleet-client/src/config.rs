@@ -30,6 +30,11 @@ struct PartialConfig {
 struct PartialClient {
     #[serde(default)]
     daemon_url: Option<String>,
+    /// Owner-readable file holding the daemon service token this host's
+    /// CLIs present as `Authorization: Bearer` on `/mcp` and `/control/*`.
+    /// Needed once the daemon's bearer gate is on; harmless before.
+    #[serde(default)]
+    token_file: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -209,5 +214,83 @@ mod tests {
         );
         let cfg: PartialConfig = toml::from_str("[daemon]\nport = 1\n").unwrap();
         assert_eq!(cfg.client.daemon_url, None);
+    }
+}
+
+/// The bearer this host's CLIs present to the daemon: the token in
+/// `BLACKBOX_CLIENT_TOKEN_FILE`, else config `[client].token_file`
+/// (tilde-expanded). `None` when neither is set. A file that is set but
+/// cannot be read, or does not hold one token, is an error: a client that
+/// quietly sent nothing would be refused with no hint why.
+pub fn client_bearer() -> anyhow::Result<Option<String>> {
+    let path = match std::env::var("BLACKBOX_CLIENT_TOKEN_FILE")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        Some(value) => Some(expand_tilde(value.trim())),
+        None => load_partial()
+            .client
+            .token_file
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(expand_tilde),
+    };
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let text = std::fs::read_to_string(&path).map_err(|error| {
+        anyhow::anyhow!(
+            "client token file {} (BLACKBOX_CLIENT_TOKEN_FILE or [client].token_file): {error}",
+            path.display()
+        )
+    })?;
+    let token = text.trim();
+    if token.len() != 64 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        anyhow::bail!(
+            "client token file {} must hold one 64 hex digit daemon service token",
+            path.display()
+        );
+    }
+    Ok(Some(token.to_string()))
+}
+
+/// Default request headers for a daemon HTTP client: the bearer when one is
+/// configured, nothing otherwise.
+pub fn bearer_headers() -> anyhow::Result<reqwest::header::HeaderMap> {
+    let mut headers = reqwest::header::HeaderMap::new();
+    if let Some(token) = client_bearer()? {
+        let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))?;
+        value.set_sensitive(true);
+        headers.insert(reqwest::header::AUTHORIZATION, value);
+    }
+    Ok(headers)
+}
+
+#[cfg(test)]
+mod bearer_tests {
+    use super::*;
+
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn the_client_bearer_comes_from_the_env_file_and_is_checked() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("good.token");
+        std::fs::write(&good, format!("{}\n", "a".repeat(64))).unwrap();
+        let bad = dir.path().join("bad.token");
+        std::fs::write(&bad, "not a token").unwrap();
+        // SAFETY: nextest runs each test in its own process.
+        unsafe { std::env::set_var("BLACKBOX_CLIENT_TOKEN_FILE", &good) };
+        assert_eq!(
+            client_bearer().unwrap().as_deref(),
+            Some("a".repeat(64).as_str())
+        );
+        let headers = bearer_headers().unwrap();
+        assert!(headers[reqwest::header::AUTHORIZATION].is_sensitive());
+        unsafe { std::env::set_var("BLACKBOX_CLIENT_TOKEN_FILE", &bad) };
+        assert!(client_bearer().is_err());
+        unsafe { std::env::set_var("BLACKBOX_CLIENT_TOKEN_FILE", dir.path().join("missing")) };
+        assert!(client_bearer().is_err());
+        unsafe { std::env::remove_var("BLACKBOX_CLIENT_TOKEN_FILE") };
     }
 }

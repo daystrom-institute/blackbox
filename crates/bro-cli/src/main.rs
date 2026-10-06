@@ -163,6 +163,7 @@ async fn run_tail_stream_printer(sel: TailSelectors) -> anyhow::Result<()> {
     let url = tail_url(&sel);
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
+        .default_headers(bro_fleet_client::bearer_headers()?)
         .build()?;
 
     loop {

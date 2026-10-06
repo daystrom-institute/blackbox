@@ -17,7 +17,7 @@ pub(super) fn build_http_app(
     shared: Arc<SharedState>,
     cfg: &config::Config,
     ct: &CancellationToken,
-) -> axum::Router {
+) -> anyhow::Result<axum::Router> {
     let server_config = StreamableHttpServerConfig::default()
         .with_allowed_hosts(cfg.daemon.mcp_allowed_hosts.clone())
         .with_cancellation_token(ct.child_token())
@@ -77,16 +77,24 @@ pub(super) fn build_http_app(
             super::admin_auth::authenticate_admin_request,
         ));
 
-    axum::Router::new()
-        // The HTTP router is constructed only after durable state has opened,
-        // so a reachable route proves startup completed as well as liveness.
-        .route("/healthz", axum::routing::get(health_probe))
-        .route("/readyz", axum::routing::get(health_probe))
-        .route("/tail", axum::routing::get(tail_handler))
-        // Generic orchestration control plane. These are thin HTTP adapters over
-        // the `bro_*` dispatch/control tools, shared by every external driver
-        // (the fleet client, future bridges). The canonical namespace is
-        // `/control/*`.
+    // The MCP bearer gate (`super::mcp_auth`) covers the nested `/mcp`
+    // service and exactly the `/control/*` routes; off by default. A gate
+    // that is on but cannot load its token stops startup here.
+    let mcp_auth = super::mcp_auth::McpAuth::from_config(&cfg.daemon)?;
+    let mcp_gate = || {
+        axum::middleware::from_fn_with_state(
+            mcp_auth.clone(),
+            super::mcp_auth::authenticate_mcp_request,
+        )
+    };
+    let mcp_routes = axum::Router::new()
+        .nest_service("/mcp", mcp_service)
+        .layer(mcp_gate());
+    // Generic orchestration control plane. These are thin HTTP adapters over
+    // the `bro_*` dispatch/control tools, shared by every external driver
+    // (the fleet client, future bridges). The canonical namespace is
+    // `/control/*`.
+    let control_routes = axum::Router::new()
         .route("/control/exec", axum::routing::post(control_exec_handler))
         .route(
             "/control/resume",
@@ -125,6 +133,15 @@ pub(super) fn build_http_app(
             "/control/cancel",
             axum::routing::post(control_cancel_handler),
         )
+        .route_layer(mcp_gate());
+
+    Ok(axum::Router::new()
+        // The HTTP router is constructed only after durable state has opened,
+        // so a reachable route proves startup completed as well as liveness.
+        .route("/healthz", axum::routing::get(health_probe))
+        .route("/readyz", axum::routing::get(health_probe))
+        .route("/tail", axum::routing::get(tail_handler))
+        .merge(control_routes)
         .merge(admin_routes)
         .merge(super::code_source::router(shared.clone()))
         .merge(super::file_source::router(shared.clone()))
@@ -133,7 +150,7 @@ pub(super) fn build_http_app(
         .merge(super::git_source::router(shared.clone()))
         .merge(super::knowledge_source::router(shared.clone()))
         .with_state(shared)
-        .nest_service("/mcp", mcp_service)
+        .merge(mcp_routes))
 }
 
 #[cfg(test)]
@@ -148,7 +165,7 @@ mod tests {
         let shared = Arc::new(SharedState::for_test(dir.path()));
         let cfg = shared.config.read().clone();
         let ct = CancellationToken::new();
-        (build_http_app(shared.clone(), &cfg, &ct), shared)
+        (build_http_app(shared.clone(), &cfg, &ct).unwrap(), shared)
     }
 
     fn test_app() -> axum::Router {
@@ -214,7 +231,7 @@ mod tests {
         let shared = Arc::new(SharedState::for_test(dir.path()));
         let mut cfg = shared.config.read().clone();
         cfg.daemon.mcp_allowed_hosts = vec!["corpus.internal:7264".to_string()];
-        let app = build_http_app(shared, &cfg, &CancellationToken::new());
+        let app = build_http_app(shared, &cfg, &CancellationToken::new()).unwrap();
         let initialize = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,

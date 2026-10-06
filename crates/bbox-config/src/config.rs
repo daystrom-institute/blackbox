@@ -358,6 +358,21 @@ struct RawDaemonConfig {
     /// When absent, the admin plane stays loopback-only.
     #[serde(default)]
     pub admin_token_file: Option<PathBuf>,
+    /// Require the daemon service bearer on `/mcp` and `/control/*` for
+    /// every peer that is neither loopback nor inside
+    /// `mcp_trusted_peer_networks`. Off by default.
+    #[serde(default)]
+    pub mcp_require_bearer: bool,
+    /// Owner-readable file holding the daemon service token
+    /// (`bro_rpc::ServiceToken` shape) that `mcp_require_bearer` verifies.
+    /// Required when the gate is on.
+    #[serde(default)]
+    pub service_token_file: Option<PathBuf>,
+    /// Peer networks (`address` or `address/prefix`) whose connections pass
+    /// the MCP bearer gate without a bearer. Matched on the accepted
+    /// connection's address only, never on forwarded headers.
+    #[serde(default)]
+    pub mcp_trusted_peer_networks: Vec<String>,
 }
 
 /// Which executor turns a resolved spawn spec into a supervised worker.
@@ -636,6 +651,9 @@ pub struct DaemonConfig {
     /// The daemon holds no checkout; see `[daemon] no_checkout_authority`.
     pub no_checkout_authority: bool,
     pub admin_token_file: Option<PathBuf>,
+    pub mcp_require_bearer: bool,
+    pub service_token_file: Option<PathBuf>,
+    pub mcp_trusted_peer_networks: Vec<String>,
 }
 
 /// Index configuration
@@ -1141,6 +1159,9 @@ impl Config {
                 fleetd_worker_bro_home: None,
                 no_checkout_authority: false,
                 admin_token_file: None,
+                mcp_require_bearer: false,
+                service_token_file: None,
+                mcp_trusted_peer_networks: Vec::new(),
             },
             index: RawIndexConfig {
                 reindex_interval_secs: default_index_reindex_interval_secs(),
@@ -1317,6 +1338,26 @@ fn apply_explicit_env(raw: RawConfig) -> RawConfig {
         && !path.trim().is_empty()
     {
         raw.daemon.admin_token_file = Some(PathBuf::from(path));
+    }
+    if let Ok(value) = std::env::var("BBOX_MCP_REQUIRE_BEARER")
+        && let Some(require) = parse_env_bool(&value)
+    {
+        raw.daemon.mcp_require_bearer = require;
+    }
+    if let Ok(path) = std::env::var("BLACKBOX_SERVICE_TOKEN_FILE")
+        && !path.trim().is_empty()
+    {
+        raw.daemon.service_token_file = Some(PathBuf::from(path));
+    }
+    if let Ok(networks) = std::env::var("BBOX_MCP_TRUSTED_PEER_NETWORKS")
+        && !networks.trim().is_empty()
+    {
+        raw.daemon.mcp_trusted_peer_networks = networks
+            .split(',')
+            .map(str::trim)
+            .filter(|network| !network.is_empty())
+            .map(str::to_string)
+            .collect();
     }
 
     // poller_min_interval_secs
@@ -1556,6 +1597,9 @@ pub fn load_with(options: LoadOptions) -> Result<Config> {
             fleetd_worker_bro_home,
             no_checkout_authority: raw.daemon.no_checkout_authority,
             admin_token_file: raw.daemon.admin_token_file,
+            mcp_require_bearer: raw.daemon.mcp_require_bearer,
+            service_token_file: raw.daemon.service_token_file,
+            mcp_trusted_peer_networks: raw.daemon.mcp_trusted_peer_networks,
         },
         index: IndexConfig {
             reindex_interval_secs: raw.index.reindex_interval_secs,

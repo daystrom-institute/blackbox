@@ -129,6 +129,10 @@ Domain home for the dispatch plane. Boundary contract:
   (`BRO_HARNESS_MCP_HTTP_LIFECYCLE`). Add a harness switch there when a
   stray export in the daemon's or fleetd's environment must not change
   every worker on the host.
+- A worker presents the daemon service bearer to its own MCP server when
+  the daemon has one (`daemon.service_token_file`): the header value is
+  `$env:BLACKBOX_MCP_BEARER` and the token rides the spec env, on the
+  scrub list like every spec key. External MCP servers get no such header.
 
 ## Allocator binary eligibility follows the executor boundary
 

@@ -148,6 +148,7 @@ mod tests {
             &cfg,
             &tokio_util::sync::CancellationToken::new(),
         )
+        .unwrap()
     }
 
     fn get(peer: Option<SocketAddr>, bearer: Option<&str>) -> Request<Body> {

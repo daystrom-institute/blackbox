@@ -65,6 +65,43 @@ const WORKER_UNINHERITED_ENV_VARS: &[&str] = &["BRO_HARNESS_MCP_HTTP_LIFECYCLE"]
 
 const HARNESS_SPAWN_SCRUB_ENV: &str = "BRO_HARNESS_SPAWN_SCRUB";
 
+/// The worker-side variable that carries the daemon service bearer for the
+/// worker's own MCP server. The header in the worker's MCP config refers to
+/// it (`$env:`), so the secret rides the spec's SecretEnv and the scrub
+/// list, never the command line or a config file.
+pub const WORKER_MCP_BEARER_ENV: &str = "BLACKBOX_MCP_BEARER";
+
+static WORKER_MCP_BEARER: std::sync::OnceLock<Option<bro_rpc::ServiceToken>> =
+    std::sync::OnceLock::new();
+
+/// Load the daemon service token workers present to the daemon's MCP
+/// bearer gate (`daemon.service_token_file`). Called once at startup, before
+/// anything can dispatch; `None` means workers send no bearer, which is
+/// right while the gate is off. A configured file that cannot be loaded is
+/// a startup error: a daemon whose workers would be refused must not come
+/// up quietly.
+pub fn configure_worker_mcp_bearer(
+    service_token_file: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    let token = match service_token_file {
+        Some(path) => Some(bro_rpc::ServiceToken::load(path).map_err(|error| {
+            anyhow::anyhow!(
+                "daemon.service_token_file {} cannot be loaded for worker MCP bearers: {error}",
+                path.display()
+            )
+        })?),
+        None => None,
+    };
+    if WORKER_MCP_BEARER.set(token).is_err() {
+        anyhow::bail!("the worker MCP bearer was configured twice");
+    }
+    Ok(())
+}
+
+fn worker_mcp_bearer() -> Option<&'static bro_rpc::ServiceToken> {
+    WORKER_MCP_BEARER.get().and_then(Option::as_ref)
+}
+
 /// The process-wide executor every harness dispatch goes through.
 ///
 /// Installed once at daemon startup from `daemon.executor` (default `fleetd`).
@@ -3444,6 +3481,17 @@ fn prepare_harness_child_launch(
         env_overrides.unwrap_or_default().into_iter().collect();
     env.entry("BRO_HARNESS_PROVIDER".to_string())
         .or_insert_with(|| provider.as_str().to_string());
+    // The worker presents the daemon service bearer to its own MCP server
+    // whenever the daemon has one, whether or not the gate is on, so turning
+    // the gate on needs no change on the worker side.
+    if self_mcp_url.is_some()
+        && let Some(bearer) = worker_mcp_bearer()
+    {
+        env.insert(
+            WORKER_MCP_BEARER_ENV.to_string(),
+            bearer.expose_secret().to_string(),
+        );
+    }
     if let Some(binding) = &workspace_binding {
         env.insert(
             bro_protocol::WORKSPACE_BINDING_ENV.to_string(),
@@ -4043,7 +4091,12 @@ fn build_harness_mcp_config(
             .or_insert_with(|| serde_json::json!({}))
             .as_object_mut()
             .ok_or_else(|| anyhow::anyhow!("--mcp-config mcpServers must be a JSON object"))?;
-        add_transient_blackbox_mcp_server(servers, self_mcp_url, workspace_bound);
+        add_transient_blackbox_mcp_server(
+            servers,
+            self_mcp_url,
+            workspace_bound,
+            worker_mcp_bearer().is_some(),
+        );
         servers.is_empty()
     };
     let placement = parse_dispatch_tool_placement(tool_placement)?;
@@ -4064,6 +4117,7 @@ fn add_transient_blackbox_mcp_server(
     servers: &mut serde_json::Map<String, Value>,
     self_mcp_url: Option<&str>,
     workspace_bound: bool,
+    with_bearer: bool,
 ) {
     let Some(url) = self_mcp_url.filter(|s| !s.is_empty()) else {
         return;
@@ -4072,14 +4126,20 @@ fn add_transient_blackbox_mcp_server(
     // This name is reserved for the daemon capability channel. Replace a
     // caller-supplied collision so capability aliases cannot be redirected to
     // an unrelated server; all differently named MCP servers remain intact.
-    let headers = if workspace_bound {
-        serde_json::json!({
-            bro_protocol::WORKSPACE_BINDING_HEADER:
-                format!("$env:{}", bro_protocol::WORKSPACE_BINDING_ENV),
-        })
-    } else {
-        serde_json::json!({})
-    };
+    let mut headers = serde_json::Map::new();
+    if workspace_bound {
+        headers.insert(
+            bro_protocol::WORKSPACE_BINDING_HEADER.to_string(),
+            Value::String(format!("$env:{}", bro_protocol::WORKSPACE_BINDING_ENV)),
+        );
+    }
+    if with_bearer {
+        headers.insert(
+            "Authorization".to_string(),
+            Value::String(format!("$env:{WORKER_MCP_BEARER_ENV}")),
+        );
+    }
+    let headers = Value::Object(headers);
     servers.insert(
         name,
         serde_json::json!({
@@ -5883,6 +5943,101 @@ mod tests {
             config["mcpServers"]["selfbox"]["url"],
             "http://127.0.0.1:7264/mcp?surface=agent-internal"
         );
+    }
+
+    /// With a service token configured, a worker's own MCP server carries
+    /// the bearer as an `$env:` header and the spec env carries the value,
+    /// scrubbed from shell grandchildren; an external server gets nothing.
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn a_worker_presents_the_service_bearer_to_its_own_mcp_server() {
+        let mut env = crate::util::TestEnvGuard::new();
+        env.set("BLACKBOX_MCP_NAME", "selfbox");
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        env.set(
+            "BLACKBOX_CONFIG",
+            root.join("missing-config.toml").to_str().unwrap(),
+        );
+        let token_file = root.join("service.token");
+        let secret = bro_rpc::ServiceToken::load_or_create(&token_file)
+            .unwrap()
+            .expose_secret()
+            .to_string();
+        // One process, one configuration: a second test in this process
+        // would find it set, so this test owns the only call.
+        configure_worker_mcp_bearer(Some(&token_file)).unwrap();
+        assert!(configure_worker_mcp_bearer(None).is_err());
+
+        let spec = prepare_harness_child_launch(
+            "task-b".to_string(),
+            "sess-b".to_string(),
+            Provider::Glm,
+            vec![
+                "-p".to_string(),
+                "turn".to_string(),
+                "--mcp-config".to_string(),
+                serde_json::json!({
+                    "mcpServers": {
+                        "external": {"type": "http", "url": "http://127.0.0.1:9/mcp"}
+                    }
+                })
+                .to_string(),
+            ],
+            root.to_str(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            &root,
+            Some("http://127.0.0.1:7264/mcp?surface=default"),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            spec.env
+                .as_map()
+                .get(WORKER_MCP_BEARER_ENV)
+                .map(String::as_str),
+            Some(secret.as_str())
+        );
+        let scrub = spec.env.as_map().get(HARNESS_SPAWN_SCRUB_ENV).unwrap();
+        assert!(scrub.split(',').any(|key| key == WORKER_MCP_BEARER_ENV));
+        let mcp_config_index = spec
+            .argv
+            .iter()
+            .position(|arg| arg == "--mcp-config")
+            .unwrap();
+        let config: Value = serde_json::from_str(&spec.argv[mcp_config_index + 1]).unwrap();
+        assert_eq!(
+            config["mcpServers"]["selfbox"]["headers"]["Authorization"],
+            format!("$env:{WORKER_MCP_BEARER_ENV}")
+        );
+        assert!(config["mcpServers"]["external"]["headers"].is_null());
+        // The secret itself is never written into the config.
+        assert!(!spec.argv[mcp_config_index + 1].contains(&secret));
+
+        // Without a self MCP server there is nothing to present it to.
+        let spec = prepare_harness_child_launch(
+            "task-c".to_string(),
+            "sess-c".to_string(),
+            Provider::Glm,
+            vec!["-p".to_string(), "turn".to_string()],
+            root.to_str(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            &root,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(spec.env.as_map().get(WORKER_MCP_BEARER_ENV).is_none());
     }
 
     #[test]

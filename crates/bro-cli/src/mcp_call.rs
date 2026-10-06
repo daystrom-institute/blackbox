@@ -119,11 +119,15 @@ impl McpClient {
             mcp_url.query_pairs_mut().append_pair("surface", surface);
         }
         let mcp_url = mcp_url.to_string();
-        let client = if initialization_headers.is_empty() {
+        // The configured daemon bearer rides every request of this client,
+        // the handshake included.
+        let bearer = bro_fleet_client::bearer_headers()?;
+        let client = if initialization_headers.is_empty() && bearer.is_empty() {
             reqwest::Client::new()
         } else {
             reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
+                .default_headers(bearer)
                 .build()
                 .context("building credentialed MCP client")?
         };

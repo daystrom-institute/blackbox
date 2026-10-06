@@ -28,6 +28,9 @@ Important state/config env vars:
   read at daemon start),
   `BLACKBOX_SHUTDOWN_GRACE_SECS`, `BLACKBOX_ADMIN_TOKEN_FILE` (bearer that admits
   non-loopback peers to `/admin/*`; without it the plane is loopback-only),
+  `BBOX_MCP_REQUIRE_BEARER`, `BLACKBOX_SERVICE_TOKEN_FILE` and
+  `BBOX_MCP_TRUSTED_PEER_NETWORKS` (the bearer gate on `/mcp` and `/control/*`;
+  off by default), `BLACKBOX_CLIENT_TOKEN_FILE` (the bearer CLIs send),
   `BBOX_CONTEXT_CEILING_RATIO` (legacy roster telemetry threshold; default
   0.8, must be in `(0, 1]`, read once per process). Ordinary MCP status,
   wait and dashboard replies omit context telemetry. Explicit status debug

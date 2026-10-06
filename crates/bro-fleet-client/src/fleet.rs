@@ -1226,7 +1226,19 @@ const STREAM_HTTP_TIMEOUTS: HttpClientTimeouts = HttpClientTimeouts {
 };
 
 fn build_http_client(timeouts: HttpClientTimeouts) -> reqwest::Client {
-    let mut builder = reqwest::Client::builder().connect_timeout(timeouts.connect);
+    // The configured bearer rides every request; a token file that is set
+    // but unreadable is reported once here and the client goes without,
+    // so the daemon's refusal, not a silent client, is what the caller sees.
+    let headers = match crate::config::bearer_headers() {
+        Ok(headers) => headers,
+        Err(error) => {
+            tracing::warn!(%error, "daemon client bearer not sent");
+            reqwest::header::HeaderMap::new()
+        }
+    };
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(timeouts.connect)
+        .default_headers(headers);
     if let Some(total) = timeouts.total {
         builder = builder.timeout(total);
     }

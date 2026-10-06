@@ -54,6 +54,17 @@
   legacy MCP wire, in `/control/*` replies and for the response budget.
   `call_tool` sets `resultType: complete` on the way out only for a request
   served sessionless on a no-handshake revision, which requires it.
+- Two bearer gates sit in front of handlers and nothing else does. `/admin/*`
+  admits a loopback peer or the admin token (`admin_auth`). `/mcp` and every
+  `/control/*` route admit everything until `daemon.mcp_require_bearer` is
+  on, then a loopback peer, a peer inside `mcp_trusted_peer_networks`, or
+  the service token (`mcp_auth`), with a bare 401 otherwise; the gate runs
+  before rmcp sees a request, so it covers sessionless and handshake
+  requests, the event stream and the session end alike. Both read the peer
+  from `ConnectInfo` only and never a forwarded header; a missing peer is
+  non-loopback. The Host allowlist is rmcp's and applies to `/mcp` only.
+  Nothing on `/healthz`, `/readyz`, `/tail` or `/internal/*` is gated here;
+  the producer routes carry their own tokens.
 - A refused scope (unknown surface, unauthenticated binding) must fail
   BEFORE any slot is set: resolution returns the whole scope or an error,
   and `pin_scope` sets every slot together, so no half-initialized handler
