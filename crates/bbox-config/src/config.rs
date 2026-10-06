@@ -2613,9 +2613,11 @@ port = 7300
             env::remove_var("BLACKBOX_CONFIG");
             env::remove_var("BLACKBOX_NO_CHECKOUT_AUTHORITY");
         }
-        let config_dir = home.join(".config").join("blackbox");
-        std::fs::create_dir_all(&config_dir).unwrap();
-        let config_path = config_dir.join("config.toml");
+        // Follow the loader's platform default: dirs::config_dir() uses
+        // Library/Application Support on macOS, rather than XDG_CONFIG_HOME.
+        let config_path = default_config_path().unwrap();
+        assert!(config_path.starts_with(home));
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
 
         // Absent key and absent env: the daemon holds checkout authority.
         assert!(!load().unwrap().daemon.no_checkout_authority);
