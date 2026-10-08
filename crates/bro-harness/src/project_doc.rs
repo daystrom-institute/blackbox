@@ -646,6 +646,10 @@ fn check_scan(probe: &Probe, mut plan: ScanPlan, paths: Vec<PathBuf>) -> Result<
     })
 }
 
+/// Bounded scans a refresh or resume makes before its timeout fails the
+/// caller.
+const REFRESH_ATTEMPTS: u32 = 3;
+
 /// Session-owned version ledger. Shell and remote tools are explicit escape
 /// hatches; this policy only admits tool-owned structured filesystem scopes.
 #[derive(Clone)]
@@ -921,19 +925,37 @@ impl ScopedProjectDocs {
         self.refresh_in(Phase::Refresh).await
     }
 
+    /// A scan whose read completed after its deadline is retried as a fresh
+    /// bounded operation, up to [`REFRESH_ATTEMPTS`] in all: the late result
+    /// is still discarded, nothing is inferred until a scan succeeds, and a
+    /// read that completed just late usually succeeds on the next scan. A
+    /// read that has not returned keeps the worker slot, so retrying it would
+    /// only queue behind the stall; that timeout fails the caller at once.
     async fn refresh_in(&self, phase: Phase) -> Result<(), String> {
-        self.bounded(
-            phase,
-            |ledger| ScanPlan::capture(&self.root, &self.names, ledger),
-            |probe, plan| scan(probe, &plan),
-            |ledger, scanned| {
-                let Scan { documents, errors } = scanned?;
-                ledger.reconcile(documents, errors.is_empty());
-                errors.into_iter().next().map_or(Ok(()), Err)
-            },
-        )
-        .await
-        .map_err(|failure| failure.message())?
+        let mut attempt = 1;
+        loop {
+            let outcome = self
+                .bounded(
+                    phase,
+                    |ledger| ScanPlan::capture(&self.root, &self.names, ledger),
+                    |probe, plan| scan(probe, &plan),
+                    |ledger, scanned| {
+                        let Scan { documents, errors } = scanned?;
+                        ledger.reconcile(documents, errors.is_empty());
+                        errors.into_iter().next().map_or(Ok(()), Err)
+                    },
+                )
+                .await;
+            match outcome {
+                Ok(result) => return result,
+                Err(IoFailure::Timeout(timeout))
+                    if timeout.completed_late && attempt < REFRESH_ATTEMPTS =>
+                {
+                    attempt += 1
+                }
+                Err(failure) => return Err(failure.message()),
+            }
+        }
     }
 
     /// Run one instruction operation under a single deadline. Admission, the

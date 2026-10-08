@@ -781,7 +781,8 @@ async fn results_ready_only_after_the_deadline_never_commit_or_admit_effects() {
     assert_eq!(emitted.len(), 1, "{emitted:?}");
     assert_eq!(emitted[0]["phase"], "check");
 
-    // A late refresh scan of changed bytes is not reconciled.
+    // A late refresh scan of changed bytes is not reconciled; the refresh
+    // retries with a fresh scan, and that scan delivers the new bytes.
     let fs = GatedFs::new();
     let (emitter, events) = capture();
     let docs = gated(&root, &fs, BUDGET, Some(emitter));
@@ -789,12 +790,18 @@ async fn results_ready_only_after_the_deadline_never_commit_or_admit_effects() {
     docs.acknowledge(&docs.pending_batch(1).unwrap());
     write(&document, "ROOT RULES v2\nRead @rules.md.");
     fs.stall_on(FsOp::Read, document.clone());
-    let error = resume_after_expiry(docs.refresh(), &fs, &docs)
+    resume_after_expiry(docs.refresh(), &fs, &docs)
         .await
-        .unwrap_err();
-    assert!(error.contains("instruction refresh timed out"), "{error}");
-    assert!(docs.pending_batch(2).is_none());
+        .expect("the retry's fresh scan succeeds");
     assert_eq!(timeouts(&events).len(), 1);
+    let delivered = docs.pending_batch(2).expect("the fresh scan is delivered");
+    assert!(
+        delivered
+            .documents
+            .iter()
+            .any(|document| document.body.contains("ROOT RULES v2")),
+        "{delivered:?}"
+    );
 
     // Admission that becomes ready only after the deadline starts no scan.
     let fs = GatedFs::new();
@@ -809,7 +816,12 @@ async fn results_ready_only_after_the_deadline_never_commit_or_admit_effects() {
         .await
         .unwrap_err();
     assert!(error.contains("waited for admission"), "{error}");
-    assert!(first.await.unwrap().is_err());
-    assert_eq!(docs.slot.spawned_workers(), 1);
-    assert!(docs.pending_batch(1).is_none());
+    // The first caller's read completed late: its result was discarded and
+    // its retry scanned afresh in a second worker.
+    first
+        .await
+        .unwrap()
+        .expect("the late read's retry succeeds");
+    assert_eq!(docs.slot.spawned_workers(), 2);
+    assert!(docs.pending_batch(1).is_some());
 }
