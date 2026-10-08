@@ -904,22 +904,28 @@ impl Transport for AnthropicTransport {
             // partial assistant turn, so the request continues it (on an in-band
             // retry the buffer is unchanged, so the body is identical).
             let body = self.build_body(tools, opts);
-            let resp = super::http::send_with_retry("anthropic/messages", || {
-                let mut rb = self
-                    .http
-                    .post(&url)
-                    .header("content-type", "application/json")
-                    .header("anthropic-version", &self.version)
-                    .timeout(super::http::request_timeout());
-                if !betas.is_empty() {
-                    rb = rb.header("anthropic-beta", &betas);
-                }
-                rb = match &self.auth {
-                    Auth::Bearer(t) => rb.header("authorization", format!("Bearer {t}")),
-                    Auth::ApiKey(k) => rb.header("x-api-key", k.clone()),
-                };
-                rb.json(&body).send()
-            })
+            let report = |report| sink.model_request(report);
+            let resp = super::http::send_with_retry_reported(
+                "anthropic/messages",
+                || {
+                    let mut rb = self
+                        .http
+                        .post(&url)
+                        .header("content-type", "application/json")
+                        .header("anthropic-version", &self.version)
+                        .timeout(super::http::request_timeout());
+                    if !betas.is_empty() {
+                        rb = rb.header("anthropic-beta", &betas);
+                    }
+                    rb = match &self.auth {
+                        Auth::Bearer(t) => rb.header("authorization", format!("Bearer {t}")),
+                        Auth::ApiKey(k) => rb.header("x-api-key", k.clone()),
+                    };
+                    rb.json(&body).send()
+                },
+                |_| {},
+                &report,
+            )
             .await
             .context("messages request")
             .map_err(|error| self.fail_response(error, &[], assistant_idx))?;
@@ -1072,6 +1078,12 @@ impl Transport for AnthropicTransport {
                         wait_ms = wait.as_millis() as u64,
                         "transient in-band stream fault; retrying turn"
                     );
+                    sink.model_request(super::ModelRequestReport::RetryWait {
+                        label: "anthropic/messages".to_string(),
+                        attempt: inband_attempt,
+                        wait,
+                        reason: super::ModelRequestReport::bounded_reason(&msg),
+                    });
                     tokio::time::sleep(wait).await;
                     continue;
                 }
@@ -1130,6 +1142,12 @@ impl Transport for AnthropicTransport {
                     wait_ms = wait.as_millis() as u64,
                     "empty model output (end_turn, no content); retrying turn"
                 );
+                sink.model_request(super::ModelRequestReport::RetryWait {
+                    label: "anthropic/messages".to_string(),
+                    attempt: inband_attempt,
+                    wait,
+                    reason: "empty model output".to_string(),
+                });
                 tokio::time::sleep(wait).await;
                 continue;
             }

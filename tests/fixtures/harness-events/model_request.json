@@ -1,0 +1,9 @@
+{
+  "type": "harness_model_request",
+  "session_id": "fixture-session",
+  "state": "retry_wait",
+  "label": "anthropic/messages",
+  "attempt": 2,
+  "retry_in_ms": 4000,
+  "reason": "HTTP 529"
+}

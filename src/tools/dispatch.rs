@@ -2366,12 +2366,21 @@ impl BlackboxServer {
                 ));
             }
         }
+        // Noted before the send, so a delivery event cannot arrive ahead of
+        // the record it clears.
+        task.inner
+            .lock()
+            .supervision
+            .note_queued_steer(&p.prompt, orch::now_ms());
         match orch::steer_harness_task(&p.task_id, p.prompt) {
             Ok(()) => Self::ok_json(&json!({
                 "taskId": p.task_id,
                 "status": "steered",
             })),
-            Err(e) => Self::err_text(&e),
+            Err(e) => {
+                task.inner.lock().supervision.pending_steers.pop_back();
+                Self::err_text(&e)
+            }
         }
     }
 

@@ -475,15 +475,21 @@ impl Transport for OpenAiChatTransport {
         let body = self.build_body(tools, opts);
 
         let url = format!("{}/chat/completions", self.base_url);
-        let resp = super::http::send_with_retry("openai-chat/completions", || {
-            self.http
-                .post(&url)
-                .header("content-type", "application/json")
-                .header("authorization", format!("Bearer {}", self.api_key))
-                .timeout(super::http::request_timeout())
-                .json(&body)
-                .send()
-        })
+        let report = |report| sink.model_request(report);
+        let resp = super::http::send_with_retry_reported(
+            "openai-chat/completions",
+            || {
+                self.http
+                    .post(&url)
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {}", self.api_key))
+                    .timeout(super::http::request_timeout())
+                    .json(&body)
+                    .send()
+            },
+            |_| {},
+            &report,
+        )
         .await
         .context("chat/completions request")?;
         let status = resp.status();

@@ -293,6 +293,10 @@ impl OpenAiResponsesTransport {
 
         'attempt: loop {
             attempt += 1;
+            sink.model_request(super::ModelRequestReport::Requesting {
+                label: "openai-responses".to_string(),
+                attempt,
+            });
             let resp = self
                 .send_with_auth_recovery(
                     "openai-responses",

@@ -297,6 +297,10 @@ impl WsChannel {
             }
 
             // Send the request frame.
+            sink.model_request(super::ModelRequestReport::Requesting {
+                label: "openai-responses/ws".to_string(),
+                attempt,
+            });
             if let Err(e) = self
                 .conn
                 .as_mut()
