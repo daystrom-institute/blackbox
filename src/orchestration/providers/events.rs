@@ -375,13 +375,21 @@ fn parse_claude_event(evt: &Value, sink: &mut EventSink) {
     }
     if evt["type"].as_str() == Some("result") {
         sink.interrupted = result_event_interrupted(evt);
-        if let Some(result) = evt["result"].as_str() {
-            let already_have_streamed_text = sink
-                .last_assistant_message
-                .as_deref()
-                .is_some_and(|m| !m.is_empty());
-            if !result.is_empty() && !already_have_streamed_text {
-                sink.last_assistant_message = Some(result.to_string());
+        if let Some(result) = evt["result"].as_str()
+            && !result.trim().is_empty()
+        {
+            // The result carries the turn's final answer. Text accumulated
+            // from earlier steps usually already ends with it; when the final
+            // step's text was never captured, append it so the deliverable
+            // is not left as progress narration only.
+            match sink.last_assistant_message.as_mut() {
+                Some(buffer) if !buffer.is_empty() => {
+                    if !ends_with_final_answer(buffer, result) {
+                        buffer.push_str("\n\n");
+                        buffer.push_str(result.trim());
+                    }
+                }
+                _ => sink.last_assistant_message = Some(result.to_string()),
             }
         }
         if let Some(usage) = evt["usage"].as_object() {
@@ -412,6 +420,19 @@ fn parse_claude_event(evt: &Value, sink: &mut EventSink) {
         sink.cost_usd = evt["total_cost_usd"].as_f64();
         sink.num_turns = evt["num_turns"].as_u64();
     }
+}
+
+/// Whether accumulated text already ends with the result's final answer.
+/// Compares only the answer's last paragraph: the harness and the daemon may
+/// join an answer's text blocks differently, but not inside one block.
+fn ends_with_final_answer(buffer: &str, result: &str) -> bool {
+    let result = result.trim();
+    let tail = result
+        .rsplit("\n\n")
+        .map(str::trim)
+        .find(|paragraph| !paragraph.is_empty())
+        .unwrap_or(result);
+    buffer.trim_end().ends_with(tail)
 }
 
 pub fn result_event_interrupted(evt: &Value) -> bool {

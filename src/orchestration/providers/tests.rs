@@ -347,6 +347,63 @@ fn harness_streaming_accumulates_text_across_blocks_and_turns() {
     );
 }
 
+/// Progress text streamed from earlier steps must not stand in for the final
+/// answer: when the final step's text was never captured, the result event
+/// supplies it, and an answer already captured is not repeated.
+#[test]
+fn harness_result_supplies_a_final_answer_the_stream_missed() {
+    let progress = |text: &str| {
+        vec![
+            serde_json::json!({
+                "type":"stream_event",
+                "event":{"type":"content_block_start","content_block":{"type":"text"}}
+            }),
+            serde_json::json!({
+                "type":"stream_event",
+                "event":{"type":"content_block_delta","delta":{"type":"text_delta","text":text}}
+            }),
+        ]
+    };
+
+    let mut missed = empty_sink();
+    for evt in progress("Checking the store.")
+        .iter()
+        .chain(&progress("Writing the report."))
+    {
+        Provider::Kimi.parse_event(evt, &mut missed);
+    }
+    Provider::Kimi.parse_event(
+        &serde_json::json!({
+            "type":"result",
+            "result":"Report saved.\n\nAll checks passed."
+        }),
+        &mut missed,
+    );
+    assert_eq!(
+        missed.last_assistant_message.as_deref(),
+        Some("Checking the store.\n\nWriting the report.\n\nReport saved.\n\nAll checks passed.")
+    );
+
+    let mut captured = empty_sink();
+    for evt in progress("Checking the store.")
+        .iter()
+        .chain(&progress("Report saved.\n\nAll checks passed."))
+    {
+        Provider::Kimi.parse_event(evt, &mut captured);
+    }
+    Provider::Kimi.parse_event(
+        &serde_json::json!({
+            "type":"result",
+            "result":"Report saved.\n\nAll checks passed.\n"
+        }),
+        &mut captured,
+    );
+    assert_eq!(
+        captured.last_assistant_message.as_deref(),
+        Some("Checking the store.\n\nReport saved.\n\nAll checks passed.")
+    );
+}
+
 #[test]
 fn context_pressure_event_captures_occupancy_and_window() {
     let mut sink = empty_sink();
