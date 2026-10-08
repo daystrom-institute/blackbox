@@ -58,7 +58,9 @@ the daemon boundary contract is `design/bro-harness/harness-process-boundary.md`
   that covers admission, every filesystem probe, and conflict retries. Startup
   is best effort: a timeout discards the partial result, keeps the root and
   global candidates enrolled, and the session still starts. Refresh and resume
-  timeouts prevent inference; check timeouts return `instruction_read_error`
+  timeouts prevent inference; a scan whose read completed after the deadline
+  is retried as a fresh bounded operation, up to three in all, while a read
+  that has not returned fails the caller at once. Check timeouts return `instruction_read_error`
   with no filesystem effects. Each ledger has one detached instruction worker;
   a stalled one keeps its slot until it exits, and later callers wait only
   within their own deadline. The ledger lock is never held across filesystem
