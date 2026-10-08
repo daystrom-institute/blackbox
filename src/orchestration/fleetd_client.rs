@@ -85,6 +85,10 @@ const AUTOSTART_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// fleetd resolves the binary through a login shell, which on a cold macOS
 /// host can take a noticeable fraction of a second.
 const SPAWN_ACK_TIMEOUT: Duration = Duration::from_secs(30);
+/// Bound on a remote dial: TCP connect, TLS, the protocol handshake and
+/// authentication together. Without it an unreachable worker host costs the
+/// operating system's connect timeout, minutes, per dispatch or resume.
+const REMOTE_DIAL_TIMEOUT: Duration = Duration::from_secs(15);
 /// Worker inspection executes a handful of local Git and filesystem reads.
 const WORKSPACE_INSPECTION_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long to wait for fleetd's `Sessions` answer when proving whether a
@@ -317,6 +321,9 @@ pub struct FleetdConfig {
     /// Deadline for a workspace inspection answer. Production uses
     /// [`WORKSPACE_INSPECTION_TIMEOUT`].
     pub inspection_timeout: Duration,
+    /// Deadline for a remote (TCP or TLS) dial. Production uses
+    /// [`REMOTE_DIAL_TIMEOUT`].
+    pub remote_dial_timeout: Duration,
 }
 
 impl FleetdConfig {
@@ -334,6 +341,7 @@ impl FleetdConfig {
             heartbeat_interval: HEARTBEAT_INTERVAL,
             list_sessions_timeout: LIST_SESSIONS_TIMEOUT,
             inspection_timeout: WORKSPACE_INSPECTION_TIMEOUT,
+            remote_dial_timeout: REMOTE_DIAL_TIMEOUT,
         }
     }
 
@@ -414,6 +422,7 @@ impl FleetdConfig {
             heartbeat_interval: HEARTBEAT_INTERVAL,
             list_sessions_timeout: LIST_SESSIONS_TIMEOUT,
             inspection_timeout: WORKSPACE_INSPECTION_TIMEOUT,
+            remote_dial_timeout: REMOTE_DIAL_TIMEOUT,
         })
     }
 }
@@ -748,6 +757,24 @@ impl FleetdExecutor {
 
     /// Connect, authenticate, and start the connection actor.
     async fn dial(&self) -> anyhow::Result<Connection> {
+        if self.shared.config.endpoint.is_remote() {
+            let deadline = self.shared.config.remote_dial_timeout;
+            return tokio::time::timeout(deadline, self.dial_endpoint())
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "remote fleetd at {} did not connect and authenticate within {}s. \
+                         Remote fleetd is never auto-started and there is no local-executor \
+                         fallback.",
+                        self.shared.config.endpoint.label(),
+                        deadline.as_secs()
+                    )
+                })?;
+        }
+        self.dial_endpoint().await
+    }
+
+    async fn dial_endpoint(&self) -> anyhow::Result<Connection> {
         match &self.shared.config.endpoint {
             FleetdEndpoint::Unix(socket) => {
                 if UnixStream::connect(socket).await.is_err() {
@@ -3398,6 +3425,51 @@ mod tests {
                 .to_string()
                 .contains("Remote fleetd is never auto-started")
         );
+    }
+
+    /// A remote peer that accepts the connection and never answers the
+    /// handshake fails the dial at its deadline, not at whatever the
+    /// operating system's timeouts allow.
+    #[tokio::test]
+    async fn a_silent_remote_fleetd_fails_the_dial_at_its_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let held = tokio::spawn(async move {
+            let mut accepted = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                accepted.push(stream);
+            }
+        });
+        let token = root.join("fleetd.token");
+        ServiceToken::load_or_create(&token).unwrap();
+        let mut config = FleetdConfig::resolve(
+            &root,
+            Some(&format!("tcp://{address}")),
+            Some(&token),
+            Some(&root),
+            Some(&root),
+            None,
+        )
+        .unwrap();
+        config.remote_dial_timeout = Duration::from_millis(300);
+        let executor = FleetdExecutor::new(config);
+
+        let started = tokio::time::Instant::now();
+        let error = executor
+            .lane()
+            .await
+            .err()
+            .expect("a silent peer never connects");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(
+            error
+                .to_string()
+                .contains("did not connect and authenticate"),
+            "{error:#}"
+        );
+        held.abort();
     }
 
     /// A connection whose re-adoption sweep failed is not kept. Here the
