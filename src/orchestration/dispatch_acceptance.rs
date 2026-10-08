@@ -17,7 +17,8 @@ mod acceptance {
     /// A stub standing in for `bro-harness`. It records what it was started
     /// with under `<root>/child-<pid>/` (argv, cwd, the provider it was told to
     /// be, the path it was run as, and environment variable names, never
-    /// values), appends every stdin line it receives,
+    /// values), appends every stdin line it receives, ends a turn with an
+    /// error result and keeps running when a line mentions TURN_FAIL,
     /// finishes its turn when a line mentions FINISH, and records a
     /// termination signal before exiting on one.
     fn write_recording_stub(root: &Path) -> PathBuf {
@@ -45,6 +46,9 @@ mod acceptance {
              \x20 case \"$line\" in *REPORT_SHELLS*)\n\
              \x20   printf '{{\"type\":\"harness_shell_sessions\",\"session_id\":\"%s\",\"seq\":5,\"sessions\":[{{\"id\":\"sh-1\",\"command\":\"sleep 600\",\"elapsed_ms\":1500,\"running\":true}}]}}\\n' \"$session\"\n\
              \x20   printf '{{\"type\":\"harness_shell_sessions\",\"session_id\":\"another-session\",\"seq\":6,\"sessions\":[]}}\\n';;\n\
+             \x20 esac\n\
+             \x20 case \"$line\" in *TURN_FAIL*)\n\
+             \x20   printf '{{\"type\":\"result\",\"is_error\":true,\"result\":\"stub turn failed\",\"session_id\":\"%s\"}}\\n' \"$session\";;\n\
              \x20 esac\n\
              \x20 case \"$line\" in *FINISH*)\n\
              \x20   printf '{{\"type\":\"result\",\"is_error\":false,\"result\":\"stub ok\",\"session_id\":\"%s\"}}\\n' \"$session\"\n\
@@ -313,6 +317,72 @@ mod acceptance {
         await_file(&second.join("signal"), "term").await;
         assert_eq!(plane.status(&resumed_task)["status"], "cancelled");
         assert_eq!(plane.task_count(), 2);
+    }
+
+    /// A turn that ends in an error result does not end the worker. The task
+    /// stays running, so the coordinator can steer it and cancel it, and the
+    /// cancelled session resumes as a new task on a new child.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_turn_leaves_the_worker_steerable_cancellable_and_resumable() {
+        let mut plane = Plane::start().await;
+        let cwd = plane.cwd();
+        let (task, session, child) = plane
+            .exec(json!({ "prompt": "first turn", "provider": "glm", "cwd": cwd }))
+            .await;
+        await_file(&child.join("stdin"), "first turn").await;
+
+        assert_eq!(plane.steer(&task, "TURN_FAIL")["status"], "steered");
+        let deadline = tokio::time::Instant::now() + super::smoke::DEADLINE;
+        loop {
+            let ingested = plane
+                .state
+                .task_store
+                .read()
+                .get(&task)
+                .expect("task")
+                .inner
+                .lock()
+                .stderr
+                .contains("stub turn failed");
+            if ingested {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the failed turn never reached the task"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(plane.status(&task)["status"], "running");
+
+        assert_eq!(plane.steer(&task, "after the failure")["status"], "steered");
+        await_file(&child.join("stdin"), "after the failure").await;
+
+        let cancelled = parsed(&plane.server.bro_cancel(call(json!({ "task_id": task }))));
+        assert_eq!(cancelled["status"], "cancelled", "{cancelled}");
+
+        let resumed = plane
+            .server
+            .bro_resume(call(json!({
+                "prompt": "continue",
+                "session_id": session,
+                "provider": "glm",
+                "cwd": cwd,
+            })))
+            .await;
+        let resumed = parsed(&resumed);
+        let resumed_task = resumed["taskId"].as_str().expect("resume taskId").to_string();
+        assert_ne!(resumed_task, task);
+        await_file(&child.join("signal"), "term").await;
+        let second = plane.next_child().await;
+        await_file(&second.join("stdin"), "continue").await;
+        assert_eq!(
+            flag(&argv(&second), "--resume"),
+            Some(session.as_str()),
+            "the same session continues"
+        );
+        assert_eq!(plane.status(&resumed_task)["status"], "running");
+        assert_eq!(plane.status(&task)["status"], "cancelled");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -571,8 +571,8 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bro_cancel",
         category: ToolCategory::Orchestration,
-        summary: "Cancel a running task (SIGTERM); check bro_status first unless the user explicitly asked to stop.",
-        when_to_use: "Task is confirmed stuck, you intentionally abandon a lost race, or the user asked to stop. A wait timeout is not enough evidence by itself; call `bro_status` first and avoid cancelling tasks you did not create unless instructed.",
+        summary: "Cancel a running task (SIGTERM), or stop the still-live worker of a terminal task; check bro_status first unless the user explicitly asked to stop.",
+        when_to_use: "Task is confirmed stuck, you intentionally abandon a lost race, or the user asked to stop. A wait timeout is not enough evidence by itself; call `bro_status` first and avoid cancelling tasks you did not create unless instructed. A terminal task whose status shows `workerShutdown: \"pending\"` still has a live worker: cancelling it sends the stop request again and leaves the terminal status as it was. Same-session `bro_resume` waits a bounded time for a worker it already asked to stop.",
         example: None,
     },
     ToolDoc {
