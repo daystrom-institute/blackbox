@@ -28,6 +28,12 @@ pub struct EventSink {
     /// harness, which the daemon does not link, and a locally-guessed window
     /// would drift from the one actually driving compaction.
     pub context_window: Option<u64>,
+    /// Byte offset in [`Self::last_assistant_message`] where streamed text that
+    /// no `assistant` event has committed yet begins. A model step's streamed
+    /// text is provisional: the step's `assistant` event replaces it with the
+    /// step's authoritative text, and a step that never completes (an
+    /// interrupt that discards it, a retried attempt) is dropped.
+    pub uncommitted_text_from: Option<usize>,
 }
 
 /// Bounded text from the latest assistant message, separate from accumulated output.
@@ -318,9 +324,16 @@ fn parse_claude_event(evt: &Value, sink: &mut EventSink) {
     if evt["type"].as_str() == Some("stream_event") {
         let inner_ty = evt["event"]["type"].as_str().unwrap_or("");
         match inner_ty {
+            // A new attempt: text streamed by an attempt that never completed
+            // is gone.
+            "message_start" => drop_uncommitted_text(sink),
             "content_block_start"
                 if evt["event"]["content_block"]["type"].as_str() == Some("text") =>
             {
+                if sink.uncommitted_text_from.is_none() {
+                    sink.uncommitted_text_from =
+                        Some(sink.last_assistant_message.as_deref().map_or(0, str::len));
+                }
                 append_block_separator(&mut sink.last_assistant_message);
             }
             "content_block_delta"
@@ -328,6 +341,7 @@ fn parse_claude_event(evt: &Value, sink: &mut EventSink) {
             {
                 if let Some(chunk) = evt["event"]["delta"]["text"].as_str() {
                     let buf = sink.last_assistant_message.get_or_insert_with(String::new);
+                    sink.uncommitted_text_from.get_or_insert(buf.len());
                     buf.push_str(chunk);
                 }
             }
@@ -354,11 +368,11 @@ fn parse_claude_event(evt: &Value, sink: &mut EventSink) {
                 sink.last_turn_input_tokens = Some(occupancy);
             }
         }
-        let streaming_captured = sink
-            .last_assistant_message
-            .as_deref()
-            .is_some_and(|m| !m.is_empty());
-        if !streaming_captured && let Some(content) = evt["message"]["content"].as_array() {
+        // The step's own text is authoritative: it replaces whatever was
+        // streamed since the last committed step, including text from
+        // attempts the provider discarded.
+        drop_uncommitted_text(sink);
+        if let Some(content) = evt["message"]["content"].as_array() {
             for block in content {
                 if block["type"].as_str() == Some("text")
                     && let Some(text) = block["text"].as_str()
@@ -378,6 +392,8 @@ fn parse_claude_event(evt: &Value, sink: &mut EventSink) {
         if let Some(result) = evt["result"].as_str()
             && !result.trim().is_empty()
         {
+            // Text no step committed is superseded by the final answer.
+            drop_uncommitted_text(sink);
             // The result carries the turn's final answer. Text accumulated
             // from earlier steps usually already ends with it; when the final
             // step's text was never captured, append it so the deliverable
@@ -419,6 +435,19 @@ fn parse_claude_event(evt: &Value, sink: &mut EventSink) {
         }
         sink.cost_usd = evt["total_cost_usd"].as_f64();
         sink.num_turns = evt["num_turns"].as_u64();
+    }
+}
+
+/// Truncate the accumulated text back to where uncommitted streamed text began.
+fn drop_uncommitted_text(sink: &mut EventSink) {
+    let Some(start) = sink.uncommitted_text_from.take() else {
+        return;
+    };
+    if let Some(buffer) = sink.last_assistant_message.as_mut() {
+        buffer.truncate(start.min(buffer.len()));
+        if buffer.is_empty() {
+            sink.last_assistant_message = None;
+        }
     }
 }
 
