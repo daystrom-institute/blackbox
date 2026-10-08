@@ -347,60 +347,117 @@ fn harness_streaming_accumulates_text_across_blocks_and_turns() {
     );
 }
 
-/// Progress text streamed from earlier steps must not stand in for the final
-/// answer: when the final step's text was never captured, the result event
-/// supplies it, and an answer already captured is not repeated.
+/// One model step as a harness emits it: streamed text, then (for a step
+/// that completed) the step's `assistant` event carrying the same text.
+fn streamed_step(text: &str, committed: bool) -> Vec<serde_json::Value> {
+    let mut events = vec![
+        serde_json::json!({
+            "type":"stream_event",
+            "event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+        }),
+        serde_json::json!({
+            "type":"stream_event",
+            "event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":text}}
+        }),
+    ];
+    if committed {
+        events.push(serde_json::json!({
+            "type":"assistant",
+            "message":{"content":[{"type":"text","text":text}]}
+        }));
+    }
+    events
+}
+
+fn parse_all(provider: Provider, events: &[serde_json::Value]) -> EventSink {
+    let mut sink = empty_sink();
+    for evt in events {
+        provider.parse_event(evt, &mut sink);
+    }
+    sink
+}
+
+/// Progress from completed steps accumulates and the final answer follows it.
+/// When the final step's text never streamed, its `assistant` event or the
+/// result supplies it; an answer already captured is not repeated.
 #[test]
 fn harness_result_supplies_a_final_answer_the_stream_missed() {
-    let progress = |text: &str| {
-        vec![
-            serde_json::json!({
-                "type":"stream_event",
-                "event":{"type":"content_block_start","content_block":{"type":"text"}}
-            }),
-            serde_json::json!({
-                "type":"stream_event",
-                "event":{"type":"content_block_delta","delta":{"type":"text_delta","text":text}}
-            }),
-        ]
-    };
-
-    let mut missed = empty_sink();
-    for evt in progress("Checking the store.")
-        .iter()
-        .chain(&progress("Writing the report."))
-    {
-        Provider::Kimi.parse_event(evt, &mut missed);
-    }
-    Provider::Kimi.parse_event(
-        &serde_json::json!({
-            "type":"result",
-            "result":"Report saved.\n\nAll checks passed."
-        }),
-        &mut missed,
-    );
+    let mut events = streamed_step("Checking the store.", true);
+    events.extend(streamed_step("Writing the report.", true));
+    events.push(serde_json::json!({
+        "type":"result",
+        "result":"Report saved.\n\nAll checks passed."
+    }));
     assert_eq!(
-        missed.last_assistant_message.as_deref(),
+        parse_all(Provider::Kimi, &events)
+            .last_assistant_message
+            .as_deref(),
         Some("Checking the store.\n\nWriting the report.\n\nReport saved.\n\nAll checks passed.")
     );
 
-    let mut captured = empty_sink();
-    for evt in progress("Checking the store.")
-        .iter()
-        .chain(&progress("Report saved.\n\nAll checks passed."))
-    {
-        Provider::Kimi.parse_event(evt, &mut captured);
-    }
-    Provider::Kimi.parse_event(
-        &serde_json::json!({
-            "type":"result",
-            "result":"Report saved.\n\nAll checks passed.\n"
-        }),
-        &mut captured,
+    let mut events = streamed_step("Checking the store.", true);
+    events.extend(streamed_step("Report saved.\n\nAll checks passed.", true));
+    events.push(serde_json::json!({
+        "type":"result",
+        "result":"Report saved.\n\nAll checks passed.\n"
+    }));
+    assert_eq!(
+        parse_all(Provider::Kimi, &events)
+            .last_assistant_message
+            .as_deref(),
+        Some("Checking the store.\n\nReport saved.\n\nAll checks passed.")
+    );
+}
+
+/// A steer that interrupts a step discards that step's output on the
+/// provider side. The text it had streamed is not part of the deliverable:
+/// the next completed step and the final answer are.
+#[test]
+fn text_streamed_by_a_discarded_step_leaves_the_deliverable() {
+    let mut events = streamed_step("Earlier finding.", true);
+    events.extend(streamed_step("First draft, cut off mid", false));
+    events.extend(streamed_step("Second draft, also cut", false));
+    events.extend(streamed_step("Final answer. PROBE-OK", true));
+    events.push(serde_json::json!({"type":"result","result":"Final answer. PROBE-OK"}));
+    let sink = parse_all(Provider::Brodex, &events);
+    assert_eq!(
+        sink.last_assistant_message.as_deref(),
+        Some("Earlier finding.\n\nFinal answer. PROBE-OK")
+    );
+    assert_eq!(sink.uncommitted_text_from, None);
+}
+
+/// A step whose text never streamed still contributes its text, so a
+/// non-streaming transport accumulates every step rather than only the first.
+#[test]
+fn every_committed_step_contributes_without_streaming() {
+    let step = |text: &str| {
+        serde_json::json!({
+            "type":"assistant",
+            "message":{"content":[{"type":"text","text":text}]}
+        })
+    };
+    let sink = parse_all(
+        Provider::Glm,
+        &[step("Looked at the store."), step("Done: report written.")],
     );
     assert_eq!(
-        captured.last_assistant_message.as_deref(),
-        Some("Checking the store.\n\nReport saved.\n\nAll checks passed.")
+        sink.last_assistant_message.as_deref(),
+        Some("Looked at the store.\n\nDone: report written.")
+    );
+}
+
+/// With no final answer to supersede it, streamed text is all there is and
+/// stays, as for a producer that streams but never commits a step.
+#[test]
+fn uncommitted_text_stays_when_nothing_supersedes_it() {
+    let mut events = streamed_step("Only streamed.", false);
+    events.push(serde_json::json!({"type":"result","result":""}));
+    assert_eq!(
+        parse_all(Provider::Glm, &events)
+            .last_assistant_message
+            .as_deref(),
+        Some("Only streamed.")
     );
 }
 
