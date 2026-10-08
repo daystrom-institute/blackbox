@@ -80,6 +80,34 @@ Domain home for the dispatch plane. Boundary contract:
   cockpit sets no per-dispatch defaults of its own, so its grants come from
   the brofile lane unless a caller fills the spec field.
 
+## Task terminal state follows the worker
+
+- **A `result` event ends a turn, not the worker.** A harness worker takes a
+  queued steer as its next turn after any result, including an error result.
+  Ingest records an error result's message in stderr and leaves the task
+  running. The worker's exit decides the outcome: exit code zero with a latest
+  retained result that is not an error completes the task, anything else
+  fails it (`latest_result_is_error`), so a worker that exits zero after an
+  error result still fails.
+- **A task goes terminal before its worker exits only by cancel or fork
+  rejection, and both ask the worker to stop.** The kill switch stays
+  registered until the terminal waiter observes the exit, so a registered
+  switch on a terminal task means a live worker. Status shows
+  `workerShutdown: "pending"` for that state, and `bro_cancel` on such a task
+  sends the stop request again (`CancelOutcome::StopResent`) without changing
+  the record. The exit of a task already published as terminal
+  (`completed_at` set and not `recoverable`) keeps its record and publishes no
+  second outcome.
+- **Restart re-adoption stops a terminal task's live worker.** A task that is
+  terminal while fleetd still reports its worker running is reattached with
+  its record unchanged and its worker is asked to stop, so the exit is
+  observed and the session's supervision key is freed for a resume.
+- **A resume waits for a worker it already asked to stop.** A spawn whose
+  supervision key is held by a worker with a pending stop request waits a
+  bounded time for that worker's exit before refusing; the harness
+  checkpoints on SIGTERM before exiting, so a resume issued right after a
+  cancel lands in that window.
+
 ## Worker telemetry is not conversation
 
 - A `harness_shell_sessions` envelope reports the worker's retained shell

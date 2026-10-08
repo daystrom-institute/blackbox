@@ -146,7 +146,7 @@ creates or auto-starts anything.
 
 ## The daemon side of this contract
 
-`src/orchestration/fleetd_client.rs` is the client. Three things there are
+`src/orchestration/fleetd_client.rs` is the client. These rules there are
 paired with invariants above and must not drift:
 
 - **One endpoint and one connection, sessions multiplexed over it.** Because
@@ -162,6 +162,18 @@ paired with invariants above and must not drift:
   paths still pass the literal `"pending"`). Two concurrent pending dispatches
   would otherwise collide on this registry, on the daemon's slot map, and on
   the event-log filename.
+- **Anything addressed to a session goes through its slot's current
+  connection.** Re-adoption on a new connection replaces the slot's command
+  sender. Control relays and kill switches look that sender up each time they
+  send and never capture one at spawn: a captured sender still points at the
+  dead connection after a reconnect, so steers fail as a closed channel and a
+  cancel's kill never arrives. A kill requested while no connection is up is
+  remembered on the slot and re-sent by every re-adoption that still finds the
+  worker running; a control message waits a bounded time for the redial.
+- **A dropped connection is redialed while sessions are held.** Each installed
+  connection gets a watcher that redials with backoff once it dies, for as
+  long as any slot exists. Leaving the redial to the next dispatch strands
+  live workers' events, steers and kills.
 - **Remote worker roots are mandatory and absolute.** The daemon state root,
   worker HOME, and worker BRO_HOME are three different localities. Provider
   credential paths and harness replay logs use the worker roots; task stores,

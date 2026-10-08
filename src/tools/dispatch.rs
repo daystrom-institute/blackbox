@@ -2282,7 +2282,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bro_cancel",
-        description = "Cancel a running task (SIGTERM); check bro_status first unless the user explicitly asked to stop."
+        description = "Cancel a running task (SIGTERM), or stop the still-live worker of a terminal task; check bro_status first unless the user explicitly asked to stop."
     )]
     pub(crate) fn bro_cancel(&self, Parameters(p): Parameters<CancelParams>) -> CallToolResult {
         let task = match self.state.task_store.read().get(&p.task_id) {
@@ -2290,7 +2290,18 @@ impl BlackboxServer {
             None => return Self::err_text(&format!("Unknown task ID: {}", p.task_id)),
         };
         match orch::cancel_task(&task, &self.state.task_store, &self.state.store_dir) {
-            Ok(()) => {
+            Ok(orch::CancelOutcome::StopResent(status)) => {
+                let inner = task.inner.lock();
+                Self::ok_json(&json!({
+                    "taskId": inner.id,
+                    "sessionId": inner.session_id,
+                    "status": status,
+                    "workerShutdown": "pending",
+                    "notice": "the task was already terminal but its worker had not exited; \
+                               the stop request was sent again",
+                }))
+            }
+            Ok(orch::CancelOutcome::Cancelled) => {
                 let mut inner = task.inner.lock();
                 inner.live_cursor += 1;
                 let _ = self.state.tail_tx.send(TailEvent::TaskCancelled {

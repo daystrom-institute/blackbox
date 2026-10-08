@@ -76,13 +76,12 @@ pub enum ProviderBinaryLocation {
 enum KillTarget {
     /// The daemon is the child's parent: signal the pid directly.
     LocalPid(Option<u32>),
-    /// fleetd is the child's parent: ask it to signal, over the owner
-    /// connection. Delivery is best-effort by contract, exactly like the local
-    /// arm (a `libc::kill` to an already-reaped pid is also a silent no-op).
-    Fleetd {
-        session_id: String,
-        commands: tokio::sync::mpsc::UnboundedSender<bro_protocol::DaemonToFleetd>,
-    },
+    /// fleetd is the child's parent: ask it to signal. The route resolves the
+    /// session's current owner connection when it is called, never at spawn,
+    /// because the connection that spawned the worker may since have been
+    /// replaced; a request made while no connection is up is re-sent when
+    /// the session is re-adopted.
+    Routed(Arc<dyn Fn() + Send + Sync>),
 }
 
 /// Idempotent kill switch for a spawned worker child. Replaces the raw
@@ -101,16 +100,10 @@ impl WorkerKill {
         })
     }
 
-    /// A kill switch that routes through fleetd instead of a local signal.
-    pub(super) fn via_fleetd(
-        session_id: String,
-        commands: tokio::sync::mpsc::UnboundedSender<bro_protocol::DaemonToFleetd>,
-    ) -> Arc<Self> {
+    /// A kill switch that delivers through `route` instead of a local signal.
+    pub(super) fn routed(route: impl Fn() + Send + Sync + 'static) -> Arc<Self> {
         Arc::new(Self {
-            target: KillTarget::Fleetd {
-                session_id,
-                commands,
-            },
+            target: KillTarget::Routed(Arc::new(route)),
             fired: AtomicBool::new(false),
         })
     }
@@ -121,6 +114,21 @@ impl WorkerKill {
         if self.fired.swap(true, Ordering::SeqCst) {
             return;
         }
+        self.signal();
+    }
+
+    /// Send the termination request again even though it already fired.
+    ///
+    /// For a worker that is still registered after its task went terminal:
+    /// the first request may never have reached it. The registry entry is
+    /// removed when the worker's exit is observed, so a registered switch
+    /// still names a live child.
+    pub fn resend(&self) {
+        self.fired.store(true, Ordering::SeqCst);
+        self.signal();
+    }
+
+    fn signal(&self) {
         match &self.target {
             KillTarget::LocalPid(Some(pid)) => {
                 // SAFETY: SIGTERM to a pid this daemon spawned. Matches the
@@ -131,14 +139,7 @@ impl WorkerKill {
                 }
             }
             KillTarget::LocalPid(None) => {}
-            KillTarget::Fleetd {
-                session_id,
-                commands,
-            } => {
-                let _ = commands.send(bro_protocol::DaemonToFleetd::Kill {
-                    session_id: session_id.clone(),
-                });
-            }
+            KillTarget::Routed(route) => route(),
         }
     }
 }

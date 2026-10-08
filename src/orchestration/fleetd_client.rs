@@ -99,6 +99,19 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 /// A terminal entry nobody acked keeps the key occupied on fleetd's side even
 /// after the daemon has released its own slot.
 const FLEETD_DUPLICATE_SESSION_CODE: &str = "session.duplicate";
+/// First delay before redialing a dropped connection that still carries live
+/// sessions; doubles per failed attempt up to [`REDIAL_MAX_BACKOFF`].
+const REDIAL_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
+const REDIAL_MAX_BACKOFF: Duration = Duration::from_secs(30);
+/// How long a control message waits for a replacement connection when it
+/// finds its session's connection gone, before it is dropped.
+const CONTROL_REDELIVERY_WINDOW: Duration = Duration::from_secs(60);
+/// How long a spawn that collides with a worker it already asked to stop
+/// waits for that worker's exit before refusing. The harness checkpoints on
+/// SIGTERM before exiting, so a resume issued right after a cancel lands in
+/// this window.
+const STOPPING_WORKER_EXIT_WAIT: Duration = Duration::from_secs(30);
+const STOPPING_WORKER_POLL: Duration = Duration::from_millis(100);
 
 /// The one fleetd this daemon owns. Multi-fleet routing is deliberately not
 /// hidden in this type: v1 has one endpoint and therefore one owner/fencing
@@ -481,9 +494,14 @@ struct SessionSlot {
     exit_after_replay: Option<Option<i32>>,
     /// Highest seq seen on this session's relayed events, for `EventAck`.
     last_seq: u64,
-    /// Command lane, so a terminal session can be acked without reaching back
-    /// through the connection.
+    /// Command lane of the connection that currently owns this session.
+    /// Re-adoption on a new connection replaces it, so it is the only sender
+    /// anything addressed to the session may use.
     commands: mpsc::UnboundedSender<DaemonToFleetd>,
+    /// The daemon asked fleetd to stop this worker. Re-sent on every
+    /// re-adoption while fleetd still reports the worker running, so a kill
+    /// issued while no connection was up still arrives.
+    kill_requested: bool,
 }
 
 impl SessionSlot {
@@ -571,6 +589,9 @@ struct Shared {
     /// as for `list_waiters`.
     workspace_waiters: Mutex<HashMap<String, (u64, oneshot::Sender<WorkspaceInspectionOutcome>)>>,
     message_counter: AtomicU64,
+    /// Woken each time a connection is installed with its sessions re-adopted,
+    /// so a control message held across a reconnect can be delivered.
+    connected: tokio::sync::Notify,
 }
 
 impl Shared {
@@ -581,6 +602,7 @@ impl Shared {
 }
 
 /// Executes workers as children of fleetd, over its Unix domain socket.
+#[derive(Clone)]
 pub struct FleetdExecutor {
     shared: Arc<Shared>,
     /// Held across a dial and its re-adoption sweep, so two concurrent
@@ -600,6 +622,7 @@ impl FleetdExecutor {
                 list_waiters: Mutex::new(VecDeque::new()),
                 workspace_waiters: Mutex::new(HashMap::new()),
                 message_counter: AtomicU64::new(0),
+                connected: tokio::sync::Notify::new(),
             }),
             connection: Arc::new(tokio::sync::Mutex::new(None)),
         }
@@ -651,7 +674,44 @@ impl FleetdExecutor {
         }
         abandoned.disarm();
         *connection = Some(fresh);
+        self.shared.connected.notify_waiters();
+        self.watch_connection(lane.cancel.clone());
         Ok(lane)
+    }
+
+    /// Redial once the installed connection dies, for as long as sessions are
+    /// held. Without this a dropped connection stays down until some new
+    /// dispatch dials: live workers' events stop reaching their tasks, and
+    /// steers and kills have no connection to travel on.
+    fn watch_connection(&self, cancel: CancellationToken) {
+        let executor = self.clone();
+        tokio::spawn(async move {
+            cancel.cancelled().await;
+            let mut backoff = REDIAL_INITIAL_BACKOFF;
+            loop {
+                if executor.shared.sessions.lock().is_empty() {
+                    return;
+                }
+                tokio::time::sleep(backoff).await;
+                match executor.lane().await {
+                    Ok(lane) => {
+                        tracing::info!(
+                            generation = lane.generation,
+                            "fleetd connection re-established; live sessions re-adopted"
+                        );
+                        return;
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            retry_in_ms = backoff.as_millis() as u64,
+                            "fleetd redial failed while sessions are live"
+                        );
+                        backoff = (backoff * 2).min(REDIAL_MAX_BACKOFF);
+                    }
+                }
+            }
+        });
     }
 
     /// Dial fleetd and run the re-adoption sweep at daemon startup, without
@@ -968,6 +1028,7 @@ impl HarnessExecutor for FleetdExecutor {
                             exit_after_replay: None,
                             last_seq: 0,
                             commands: commands.clone(),
+                            kill_requested: false,
                         },
                     );
                     true
@@ -981,6 +1042,9 @@ impl HarnessExecutor for FleetdExecutor {
                          one supervision key"
                     );
                 }
+                if self.await_stopping_worker(&session_id).await? {
+                    continue;
+                }
                 match release_stale_supervision_key(&self.shared, &lane, &session_id).await {
                     Ok(true) => {
                         released_stale_key = true;
@@ -989,7 +1053,9 @@ impl HarnessExecutor for FleetdExecutor {
                     Ok(false) => anyhow::bail!(
                         "fleetd session id `{session_id}` is genuinely live (fleetd reports a \
                          running worker under this supervision key); refusing to multiplex \
-                         two dispatches onto one supervision key"
+                         two dispatches onto one supervision key. If the task that started \
+                         that worker is already terminal, bro_cancel it to stop the worker, \
+                         then resume"
                     ),
                     Err(error) => anyhow::bail!(
                         "fleetd session id `{session_id}` is registered as live and fleetd \
@@ -1044,13 +1110,144 @@ impl HarnessExecutor for FleetdExecutor {
                 }
             };
 
+            let route = SessionRoute::new(&self.shared, &session_id);
             return Ok(WorkerHandle {
-                control: control_lane(session_id.clone(), commands.clone()),
+                control: control_lane(route.clone()),
                 events: events_rx,
                 pid,
-                killer: WorkerKill::via_fleetd(session_id, commands),
+                killer: route.killer(),
                 outcome: outcome_rx,
             });
+        }
+    }
+}
+
+impl FleetdExecutor {
+    /// A spawn found its supervision key held. When the holder is a worker
+    /// this daemon already asked to stop, wait a bounded time for it to exit
+    /// instead of refusing outright. Returns whether the key is free to claim
+    /// again; `false` means the holder was never asked to stop and the
+    /// ordinary liveness proof decides.
+    async fn await_stopping_worker(&self, session_id: &str) -> anyhow::Result<bool> {
+        match self
+            .shared
+            .sessions
+            .lock()
+            .get(session_id)
+            .map(|slot| slot.kill_requested)
+        {
+            None => return Ok(true),
+            Some(false) => return Ok(false),
+            Some(true) => {}
+        }
+        let deadline = tokio::time::Instant::now() + STOPPING_WORKER_EXIT_WAIT;
+        loop {
+            tokio::time::sleep(STOPPING_WORKER_POLL).await;
+            if !self.shared.sessions.lock().contains_key(session_id) {
+                return Ok(true);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                anyhow::bail!(
+                    "fleetd session id `{session_id}` belongs to a worker that was asked to \
+                     stop and has not exited after {}s; refusing to multiplex two dispatches \
+                     onto one supervision key. Retry once it exits",
+                    STOPPING_WORKER_EXIT_WAIT.as_secs()
+                );
+            }
+        }
+    }
+}
+
+/// Addresses one session through whichever connection currently owns its
+/// slot. Control messages and kills go through here rather than through a
+/// sender captured at spawn: re-adoption on a new connection replaces the
+/// slot's sender, and a captured one keeps pointing at the dead connection,
+/// so steers fail as a closed channel and a cancel's kill vanishes while the
+/// worker keeps running.
+#[derive(Clone)]
+struct SessionRoute {
+    shared: Arc<Shared>,
+    session_id: String,
+}
+
+enum RouteError {
+    /// The slot is gone: the session's terminal state was published.
+    Gone,
+    /// The owning connection is down; the message comes back unsent.
+    Disconnected(DaemonToFleetd),
+}
+
+impl SessionRoute {
+    fn new(shared: &Arc<Shared>, session_id: &str) -> Self {
+        Self {
+            shared: shared.clone(),
+            session_id: session_id.to_string(),
+        }
+    }
+
+    fn try_send(&self, message: DaemonToFleetd) -> Result<(), RouteError> {
+        let commands = match self.shared.sessions.lock().get(&self.session_id) {
+            Some(slot) => slot.commands.clone(),
+            None => return Err(RouteError::Gone),
+        };
+        commands
+            .send(message)
+            .map_err(|error| RouteError::Disconnected(error.0))
+    }
+
+    fn killer(&self) -> Arc<WorkerKill> {
+        let route = self.clone();
+        WorkerKill::routed(move || route.request_kill())
+    }
+
+    /// Ask fleetd to stop the worker, and remember the request on the slot so
+    /// re-adoption repeats it if this send never reaches fleetd.
+    fn request_kill(&self) {
+        let commands = {
+            let mut sessions = self.shared.sessions.lock();
+            let Some(slot) = sessions.get_mut(&self.session_id) else {
+                return;
+            };
+            slot.kill_requested = true;
+            slot.commands.clone()
+        };
+        let sent = commands.send(DaemonToFleetd::Kill {
+            session_id: self.session_id.clone(),
+        });
+        if sent.is_err() {
+            tracing::info!(
+                session_id = %self.session_id,
+                "fleetd connection is down; the stop request is re-sent when the session \
+                 is re-adopted"
+            );
+        }
+    }
+
+    /// Deliver one control message, waiting up to
+    /// [`CONTROL_REDELIVERY_WINDOW`] for a replacement connection when the
+    /// owning one is down. Returns `false` once the session is gone.
+    async fn deliver_control(&self, message: Value) -> bool {
+        let mut message = DaemonToFleetd::Control {
+            session_id: self.session_id.clone(),
+            message,
+        };
+        let deadline = tokio::time::Instant::now() + CONTROL_REDELIVERY_WINDOW;
+        loop {
+            let connected = self.shared.connected.notified();
+            tokio::pin!(connected);
+            connected.as_mut().enable();
+            match self.try_send(message) {
+                Ok(()) => return true,
+                Err(RouteError::Gone) => return false,
+                Err(RouteError::Disconnected(returned)) => message = returned,
+            }
+            if tokio::time::timeout_at(deadline, connected).await.is_err() {
+                tracing::warn!(
+                    session_id = %self.session_id,
+                    "fleetd stayed unreachable; dropping a control message for this session"
+                );
+                return true;
+            }
         }
     }
 }
@@ -1059,21 +1256,15 @@ impl HarnessExecutor for FleetdExecutor {
 /// messages. The daemon-side registry stores an
 /// `UnboundedSender<Value>` regardless of executor, so the translation is a
 /// relay task rather than a change to every `bro_steer` caller.
-fn control_lane(
-    session_id: String,
-    commands: mpsc::UnboundedSender<DaemonToFleetd>,
-) -> mpsc::UnboundedSender<Value> {
+fn control_lane(route: SessionRoute) -> mpsc::UnboundedSender<Value> {
     let (control_tx, mut control_rx) = mpsc::unbounded_channel::<Value>();
     tokio::spawn(async move {
         while let Some(message) = control_rx.recv().await {
-            if commands
-                .send(DaemonToFleetd::Control {
-                    session_id: session_id.clone(),
-                    message,
-                })
-                .is_err()
-            {
-                tracing::debug!(%session_id, "fleetd control lane closed");
+            if !route.deliver_control(message).await {
+                tracing::debug!(
+                    session_id = %route.session_id,
+                    "fleetd session ended; closing its control lane"
+                );
                 break;
             }
         }
@@ -1552,6 +1743,7 @@ async fn readopt_live_sessions(shared: &Arc<Shared>, lane: &Lane) -> anyhow::Res
     let summaries = list_sessions(shared, lane).await?;
 
     let mut replays: Vec<(String, u64)> = Vec::new();
+    let mut kills: Vec<String> = Vec::new();
     let mut finished: Vec<(String, SessionSlot)> = Vec::new();
     {
         let mut sessions = shared.sessions.lock();
@@ -1577,6 +1769,9 @@ async fn readopt_live_sessions(shared: &Arc<Shared>, lane: &Lane) -> anyhow::Res
                     }
                 }
                 Some(summary) => {
+                    if summary.state == SessionState::Running && slot.kill_requested {
+                        kills.push(session_id.clone());
+                    }
                     if summary.state == SessionState::Exited && slot.exit_after_replay.is_none() {
                         slot.exit_after_replay = Some(summary.exit_code);
                     }
@@ -1599,6 +1794,13 @@ async fn readopt_live_sessions(shared: &Arc<Shared>, lane: &Lane) -> anyhow::Res
              forgot it); the worker is gone."
                 .to_string(),
         );
+    }
+    for session_id in kills {
+        tracing::info!(
+            %session_id,
+            "re-sending a stop request for a worker fleetd still reports running"
+        );
+        let _ = commands.send(DaemonToFleetd::Kill { session_id });
     }
     for (session_id, from_seq) in replays {
         tracing::info!(
@@ -1630,8 +1832,26 @@ fn readopt_one(
 ) {
     let (events_tx, events_rx) = mpsc::unbounded_channel::<String>();
     let (outcome_tx, outcome_rx) = oneshot::channel();
-    let control = control_lane(summary.session_id.clone(), commands.clone());
-    let killer = WorkerKill::via_fleetd(summary.session_id.clone(), commands.clone());
+    // The slot exists before the daemon sees the session, so a kill the
+    // daemon issues while reattaching (a worker whose task is already
+    // terminal) has a connection to travel on.
+    shared.sessions.lock().insert(
+        summary.session_id.clone(),
+        SessionSlot {
+            events: events_tx,
+            // Already started; nothing to acknowledge.
+            started: None,
+            outcome: Some(outcome_tx),
+            // An already-exited session publishes terminal state when its
+            // replay terminates: fleetd sent its `SessionExited` to the daemon
+            // instance that is gone.
+            exit_after_replay: (summary.state == SessionState::Exited).then_some(summary.exit_code),
+            last_seq: 0,
+            commands: commands.clone(),
+            kill_requested: false,
+        },
+    );
+    let route = SessionRoute::new(shared, &summary.session_id);
 
     let Some(cursor) = super::readopt_harness_session(super::ReadoptedSession {
         session_id: summary.session_id.clone(),
@@ -1641,11 +1861,12 @@ fn readopt_one(
         workspace_binding_token: summary.workspace_binding_token.clone(),
         pid: summary.pid,
         state: summary.state,
-        control,
-        killer,
+        control: control_lane(route.clone()),
+        killer: route.killer(),
         events: events_rx,
         outcome: outcome_rx,
     }) else {
+        shared.sessions.lock().remove(&summary.session_id);
         // Not ours, or terminal and already published. An unknown RUNNING
         // session is left strictly alone: it is somebody's live work, and the
         // daemon forgetting it (task TTL, a wiped store) is not a reason to
@@ -1661,22 +1882,9 @@ fn readopt_one(
         }
         return;
     };
-
-    shared.sessions.lock().insert(
-        summary.session_id.clone(),
-        SessionSlot {
-            events: events_tx,
-            // Already started; nothing to acknowledge.
-            started: None,
-            outcome: Some(outcome_tx),
-            // An already-exited session publishes terminal state when its
-            // replay terminates: fleetd sent its `SessionExited` to the daemon
-            // instance that is gone.
-            exit_after_replay: (summary.state == SessionState::Exited).then_some(summary.exit_code),
-            last_seq: cursor,
-            commands: commands.clone(),
-        },
-    );
+    if let Some(slot) = shared.sessions.lock().get_mut(&summary.session_id) {
+        slot.last_seq = cursor;
+    }
 
     tracing::info!(
         session_id = %summary.session_id,
@@ -1838,6 +2046,9 @@ mod tests {
         replays: Arc<Mutex<Vec<(String, u64)>>>,
         lists: Arc<AtomicUsize>,
         inspections: Arc<Mutex<Vec<String>>>,
+        /// `Kill` and `Control` requests as `(connection ordinal, session id)`.
+        kills: Arc<Mutex<Vec<(usize, String)>>>,
+        controls: Arc<Mutex<Vec<(usize, String)>>>,
         /// Connections that passed the bearer gate. The executor's Unix dial
         /// makes a probe connect first, so raw accept counts overcount real
         /// connections; scripts and asserts key on this ordinal instead.
@@ -1870,6 +2081,8 @@ mod tests {
                 replays: Arc::new(Mutex::new(Vec::new())),
                 lists: Arc::new(AtomicUsize::new(0)),
                 inspections: Arc::new(Mutex::new(Vec::new())),
+                kills: Arc::new(Mutex::new(Vec::new())),
+                controls: Arc::new(Mutex::new(Vec::new())),
                 authenticated: Arc::new(AtomicUsize::new(0)),
                 replay,
                 script,
@@ -2047,6 +2260,12 @@ mod tests {
                             .await?;
                         }
                     }
+                    DaemonToFleetd::Kill { session_id } => {
+                        self.kills.lock().push((ordinal, session_id));
+                    }
+                    DaemonToFleetd::Control { session_id, .. } => {
+                        self.controls.lock().push((ordinal, session_id));
+                    }
                     _ => {}
                 }
             }
@@ -2133,6 +2352,7 @@ mod tests {
                 exit_after_replay,
                 last_seq,
                 commands: dead_commands,
+                kill_requested: false,
             },
         );
         outcome_rx
@@ -2362,6 +2582,135 @@ mod tests {
             .get("sess-late-exit")
             .map(|slot| slot.exit_after_replay);
         assert_eq!(exit_after_replay, Some(Some(Some(0))));
+    }
+
+    /// Poll `condition` until it holds, failing after five seconds.
+    async fn eventually(what: &str, condition: impl Fn() -> bool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !condition() {
+            assert!(tokio::time::Instant::now() < deadline, "timed out: {what}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// The connection that spawned a worker can die while the worker keeps
+    /// running. The client redials on its own while sessions are held, and
+    /// the worker's control lane and kill switch follow the session to the
+    /// new connection: a steer sent while no connection was up is delivered
+    /// after the redial, and a later cancel's kill reaches fleetd.
+    #[tokio::test]
+    async fn steer_and_kill_follow_a_session_across_a_reconnect() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = FakeFleetd::serve(dir.path(), vec![], ReplayScript::Silent);
+        let mut config = FleetdConfig::in_state_dir(dir.path());
+        config.heartbeat_interval = Duration::from_secs(3600);
+        let executor = FleetdExecutor::new(config);
+
+        let handle = executor.spawn(spec("sess-moved")).await.unwrap();
+        let first = executor.lane().await.unwrap();
+        first.cancel.cancel();
+        eventually("the dead connection's queue closes", || {
+            first.commands.is_closed()
+        })
+        .await;
+
+        handle
+            .control
+            .send(serde_json::json!({"type": "user"}))
+            .unwrap();
+        eventually("the client redials without a new dispatch", || {
+            fake.authenticated.load(Ordering::SeqCst) >= 2
+        })
+        .await;
+        eventually("the held steer reaches the new connection", || {
+            fake.controls.lock().as_slice() == [(2, "sess-moved".to_string())]
+        })
+        .await;
+
+        handle.killer.kill();
+        eventually("the kill reaches the new connection", || {
+            fake.kills.lock().as_slice() == [(2, "sess-moved".to_string())]
+        })
+        .await;
+        assert_eq!(
+            fake.authenticated.load(Ordering::SeqCst),
+            2,
+            "one redial, no extra connections"
+        );
+    }
+
+    /// A kill requested while no connection was up is not lost: re-adoption
+    /// on the next connection repeats it while fleetd still reports the
+    /// worker running.
+    #[tokio::test]
+    async fn a_kill_requested_while_disconnected_is_resent_on_readoption() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = FakeFleetd::serve(
+            dir.path(),
+            vec![summary("sess-stop", SessionState::Running, Some(9), None)],
+            ReplayScript::Silent,
+        );
+        let executor = FleetdExecutor::new(FleetdConfig::in_state_dir(dir.path()));
+        let _outcome = plant_slot(&executor, "sess-stop", None, 9, false);
+        SessionRoute::new(&executor.shared, "sess-stop")
+            .killer()
+            .kill();
+        assert!(
+            executor
+                .shared
+                .sessions
+                .lock()
+                .get("sess-stop")
+                .is_some_and(|slot| slot.kill_requested),
+            "the request is remembered on the slot"
+        );
+
+        executor.lane().await.unwrap();
+        eventually("the stop request is re-sent", || {
+            fake.kills.lock().as_slice() == [(1, "sess-stop".to_string())]
+        })
+        .await;
+    }
+
+    /// A resume issued right after a cancel finds the key held by the worker
+    /// it just asked to stop. It waits for that worker's exit and then
+    /// spawns, instead of refusing the session as live.
+    #[tokio::test]
+    async fn spawn_waits_for_a_worker_it_asked_to_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = FakeFleetd::serve(
+            dir.path(),
+            vec![summary("sess-next", SessionState::Running, Some(5), None)],
+            ReplayScript::Silent,
+        );
+        let executor = FleetdExecutor::new(FleetdConfig::in_state_dir(dir.path()));
+        let _outcome = plant_slot(&executor, "sess-next", None, 5, false);
+        executor
+            .shared
+            .sessions
+            .lock()
+            .get_mut("sess-next")
+            .unwrap()
+            .kill_requested = true;
+
+        let exiting = executor.clone();
+        let registry = fake.sessions.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            registry
+                .lock()
+                .retain(|summary| summary.session_id != "sess-next");
+            let slot = exiting.shared.sessions.lock().remove("sess-next");
+            if let Some(slot) = slot {
+                slot.finish("sess-next", Some(0), String::new());
+            }
+        });
+
+        let started = tokio::time::Instant::now();
+        let handle = executor.spawn(spec("sess-next")).await.unwrap();
+        assert_eq!(handle.pid, Some(4242));
+        assert!(started.elapsed() >= Duration::from_millis(300));
+        assert_eq!(fake.spawns.lock().as_slice(), ["sess-next"]);
     }
 
     #[test]
@@ -2676,6 +3025,7 @@ mod tests {
             list_waiters: Mutex::new(VecDeque::new()),
             workspace_waiters: Mutex::new(HashMap::new()),
             message_counter: AtomicU64::new(0),
+            connected: tokio::sync::Notify::new(),
         });
         let (commands_tx, mut commands_rx) = mpsc::unbounded_channel::<DaemonToFleetd>();
         let (events_tx, mut events_rx) = mpsc::unbounded_channel::<String>();
@@ -2689,6 +3039,7 @@ mod tests {
                 exit_after_replay: None,
                 last_seq: 0,
                 commands: commands_tx.clone(),
+                kill_requested: false,
             },
         );
 
@@ -2746,6 +3097,7 @@ mod tests {
             list_waiters: Mutex::new(VecDeque::new()),
             workspace_waiters: Mutex::new(HashMap::new()),
             message_counter: AtomicU64::new(0),
+            connected: tokio::sync::Notify::new(),
         });
         let (commands_tx, _commands_rx) = mpsc::unbounded_channel::<DaemonToFleetd>();
         let (events_tx, _events_rx) = mpsc::unbounded_channel::<String>();
@@ -2760,6 +3112,7 @@ mod tests {
                 exit_after_replay: None,
                 last_seq: 0,
                 commands: commands_tx.clone(),
+                kill_requested: false,
             },
         );
 
@@ -2787,6 +3140,7 @@ mod tests {
             list_waiters: Mutex::new(VecDeque::new()),
             workspace_waiters: Mutex::new(HashMap::new()),
             message_counter: AtomicU64::new(0),
+            connected: tokio::sync::Notify::new(),
         };
         let first = shared.next_message_id();
         let second = shared.next_message_id();

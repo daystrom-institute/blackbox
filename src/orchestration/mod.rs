@@ -310,14 +310,20 @@ pub struct ReadoptedSession {
 ///
 /// Returns the task's durable ingest cursor, which the caller replays from.
 /// `None` means "not ours": either the task store never knew this task (a TTL
-/// reap, a wiped store, another daemon's session) or it is already terminal, in
-/// which case there is nothing left to publish. The caller leaves those alone
-/// rather than killing them. A known task whose workspace binding cannot be
-/// restored is declined too, and the decline is recorded on the task.
+/// reap, a wiped store, another daemon's session) or it is already terminal
+/// and its worker has exited, in which case there is nothing left to publish.
+/// The caller leaves those alone rather than killing them. A known task whose
+/// workspace binding cannot be restored is declined too, and the decline is
+/// recorded on the task.
 ///
 /// A task the previous daemon left `Running` was flipped to `Failed`
 /// (`recoverable: true`) by `TaskStore::load` unless owner-managed. Re-adoption puts it back to
 /// `Running`, because the child genuinely never died: the daemon did.
+///
+/// A task that was already terminal while fleetd still runs its worker (a
+/// cancel whose stop request never arrived) is reattached with its terminal
+/// record unchanged and its worker is asked to stop, so the worker's exit is
+/// observed and the session's key is freed for a resume.
 pub fn readopt_harness_session(session: ReadoptedSession) -> Option<u64> {
     let ReadoptedSession {
         session_id,
@@ -401,28 +407,43 @@ pub fn readopt_harness_session(session: ReadoptedSession) -> Option<u64> {
         _ => {}
     }
 
-    let (provider, cursor) = {
+    let (provider, cursor, stop_worker) = {
         let mut inner = task.inner.lock();
         let already_terminal = inner.status != TaskStatus::Running && !inner.recoverable;
         if already_terminal {
-            return None;
+            if state != bro_protocol::SessionState::Running {
+                return None;
+            }
+            tracing::warn!(
+                %task_id,
+                %session_id,
+                status = ?inner.status,
+                "fleetd still runs the worker of a terminal task; reattaching it to stop it"
+            );
+            (inner.provider, inner.harness_ingest_seq, true)
+        } else {
+            if state == bro_protocol::SessionState::Running {
+                inner.status = TaskStatus::Running;
+                inner.completed_at = None;
+                inner.recoverable = false;
+                // The restart notice `TaskStore::load` appended is now wrong: the
+                // session was never lost, so it must not be left in the record for
+                // an agent to read as a failure.
+                strip_restart_notice(&mut inner.stderr);
+            }
+            (inner.provider, inner.harness_ingest_seq, false)
         }
-        if state == bro_protocol::SessionState::Running {
-            inner.status = TaskStatus::Running;
-            inner.completed_at = None;
-            inner.recoverable = false;
-            // The restart notice `TaskStore::load` appended is now wrong: the
-            // session was never lost, so it must not be left in the record for
-            // an agent to read as a failure.
-            strip_restart_notice(&mut inner.stderr);
-        }
-        (inner.provider, inner.harness_ingest_seq)
     };
     *task.child_id.lock() = pid;
 
-    harness_killers().write().insert(task_id.clone(), killer);
+    harness_killers()
+        .write()
+        .insert(task_id.clone(), killer.clone());
     harness_controls().write().insert(task_id.clone(), control);
     task.emit_roster_updated();
+    if stop_worker {
+        killer.kill();
+    }
 
     tracing::info!(
         session_id = %session_id,
@@ -3764,8 +3785,24 @@ fn spawn_harness_terminal_waiter(
         }
 
         let code = outcome.exit_code;
-        let (terminal_status, elapsed, cost, error_snippet, source_session, task_kind, cursor) = {
+        let (
+            terminal_status,
+            already_published,
+            elapsed,
+            cost,
+            error_snippet,
+            source_session,
+            task_kind,
+            cursor,
+        ) = {
             let mut inner = task.inner.lock();
+            // A task already published as terminal (cancelled, or reattached
+            // after a restart only to stop its worker) keeps its terminal
+            // record; the worker's exit only confirms the shutdown.
+            // A restart-flipped record (`recoverable`) is not one: re-adoption
+            // is still settling its outcome.
+            let already_published =
+                inner.completed_at.is_some() && inner.status.is_terminal() && !inner.recoverable;
             inner.exit_code = code;
             // Append the executor's collected child stderr. `ingest_harness_event`
             // may already have written a result-error message into `inner.stderr`
@@ -3775,15 +3812,18 @@ fn spawn_harness_terminal_waiter(
             inner.stderr.push_str(&outcome.stderr);
             // Preserve terminal states set during stream parsing (Cancelled on
             // kill, Failed on session fork detection) — don't let a clean exit
-            // code flip a detected failure back to Completed.
+            // code flip a detected failure back to Completed. A worker that
+            // exits zero after an error result still failed (gap-32113fd4).
             if inner.status != TaskStatus::Cancelled && inner.status != TaskStatus::Failed {
-                inner.status = if code == Some(0) {
+                inner.status = if code == Some(0) && latest_result_is_error(&inner) != Some(true) {
                     TaskStatus::Completed
                 } else {
                     TaskStatus::Failed
                 };
             }
-            inner.completed_at = Some(now_ms());
+            if !already_published {
+                inner.completed_at = Some(now_ms());
+            }
             let elapsed = format_elapsed(inner.started_at, inner.completed_at);
             let terminal_status = inner.status;
             let cost = inner.cost_usd;
@@ -3794,6 +3834,7 @@ fn spawn_harness_terminal_waiter(
             let cursor = inner.live_cursor;
             (
                 terminal_status,
+                already_published,
                 elapsed,
                 cost,
                 error_snippet,
@@ -3804,6 +3845,7 @@ fn spawn_harness_terminal_waiter(
         };
         task.emit_roster_updated();
         match terminal_status {
+            _ if already_published => {}
             TaskStatus::Completed => {
                 let _ = tail_tx.send(tail::TailEvent::TaskCompleted {
                     cursor,
@@ -3930,7 +3972,7 @@ fn ingest_harness_event(
     // per-delta O(accumulated-message) work measurably degraded runtime
     // worker poll times (thread-935b467d §4.6 measurements).
     let is_stream_delta = evt.get("type").and_then(Value::as_str) == Some("stream_event");
-    let (snippet_to_emit, emit_roster, task_event_to_emit) = {
+    let (snippet_to_emit, emit_roster, task_event_to_emit, fork_rejected) = {
         let mut inner = task.inner.lock();
         // Decide fork-acceptance BEFORE parsing so the parse can mutate the
         // task's accumulated message in place (taken, not cloned) — a
@@ -3938,6 +3980,7 @@ fn ingest_harness_event(
         let emitted_session_id = emitted_session_id_from_event(&evt);
         let mut accepted = true;
         let mut session_id_observed = false;
+        let mut fork_rejected = false;
         if let Some(sid) = emitted_session_id {
             if inner.session_id == "pending" {
                 inner.session_id = sid;
@@ -3950,7 +3993,7 @@ fn ingest_harness_event(
                     location.session_id = Some(observed_session_id);
                 }
             } else if inner.session_id != sid {
-                reject_forked_session(&mut inner, &sid);
+                fork_rejected = reject_forked_session(&mut inner, &sid);
                 accepted = false;
             }
         }
@@ -3987,16 +4030,15 @@ fn ingest_harness_event(
                     .observe_event(&evt, &sink, &supervision::config(), now_ms());
             }
             apply_sink_updates(&mut inner, sink);
-            // A terminal `result` event with `is_error: true` fails the task and
-            // preserves the message in stderr. A controlled harness turn may
-            // still exit the child with code zero after emitting an error
-            // result, so the event itself is authoritative (gap-32113fd4).
+            // A `result` event ends one turn, not the worker: a queued steer
+            // starts the next turn in the same process. An error result keeps
+            // its message in stderr, and the task's outcome waits for the
+            // worker's exit, where the latest result decides it
+            // (`latest_result_is_error`), so a task never reads as terminal
+            // while its worker can still be steered or cancelled.
             if evt.get("type").and_then(Value::as_str) == Some("result")
                 && evt.get("is_error").and_then(Value::as_bool) == Some(true)
             {
-                if inner.status != TaskStatus::Cancelled {
-                    inner.status = TaskStatus::Failed;
-                }
                 if let Some(msg) = evt.get("result").and_then(Value::as_str)
                     && !msg.trim().is_empty()
                 {
@@ -4042,8 +4084,15 @@ fn ingest_harness_event(
                 (snippet, session_id_observed, cursor)
             })
             .or_else(|| session_id_observed.then(|| (String::new(), true, None)));
-        (snippet, emit_roster, task_event_to_emit)
+        (snippet, emit_roster, task_event_to_emit, fork_rejected)
     };
+
+    // A forked worker is running a session this task does not own. The task
+    // is failed, so the worker is stopped rather than left running where no
+    // steer or cancel can reach it.
+    if fork_rejected && let Some(killer) = harness_killers().read().get(task_id).cloned() {
+        killer.kill();
+    }
 
     if let Some(task_event) = task_event_to_emit {
         let _ = tail_tx.send(task_event);
@@ -4354,17 +4403,37 @@ pub async fn wait_for_task_session_id_with_timeout(
     .flatten()
 }
 
-/// Cancel a running task.
+/// What [`cancel_task`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelOutcome {
+    /// A running task was cancelled and its worker asked to stop.
+    Cancelled,
+    /// The task was already terminal, but its worker had not exited, so the
+    /// stop request was sent again. The terminal record is unchanged.
+    StopResent(TaskStatus),
+}
+
+/// Cancel a running task, or stop the still-live worker of a terminal one.
 pub fn cancel_task(
     task: &Task,
     task_store: &RwLock<TaskStore>,
     store_dir: &std::path::Path,
-) -> Result<(), String> {
+) -> Result<CancelOutcome, String> {
+    let task_id = task.id();
     let mut inner = task.inner.lock();
     if inner.status != TaskStatus::Running {
+        let status = inner.status;
+        drop(inner);
+        // A registered kill switch means the worker's exit has not been
+        // observed. Its earlier stop request may never have arrived, so ask
+        // again rather than leave a live worker no tool can reach.
+        if let Some(killer) = harness_killers().read().get(&task_id).cloned() {
+            killer.resend();
+            return Ok(CancelOutcome::StopResent(status));
+        }
         return Err(format!(
             "Task already {}",
-            serde_json::to_string(&inner.status).unwrap_or_default()
+            serde_json::to_string(&status).unwrap_or_default()
         ));
     }
     inner.status = TaskStatus::Cancelled;
@@ -4375,7 +4444,6 @@ pub fn cancel_task(
     // Kill the child process. Executor-backed harness workers go through the
     // handle's idempotent kill switch (registered in harness_killers); other
     // tasks (one-shot / non-harness) still carry a raw PID in child_id.
-    let task_id = task.id();
     if let Some(killer) = harness_killers().read().get(&task_id).cloned() {
         killer.kill();
     } else if let Some(pid) = task.child_id.lock().take() {
@@ -4385,7 +4453,13 @@ pub fn cancel_task(
     }
     request_persist(task_store, store_dir);
     task.notify.notify_waiters();
-    Ok(())
+    Ok(CancelOutcome::Cancelled)
+}
+
+/// Whether a terminal task's worker has not yet been observed to exit. Its
+/// kill switch stays registered until the terminal waiter sees the exit.
+fn worker_shutdown_pending(task_id: &str) -> bool {
+    harness_killers().read().contains_key(task_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -4518,14 +4592,28 @@ fn tool_result_content_text(content: Option<&Value>) -> String {
     }
 }
 
-fn reject_forked_session(inner: &mut TaskInner, emitted_session_id: &str) {
-    if inner.status != TaskStatus::Failed {
-        let requested = inner.session_id.clone();
-        inner.status = TaskStatus::Failed;
-        inner.stderr.push_str(&format!(
-            "\nsession fork detected: requested resume of {requested}, provider emitted {emitted_session_id}"
-        ));
+/// Fail the task on a session fork. Returns whether this call failed it.
+fn reject_forked_session(inner: &mut TaskInner, emitted_session_id: &str) -> bool {
+    if inner.status == TaskStatus::Failed {
+        return false;
     }
+    let requested = inner.session_id.clone();
+    inner.status = TaskStatus::Failed;
+    inner.stderr.push_str(&format!(
+        "\nsession fork detected: requested resume of {requested}, provider emitted {emitted_session_id}"
+    ));
+    true
+}
+
+/// Whether the worker's latest turn ended in an error result. `None` when no
+/// result is retained, so the exit code decides alone.
+fn latest_result_is_error(inner: &TaskInner) -> Option<bool> {
+    inner
+        .events
+        .iter()
+        .rev()
+        .find(|event| event.get("type").and_then(Value::as_str) == Some("result"))
+        .map(|event| event.get("is_error").and_then(Value::as_bool) == Some(true))
 }
 
 pub fn format_elapsed(started_at: u64, completed_at: Option<u64>) -> String {
@@ -4601,6 +4689,12 @@ fn task_view_json_from_inner(
     }
     if inner.interrupted {
         obj["interrupted"] = Value::Bool(true);
+    }
+    // A terminal status is about the task; whether its worker process has
+    // exited is a separate fact. Until the exit is observed the worker is
+    // still running, and `bro_cancel` on the task asks it to stop again.
+    if inner.status.is_terminal() && worker_shutdown_pending(&inner.id) {
+        obj["workerShutdown"] = json!("pending");
     }
     // hasResult is truthful: true only when the task reached a terminal state
     // AND produced a final assistant message (the deliverable). Live tasks
@@ -6253,6 +6347,81 @@ mod tests {
         assert_eq!(healthy.inner.lock().status, TaskStatus::Completed);
     }
 
+    /// A failed turn is not a failed worker. The worker that emitted an error
+    /// result takes a queued steer as its next turn, so the task stays
+    /// running and steerable until the worker exits, and that exit's latest
+    /// result decides the outcome.
+    #[tokio::test]
+    async fn harness_task_stays_steerable_after_a_failed_turn() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let bin = root.join("two-turn-harness");
+        std::fs::write(
+            &bin,
+            concat!(
+                "#!/bin/sh\n",
+                "IFS= read -r input\n",
+                "printf '%s\\n' '{\"type\":\"result\",\"is_error\":true,\"result\":\"turn one failed\",\"session_id\":\"session-steer\"}'\n",
+                "IFS= read -r steer\n",
+                "printf '%s\\n' '{\"type\":\"result\",\"is_error\":false,\"result\":\"turn two ok\",\"session_id\":\"session-steer\"}'\n",
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&bin).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&bin, permissions).unwrap();
+
+        let mut env = crate::util::TestEnvGuard::new();
+        env.remove("BLACKBOX_MCP_URL");
+        env.set("BRO_HARNESS_BIN", &bin);
+        let store = Arc::new(RwLock::new(TaskStore::new()));
+        let (tail_tx, _) = tokio::sync::broadcast::channel(32);
+        let task = spawn_task_with_tool_placement(
+            "steer-after-error".to_string(),
+            Provider::Glm,
+            vec![
+                "-p".to_string(),
+                "start".to_string(),
+                "--model".to_string(),
+                "glm-test".to_string(),
+            ],
+            "session-steer".to_string(),
+            Some(root.to_string_lossy().into_owned()),
+            None,
+            root.join("store"),
+            store,
+            tail_tx,
+            None,
+            None,
+            None,
+            None,
+            None,
+            bro_core::Origin::AgentDispatch,
+        )
+        .await;
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !task.inner.lock().stderr.contains("turn one failed") {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the failed turn is ingested"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(task.inner.lock().status, TaskStatus::Running);
+        steer_harness_task("steer-after-error", "keep going".to_string())
+            .expect("the worker is still steerable after a failed turn");
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), wait_for_task(&task))
+            .await
+            .expect("the worker exits after its second turn");
+        let inner = task.inner.lock();
+        assert_eq!(inner.status, TaskStatus::Completed);
+        assert!(inner.stderr.contains("turn one failed"));
+    }
+
     /// The invariant slice 3 establishes: EVERY dispatch path that can produce
     /// a harness worker goes through the executor seam, so when the executor
     /// is fleetd no harness child is ever a direct daemon child.
@@ -6533,10 +6702,7 @@ mod tests {
             pid: Some(4242),
             state: bro_protocol::SessionState::Running,
             control: control_tx,
-            killer: executor::WorkerKill::via_fleetd(
-                "adopt-session".to_string(),
-                tokio::sync::mpsc::unbounded_channel().0,
-            ),
+            killer: executor::WorkerKill::routed(|| {}),
             events: events_rx,
             outcome: outcome_rx,
         });
@@ -6569,6 +6735,202 @@ mod tests {
             harness_killers().read().contains_key("adopt-task"),
             "cancel must reach the re-adopted child"
         );
+    }
+
+    /// A cancel whose stop request never reached fleetd leaves a terminal
+    /// task with a live worker. Re-adoption reattaches it with its terminal
+    /// record unchanged and asks the worker to stop; the worker's exit
+    /// confirms the shutdown without publishing a second terminal event.
+    #[tokio::test]
+    async fn readoption_stops_the_live_worker_of_a_cancelled_task() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store = Arc::new(RwLock::new(TaskStore::new()));
+        let (tail_tx, mut tail_rx) = tokio::sync::broadcast::channel(64);
+
+        let task = spawn_in_process_task(
+            "stop-task".to_string(),
+            Provider::Glm,
+            "stop-session".to_string(),
+            None,
+            root.clone(),
+            store.clone(),
+            tail_tx.clone(),
+            None,
+            None,
+            bro_core::Origin::AgentDispatch,
+        );
+        store
+            .write()
+            .insert_reserved("stop-task".to_string(), task.clone())
+            .ok();
+        {
+            let mut inner = task.inner.lock();
+            inner.status = TaskStatus::Cancelled;
+            inner.completed_at = Some(1234);
+            inner.harness_ingest_seq = 7;
+        }
+
+        install_harness_executor(
+            bbox_config::config::ExecutorKind::Local,
+            root.clone(),
+            store.clone(),
+            tail_tx,
+            None,
+        );
+
+        let kills = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = kills.clone();
+        let (control_tx, _control_rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
+        let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (outcome_tx, outcome_rx) = tokio::sync::oneshot::channel();
+        let cursor = readopt_harness_session(ReadoptedSession {
+            session_id: "stop-session".to_string(),
+            task_id: "stop-task".to_string(),
+            workspace_id: None,
+            workspace_scope: None,
+            workspace_binding_token: None,
+            pid: Some(4242),
+            state: bro_protocol::SessionState::Running,
+            control: control_tx,
+            killer: executor::WorkerKill::routed(move || {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }),
+            events: events_rx,
+            outcome: outcome_rx,
+        });
+
+        assert_eq!(cursor, Some(7));
+        assert_eq!(kills.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(task.inner.lock().status, TaskStatus::Cancelled);
+        assert_eq!(task_result_json(&task)["workerShutdown"], "pending");
+
+        drop(events_tx);
+        outcome_tx
+            .send(executor::WorkerOutcome {
+                exit_code: Some(0),
+                stderr: String::new(),
+            })
+            .ok();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while worker_shutdown_pending("stop-task") {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the worker's exit is observed"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let inner = task.inner.lock();
+        assert_eq!(inner.status, TaskStatus::Cancelled);
+        assert_eq!(inner.completed_at, Some(1234));
+        drop(inner);
+        assert!(task_result_json(&task).get("workerShutdown").is_none());
+        while let Ok(event) = tail_rx.try_recv() {
+            assert!(
+                !matches!(
+                    event,
+                    tail::TailEvent::TaskCompleted { .. } | tail::TailEvent::TaskFailed { .. }
+                ),
+                "an already published terminal task publishes no second outcome"
+            );
+        }
+    }
+
+    /// A terminal task whose worker fleetd reports exited has nothing left to
+    /// stop or publish, and is not reattached.
+    #[tokio::test]
+    async fn readoption_leaves_the_exited_worker_of_a_terminal_task_alone() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store = Arc::new(RwLock::new(TaskStore::new()));
+        let (tail_tx, _rx) = tokio::sync::broadcast::channel(32);
+        let task = spawn_in_process_task(
+            "done-task".to_string(),
+            Provider::Glm,
+            "done-session".to_string(),
+            None,
+            root.clone(),
+            store.clone(),
+            tail_tx.clone(),
+            None,
+            None,
+            bro_core::Origin::AgentDispatch,
+        );
+        store
+            .write()
+            .insert_reserved("done-task".to_string(), task.clone())
+            .ok();
+        {
+            let mut inner = task.inner.lock();
+            inner.status = TaskStatus::Cancelled;
+            inner.completed_at = Some(1234);
+        }
+        install_harness_executor(
+            bbox_config::config::ExecutorKind::Local,
+            root.clone(),
+            store.clone(),
+            tail_tx,
+            None,
+        );
+
+        let kills = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = kills.clone();
+        let (control_tx, _control_rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
+        let (_events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (_outcome_tx, outcome_rx) = tokio::sync::oneshot::channel();
+        let cursor = readopt_harness_session(ReadoptedSession {
+            session_id: "done-session".to_string(),
+            task_id: "done-task".to_string(),
+            workspace_id: None,
+            workspace_scope: None,
+            workspace_binding_token: None,
+            pid: Some(4242),
+            state: bro_protocol::SessionState::Exited,
+            control: control_tx,
+            killer: executor::WorkerKill::routed(move || {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }),
+            events: events_rx,
+            outcome: outcome_rx,
+        });
+        assert_eq!(cursor, None);
+        assert_eq!(kills.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(!harness_killers().read().contains_key("done-task"));
+    }
+
+    /// `bro_cancel` on a terminal task whose worker has not exited sends the
+    /// stop request again, every time, and leaves the terminal record alone.
+    /// Once the exit is observed it refuses as before.
+    #[test]
+    fn cancel_resends_the_stop_to_a_terminal_task_with_a_live_worker() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = RwLock::new(TaskStore::new());
+        let task = test_task("resend-task", TaskStatus::Failed, Provider::Brodex);
+        let kills = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = kills.clone();
+        harness_killers().write().insert(
+            "resend-task".to_string(),
+            executor::WorkerKill::routed(move || {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }),
+        );
+
+        for expected in 1..=2 {
+            assert_eq!(
+                cancel_task(&task, &store, directory.path()),
+                Ok(CancelOutcome::StopResent(TaskStatus::Failed))
+            );
+            assert_eq!(kills.load(std::sync::atomic::Ordering::SeqCst), expected);
+        }
+        assert_eq!(task.inner.lock().status, TaskStatus::Failed);
+        assert_eq!(task_result_json(&task)["workerShutdown"], "pending");
+
+        harness_killers().write().remove("resend-task");
+        let error = cancel_task(&task, &store, directory.path()).unwrap_err();
+        assert!(error.contains("Task already"), "{error}");
+        assert!(task_result_json(&task).get("workerShutdown").is_none());
     }
 
     struct MismatchedWorkspaceBindingAuthority;
@@ -6669,10 +7031,7 @@ mod tests {
                 pid: Some(4242),
                 state,
                 control: control_tx,
-                killer: executor::WorkerKill::via_fleetd(
-                    format!("{id}-session"),
-                    tokio::sync::mpsc::unbounded_channel().0,
-                ),
+                killer: executor::WorkerKill::routed(|| {}),
                 events: events_rx,
                 outcome: outcome_rx,
             })
@@ -6742,10 +7101,7 @@ mod tests {
             pid: Some(9999),
             state: bro_protocol::SessionState::Running,
             control: control_tx,
-            killer: executor::WorkerKill::via_fleetd(
-                "ghost-session".to_string(),
-                tokio::sync::mpsc::unbounded_channel().0,
-            ),
+            killer: executor::WorkerKill::routed(|| {}),
             events: events_rx,
             outcome: outcome_rx,
         });
@@ -8035,10 +8391,10 @@ mod tests {
     }
 
     #[test]
-    fn ingest_is_error_result_marks_child_task_failed_and_captures_message() {
-        // A child can exit zero after a terminal `result {is_error:true}` event.
-        // Ingesting it must fail the task and preserve the message
-        // (gap-32113fd4), independently of the process exit code.
+    fn ingest_is_error_result_keeps_the_task_running_and_captures_message() {
+        // A `result {is_error:true}` ends one turn; the worker may take a
+        // queued steer next. Ingest keeps the message and leaves the task
+        // running, and the latest result is what the exit decision reads.
         let task = Arc::new(Task {
             inner: Mutex::new(TaskInner {
                 id: "task-err".to_string(),
@@ -8089,9 +8445,29 @@ mod tests {
             "num_turns": 2,
         });
         ingest_harness_event(&task, Provider::Minimax, evt, &tx, "task-err");
+        {
+            let inner = task.inner.lock();
+            assert_eq!(inner.status, TaskStatus::Running);
+            assert!(inner.stderr.contains("400 Bad Request: boom"));
+            assert_eq!(latest_result_is_error(&inner), Some(true));
+        }
+
+        let recovered = serde_json::json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "session_id": "sess-err",
+            "result": "second turn done",
+            "num_turns": 3,
+        });
+        ingest_harness_event(&task, Provider::Minimax, recovered, &tx, "task-err");
         let inner = task.inner.lock();
-        assert!(matches!(inner.status, TaskStatus::Failed));
-        assert!(inner.stderr.contains("400 Bad Request: boom"));
+        assert_eq!(inner.status, TaskStatus::Running);
+        assert_eq!(
+            latest_result_is_error(&inner),
+            Some(false),
+            "a later successful turn supersedes the failed one"
+        );
     }
 
     fn mk_ingest_task(id: &str, session_id: &str) -> Arc<Task> {
@@ -8376,6 +8752,14 @@ mod tests {
         // (which is taken, not cloned, on the accept path) nor be stored.
         let task = mk_ingest_task("task-fork", "sess-real");
         task.inner.lock().last_assistant_message = Some("real text".to_string());
+        let kills = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = kills.clone();
+        harness_killers().write().insert(
+            "task-fork".to_string(),
+            executor::WorkerKill::routed(move || {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }),
+        );
         let (tx, _rx) = tokio::sync::broadcast::channel(16);
         let forked = serde_json::json!({
             "type": "stream_event",
@@ -8389,6 +8773,12 @@ mod tests {
         assert!(inner.events.iter().count() == 0, "forked event not stored");
         assert!(matches!(inner.status, TaskStatus::Failed));
         assert!(inner.stderr.contains("session fork detected"));
+        drop(inner);
+        assert_eq!(
+            kills.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the failed task's forked worker is stopped, not left running unreachable"
+        );
     }
 
     #[test]
