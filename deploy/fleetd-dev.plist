@@ -55,7 +55,10 @@
     <key>StandardErrorPath</key>
     <string>/Users/invidious/.local/state/blackbox-dev/bro/fleetd.err.log</string>
 
+    <!-- Standard, not Background: every worker fleetd spawns inherits the
+         job's scheduling class, and Background runs builds, app servers and
+         instruction reads at the lowest CPU and I/O priority. -->
     <key>ProcessType</key>
-    <string>Background</string>
+    <string>Standard</string>
 </dict>
 </plist>
