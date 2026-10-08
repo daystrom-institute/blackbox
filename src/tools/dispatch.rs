@@ -88,6 +88,32 @@ pub(crate) struct FreshDispatchResult {
     pub(crate) allocation: Option<orchestration::allocator::Allocation>,
 }
 
+/// Longest a single wait blocks on the server. MCP clients put their own
+/// deadline on each tool call (commonly 900s); a wait that outlives it ends as
+/// a transport timeout with no snapshot, so every wait, including one with no
+/// timeout, returns its snapshot before that.
+const MAX_WAIT_SECONDS: f64 = 840.0;
+
+/// The wait the server performs, and the requested wait when the cap
+/// shortened it (`None` stands for "no timeout").
+fn capped_wait(requested: Option<f64>) -> (f64, Option<Option<f64>>) {
+    match requested {
+        Some(seconds) if seconds <= MAX_WAIT_SECONDS => (seconds, None),
+        other => (MAX_WAIT_SECONDS, Some(other)),
+    }
+}
+
+/// Tell the caller a timed-out wait was shortened by the cap, so it reads the
+/// snapshot as "still running, wait again", not as its own deadline passing.
+fn note_wait_cap(out: &mut Value, capped_from: Option<Option<f64>>) {
+    if let Some(requested) = capped_from {
+        out["waitCapped"] = json!({
+            "requestedSeconds": requested,
+            "waitedSeconds": MAX_WAIT_SECONDS,
+        });
+    }
+}
+
 /// Validate before registering observers or touching task state. Both duration
 /// conversion and the platform clock deadline must be representable.
 fn validate_wait_timeout(seconds: Option<f64>) -> Result<(), &'static str> {
@@ -1674,16 +1700,18 @@ impl BlackboxServer {
         let progress_handle = caller_token
             .map(|token| spawn_progress_notifier(vec![task.clone()], context.peer.clone(), token));
 
-        let completed = orch::wait_for_task_with_timeout(&task, p.timeout_seconds).await;
+        let (wait, capped_from) = capped_wait(p.timeout_seconds);
+        let completed = orch::wait_for_task_with_timeout(&task, Some(wait)).await;
         if let Some(h) = progress_handle {
             h.abort();
         }
-        let result = if completed {
+        let mut out = if completed {
             orch::mcp_task_result_json(&task)
         } else {
-            orch::timeout_snapshot_json(&task)
+            let mut snapshot = orch::timeout_snapshot_json(&task);
+            note_wait_cap(&mut snapshot, capped_from);
+            snapshot
         };
-        let mut out = result;
         if let Some(name) = task.inner.lock().bro_label.clone() {
             out["bro"] = Value::String(name);
         }
@@ -1715,7 +1743,8 @@ impl BlackboxServer {
             .map(|token| spawn_progress_notifier(tasks.clone(), context.peer.clone(), token));
 
         // Wait concurrently (like Promise.all), not sequentially
-        let timeout = p.timeout_seconds;
+        let (wait, capped_from) = capped_wait(p.timeout_seconds);
+        let timeout = Some(wait);
         let futs: Vec<_> = tasks
             .iter()
             .map(|task| {
@@ -1757,6 +1786,9 @@ impl BlackboxServer {
         if let Some(truncation) = results_truncated {
             out["resultsTruncated"] = truncation;
         }
+        if !all_completed {
+            note_wait_cap(&mut out, capped_from);
+        }
         Self::ok_json(&out)
     }
 
@@ -1779,6 +1811,7 @@ impl BlackboxServer {
         let task_ids: Vec<String> = tasks.iter().map(|task| task.id()).collect();
         let _long_poll = self.state.long_polls.register("bro_when_any", task_ids);
 
+        let (wait, capped_from) = capped_wait(p.timeout_seconds);
         // Check if any already done
         let any_done = tasks.iter().any(|t| t.inner.lock().status.is_terminal());
         let progress_handle = if !any_done {
@@ -1802,15 +1835,8 @@ impl BlackboxServer {
                 })
                 .collect();
 
-            match p.timeout_seconds {
-                Some(secs) => {
-                    let dur = std::time::Duration::from_secs_f64(secs);
-                    let _ = tokio::time::timeout(dur, futures::future::select_all(futs)).await;
-                }
-                None => {
-                    futures::future::select_all(futs).await;
-                }
-            }
+            let dur = std::time::Duration::from_secs_f64(wait);
+            let _ = tokio::time::timeout(dur, futures::future::select_all(futs)).await;
         }
         if let Some(h) = progress_handle {
             h.abort();
@@ -1849,6 +1875,9 @@ impl BlackboxServer {
         });
         if let Some(truncation) = results_truncated {
             out["resultsTruncated"] = truncation;
+        }
+        if !any_completed {
+            note_wait_cap(&mut out, capped_from);
         }
         Self::ok_json(&out)
     }
@@ -2805,6 +2834,28 @@ fn summarize_when_ids(ids: &[String]) -> String {
 mod tests {
     use super::*;
     use crate::server::state::SharedState;
+
+    #[test]
+    fn a_wait_is_capped_inside_the_client_deadline() {
+        assert_eq!(capped_wait(Some(120.0)), (120.0, None));
+        assert_eq!(
+            capped_wait(Some(MAX_WAIT_SECONDS)),
+            (MAX_WAIT_SECONDS, None)
+        );
+        assert_eq!(
+            capped_wait(Some(900.0)),
+            (MAX_WAIT_SECONDS, Some(Some(900.0)))
+        );
+        assert_eq!(capped_wait(None), (MAX_WAIT_SECONDS, Some(None)));
+
+        let mut snapshot = json!({"status": "running"});
+        note_wait_cap(&mut snapshot, Some(Some(900.0)));
+        assert_eq!(snapshot["waitCapped"]["requestedSeconds"], 900.0);
+        assert_eq!(snapshot["waitCapped"]["waitedSeconds"], MAX_WAIT_SECONDS);
+        let mut untouched = json!({"status": "running"});
+        note_wait_cap(&mut untouched, None);
+        assert!(untouched.get("waitCapped").is_none());
+    }
 
     fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         BlackboxServer::new(Arc::new(SharedState::for_test(&tmp.path().join("bro"))))
