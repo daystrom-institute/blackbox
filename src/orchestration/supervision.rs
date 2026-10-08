@@ -157,10 +157,133 @@ pub struct SupervisionState {
     /// not an empty set. Absent in records written before the field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shell_sessions: Option<ShellSessionsObservation>,
+    /// The worker's latest accepted report of what its provider request is
+    /// waiting on. In memory only: after a restart it would describe nothing
+    /// current.
+    #[serde(skip)]
+    pub model_request: Option<ModelRequestObservation>,
+    /// Steers handed to the worker that it has not yet shown the model, oldest
+    /// first. The harness logs a steer as a user event carrying its exact text
+    /// when it injects it, which is what clears the entry.
+    #[serde(default, skip_serializing_if = "VecDeque::is_empty")]
+    pub pending_steers: VecDeque<PendingSteer>,
+}
+
+/// A steer queued to the worker and not yet delivered, kept as a digest of
+/// its text so the record never holds the prompt itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingSteer {
+    pub queued_at_ms: u64,
+    pub text_sha256: String,
+}
+
+/// Bound on remembered undelivered steers; the oldest is forgotten first.
+pub const MAX_PENDING_STEERS: usize = 32;
+
+fn steer_digest(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(text.as_bytes()))
+}
+
+/// The text of an ordinary user event, the shape a delivered steer takes.
+/// Subtyped user events (instruction context, tool outcomes) and tool
+/// results are never steers.
+fn plain_user_text(event: &Value) -> Option<String> {
+    if event.get("type").and_then(Value::as_str) != Some("user") || event.get("subtype").is_some() {
+        return None;
+    }
+    let blocks = event.get("message")?.get("content")?.as_array()?;
+    let mut text = String::new();
+    for block in blocks {
+        if block.get("type").and_then(Value::as_str) != Some("text") {
+            return None;
+        }
+        text.push_str(block.get("text")?.as_str()?);
+    }
+    Some(text)
 }
 
 /// Type tag of the harness envelope that reports a worker's shell sessions.
 pub const SHELL_SESSIONS_EVENT: &str = "harness_shell_sessions";
+/// Type tag of the harness envelope that reports what a worker's provider
+/// request is waiting on.
+pub const MODEL_REQUEST_EVENT: &str = "harness_model_request";
+/// Bounds a model-request report must respect to be accepted. The reason
+/// bound mirrors the worker's.
+pub const MAX_MODEL_REQUEST_LABEL_CHARS: usize = 64;
+pub const MAX_MODEL_REQUEST_REASON_CHARS: usize = 160;
+
+/// What a worker's provider request was waiting on when it last reported:
+/// `requesting` (sent, no response read yet) or `retry_wait` (a failed
+/// attempt sleeping before the next).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelRequestObservation {
+    pub seq: u64,
+    pub received_at_ms: u64,
+    pub state: String,
+    pub label: String,
+    pub attempt: u64,
+    pub retry_in_ms: Option<u64>,
+    pub reason: Option<String>,
+    /// No conversation event has arrived since the report, so the worker is
+    /// still waiting on what it describes.
+    pub current: bool,
+}
+
+impl ModelRequestObservation {
+    fn response_json(&self, now_ms: u64) -> Value {
+        let mut out = serde_json::json!({
+            "state": self.state,
+            "label": self.label,
+            "attempt": self.attempt,
+            "age_seconds": now_ms.saturating_sub(self.received_at_ms) / 1000,
+        });
+        if let Some(retry_in_ms) = self.retry_in_ms {
+            out["retry_in_ms"] = Value::from(retry_in_ms);
+        }
+        if let Some(reason) = &self.reason {
+            out["reason"] = Value::from(reason.clone());
+        }
+        out
+    }
+}
+
+/// Decode a model-request report strictly; anything malformed or over a
+/// bound yields `None`.
+fn decode_model_request(event: &Value, now_ms: u64) -> Option<ModelRequestObservation> {
+    let seq = event.get("seq")?.as_u64()?;
+    let state = event.get("state")?.as_str()?;
+    let label = event.get("label")?.as_str()?;
+    let attempt = event.get("attempt")?.as_u64()?;
+    if label.is_empty() || label.chars().count() > MAX_MODEL_REQUEST_LABEL_CHARS {
+        return None;
+    }
+    let (retry_in_ms, reason) = match state {
+        "requesting" => (None, None),
+        "retry_wait" => {
+            let reason = event.get("reason")?.as_str()?;
+            if reason.chars().count() > MAX_MODEL_REQUEST_REASON_CHARS {
+                return None;
+            }
+            (
+                Some(event.get("retry_in_ms")?.as_u64()?),
+                Some(reason.to_string()),
+            )
+        }
+        _ => return None,
+    };
+    Some(ModelRequestObservation {
+        seq,
+        received_at_ms: now_ms,
+        state: state.to_string(),
+        label: label.to_string(),
+        attempt,
+        retry_in_ms,
+        reason,
+        current: true,
+    })
+}
+
 /// Bounds a report must respect to be accepted. They mirror the worker's
 /// session cap and the command head it publishes.
 pub const MAX_OBSERVED_SHELL_SESSIONS: usize = 32;
@@ -210,14 +333,17 @@ impl ShellSessionsObservation {
     }
 }
 
-/// Whether `event` is a shell-session report addressed to a different session
-/// than `session_id`. Such a report must not be observed at all.
-pub fn is_foreign_shell_sessions_event(event: &Value, session_id: &str) -> bool {
-    event.get("type").and_then(Value::as_str) == Some(SHELL_SESSIONS_EVENT)
-        && event
-            .get("session_id")
-            .and_then(Value::as_str)
-            .is_some_and(|reported| reported != session_id)
+/// Whether `event` is worker telemetry (a shell-session or model-request
+/// report) addressed to a different session than `session_id`. Such a report
+/// must not be observed at all.
+pub fn is_foreign_worker_telemetry(event: &Value, session_id: &str) -> bool {
+    matches!(
+        event.get("type").and_then(Value::as_str),
+        Some(SHELL_SESSIONS_EVENT | MODEL_REQUEST_EVENT)
+    ) && event
+        .get("session_id")
+        .and_then(Value::as_str)
+        .is_some_and(|reported| reported != session_id)
 }
 
 /// Decode a shell-session report strictly. Anything missing, mistyped or over
@@ -269,6 +395,26 @@ impl Default for SupervisionConfig {
 }
 
 impl SupervisionState {
+    /// Remember a steer handed to the worker until the worker shows it to the
+    /// model.
+    pub fn note_queued_steer(&mut self, text: &str, now_ms: u64) {
+        self.pending_steers.push_back(PendingSteer {
+            queued_at_ms: now_ms,
+            text_sha256: steer_digest(text),
+        });
+        while self.pending_steers.len() > MAX_PENDING_STEERS {
+            self.pending_steers.pop_front();
+        }
+    }
+
+    fn pending_steers_json(&self, now_ms: u64) -> Option<Value> {
+        let oldest = self.pending_steers.front()?;
+        Some(serde_json::json!({
+            "count": self.pending_steers.len(),
+            "oldest_queued_seconds": now_ms.saturating_sub(oldest.queued_at_ms) / 1000,
+        }))
+    }
+
     /// Accept a shell-session report when it is well formed and newer than the
     /// one held. A malformed or over-limit report, a duplicate and an older
     /// report all leave the state exactly as it was. An accepted report
@@ -316,9 +462,37 @@ impl SupervisionState {
             self.observe_shell_sessions(event, now_ms);
             return;
         }
+        // A model-request report is telemetry too. It is shown only while no
+        // conversation event has followed it.
+        if event.get("type").and_then(Value::as_str) == Some(MODEL_REQUEST_EVENT) {
+            if let Some(report) = decode_model_request(event, now_ms)
+                && self
+                    .model_request
+                    .as_ref()
+                    .is_none_or(|held| report.seq > held.seq)
+            {
+                self.model_request = Some(report);
+            }
+            return;
+        }
 
         self.event_count = self.event_count.saturating_add(1);
         self.last_event_at_ms = Some(now_ms);
+        if let Some(report) = self.model_request.as_mut() {
+            report.current = false;
+        }
+        if !self.pending_steers.is_empty()
+            && let Some(text) = plain_user_text(event)
+        {
+            let digest = steer_digest(&text);
+            if let Some(index) = self
+                .pending_steers
+                .iter()
+                .position(|steer| steer.text_sha256 == digest)
+            {
+                self.pending_steers.remove(index);
+            }
+        }
 
         self.observe_usage(sink);
 
@@ -486,6 +660,12 @@ impl SupervisionState {
         if let Some(report) = &self.shell_sessions {
             obj["shell_sessions"] = report.response_json(now_ms);
         }
+        if let Some(report) = self.model_request.as_ref().filter(|report| report.current) {
+            obj["model_request"] = report.response_json(now_ms);
+        }
+        if let Some(pending) = self.pending_steers_json(now_ms) {
+            obj["pending_steers"] = pending;
+        }
 
         let compactions_in_window = self.compactions_within_window(cfg, now_ms);
         obj["compactions_in_window"] = Value::from(compactions_in_window);
@@ -532,6 +712,15 @@ impl SupervisionState {
                 if let Some(report) = &self.shell_sessions {
                     obj["shell_sessions"] = report.response_json(now_ms);
                 }
+            }
+            // A worker waiting on its provider is not busy: say what it is
+            // waiting on whenever that is still the latest thing it did.
+            if let Some(report) = self.model_request.as_ref().filter(|report| report.current) {
+                obj["model_request"] = report.response_json(now_ms);
+            }
+            // An undelivered steer is a fact a coordinator acts on.
+            if let Some(pending) = self.pending_steers_json(now_ms) {
+                obj["pending_steers"] = pending;
             }
             return obj;
         }
@@ -768,6 +957,8 @@ impl Default for SupervisionState {
             alerts: Vec::new(),
             last_alert_at_ms: BTreeMap::new(),
             shell_sessions: None,
+            model_request: None,
+            pending_steers: VecDeque::new(),
         }
     }
 }
@@ -1881,6 +2072,135 @@ mod tests {
         );
     }
 
+    /// The harness's emitter test produces this same fixture.
+    const MODEL_REQUEST_FIXTURE: &str =
+        include_str!("../../tests/fixtures/harness-events/model_request.json");
+
+    fn model_request(seq: u64) -> Value {
+        let mut report: Value = serde_json::from_str(MODEL_REQUEST_FIXTURE).unwrap();
+        report["seq"] = Value::from(seq);
+        report
+    }
+
+    /// A model-request report says what the worker is waiting on until the
+    /// next conversation event. It is not activity, an older report never
+    /// replaces a newer one, and a malformed one is ignored.
+    #[test]
+    fn a_model_request_report_is_shown_until_the_conversation_moves_on() {
+        let mut state = SupervisionState::default();
+        let text = serde_json::json!({"type": "assistant", "message": {"content": []}});
+        state.observe_event(&text, &sink_without_usage(), &cfg(), 1_000);
+        state.observe_event(&model_request(7), &sink_without_usage(), &cfg(), 2_000);
+        assert_eq!(state.event_count, 1, "a report is not activity");
+        assert_eq!(state.last_event_at_ms, Some(1_000));
+
+        let shown = state.snapshot_for_response(&cfg(), 9_000);
+        assert_eq!(shown["ok"], true);
+        assert_eq!(shown["model_request"]["state"], "retry_wait");
+        assert_eq!(shown["model_request"]["label"], "anthropic/messages");
+        assert_eq!(shown["model_request"]["attempt"], 2);
+        assert_eq!(shown["model_request"]["retry_in_ms"], 4000);
+        assert_eq!(shown["model_request"]["reason"], "HTTP 529");
+        assert_eq!(shown["model_request"]["age_seconds"], 7);
+        assert_eq!(
+            state.snapshot(&cfg(), 9_000)["model_request"]["state"],
+            "retry_wait"
+        );
+
+        let mut older = model_request(3);
+        older["state"] = Value::from("requesting");
+        state.observe_event(&older, &sink_without_usage(), &cfg(), 3_000);
+        assert_eq!(state.model_request.as_ref().unwrap().seq, 7);
+        let mut malformed = model_request(8);
+        malformed["state"] = Value::from("sleeping");
+        state.observe_event(&malformed, &sink_without_usage(), &cfg(), 3_000);
+        assert_eq!(state.model_request.as_ref().unwrap().seq, 7);
+
+        state.observe_event(&text, &sink_without_usage(), &cfg(), 10_000);
+        assert!(
+            state
+                .snapshot_for_response(&cfg(), 11_000)
+                .get("model_request")
+                .is_none()
+        );
+        assert!(
+            state
+                .snapshot(&cfg(), 11_000)
+                .get("model_request")
+                .is_none()
+        );
+    }
+
+    /// A queued steer stays pending until the worker logs it as a user turn;
+    /// other user events never clear it.
+    #[test]
+    fn a_steer_is_pending_until_the_worker_shows_it_to_the_model() {
+        let mut state = SupervisionState::default();
+        state.note_queued_steer("prefer the smaller fix", 1_000);
+        state.note_queued_steer("then stop", 2_000);
+        let shown = state.snapshot_for_response(&cfg(), 5_000);
+        assert_eq!(shown["pending_steers"]["count"], 2);
+        assert_eq!(shown["pending_steers"]["oldest_queued_seconds"], 4);
+
+        let user = |subtype: Option<&str>, text: &str| {
+            let mut event = serde_json::json!({
+                "type": "user",
+                "message": {"role": "user", "content": [{"type": "text", "text": text}]},
+            });
+            if let Some(subtype) = subtype {
+                event["subtype"] = Value::from(subtype);
+            }
+            event
+        };
+        state.observe_event(
+            &user(Some("instruction_context"), "prefer the smaller fix"),
+            &sink_without_usage(),
+            &cfg(),
+            6_000,
+        );
+        state.observe_event(
+            &user(None, "something else"),
+            &sink_without_usage(),
+            &cfg(),
+            6_000,
+        );
+        assert_eq!(state.pending_steers.len(), 2);
+
+        state.observe_event(
+            &user(None, "prefer the smaller fix"),
+            &sink_without_usage(),
+            &cfg(),
+            7_000,
+        );
+        let shown = state.snapshot(&cfg(), 8_000);
+        assert_eq!(shown["pending_steers"]["count"], 1);
+        assert_eq!(shown["pending_steers"]["oldest_queued_seconds"], 6);
+        state.observe_event(
+            &user(None, "then stop"),
+            &sink_without_usage(),
+            &cfg(),
+            9_000,
+        );
+        assert!(
+            state
+                .snapshot(&cfg(), 9_000)
+                .get("pending_steers")
+                .is_none()
+        );
+
+        for index in 0..(MAX_PENDING_STEERS + 3) {
+            state.note_queued_steer(&format!("steer {index}"), 10_000);
+        }
+        assert_eq!(state.pending_steers.len(), MAX_PENDING_STEERS);
+    }
+
+    #[test]
+    fn worker_telemetry_for_another_session_is_foreign() {
+        let report = model_request(1);
+        assert!(!is_foreign_worker_telemetry(&report, "fixture-session"));
+        assert!(is_foreign_worker_telemetry(&report, "another-session"));
+    }
+
     #[test]
     fn shell_session_observations_persist_and_load_as_history() {
         // A record written before the field existed loads with no observation.
@@ -1928,17 +2248,14 @@ mod tests {
     #[test]
     fn a_report_for_another_session_is_recognized_as_foreign() {
         let event = shell_report(1, json!([]));
-        assert!(!is_foreign_shell_sessions_event(
-            &event,
-            "synthetic-session"
-        ));
-        assert!(is_foreign_shell_sessions_event(&event, "another-session"));
+        assert!(!is_foreign_worker_telemetry(&event, "synthetic-session"));
+        assert!(is_foreign_worker_telemetry(&event, "another-session"));
         // Other events, and a report without a session id, are never foreign.
-        assert!(!is_foreign_shell_sessions_event(
+        assert!(!is_foreign_worker_telemetry(
             &text_event(),
             "another-session"
         ));
-        assert!(!is_foreign_shell_sessions_event(
+        assert!(!is_foreign_worker_telemetry(
             &json!({ "type": SHELL_SESSIONS_EVENT, "seq": 1, "sessions": [] }),
             "another-session"
         ));

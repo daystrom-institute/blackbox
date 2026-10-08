@@ -147,6 +147,20 @@ Domain home for the dispatch plane. Boundary contract:
   is a new task with fresh supervision state, so a new worker process never
   reports under an existing task's held sequence.
 
+- **A model-request report says what the worker's provider request is
+  waiting on.** `harness_model_request` is sent when a request goes out
+  (`requesting`) and when a failed attempt starts its backoff (`retry_wait`,
+  with the wait and a bounded reason). Like a shell report it is telemetry:
+  it is never activity, it is not stored in the task's event ring, and a
+  report with a lower sequence than the held one is ignored. It is shown, as
+  `model_request`, only until the next conversation event, because after that
+  it no longer describes what the worker is doing. It is held in memory only.
+- **A steer is pending until the worker shows it to the model.** `bro_steer`
+  records a digest of the steer's text before sending it; the harness logs
+  the steer as an ordinary user event with that exact text when it injects
+  it, which clears the entry. Status shows `pending_steers` (count and the
+  oldest one's age) while any remain. Subtyped user events never clear one.
+
 ## Worker environment inheritance
 
 - A worker inherits the spawning process's environment minus the spec's

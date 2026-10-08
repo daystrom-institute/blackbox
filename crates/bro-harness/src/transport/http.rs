@@ -244,7 +244,24 @@ where
 pub async fn send_with_retry_observed<F, Fut, O>(
     label: &str,
     make: F,
+    observe: O,
+) -> reqwest::Result<reqwest::Response>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = reqwest::Result<reqwest::Response>>,
+    O: FnMut(Option<RetryAfter>),
+{
+    send_with_retry_reported(label, make, observe, &|_| {}).await
+}
+
+/// [`send_with_retry_observed`] that also reports each attempt and each
+/// retry wait to `report`, so a supervisor can tell a request awaiting its
+/// response from one sleeping before its next attempt.
+pub async fn send_with_retry_reported<F, Fut, O>(
+    label: &str,
+    make: F,
     mut observe: O,
+    report: &(dyn Fn(super::ModelRequestReport) + Sync),
 ) -> reqwest::Result<reqwest::Response>
 where
     F: Fn() -> Fut,
@@ -255,6 +272,10 @@ where
     let mut attempt = 0u32;
     loop {
         attempt += 1;
+        report(super::ModelRequestReport::Requesting {
+            label: label.to_string(),
+            attempt,
+        });
         match make().await {
             Ok(resp) => {
                 observe(RetryAfter::from_headers(resp.headers()));
@@ -288,6 +309,12 @@ where
                     wait_ms = wait.as_millis() as u64,
                     "transient HTTP status; retrying"
                 );
+                report(super::ModelRequestReport::RetryWait {
+                    label: label.to_string(),
+                    attempt,
+                    wait,
+                    reason: format!("HTTP {}", status.as_u16()),
+                });
                 match advice {
                     Some(advice) => sleep_until_retry(advice).await,
                     None => tokio::time::sleep(wait).await,
@@ -302,6 +329,12 @@ where
                     label, attempt, error = %e, wait_ms = wait.as_millis() as u64,
                     "transient HTTP error; retrying"
                 );
+                report(super::ModelRequestReport::RetryWait {
+                    label: label.to_string(),
+                    attempt,
+                    wait,
+                    reason: super::ModelRequestReport::bounded_reason(&e.to_string()),
+                });
                 tokio::time::sleep(wait).await;
             }
         }

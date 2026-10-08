@@ -4031,9 +4031,9 @@ fn ingest_harness_event(
             };
             provider.parse_event(&evt, &mut sink);
             apply_cwd_updates_from_event(&mut inner, &evt);
-            // A shell-session report names its session. One addressed to a
+            // Worker telemetry names its session. A report addressed to a
             // different session than this task's is not this worker's state.
-            if !supervision::is_foreign_shell_sessions_event(&evt, &inner.session_id) {
+            if !supervision::is_foreign_worker_telemetry(&evt, &inner.session_id) {
                 inner
                     .supervision
                     .observe_event(&evt, &sink, &supervision::config(), now_ms());
@@ -4062,7 +4062,12 @@ fn ingest_harness_event(
             // wave-15 consumer inventory in thread-935b467d. Storing one
             // per text chunk made the 512-slot ring all-deltas under
             // streaming and deep-cloned every chunk.
-            if !is_stream_delta {
+            // Model-request reports are not stored either: supervision keeps
+            // the latest one, and one per model step would crowd conversation
+            // events out of the ring.
+            let is_model_request =
+                evt.get("type").and_then(Value::as_str) == Some(supervision::MODEL_REQUEST_EVENT);
+            if !is_stream_delta && !is_model_request {
                 task_event_to_emit = Some(append_task_event(&mut inner, evt));
             }
         }

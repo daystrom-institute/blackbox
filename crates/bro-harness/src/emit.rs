@@ -236,6 +236,40 @@ impl Emitter {
         }));
     }
 
+    /// `harness_model_request`: what the worker's provider request is waiting
+    /// on, sent when a request starts and when a retry begins its wait.
+    /// Telemetry for the supervising daemon, which keeps the latest report by
+    /// `seq` and shows it until the next conversation event. Carries the
+    /// transport label, attempt, wait and a bounded reason: never request or
+    /// response content.
+    pub fn model_request(&self, report: &crate::transport::ModelRequestReport) {
+        use crate::transport::ModelRequestReport;
+        let mut line = json!({
+            "type": "harness_model_request",
+            "session_id": self.session_id,
+        });
+        match report {
+            ModelRequestReport::Requesting { label, attempt } => {
+                line["state"] = json!("requesting");
+                line["label"] = json!(label);
+                line["attempt"] = json!(attempt);
+            }
+            ModelRequestReport::RetryWait {
+                label,
+                attempt,
+                wait,
+                reason,
+            } => {
+                line["state"] = json!("retry_wait");
+                line["label"] = json!(label);
+                line["attempt"] = json!(attempt);
+                line["retry_in_ms"] = json!(u64::try_from(wait.as_millis()).unwrap_or(u64::MAX));
+                line["reason"] = json!(ModelRequestReport::bounded_reason(reason));
+            }
+        }
+        self.write_line(line);
+    }
+
     /// `system/init` for bidirectional mode, advertising the in-stream slash
     /// commands the harness accepts (currently `/compact`) so a driver knows the
     /// control surface (NDJSON_FORMAT.md §system/init `slash_commands`).
@@ -650,6 +684,10 @@ impl crate::transport::TurnSink for Emitter {
     fn stream_event(&self, event: Value) {
         Emitter::stream_event(self, event);
     }
+
+    fn model_request(&self, report: crate::transport::ModelRequestReport) {
+        Emitter::model_request(self, &report);
+    }
 }
 
 #[cfg(test)]
@@ -660,6 +698,49 @@ mod tests {
     /// The daemon's status-tail acceptance test ingests this same fixture.
     const INSTRUCTION_TIMEOUT_FIXTURE: &str =
         include_str!("../../../tests/fixtures/harness-events/instruction_read_timeout.json");
+
+    /// The daemon's supervision test ingests this same fixture.
+    const MODEL_REQUEST_FIXTURE: &str =
+        include_str!("../../../tests/fixtures/harness-events/model_request.json");
+
+    #[test]
+    fn model_request_reports_match_the_daemon_fixture_and_bound_the_reason() {
+        use crate::transport::ModelRequestReport;
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let sink = {
+            let captured = captured.clone();
+            Arc::new(move |event: Value| captured.lock().unwrap().push(event))
+        };
+        let emitter = Emitter::with_callback("fixture-session".into(), sink);
+        emitter.model_request(&ModelRequestReport::RetryWait {
+            label: "anthropic/messages".into(),
+            attempt: 2,
+            wait: std::time::Duration::from_secs(4),
+            reason: "HTTP 529".into(),
+        });
+        emitter.model_request(&ModelRequestReport::Requesting {
+            label: "openai-responses/ws".into(),
+            attempt: 1,
+        });
+        emitter.model_request(&ModelRequestReport::RetryWait {
+            label: "anthropic/messages".into(),
+            attempt: 3,
+            wait: std::time::Duration::from_millis(500),
+            reason: "x".repeat(400),
+        });
+        let emitted = captured.lock().unwrap().clone();
+        let mut unsequenced = emitted[0].clone();
+        unsequenced.as_object_mut().unwrap().remove("seq");
+        let fixture: Value = serde_json::from_str(MODEL_REQUEST_FIXTURE).unwrap();
+        assert_eq!(unsequenced, fixture);
+        assert_eq!(emitted[1]["state"], "requesting");
+        assert_eq!(emitted[1]["attempt"], 1);
+        assert!(emitted[1].get("retry_in_ms").is_none());
+        assert_eq!(
+            emitted[2]["reason"].as_str().unwrap().chars().count(),
+            ModelRequestReport::MAX_REASON_CHARS
+        );
+    }
 
     #[test]
     fn instruction_read_timeout_is_sequenced_logged_and_matches_the_daemon_fixture() {

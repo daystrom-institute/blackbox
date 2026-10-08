@@ -441,6 +441,34 @@ pub struct CompactionParams {
 /// `Send` turn future.
 pub trait TurnSink: Send + Sync {
     fn stream_event(&self, event: Value);
+
+    /// Provider-request telemetry for the supervising daemon: a request was
+    /// sent, or a retry is waiting. Default: discarded.
+    fn model_request(&self, _report: ModelRequestReport) {}
+}
+
+/// What a transport is waiting on, reported as it changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelRequestReport {
+    /// A request was sent and no response has been read yet.
+    Requesting { label: String, attempt: u32 },
+    /// A failed attempt is waiting out its backoff before the next one.
+    RetryWait {
+        label: String,
+        attempt: u32,
+        wait: std::time::Duration,
+        reason: String,
+    },
+}
+
+impl ModelRequestReport {
+    /// Longest retry reason a report carries: error text can embed request
+    /// detail, and the report is a status line, not a log.
+    pub const MAX_REASON_CHARS: usize = 160;
+
+    pub fn bounded_reason(reason: &str) -> String {
+        reason.chars().take(Self::MAX_REASON_CHARS).collect()
+    }
 }
 
 /// Synthetic assistant text appended to repair role alternation after a turn is
