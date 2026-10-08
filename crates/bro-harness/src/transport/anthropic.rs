@@ -336,6 +336,23 @@ fn inband_error_retryable(ev: &Value) -> bool {
 /// Empty text/thinking starts are stream scaffolding. Other block starts can
 /// carry complete content or signal provider-side execution, so replaying the
 /// request after forwarding them can duplicate output or a native tool call.
+/// Content whose replay would show twice or run twice: anything but
+/// thinking. Thinking is shown only as it streams and never reaches the
+/// transcript or the deliverable from a failed attempt.
+fn sse_event_has_visible_content(ev: &Value) -> bool {
+    match ev["type"].as_str() {
+        Some("content_block_delta") => !matches!(
+            ev["delta"]["type"].as_str(),
+            Some("thinking_delta" | "signature_delta")
+        ),
+        Some("content_block_start") => match ev["content_block"]["type"].as_str() {
+            Some("thinking" | "redacted_thinking") => false,
+            _ => sse_event_has_content(ev),
+        },
+        _ => false,
+    }
+}
+
 fn sse_event_has_content(ev: &Value) -> bool {
     match ev["type"].as_str() {
         Some("content_block_delta") => true,
@@ -928,10 +945,12 @@ impl Transport for AnthropicTransport {
             let mut usage = Usage::default();
             let mut stop = StopReason::Done;
             let mut inband_error: Option<(String, bool)> = None;
-            // Once content or a tool start has been forwarded, retrying can
-            // duplicate output or provider-side execution. Empty text/thinking
-            // starts alone still allow a retry before actual content arrives.
+            // Once text or a tool start has been forwarded, retrying can
+            // duplicate output or provider-side execution, so a fault after it
+            // is terminal. Thinking alone does not: a fault or a truncated
+            // response after only thinking is retried.
             let mut streamed_content = false;
+            let mut visible_content = false;
             let mut integrity = AnthropicStreamIntegrity::default();
 
             'consume: loop {
@@ -990,14 +1009,22 @@ impl Transport for AnthropicTransport {
                                     Some((format!("{code}: {msg}"), inband_error_retryable(&ev)));
                                 break 'consume;
                             }
-                            integrity.observe(&ev).map_err(|error| {
-                                super::rejected_provider_response(
+                            if let Err(error) = integrity.observe(&ev) {
+                                // A malformed or truncated response with nothing
+                                // visible yet is retried like a transient fault.
+                                if !visible_content {
+                                    inband_error =
+                                        Some((format!("malformed response: {error}"), true));
+                                    break 'consume;
+                                }
+                                return Err(super::rejected_provider_response(
                                     self.fail_response(error, &blocks, assistant_idx),
                                     "anthropic",
                                     ev.clone(),
-                                )
-                            })?;
+                                ));
+                            }
                             streamed_content |= sse_event_has_content(&ev);
+                            visible_content |= sse_event_has_visible_content(&ev);
                             sink.stream_event(ev.clone());
                             fold_sse(&ev, &mut blocks, &mut usage, &mut stop);
                             // Mirror the running usage onto the transport so a
@@ -1020,14 +1047,23 @@ impl Transport for AnthropicTransport {
                 }
             }
 
-            // In-band fault (provider error event, idle timeout, or mid-stream
-            // read error): retry the whole turn on a transient one (overload /
-            // rate-limit / network / idle) — but only while nothing has streamed
-            // yet, so the retry can't duplicate already-emitted content. Otherwise
-            // surface it as a failure instead of returning a silent partial/empty
-            // success.
+            // A stream that ended without message_stop is truncated: with
+            // nothing visible yet it is retried like an in-band fault.
+            if inband_error.is_none()
+                && !visible_content
+                && let Err(error) = integrity.finish()
+            {
+                inband_error = Some((format!("truncated response: {error}"), true));
+            }
+
+            // In-band fault (provider error event, idle timeout, mid-stream
+            // read error, malformed or truncated response): retry the whole
+            // turn on a transient one (overload / rate-limit / network / idle)
+            // while nothing visible has streamed, so the retry can't duplicate
+            // already-emitted text or tool calls. Otherwise surface it as a
+            // failure instead of returning a silent partial/empty success.
             if let Some((msg, retryable)) = inband_error {
-                if retryable && !streamed_content && inband_attempt <= max_inband {
+                if retryable && !visible_content && inband_attempt <= max_inband {
                     let wait = super::http::backoff(inband_attempt);
                     tracing::warn!(
                         label = "anthropic/messages",
@@ -2650,6 +2686,20 @@ mod tests {
     }
 
     async fn assert_retry_after_stream_prefix(prefix: &[Value], should_retry: bool) {
+        let overloaded =
+            [json!({"type":"error","error":{"type":"overloaded_error","message":"try again"}})];
+        assert_retry_after_stream(prefix, &overloaded, should_retry, "overloaded_error").await;
+    }
+
+    /// The first response streams `prefix` and then `tail`; a retry gets a
+    /// clean text response. `terminal_error` is what a non-retried failure
+    /// must name.
+    async fn assert_retry_after_stream(
+        prefix: &[Value],
+        tail: &[Value],
+        should_retry: bool,
+        terminal_error: &str,
+    ) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         struct NoSink;
@@ -2660,12 +2710,9 @@ mod tests {
         let mut first_body = String::from(
             "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"role\":\"assistant\",\"content\":[]}}\n\n",
         );
-        for event in prefix {
+        for event in prefix.iter().chain(tail) {
             first_body.push_str(&format!("data: {event}\n\n"));
         }
-        first_body.push_str(
-            "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"try again\"}}\n\n",
-        );
         let recovered_body = concat!(
             "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
             "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"recovered\"}}\n\n",
@@ -2744,7 +2791,7 @@ mod tests {
             let error = result
                 .err()
                 .expect("content must make the failure terminal");
-            assert!(format!("{error:#}").contains("overloaded_error"));
+            assert!(format!("{error:#}").contains(terminal_error), "{error:#}");
             assert_eq!(requests, 1, "content must prevent a second HTTP request");
             assert_eq!(tx.messages.len(), 1, "failed segment must not be committed");
         }
@@ -2775,6 +2822,34 @@ mod tests {
                 json!({"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}),
             ],
             true,
+        )
+        .await;
+    }
+
+    /// Thinking is the only output a failed attempt had shown, so a fault or a
+    /// truncated response after it is retried; after visible text it is not.
+    #[tokio::test]
+    async fn run_turn_retries_a_failure_after_thinking_alone() {
+        let thinking = [
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"planning the review"}}),
+        ];
+        assert_retry_after_stream_prefix(&thinking, true).await;
+        // The observed provider shape: message_stop with the thinking block
+        // still open and no stop_reason.
+        assert_retry_after_stream(&thinking, &[json!({"type":"message_stop"})], true, "").await;
+        // The stream ends with no message_stop at all.
+        assert_retry_after_stream(&thinking, &[], true, "").await;
+
+        let text = [
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}),
+        ];
+        assert_retry_after_stream(
+            &text,
+            &[json!({"type":"message_stop"})],
+            false,
+            "message_stop before stop_reason or block completion",
         )
         .await;
     }
