@@ -845,6 +845,29 @@ fn validate_completed_item(added: &Value, completed: &Value) -> Result<()> {
     Ok(())
 }
 
+/// Whether the terminal snapshot carries a streamed item. Every field must
+/// match exactly except `encrypted_content`: the server encrypts an item's
+/// opaque state again each time it serializes the item, so the terminal copy
+/// of a reasoning item can carry different ciphertext for the same item.
+fn terminal_carries_item(output: &[Value], done: &Value) -> bool {
+    output
+        .iter()
+        .any(|item| item == done || same_except_ciphertext(item, done))
+}
+
+fn same_except_ciphertext(left: &Value, right: &Value) -> bool {
+    const CIPHERTEXT: &str = "encrypted_content";
+    let (Some(left), Some(right)) = (left.as_object(), right.as_object()) else {
+        return false;
+    };
+    left.contains_key(CIPHERTEXT)
+        && right.contains_key(CIPHERTEXT)
+        && left.len() == right.len()
+        && left
+            .iter()
+            .all(|(key, value)| key == CIPHERTEXT || right.get(key) == Some(value))
+}
+
 fn parse_sse_validated(
     input: &mut Vec<Value>,
     custom_tool_call_ids: &mut HashSet<String>,
@@ -1031,10 +1054,11 @@ fn parse_sse_validated(
         }
         for done in &output_items {
             anyhow::ensure!(
-                output.contains(done),
+                terminal_carries_item(&output, done),
                 "terminal output disagrees with completed item"
             );
         }
+        // The terminal copy is kept, including its ciphertext.
         output_items = output;
     } else {
         anyhow::ensure!(
@@ -1820,6 +1844,51 @@ mod tests {
             before,
             "a discarded open item is not admitted"
         );
+    }
+
+    #[test]
+    fn interrupted_terminal_may_reencrypt_a_completed_reasoning_item() {
+        // The observed wire shape: a steer interrupts the response after a
+        // reasoning item completed, and the interrupted terminal snapshot
+        // repeats that item with freshly encrypted opaque state. The item is
+        // the same; the terminal copy is the one kept for the next request.
+        let streamed = json!({"id":"rs_done","type":"reasoning","summary":[{"type":"summary_text","text":"plan"}],"encrypted_content":"ciphertext-from-stream"});
+        let mut terminal_copy = streamed.clone();
+        terminal_copy["encrypted_content"] = json!("ciphertext-from-terminal");
+        let events = |terminal_item: Value| {
+            response_events(&[
+                json!({"type":"response.created","response":{"id":"resp_reenc"}}),
+                json!({"type":"response.output_item.added","output_index":0,"item":{"id":"rs_done","type":"reasoning","summary":[]}}),
+                json!({"type":"response.interrupt.accepted","response_id":"resp_reenc"}),
+                json!({"type":"response.output_item.done","output_index":0,"item":streamed}),
+                json!({"type":"response.output_item.added","output_index":1,"item":{"id":"msg_open","type":"message","content":[]}}),
+                json!({"type":"response.output_item.interrupted","response_id":"resp_reenc","item_id":"msg_open","output_index":1}),
+                json!({"type":"response.incomplete","response":{
+                    "id":"resp_reenc","status":"incomplete",
+                    "incomplete_details":{"reason":"interrupted"},
+                    "output":[terminal_item],
+                    "usage":{"input_tokens":30,"output_tokens":4}
+                }}),
+            ])
+        };
+
+        let mut s = state();
+        let out = s
+            .parse_sse(&events(terminal_copy.clone()))
+            .expect("a re-encrypted copy of the same item reconciles");
+        assert_eq!(out.end_turn, Some(false));
+        assert!(s.input.contains(&terminal_copy));
+        assert!(!s.input.contains(&streamed));
+
+        let mut changed = terminal_copy;
+        changed["summary"] = json!([{"type":"summary_text","text":"another plan"}]);
+        let mut s = state();
+        let before = s.input.clone();
+        assert!(
+            s.parse_sse(&events(changed)).is_err(),
+            "any other difference still fails reconciliation"
+        );
+        assert_eq!(s.input, before);
     }
 
     #[test]
