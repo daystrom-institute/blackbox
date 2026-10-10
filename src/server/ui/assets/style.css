@@ -1,0 +1,355 @@
+/*
+ * Operator web UI stylesheet. One accent color for links and the active
+ * navigation item; state colors only for task state buckets and health
+ * verdicts, always beside a text label. Light and dark schemes follow
+ * prefers-color-scheme.
+ */
+
+:root {
+  color-scheme: light dark;
+  --bg: #f7f7f5;
+  --surface: #ffffff;
+  --surface-sunken: #efefec;
+  --border: #d9d9d4;
+  --text: #1d1d1b;
+  --text-muted: #5f5f5a;
+  --accent: #1f5fbf;
+  --accent-soft: #e3ecfa;
+  --state-running: #1f7a3d;
+  --state-waiting: #8a6100;
+  --state-finished: #4d4d48;
+  --state-failed: #b3261e;
+  --state-stale: #7a4fa3;
+  --font-sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  --nav-width: 13rem;
+  --header-height: 3rem;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #151514;
+    --surface: #1d1d1c;
+    --surface-sunken: #252523;
+    --border: #3a3a37;
+    --text: #e8e8e4;
+    --text-muted: #a3a39d;
+    --accent: #7fb0ff;
+    --accent-soft: #1f2d45;
+    --state-running: #5cc983;
+    --state-waiting: #e0b14a;
+    --state-finished: #b5b5ae;
+    --state-failed: #ff8a80;
+    --state-stale: #c3a1e6;
+  }
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.45;
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+a:hover,
+a:focus-visible {
+  text-decoration: underline;
+}
+
+code,
+pre {
+  font-family: var(--font-mono);
+  font-size: 0.92em;
+}
+
+/* Shell */
+
+.shell-nav {
+  position: fixed;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: var(--nav-width);
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+  padding: 0.75rem 0;
+  overflow-y: auto;
+}
+
+.shell-brand {
+  display: block;
+  padding: 0 1rem 0.75rem;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.shell-nav ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.shell-nav a {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.4rem 1rem;
+  color: var(--text);
+}
+
+.shell-nav a:hover {
+  background: var(--surface-sunken);
+  text-decoration: none;
+}
+
+.shell-nav a[aria-current="page"] {
+  color: var(--accent);
+  background: var(--accent-soft);
+  font-weight: 600;
+}
+
+.shell-nav svg {
+  width: 16px;
+  height: 16px;
+  flex: none;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.shell-main {
+  margin-left: var(--nav-width);
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.shell-header {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  height: var(--header-height);
+  padding: 0 1.25rem;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+}
+
+.shell-identity {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0 1.25rem;
+  color: var(--text-muted);
+  font-size: 0.9em;
+}
+
+.shell-identity strong {
+  color: var(--text);
+}
+
+.shell-principal {
+  font-size: 0.9em;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.shell-principal strong {
+  color: var(--text);
+}
+
+.shell-content {
+  flex: 1;
+  padding: 1.25rem;
+}
+
+.shell-footer {
+  padding: 0.6rem 1.25rem;
+  border-top: 1px solid var(--border);
+  color: var(--text-muted);
+  font-size: 0.85em;
+}
+
+h1 {
+  font-size: 1.3rem;
+  margin: 0 0 1rem;
+}
+
+h2 {
+  font-size: 1rem;
+  margin: 0 0 0.5rem;
+}
+
+/* Overview panels */
+
+.panels {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(18rem, 1fr));
+  gap: 1rem;
+}
+
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.75rem 1rem;
+}
+
+.panel-source {
+  margin: 0.5rem 0 0;
+  color: var(--text-muted);
+  font-size: 0.85em;
+}
+
+/* Tables */
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+th,
+td {
+  padding: 0.3rem 0.5rem;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  vertical-align: top;
+}
+
+thead th {
+  position: sticky;
+  top: var(--header-height);
+  background: var(--surface-sunken);
+  color: var(--text-muted);
+  font-weight: 600;
+  font-size: 0.85em;
+}
+
+.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+tfoot td {
+  font-weight: 600;
+}
+
+/* State labels: color is never the only signal, the label text is. */
+
+.state {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.state::before {
+  content: "";
+  width: 0.55rem;
+  height: 0.55rem;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.state-running {
+  color: var(--state-running);
+}
+
+.state-waiting {
+  color: var(--state-waiting);
+}
+
+.state-finished {
+  color: var(--state-finished);
+}
+
+.state-failed {
+  color: var(--state-failed);
+}
+
+.state-stale {
+  color: var(--state-stale);
+}
+
+/* Empty states and error fragments */
+
+.empty-state {
+  color: var(--text-muted);
+  margin: 0.25rem 0;
+}
+
+.error-fragment {
+  border-left: 3px solid var(--state-failed);
+  padding: 0.4rem 0.75rem;
+  background: var(--surface-sunken);
+}
+
+.error-fragment p {
+  margin: 0.2rem 0;
+}
+
+.error-fragment code {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* Stand-alone pages (unauthorized) */
+
+.standalone {
+  max-width: 34rem;
+  margin: 15vh auto 0;
+  padding: 1.5rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
+@media (max-width: 720px) {
+  .shell-nav {
+    position: static;
+    width: auto;
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .shell-nav ul {
+    display: flex;
+    flex-wrap: wrap;
+  }
+
+  .shell-main {
+    margin-left: 0;
+  }
+
+  .shell-header {
+    position: static;
+    height: auto;
+    padding: 0.5rem 1rem;
+    flex-wrap: wrap;
+  }
+
+  thead th {
+    top: 0;
+  }
+}

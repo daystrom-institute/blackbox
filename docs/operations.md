@@ -251,6 +251,27 @@ counter moves, and the daemon never attempts a checkout-backed fallback:
 Transcript attribution is unaffected: every collected project is attributed
 from its attachment path without reading the checkout.
 
+### Operator web UI
+
+The daemon serves a read-only operator web UI on a second listener, off by
+default. Set `daemon.ui_listen` (`BBOX_UI_LISTEN`) to a loopback
+`host:port`:
+
+```toml
+[daemon]
+ui_listen = "127.0.0.1:7300"
+```
+
+Only a loopback address is accepted (`127.0.0.1`, `[::1]` or `localhost`);
+any other value stops the daemon at startup before the listener binds. The
+setting is read at startup.
+
+The UI has no login of its own. An identity-aware reverse proxy must sit in
+front of it, on the same host or in the same pod, as the only route in, and
+forward the signed-in user as `X-Forwarded-Email` (or `X-Forwarded-User`).
+Every request without that header is answered with a 401 page, and a request
+whose peer is not loopback is refused. The main listener never serves the UI.
+
 ### Local dev daemon
 
 A local daemon for live validation runs from its own binary path, port and

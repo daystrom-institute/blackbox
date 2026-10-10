@@ -84,6 +84,16 @@
   answers tool lists.
 - Scope resolution does blocking fs/git probes → blocking pool, like every
   other resolver call site.
+- The operator UI listener (`daemon.ui_listen`, `src/server/ui/`) is the one
+  listener that reads a forwarded header: the principal is
+  `X-Forwarded-Email`, else `X-Forwarded-User`, and a request without one is
+  answered with a 401 page. That is safe because startup refuses a
+  non-loopback `ui_listen` and the identity proxy beside the daemon is the
+  only route to that loopback port; the principal layer also refuses a
+  request whose peer is missing or not loopback. No UI route is ever mounted
+  on the main listener, and no other code reads a forwarded header. UI pages
+  read through the same internal readers as the tools and never call the
+  daemon's own MCP endpoint.
 - Startup ordering in open.rs is load-bearing and documented inline: repo-
   owned stores (knowledge, gaps) load their committed files BEFORE any save
   can run, or the in-memory set purges the repo's files; alias

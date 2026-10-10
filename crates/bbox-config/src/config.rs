@@ -312,6 +312,11 @@ struct RawDaemonConfig {
     /// requests) beside handshake sessions. Off by default.
     #[serde(default)]
     pub mcp_modern_lifecycle: bool,
+    /// `host:port` of the operator web UI listener. Unset, no UI listener
+    /// runs. The host must be a loopback address: the listener trusts the
+    /// identity headers of the reverse proxy that is its only route in.
+    #[serde(default)]
+    pub ui_listen: Option<String>,
     #[serde(default = "default_daemon_poller_min_interval_secs")]
     pub poller_min_interval_secs: u64,
     #[serde(default = "default_checkout_lifecycle_writer_wait_ms")]
@@ -735,6 +740,8 @@ pub struct DaemonConfig {
     pub mcp_session_keepalive_secs: u64,
     /// Serve the 2026-07-28 MCP lifecycle beside handshake sessions.
     pub mcp_modern_lifecycle: bool,
+    /// Loopback `host:port` of the operator web UI listener; unset is off.
+    pub ui_listen: Option<String>,
     pub poller_min_interval_secs: u64,
     pub checkout_lifecycle_writer_wait_ms: u64,
     pub executor: ExecutorKind,
@@ -1247,6 +1254,7 @@ impl Config {
                 task_ttl_ms: default_daemon_task_ttl_ms(),
                 mcp_session_keepalive_secs: default_daemon_mcp_session_keepalive_secs(),
                 mcp_modern_lifecycle: false,
+                ui_listen: None,
                 poller_min_interval_secs: default_daemon_poller_min_interval_secs(),
                 checkout_lifecycle_writer_wait_ms: default_checkout_lifecycle_writer_wait_ms(),
                 executor: default_daemon_executor(),
@@ -1378,6 +1386,12 @@ fn apply_explicit_env(raw: RawConfig) -> RawConfig {
         && !modern.trim().is_empty()
     {
         raw.daemon.mcp_modern_lifecycle = matches!(modern.trim(), "1" | "true" | "yes");
+    }
+
+    if let Ok(ui_listen) = std::env::var("BBOX_UI_LISTEN")
+        && !ui_listen.trim().is_empty()
+    {
+        raw.daemon.ui_listen = Some(ui_listen.trim().to_string());
     }
 
     // shutdown_grace_secs
@@ -1710,6 +1724,7 @@ pub fn load_with(options: LoadOptions) -> Result<Config> {
             task_ttl_ms: raw.daemon.task_ttl_ms,
             mcp_session_keepalive_secs: raw.daemon.mcp_session_keepalive_secs,
             mcp_modern_lifecycle: raw.daemon.mcp_modern_lifecycle,
+            ui_listen: raw.daemon.ui_listen,
             poller_min_interval_secs: raw.daemon.poller_min_interval_secs,
             checkout_lifecycle_writer_wait_ms: raw.daemon.checkout_lifecycle_writer_wait_ms,
             executor: raw.daemon.executor,
@@ -3989,6 +4004,52 @@ state_dir = "~"
             configured.advertise_url.as_deref(),
             Some("https://blackbox.example.test")
         );
+    }
+
+    #[test]
+    fn ui_listen_reads_config_and_env() {
+        let _guard = bbox_util::util::test_env_lock();
+
+        let dir = tempdir().unwrap();
+        let home = dir.path();
+        unsafe {
+            env::set_var("HOME", home);
+            env::set_var("XDG_CONFIG_HOME", home.join(".config"));
+            env::set_var("XDG_DATA_HOME", home.join(".local/share"));
+            env::set_var("XDG_STATE_HOME", home.join(".local/state"));
+            env::remove_var("BLACKBOX_CONFIG");
+            env::remove_var("BBOX_UI_LISTEN");
+        }
+        let config_dir = home.join(".config").join("blackbox");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("config.toml");
+
+        assert_eq!(load().unwrap().daemon.ui_listen, None);
+
+        std::fs::write(&config_path, "[daemon]\nui_listen = \"127.0.0.1:7300\"\n").unwrap();
+        assert_eq!(
+            load().unwrap().daemon.ui_listen.as_deref(),
+            Some("127.0.0.1:7300")
+        );
+
+        unsafe {
+            env::set_var("BBOX_UI_LISTEN", " [::1]:7301 ");
+        }
+        assert_eq!(
+            load().unwrap().daemon.ui_listen.as_deref(),
+            Some("[::1]:7301")
+        );
+        unsafe {
+            env::set_var("BBOX_UI_LISTEN", "  ");
+        }
+        assert_eq!(
+            load().unwrap().daemon.ui_listen.as_deref(),
+            Some("127.0.0.1:7300"),
+            "a blank env value leaves the configured listener"
+        );
+        unsafe {
+            env::remove_var("BBOX_UI_LISTEN");
+        }
     }
 
     /// A config written for a daemon that honored `auto_publish` still
