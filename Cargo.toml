@@ -16,6 +16,8 @@ members = [
     "crates/bro-transcript",
     "crates/bro-code-mode",
     "crates/bro-apply-patch",
+    # The codex lane's worker: a stdio shim over one `codex app-server`.
+    "crates/bro-codex",
 
     # The per-machine fleet supervisor (slice 5). Its dependency ceiling is
     # narrow BY DESIGN and asserted by scripts/acceptance-fleetd-deps.sh: no

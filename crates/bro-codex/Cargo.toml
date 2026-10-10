@@ -1,0 +1,32 @@
+# The codex lane's worker: one `codex app-server` per dispatch behind the
+# claude lane's stream-json stdio contract. It owns no model loop, runs no
+# tools and reads no provider config; see AGENTS.md.
+[package]
+name = "bro-codex"
+version = "0.0.1"
+edition = "2024"
+
+[[bin]]
+name = "bro-codex"
+path = "src/main.rs"
+
+[dependencies]
+bro-core = { path = "../bro-core" }
+
+anyhow = "1"
+serde_json = "1"
+tokio = { version = "1", features = [
+    "io-std",
+    "io-util",
+    "macros",
+    "process",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["io-util", "macros", "rt-multi-thread", "sync", "time", "test-util"] }
+
+[lints.clippy]
+disallowed_methods = "deny"

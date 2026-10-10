@@ -54,15 +54,15 @@ is healthy, install the changed checkout-host satellites from the same commit:
 
 ```bash
 cargo build --release --bin blackbox
-cargo build --release -p bro-cli -p bro-harness -p fleetd \
+cargo build --release -p bro-cli -p bro-harness -p bro-codex -p fleetd \
   -p bbox-code-collector -p bbox-transcript-collector
 install -m 755 target/release/blackbox ~/.local/bin/blackbox
-install -m 755 target/release/{bro,bro-harness,fleetd} ~/.local/bin/
+install -m 755 target/release/{bro,bro-harness,bro-codex,fleetd} ~/.local/bin/
 install -m 755 target/release/{bbox-code-collector,bbox-transcript-collector} ~/.local/bin/
 ```
 
 Kickstart the collectors after installing them. New sessions pick up a new
-`bro-harness` without a restart.
+`bro-harness` or `bro-codex` without a restart.
 
 Gate the roll with `scripts/converge-gate --drain` and reopen admission with
 `scripts/converge-gate --clear` (`docs/converge-gate.md`). The daemon admits
