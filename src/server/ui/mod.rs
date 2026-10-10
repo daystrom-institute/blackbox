@@ -152,8 +152,29 @@ pub(crate) fn spawn_ui_server(
 pub(crate) fn build_ui_router(state: UiState) -> Router {
     Router::new()
         .route("/", get(pages::overview::page))
-        .route("/threads", placeholder(Section::Threads))
-        .route("/bros", placeholder(Section::Bros))
+        .route("/threads", get(pages::threads::list_page))
+        .route("/threads/{id}", get(pages::threads::detail_page))
+        .route(
+            "/fragments/threads/table",
+            get(pages::threads::table_fragment),
+        )
+        .route(
+            "/fragments/threads/{id}",
+            get(pages::threads::detail_fragment),
+        )
+        .route("/bros", get(pages::bros::roster_page))
+        .route("/bros/{task}", get(pages::bros::task_page))
+        .route("/fragments/bros/rows", get(pages::bros::rows_fragment))
+        .route(
+            "/fragments/bros/{task}/summary",
+            get(pages::bros::summary_fragment),
+        )
+        .route(
+            "/fragments/bros/{task}/tail",
+            get(pages::bros::tail_fragment),
+        )
+        .route("/streams/bros", get(pages::bros::roster_stream))
+        .route("/streams/bros/{task}/tail", get(pages::bros::task_stream))
         .route("/projects", placeholder(Section::Projects))
         .route("/system", placeholder(Section::System))
         .route("/config", placeholder(Section::Configuration))
@@ -517,7 +538,7 @@ mod tests {
     async fn unbuilt_sections_render_inside_the_shell() {
         let dir = tempfile::tempdir().unwrap();
         let identity = [("x-forwarded-email", "operator@example.test")];
-        for uri in ["/threads", "/bros", "/projects", "/system", "/config"] {
+        for uri in ["/projects", "/system", "/config"] {
             let (status, _, body) =
                 send(ui_router(&dir), request(uri, Some(PROXY_PEER), &identity)).await;
             assert_eq!(status, StatusCode::OK, "{uri}");
