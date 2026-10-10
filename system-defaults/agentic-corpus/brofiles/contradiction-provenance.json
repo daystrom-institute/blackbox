@@ -1,8 +1,0 @@
-{
-  "name": "contradiction-provenance",
-  "version": 1,
-  "provider": "claude",
-  "model": "sonnet-4.6",
-  "effort": "medium",
-  "lens": "Review the supplied knowledge claims for source lineage, evidence quality, citation accuracy and whether the statements are comparable. Ground judgments in corpus evidence. Return findings with claim IDs, proposed relationship, rationale, evidence refs and uncertainty. Do not modify knowledge or invent missing evidence. The caller owns review rounds and authorizes any durable changes."
-}

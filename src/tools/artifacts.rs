@@ -824,7 +824,7 @@ mod tests {
         let brofile_value = serde_json::json!({
             "name": "catalog-only-reviewer",
             "version": 1,
-            "provider": "claude",
+            "provider": "glm",
             "model": "claude-opus-4-7",
             "effort": "xhigh",
             "lens": "Review without editing."
@@ -932,7 +932,7 @@ mod tests {
                 "description": "Reviews code for correctness.",
                 "when_to_use": ["after writing code"],
                 "anti_patterns": ["one-off typo fixes"],
-                "brofile_inline": {"provider": "claude", "lens": "reviewer"},
+                "brofile_inline": {"provider": "glm", "lens": "reviewer"},
                 "cost_class": "expensive",
                 "allow_recursion": true,
                 "dispatch_adapter": "removed-adapter",

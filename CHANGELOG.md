@@ -8,16 +8,18 @@ out explicitly under `Changed` or `Removed`.
 
 ## Unreleased
 
-- The dispatch plane gains a claude CLI lane. `claude` returns as a dispatch
-  provider, and GLM, DeepSeek, MiniMax and Kimi now run as `claude -p`
-  children against their `~/.claude-*` config dirs instead of `bro-harness`.
+- The dispatch plane gains a claude CLI lane: GLM, DeepSeek, MiniMax and Kimi
+  now run as `claude -p` children against their `~/.claude-*` config dirs
+  instead of `bro-harness`.
   Persona and scope ride `--append-system-prompt`, structured output
   `--json-schema`, tool filters `--allowedTools`/`--disallowedTools`, and the
   daemon MCP server `--mcp-config --strict-mcp-config`. The executor that owns
   a claude child's stdout writes its session log (fleetd included), and the
   daemon closes the child's stdin after a turn's result; fleetd learns an
   `EndInput` message for that. Brodex and VibeBh stay on the harness lane.
-  Catalog brofiles that declared `provider: claude` now dispatch real Claude.
+  The legacy `claude` provider alias is gone, and the catalog brofiles that
+  declared it (the refactor, review, supervision and agentic-corpus
+  personas) are removed.
 
 - The daemon's `/admin/*` HTTP plane now requires a loopback peer or
   `Authorization: Bearer <token>` matching the owner-readable 64-hex token

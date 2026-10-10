@@ -334,7 +334,7 @@ mod tests {
     }
 
     fn brofile_json(name: &str, model: &str) -> String {
-        serde_json::json!({"name": name, "provider": "claude", "model": model}).to_string()
+        serde_json::json!({"name": name, "provider": "glm", "model": model}).to_string()
     }
 
     fn parse(

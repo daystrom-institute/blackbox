@@ -22,7 +22,7 @@ lists.
 
 | Lane | Providers | Worker |
 |---|---|---|
-| `ClaudeCli` | `claude`, `glm`, `deepseek`, `minimax`, `kimi` | one `claude -p` child per dispatch |
+| `ClaudeCli` | `glm`, `deepseek`, `minimax`, `kimi` | one `claude -p` child per dispatch |
 | `Codex` | `codex` | one `bro-codex` shim child per dispatch, fronting its own `codex app-server` |
 | `Harness` | `brodex`, `vibebh` (transitional, retiring) | one `bro-harness` child per dispatch |
 | `Workflow` | `workflow` | daemon-internal, no child |
@@ -52,14 +52,10 @@ daemon mints is a UUID, which is what `--session-id` requires.
 ### Credentials and configuration
 
 Endpoint, credentials and model slots come from a `claude` config dir, never
-from env the daemon lifts out of it:
-
-- `claude` default account: the CLI's own `~/.claude`; `account<N>` selects
-  `~/.claude-account<N>` through `CLAUDE_CONFIG_DIR`.
-- `glm`, `deepseek`, `minimax`, `kimi`: `CLAUDE_CONFIG_DIR` names
-  `~/.claude-zai`, `~/.claude-ds`, `~/.claude-mm`, `~/.claude-k`.
-
-The config dir resolves against the execution home, so an off-host fleetd
+from env the daemon lifts out of it: `CLAUDE_CONFIG_DIR` names
+`~/.claude-zai`, `~/.claude-ds`, `~/.claude-mm` or `~/.claude-k`. Anthropic's
+own models are not a dispatch provider; the operator's `~/.claude` is never a
+worker's config dir. The config dir resolves against the execution home, so an off-host fleetd
 reads its own worker-local dirs. Hooks, plugins and settings in that dir apply
 to the dispatched child exactly as they apply to a terminal session started
 with the same dir.
@@ -119,10 +115,6 @@ closeout reads. Replayed user envelopes are the record of operator turns.
 Harness-only system events (`context_pressure`, `harness_shell_sessions`,
 `instruction_read_timeout`, `harness_milestone`, `compaction_threshold`) do
 not exist on this lane and are not emulated; consumers treat them as absent.
-
-The indexer labels a dispatched Claude session `claude-dispatch`, distinct
-from the interactive `claude` source read from the CLI's own project
-transcripts.
 
 ## 2. Codex lane
 

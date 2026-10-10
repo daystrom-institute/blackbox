@@ -317,7 +317,7 @@ fn nested_published_scopes_map_landing_paths_consistently() {
             "test",
             |_| {
                 Ok(Some(ProjectConfigEdit::Write(brofile(
-                    "reviewer", "claude", "next",
+                    "reviewer", "glm", "next",
                 ))))
             },
         )
@@ -344,8 +344,8 @@ async fn guarded_edits_chain_privately_and_reads_switch_only_at_publication() {
     let (fixture, server) = accepted_fixture(&scope);
     let target = ProjectConfigTargetV1::Brofile("reviewer".into());
     let accepted = brofile("reviewer", "deepseek", "project-reviewer");
-    let first = brofile("reviewer", "claude", "first-edit");
-    let second = brofile("reviewer", "claude", "second-edit");
+    let first = brofile("reviewer", "glm", "first-edit");
+    let second = brofile("reviewer", "glm", "second-edit");
 
     let mut bases = Vec::new();
     let mut edit = |next: Option<String>| {
@@ -572,7 +572,7 @@ async fn simultaneous_read_modify_write_edits_serialize_without_losing_either() 
 fn a_publication_that_moves_during_preparation_is_re_read_before_enqueue() {
     let scope = CatalogFixture::scope(".");
     let (fixture, server) = accepted_fixture(&scope);
-    let moved = brofile("reviewer", "claude", "moved-under-us");
+    let moved = brofile("reviewer", "glm", "moved-under-us");
     let mut moved_once = false;
     let receipt = server
         .state
@@ -595,7 +595,7 @@ fn a_publication_that_moves_during_preparation_is_re_read_before_enqueue() {
             |base| {
                 assert_eq!(base, Some(moved.as_str()));
                 Ok(Some(ProjectConfigEdit::Write(brofile(
-                    "reviewer", "claude", "after",
+                    "reviewer", "glm", "after",
                 ))))
             },
         )
@@ -873,8 +873,8 @@ async fn conflict_recovery_after_an_applied_prefix_prepares_against_the_owners_p
             .unwrap()
             .unwrap()
     };
-    let a = edit(&server, brofile("reviewer", "claude", "a"));
-    let b = edit(&server, brofile("reviewer", "claude", "b"));
+    let a = edit(&server, brofile("reviewer", "glm", "a"));
+    let b = edit(&server, brofile("reviewer", "glm", "b"));
     let local = brofile("reviewer", "glm", "owner-local");
     {
         let mut queue = server.state.checkout_mutations.write();
@@ -920,7 +920,7 @@ async fn conflict_recovery_after_an_applied_prefix_prepares_against_the_owners_p
         .prepare_project_config_mutation(PROJECT, &target, "test", |base| {
             assert_eq!(base, Some(local.as_str()));
             Ok(Some(ProjectConfigEdit::Write(brofile(
-                "reviewer", "claude", "c",
+                "reviewer", "glm", "c",
             ))))
         })
         .unwrap()

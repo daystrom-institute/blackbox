@@ -192,10 +192,9 @@ fn normalize_model_for_provider(provider: Provider, model: &str) -> String {
 /// built-in default and bails with `no --model …`; the claude-compatible
 /// endpoints need a wire id that their config dir may not pin. Both get the
 /// catalog `.default` model here, at the single arg-building chokepoint, so
-/// every caller is covered. `Provider::Claude` returns None: the operator's
-/// own `claude` settings choose the model, exactly as in a terminal.
+/// every caller is covered.
 fn default_model(provider: Provider) -> Option<String> {
-    if provider == Provider::Claude || !provider.is_dispatchable() {
+    if !provider.is_dispatchable() {
         return None;
     }
     provider

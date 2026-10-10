@@ -25,7 +25,7 @@ fn provider_roundtrip_for_dispatchable_harness_providers() {
         assert_eq!(Provider::from_str(p.as_str()).ok(), Some(*p));
     }
     assert!(Provider::from_str("workflow").is_ok());
-    assert_eq!(Provider::from_str("claude").ok(), Some(Provider::Claude));
+    assert!(Provider::from_str("claude").is_err());
     assert!(Provider::from_str("codex").is_err());
     assert!(Provider::from_str("copilot").is_err());
     assert!(Provider::from_str("gemini").is_err());
@@ -221,14 +221,6 @@ fn harness_exec_and_resume_args_use_stream_json() {
 fn providers_default_model_when_none_supplied() {
     for provider in Provider::ALL {
         let args = provider.build_exec_args("hi", None, "", None, None);
-        if *provider == Provider::Claude {
-            // The operator's own claude settings pick the model.
-            assert!(
-                !args.contains(&"--model".to_string()),
-                "a raw Claude dispatch leaves the model to the CLI"
-            );
-            continue;
-        }
         assert!(
             args.contains(&"--model".to_string()),
             "{provider:?} raw dispatch must include --model"

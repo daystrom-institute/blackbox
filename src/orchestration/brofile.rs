@@ -857,11 +857,6 @@ fn synthesized_account_env_for_home(
 
     let (env_key, rel_path) = match provider {
         Provider::Brodex => ("CODEX_HOME", format!(".codex{suffix}")),
-        // The default Claude account is the CLI's own `~/.claude`; naming it
-        // explicitly would only shadow a config dir the operator may have
-        // relocated. Secondary accounts live in `~/.claude-account<N>`.
-        Provider::Claude if suffix.is_empty() => return None,
-        Provider::Claude => ("CLAUDE_CONFIG_DIR", format!(".claude{suffix}")),
         // GLM/DeepSeek/MiniMax/Kimi inherit credentials from fixed
         // Claude-compatible config dirs; vibe-bh authenticates via
         // MISTRAL_API_KEY, not accounts.
@@ -928,10 +923,8 @@ fn resolve_provider_env_for_locality(
         .map(|locality| locality.home.clone())
         .or_else(dirs::home_dir);
     let mut env = match provider {
-        // The claude lane needs no transport env: `CLAUDE_CONFIG_DIR` (or the
-        // CLI's default `~/.claude` for the primary Claude account) carries
+        // The claude lane needs no transport env: `CLAUDE_CONFIG_DIR` carries
         // endpoint and credentials.
-        Provider::Claude => HashMap::new(),
         Provider::Glm | Provider::Deepseek | Provider::Minimax | Provider::Kimi => execution_home
             .as_deref()
             .and_then(|home| claude_config_dir_env(provider, home))
@@ -1371,70 +1364,6 @@ mod tests {
     }
 
     #[test]
-    fn rust_refactor_persona_matches_design_spec() {
-        let src =
-            include_str!("../../system-defaults/brofiles/refactor/rust-refactor-persona.json");
-        let bf: Brofile = serde_json::from_str(src).expect("rust-refactor-persona parses");
-        assert_eq!(bf.name, "rust-refactor-persona");
-        assert_eq!(bf.provider, Provider::Claude);
-        assert_eq!(
-            bf.context.as_ref().and_then(|c| c.provider_defaults),
-            Some(ProviderDefaultsMode::SuppressWhenSupported)
-        );
-        let lens = bf.lens.as_deref().unwrap_or("");
-        assert!(lens.contains("harness-native isolate bindings"));
-        assert!(lens.contains("rust.fixRound"));
-        assert!(lens.contains("capped at five rounds"));
-        assert!(lens.contains("dispatch defaults"));
-
-        let f = bf.filters.expect("filters present");
-
-        let expected_allow: Vec<&str> = vec![
-            "mcp__blackbox__bbox_thread",
-            "mcp__blackbox__bbox_inspect_entity",
-            "mcp__blackbox__bbox_hybrid_search",
-            "Read",
-            "Grep",
-            "Glob",
-            "exec",
-            "wait",
-            "code.*",
-            "analysis.*",
-            "rust.*",
-            "edits.*",
-            "lsp.*",
-            "build.gate",
-        ];
-        let expected_disallow: Vec<&str> = vec![
-            "mcp__blackbox__bbox_forget",
-            "mcp__blackbox__bbox_learn",
-            "mcp__blackbox__bbox_render",
-            "mcp__blackbox__bro_*",
-            "Bash",
-            "Write",
-            "Edit",
-        ];
-
-        let allow_set: std::collections::BTreeSet<&str> =
-            f.allow.iter().map(String::as_str).collect();
-        let expected_allow_set: std::collections::BTreeSet<&str> =
-            expected_allow.iter().copied().collect();
-        assert_eq!(
-            allow_set, expected_allow_set,
-            "rust-refactor-persona allow list drifted from design spec"
-        );
-
-        let disallow_set: std::collections::BTreeSet<&str> =
-            f.disallow.iter().map(String::as_str).collect();
-        let expected_disallow_set: std::collections::BTreeSet<&str> =
-            expected_disallow.iter().copied().collect();
-        assert_eq!(
-            disallow_set, expected_disallow_set,
-            "rust-refactor-persona disallow list drifted from design spec"
-        );
-    }
-
-    #[test]
     fn java_refactor_persona_matches_design_spec() {
         let src =
             include_str!("../../system-defaults/brofiles/refactor/java-refactor-persona.json");
@@ -1500,77 +1429,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn rust_and_java_refactor_personas_share_tool_surface() {
-        let rust_src =
-            include_str!("../../system-defaults/brofiles/refactor/rust-refactor-persona.json");
-        let java_src =
-            include_str!("../../system-defaults/brofiles/refactor/java-refactor-persona.json");
-        let rust: Brofile = serde_json::from_str(rust_src).unwrap();
-        let java: Brofile = serde_json::from_str(java_src).unwrap();
-
-        let r = rust.filters.unwrap();
-        let j = java.filters.unwrap();
-        let r_allow: std::collections::BTreeSet<&str> =
-            r.allow.iter().map(String::as_str).collect();
-        let j_allow: std::collections::BTreeSet<&str> =
-            j.allow.iter().map(String::as_str).collect();
-        let r_disallow: std::collections::BTreeSet<&str> =
-            r.disallow.iter().map(String::as_str).collect();
-        let j_disallow: std::collections::BTreeSet<&str> =
-            j.disallow.iter().map(String::as_str).collect();
-        const JAVA_ONLY: &[&str] = &["java.*"];
-        const RUST_ONLY: &[&str] = &["rust.*", "build.gate"];
-        let r_core: std::collections::BTreeSet<&str> = r_allow
-            .iter()
-            .copied()
-            .filter(|t| !RUST_ONLY.contains(t))
-            .collect();
-        let j_core: std::collections::BTreeSet<&str> = j_allow
-            .iter()
-            .copied()
-            .filter(|t| !JAVA_ONLY.contains(t))
-            .collect();
-        assert_eq!(
-            r_core, j_core,
-            "refactor personas should expose identical core allow sets"
-        );
-        for t in JAVA_ONLY {
-            assert!(j_allow.contains(t), "java persona missing {t}");
-        }
-        for t in ["analysis.*", "lsp.*"] {
-            assert!(r_allow.contains(t), "rust persona missing shared {t}");
-            assert!(j_allow.contains(t), "java persona missing shared {t}");
-        }
-        assert!(
-            !r_allow.contains("java.*"),
-            "rust persona must not advertise java-scoped bindings"
-        );
-        assert!(
-            !j_allow.contains("rust.*") && !j_allow.contains("build.gate"),
-            "java persona must not advertise Rust compiler-loop bindings"
-        );
-        assert!(
-            !r_allow.contains("build.*") && !j_allow.contains("build.*"),
-            "personas must allow the exact build.gate tool, never build.*"
-        );
-        assert_eq!(
-            r_disallow, j_disallow,
-            "refactor personas should expose identical disallow sets"
-        );
-        assert_eq!(
-            rust.context.as_ref().and_then(|c| c.provider_defaults),
-            java.context.as_ref().and_then(|c| c.provider_defaults),
-            "refactor personas should share context policy"
-        );
-    }
-
-    /// Regression scan (post-MCP-retirement): live brofile lenses, allowlists,
-    /// and agent prompt contracts must never name the retired daemon MCP
-    /// refactor/slice/code-nav/macro tools. Retired names in an allowlist are
-    /// dead entries; in a lens or prompt they instruct agents to call tools
-    /// that no longer exist. Atom/workflow/eval artifacts are deliberately
-    /// out of scope here (their content migration is a separate arc).
     #[test]
     fn live_lenses_and_prompts_never_name_retired_mcp_tools() {
         const RETIRED: &[&str] = &[
@@ -1640,28 +1498,10 @@ mod tests {
 
     #[test]
     fn refactor_atom_brofiles_suppress_provider_defaults() {
-        for (name, src) in [
-            (
-                "rust-refactor-persona",
-                include_str!("../../system-defaults/brofiles/refactor/rust-refactor-persona.json"),
-            ),
-            (
-                "java-refactor-persona",
-                include_str!("../../system-defaults/brofiles/refactor/java-refactor-persona.json"),
-            ),
-            (
-                "csharp-refactor-persona",
-                include_str!(
-                    "../../system-defaults/brofiles/refactor/csharp-refactor-persona.json"
-                ),
-            ),
-            (
-                "elixir-refactor-persona",
-                include_str!(
-                    "../../system-defaults/brofiles/refactor/elixir-refactor-persona.json"
-                ),
-            ),
-        ] {
+        for (name, src) in [(
+            "java-refactor-persona",
+            include_str!("../../system-defaults/brofiles/refactor/java-refactor-persona.json"),
+        )] {
             let bf: Brofile = serde_json::from_str(src)
                 .unwrap_or_else(|e| panic!("{name} brofile should parse: {e}"));
             assert_eq!(
@@ -1816,7 +1656,7 @@ mod tests {
     fn test_brofile_coerce_workspace_deserializes_from_json() {
         let json = r#"{
             "name": "ws-json",
-            "provider": "claude",
+            "provider": "glm",
             "coerce_workspace": true
         }"#;
         let bf: Brofile = serde_json::from_str(json).unwrap();
@@ -1939,38 +1779,6 @@ mod tests {
         );
         assert!(!resolved.contains_key("BRO_HARNESS_TRANSPORT"));
         assert!(!resolved.contains_key("ANTHROPIC_AUTH_TOKEN"));
-    }
-
-    #[test]
-    fn test_resolve_provider_env_claude_accounts_select_config_dirs() {
-        let store = temp_store();
-        let home = temp_store();
-
-        // The primary account is the CLI's own ~/.claude: no env at all.
-        let primary = with_fake_home(home.path(), || {
-            resolve_provider_env(Provider::Claude, None, None, store.path(), None)
-        });
-        assert_eq!(primary, None);
-        let named_primary = with_fake_home(home.path(), || {
-            resolve_provider_env(Provider::Claude, Some("account1"), None, store.path(), None)
-        });
-        assert_eq!(named_primary, None);
-
-        // A secondary account selects its sibling config dir.
-        let second = with_fake_home(home.path(), || {
-            resolve_provider_env(Provider::Claude, Some("account2"), None, store.path(), None)
-                .unwrap()
-        });
-        assert_eq!(
-            second.get("CLAUDE_CONFIG_DIR").map(String::as_str),
-            Some(
-                home.path()
-                    .join(".claude-account2")
-                    .to_string_lossy()
-                    .as_ref()
-            )
-        );
-        assert_eq!(second.len(), 1, "{second:?}");
     }
 
     #[test]

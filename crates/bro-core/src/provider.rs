@@ -31,10 +31,6 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "lowercase")]
 #[strum(serialize_all = "lowercase")]
 pub enum Provider {
-    /// Anthropic Claude through the `claude` CLI in headless stream-json
-    /// mode. Accounts select a `CLAUDE_CONFIG_DIR`; the default account uses
-    /// the operator's `~/.claude`.
-    Claude,
     /// GLM (Z.AI Coding Plan) through the `claude` CLI with
     /// `CLAUDE_CONFIG_DIR=~/.claude-zai`.
     #[strum(serialize = "glm")]
@@ -120,7 +116,6 @@ pub enum ProviderLane {
 
 impl Provider {
     pub const ALL: &[Provider] = &[
-        Provider::Claude,
         Provider::Glm,
         Provider::Deepseek,
         Provider::Minimax,
@@ -135,19 +130,16 @@ impl Provider {
 
     pub fn lane(&self) -> ProviderLane {
         match self {
-            Provider::Claude
-            | Provider::Glm
-            | Provider::Deepseek
-            | Provider::Minimax
-            | Provider::Kimi => ProviderLane::ClaudeCli,
+            Provider::Glm | Provider::Deepseek | Provider::Minimax | Provider::Kimi => {
+                ProviderLane::ClaudeCli
+            }
             Provider::Brodex | Provider::VibeBh => ProviderLane::Harness,
             Provider::Workflow => ProviderLane::Workflow,
         }
     }
 
     /// The `claude` CLI config dir name under the execution home that holds
-    /// this provider's credentials and endpoint, when it is not the default
-    /// `~/.claude`.
+    /// this provider's credentials and endpoint.
     pub fn claude_config_dir_name(&self) -> Option<&'static str> {
         match self {
             Provider::Glm => Some(".claude-zai"),
@@ -168,8 +160,6 @@ impl Provider {
     pub fn capabilities(&self) -> std::collections::HashSet<Capability> {
         use Capability::*;
         let v: &[Capability] = match self {
-            // The claude CLI delivers structured output through `--json-schema`.
-            Provider::Claude => &[StructuredOutput, ToolUse, Resume],
             // All harness-backed providers support structured output via the
             // forced `final_result` terminal tool (transport-agnostic — works
             // for every tool-using provider).
@@ -190,7 +180,6 @@ impl Provider {
 
     pub fn as_str(&self) -> &'static str {
         match self {
-            Provider::Claude => "claude",
             Provider::Glm => "glm",
             Provider::Deepseek => "deepseek",
             Provider::Minimax => "minimax",
@@ -333,7 +322,6 @@ pub enum PromptCacheCapability {
 
 fn models_for(provider: Provider) -> &'static [ModelInfo] {
     match provider {
-        Provider::Claude => CLAUDE_MODELS,
         Provider::Glm => GLM_MODELS,
         Provider::Deepseek => DEEPSEEK_MODELS,
         Provider::Minimax => MINIMAX_MODELS,
@@ -346,7 +334,7 @@ fn models_for(provider: Provider) -> &'static [ModelInfo] {
 
 fn efforts_for(provider: Provider) -> &'static [EffortInfo] {
     match provider {
-        Provider::Claude | Provider::Glm | Provider::Minimax => CLAUDE_EFFORTS,
+        Provider::Glm | Provider::Minimax => CLAUDE_EFFORTS,
         Provider::Deepseek => DEEPSEEK_EFFORTS,
         Provider::Kimi => KIMI_EFFORTS,
         Provider::Brodex => CODEX_EFFORTS,
@@ -357,11 +345,9 @@ fn efforts_for(provider: Provider) -> &'static [EffortInfo] {
 
 fn prompt_cache_for(provider: Provider) -> PromptCacheCapability {
     match provider {
-        Provider::Claude
-        | Provider::Glm
-        | Provider::Deepseek
-        | Provider::Minimax
-        | Provider::Kimi => PromptCacheCapability::AnthropicCacheControl,
+        Provider::Glm | Provider::Deepseek | Provider::Minimax | Provider::Kimi => {
+            PromptCacheCapability::AnthropicCacheControl
+        }
         Provider::Brodex => PromptCacheCapability::OpenAiPromptTokenDetails,
         Provider::VibeBh => PromptCacheCapability::ChatCompletionsPromptCacheKey,
         Provider::Workflow => PromptCacheCapability::NoneKnown,
@@ -393,58 +379,6 @@ static CLAUDE_EFFORTS: &[EffortInfo] = &[
         id: "max",
         description: "Maximum reasoning depth",
         default: false,
-    },
-];
-
-static CLAUDE_MODELS: &[ModelInfo] = &[
-    ModelInfo {
-        id: "claude-opus-5-5",
-        description: "Claude Opus 5.5",
-        default: true,
-        efforts: &[],
-        default_effort: None,
-    },
-    ModelInfo {
-        id: "claude-fable-5-1",
-        description: "Claude Fable 5.1",
-        default: false,
-        efforts: &[],
-        default_effort: None,
-    },
-    ModelInfo {
-        id: "claude-sonnet-5-5",
-        description: "Claude Sonnet 5.5",
-        default: false,
-        efforts: &[],
-        default_effort: None,
-    },
-    ModelInfo {
-        id: "claude-haiku-5-5",
-        description: "Claude Haiku 5.5",
-        default: false,
-        efforts: &[],
-        default_effort: None,
-    },
-    ModelInfo {
-        id: "opus",
-        description: "Latest Opus alias resolved by the claude CLI",
-        default: false,
-        efforts: &[],
-        default_effort: None,
-    },
-    ModelInfo {
-        id: "sonnet",
-        description: "Latest Sonnet alias resolved by the claude CLI",
-        default: false,
-        efforts: &[],
-        default_effort: None,
-    },
-    ModelInfo {
-        id: "haiku",
-        description: "Latest Haiku alias resolved by the claude CLI",
-        default: false,
-        efforts: &[],
-        default_effort: None,
     },
 ];
 

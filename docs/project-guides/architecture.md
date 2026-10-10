@@ -63,14 +63,13 @@ routing facts:
 - Every dispatchable provider belongs to one lane (`Provider::lane()` in
   `bro-core`), and the daemon composes argv, environment, controls and event
   handling per lane. See `design/orchestration/provider-lanes.md`.
-- The claude CLI lane runs Claude, GLM, DeepSeek, MiniMax and Kimi as one
-  `claude -p` child per dispatch in stream-json mode (`CLAUDE_BIN` selects the
-  executable). Endpoint and credentials come from a `claude` config dir:
-  `~/.claude` or `~/.claude-account<N>` for Claude accounts, and the fixed
-  `~/.claude-{zai,ds,mm,k}` dirs for the other four, named through
-  `CLAUDE_CONFIG_DIR`. The daemon lifts nothing out of those dirs. The
-  executor that owns the child's stdout writes its session log; the daemon
-  closes stdin after a turn's result so the child exits.
+- The claude CLI lane runs GLM, DeepSeek, MiniMax and Kimi as one `claude -p`
+  child per dispatch in stream-json mode (`CLAUDE_BIN` selects the
+  executable). Endpoint and credentials come from the fixed
+  `~/.claude-{zai,ds,mm,k}` config dirs, named through `CLAUDE_CONFIG_DIR`;
+  the daemon lifts nothing out of them. Claude itself is not a dispatch
+  provider. The executor that owns the child's stdout writes its session
+  log; the daemon closes stdin after a turn's result so the child exits.
 - Brodex (Codex/ChatGPT on OpenAI Responses) and VibeBh (Mistral on chat
   completions) still dispatch through the standalone `bro-harness` binary
   (`BRO_HARNESS_BIN`) until the codex app-server lane replaces Brodex.
