@@ -16,7 +16,6 @@ use axum::response::Response;
 use bbox_corpus_core::project_catalog::{
     AttachmentStatus, CheckoutAttachment, CorpusProject, ProjectId, ProjectScope,
 };
-use bbox_corpus_core::project_record::ProjectRecord;
 use maud::{Markup, html};
 
 use super::super::shell::{Section, empty_state, error_fragment, layout};
@@ -38,13 +37,43 @@ struct CatalogRow {
     last_activation: Option<u64>,
 }
 
+/// A registered root as `bbox_project_list` reports it. Recorded paths are
+/// not rendered: a project is identified by id, and checkout paths belong to
+/// the lease-confined readers.
+#[derive(Clone)]
+struct RootRow {
+    project_id: String,
+    repo_id: Option<String>,
+    is_git_repo: bool,
+    registered_at: String,
+    aliases: Vec<String>,
+}
+
+/// The registered roots, ordered by project id.
+fn registered_roots(ui: &UiState) -> Vec<RootRow> {
+    let snapshot = ui.shared.records_provider.records_snapshot();
+    let mut rows: Vec<_> = snapshot
+        .records
+        .iter()
+        .map(|record| RootRow {
+            project_id: record.project_id.clone(),
+            repo_id: record.repo_id.clone(),
+            is_git_repo: record.is_git_repo,
+            registered_at: record.registered_at.clone(),
+            aliases: record.aliases.iter().cloned().collect(),
+        })
+        .collect();
+    rows.sort_by(|a, b| a.project_id.cmp(&b.project_id));
+    rows
+}
+
 struct CatalogData {
     /// `None` while the version-1 registry is the runtime authority.
     catalog: Option<Result<Vec<CatalogRow>, String>>,
     /// The code-source activation records could not be read.
     activation_error: Option<String>,
     /// `bbox_project_list`: registered roots with an attached path.
-    records: Vec<ProjectRecord>,
+    records: Vec<RootRow>,
 }
 
 impl CatalogData {
@@ -86,13 +115,7 @@ impl CatalogData {
             rows.sort_by(|a, b| a.project_id.cmp(&b.project_id));
             Ok(rows)
         });
-        let mut records = shared
-            .records_provider
-            .records_snapshot()
-            .records
-            .as_ref()
-            .clone();
-        records.sort_by(|a, b| a.project_id.cmp(&b.project_id));
+        let records = registered_roots(ui);
         Self {
             catalog,
             activation_error,
@@ -251,7 +274,6 @@ fn render_catalog(data: &CatalogData) -> Markup {
                         thead {
                             tr {
                                 th scope="col" { "Project" }
-                                th scope="col" { "Root" }
                                 th scope="col" { "Repository" }
                                 th scope="col" { "Registered" }
                             }
@@ -260,7 +282,6 @@ fn render_catalog(data: &CatalogData) -> Markup {
                             @for record in &data.records {
                                 tr {
                                     td { a href=(format!("/projects/{}", record.project_id)) { code { (record.project_id) } } }
-                                    td { code { (record.canonical_path) } }
                                     td {
                                         @match &record.repo_id {
                                             Some(repo) => { code { (repo) } }
@@ -288,7 +309,7 @@ enum Identity {
         default_attachment: Option<String>,
         epoch: u64,
     },
-    Record(ProjectRecord),
+    Record(RootRow),
 }
 
 /// One visible graph and, when its description read, its schema and
@@ -351,13 +372,11 @@ impl Detail {
                 }
             }
             None => {
-                let records = shared.records_provider.records_snapshot();
-                match records
-                    .records
-                    .iter()
+                match registered_roots(ui)
+                    .into_iter()
                     .find(|record| record.project_id == id)
                 {
-                    Some(record) => Identity::Record(record.clone()),
+                    Some(record) => Identity::Record(record),
                     None => return Detail::Unknown,
                 }
             }
@@ -548,7 +567,6 @@ fn identity_table(data: &DetailData) -> Markup {
             rows.push(("Catalog epoch".into(), html! { (epoch) }));
         }
         Identity::Record(record) => {
-            rows.push(("Root".into(), html! { code { (record.canonical_path) } }));
             rows.push((
                 "Repository".into(),
                 match &record.repo_id {
@@ -675,7 +693,7 @@ fn attachments_table(data: &DetailData) -> Markup {
     } = &data.identity
     else {
         return empty_state(
-            "Registered roots carry no catalog attachments; the root above is the project's checkout.",
+            "A registered root carries no catalog attachments.",
             "bbox_project_catalog_get",
         );
     };
@@ -704,6 +722,7 @@ fn attachments_table(data: &DetailData) -> Markup {
                     th scope="col" { "Status" }
                     th scope="col" { "Kind" }
                     th scope="col" { "Checkout" }
+                    th scope="col" { "Project root" }
                     th scope="col" { "Branch" }
                     th scope="col" { "Capabilities" }
                     th scope="col" { "Attached" }
@@ -724,7 +743,8 @@ fn attachments_table(data: &DetailData) -> Markup {
                             }
                         }
                         td { (serde_label(&row.kind)) }
-                        td { code { (row.checkout_project_dir) } }
+                        td { code { (row.checkout_id) } }
+                        td { code { (row.project_root_relpath) } }
                         td { (row.branch_ref.as_deref().unwrap_or("none")) }
                         td {
                             @match capabilities(id) {
