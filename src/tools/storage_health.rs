@@ -46,32 +46,40 @@ impl BlackboxServer {
         }
         let server = self.clone();
         Self::run_blocking("bbox_storage_health", move || {
-            let edges_dir = storage_health::find_edges_dir(&server.state.store_dir, None);
-
-            let registered = server.state.corpus_registered_project_ids();
-
-            // Filter-class engine resolution (phase-2 §9.2 B6): a resolving
-            // selector narrows by identity; a miss keeps the literal
-            // pass-through (the literal-filter semantics).
-            let project_filter: Option<String> = p.project.as_ref().map(|project| {
-                server
-                    .resolve_project_filter(project)
-                    .and_then(|resolution| resolution.project_id().map(str::to_owned))
-                    .unwrap_or_else(|| project.clone())
-            });
-
-            let include_files = p.include_files.unwrap_or(false);
-            let report = storage_health::scan_storage_health(
-                &edges_dir,
-                &registered,
-                project_filter.as_deref(),
-                include_files,
-            )?;
-
+            let (report, edges_dir) = server
+                .storage_health_report(p.project.as_deref(), p.include_files.unwrap_or(false))?;
             let value = storage_health_response(serde_json::to_value(report)?, &edges_dir, &p)?;
             Ok(serde_json::to_string(&value)?)
         })
         .await
+    }
+}
+
+impl BlackboxServer {
+    /// Rescan daemon-owned edge storage and return the report with the
+    /// storage root it describes. Blocking: it walks the storage tree.
+    pub(crate) fn storage_health_report(
+        &self,
+        project: Option<&str>,
+        include_files: bool,
+    ) -> anyhow::Result<(storage_health::StorageHealthReport, std::path::PathBuf)> {
+        let edges_dir = storage_health::find_edges_dir(&self.state.store_dir, None);
+        let registered = self.state.corpus_registered_project_ids();
+        // Filter-class engine resolution (phase-2 §9.2 B6): a resolving
+        // selector narrows by identity; a miss keeps the literal
+        // pass-through (the literal-filter semantics).
+        let project_filter: Option<String> = project.map(|project| {
+            self.resolve_project_filter(project)
+                .and_then(|resolution| resolution.project_id().map(str::to_owned))
+                .unwrap_or_else(|| project.to_string())
+        });
+        let report = storage_health::scan_storage_health(
+            &edges_dir,
+            &registered,
+            project_filter.as_deref(),
+            include_files,
+        )?;
+        Ok((report, edges_dir))
     }
 }
 
