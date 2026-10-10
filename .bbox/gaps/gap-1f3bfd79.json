@@ -1,0 +1,23 @@
+{
+  "id": "gap-1f3bfd79",
+  "title": "Deployment fleetd probe hardcodes protocol version 1",
+  "gap_kind": "tooling",
+  "domain": "fleetd",
+  "wanted_capability": "Use the deployment readiness and empty-session probe across supported fleetd protocol upgrades.",
+  "missing_primitive": "The operator-side migration/probe-fleetd.mjs offers only version 1 and stamps every frame with version 1, so it cannot inspect a protocol-2 fleetd.",
+  "fallback_used": "Updated the probe to offer versions 2 and 1 and frame requests with the negotiated version.",
+  "evidence": [
+    "thread-f3648dd4",
+    "crates/bro-protocol/src/fleetd.rs"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/fleetd/probe-protocol-negotiation",
+  "notes": "Version-1 empty-session probe passed. Version-2 verification follows installation of the new fleetd.",
+  "resolution": "addressed",
+  "project_id": "89bd722f",
+  "created_at": "2026-10-10T18:15:20Z",
+  "updated_at": "2026-10-10T18:23:37Z",
+  "resolved_at": "2026-10-10T18:23:37Z",
+  "resolution_note": "Deployment probe now offers fleetd protocols 2 and 1 and uses the negotiated version in every frame. Syntax validation passed. Live empty-session probes passed against protocol-1 fleetd and protocol-2 fleetd, and the protocol-2 invalid-token probe returned auth.invalid."
+}
