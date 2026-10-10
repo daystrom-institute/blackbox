@@ -75,7 +75,6 @@ pub struct IndexOverrides {
 pub struct ProviderOverrides {
     pub claude_bin: Option<Option<String>>,
     pub codex_bin: Option<Option<String>>,
-    pub gemini_bin: Option<Option<String>>,
     pub copilot_bin: Option<Option<String>>,
     pub vibe_bin: Option<Option<String>>,
     pub vibe_session_dir: Option<Option<PathBuf>>,
@@ -475,7 +474,6 @@ fn default_provenance_git_notes_namespace() -> String {
 struct RawProviderConfig {
     pub claude_bin: Option<String>,
     pub codex_bin: Option<String>,
-    pub gemini_bin: Option<String>,
     pub copilot_bin: Option<String>,
     pub vibe_bin: Option<String>,
     pub vibe_session_dir: Option<PathBuf>,
@@ -1058,7 +1056,6 @@ pub struct ProvenanceConfig {
 pub struct ProviderConfig {
     pub claude_bin: Option<String>,
     pub codex_bin: Option<String>,
-    pub gemini_bin: Option<String>,
     pub copilot_bin: Option<String>,
     pub vibe_bin: Option<String>,
     pub vibe_session_dir: Option<PathBuf>,
@@ -1175,7 +1172,6 @@ impl Config {
             providers: RawProviderConfig {
                 claude_bin: None,
                 codex_bin: None,
-                gemini_bin: None,
                 copilot_bin: None,
                 vibe_bin: None,
                 vibe_session_dir: None,
@@ -1455,7 +1451,6 @@ fn apply_explicit_env(raw: RawConfig) -> RawConfig {
 
     set_provider_bin!("CLAUDE_BIN", claude_bin);
     set_provider_bin!("CODEX_BIN", codex_bin);
-    set_provider_bin!("GEMINI_BIN", gemini_bin);
     set_provider_bin!("COPILOT_BIN", copilot_bin);
     set_provider_bin!("VIBE_BIN", vibe_bin);
 
@@ -1630,7 +1625,6 @@ pub fn load_with(options: LoadOptions) -> Result<Config> {
         providers: ProviderConfig {
             claude_bin: raw.providers.claude_bin,
             codex_bin: raw.providers.codex_bin,
-            gemini_bin: raw.providers.gemini_bin,
             copilot_bin: raw.providers.copilot_bin,
             vibe_bin: raw.providers.vibe_bin,
             vibe_session_dir: raw.providers.vibe_session_dir,
@@ -1966,9 +1960,6 @@ fn apply_flag_overrides(mut raw: RawConfig, overrides: ConfigOverrides) -> RawCo
     }
     if let Some(codex_bin) = overrides.providers.codex_bin {
         raw.providers.codex_bin = codex_bin;
-    }
-    if let Some(gemini_bin) = overrides.providers.gemini_bin {
-        raw.providers.gemini_bin = gemini_bin;
     }
     if let Some(copilot_bin) = overrides.providers.copilot_bin {
         raw.providers.copilot_bin = copilot_bin;

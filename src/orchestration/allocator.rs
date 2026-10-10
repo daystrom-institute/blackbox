@@ -1908,7 +1908,6 @@ mod tests {
         let keys = [
             "CLAUDE_BIN",
             "CODEX_BIN",
-            "GEMINI_BIN",
             "VIBE_BIN",
             "COPILOT_BIN",
             "BRO_HARNESS_BIN",

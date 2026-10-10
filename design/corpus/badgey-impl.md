@@ -804,7 +804,7 @@ section listing badgey + its tools + use cases + anti-patterns.
 - (later) auto-discovery from registered consultants — out of v1.
 
 **Gates.**
-- Cold Codex / Gemini provider sees the consultants section in
+- Cold Codex provider sees the consultants section in
   `bbox_describe_schema` output.
 - Section format passes the existing schema output snapshot test.
 

@@ -17,7 +17,7 @@ context through a safer shared surface.
 
 - [Provider Transcript Read Plane](provider-transcript-read-plane.md)
 - [Provider Transcript Read Plane - Implementation Plan](provider-transcript-read-plane-impl.md)
-- [Provider Transcript Read Plane - Phase 4-8 Notes](provider-transcript-read-plane-phase4-8-notes.md)
+- [Provider Transcript Read Plane - Phase 5-8 Notes](provider-transcript-read-plane-phase4-8-notes.md)
 
 ## Crosscuts
 

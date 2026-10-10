@@ -45,7 +45,6 @@
         bbx-dev-bro = mkWrapped "bbx-dev-bro" "${blackbox}/bin/bro";
         bbx-dev-claude = mkWrapped "bbx-dev-claude" ''"''${CLAUDE_BIN:-claude}"'';
         bbx-dev-codex = mkWrapped "bbx-dev-codex" ''"''${CODEX_BIN:-codex}"'';
-        bbx-dev-gemini = mkWrapped "bbx-dev-gemini" ''"''${GEMINI_BIN:-gemini}"'';
         bbx-dev-copilot = mkWrapped "bbx-dev-copilot" ''"''${COPILOT_BIN:-gh}"'';
         bbx-dev-vibe = mkWrapped "bbx-dev-vibe" ''"''${VIBE_BIN:-vibe}"'';
       in {
@@ -57,7 +56,6 @@
           dev-bro = bbx-dev-bro;
           dev-claude = bbx-dev-claude;
           dev-codex = bbx-dev-codex;
-          dev-gemini = bbx-dev-gemini;
           dev-copilot = bbx-dev-copilot;
           dev-vibe = bbx-dev-vibe;
         };
@@ -72,7 +70,6 @@
           dev-bro = flake-utils.lib.mkApp { drv = bbx-dev-bro; };
           dev-claude = flake-utils.lib.mkApp { drv = bbx-dev-claude; };
           dev-codex = flake-utils.lib.mkApp { drv = bbx-dev-codex; };
-          dev-gemini = flake-utils.lib.mkApp { drv = bbx-dev-gemini; };
           dev-copilot = flake-utils.lib.mkApp { drv = bbx-dev-copilot; };
           dev-vibe = flake-utils.lib.mkApp { drv = bbx-dev-vibe; };
         };
@@ -119,7 +116,6 @@
             bbx-dev-bro
             bbx-dev-claude
             bbx-dev-codex
-            bbx-dev-gemini
             bbx-dev-copilot
             bbx-dev-vibe
           ];

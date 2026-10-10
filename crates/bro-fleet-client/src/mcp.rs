@@ -24,15 +24,11 @@ pub enum McpServerConfig {
         url: String,
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         headers: BTreeMap<String, Value>,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        exclude_tools: Vec<String>,
     },
     Sse {
         url: String,
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         headers: BTreeMap<String, Value>,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        exclude_tools: Vec<String>,
     },
     Stdio {
         command: String,

@@ -14,9 +14,8 @@ use crate::orchestration::providers::{ExecOpts, Provider};
 use crate::orchestration::tail::TailEvent;
 use crate::server::BlackboxServer;
 use crate::server::progress::{
-    cleanup_policy_file_when_done, combine_dispatch_filters, extra_filters_from_params,
-    release_resume_lease_when_done, resolve_dispatch_filters, spawn_progress_notifier,
-    try_acquire_resume_lease,
+    combine_dispatch_filters, extra_filters_from_params, release_resume_lease_when_done,
+    resolve_dispatch_filters, spawn_progress_notifier, try_acquire_resume_lease,
 };
 use crate::tools::bro_params::*;
 
@@ -641,7 +640,6 @@ impl BlackboxServer {
             );
         }
         drop(allocation_guard);
-        cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
         if let Some(bro_name) = &request.record_to_bro {
             self.record_task_to_bro(bro_name, &task);
         }
@@ -881,10 +879,7 @@ impl BlackboxServer {
 
         // Auto-resolve cwd from the session's own recorded origin so
         // agents can resurrect each other across repo boundaries without
-        // the caller threading cwd. Gemini gets a hard refuse on
-        // miss because its CLI silently forks a fresh session when the
-        // UUID isn't in the cwd's project hash folder (aliasing the
-        // resumed session). Claude/Codex error loudly on miss — fall
+        // the caller threading cwd. Claude/Codex error loudly on miss: fall
         // through to the caller's cwd and let them surface the failure.
         let cwd = match provider.resolve_session_cwd(&session_id) {
             Some(p) => Some(p.to_string_lossy().into_owned()),
@@ -1025,7 +1020,6 @@ impl BlackboxServer {
                 ),
             );
         }
-        cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
         release_resume_lease_when_done(task.clone(), resume_lease);
 
         let inner = task.inner.lock();
@@ -2208,7 +2202,6 @@ impl BlackboxServer {
             bro_core::Origin::AgentDispatch,
         )
         .await;
-        cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
         release_resume_lease_when_done(task, resume_lease);
         Ok(task_id)
     }

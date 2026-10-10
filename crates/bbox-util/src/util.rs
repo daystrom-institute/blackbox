@@ -195,7 +195,7 @@ pub fn blackbox_artifacts_dir(home: &Path) -> PathBuf {
 }
 
 /// Provider-neutral global memory file. Lives under `~/.blackbox/`
-/// (parallel to `~/.codex/`, `~/.gemini/`) — *not* `~/.claude-shared/`,
+/// (parallel to `~/.codex/`), *not* `~/.claude-shared/`,
 /// which is claude-specific multi-account state. Each provider's global
 /// memory files import this path so providers share one canonical body of
 /// guidance.

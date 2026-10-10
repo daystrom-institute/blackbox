@@ -434,7 +434,7 @@ mod tests {
             "--session",
             "sid-123",
             "--provider",
-            "gemini",
+            "codex",
         ]);
 
         let BroCommand::Tail(args) = cli.command else {
@@ -443,7 +443,7 @@ mod tests {
         let sel = TailSelectors::from(args);
         assert_eq!(sel.bros, vec!["solo", "alpha", "beta"]);
         assert_eq!(sel.sessions, vec!["sid-123"]);
-        assert_eq!(sel.providers, vec!["gemini"]);
+        assert_eq!(sel.providers, vec!["codex"]);
     }
 
     #[test]

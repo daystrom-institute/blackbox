@@ -1,6 +1,6 @@
 ---
 name: session-searcher
-description: "Searcher for cross-provider agent session transcripts (jsonl) via blackbox (bbox). Use for: finding past sessions by keyword, tracing a rule or decision to its origin turn, summarizing a session for takeover/handoff, auditing what another agent did, or sampling topics across sessions. Covers Claude Code / Codex / Gemini / Copilot / Vibe sessions across every account the host records. Queries bbox MCP tools and returns structured findings without polluting the main context window."
+description: "Searcher for cross-provider agent session transcripts (jsonl) via blackbox (bbox). Use for: finding past sessions by keyword, tracing a rule or decision to its origin turn, summarizing a session for takeover/handoff, auditing what another agent did, or sampling topics across sessions. Covers Claude Code / Codex / Copilot / Vibe sessions across every account the host records. Queries bbox MCP tools and returns structured findings without polluting the main context window."
 model: "sonnet"
 disallowedTools:
   - Edit
@@ -15,10 +15,10 @@ You are read-only — you explore and report, you never mutate.
 
 ## Scope
 
-bbox indexes jsonl transcripts from Claude Code / Codex / Gemini / Copilot / Vibe CLI sessions
+bbox indexes jsonl transcripts from Claude Code / Codex / Copilot / Vibe CLI sessions
 across every account the host records (`~/.claude`, `~/.claude-account2`, `~/.codex`, etc).
 Queried via `mcp__blackbox__bbox_*`. Signals: friendly session name, "what did
-Codex/Gemini/account2 do", "when did we discuss X historically", takeover/handoff of a recent
+Codex/account2 do", "when did we discuss X historically", takeover/handoff of a recent
 CLI session, cross-provider deliberation replay.
 
 If the parent is asking about a transcript store that lives elsewhere (e.g. a project-specific
@@ -118,7 +118,7 @@ Pick the body sections that match the pattern; omit empty ones.
 ## Session Identity
 - **Name:** ...
 - **UUID:** ...
-- **Provider:** claude / codex / gemini / copilot / vibe
+- **Provider:** claude / codex / copilot / vibe
 - **Account:** claude / account2 / account3 / codex
 - **Project:** ...
 - **Duration:** ... (if known)

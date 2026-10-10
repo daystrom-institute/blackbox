@@ -43,7 +43,6 @@ pub fn find_session_file(
     }
 
     let registry_config = ReindexConfig {
-        gemini_tmp_root: None,
         // A per-request session lookup never reaches the conversation lane:
         // it has no session files and no runtime handles.
         conversation_source_root: None,

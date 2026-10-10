@@ -215,7 +215,7 @@ so repair the type dispatch rather than weakening reader validation.
   if a concrete client needs it.
 - `bro_mcp sync` has no destination: `FANOUT_PROVIDERS` is empty in
   [mcp.rs](../../../src/orchestration/mcp.rs). Current providers consume
-  per-dispatch injection. Retire sync and stale provider-CLI/Gemini wording.
+  per-dispatch injection. Retire sync and stale provider-CLI wording.
 - `bbox_project_list` is an unpaged compatibility root projection; catalog
   list/get is authoritative logical-project discovery. `unregister` means
   detach in catalog mode, not logical project retirement. Reconcile aliases
@@ -373,7 +373,7 @@ its present contract subject to the stated evidence limits.
 | `bro_mcp` | get | retain | Selected configuration detail uses response_view redaction; explain server-not-registered domain outcome and daemon ownership. | source; existing redaction tests | A09 |
 | `bro_mcp` | list | adjust | Effective servers/filters are useful, endpoint values redacted; scope is ignored and inventory unpaged. Distinguish effective union from selected-scope get. | mcp_list, mcp_bad_scope | A03 A06 A09 |
 | `bro_mcp` | remove | adjust | Persistent dispatch MCP settings remain useful; project paths still resolve daemon-local files, mutation replies expose paths, and add schema advertises unsupported stdio. | source | A09 A10 A12 |
-| `bro_mcp` | sync | retire-candidate | FANOUT_PROVIDERS is empty: sync resolves config/secrets but cannot synchronize any current provider. Per-dispatch injection is the real consumer; retire this action and stale CLI/Gemini guidance. | source | A08 |
+| `bro_mcp` | sync | retire-candidate | FANOUT_PROVIDERS is empty: sync resolves config/secrets but cannot synchronize any current provider. Per-dispatch injection is the real consumer; retire this action and stale CLI guidance. | source | A08 |
 
 ### [src/tools/dispatch.rs](../../../src/tools/dispatch.rs)
 

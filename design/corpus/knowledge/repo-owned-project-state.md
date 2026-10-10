@@ -126,7 +126,7 @@ repo-anchored:
 So portability is actually **worse** than "per-machine id": an absolute path
 string doesn't survive a different `$HOME`, a different checkout location, or a
 second user — let alone a second machine. And the repo carries only the **rendered
-markdown** (`CLAUDE.md` / `AGENTS.md` / `GEMINI.md`), a **lossy** projection that
+markdown** (`CLAUDE.md` / `AGENTS.md`), a **lossy** projection that
 cannot be reverse-derived to the structured entries (rendered files are never
 imported back into the store).
 
@@ -226,7 +226,7 @@ we do not invent one.
       .gitignore              # (exists)
       threads/ notes/         # NEW: live activity
       <kind>/                 # (exists) local artifacts
-  CLAUDE.md / AGENTS.md / GEMINI.md   # derived; committed behind render --check (policy B)
+  CLAUDE.md / AGENTS.md       # derived; committed behind render --check (policy B)
   PROJECT.md                  # hand-authored, included by reference (unchanged)
 ```
 

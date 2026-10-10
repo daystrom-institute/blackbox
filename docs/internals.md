@@ -20,7 +20,7 @@ source material:
 
 | Layer | Purpose |
 |---|---|
-| Transcript adapters | Read Claude, Codex, Gemini, and other provider session formats |
+| Transcript adapters | Read Claude, Codex, and other provider session formats |
 | Tantivy index | Fast BM25 search over transcript blocks, project files, git messages, knowledge, and threads |
 | Vector store | Per-route embedding partitions for semantic retrieval |
 | Edge sidecars | Manifest, snapshots and overlays that authorize code-source activation (no in-memory edge graph) |

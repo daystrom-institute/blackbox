@@ -83,7 +83,7 @@ Produce a concrete initial charter with these fields:
 - **Expected phase sequence:** first-cut ordered list of crucibles. Will evolve — this is a starting map.
 - **Halt conditions:** triggers for pausing and escalating to user. Defaults below; user may add more.
 - **Exit conditions:** what "done" means concretely (all ruled-in items shipped + all non-trivial defects recorded, OR something more specific the user demands).
-- **Ensemble composition:** default two reviewer brofiles, one codex and one gemini (for example `red-team-codex` and `red-team-gemini`), unless user overrides.
+- **Ensemble composition:** default two reviewer brofiles, one codex and one glm (for example `red-team-codex` and `red-team-glm`), unless user overrides.
 - **Implementer profile:** default `crucible-implementer` (Claude Opus 4.7 xhigh) unless user overrides.
 - **Spine doc location:** project-conventional (e.g. `design/arc-<slug>.md` if `design/` exists, else `docs/arcs/<slug>.md`, else `.overmind/<slug>.md`).
 

@@ -51,9 +51,9 @@ impl TranscriptAdapterRegistry {
     }
 
     /// Registry for index-time scans. Every source root must be explicit in
-    /// the config — harness sessions dir, interactive claude roots, codex
-    /// root, gemini tmp root are all `None`/empty in hermetic test indexes —
-    /// so reindex never silently scans the operator's real state.
+    /// the config: harness sessions dir, interactive claude roots, and codex
+    /// root are all `None`/empty in hermetic test indexes, so reindex never
+    /// silently scans the operator's real state.
     pub fn from_reindex_config(config: &ReindexConfig) -> Self {
         let mut adapters: Vec<Box<dyn TranscriptReadAdapter>> = Vec::new();
         if let Some(dir) = &config.harness_sessions_dir {
@@ -67,11 +67,6 @@ impl TranscriptAdapterRegistry {
         if let Some(codex_root) = config.codex_root.clone() {
             adapters.push(Box::new(super::interactive::CodexTranscriptAdapter::new(
                 codex_root,
-            )));
-        }
-        if let Some(tmp_root) = config.gemini_tmp_root.clone() {
-            adapters.push(Box::new(super::interactive::GeminiTranscriptAdapter::new(
-                tmp_root,
             )));
         }
         if let Some(root) = &config.native_source_root {

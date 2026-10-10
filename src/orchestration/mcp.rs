@@ -101,15 +101,11 @@ pub enum McpServerConfig {
         url: String,
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         headers: BTreeMap<String, SecretString>,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        exclude_tools: Vec<String>,
     },
     Sse {
         url: String,
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         headers: BTreeMap<String, SecretString>,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        exclude_tools: Vec<String>,
     },
     Stdio {
         command: String,
@@ -147,16 +143,7 @@ impl McpServerConfig {
     /// serialize the original config; no debug mode can opt out of this view.
     fn response_view(&self) -> serde_json::Value {
         match self {
-            Self::Http {
-                url,
-                headers,
-                exclude_tools,
-            }
-            | Self::Sse {
-                url,
-                headers,
-                exclude_tools,
-            } => {
+            Self::Http { url, headers } | Self::Sse { url, headers } => {
                 let transport = if matches!(self, Self::Http { .. }) {
                     "http"
                 } else {
@@ -167,7 +154,6 @@ impl McpServerConfig {
                     "endpoint_origin": endpoint_origin(url),
                     "endpoint_redacted": true,
                     "headers": redacted_values(headers),
-                    "exclude_tools": exclude_tools,
                 })
             }
             Self::Stdio { command, args, env } => serde_json::json!({
@@ -176,15 +162,6 @@ impl McpServerConfig {
                 "argument_count": args.len(),
                 "env": redacted_values(env),
             }),
-        }
-    }
-
-    /// Per-server exclude list (Gemini-only at present, applied at
-    /// registration time). Empty for Stdio (no add fan-out).
-    pub fn exclude_tools(&self) -> &[String] {
-        match self {
-            Self::Http { exclude_tools, .. } | Self::Sse { exclude_tools, .. } => exclude_tools,
-            Self::Stdio { .. } => &[],
         }
     }
 }
@@ -300,7 +277,7 @@ impl std::str::FromStr for McpToolRef {
 }
 
 /// Filter rules — mirrors what each provider's `--disallowedTools` /
-/// `--deny-tool` / `--exclude-tools` flag accepts, in a canonical form
+/// `--deny-tool` flag accepts, in a canonical form
 /// translated at dispatch time.
 ///
 /// Patterns support simple glob: `*` matches any suffix, e.g.
@@ -535,7 +512,7 @@ pub fn resolve_effective(
 
 /// Expand a glob-style pattern (e.g. `mcp__blackbox__bro_*`, `*_exec`,
 /// `bro_?xec`) against a known tool universe. Used by providers that
-/// accept exact tool names (Gemini, Codex) rather than patterns.
+/// accept exact tool names rather than patterns.
 ///
 /// Supports `*` (any sequence) and `?` (single char) anywhere in the
 /// pattern. Character classes (`[abc]`) are not supported — they fall
@@ -690,10 +667,6 @@ pub struct McpToolParams {
     /// Filter pattern for allow/disallow (e.g. `mcp__blackbox__bro_*`).
     #[serde(default)]
     pub pattern: Option<String>,
-    /// Persistent per-server exclude list stored with the server config.
-    /// Retained for compatibility; no current dispatch lane applies it.
-    #[serde(default)]
-    pub exclude_tools: Option<Vec<String>>,
     /// Optional HTTP/SSE headers (e.g. auth tokens) persisted into
     /// McpServerConfig and resolved only at dispatch time. Values are
     /// redacted in every reply.
@@ -770,7 +743,6 @@ pub(crate) fn validate_selection(p: &McpToolParams) -> Result<&'static str> {
         matches!(p.action, Add)
             || (p.url.is_none()
                 && p.transport.is_none()
-                && p.exclude_tools.is_none()
                 && p.headers.is_none()
                 && p.surface.is_none()),
         "server configuration fields require action=add"
@@ -1039,7 +1011,6 @@ fn action_add(p: &McpToolParams) -> Result<String> {
         .into_iter()
         .map(|(k, v)| (k, SecretString::Plain(v)))
         .collect();
-    let exclude = p.exclude_tools.clone().unwrap_or_default();
 
     // Append ?surface= to URL when surface is specified.
     let url = if let Some(surface) = &p.surface {
@@ -1053,12 +1024,10 @@ fn action_add(p: &McpToolParams) -> Result<String> {
         "http" => McpServerConfig::Http {
             url: url.to_string(),
             headers,
-            exclude_tools: exclude,
         },
         "sse" => McpServerConfig::Sse {
             url: url.to_string(),
             headers,
-            exclude_tools: exclude,
         },
         other => anyhow::bail!(
             "Transport '{other}' is not supported by bro_mcp add; supported transports are http and sse. stdio servers have no add lane: the store owner must write them directly."
@@ -1197,7 +1166,6 @@ mod tests {
                 ("X-Custom".into(), "opaque-secret".into()),
                 ("X-Reference".into(), SecretString::Secret { name: "SYNTHETIC_KEY_REFERENCE".into() }),
             ]),
-            exclude_tools: vec!["admin_delete".into()],
         };
         let mut store = McpStore::new();
         store.servers.insert("remote".into(), cfg.clone());
@@ -1229,7 +1197,6 @@ mod tests {
             assert!(response.contains("https://example.test"));
         }
         assert!(detail.contains("SYNTHETIC_KEY_REFERENCE"));
-        assert!(detail.contains("admin_delete"));
         let view = cfg.response_view();
         assert_eq!(view["headers"]["X-Custom"]["redacted"], true);
         let loaded = McpStore::load(&project_store_path(&root)).unwrap();
@@ -1282,7 +1249,6 @@ mod tests {
                         "X-Custom".into(),
                         SecretString::Plain("fixture-secret".into()),
                     )]),
-                    exclude_tools: Vec::new(),
                 },
             );
         }
@@ -1330,7 +1296,6 @@ mod tests {
             McpServerConfig::Http {
                 url: "http://127.0.0.1:7264/mcp".into(),
                 headers: BTreeMap::new(),
-                exclude_tools: Vec::new(),
             },
         );
         store.save(&path).unwrap();
@@ -1347,34 +1312,36 @@ mod tests {
         let cfg = McpServerConfig::Http {
             url: "http://127.0.0.1:7264/mcp".into(),
             headers: BTreeMap::new(),
-            exclude_tools: Vec::new(),
         };
         assert!(cfg.blackbox_matches("http://127.0.0.1:7264/mcp"));
         assert!(!cfg.blackbox_matches("http://127.0.0.1:7263/mcp"));
     }
 
     #[test]
-    fn roundtrip_persists_headers_and_exclude_tools() {
+    fn roundtrip_persists_headers_and_ignores_a_stored_exclude_list() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("mcp.json");
-        let mut store = McpStore::new();
-        let mut headers = BTreeMap::new();
-        headers.insert("Authorization".into(), "Bearer token".into());
-        store.servers.insert(
-            "blackbox".into(),
-            McpServerConfig::Http {
-                url: "http://127.0.0.1:7264/mcp".into(),
-                headers,
-                exclude_tools: vec!["bro_exec".into(), "bro_resume".into()],
-            },
-        );
-        store.save(&path).unwrap();
+        fs::write(
+            &path,
+            serde_json::json!({
+                "version": 1,
+                "servers": {
+                    "blackbox": {
+                        "type": "http",
+                        "url": "http://127.0.0.1:7264/mcp",
+                        "headers": {"Authorization": "Bearer token"},
+                        "exclude_tools": ["bro_exec", "bro_resume"],
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let loaded = McpStore::load(&path).unwrap();
+        loaded.save(&path).unwrap();
+        assert!(!fs::read_to_string(&path).unwrap().contains("exclude_tools"));
         let loaded = McpStore::load(&path).unwrap();
         let cfg = loaded.servers.get("blackbox").unwrap();
-        assert_eq!(
-            cfg.exclude_tools(),
-            &["bro_exec".to_string(), "bro_resume".to_string()]
-        );
         match cfg {
             McpServerConfig::Http { headers, .. } => {
                 assert_eq!(
@@ -1407,7 +1374,6 @@ mod tests {
             scope: Some("project".into()),
             project: Some(project.clone()),
             pattern: None,
-            exclude_tools: None,
             headers: None,
             surface: Some("readonly".into()),
             limit: None,
@@ -1448,7 +1414,6 @@ mod tests {
             scope: Some("project".into()),
             project: Some(project.clone()),
             pattern: None,
-            exclude_tools: None,
             headers: None,
             surface: None,
             limit: None,
@@ -1538,7 +1503,6 @@ mod tests {
             McpServerConfig::Http {
                 url: "http://project".into(),
                 headers: BTreeMap::new(),
-                exclude_tools: Vec::new(),
             },
         );
         let store_path = project_store_path(&project);
@@ -1553,7 +1517,6 @@ mod tests {
                     McpServerConfig::Http {
                         url: "http://global".into(),
                         headers: BTreeMap::new(),
-                        exclude_tools: Vec::new(),
                     },
                 );
                 servers
@@ -1570,7 +1533,6 @@ mod tests {
             scope: Some("project".into()),
             project: Some(project.to_string_lossy().into()),
             pattern: None,
-            exclude_tools: None,
             headers: None,
             surface: None,
             limit: None,
@@ -1592,7 +1554,6 @@ mod tests {
             scope: Some("global".into()),
             project: None,
             pattern: None,
-            exclude_tools: None,
             headers: None,
             surface: None,
             limit: None,
@@ -1625,7 +1586,6 @@ mod tests {
         McpServerConfig::Http {
             url: url.to_string(),
             headers: BTreeMap::new(),
-            exclude_tools: Vec::new(),
         }
     }
 
@@ -1754,7 +1714,6 @@ mod tests {
             McpServerConfig::Http {
                 url: "http://remote.test".to_string(),
                 headers,
-                exclude_tools: Vec::new(),
             },
         );
         let store_file = project_store_path(&project);
@@ -2122,13 +2081,9 @@ mod tests {
             };
             headers.insert(key, value);
         }
-        let exclude_tools: Vec<String> = (0..2000)
-            .map(|i| format!("mcp__unit__tool_{i:04}"))
-            .collect();
         let http = McpServerConfig::Http {
             url: "http://unit.test/mcp".to_string(),
             headers,
-            exclude_tools,
         };
         let mut env = BTreeMap::new();
         for i in 0..3000 {
@@ -2209,17 +2164,7 @@ mod tests {
     }
 
     #[test]
-    fn exclude_tools_empty_for_stdio() {
-        let cfg = McpServerConfig::Stdio {
-            command: "node".into(),
-            args: vec![],
-            env: BTreeMap::new(),
-        };
-        assert!(cfg.exclude_tools().is_empty());
-    }
-
-    #[test]
-    fn action_add_project_scope_persists_headers_and_exclude_tools() {
+    fn action_add_project_scope_persists_headers() {
         // Project scope persists into the project store only; no provider
         // CLI fan-out exists to touch from a test.
         let dir = tempdir().unwrap();
@@ -2236,7 +2181,6 @@ mod tests {
             scope: Some("project".into()),
             project: Some(project.clone()),
             pattern: None,
-            exclude_tools: Some(vec!["dangerous_tool".into(), "other_tool".into()]),
             headers: Some(headers),
             surface: None,
             limit: None,
@@ -2252,10 +2196,6 @@ mod tests {
         let store_path = project_store_path(Path::new(&project));
         let store = McpStore::load(&store_path).unwrap();
         let cfg = store.servers.get("custom-mcp").unwrap();
-        assert_eq!(
-            cfg.exclude_tools(),
-            &["dangerous_tool".to_string(), "other_tool".to_string()]
-        );
         match cfg {
             McpServerConfig::Http { url, headers, .. } => {
                 assert_eq!(url, "http://example.com/mcp");
@@ -2385,7 +2325,6 @@ mod tests {
             McpServerConfig::Http {
                 url: "http://old/mcp".into(),
                 headers: BTreeMap::new(),
-                exclude_tools: Vec::new(),
             },
         );
         global.filters.disallow.push("Bash(git push *)".into());
@@ -2396,7 +2335,6 @@ mod tests {
             McpServerConfig::Http {
                 url: "http://new/mcp".into(),
                 headers: BTreeMap::new(),
-                exclude_tools: Vec::new(),
             },
         );
         project.filters.disallow.push("Edit(*)".into());
@@ -2537,7 +2475,6 @@ mod tests {
             McpServerConfig::Http {
                 url: "http://host/mcp".into(),
                 headers,
-                exclude_tools: Vec::new(),
             },
         );
         store.save(&path).unwrap();
@@ -2578,7 +2515,6 @@ mod tests {
                 );
                 h
             },
-            exclude_tools: Vec::new(),
         };
         // Without the env var set, resolution must fail.
         unsafe {
@@ -2619,7 +2555,6 @@ mod tests {
                     );
                     h
                 },
-                exclude_tools: Vec::new(),
             },
         );
         let result = validate_project_store(&store);
@@ -2651,7 +2586,6 @@ mod tests {
                     );
                     h
                 },
-                exclude_tools: Vec::new(),
             },
         );
         // validate_project_store is only called for project files; global files

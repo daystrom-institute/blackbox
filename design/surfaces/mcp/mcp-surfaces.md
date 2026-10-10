@@ -310,7 +310,7 @@ Minimum tests:
 - config tables override built-in surfaces by name and add new ones.
 - provider alias registration preserves query strings in generated MCP config.
 - dispatch-time merge of a surface produces expected provider args for
-  Claude, Codex, Copilot, and Gemini.
+  Claude, Codex, and Copilot.
 - hidden tools are rejected through direct `call_tool`, not only hidden from
   discovery.
 - an unknown surface fails MCP initialization instead of returning an empty

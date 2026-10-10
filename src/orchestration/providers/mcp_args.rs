@@ -11,25 +11,18 @@ use super::Provider;
 /// [`super::dispatch_prelude`].
 pub trait ProviderMcp {
     #[allow(dead_code)]
-    fn build_mcp_add_http_args(
-        &self,
-        name: &str,
-        url: &str,
-        exclude_tools: &[String],
-    ) -> Option<Vec<String>>;
+    fn build_mcp_add_http_args(&self, name: &str, url: &str) -> Option<Vec<String>>;
     #[allow(dead_code)]
     fn build_mcp_add_http_args_scoped(
         &self,
         name: &str,
         url: &str,
-        exclude_tools: &[String],
         scope: &str,
     ) -> Option<Vec<String>>;
     fn build_mcp_add_http_args_full(
         &self,
         name: &str,
         url: &str,
-        exclude_tools: &[String],
         headers: &BTreeMap<String, String>,
         scope: &str,
     ) -> Option<Vec<String>>;
@@ -53,13 +46,8 @@ pub trait ProviderMcp {
 
 impl ProviderMcp for Provider {
     #[allow(dead_code)]
-    fn build_mcp_add_http_args(
-        &self,
-        name: &str,
-        url: &str,
-        exclude_tools: &[String],
-    ) -> Option<Vec<String>> {
-        self.build_mcp_add_http_args_full(name, url, exclude_tools, &BTreeMap::new(), "user")
+    fn build_mcp_add_http_args(&self, name: &str, url: &str) -> Option<Vec<String>> {
+        self.build_mcp_add_http_args_full(name, url, &BTreeMap::new(), "user")
     }
 
     #[allow(dead_code)]
@@ -67,17 +55,15 @@ impl ProviderMcp for Provider {
         &self,
         name: &str,
         url: &str,
-        exclude_tools: &[String],
         scope: &str,
     ) -> Option<Vec<String>> {
-        self.build_mcp_add_http_args_full(name, url, exclude_tools, &BTreeMap::new(), scope)
+        self.build_mcp_add_http_args_full(name, url, &BTreeMap::new(), scope)
     }
 
     fn build_mcp_add_http_args_full(
         &self,
         _name: &str,
         _url: &str,
-        _exclude_tools: &[String],
         _headers: &BTreeMap<String, String>,
         _scope: &str,
     ) -> Option<Vec<String>> {

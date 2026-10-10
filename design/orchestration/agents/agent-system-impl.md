@@ -597,7 +597,7 @@ installed agents with summary + use cases + anti-patterns.
 
 **Gates.**
 - Response includes the `agents` section.
-- Cold Codex / Gemini sees the section through MCP discovery.
+- Cold Codex sees the section through MCP discovery.
 - Snapshot test of schema response validates structure.
 
 **Follow-ups.** None blocked.

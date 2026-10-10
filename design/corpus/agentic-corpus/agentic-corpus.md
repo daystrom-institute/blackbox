@@ -416,7 +416,7 @@ For projects not under git, `repo_id == project_id` and git-related
 edges/entity types are absent.
 
 There's no notion of "account" in entity refs. Bbox tracks one daemon, one
-unified corpus, accessible from any client (Claude Code / Codex / Gemini /
+unified corpus, accessible from any client (Claude Code / Codex /
 direct MCP). The original multi-account framing was about Claude account
 shells, not about the corpus structure; the corpus is account-agnostic.
 
@@ -1068,7 +1068,7 @@ The minimum set; chunker-specific or arc-specific packets compose on top via
 
 ### 14.1 What's already in the corpus
 
-Every Claude Code / Codex / Gemini transcript records every `Edit`, `Write`,
+Every Claude Code / Codex transcript records every `Edit`, `Write`,
 `Read`, `Bash` as discrete tool-call blocks. The existing parser at
 `src/parser.rs` handles tool_use/tool_result blocks — they're already indexed
 as content blocks; they're just not exposed as edges.
@@ -1332,7 +1332,7 @@ multi-run orchestration problem, not just a local loop over test cases.
   policy (`knowledge`, `code`, `docs`, `transcripts`, `git_message`, `notes`).
   Each bucket has a configured provider route (§5.4).
 - **Calling LLM** — whichever LLM is invoking bbox tools (Claude Code, Codex,
-  Gemini, the user's IDE assistant). The runner of the agentic loop.
+  the user's IDE assistant). The runner of the agentic loop.
 - **Chunker registry** — first-claimer-wins ordered list of
   `SourceFormatChunker` impls; one per source format (markdown, code, PDF,
   etc.). The single place that knows the format (§7.1).

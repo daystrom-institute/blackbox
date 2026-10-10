@@ -467,7 +467,7 @@ pub(crate) struct PruneParams {
     /// without further filtering. Running tasks are never pruned.
     #[serde(default)]
     pub(crate) status: Option<String>,
-    /// Optional provider filter (claude, codex, copilot, gemini, vibe).
+    /// Optional provider filter (claude, codex, copilot, vibe).
     #[serde(default)]
     pub(crate) provider: Option<String>,
     /// Drop tasks that started more than this many hours ago.

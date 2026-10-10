@@ -300,7 +300,7 @@ bros inherit the correct tool boundary. Provider configs gain surface aliases.
   effective allow `[B, C]`.
 - Disallow-additive: surface disallow `[X]` + brofile disallow `[Y]` → both
   denied.
-- Claude, Codex, Copilot, Gemini filter args all reflect merged surface filters.
+- Claude, Codex, Copilot filter args all reflect merged surface filters.
 - Provider alias registration preserves query string in stored URL.
 
 ## Phase 4 - Docs and operator path

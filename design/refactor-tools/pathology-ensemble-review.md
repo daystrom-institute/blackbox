@@ -188,8 +188,8 @@ Each lens owns one question and defers the rest:
 
 ## Provider heterogeneity
 
-The panel is drawn from four providers — `claude`, `deepseek`, `glm`, `brodex`
-(`gemini` is deliberately excluded). `brodex` is the Codex/ChatGPT backend over
+The panel is drawn from four providers: `claude`, `deepseek`, `glm`, `brodex`.
+`brodex` is the Codex/ChatGPT backend over
 the OpenAI Responses transport via `bro-harness` — a different dispatch path from
 the `codex`-CLI facilitator. Models pinned to current catalog ids
 (`src/orchestration/providers/catalog.rs`):
@@ -205,8 +205,7 @@ the `codex`-CLI facilitator. Models pinned to current catalog ids
 **Known homogeneity:** Precision and Corroboration are both `brodex` / `gpt-5.5`
 — identical provider and model, differing only by lens prompt. This is the one
 pair where the panel is *not* heterogeneous, an accepted trade against the
-alternatives (`deepseek-reasoner` is three generations old; a fifth distinct
-provider would mean `gemini`, which is excluded). If a fifth genuinely-distinct
+alternatives (`deepseek-reasoner` is three generations old). If a fifth genuinely-distinct
 current model becomes acceptable, Corroboration is the slot to move.
 
 All five run at `effort: high` where the provider honors effort. All five are

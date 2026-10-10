@@ -28,7 +28,6 @@ fn provider_roundtrip_for_dispatchable_harness_providers() {
     assert!(Provider::from_str("claude").is_err());
     assert!(Provider::from_str("codex").is_err());
     assert!(Provider::from_str("copilot").is_err());
-    assert!(Provider::from_str("gemini").is_err());
 }
 
 #[test]
@@ -703,7 +702,6 @@ fn fleet_mcp_args_harness_providers_emit_single_config_blob() {
         McpServerConfig::Http {
             url: "https://ctx7.example/mcp".into(),
             headers: Default::default(),
-            exclude_tools: Vec::new(),
         },
     );
 
@@ -736,7 +734,6 @@ fn fleet_mcp_config_json_resolves_secret_headers_and_stdio() {
         McpServerConfig::Http {
             url: "https://ctx.example/mcp".into(),
             headers,
-            exclude_tools: Vec::new(),
         },
     );
     servers.insert(

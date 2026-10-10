@@ -271,8 +271,8 @@ pub fn scan_source_files(config: &ReindexConfig) -> Vec<(String, u64, u64)> {
 }
 
 /// Collect (path, mtime, size) for every transcript file owned by a
-/// registered transcript adapter (harness session event logs, gemini tmp
-/// sessions — anything not covered by the legacy roots walk above).
+/// registered transcript adapter (harness session event logs, and anything
+/// not covered by the legacy roots walk above).
 ///
 /// This scan is load-bearing for two consumers, not just change detection:
 /// the purge phase treats any indexed `file_path` absent from

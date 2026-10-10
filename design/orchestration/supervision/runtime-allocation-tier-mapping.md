@@ -151,16 +151,14 @@ parameters:
       "claude": { "model": "claude-haiku-4-5-20251001", "effort": "low" },
       "codex": { "model": "gpt-5.5-mini", "effort": "low" },
       "glm": { "model": "glm-4.5-air", "effort": "low" },
-      "deepseek": { "model": "deepseek-v4-flash", "effort": "low" },
-      "gemini": { "model": "gemini-2.5-flash-lite" }
+      "deepseek": { "model": "deepseek-v4-flash", "effort": "low" }
     },
     "standard": {
       "claude": { "model": "claude-sonnet-4-6", "effort": "medium" },
       "codex": { "model": "gpt-5.5", "effort": "medium" },
       "glm": { "model": "glm-5.1", "effort": "medium" },
       "deepseek": { "model": "deepseek-v4-pro", "effort": "medium" },
-      "inception": { "model": "inception/mercury-2", "effort": "medium" },
-      "gemini": { "model": "gemini-3-flash-preview" }
+      "inception": { "model": "inception/mercury-2", "effort": "medium" }
     },
     "super-el-cheapo-drones": {
       "codex": { "model": "gpt-5.3-codex-spark", "effort": "low", "weight": 1.0 },
@@ -188,7 +186,7 @@ status/trace surfaces should report which mapping version or revision was used.
 
 The mapping example is illustrative. Eligibility still applies after tier
 expansion. In current code, only Claude and Codex advertise
-`structured_output`; GLM, DeepSeek, Inception, Gemini, and Vibe tier entries are
+`structured_output`; GLM, DeepSeek, Inception, and Vibe tier entries are
 ineligible for workloads that hard-require structured output until their
 capability tags or runtime support change. Tier membership is not a capability
 grant.
@@ -362,7 +360,7 @@ Pins narrow eligibility. They do not disable validation.
 
 Examples:
 
-- pinned `provider=gemini` plus required `structured_output` fails if Gemini's
+- pinned `provider=glm` plus required `structured_output` fails if GLM's
   effective lane lacks `structured_output`.
 - pinned `account=account2` fails if that account is exhausted, disabled, over
   concurrency, or lacks the requested tier/model.

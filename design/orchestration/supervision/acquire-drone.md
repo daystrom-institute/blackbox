@@ -229,18 +229,17 @@ separate store.
   },
   "provider_defaults": {},
   "drone": {
-    "default_pool": ["glm", "claude", "codex", "deepseek", "gemini", "vibe"],
+    "default_pool": ["glm", "claude", "codex", "deepseek", "vibe"],
     "named_pools": {
       "coding": ["glm", "claude", "codex", "deepseek"],
-      "any": ["glm", "claude", "codex", "deepseek", "gemini", "vibe"]
+      "any": ["glm", "claude", "codex", "deepseek", "vibe"]
     },
-    "preference_order": ["glm", "claude", "codex", "deepseek", "gemini", "vibe"],
+    "preference_order": ["glm", "claude", "codex", "deepseek", "vibe"],
     "provider_weights": {
       "glm": 1.0,
       "claude": 0.82,
       "codex": 0.68,
       "deepseek": 0.55,
-      "gemini": 0.45,
       "vibe": 0.25
     },
     "providers": {
@@ -267,12 +266,6 @@ separate store.
         "effort": null,
         "accounts": ["default"],
         "probe": "deepseek-balance"
-      },
-      "gemini": {
-        "model": "gemini-3-flash-preview",
-        "effort": null,
-        "accounts": ["default"],
-        "probe": "credential-freshness"
       },
       "vibe": {
         "model": null,
@@ -311,7 +304,6 @@ brofiles:
 | `glm` | `glm-5.1` | `null` |
 | `deepseek` | `deepseek-v4-flash` | `null` |
 | `inception` | `inception/mercury-2` | `null` |
-| `gemini` | `gemini-3-flash-preview` | `null` |
 | `vibe` | provider default | `null` |
 
 The config may alternatively point at brofiles for mappings, but acquisition
@@ -339,7 +331,6 @@ observations with runtime observations from spawned drone tasks.
 |---|---|---|---|
 | `rate-limit-headers` | Claude | Minimal Anthropic `https://api.anthropic.com/v1/messages` call with Haiku probe model, `anthropic-version: 2023-06-01`, and `anthropic-beta: oauth-2025-04-20`; parse `anthropic-ratelimit-unified-5h-utilization`, `anthropic-ratelimit-unified-7d-utilization`, `anthropic-ratelimit-unified-status`, reset, overage status, and overage utilization headers. | `five_hour_utilization`, `seven_day_utilization`, `status`, `resets_at`, `overage_*` |
 | `usage-endpoint` | Codex | Read `auth.json` tokens and call `https://chatgpt.com/backend-api/wham/usage` with bearer token and optional `ChatGPT-Account-Id`; parse `rate_limit.primary_window.used_percent`, `primary_window.reset_at`, `secondary_window.used_percent`, `allowed`, `limit_reached`, and `plan_type`. | `five_hour_utilization`, `seven_day_utilization`, `status`, `resets_at`, `plan` |
-| `credential-freshness` | Gemini | Read `oauth_creds.json` from the Gemini home directory selected by account env, confirm `access_token`, and compare `expiry_date` milliseconds to now. Daystrom notes no public quota API. Drone-acquired Gemini sessions must store cwd in the drone registry (Section 8), because cwd/session lookup is provider-specific and should not be rediscovered on resume. | `credential_status`, `expires_at`; quota utilization is unknown |
 | `zai-usage-endpoint` | GLM/Z.AI Coding Plan via Claude Code custom model config | Read `ANTHROPIC_AUTH_TOKEN` from the selected Claude config dir (`~/.claude-zai/settings.json` for the default account) and call `https://api.z.ai/api/monitor/usage/quota/limit` with `Authorization: <key>`, `Accept-Language: en-US,en`, and `Content-Type: application/json`. Parse `data.limits[]`: `type=TOKENS_LIMIT, number=5, unit=3` is the five-hour window; `type=TOKENS_LIMIT, number=1, unit=6` is the weekly/seven-day window. Use `percentage` as utilization and `nextResetTime` milliseconds as reset. If the quota endpoint fails, fall back to `glm-active-probe` behavior for launchability and error-code classification. | `five_hour_utilization`, `seven_day_utilization`, `resets_at`, `plan_level`, `provider_cooldown_until` |
 | `deepseek-balance` | DeepSeek via Claude Code custom model config | Call `https://api.deepseek.com/user/balance` with `ANTHROPIC_AUTH_TOKEN` from the selected Claude config dir (`~/.claude-ds/settings.json` for the default account) as `Authorization: Bearer <key>`. `is_available=false` marks the account unavailable; `is_available=true` with positive `balance_infos[0].total_balance` proves pay-as-you-go availability but does not map to 5h/7d utilization. If no direct token is extractable, fall back to a minimal Claude Code invocation and treat success as `active_acceptance`, not `payg_balance`. | `credential_status`, `quota_status`, `balance_available`, `balance_total`, `balance_currency`; quota utilization is unknown |
 | `none` | Vibe or unsupported providers | No active probe. Select only by task in-flight count and failure cooldown. | `status=unknown`; quota utilization is unknown |
@@ -378,10 +369,9 @@ Daystrom source anchors:
   `file-presence`.
 - `../daystrom-mk2/src/Daystrom.Core/Auth/TransitionalProviderDefaults.cs`
   maps providers to account-home env vars: Claude `CLAUDE_CONFIG_DIR`, Codex
-  `CODEX_HOME`, Gemini `HOME` plus `GEMINI_CLI_NO_RELAUNCH=true`, and GLM
-  `XDG_DATA_HOME`.
+  `CODEX_HOME`, and GLM `XDG_DATA_HOME`.
 - `../daystrom-mk2/src/Daystrom.Worker/Services/AccountProbeService.cs`
-  contains the concrete Claude, Codex, Gemini, and GLM probe implementations.
+  contains the concrete Claude, Codex, and GLM probe implementations.
 - `../daystrom-mk2/src/Daystrom.Worker/Services/AccountBalancer.cs` contains
   useful selection mechanics to reuse: active-only, weekly ceiling, max
   concurrent leases, tier/provider filters, utilization sort, and in-flight
@@ -462,7 +452,7 @@ score.
 
 Eligibility and utilization are separate fields.
 
-Credential-only probes (`credential-freshness`, `file-presence`, `none`) can
+Credential-only probes (`file-presence`, `none`) can
 prove that an account is launchable or not launchable. They do not prove spare
 quota. They must never write `five_hour_utilization=0` or
 `seven_day_utilization=0` merely because credentials exist.
@@ -490,7 +480,7 @@ Provider limits are not the same shape:
 - Inception, and GLM/Z.AI when the usage endpoint is unavailable, expose hard
   failures and reset times through active calls, but no successful-call
   percentage.
-- Gemini and Vibe may only expose launchability.
+- Vibe may only expose launchability.
 
 Each mechanism maps to quota_capacity via a fixed, mechanical derivation table
 (ordered — the first matching mechanism sets the calculation):
@@ -503,7 +493,6 @@ Each mechanism maps to quota_capacity via a fixed, mechanical derivation table
 | `deepseek-balance` (`is_available=true`, balance known) | `payg_balance` | `min(1.0, balance / ceiling) * payg_available_multiplier` |
 | `glm-active-probe` (success) | `active_acceptance` | `active_probe_success` bucket |
 | `zai-usage-endpoint` · `glm-active-probe` · `deepseek-balance` (probe failed) | — | lane excluded by cooldown, not scored |
-| `credential-freshness` (present, not expired) | `credential_only` | `credential_only` bucket |
 | `file-presence` · `none` | `credential_only` · `none` | `credential_only` or `none` bucket |
 
 Selection should convert all probe/runtime evidence into a synthetic
@@ -520,7 +509,7 @@ Where:
 
 - `provider_preference_weight` comes from `provider_weights` or the
   `preference_order` fallback. This is the steering knob for "favor GLM, then
-  Claude, then Codex, then DeepSeek, then Gemini, then Vibe".
+  Claude, then Codex, then DeepSeek, then Vibe".
 - `quota_capacity` is `1.0 - max(five_hour_utilization, seven_day_utilization)`
   when utilization is known. GLM/Z.AI Coding Plan should use real utilization
   from `zai-usage-endpoint`; only fallback active-probe success uses the
@@ -693,7 +682,7 @@ This is load-bearing.
 
 Provider sessions live under provider account homes. A Codex session created
 with `CODEX_HOME=/home/me/.codex-account2` may not be resumable from the default
-`CODEX_HOME`. The same applies to Claude config dirs and Gemini homes.
+`CODEX_HOME`. The same applies to Claude config dirs.
 
 `acquire_drone` must persist:
 
@@ -780,7 +769,6 @@ pub fn acquire_drone(
 // Probe implementations — one per mechanism.
 fn probe_claude_rate_limit(account: &str) -> Result<ProbeRecord>;
 fn probe_codex_usage(account: &str) -> Result<ProbeRecord>;
-fn probe_gemini_credential(account: &str) -> Result<ProbeRecord>;
 fn probe_zai_usage(account: &str) -> Result<ProbeRecord>;
 fn probe_glm_active(account: &str, model: &str) -> Result<ProbeRecord>;
 fn probe_deepseek_balance(account: &str) -> Result<ProbeRecord>;
@@ -833,7 +821,6 @@ Tests:
   checks failed
 - runtime `RateLimit` updates account utilization/exhaustion after a task
 - runtime `UsageUpdate` and `Completed.Metrics` update session accounting
-- Gemini expired credential marks account non-selectable
 
 ## 11. Open questions
 

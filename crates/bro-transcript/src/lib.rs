@@ -5,7 +5,7 @@
 //! `parse_codex_line`, …) via `src/index/*`; the `bro` cockpit's `bro tail`
 //! reader uses the rich API (`TranscriptEvent`, `*_rich` functions). Each
 //! consumer sees the other half as dead, so dead-code is allowed crate-wide.
-//! The per-provider parsers (codex/copilot/vibe/gemini) are NOT §4 dead code —
+//! The per-provider parsers (codex/copilot/vibe) are NOT §4 dead code:
 //! the daemon still indexes historical transcripts of formerly-dispatched
 //! providers, and `bro tail` still renders them.
 #![allow(dead_code)]
@@ -249,25 +249,6 @@ pub fn extract_tool_target(tool_name: &str, input: &Value) -> String {
         }
     }
     String::new()
-}
-
-/// Split Gemini assistant content on inlined `[Thought: true]` / `[Thought:true]`
-/// reasoning markers. Each segment before a marker is a thought; the final
-/// segment (after the last marker, or the whole string if no markers) is the
-/// answer. Returns at least one segment.
-fn split_gemini_thought_segments(content: &str) -> Vec<&str> {
-    let mut parts = Vec::new();
-    let mut rest = content;
-    while let Some(start) = rest.find("[Thought:") {
-        if let Some(close_rel) = rest[start..].find(']') {
-            parts.push(&rest[..start]);
-            rest = &rest[start + close_rel + 1..];
-        } else {
-            break;
-        }
-    }
-    parts.push(rest);
-    parts
 }
 
 fn oneline_snippet(s: &str, max_chars: usize) -> String {
@@ -1043,170 +1024,6 @@ pub fn parse_vibe_line_rich(line: &str, session_id: &str) -> Vec<TranscriptEvent
     }
 }
 
-// ── Rich parser: Gemini chat JSON (single-object, not JSONL) ────────
-
-/// Parse a full Gemini chat-session JSON file. Gemini stores sessions as
-/// pretty-printed JSON objects under `~/.gemini/tmp/<project>/chats/`
-/// rather than JSONL; callers re-invoke this on file mtime change and
-/// filter out already-rendered messages by `id`.
-pub fn parse_gemini_file_rich(raw: &str) -> Vec<TranscriptEvent> {
-    let v: Value = match serde_json::from_str(raw) {
-        Ok(v) => v,
-        Err(_) => return vec![],
-    };
-    let session_id = v["sessionId"].as_str().unwrap_or("").to_string();
-    let messages = match v["messages"].as_array() {
-        Some(m) => m,
-        None => return vec![],
-    };
-    let mut out = Vec::new();
-    for msg in messages {
-        let timestamp = msg["timestamp"].as_str().map(String::from);
-        let msg_id = msg["id"].as_str().unwrap_or("").to_string();
-        let base = RichBase {
-            session_id: session_id.clone(),
-            timestamp,
-            git_branch: None,
-            is_subagent: false,
-            agent_slug: None,
-            cwd: None,
-            parent_tool_use_id: Some(msg_id),
-        };
-        let msg_type = msg["type"].as_str().unwrap_or("");
-        match msg_type {
-            "user" => {
-                // content is either a string or an array of { text }
-                if let Some(s) = msg["content"].as_str() {
-                    if !s.is_empty() {
-                        out.push(make_rich(
-                            MessageRole::User,
-                            EventDetail::Text { text: s.into() },
-                            &base,
-                        ));
-                    }
-                } else if let Some(arr) = msg["content"].as_array() {
-                    for block in arr {
-                        if let Some(text) = block["text"].as_str()
-                            && !text.is_empty()
-                        {
-                            out.push(make_rich(
-                                MessageRole::User,
-                                EventDetail::Text { text: text.into() },
-                                &base,
-                            ));
-                        }
-                    }
-                }
-            }
-            "gemini" => {
-                // Thoughts (reasoning) first, then content, then any tool calls.
-                if let Some(thoughts) = msg["thoughts"].as_array() {
-                    for t in thoughts {
-                        let subject = t["subject"].as_str().unwrap_or("");
-                        let description = t["description"].as_str().unwrap_or("");
-                        let text = if subject.is_empty() {
-                            description.to_string()
-                        } else {
-                            format!("{subject}\n{description}")
-                        };
-                        if !text.is_empty() {
-                            out.push(make_rich(
-                                MessageRole::Thinking,
-                                EventDetail::Thinking { text },
-                                &base,
-                            ));
-                        }
-                    }
-                }
-                if let Some(s) = msg["content"].as_str()
-                    && !s.is_empty()
-                {
-                    // Gemini sometimes inlines reasoning into `content`
-                    // delimited by `[Thought: true]` markers: each
-                    // segment before a marker is a thought, and anything
-                    // after the final marker is the assistant's answer.
-                    let segments = split_gemini_thought_segments(s);
-                    let last = segments.len().saturating_sub(1);
-                    for (i, seg) in segments.iter().enumerate() {
-                        let trimmed = seg.trim();
-                        if trimmed.is_empty() {
-                            continue;
-                        }
-                        if i == last {
-                            out.push(make_rich(
-                                MessageRole::Assistant,
-                                EventDetail::Text {
-                                    text: trimmed.into(),
-                                },
-                                &base,
-                            ));
-                        } else {
-                            out.push(make_rich(
-                                MessageRole::Thinking,
-                                EventDetail::Thinking {
-                                    text: trimmed.into(),
-                                },
-                                &base,
-                            ));
-                        }
-                    }
-                }
-                // Gemini packs call + result together: each toolCalls entry has
-                // id/name/args plus a result[].functionResponse.response blob
-                // and a status (success|error|cancelled). Emit a ToolUse/
-                // ToolResult pair per call so counters and tail rendering match
-                // the other providers.
-                if let Some(calls) = msg["toolCalls"].as_array() {
-                    for call in calls {
-                        let name = call["name"].as_str().unwrap_or("unknown").to_string();
-                        let tool_use_id = call["id"].as_str().map(String::from);
-                        let input = call["args"].clone();
-                        let target = extract_tool_target(&name, &input);
-                        out.push(make_rich(
-                            MessageRole::ToolUse,
-                            EventDetail::ToolUse {
-                                name: name.clone(),
-                                target,
-                                tool_use_id: tool_use_id.clone(),
-                                input,
-                            },
-                            &base,
-                        ));
-                        let status = call["status"].as_str().unwrap_or("success");
-                        let is_error = status != "success";
-                        let response = call["result"][0]["functionResponse"]["response"].clone();
-                        let output = if let Some(s) = response["output"].as_str() {
-                            s.to_string()
-                        } else if let Some(s) = response["error"].as_str() {
-                            s.to_string()
-                        } else if response.is_null() {
-                            String::new()
-                        } else {
-                            response.to_string()
-                        };
-                        let size = output.len();
-                        let preview = oneline_snippet(&output, 200);
-                        let exit_code = extract_exit_code(&output);
-                        out.push(make_rich(
-                            MessageRole::ToolResult,
-                            EventDetail::ToolResult {
-                                tool_use_id: tool_use_id.unwrap_or_else(|| "?".into()),
-                                is_error,
-                                exit_code,
-                                size,
-                                preview,
-                            },
-                            &base,
-                        ));
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    out
-}
-
 /// Parse a single JSONL line into zero or more searchable events.
 pub fn parse_transcript_line(line: &str) -> Vec<ParsedEvent> {
     let v: Value = match serde_json::from_str(line) {
@@ -1764,66 +1581,6 @@ mod tests {
     }
 
     #[test]
-    fn test_rich_gemini_thoughts_to_thinking() {
-        let raw = json!({
-            "sessionId": "g1",
-            "messages": [
-                {
-                    "id": "m1",
-                    "timestamp": "t",
-                    "type": "gemini",
-                    "content": "final answer",
-                    "thoughts": [
-                        {"subject": "Step 1", "description": "Considering options"}
-                    ]
-                }
-            ]
-        })
-        .to_string();
-        let events = parse_gemini_file_rich(&raw);
-        assert_eq!(events.len(), 2);
-        assert!(matches!(events[0].detail, EventDetail::Thinking { .. }));
-        assert!(matches!(events[1].detail, EventDetail::Text { .. }));
-    }
-
-    #[test]
-    fn test_rich_gemini_inline_thoughts() {
-        let raw = json!({
-            "sessionId": "g1",
-            "messages": [{
-                "id": "m1",
-                "timestamp": "t",
-                "type": "gemini",
-                "content": "**Step 1** thinking about problem[Thought: true]**Step 2** more thinking[Thought:true]Here is the final answer."
-            }]
-        }).to_string();
-        let events = parse_gemini_file_rich(&raw);
-        assert_eq!(events.len(), 3);
-        assert!(matches!(events[0].detail, EventDetail::Thinking { .. }));
-        assert!(matches!(events[1].detail, EventDetail::Thinking { .. }));
-        match &events[2].detail {
-            EventDetail::Text { text } => assert_eq!(text, "Here is the final answer."),
-            _ => panic!("expected trailing Text"),
-        }
-    }
-
-    #[test]
-    fn test_rich_gemini_no_inline_thoughts() {
-        // Plain content with no markers should still produce a single Text event.
-        let raw = json!({
-            "sessionId": "g1",
-            "messages": [{
-                "id": "m1", "timestamp": "t", "type": "gemini",
-                "content": "just the answer"
-            }]
-        })
-        .to_string();
-        let events = parse_gemini_file_rich(&raw);
-        assert_eq!(events.len(), 1);
-        assert!(matches!(events[0].detail, EventDetail::Text { .. }));
-    }
-
-    #[test]
     fn claude_tool_use_preserves_tool_call_payload() {
         let line = serde_json::json!({
             "type": "assistant",
@@ -1872,73 +1629,6 @@ mod tests {
         assert_eq!(tool_call.kind, ToolCallKind::Bash);
         assert_eq!(tool_call.tool_use_id.as_deref(), Some("call_1"));
         assert_eq!(tool_call_command(tool_call), Some("cargo test"));
-    }
-
-    #[test]
-    fn test_rich_gemini_tool_calls() {
-        let raw = json!({
-            "sessionId": "g1",
-            "messages": [{
-                "id": "m1",
-                "timestamp": "t",
-                "type": "gemini",
-                "content": "",
-                "toolCalls": [
-                    {
-                        "id": "c1",
-                        "name": "read_file",
-                        "args": {"path": "foo.rs"},
-                        "status": "success",
-                        "result": [{"functionResponse": {"response": {"output": "file contents"}}}]
-                    },
-                    {
-                        "id": "c2",
-                        "name": "read_file",
-                        "args": {"path": "nope.rs"},
-                        "status": "error",
-                        "result": [{"functionResponse": {"response": {"error": "File not found"}}}]
-                    }
-                ]
-            }]
-        })
-        .to_string();
-        let events = parse_gemini_file_rich(&raw);
-        assert_eq!(events.len(), 4);
-        match &events[0].detail {
-            EventDetail::ToolUse {
-                name,
-                target,
-                tool_use_id,
-                ..
-            } => {
-                assert_eq!(name, "read_file");
-                assert_eq!(target, "foo.rs");
-                assert_eq!(tool_use_id.as_deref(), Some("c1"));
-            }
-            _ => panic!("expected ToolUse"),
-        }
-        match &events[1].detail {
-            EventDetail::ToolResult {
-                is_error,
-                preview,
-                tool_use_id,
-                ..
-            } => {
-                assert!(!is_error);
-                assert_eq!(preview, "file contents");
-                assert_eq!(tool_use_id, "c1");
-            }
-            _ => panic!("expected ToolResult"),
-        }
-        match &events[3].detail {
-            EventDetail::ToolResult {
-                is_error, preview, ..
-            } => {
-                assert!(is_error);
-                assert_eq!(preview, "File not found");
-            }
-            _ => panic!("expected error ToolResult"),
-        }
     }
 
     #[test]

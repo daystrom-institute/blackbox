@@ -51,7 +51,7 @@ mod tests {
         for (id, selected_session, source) in [
             ("original", session.as_str(), "codex"),
             ("other-session", "other-session", "codex"),
-            ("other-source", session.as_str(), "gemini"),
+            ("other-source", session.as_str(), "claude"),
             ("retained-source", session.as_str(), "slack"),
         ] {
             let mut doc = TantivyDocument::new();

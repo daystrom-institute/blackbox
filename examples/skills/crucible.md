@@ -6,7 +6,7 @@ argument-hint: <task description>
 
 # Crucible — Orchestrator + Continuous Ensemble + Durable Implementer
 
-Substantial implementation work, coordinated by the main-session orchestrator through a **bbox work-item thread**, reviewed by a **continuous red-team ensemble** (codex + gemini by default, with sustained per-member context across rounds), executed by a **durable implementer bro** (Opus 4.7 xhigh, context compartmentalizer held across rounds via `bro_resume`).
+Substantial implementation work, coordinated by the main-session orchestrator through a **bbox work-item thread**, reviewed by a **continuous red-team ensemble** (codex + glm by default, with sustained per-member context across rounds), executed by a **durable implementer bro** (Opus 4.7 xhigh, context compartmentalizer held across rounds via `bro_resume`).
 
 **Why this exists:** main-session context is finite and gets compacted. The implementer is a separate durable session that holds dense mechanical code context and survives your compactions. You keep orchestration, ensemble deliberation, and user dialogue in main; it keeps line numbers, call-site maps, and test-infra coupling. That's the whole point — compartmentalization, not delegation.
 
@@ -82,13 +82,13 @@ Concrete plan: files to touch, functions to add/change, new types, migration ord
 
 ### 2b. Choose the ensemble (once per crucible)
 
-Default ensemble = two reviewer brofiles, one codex and one gemini (for example `red-team-codex` and `red-team-gemini`). List what exists first:
+Default ensemble = two reviewer brofiles, one codex and one glm (for example `red-team-codex` and `red-team-glm`). List what exists first:
 
 ```
 bro_brofile(action="list")
 ```
 
-…or dispatch ad hoc with `provider=`. Minimum viable is two cross-provider voices; three is better if Gemini's available and the topic has architectural weight.
+…or dispatch ad hoc with `provider=`. Minimum viable is two cross-provider voices; three is better when the topic has architectural weight (add a third provider such as kimi or deepseek, checked with `bro_providers`).
 
 ### 2c. Brief the ensemble (first round: carries problem space)
 
@@ -143,7 +143,7 @@ bro_when_all(task_ids=[<member taskIds>], timeout_seconds=600)
 Read each member's final answer from the join (`bro_status(task_id, tail=N)` if one is truncated), then record the round on the thread:
 
 ```
-bbox_thread(action="continue", id=<thread_id>, note="Plan round 1: codex <verdict>, gemini <verdict>; disputes: <...>")
+bbox_thread(action="continue", id=<thread_id>, note="Plan round 1: codex <verdict>, glm <verdict>; disputes: <...>")
 ```
 
 Classify findings: agreed / majority / minority / contradictory. Revise plan incorporating agreed+majority concerns. Reject minorities only with concrete evidence — cite it. When two reviewers contradict, pick the side with stronger evidence and note the dissent for the round-2 prompt.
@@ -157,11 +157,11 @@ ROUND 2 — plan revision.
 
 Round 1:
 - codex said: "<quote>"
-- gemini said: "<quote>"
+- glm said: "<quote>"
 
 Revised plan addresses <X> and <Y>. Unresolved: <Z>.
 Codex: <pointed question on Z>
-Gemini: <pointed question on Z>
+GLM: <pointed question on Z>
 
 Same verdict format. Under 150 words.
 ```

@@ -113,7 +113,7 @@ events) ages out. Resuming a 7-day-old session works; querying its
 historical task status doesn't.
 
 **Provider-side session storage outlives bbox TaskStore.** Provider
-session histories (Claude / Codex / Gemini all persist their own
+session histories (Claude / Codex both persist their own
 session content) live by the provider's policy, typically much
 longer than 24h. The session_id remains valid until the provider
 GCs it.
@@ -1010,8 +1010,7 @@ the dispatcher selecting based on caller provider:
 ```json
 "brofile_refs_by_provider": {
   "claude": "code-reviewer-claude",
-  "codex": "code-reviewer-codex",
-  "gemini": "code-reviewer-gemini"
+  "codex": "code-reviewer-codex"
 }
 ```
 

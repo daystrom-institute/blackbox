@@ -25,8 +25,7 @@ axes → evidence. (Finding *new* axes is a different job — see
 - `VERSION` — the exact version being mined (e.g. `2.1.160`).
 - `SOURCE` — where to mine: a source repo path (open source) or a binary path
   (compiled). State which.
-- `CONFIG` — the CLI's config dir, if any (e.g. `~/.claude`, `~/.gemini`,
-  `~/.vibe`).
+- `CONFIG` — the CLI's config dir, if any (e.g. `~/.claude`, `~/.vibe`).
 
 ## Step 0 — tool surface (read this first)
 

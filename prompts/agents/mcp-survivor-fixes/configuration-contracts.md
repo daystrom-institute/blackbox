@@ -17,7 +17,7 @@ Owned implementation: src/tools/roster.rs (brofile/account branches only); src/t
 
 Invalid scope in bro_brofile list returns normal results; get ignores scope. bro_mcp list ignores its scope, sync has FANOUT_PROVIDERS=[], and stdio add advertises a path that then points at retired provider CLIs.
 - Validate closed scope/action vocabularies and action-specific required fields. Make requested store selection effective for list/get or explicitly reject unsupported combinations. Do not widen typos to effective/global lookup.
-- State actual config owner/prerequisites and supported transport lanes. Remove obsolete provider/Gemini/CLI guidance. A destination-free sync must return an honest unsupported/retired outcome without resolving secrets or pretending to synchronize.
+- State actual config owner/prerequisites and supported transport lanes. Remove obsolete provider/CLI guidance. A destination-free sync must return an honest unsupported/retired outcome without resolving secrets or pretending to synchronize.
 - Bound account inventories and large brofile/config detail. Supply exact recovery after redaction, with selector/content-bound cursors and useful presence/identity summaries.
 - Add synthetic sentinel tests for env, headers, endpoint credentials, nested config, errors, and text/structured/debug views. Preserve safe identity and presence fields; do not blindly redact ordinary prose.
 - Test scope parity, unknown scope, ignored fields, no-op sync, large inventories, full redacted reconstruction, and existing valid config operations.

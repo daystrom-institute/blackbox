@@ -240,8 +240,7 @@ ordering rule live in
 The dispatch plane contains zero provider CLIs; providers dispatch
 through the standalone `bro-harness` binary. The code-owned catalog in
 `crates/bro-core/src/provider.rs` is the authority: `claude` survives
-only as a serde alias to `glm`, `codex` as an alias to `brodex`, and
-the Gemini lane is removed. See
+only as a serde alias to `glm` and `codex` as an alias to `brodex`. See
 [Provider & Agent Surfaces](../PROJECT.md#provider--agent-surfaces)
 rather than re-inventorying providers here.
 

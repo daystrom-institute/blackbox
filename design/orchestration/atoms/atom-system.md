@@ -60,7 +60,7 @@ explain from outside the source tree: a brofile is the persona/runtime lens,
 while an agent is the typed JSON wrapper around one.
 
 There is also a provider-language collision. "Spin up an agent" means different
-things to Claude, Codex, Gemini, and bbox. A caller may interpret it as a
+things to Claude, Codex, and bbox. A caller may interpret it as a
 native Claude subagent, a Codex worker, an AgentTool call, or a bbox dispatch.
 "Spin up a bro" is intentionally weird, but unambiguous: bbox should create a
 runtime worker.

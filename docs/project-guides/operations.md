@@ -44,7 +44,7 @@ Important state/config env vars:
 - Index/transcripts: `TRANSCRIPT_SEARCH_ROOTS`,
   `TRANSCRIPT_SEARCH_CODEX_ROOT`, `TRANSCRIPT_SEARCH_INDEX_PATH`,
   `BLACKBOX_REINDEX_INTERVAL_SECS`
-  `VIBE_BIN`, `GEMINI_BIN`, `BRO_EXTRA_PATH`, `VIBE_SESSION_DIR`
+  `VIBE_BIN`, `BRO_EXTRA_PATH`, `VIBE_SESSION_DIR`
 
 Legacy aliases should not be revived unless the code explicitly still accepts
 them.

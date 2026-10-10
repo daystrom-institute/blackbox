@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -80,13 +79,9 @@ pub(crate) fn format_progress_snapshot(tasks: &[Arc<orch::Task>]) -> (String, bo
 
 /// Load the effective tool filter set for a dispatch (global + project
 /// overlay + default recursion guard unless `allow_recursion`), then
-/// translate to provider-specific CLI args. For Gemini, also writes a
-/// per-dispatch policy file and returns the path so the caller can
-/// clean it up after the child exits.
+/// translate to provider-specific CLI args.
 pub(crate) struct DispatchFilters {
     pub(crate) args: Vec<String>,
-    /// Tempfile path for Gemini policy cleanup; None for other providers.
-    pub(crate) policy_file: Option<PathBuf>,
     pub(crate) filters: orchestration::mcp::McpFilters,
 }
 
@@ -171,40 +166,11 @@ pub(crate) fn resolve_dispatch_filters(
     }
 
     let args = provider.build_filter_args(&eff.filters);
-    let policy_file = None;
 
     Ok(DispatchFilters {
         args,
-        policy_file,
         filters: eff.filters,
     })
-}
-
-/// Delete a Gemini policy tempfile once the associated task reaches a
-/// terminal state. Spawned as a detached tokio task from the dispatch
-/// path. No-op if path is None.
-pub(crate) fn cleanup_policy_file_when_done(
-    task: std::sync::Arc<orch::Task>,
-    path: Option<PathBuf>,
-) {
-    let Some(path) = path else { return };
-    tokio::spawn(async move {
-        loop {
-            {
-                let inner = task.inner.lock();
-                if inner.status.is_terminal() {
-                    break;
-                }
-            }
-            tokio::select! {
-                _ = task.notify.notified() => {}
-                _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
-            }
-        }
-        if let Err(e) = std::fs::remove_file(&path) {
-            tracing::debug!("gemini policy cleanup {}: {e}", path.display());
-        }
-    });
 }
 
 /// Single-flight admission for a resume of `(provider, session_id)`.

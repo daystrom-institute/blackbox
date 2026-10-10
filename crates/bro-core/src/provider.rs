@@ -67,9 +67,8 @@ pub enum Provider {
 /// Mirrors daystrom's `CapabilityTag` shape (see
 /// `daystrom-mk2/src/Daystrom.AgentSdk/Providers/IAgentProvider.cs`)
 /// — the lesson there was that silent fallback when a provider
-/// can't honor a feature flag (Gemini's structured output story)
-/// caused multi-hour debugging sessions. Hard error at compile time
-/// is the right call.
+/// can't honor a feature flag caused multi-hour debugging sessions.
+/// Hard error at compile time is the right call.
 #[derive(
     Debug,
     Clone,
@@ -86,8 +85,7 @@ pub enum Provider {
 #[strum(serialize_all = "snake_case")]
 pub enum Capability {
     /// Native JSON-schema-backed structured output. Codex
-    /// (--output-schema), Claude (extension-passed schema). Gemini
-    /// CLI does NOT (per daystrom GeminiProvider.cs:49).
+    /// (--output-schema), Claude (extension-passed schema).
     StructuredOutput,
     /// Image input (vision).
     Vision,

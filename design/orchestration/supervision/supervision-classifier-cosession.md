@@ -226,6 +226,6 @@ bounded snapshot. Stateful classifier sessions are optional and should be an
 explicit cost/quality choice, not the default.
 
 Current provider capability tags matter. In current code only Claude and Codex
-advertise `structured_output`; GLM, DeepSeek, Inception, Gemini, and Vibe are
+advertise `structured_output`; GLM, DeepSeek, Inception, and Vibe are
 not eligible for a classifier atom that hard-requires structured output unless
 their capability tags or the atom's contract change.

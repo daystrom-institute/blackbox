@@ -2198,7 +2198,7 @@ impl TaskStore {
 // layer rendered from `tool_docs` into the global memory files.
 
 // Text recursion guard retired 2026-04-17. Every dispatch-capable
-// provider (Claude, Copilot, Codex, Gemini) now has a mechanical tool
+// provider (Claude, Copilot, Codex) now has a mechanical tool
 // filter applied at argv construction time. Vibe has no MCP at all, so
 // no bro_* tools reach it to recurse through.
 //

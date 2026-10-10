@@ -4967,6 +4967,118 @@ mod tests {
         assert_eq!(doc_type_count(&index, "transcript"), 3);
     }
 
+    /// Rows stored under a source label with no registered adapter (here a
+    /// stored `gemini` session) stay readable, because every read surface
+    /// treats `source` as a plain string. The adapter registry no longer
+    /// scans their file, so the next pass purges them by path together with
+    /// their freshness rows, even while the file itself remains on disk.
+    #[test]
+    fn rows_from_an_unregistered_source_stay_readable_and_purge_on_the_next_pass() {
+        use tantivy::collector::Count;
+        use tantivy::query::TermQuery;
+        use tantivy::schema::{IndexRecordOption, Term};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let index = test_index(&root);
+        let fields = index.field_handles();
+        let stored_source = "gemini";
+        let chats = root.join("chat-tmp").join("proj").join("chats");
+        std::fs::create_dir_all(&chats).unwrap();
+        let chat = chats.join("session-0001.json");
+        std::fs::write(
+            &chat,
+            r#"{"sessionId":"unregistered-session","messages":[]}"#,
+        )
+        .unwrap();
+        let chat_path = chat.to_string_lossy().to_string();
+        {
+            let mut writer = index.index_handle().writer(15_000_000).unwrap();
+            for offset in 0..2u64 {
+                let mut doc = tantivy::TantivyDocument::new();
+                doc.add_text(fields.doc_type, "transcript");
+                doc.add_text(fields.source, stored_source);
+                doc.add_text(fields.account, stored_source);
+                doc.add_text(fields.session_id, "unregistered-session");
+                doc.add_text(fields.file_path, &chat_path);
+                doc.add_text(fields.role, "user");
+                doc.add_text(fields.timestamp, "2026-09-01T00:00:00Z");
+                doc.add_text(fields.content, "unregisteredsourceneedle");
+                doc.add_u64(fields.byte_offset, offset);
+                doc.add_u64(fields.is_subagent, 0);
+                writer.add_document(doc).unwrap();
+            }
+            writer.commit().unwrap();
+        }
+        index.reader_reload_for_test();
+        let meta: HashMap<String, super::super::FileMeta> = [(
+            chat_path.clone(),
+            super::super::FileMeta {
+                mtime: 1,
+                size: 1,
+                mat_version: None,
+                source: super::super::FileMetaSource::LegacyFilesystem,
+            },
+        )]
+        .into_iter()
+        .collect();
+        bbox_corpus_index::index::passes::save_meta(&index.reindex_config().meta_path, &meta)
+            .unwrap();
+
+        assert!(search(&index, "unregisteredsourceneedle").contains("unregistered-session"));
+        let sessions: serde_json::Value = serde_json::from_str(
+            &index
+                .sessions_list(
+                    &serde_json::from_value(serde_json::json!({"source": stored_source})).unwrap(),
+                    None,
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            sessions.to_string().contains("unregistered-session"),
+            "{sessions}"
+        );
+        let messages: serde_json::Value = serde_json::from_str(
+            &index
+                .messages(
+                    &serde_json::from_value(
+                        serde_json::json!({"session_id": "unregistered-session"}),
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(messages["total_matching_messages"], 2);
+
+        let source_rows = |index: &TranscriptIndex| {
+            index.reader_reload_for_test();
+            index
+                .searcher()
+                .search(
+                    &TermQuery::new(
+                        Term::from_field_text(fields.source, stored_source),
+                        IndexRecordOption::Basic,
+                    ),
+                    &Count,
+                )
+                .unwrap()
+        };
+        assert_eq!(source_rows(&index), 2);
+
+        let actor = IndexWriterActor::spawn_for(&index);
+        actor.run_reindex_pass(false, false).unwrap();
+        assert_eq!(source_rows(&index), 0);
+        assert!(
+            !bbox_corpus_index::index::passes::load_meta(&index.reindex_config().meta_path)
+                .unwrap()
+                .contains_key(&chat_path),
+            "the purged file's freshness row must go with its documents"
+        );
+        assert!(chat.exists(), "purge never touches the source file");
+    }
+
     #[test]
     fn scope_replace_preserves_globals_and_unrelated_projects() {
         let dir = tempfile::tempdir().unwrap();

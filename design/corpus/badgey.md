@@ -29,7 +29,7 @@ it, and even warm providers re-pay the discovery cost every session.
 
 Badgey is the embodied protocol. A long-lived MCP-addressable agent
 identity — exec once, resume for an hour or a day — that hides the
-graph-nav loop behind a handoff. Outside callers (Codex, Gemini, or a cold
+graph-nav loop behind a handoff. Outside callers (Codex or a cold
 Claude session) reach into the corpus through one of three modes: answer,
 teach, or scout. The scout returns evidence bundles. The teacher returns
 worked walkthroughs anchored on the caller's actual current corpus. The
@@ -56,7 +56,7 @@ Badgey solves a different problem:
    building on its own intermediate results cannot be encoded as a tool
    description.
 2. **Cross-provider parity.** `CLAUDE.md` rendering reaches Claude only.
-   Codex and Gemini cannot consume rendered Claude memory; they only see
+   Codex cannot consume rendered Claude memory; it only sees
    MCP tool descriptions. Sharper descriptions help, but they don't carry
    the worked-example density that an agent loaded with the design doc
    does in teach mode.
@@ -108,7 +108,7 @@ turns. Therefore:
 ### 2.1 Layering
 
 ```
-caller LLM (Claude / Codex / Gemini)
+caller LLM (Claude / Codex)
    │
    ▼  (MCP transport)
 bbox daemon
@@ -1500,7 +1500,7 @@ Non-goals:
    by the wrapper's scout dispatcher (NOT the brofile prompt).
 8. **Compaction interception reliability.** §8.1 says emissions are
    mirrored to durable store before provider compaction. Is this
-   reliable across providers (Claude / Codex / Gemini all compact at
+   reliable across providers (Claude / Codex both compact at
    different points)? Bias: rely on bbox-side write happening before
    the next turn boundary; use turn-boundary as the compaction-safe
    point.

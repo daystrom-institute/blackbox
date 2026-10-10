@@ -11,8 +11,8 @@
 //! plus an async fetch. `refresh_account_probes` runs them all and merges the
 //! results into the store, keyed by the same `lane_key` the allocator scores on.
 //!
-//! NOT yet implemented: Gemini credential-freshness, and transcript-usage
-//! enrichment between probes (the `last_runtime_observation_at` fusion).
+//! NOT yet implemented: transcript-usage enrichment between probes (the
+//! `last_runtime_observation_at` fusion).
 
 use std::path::Path;
 use std::time::Duration;

@@ -1,5 +1,5 @@
 ---
-title: "Provider Transcript Read Plane: Phase 4-8 Implementation Notes"
+title: "Provider Transcript Read Plane: Phase 5-8 Implementation Notes"
 kind: design
 lifecycle: archived
 corpus: blackbox-design
@@ -8,117 +8,15 @@ topic:
   - provider-transcripts
 ---
 
-# Provider Transcript Read Plane: Phase 4-8 Implementation Notes
+# Provider Transcript Read Plane: Phase 5-8 Implementation Notes
 
 Date: 2026-05-12
 Author: readplane-impl::glm (task 30de744d)
 Status: implemented follow-up notes archived after `c3022b5`
 Companion to: `design/surfaces/provider-transcripts/provider-transcript-read-plane-impl.md`
 
-Concrete codebase audit of every provider surface that Phases 4-8 depend on.
+Concrete codebase audit of every provider surface that Phases 5-8 depend on.
 Findings are keyed by phase with file:line references to the actual code.
-
----
-
-## Phase 4: Gemini JSON-File Adapter and Indexing
-
-### Surfaces that exist
-
-| Surface | Location | Notes |
-|---------|----------|-------|
-| `parse_gemini_file_rich` | `parser.rs:1022` | Full-file JSON parser → `Vec<TranscriptEvent>`. Handles `user`, `gemini` message types with thoughts, inline `[Thought: true]` segments, and `toolCalls[]`. |
-| `TranscriptEvent::to_parsed()` | `parser.rs:129` | Projects rich event → `Option<ParsedEvent>`. SystemSignal filtered out. |
-| `build_transcript_doc` | `reindex.rs:494` | `ParsedEvent` → `TantivyDocument`. Does NOT write `entity_id`. |
-| `entity_id` field in schema | `index/mod.rs:92,624` | `STRING | STORED` field exists but unused for transcript docs. |
-| `discover_gemini_session` | `providers.rs:1503` | Walks `~/.gemini/tmp/` for session by start_ms + project_dir + optional task_id. |
-| `discover_gemini_session_in` | `providers.rs:1512` | Testable variant with explicit tmp_root. |
-| `resolve_gemini_session_cwd` | `providers.rs:1641` | Reads `.project_root` file next to session JSON. |
-| `resolve_gemini_session_cwd_in` | `providers.rs:1785` | Testable variant. |
-| `find_session_file` (Gemini) | `helpers.rs:88-113` | WalkDir depth-4 scan of `~/.gemini/tmp/` matching `session-*-{first8}.json`. |
-| `infer_provider_from_path` | `bro_helpers.rs:139` | Matches `/.gemini/tmp/` in path string. |
-| Gemini tests | `parser.rs:1726-1837` | 4 tests: thoughts, inline thoughts, no inline thoughts, tool calls. |
-| Gemini discovery tests | `providers.rs:3110-3247` | 7 tests covering cwd resolution, prefix collision, short ID rejection, project/task matching. |
-
-### Blocker: entity_id not populated for transcripts
-
-`build_transcript_doc` (reindex.rs:494-531) never writes `entity_id`. The field
-exists in the schema (`FieldHandles.entity_id`) and is used by project_file docs
-but transcript docs leave it empty. For Gemini, where every event in a file
-shares `byte_offset=0`, entity_id is the only stable identity.
-
-**Required Phase 0 change:** Extend `build_transcript_doc` (or the adapter's
-projection helper) to accept and write an optional `entity_id` parameter. The
-current function signature is:
-
-```rust
-pub(crate) fn build_transcript_doc(
-    event: &parser::ParsedEvent,
-    account: &str,
-    file_path: &str,
-    byte_offset: u64,
-    is_subagent: bool,
-    project_fallback: &str,
-    f: FieldHandles,
-) -> TantivyDocument
-```
-
-Needs an `entity_id: Option<&str>` parameter. Claude/Codex callers pass `None`
-for backward compatibility; Gemini callers pass
-`Some("gemini:<session_id>:<message_id>:<event_idx>")`.
-
-### Blocker: no Gemini reindex scan
-
-`scan_source_files` (reindex.rs:121) only walks Claude `projects/` and Codex
-`sessions/` directories. No Gemini scan exists. The function needs a new arm:
-
-```text
-if gemini_root exists:
-    scan Gemini JSON files under ~/.gemini/tmp/
-```
-
-This requires `ReindexConfig` to gain a `gemini_root: Option<PathBuf>` field
-(similar to `codex_root`). The root is always `~/.gemini/tmp/`.
-
-### Blocker: no bulk Gemini indexing function
-
-There is no `index_gemini_directory_standalone` equivalent. Needs writing, but
-the shape is clear from existing `index_directory_standalone` (reindex.rs:550):
-
-1. Walk `~/.gemini/tmp/` for `session-*.json` files
-2. Skip unchanged via mtime/size in `_meta.json`
-3. Parse with `parse_gemini_file_rich`
-4. Convert each `TranscriptEvent` to `ParsedEvent` via `to_parsed()`
-5. Build tantivy doc with `entity_id` = `gemini:<sid>:<msg_id>:<idx>`
-6. Set `byte_offset = 0`, `account = "gemini"`
-7. Delete-by-file-path and re-add on change
-
-### No-blocker notes
-
-- **Account label:** Gemini has no multi-account support
-  (`synthesized_account_env_for_home` returns `None` for Gemini, brofile.rs:346).
-  Hardcode `account = "gemini"` in the adapter.
-- **Meta store compatibility:** mtime/size skip works fine for Gemini JSON files.
-  The `_meta.json` keyed by canonical path is sufficient.
-- **CLI seed/poll:** `cli.rs:745` (`seed_gemini`) and `cli.rs:832` (`poll_gemini`)
-  already do full-file re-parse with mtime detection + message-id dedupe. The
-  adapter can reuse the same pattern.
-- **parent_tool_use_id as message identity:** `parse_gemini_file_rich` stores the
-  Gemini message `id` in `TranscriptEvent.parent_tool_use_id` (parser.rs:1043).
-  This is the stable per-message identity the design doc references.
-
-### Gemini session identity chain
-
-The full chain for locating and identifying a Gemini session:
-
-1. Dispatch produces a session UUID (or `pending` if not yet known)
-2. Background discovery (`orchestration/mod.rs:1032-1077`) polls for the file
-3. File lives at `~/.gemini/tmp/<project>/chats/session-<iso>-<first8>.json`
-4. `discover_gemini_session_in` verifies `"sessionId": "<full-uuid>"` in first 256 bytes
-5. `resolve_gemini_session_cwd_in` reads `.project_root` sibling file
-
-The adapter's `locate(session_id)` can reuse step 4-5 via `find_session_file`.
-Session discovery for bulk indexing (enumerate all sessions) needs a new
-directory walker under `~/.gemini/tmp/`.
 
 ---
 
@@ -129,10 +27,7 @@ directory walker under `~/.gemini/tmp/`.
 | Surface | Location | Notes |
 |---------|----------|-------|
 | `file_offset: u64` on `Lane` | `cli.rs:546` | JSONL byte-offset cursor for `bro tail` |
-| `file_mtime: Option<SystemTime>` on `Lane` | `cli.rs:547` | Gemini mtime-based polling cursor |
-| `seen_ids: HashSet<String>` on `Lane` | `cli.rs:548` | Gemini message-id dedupe set |
 | `seed_jsonl` / `poll_jsonl` | `cli.rs:725,789` | In-memory only, lost on process exit |
-| `seed_gemini` / `poll_gemini` | `cli.rs:745,832` | In-memory only |
 | `_meta.json` load/save | `reindex.rs:45-61` | Atomic write via temp+rename pattern |
 | `json_store::atomic_write_json_locked` | Used by notes, knowledge, threads | Reusable pattern |
 
@@ -173,14 +68,8 @@ Based on actual provider storage shapes:
 |----------|-------------|--------|
 | Claude | `ByteOffset(u64)` | Append-only JSONL, byte offset sufficient |
 | Codex | `ByteOffset(u64)` | Same as Claude |
-| Gemini | `MessageIdSet(Vec<String>)` | Full-file re-parse; track seen message IDs |
 | Copilot | `ByteOffset(u64)` | Append-only JSONL |
 | Vibe | `ByteOffset(u64)` | Append-only JSONL |
-
-Note: Gemini cursor is NOT byte-offset. The Gemini adapter must track which
-message IDs have been emitted. The `seen_ids: HashSet<String>` pattern in
-`cli.rs:548` is the proven approach. For persistence, store as a sorted vec of
-seen IDs (or a bloom filter approximation for large sessions).
 
 ### Location fingerprint strategy
 
@@ -238,7 +127,7 @@ This probe must run first. DB candidate paths:
 The adapter should try both and prefer the one containing the target session_id.
 
 
-Unlike Gemini (`discover_gemini_session`) and Vibe (`discover_vibe_session`), there
+Unlike Vibe (`discover_vibe_session`), there
 JSON events).
 
 For the read-plane adapter, session discovery means:
@@ -250,7 +139,7 @@ For the read-plane adapter, session discovery means:
 This is a NEW function that must be written. It can live in the adapter module.
 
 
-`find_session_file` (helpers.rs) handles Claude, Codex, Gemini, Copilot, Vibe
+`find_session_file` (helpers.rs) handles Claude, Codex, Copilot, Vibe
 
 - A SQLite query (not a file path lookup), or
 
@@ -258,7 +147,7 @@ The `BroRosterEntry.jsonl_path` field is `Option<String>` so `None` is valid.
 through the adapter directly, not through `find_session_file`.
 
 
-Same as Gemini — no scan, no bulk index function. Requires:
+No scan, no bulk index function. Requires:
 
 4. Cursor: `SqliteRow { table: "message", timestamp_ms, id }`
 
@@ -417,7 +306,7 @@ Current `TaskInner` (mod.rs:64-102) has no such fields. Adding them requires:
 
 1. New fields on `TaskInner`
 2. Populate at dispatch time (when session_id resolves)
-3. Update on late discovery (Gemini, Vibe post-hoc session discovery)
+3. Update on late discovery (Vibe post-hoc session discovery)
 4. Surface in `task_result_json` for `bro_status`
 
 **Population timing by provider:**
@@ -426,12 +315,11 @@ Current `TaskInner` (mod.rs:64-102) has no such fields. Adding them requires:
 |----------|-----------------------|------------------------|
 | Claude | Immediately (provided) | Dispatch start |
 | Codex | Immediately | Dispatch start |
-| Gemini | Late (background poll, mod.rs:1032) | After discovery |
 | Copilot | Immediately | Dispatch start |
 | Vibe | Late (post-exit, mod.rs:1229) | After process exit |
 
-The late-discovery providers (Gemini, Vibe) already have background discovery
-tasks that update `TaskInner.session_id`. The transcript_location update can
+The late-discovery provider (Vibe) already has a background discovery task
+that updates `TaskInner.session_id`. The transcript_location update can
 piggyback on the same discovery resolution.
 
 ### Integration: bro_status surface
@@ -474,24 +362,6 @@ for attempt in 0..3 {
 }
 ```
 
-### Integration: late Gemini session discovery
-
-The existing background discovery at mod.rs:1032-1077 updates `TaskInner.session_id`
-when the Gemini session file appears. The transcript_location update should be
-added in the same callback:
-
-```rust
-if let Some(sid) = providers::discover_gemini_session(start, &cwd) {
-    let mut inner = task_ref_wait.inner.lock();
-    inner.session_id = sid.clone();
-    // NEW: populate transcript_location
-    inner.transcript_location = Some(TranscriptLocation::JsonFile {
-        path: find_session_file(&sid, &config.roots, codex_root),
-        account: "gemini".into(),
-    });
-}
-```
-
 ---
 
 ## Cross-Phase Dependencies
@@ -501,10 +371,9 @@ Phase 0 (types + trait + projection)
   ├── Phase 1 (Claude/Codex adapters)
   │     └── Phase 2 (reindex routing)
   │           └── Phase 3 (unified lookup)
-  │                 ├── Phase 4 (Gemini)     ← needs entity_id in build_transcript_doc
-  │                 ├── Phase 7 (Copilot/Vibe) ← Copilot is trivially parallel with Phase 4
-  │                 └── Phase 5 (cursor store) ← independent of 3/4, needed by 6/8
-  │                       └── Phase 8 (workflow) ← needs 4+5+6 for full coverage
+  │                 ├── Phase 7 (Copilot/Vibe) ← Copilot is trivially parallel with Phase 5
+  │                 └── Phase 5 (cursor store) ← independent of 3, needed by 6/8
+  │                       └── Phase 8 (workflow) ← needs 5+6 for full coverage
 ```
 
 ### Critical path for workflow gates
@@ -524,7 +393,6 @@ After Phase 3 lands:
 
 1. **Phase 5 (cursor store)** — no provider dependencies, pure infrastructure
 2. **Phase 7 Copilot** (parallel with 5) — simplest adapter, validates the trait
-3. **Phase 4 (Gemini)** — needs entity_id extension, but parser/discovery exist
 5. **Phase 7 Vibe** (parallel with 6) — straightforward if heuristic error inference is acceptable
 6. **Phase 8 (workflow)** — last, integrates everything
 
@@ -537,21 +405,12 @@ After Phase 3 lands:
 
 2. **Confirm entity_id field behavior** — verify that leaving `entity_id` empty on existing transcript docs doesn't break search/filter behavior. The field is `STRING | STORED` — empty string vs absent may differ in tantivy.
 
-3. **Inventory Gemini fixture** — check if the existing `parse_gemini_file_rich` tests in `parser.rs:1726-1837` cover enough event types for a full indexing test, or if additional fixtures are needed (especially: multi-message sessions with interleaved user/gemini turns).
-
-### Phase 4 prerequisites (after Phase 0)
-
-4. Extend `build_transcript_doc` with `entity_id: Option<&str>` parameter
-5. Add `gemini_root: Option<PathBuf>` to `ReindexConfig`
-6. Write `index_gemini_standalone` following `index_directory_standalone` pattern
-7. Wire into `scan_source_files` and `try_background_reindex`
-
 ### Phase 6 prerequisites (after Phase 0)
 
 8. Add `rusqlite` to `Cargo.toml` (feature-gate optional)
 9. Write schema probe that validates required tables
 
-### Phase 8 prerequisites (after Phases 4-5)
+### Phase 8 prerequisites (after Phase 5)
 
 12. Add `transcript_location` and `transcript_cursor` to `TaskInner`
 13. Extend `WaitSignal` with `provider_event` variant

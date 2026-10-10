@@ -50,7 +50,6 @@ The XDG path migration has run for the JSON state stores, but **the migration is
         badgey/
         generated/
         slack-*.json
-        gemini-policies/
 
 ~/.local/share/blackbox/
     index/                        # tantivy full-text index ($TRANSCRIPT_SEARCH_INDEX_PATH)
@@ -144,7 +143,7 @@ The prior draft listed four env vars in a single table. The actual surface is ~3
 | Provider extra PATH | `BRO_EXTRA_PATH` | env-only |
 | Vibe session dir | `VIBE_SESSION_DIR` | TOML `[providers]` |
 | LSP binaries | `BLACKBOX_JDTLS_BIN`, `BLACKBOX_RUST_ANALYZER_BIN`, `RUST_ANALYZER_BIN` | TOML `[lsp]`; **deprecate unprefixed `RUST_ANALYZER_BIN`** |
-| Provider global memory paths | `BLACKBOX_GLOBAL_CLAUDE_MD` / `CODEX_MD` / `GEMINI_MD` / `COMMON_MD` | env-only (override hatch); see migration A above for default change |
+| Provider global memory paths | `BLACKBOX_GLOBAL_CLAUDE_MD` / `CODEX_MD` / `COMMON_MD` | env-only (override hatch); see migration A above for default change |
 | Slack sidecar | `SLACK_BOT_TOKEN`, `BRO_SLACK_SHARED_SECRET`, `SLACK_PROJECT_DIR` | secrets surface (see §3) |
 | Voyage embeddings | `VOYAGE_API_KEY`, `DAYSTROM_VOYAGE_API_KEY` | secrets surface (see §3); deprecate the legacy name |
 
@@ -188,7 +187,6 @@ git_notes_namespace           = "bbox-provenance"
 # Omit a key entirely to fall back to $PATH lookup.
 # claude_bin   = "/usr/local/bin/claude"
 # codex_bin    = "/usr/local/bin/codex"
-# gemini_bin   = "..."
 # copilot_bin  = "..."
 # vibe_bin     = "..."
 # vibe_session_dir = "~/.vibe"
@@ -398,7 +396,7 @@ A small `tests/support/env_guard.rs` helper (RAII guard, holds the lock + snapsh
 
 ### 12. Provider config write-back (out of scope, documented)
 
-On startup, `main.rs:1457` calls `self_register_blackbox` which invokes each installed provider's CLI (`claude mcp add`, `codex mcp add`, etc.) to register the daemon in that provider's config file (`~/.codex/config.toml`, `~/.gemini/settings.json`, per-account `~/.claude*/.claude.json`). These writes are **provider-owned config**, not blackbox config, and the daemon's only contract is "register self if missing, leave everything else alone."
+On startup, `main.rs:1457` calls `self_register_blackbox` which invokes each installed provider's CLI (`claude mcp add`, `codex mcp add`, etc.) to register the daemon in that provider's config file (`~/.codex/config.toml`, per-account `~/.claude*/.claude.json`). These writes are **provider-owned config**, not blackbox config, and the daemon's only contract is "register self if missing, leave everything else alone."
 
 The design above does **not** propose moving or rewriting any provider config. It exclusively governs:
 

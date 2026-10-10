@@ -28,7 +28,6 @@ mode becomes a durable workflow feature.
 Today each provider is handled in a different partial path:
 
 - Claude and Codex are indexed into Tantivy from JSONL files.
-- Gemini has session-file discovery and a rich parser, but is not indexed.
 - Vibe and Copilot have some provider-specific handling, but not a unified
   adapter contract.
 
@@ -64,7 +63,6 @@ Non-goals:
 |---|---|---|---|
 | Claude Code | `~/.claude*/projects/**/*.jsonl`, plus `history.jsonl` | Indexed by background reindexer; parsed by `parse_transcript_line`; rich parser used by `bro tail`. | Mostly needs adapter wrapping and cursor contract. |
 | Codex | `~/.codex/sessions/**/rollout-*.jsonl`, plus `history.jsonl` | Indexed by background reindexer; parsed by `parse_codex_line`. | Mostly needs adapter wrapping and cursor contract. |
-| Gemini | `~/.gemini/tmp/<project>/chats/session-<iso>-<first8>.json` | Session discovery, resume-cwd safety, and rich parsing through `parse_gemini_file_rich`; not indexed. | Needs full-file polling adapter and index integration. |
 | Copilot | `~/.copilot/session-state/<session>/events.jsonl` helper lookup exists. | Streaming parser exists for orchestration/tail paths. | Needs explicit adapter and indexing decision. |
 | Vibe | `~/.vibe/logs/session/` discovery paths exist. | Bulk/non-streaming orchestration path. | Needs adapter or explicit out-of-scope decision. |
 
@@ -250,36 +248,6 @@ cwd is stored in session metadata. The adapter should wrap
 `extract_codex_session_id`, `extract_codex_cwd`, and `parse_codex_line`.
 Cursor is a byte offset plus per-line event index.
 
-### 6.3 Gemini
-
-Gemini stores one pretty-printed JSON object per chat session. The file is
-rewritten or updated as the chat changes, so byte offsets are not the right
-cursor. The existing `parse_gemini_file_rich` already groups events by
-message `id`; use message IDs as the cursor/dedupe key.
-
-Gemini should move from "tail-only parser" to a first-class indexed provider:
-
-- locate by full session ID using the first-eight filename suffix plus header
-  verification
-- load the JSON file on mtime change
-- parse all messages
-- emit groups whose message IDs have not been seen
-- index projected message/tool/thinking events
-
-Gemini projected documents need stable identities because full-file rewrites
-invalidate byte-offset identity. Use:
-
-```text
-gemini:<session_id>:<message_id>:<event_idx>
-```
-
-as the `entity_id` convention for Gemini transcript documents. If the
-existing schema can index that identity without new fields, no schema bump is
-required. If provider-message lookup needs additional stored fields, bump the
-schema version and force a full reindex.
-
-
-
 - `session`
 - `message`
 - `part`
@@ -403,7 +371,6 @@ read-source type.
    changing behavior.
 3. Wire `bro tail` through adapters for Claude/Codex as a compatibility
    exercise.
-4. Add Gemini adapter and index `~/.gemini/tmp`.
 5. Add durable live-read cursor storage under blackbox state.
    streaming JSON events.
 8. Add Copilot adapter if its JSONL schema is stable enough.
@@ -414,8 +381,6 @@ read-source type.
 ## 9. Open Questions
 
    should v1 poll `message`/`part` directly?
-2. Should Gemini full-file polling be part of the background reindexer, live
-   tailer, or both?
 3. How much raw provider payload should be retained for citations and
    debugging?
 4. Should providers without a durable read adapter be allowed in workflow

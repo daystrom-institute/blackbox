@@ -24,8 +24,8 @@ versions are omitted, detect installed ones:
 
 - `claude` — `claude --version`; binaries under `~/.local/share/claude/versions/`.
 - `codex` — `codex --version`; source at `~/repos/codex`.
-- `antigravity` (`agy`) — `agy --version`; binary `~/.local/bin/agy`, config
-  `~/.gemini`; docs repo `~/repos/antigravity-cli`.
+- `antigravity` (`agy`) — `agy --version`; binary `~/.local/bin/agy`; docs
+  repo `~/repos/antigravity-cli`.
 - `vibe` — `vibe --version`; source at `~/repos/mistral-vibe`.
 
 Confirm the latest version per subject and whether each is **source** or
@@ -56,7 +56,7 @@ tweak `MINE_CLI.md`, every future refresh inherits it.
   built-in Edit/Write already bound the surface. Add `disallow_tools` only if you
   have a specific reason.
 - `cwd` = the **source repo** (source mine) or `/home/invidious`
-  (binary mine that needs `~/.local` + `~/.gemini` + `~/repos/<docs>`).
+  (binary mine that needs `~/.local` + the CLI's config dir + `~/repos/<docs>`).
 - `pin_model`, `pin_effort: high`.
 - **Split a large CLI into 2–3 bros** by axis cluster (wire+loop / tool surfaces /
   governance) to keep each bounded; one bro per small subject is fine.

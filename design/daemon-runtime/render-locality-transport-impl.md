@@ -108,9 +108,8 @@ seeing the project root.
 
 Only these project targets are valid:
 
-- `CLAUDE.md` for `claude`;
-- `AGENTS.md` for `agents`, `codex`, or `vibe`; and
-- `GEMINI.md` for `gemini`.
+- `CLAUDE.md` for `claude`; and
+- `AGENTS.md` for `agents`, `codex`, or `vibe`.
 
 Satellites are content-addressed `.bbox/guidance/<generation>/<provider>-<topic>.md`
 files. Unknown or path-shaped provider names fail before a target is joined.

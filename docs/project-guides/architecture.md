@@ -81,8 +81,8 @@ routing facts:
   another absolute path for its own session (`harness_bin`). See
   `design/bro-harness/harness-process-boundary.md`.
 - `codex` is a serde alias for Brodex (bro-harness/Responses); there is no
-  separate codex CLI path. The Copilot, Vibe-CLI, and Gemini provider lanes
-  are removed entirely.
+  separate codex CLI path. The Copilot and Vibe-CLI provider lanes are
+  removed entirely.
 - Provider binary overrides belong in config/env, not hard-coded call sites.
 
 Dispatch-capable providers apply a mechanical recursion guard for recursive

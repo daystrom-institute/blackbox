@@ -164,7 +164,6 @@ wrappers:
 nix develop .#dev-agent
 bbx-dev-claude
 bbx-dev-codex
-bbx-dev-gemini
 ```
 
 What the harness does:

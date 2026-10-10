@@ -54,7 +54,7 @@ pub struct HybridSearchParams {
     /// `source` to select a provider lane.
     #[serde(default)]
     pub account: Option<String>,
-    /// Source lane: `glm`, `claude`, `codex`, `gemini`, `slack`, ...
+    /// Source lane: `glm`, `claude`, `codex`, `slack`, ...
     /// Comma-separated for several; a `-` prefix excludes a lane
     /// (`source="-slack"` searches everything except Slack).
     #[serde(default)]

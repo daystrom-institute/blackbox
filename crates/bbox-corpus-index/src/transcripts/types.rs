@@ -32,7 +32,7 @@ pub enum TranscriptStorage {
 }
 
 /// Identity of a transcript-producing source. Dispatch lanes (bro-harness
-/// providers) and interactive CLI sources (the operator's Claude/Codex/Gemini
+/// providers) and interactive CLI sources (the operator's Claude/Codex
 /// sessions) are deliberately distinct: the `Provider` enum models what the
 /// daemon can DISPATCH to, and the provider-removal arc (fef32d2) narrowed it
 /// to harness lanes — interactive transcripts are an index-time corpus
@@ -43,7 +43,6 @@ pub enum TranscriptSource {
     Harness(Provider),
     Claude,
     Codex,
-    Gemini,
     /// Connector-landed Slack conversations. Not a dispatch target and not a
     /// CLI the operator runs: it is an observed remote corpus that reaches the
     /// index through the same adapter contract, which is the whole point of
@@ -65,7 +64,6 @@ impl TranscriptSource {
             Self::Harness(Provider::Workflow) => "workflow",
             Self::Claude => "claude",
             Self::Codex => "codex",
-            Self::Gemini => "gemini",
             Self::Slack => "slack",
         }
     }
@@ -79,9 +77,11 @@ impl fmt::Display for TranscriptSource {
 
 // Serialized as the bare label string. The harness arm reuses the Provider
 // wire names, so locations persisted before this enum existed ("glm",
-// "brodex", ...) deserialize unchanged; "claude"/"codex"/"gemini" map to the
+// "brodex", ...) deserialize unchanged; "claude"/"codex" map to the
 // interactive sources (Provider's own serde would alias them to harness
-// lanes, which is exactly what this enum exists to avoid).
+// lanes, which is exactly what this enum exists to avoid). A label with no
+// variant decodes to a typed error, never a panic: indexed documents carry the
+// label as a plain string and are never decoded through this type.
 impl Serialize for TranscriptSource {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(self.label())
@@ -94,7 +94,6 @@ impl<'de> Deserialize<'de> for TranscriptSource {
         match raw.as_str() {
             "claude" => Ok(Self::Claude),
             "codex" => Ok(Self::Codex),
-            "gemini" => Ok(Self::Gemini),
             "slack" => Ok(Self::Slack),
             other => other.parse::<Provider>().map(Self::Harness).map_err(|_| {
                 serde::de::Error::custom(format!("unknown transcript source: {other}"))
@@ -639,5 +638,27 @@ mod tests {
         assert!(debug.contains("line_len"));
         assert!(!display.contains(&"x".repeat(512)));
         assert!(!debug.contains(&"x".repeat(512)));
+    }
+
+    #[test]
+    fn a_stored_location_with_an_unregistered_source_label_is_a_decode_error() {
+        let stored = serde_json::json!({
+            "provider": "gemini",
+            "storage": "json_file",
+            "path": "/synthetic/chats/session-0001.json",
+            "account": "gemini",
+            "session_id": "session-0001",
+            "project": null,
+            "cwd": null,
+            "is_subagent": false,
+        });
+        let err = serde_json::from_value::<TranscriptLocation>(stored).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unknown transcript source: gemini")
+        );
+
+        let known = serde_json::from_value::<TranscriptSource>(serde_json::json!("codex"));
+        assert_eq!(known.unwrap(), TranscriptSource::Codex);
     }
 }

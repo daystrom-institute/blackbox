@@ -2658,13 +2658,7 @@ mod tests {
         // Unknown / non-bidi names — and `claude`, which is no longer a fleet
         // participant — collapse to GLM. The classifier must stay steerable, so
         // it can never resolve to a one-shot (or non-fleet) provider.
-        for name in [
-            None,
-            Some("claude"),
-            Some("codex"),
-            Some("gemini"),
-            Some("nonsense"),
-        ] {
+        for name in [None, Some("claude"), Some("codex"), Some("nonsense")] {
             let c = ClassifierConfig {
                 enabled: None,
                 provider: name.map(str::to_string),

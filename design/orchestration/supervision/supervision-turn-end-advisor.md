@@ -205,8 +205,8 @@ ladder first; otherwise default recovery should stay at `tier_mode=exact`.
 
 Capability eligibility still applies to replacement lanes. In current code only
 Claude and Codex advertise `structured_output`; replacement or recovery attempts
-that require structured output cannot land on GLM, DeepSeek, Inception, Gemini,
-or Vibe until their provider capability tags or runtime support change.
+that require structured output cannot land on GLM, DeepSeek, Inception, or
+Vibe until their provider capability tags or runtime support change.
 
 ## 8. Advisor durability
 

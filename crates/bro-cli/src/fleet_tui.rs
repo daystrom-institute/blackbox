@@ -278,7 +278,7 @@ fn fleet_state_from_snapshot(
 /// Claude stays out of the fleet picker (and classifier default — see
 /// `ClassifierConfig::provider_resolved`). It remains a first-class provider
 /// dispatchable everywhere else (bro_exec, orchestration). One-shot/under-
-/// supported providers (Codex, Gemini, Vibe, Inception, Copilot) are likewise
+/// supported providers (Codex, Vibe, Inception, Copilot) are likewise
 /// hidden; they remain dispatchable elsewhere, just not pickable in the cockpit.
 const FLEET_PROVIDERS: &[Provider] = &[
     Provider::Glm,

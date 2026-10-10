@@ -314,8 +314,8 @@ from sibling roots.
   `"2026-06-02"` (all four snapshots).
 - `supersedes` (research-subject only): predecessor snapshot. Observed:
   `null` (all four snapshots are first-version).
-- `replaces` (research-subject only): non-version predecessor (e.g.
-  antigravity replaces gemini). Observed once.
+- `replaces` (research-subject only): non-version predecessor (e.g. a
+  successor CLI that replaces an earlier one). Observed once.
 - `generated_by`, `last_reviewed`: provenance and review metadata. Used
   on the two research-hub outliers.
 

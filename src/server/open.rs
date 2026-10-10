@@ -447,16 +447,6 @@ pub(super) fn open_shared_state(
     // snapshots) so harness sessions are searchable like any other provider
     // transcript. Each child receives this same root as BRO_HOME.
     idx.set_harness_sessions_dir(cfg.paths.bro_home.join("harness-sessions"));
-    // Interactive Gemini chats (claude/codex roots already travel inside
-    // ReindexConfig; gemini's tmp root is resolved here, same explicit-only
-    // contract — gap-5af6d773).
-    if let Some(gemini_tmp) = std::env::var("GEMINI_TMP_ROOT")
-        .ok()
-        .map(std::path::PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|h| h.join(".gemini").join("tmp")))
-    {
-        idx.set_gemini_tmp_root(gemini_tmp);
-    }
     idx.set_native_sources(
         cfg.paths.state_dir.join("transcript-sources"),
         if cfg.source_connectors.enabled {

@@ -50,7 +50,6 @@ ensure_base_tree() {
     "$HOME/.claude" \
     "$HOME/.claude-shared" \
     "$HOME/.codex" \
-    "$HOME/.gemini" \
     "$HOME/.local/bin" \
     "$XDG_CONFIG_HOME" \
     "$XDG_STATE_HOME" \

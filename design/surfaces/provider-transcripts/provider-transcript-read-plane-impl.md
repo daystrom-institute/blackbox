@@ -20,14 +20,12 @@ front-loaded with compatibility work:
 
 ```
 Phase 0 -> Phase 1 -> Phase 2 -> Phase 3
-                                      |-> Phase 4
                                       |-> Phase 5
                                       `-> Phase 6 -> Phase 7 -> Phase 8
 ```
 
-Phases 0-3 are the core compatibility path. Phase 4 adds Gemini indexing,
-Phase 7 fills Copilot/Vibe where worth it, and Phase 8 exposes
-workflow-facing reads.
+Phases 0-3 are the core compatibility path. Phase 7 fills Copilot/Vibe where
+worth it, and Phase 8 exposes workflow-facing reads.
 
 ---
 
@@ -233,7 +231,7 @@ gating temporary implementations.
 
 2.3 **Meta store compatibility.** Continue using `_meta.json` keyed by path
 with `{mtime, size}`. Non-JSONL providers will extend the value later, but do
-not change the meta format until Phase 4 needs it.
+not change the meta format until a provider needs it.
 
 2.4 **Tool edge preservation.** `ToolEdgeContext::emit_event_edges` expects
 `ParsedEvent`. Project normalized events into `ParsedEvent` before edge
@@ -270,20 +268,18 @@ deduplicated.
 **What gets built:**
 
 3.1 **Unify session-file lookup.** `src/index/helpers.rs::find_session_file`
-already knows Claude, Codex, Gemini, Copilot, and Vibe. Move provider-specific
+already knows Claude, Codex, Copilot, and Vibe. Move provider-specific
 lookup into adapters, then keep `find_session_file` as a compatibility
 facade over the registry.
 
 3.2 **Keep CLI parser behavior stable.** `src/cli.rs` currently imports
-`src/parser.rs` directly and has special Gemini polling paths:
+`src/parser.rs` directly:
 
 - `seed_jsonl`
-- `seed_gemini`
 - `parse_jsonl_line`
-- `poll_gemini`
 
 For this phase, do not rewrite the TUI. Add an internal read-plane facade
-that can back `seed_jsonl` for Claude/Codex, then leave Gemini/Copilot/Vibe
+that can back `seed_jsonl` for Claude/Codex, then leave Copilot/Vibe
 on existing rich parsers until their adapters land.
 
 The facade should return `TranscriptEvent` for `bro tail` in this phase, not
@@ -316,78 +312,6 @@ lookup/parser path can be served by the adapter facade.
 - Manual smoke: `bro tail --provider codex` still opens a Codex lane.
 
 **Estimated size:** 200-400 lines.
-
----
-
-## Phase 4: Gemini JSON-File Adapter and Indexing
-
-**Prerequisites:** Phases 0-3.
-
-**What gets built:**
-
-4.1 **Gemini adapter.** Implement `TranscriptLocation::JsonFile` for:
-
-```text
-~/.gemini/tmp/<project>/chats/session-<iso>-<first8>.json
-```
-
-Reuse existing session discovery/resume helpers from
-`src/orchestration/providers.rs` where possible:
-
-- `discover_gemini_session`
-- `resolve_gemini_session_cwd`
-- `resolve_gemini_session_cwd_in`
-
-Avoid duplicating the first-eight filename/header-verification logic.
-
-4.2 **Parser reuse.** Use `parser::parse_gemini_file_rich(raw)` and convert
-each `TranscriptEvent` to normalized events. Preserve message group identity
-via `parent_tool_use_id`, which the parser currently uses for Gemini message
-ids.
-
-4.3 **Stable identity.** For Gemini indexed docs:
-
-```text
-entity_id = gemini:<session_id>:<message_id>:<event_idx>
-byte_offset = 0
-file_path = <chat-json-path>
-```
-
-`byte_offset = 0` is acceptable because `entity_id` becomes the durable
-identity. If search/context tools need event-level context later, add a
-Gemini-specific context reader rather than pretending byte offsets are useful
-in pretty-printed full-file JSON.
-
-This depends on the Phase 0/2 document builder change that explicitly writes
-`entity_id`. Without that field, search entity ids fall back to byte offsets
-and every Gemini event in a file would collide at offset 0.
-
-4.4 **Reindex behavior.** Extend `_meta.json` use for Gemini locations:
-
-- mtime/size skip remains enough for incremental reindex
-- when a Gemini file changes, delete prior docs by `file_path`, then re-add
-  all projected docs
-- no live cursor needed for background reindex
-
-4.5 **Session list/stat behavior.** `bbox_stats` and `bbox_sessions_list`
-should count Gemini only after adapter indexing is wired. Add provider label
-`gemini`.
-
-**Deliverable:** Gemini chat files are indexed into Tantivy and searchable.
-Background reindexing works without Phase 5 cursor persistence because it
-deletes/re-adds docs by file path and uses stable `entity_id` values.
-Live Gemini reads before Phase 5 may use in-memory message-id dedupe only;
-durable live resume starts after Phase 5.
-
-**Tests:**
-
-- Fixture full Gemini JSON with user, thoughts, content, toolCalls.
-- Reindex twice with unchanged mtime/size -> second pass skips.
-- Modify Gemini JSON -> prior docs for file are deleted and re-added without
-  duplicates.
-- Search by Gemini assistant text returns `account=gemini`.
-
-**Estimated size:** 400-700 lines.
 
 ---
 
@@ -433,7 +357,7 @@ Consumers may pass an explicit cursor to override it, but default live polling
 loads/stores via `CursorStore`.
 
 **Deliverable:** Live readers can restart and resume from the last cursor for
-Claude/Codex/Gemini.
+Claude/Codex.
 
 **Tests:**
 
@@ -558,7 +482,7 @@ transcript_cursor: Option<TranscriptCursor>,
 ```
 
 Populate at dispatch once the provider session id is known. For providers
-that discover session ids late (Gemini, Vibe), update the handle when
+that discover session ids late (Vibe), update the handle when
 discovery resolves.
 
 8.2 **Workflow wait condition.** Add provider event wait support:
@@ -596,13 +520,13 @@ persists the cursor through `CursorStore`.
 - `bro_arc_status`: include actor read health and last cursor
 
 **Deliverable:** A workflow can gate on transcript events for at least
-Claude/Codex/Gemini and degrade predictably when the read adapter fails.
+Claude/Codex and degrade predictably when the read adapter fails.
 
 **Tests:**
 
 - Workflow wait fixture over a fake adapter stream.
 - Adapter error fixture produces blocked note after retries.
-- Late Gemini session discovery updates task read handle.
+- Late session discovery updates task read handle.
 
 **Estimated size:** 600-1000 lines.
 
@@ -628,8 +552,6 @@ Claude/Codex/Gemini and degrade predictably when the read adapter fails.
 
 1. After Phase 3, should `src/transcripts` move into `src/lib.rs` so
    `blackboxd` and `bro` share adapter code directly?
-2. Should Gemini context tools get a provider-specific context reader in Phase
-   4, or is search-only Gemini indexing enough until workflow gates need it?
    `message.time_created,id`?
 5. After Phase 7, should `bro tail` render normalized events directly, or
    keep using `TranscriptEvent` as its rich display model?

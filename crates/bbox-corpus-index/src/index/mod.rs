@@ -237,11 +237,6 @@ pub struct ReindexConfig {
     /// the operator's real harness state. Set by the daemon at startup via
     /// [`TranscriptIndex::set_harness_sessions_dir`].
     pub harness_sessions_dir: Option<PathBuf>,
-    /// Gemini CLI tmp root (`~/.gemini/tmp` or `GEMINI_TMP_ROOT`) whose chat
-    /// JSON files are indexed via the gemini interactive adapter. Same
-    /// hermetic-by-default contract as `harness_sessions_dir`: `None`
-    /// disables the adapter. Set via [`TranscriptIndex::set_gemini_tmp_root`].
-    pub gemini_tmp_root: Option<PathBuf>,
     /// The daemon's conversation landing store root
     /// (`<state_dir>/conversation-sources`) whose landed records project into
     /// transcript documents. `None` disables the conversation adapter, which
@@ -571,7 +566,6 @@ impl TranscriptIndex {
             knowledge_path,
             threads_path,
             harness_sessions_dir: None,
-            gemini_tmp_root: None,
             conversation_source_root: None,
             native_source_root: None,
             native_sources: Vec::new(),
@@ -868,12 +862,6 @@ impl TranscriptIndex {
     /// (and therefore disabled) in hermetic test indexes.
     pub fn set_harness_sessions_dir(&mut self, dir: PathBuf) {
         self.config.harness_sessions_dir = Some(dir);
-    }
-
-    /// Enable interactive Gemini chat indexing from `tmp_root`. Called by
-    /// daemon startup; left unset (disabled) in hermetic test indexes.
-    pub fn set_gemini_tmp_root(&mut self, tmp_root: PathBuf) {
-        self.config.gemini_tmp_root = Some(tmp_root);
     }
 
     /// Enable projection of connector-landed conversations from `root` for the

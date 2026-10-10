@@ -6,4 +6,3 @@
 # examples:
 # .claude/.credentials.json	/home/invidious/.claude/.credentials.json
 # .codex/auth.json	/home/invidious/.codex/auth.json
-# .gemini/oauth.json	/home/invidious/.gemini/oauth.json

@@ -227,8 +227,6 @@ The migration is wholesale — every CLI-shaped provider is dropped:
 - **claude `-p`** — moves to API pricing (June 15), erasing the CLI cost
   advantage; dispatch goes through the native Anthropic transport.
   exist natively; cut.
-- **Gemini** — dead: the CLI was deprecated in favour of the new Antigravity CLI,
-  which doesn't work properly. Dropped.
 - **Copilot** — dropped: it backs onto OpenAI/Anthropic anyway, is closed to new
   customers, and hit grandfathered users with a ~33× cost increase. Not worth
   carrying.
@@ -494,7 +492,7 @@ bindings — only the projection to the model branches.
 
 The consolidation is plausibly **net-negative code**.
 
-**Delete:** codex/vibe/copilot/gemini CLI arg-builders + dispatch branches;
+**Delete:** codex/vibe/copilot CLI arg-builders + dispatch branches;
 *parsing* on the daemon side for in-process sessions; the MCP-client-for-corpus
 robustness wrapping; `Provider::build_filter_args` translation for harness
 agents; the fleet in-process `FleetOrchestrator` duplication; the entire
@@ -894,7 +892,7 @@ roster render.
     `pub use bro_transcript as parser` (zero churn in its ~8 internal users);
     `bro-cli`'s `bro tail` imports `bro_transcript::{…}` directly. All parsers
     retained (dropping them would break daemon indexing of historical
-    codex/gemini transcripts). Validated: `cargo check --workspace` clean.
+    codex transcripts). Validated: `cargo check --workspace` clean.
   - **Step 1d-iii — DONE: `blackbox` dependency DROPPED from `bro-cli`.** The
     last coupling was `blackbox::config::load` (daemon-port resolution); all four
     call sites (`main` ×3, `council_tui` ×1) read only `daemon.port`, so they now

@@ -237,7 +237,7 @@ HTTP to a running `blackboxd`.
   per anthropic-harness.md). Aggregate per provider in the title bar.
 
 Note: `is_streaming_json` (`providers.rs:178`) covers Claude/GLM/DeepSeek/
-Brodex/Codex/Copilot/Inception (not Gemini). Streaming output ≠ control-protocol
+Brodex/Codex/Copilot/Inception. Streaming output ≠ control-protocol
 support. **Codex is deferred** (§2.1).
 
 ## 5. UX surface

@@ -1,5 +1,5 @@
-//! Interactive-CLI transcript adapters: the operator's Claude, Codex, and
-//! Gemini sessions.
+//! Interactive-CLI transcript adapters: the operator's Claude and Codex
+//! sessions.
 //!
 //! Deleted in the provider-removal arc (fef32d2) together with the dispatch
 //! providers they were keyed to, which silently stopped interactive
@@ -7,10 +7,9 @@
 //! registry contract, keyed by [`TranscriptSource`] instead of the dispatch
 //! `Provider` enum — interactive sources are an index-time corpus input, not
 //! a dispatch target. Source roots come exclusively from `ReindexConfig`
-//! (claude roots / codex root / gemini tmp root), so hermetic test indexes
-//! never scan the operator's real state.
+//! (claude roots / codex root), so hermetic test indexes never scan the
+//! operator's real state.
 
-use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -290,122 +289,6 @@ impl TranscriptReadAdapter for CodexTranscriptAdapter {
     }
 }
 
-// ── Gemini ──────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone)]
-pub struct GeminiTranscriptAdapter {
-    tmp_root: PathBuf,
-}
-
-impl GeminiTranscriptAdapter {
-    pub fn new(tmp_root: PathBuf) -> Self {
-        Self { tmp_root }
-    }
-}
-
-impl TranscriptReadAdapter for GeminiTranscriptAdapter {
-    fn source(&self) -> TranscriptSource {
-        TranscriptSource::Gemini
-    }
-
-    fn locate(&self, session_id: &str) -> Result<Option<TranscriptLocation>, TranscriptReadError> {
-        if session_id.len() < 8 {
-            return Ok(None);
-        }
-        let first8 = &session_id[..8];
-        let suffix = format!("-{first8}.json");
-        for path in gemini_chat_paths(&self.tmp_root) {
-            let name = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("");
-            if !name.starts_with("session-") || !name.ends_with(&suffix) {
-                continue;
-            }
-            if read_gemini_session_id(&path).as_deref() == Some(session_id) {
-                return Ok(Some(gemini_location(&path)));
-            }
-        }
-        Ok(None)
-    }
-
-    fn scan_locations(
-        &self,
-        target: TranscriptScanTarget,
-    ) -> Result<Vec<TranscriptLocation>, TranscriptReadError> {
-        match target {
-            TranscriptScanTarget::Sessions => Ok(gemini_chat_paths(&self.tmp_root)
-                .into_iter()
-                .map(|path| gemini_location(&path))
-                .collect()),
-            TranscriptScanTarget::History => Ok(Vec::new()),
-        }
-    }
-
-    fn read_since(
-        &self,
-        location: &TranscriptLocation,
-        cursor: Option<&TranscriptCursor>,
-    ) -> Result<TranscriptBatch, TranscriptReadError> {
-        ensure_source(location, TranscriptSource::Gemini)?;
-        let mut seen = message_id_cursor(TranscriptSource::Gemini, cursor)?;
-        let previously_seen = seen.clone();
-        let raw = fs::read_to_string(&location.path)
-            .map_err(|err| TranscriptReadError::io("read", &location.path, err))?;
-        let rich_events = parser::parse_gemini_file_rich(&raw);
-        let mut per_message_idx: HashMap<String, u32> = HashMap::new();
-        let mut events = Vec::new();
-
-        for rich in rich_events {
-            let message_id = rich
-                .parent_tool_use_id
-                .clone()
-                .filter(|id| !id.is_empty())
-                .unwrap_or_else(|| format!("message-{}", per_message_idx.len()));
-            let next_idx = per_message_idx.entry(message_id.clone()).or_insert(0);
-            let event_idx = *next_idx;
-            *next_idx += 1;
-            let already_seen = previously_seen.contains(&message_id);
-            seen.insert(message_id.clone());
-            if already_seen {
-                continue;
-            }
-            let session_id = if rich.session_id.is_empty() {
-                location.session_id.clone().unwrap_or_default()
-            } else {
-                rich.session_id.clone()
-            };
-            let entity_id = format!("gemini:{session_id}:{message_id}:{event_idx}");
-            let raw_ref = RawTranscriptRef {
-                source: TranscriptSource::Gemini,
-                storage: TranscriptStorage::JsonFile,
-                path: location.path.clone(),
-                byte_offset: Some(0),
-                event_idx: Some(event_idx),
-                line_len: None,
-                provider_event_id: Some(message_id),
-                entity_id: Some(entity_id),
-            };
-            if let Some(event) = NormalizedTranscriptEvent::from_transcript_event(
-                TranscriptSource::Gemini,
-                &rich,
-                raw_ref,
-            ) {
-                events.push(event);
-            }
-        }
-
-        Ok(TranscriptBatch {
-            location: location.clone(),
-            events,
-            cursor: Some(TranscriptCursor::MessageIdSet {
-                ids: seen.into_iter().collect(),
-            }),
-            reached_end: true,
-        })
-    }
-}
-
 // ── Shared jsonl/cursor/location helpers ───────────────────────────
 
 fn read_jsonl_events<F>(
@@ -495,20 +378,6 @@ fn byte_offset_cursor(
     }
 }
 
-fn message_id_cursor(
-    source: TranscriptSource,
-    cursor: Option<&TranscriptCursor>,
-) -> Result<BTreeSet<String>, TranscriptReadError> {
-    match cursor {
-        None => Ok(BTreeSet::new()),
-        Some(TranscriptCursor::MessageIdSet { ids }) => Ok(ids.iter().cloned().collect()),
-        Some(cursor) => Err(TranscriptReadError::UnsupportedCursor {
-            source,
-            cursor: cursor.clone(),
-        }),
-    }
-}
-
 fn next_byte_cursor(path: &Path) -> Result<Option<TranscriptCursor>, TranscriptReadError> {
     let size = fs::metadata(path)
         .map_err(|err| TranscriptReadError::io("metadata", path, err))?
@@ -568,35 +437,6 @@ fn codex_location(path: &Path) -> TranscriptLocation {
     }
 }
 
-fn gemini_location(path: &Path) -> TranscriptLocation {
-    let session_id = read_gemini_session_id(path);
-    let project = path
-        .parent()
-        .and_then(|chats| chats.parent())
-        .and_then(|project_dir| {
-            fs::read_to_string(project_dir.join(".project_root"))
-                .ok()
-                .map(|root| root.trim().to_string())
-                .filter(|root| !root.is_empty())
-                .or_else(|| {
-                    project_dir
-                        .file_name()
-                        .map(|name| name.to_string_lossy().to_string())
-                })
-        });
-    TranscriptLocation {
-        source: TranscriptSource::Gemini,
-        storage: TranscriptStorage::JsonFile,
-        path: path.to_path_buf(),
-        account: Some("gemini".to_string()),
-        session_id,
-        project,
-        cwd: None,
-        is_subagent: false,
-        logical_key: None,
-    }
-}
-
 fn extract_project_from_path(file_path: &Path, projects_root: &Path) -> Option<String> {
     let relative = file_path.strip_prefix(projects_root).unwrap_or(file_path);
     relative
@@ -630,39 +470,6 @@ fn extract_codex_cwd(path: &Path) -> Option<String> {
         }
     }
     None
-}
-
-fn gemini_chat_paths(tmp_root: &Path) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-    let Ok(projects) = fs::read_dir(tmp_root) else {
-        return paths;
-    };
-    for project in projects.filter_map(|entry| entry.ok()) {
-        let chats = project.path().join("chats");
-        let Ok(entries) = fs::read_dir(&chats) else {
-            continue;
-        };
-        for entry in entries.filter_map(|entry| entry.ok()) {
-            let path = entry.path();
-            if path.extension().map(|ext| ext != "json").unwrap_or(true) {
-                continue;
-            }
-            let name = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("");
-            if name.starts_with("session-") {
-                paths.push(path);
-            }
-        }
-    }
-    paths
-}
-
-fn read_gemini_session_id(path: &Path) -> Option<String> {
-    let raw = fs::read_to_string(path).ok()?;
-    let value: Value = serde_json::from_str(&raw).ok()?;
-    value["sessionId"].as_str().map(String::from)
 }
 
 #[cfg(test)]
@@ -835,112 +642,5 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
-    }
-
-    #[test]
-    fn gemini_adapter_reads_full_json_and_sets_stable_entity_ids() {
-        let dir = tempdir().unwrap();
-        let project_dir = dir.path().join("repo-a");
-        let chats_dir = project_dir.join("chats");
-        fs::create_dir_all(&chats_dir).unwrap();
-        fs::write(project_dir.join(".project_root"), "/repo/a\n").unwrap();
-        let path = chats_dir.join("session-2026-05-12T00-00-00-abcdef12.json");
-        let raw = json!({
-            "sessionId": "abcdef12-1111-2222-3333-444444444444",
-            "messages": [
-                {
-                    "id": "m-user",
-                    "timestamp": "2026-05-12T00:00:01Z",
-                    "type": "user",
-                    "content": "hello gemini"
-                },
-                {
-                    "id": "m-gemini",
-                    "timestamp": "2026-05-12T00:00:02Z",
-                    "type": "gemini",
-                    "thoughts": [{"subject": "Plan", "description": "think"}],
-                    "content": "answer",
-                    "toolCalls": [{
-                        "id": "call-1",
-                        "name": "Bash",
-                        "args": {"command": "true"},
-                        "status": "success",
-                        "result": [{
-                            "functionResponse": {
-                                "response": {"output": "ok"}
-                            }
-                        }]
-                    }]
-                }
-            ]
-        })
-        .to_string();
-        fs::write(&path, raw).unwrap();
-
-        let adapter = GeminiTranscriptAdapter::new(dir.path().to_path_buf());
-        let location = adapter
-            .locate("abcdef12-1111-2222-3333-444444444444")
-            .unwrap()
-            .unwrap();
-        let snapshot = adapter.load_snapshot(&location).unwrap();
-
-        assert_eq!(location.storage, TranscriptStorage::JsonFile);
-        assert_eq!(location.account.as_deref(), Some("gemini"));
-        assert_eq!(location.project.as_deref(), Some("/repo/a"));
-        assert_eq!(snapshot.events.len(), 5);
-        assert_eq!(snapshot.events[0].raw.byte_offset, Some(0));
-        assert_eq!(
-            snapshot.events[0].raw.entity_id.as_deref(),
-            Some("gemini:abcdef12-1111-2222-3333-444444444444:m-user:0")
-        );
-        assert_eq!(
-            snapshot.events[2].raw.entity_id.as_deref(),
-            Some("gemini:abcdef12-1111-2222-3333-444444444444:m-gemini:1")
-        );
-        assert_eq!(
-            snapshot.events[4].role,
-            super::super::types::TranscriptRole::ToolResult
-        );
-    }
-
-    #[test]
-    fn gemini_message_id_cursor_skips_seen_message_groups() {
-        let dir = tempdir().unwrap();
-        let chats_dir = dir.path().join("repo-a").join("chats");
-        fs::create_dir_all(&chats_dir).unwrap();
-        let path = chats_dir.join("session-2026-05-12T00-00-00-abcdef12.json");
-        fs::write(
-            &path,
-            json!({
-                "sessionId": "abcdef12-1111-2222-3333-444444444444",
-                "messages": [
-                    {"id": "m1", "type": "user", "content": "old"},
-                    {"id": "m2", "type": "user", "content": "new"}
-                ]
-            })
-            .to_string(),
-        )
-        .unwrap();
-
-        let adapter = GeminiTranscriptAdapter::new(dir.path().to_path_buf());
-        let location = adapter
-            .locate("abcdef12-1111-2222-3333-444444444444")
-            .unwrap()
-            .unwrap();
-        let batch = adapter
-            .read_since(
-                &location,
-                Some(&TranscriptCursor::MessageIdSet {
-                    ids: vec!["m1".to_string()],
-                }),
-            )
-            .unwrap();
-
-        assert_eq!(batch.events.len(), 1);
-        assert_eq!(batch.events[0].content, "new");
-        assert!(matches!(
-            batch.cursor,
-            Some(TranscriptCursor::MessageIdSet { .. })
-        ));
     }
 }

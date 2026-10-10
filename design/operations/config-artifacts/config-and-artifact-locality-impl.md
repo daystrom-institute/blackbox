@@ -189,7 +189,6 @@ Prerequisites:
    pub struct ProviderConfig {
        pub claude_bin: Option<String>,
        pub codex_bin: Option<String>,
-       pub gemini_bin: Option<String>,
        pub copilot_bin: Option<String>,
        pub vibe_bin: Option<String>,
        pub vibe_session_dir: Option<PathBuf>,
@@ -228,7 +227,6 @@ Prerequisites:
        pub global_common_md: PathBuf,
        pub global_claude_md: PathBuf,
        pub global_codex_md: PathBuf,
-       pub global_gemini_md: PathBuf,
    }
 
    ```
@@ -1606,8 +1604,8 @@ Systemd:
 
 ## Out-of-scope
 
-- Moving provider-owned config files such as `~/.codex/config.toml` or
-  `~/.gemini/settings.json`. The daemon only self-registers with resolved URL
+- Moving provider-owned config files such as `~/.codex/config.toml`. The
+  daemon only self-registers with resolved URL
   and port.
 - Rebinding the HTTP listener live on SIGHUP. Port/bind changes require restart.
 - Replacing every JSON store with a generic store abstraction.

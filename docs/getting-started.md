@@ -11,7 +11,7 @@ This gets a deployment into the normal blackbox shape:
 - project source published into the agentic corpus by its checkout host
 
 Do this once per deployment and once per checkout host, then use the same
-daemon from Claude, Codex, Gemini, Copilot, and Vibe.
+daemon from Claude, Codex, Copilot, and Vibe.
 
 ## 1. Build the binaries
 
@@ -30,7 +30,7 @@ The daemon ships as a runtime image containing `blackboxd`, the offline
 writable volume as described in
 [the runtime image README](../deploy/docker/README.md).
 
-One daemon serves every Claude / Codex / Gemini / Copilot / Vibe CLI. That is
+One daemon serves every Claude / Codex / Copilot / Vibe CLI. That is
 what makes transcript search, knowledge, threads, and bro tasks shared
 instead of provider-local.
 
@@ -94,8 +94,6 @@ url = "https://<daemon-origin>/mcp?surface=interactive"
   }
 }
 ```
-
-**Gemini CLI** - `gemini mcp add blackbox https://<daemon-origin>/mcp?surface=interactive`
 
 **Copilot** - `copilot mcp add blackbox https://<daemon-origin>/mcp?surface=interactive`
 

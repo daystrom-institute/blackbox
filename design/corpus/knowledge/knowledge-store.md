@@ -15,7 +15,6 @@ topic:
 User-facing operational context is fragmented across provider-specific silos:
 - Claude Code reads `CLAUDE.md` + has its own "memory" feature (invisible to other providers)
 - Codex CLI and Vibe both read `AGENTS.md` (currently symlinked to CLAUDE.md — wrong content)
-- Gemini CLI reads `GEMINI.md` (doesn't exist yet)
 - External tools (RTK, etc.) modify these files independently
 
 No single source of truth. No way to share knowledge across providers. Manual maintenance
@@ -41,8 +40,6 @@ Knowledge lives in three distinct layers, collapsed at render time into per-prov
 │      autonomy boundaries, tool behaviors     │
 │    Codex: sandbox model, approval policies,  │
 │      shell constraints, delegation rules     │
-│    Gemini: foundational mandates, search     │
-│      strategy, sub-agent guidance            │
 │    Vibe: tool preferences, output limits     │
 │                                              │
 │  Layer 2: Shared Memory                      │
@@ -72,7 +69,6 @@ Knowledge lives in three distinct layers, collapsed at render time into per-prov
 │                                              │
 │  CLAUDE.md     ← generated artifact          │
 │  AGENTS.md     ← generated artifact          │
-│  GEMINI.md     ← generated artifact          │
 └─────────────────────────────────────────────┘
 ```
 
@@ -82,7 +78,6 @@ Behavioral instructions specific to one provider. Stored in blackbox with `provi
 Never rendered into another provider's file. Examples:
 - "Claude: use hooks for automated behaviors, not prompt instructions"
 - "Codex: prefer apply_patch over write_file for edits"
-- "Gemini: use 'Foundational Mandates' heading for critical instructions"
 
 ### Layer 2: Shared Memory
 
@@ -149,7 +144,7 @@ needs human readability for debugging, primary access is full-scan rendering.
 | `approval` | enum | `user_confirmed`, `agent_inferred`, `imported` |
 | `supersedes` | string? | ID of entry this replaces. Forms replacement chains. |
 | `expires_at` | ISO 8601? | Auto-disable after this time. Null = permanent. |
-| `source` | string | Who created it: `user`, `claude`, `codex`, `gemini`, `vibe`, `imported` |
+| `source` | string | Who created it: `user`, `claude`, `codex`, `vibe`, `imported` |
 | `created_at` | ISO 8601 | |
 | `updated_at` | ISO 8601 | |
 
@@ -255,7 +250,6 @@ blackbox_lint()
 |---|---|
 | Claude | `{project}/CLAUDE.md` |
 | Codex + Vibe | `{project}/AGENTS.md` |
-| Gemini | `{project}/GEMINI.md` |
 
 AGENTS.md is a converged file for Codex and Vibe — necessary evil, least friction. Rendered as
 the intersection of entries visible to either provider. Provider-specific steerage for codex or
@@ -311,7 +305,6 @@ render(provider, project):
 | Claude | `## Standing Orders` | Matches existing CLAUDE.md convention |
 | Codex | `## Critical Instructions` | |
 | Vibe | `## Critical Instructions` | Shared with Codex via AGENTS.md |
-| Gemini | `## Foundational Mandates` | Triggers high-priority weighting in Gemini |
 
 ### Budget Limits
 
@@ -320,7 +313,6 @@ render(provider, project):
 | Claude | 50K chars | 1M context, generous budget |
 | Codex | 15K chars | More constrained context |
 | Vibe | 10K chars | ~1500 lines before attention degrades |
-| Gemini | 30K chars | Large context but "lost in middle" applies |
 
 ## Absorption: Git-Based Bidirectional Sync
 
@@ -333,7 +325,7 @@ Git is the manifest. No shadow copies, no hash tracking.
 
 ```
 absorb(project):
-  for each rendered file (CLAUDE.md, AGENTS.md, GEMINI.md):
+  for each rendered file (CLAUDE.md, AGENTS.md):
     # Get diff of file since last blackbox render commit
     diff = git_diff(file, since=last_render_tag_or_commit)
 
@@ -381,8 +373,7 @@ attempting surgical parsing.
 3. Create initial provider steerage entries for each provider.
 4. First render → diff against current files to verify equivalence.
 5. Delete AGENTS.md symlink, let renderer create it.
-6. Create GEMINI.md via renderer.
-7. Add `PROJECT.md` to repo. Generated files can be committed (with header) or gitignored.
+6. Add `PROJECT.md` to repo. Generated files can be committed (with header) or gitignored.
 
 ## Resolved Decisions
 
