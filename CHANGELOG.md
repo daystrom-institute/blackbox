@@ -8,6 +8,10 @@ out explicitly under `Changed` or `Removed`.
 
 ## Unreleased
 
+- Removed `bro fleet` and `bro agent`, their terminal rendering stack, classifier
+  companion and cockpit-only dependencies. `bro mcp`, `bro render` and
+  `bro tail` remain available.
+
 - Tasks restored after daemon restart keep publishing roster updates through
   recovery and completion, so dashboard status agrees with task status.
 

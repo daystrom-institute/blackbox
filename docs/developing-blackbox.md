@@ -47,9 +47,8 @@ The fold gate's wall-clock is pinned by the extended catalog migration fault
 matrix (~68s alone on a warm Mac); the mid-cycle gate's by ~5s artifact-install
 tests. The test that indexes the live checkout is an `#[ignore]`d opt-in
 benchmark (`live_checkout_markdown_and_rust_source_are_searchable`), not part
-of either gate. Cold worktree builds
-are solved separately by `project_dispatch.seed_dirs` CoW target seeding (see
-below), not by the test profiles.
+of either gate. Cold worktree builds require a warm lane or an explicitly provisioned build
+cache, independently of the test profiles.
 
 Use the narrowest command that proves your change, then broaden when touching
 shared behavior (see [`PROJECT.md`](../PROJECT.md) → Validation for targeted
@@ -57,13 +56,9 @@ recipes per subsystem).
 
 ## Build performance across git worktrees (per-worktree isolation + sccache)
 
-`bro fleet` and ad-hoc `git worktree add` both create sibling worktrees of this
-Cargo workspace. **Each worktree builds into its own `target/`** — there is no
-shared `CARGO_TARGET_DIR` injected by the cockpit (it was removed: a single
-shared target dir serializes every concurrent build on cargo's exclusive build
-lock, and it leaked Rust assumptions onto non-Rust projects). Isolation is the
-default and keeps concurrent worktree builds from blocking each other; the cost
-is that a fresh worktree cold-compiles the dependency tree once.
+Each linked worktree builds into its own `target/`. Isolation keeps concurrent
+worktree builds from blocking each other on Cargo's exclusive build lock.
+A fresh worktree needs a warm lane or an explicitly provisioned build cache.
 
 To recover cross-worktree compile reuse **without** a shared build lock, use
 [`sccache`](https://github.com/mozilla/sccache) — a compilation cache that shares
@@ -86,42 +81,25 @@ export RUSTC_WRAPPER=sccache     # in your shell profile
 #   rustc-wrapper = "sccache"
 ```
 
-### Fleet worktrees: `project_dispatch` in `fleet.json`
+### Project dispatch environment in `fleet.json`
 
-For agents dispatched by `bro fleet`, opt a project into dispatch-time env via a
-per-project **`project_dispatch`** block in `fleet.json` (it sits beside your
-blackbox `config.toml`; keyed by **canonical repo path**). This is the
-project-agnostic replacement for the old hardcoded `CARGO_TARGET_DIR` — a Rust
-repo opts into sccache, a Java repo sets `GRADLE_USER_HOME`, most set nothing:
+The daemon reads per-project `project_dispatch.env` from `fleet.json` beside
+its blackbox `config.toml`, keyed by canonical base repository path:
 
 ```json
 {
   "project_dispatch": {
     "/Users/you/repos/transcript-search": {
-      "env": { "RUSTC_WRAPPER": "sccache" },
-      "seed_dirs": ["target"]
+      "env": { "RUSTC_WRAPPER": "sccache" }
     }
   }
 }
 ```
 
-`env` is resolved **daemon-side at task spawn** for every dispatch path
-(`bro_exec` and the fleet cockpit), keyed by the
-task cwd with worktree→base-repo mapping, and delivered to harness shell
-children on the dedicated non-secret `shell_env` lane (never the transport
-session env). Reserved `BRO_FLEET_*` vars are never overridden.
-
-`seed_dirs` lists repo-relative directories to copy-on-write clone from the
-base repo into each worktree the fleet cockpit creates. Seeding a warm `target/` turns the dispatched agent's
-first build from a cold full-workspace compile into an incremental one
-(measured: a 56G target clones in ~13s on APFS; `cargo check` drops from
-10+ minutes to ~30s of first-party recompiles). Best-effort: missing dirs,
-already-present dirs, and non-CoW filesystems are skipped — there is
-deliberately no plain-copy fallback, and a malformed `fleet.json` never
-blocks a dispatch. The closeout side of the same per-project surface
-(`project_closeout` — fold target, branch prefixes, and `closeout_hooks`) is
-documented in [`design/fleet-tui/closeout-command.md`](../design/fleet-tui/closeout-command.md);
-it is strict-loaded so a typo fails the `/closeout` command loudly.
+Every dispatch resolves this environment using the task cwd with worktree to
+base repository mapping. Harness workers pass it to shell children through
+`shell_env`; CLI workers receive it in their process environment. Reserved
+`BRO_FLEET_*` variables are never overridden.
 
 ## Build, run, or develop with Nix
 

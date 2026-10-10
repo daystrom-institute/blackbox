@@ -9,7 +9,7 @@ The crate is `blackbox` (`Cargo.toml`). Binary entry points:
 
 - `blackboxd` (`src/main.rs`) - daemon entry point; real startup lives in
   `blackbox::server::run()`.
-- `bro` (`crates/bro-cli/src/main.rs`) - Fleet and bro execution client.
+- `bro` (`crates/bro-cli/src/main.rs`) - headless MCP, guidance-render and event-tail client.
 - `bro-harness` (`crates/bro-harness`) - standalone model-turn runtime.
 - `blackbox` (`src/bin/blackbox.rs`) - offline administration.
 - Source collectors publish checkout files and native transcripts from their owning hosts.

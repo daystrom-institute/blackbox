@@ -1,15 +1,8 @@
-# The `bro` terminal client (fleet cockpit, tail).
-#
-# §7 thin-client extraction COMPLETE (harness-daemon-boundary.md §7): the `bro`
-# binary no longer depends on the `blackbox` daemon crate. It links the fleet
-# engine (`bro-fleet-client`) and the contract bottom (`bro-protocol` + `bro-core`)
-# transitively — never the daemon. The daemon is reached only over HTTP
-# (`/control/*`, `/tail`, etc.).
+# Headless daemon client. Shared configuration stays in bro-fleet-client.
 [package]
 name = "bro-cli"
 version = "0.0.1"
 edition = "2024"
-build = "build.rs"
 
 [[bin]]
 name = "bro"
@@ -17,56 +10,13 @@ path = "src/main.rs"
 
 [dependencies]
 bro-fleet-client = { path = "../bro-fleet-client" }
-# SIGPIPE reset in main: a CLI whose stdout reader closes early exits quietly.
-libc = "0.2"
-bbox-corpus-core = { path = "../bbox-corpus-core" }
-# Managed-region patcher for `render global`: applies a daemon-computed global
-# guidance plan to this host's provider files. Links no knowledge store.
 bbox-util = { path = "../bbox-util" }
-bro-rpc = { path = "../bro-rpc" }
-bro-protocol = { path = "../bro-protocol" }
-bro-core = { path = "../bro-core" }
-
+# Restore conventional SIGPIPE behavior for piped output.
+libc = "0.2"
 clap = { version = "4.5", features = ["derive"] }
-crossterm = "0.28"
-ratatui = { version = "0.29", features = ["unstable-rendered-line-info", "unstable-widget-ref"] }
-unicode-width = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 tokio = { version = "1", features = ["full"] }
-dirs = "6"
 futures-util = "0.3"
-ratatui-core = "0.1"
 reqwest = { version = "0.12", features = ["stream", "rustls-tls", "json"], default-features = false }
-tracing = "0.1"
-# Cockpit logging: file-only rolling subscriber (a TUI cannot log to stderr
-# without corrupting the alt-screen), mirroring the daemon's startup idiom.
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tracing-appender = "0.2"
-tui-markdown = "0.3"
-# Style-preserving word wrapping (codex wrapping.rs technique). flatten -> wrap
-# -> re-slice spans by byte range so styles survive wrap boundaries.
-textwrap = "0.16"
-# Syntax highlighting for fenced code blocks (codex render/highlight.rs
-# technique). Pure-Rust fancy-regex backend (not codex's oniguruma/C) keeps the
-# thin `bro` client C-toolchain-free. two-face bundles bat's ~250 syntaxes +
-# themes.
-syntect = { version = "5", default-features = false, features = ["default-fancy"] }
-two-face = { version = "0.5", default-features = false, features = ["syntect-fancy"] }
-uuid = { version = "1", features = ["v4"] }
-fs2 = "0.4"
-hex = "0.4"
-sha2 = "0.10"
-toml = "0.8"
-
-[dev-dependencies]
-tempfile = "3"
-axum = "0.8"
-# Render snapshot harness (Phase 0 safety net for the fleet_tui split).
-# insta captures rendered output as reviewable golden snapshots. We render
-# headlessly into a cell grid (codex's VT100Backend technique) using ratatui's
-# built-in TestBackend rather than vt100, because vt100 0.16 requires
-# unicode-width ^0.2.1 and the workspace lock pins 0.2.0 — TestBackend gives the
-# same grid snapshot with no extra transitive deps.
-insta = "1.46"

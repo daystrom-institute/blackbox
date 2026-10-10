@@ -1,36 +1,12 @@
-#![allow(
-    clippy::collapsible_if,
-    clippy::doc_overindented_list_items,
-    clippy::doc_lazy_continuation,
-    clippy::too_many_arguments,
-    clippy::type_complexity,
-    clippy::large_enum_variant,
-    clippy::enum_variant_names,
-    clippy::let_and_return
-)]
-
-//! `bro tail` — headless stream printer for agent orchestration.
-//!
-//! Selects one or more bros (by name, session, or provider), subscribes
-//! to the daemon's `/tail` SSE stream, and writes each event payload to stdout
-//! for piping, scripting, and logging. The interactive cockpit lives in
-//! `bro fleet`.
+//! Headless client for daemon MCP calls, guidance rendering and event tailing.
 
 use std::io::{self, Write};
 use std::time::Duration;
 
-use bro_fleet_client::Provider;
-
 use clap::{Args, Parser, Subcommand};
-use ratatui::prelude::{Color, Line, Modifier, Span, Style};
 
-mod fleet_classifier;
-mod fleet_tui;
-mod logging;
 mod mcp_call;
 mod render_global;
-#[cfg(test)]
-mod test_backend;
 
 #[derive(Default, Debug, Clone)]
 struct TailSelectors {
@@ -58,50 +34,6 @@ enum BroCommand {
     Mcp(mcp_call::McpArgs),
     /// Guidance renders - pull the daemon's global render onto this host
     Render(render_global::RenderArgs),
-    /// Fleet cockpit — dispatch and live-drive many top-level agents
-    Fleet(FleetArgs),
-    /// Single-agent cockpit — launch one agent into the Fleet transcript view
-    Agent(AgentArgs),
-}
-
-#[derive(Debug, Args)]
-struct FleetArgs {
-    /// Default working directory for dispatched agents. Defaults to the
-    /// cockpit's launch cwd.
-    #[arg(long, value_name = "DIR")]
-    cwd: Option<String>,
-    /// Daemon base URL for daemon-backed fleet dispatch/control. Also accepted
-    /// via BLACKBOX_FLEET_DAEMON_URL.
-    #[arg(long, value_name = "URL")]
-    daemon_url: Option<String>,
-    /// Bypass the single-cockpit instance lock and start even if another
-    /// `bro fleet` already drives this fleet store. The two cockpits will
-    /// fight over the roster stream — recovery use only.
-    #[arg(long)]
-    force: bool,
-}
-
-#[derive(Debug, Args)]
-struct AgentArgs {
-    /// Working directory for the agent. Defaults to the shell's launch cwd.
-    #[arg(long, value_name = "DIR")]
-    cwd: Option<String>,
-    /// Provider to launch. Defaults to brodex, matching bro fleet.
-    #[arg(long, default_value = "brodex")]
-    provider: Provider,
-    /// Provider model id/alias. Defaults to the provider catalog default.
-    #[arg(long)]
-    model: Option<String>,
-    /// Provider effort/thinking level. Defaults to the provider catalog default.
-    #[arg(long)]
-    effort: Option<String>,
-    /// Resume an existing provider session id or `/rename`d session name.
-    #[arg(long, value_name = "SESSION_ID_OR_NAME")]
-    resume: Option<String>,
-    /// Optional first prompt / resume turn. If omitted, the TUI opens empty and
-    /// dispatches or resumes when you submit the first composer line.
-    #[arg(value_name = "PROMPT", trailing_var_arg = true)]
-    prompt: Vec<String>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -247,27 +179,6 @@ fn find_sse_separator(buf: &[u8]) -> Option<usize> {
     None
 }
 
-/// Capture each fleet harness session's stdout transcript + stderr (including
-/// the turn-end diagnostic) to `<state>/bro/fleet/logs/<task>.{stdout.jsonl,
-/// stderr.log}` so spurious-stop turns can be diagnosed postmortem. Honors an
-/// operator-set `BLACKBOX_HARNESS_TEE_DIR` (export it empty to disable).
-fn default_fleet_harness_tee() {
-    if std::env::var_os("BLACKBOX_HARNESS_TEE_DIR").is_some() {
-        return;
-    }
-    let base = std::env::var_os("BLACKBOX_STATE_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| {
-            dirs::home_dir()
-                .unwrap_or_default()
-                .join(".local/state/blackbox")
-        });
-    let dir = base.join("bro").join("fleet").join("logs");
-    // SAFETY: set once at CLI startup before the fleet dispatches any harness;
-    // no other thread reads the environment at this point.
-    unsafe { std::env::set_var("BLACKBOX_HARNESS_TEE_DIR", &dir) };
-}
-
 fn main() -> anyhow::Result<()> {
     restore_default_sigpipe();
     let cli = BroCli::parse();
@@ -277,23 +188,6 @@ fn main() -> anyhow::Result<()> {
         BroCommand::Tail(args) => rt.block_on(run_tail_stream_printer(TailSelectors::from(args))),
         BroCommand::Mcp(args) => rt.block_on(mcp_call::run(args)),
         BroCommand::Render(args) => rt.block_on(render_global::run(args)),
-        BroCommand::Fleet(args) => {
-            default_fleet_harness_tee();
-            rt.block_on(fleet_tui::run(args.cwd, args.daemon_url, args.force))
-        }
-        BroCommand::Agent(args) => {
-            default_fleet_harness_tee();
-            let prompt = (!args.prompt.is_empty()).then(|| args.prompt.join(" "));
-            let launch = fleet_tui::AgentLaunch {
-                cwd: args.cwd,
-                provider: args.provider,
-                model: args.model,
-                effort: args.effort,
-                resume: args.resume,
-                prompt,
-            };
-            rt.block_on(fleet_tui::run_agent(launch))
-        }
     };
     drop(rt);
     result
@@ -316,107 +210,6 @@ fn restore_default_sigpipe() {
 
 #[cfg(not(unix))]
 fn restore_default_sigpipe() {}
-
-/// Convert a `ratatui_core` Line from tui-markdown output into a `'static`
-/// ratatui Line that the fleet widgets consume.
-pub(crate) fn line_into_owned<'a>(line: ratatui_core::text::Line<'a>) -> Line<'static> {
-    let mut line_style = convert_core_style(line.style);
-    let mut iter = line.spans.into_iter().peekable();
-    let is_heading = iter
-        .peek()
-        .is_some_and(|s| is_heading_marker_span(&s.content));
-    if is_heading {
-        let _ = iter.next();
-        line_style = line_style.add_modifier(Modifier::UNDERLINED);
-    }
-    let spans: Vec<Span<'static>> = iter
-        .map(|s| {
-            let merged = line_style.patch(convert_core_style(s.style));
-            Span::styled(s.content.into_owned(), merged)
-        })
-        .collect();
-    Line::from(spans)
-}
-
-fn is_heading_marker_span(s: &str) -> bool {
-    let t = s.trim_end();
-    !t.is_empty() && t.chars().all(|c| c == '#')
-}
-
-fn is_ordered_list_marker_only(line: &Line<'_>) -> bool {
-    let joined: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-    let t = joined.trim();
-    if t.is_empty() {
-        return false;
-    }
-    let Some(dot_pos) = t.find('.') else {
-        return false;
-    };
-    if dot_pos == 0 || dot_pos != t.len() - 1 {
-        return false;
-    }
-    t[..dot_pos].chars().all(|c| c.is_ascii_digit())
-}
-
-fn is_bullet_marker_only(line: &Line<'_>) -> bool {
-    let joined: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-    matches!(joined.trim(), "-" | "*" | "+")
-}
-
-pub(crate) fn stitch_list_markers(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
-    let mut out: Vec<Line<'static>> = Vec::with_capacity(lines.len());
-    let mut iter = lines.into_iter().peekable();
-    while let Some(line) = iter.next() {
-        if (is_ordered_list_marker_only(&line) || is_bullet_marker_only(&line))
-            && let Some(next) = iter.next()
-        {
-            let mut spans = line.spans;
-            spans.extend(next.spans);
-            out.push(Line::from(spans));
-            continue;
-        }
-        out.push(line);
-    }
-    out
-}
-
-fn convert_core_style(s: ratatui_core::style::Style) -> Style {
-    let mut out = Style::default();
-    if let Some(fg) = s.fg {
-        out = out.fg(convert_core_color(fg));
-    }
-    if let Some(bg) = s.bg {
-        out = out.bg(convert_core_color(bg));
-    }
-    out = out.add_modifier(Modifier::from_bits_truncate(s.add_modifier.bits()));
-    out = out.remove_modifier(Modifier::from_bits_truncate(s.sub_modifier.bits()));
-    out
-}
-
-fn convert_core_color(c: ratatui_core::style::Color) -> Color {
-    use ratatui_core::style::Color as Rc;
-    match c {
-        Rc::Reset => Color::Reset,
-        Rc::Black => Color::Black,
-        Rc::Red => Color::Red,
-        Rc::Green => Color::Green,
-        Rc::Yellow => Color::Yellow,
-        Rc::Blue => Color::Blue,
-        Rc::Magenta => Color::Magenta,
-        Rc::Cyan => Color::Cyan,
-        Rc::Gray => Color::Gray,
-        Rc::DarkGray => Color::DarkGray,
-        Rc::LightRed => Color::LightRed,
-        Rc::LightGreen => Color::LightGreen,
-        Rc::LightYellow => Color::LightYellow,
-        Rc::LightBlue => Color::LightBlue,
-        Rc::LightMagenta => Color::LightMagenta,
-        Rc::LightCyan => Color::LightCyan,
-        Rc::White => Color::White,
-        Rc::Rgb(r, g, b) => Color::Rgb(r, g, b),
-        Rc::Indexed(i) => Color::Indexed(i),
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -444,43 +237,5 @@ mod tests {
         assert_eq!(sel.bros, vec!["solo", "alpha", "beta"]);
         assert_eq!(sel.sessions, vec!["sid-123"]);
         assert_eq!(sel.providers, vec!["codex"]);
-    }
-
-    #[test]
-    fn clap_parses_agent_launch_args() {
-        // `glm` (a surviving provider): `claude` and the other CLI-shaped
-        // providers were dropped in §4, so clap's value parser rejects them.
-        let cli = BroCli::parse_from([
-            "bro",
-            "agent",
-            "--provider",
-            "glm",
-            "--model",
-            "sonnet",
-            "--effort",
-            "high",
-            "--cwd",
-            "/tmp/project",
-            "write",
-            "tests",
-        ]);
-        let BroCommand::Agent(args) = cli.command else {
-            panic!("expected Agent command");
-        };
-        assert_eq!(args.provider, Provider::Glm);
-        assert_eq!(args.model.as_deref(), Some("sonnet"));
-        assert_eq!(args.effort.as_deref(), Some("high"));
-        assert_eq!(args.cwd.as_deref(), Some("/tmp/project"));
-        assert_eq!(args.prompt, vec!["write", "tests"]);
-    }
-
-    #[test]
-    fn clap_agent_defaults_to_brodex() {
-        let cli = BroCli::parse_from(["bro", "agent"]);
-        let BroCommand::Agent(args) = cli.command else {
-            panic!("expected Agent command");
-        };
-        assert_eq!(args.provider, Provider::Brodex);
-        assert!(args.prompt.is_empty());
     }
 }

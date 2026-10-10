@@ -33,9 +33,9 @@ not listed here.
 | `BBOX_BIND` | Bind address | `127.0.0.1` | `127.0.0.1` |
 | `BLACKBOX_MCP_NAME` | MCP server name advertised to clients | `blackbox` | `blackbox-dev-throwaway` |
 
-`BBOX_PORT` is also read by the `bro`/`bro fleet` client's
-`default_daemon_url()` to find the daemon, so a client pointing at the same
-port will route to this instance automatically.
+`BBOX_PORT` controls the loopback fallback for `bro`. MCP calls and guidance
+rendering can also use a configured remote URL, so pass `--daemon-url` explicitly
+when connecting those commands to an isolated daemon.
 
 ### State isolation
 
@@ -192,25 +192,14 @@ and `--projects-path <path>` overrides only the projects store location. The
 receipt on stdout carries the epoch, both pair hashes, and the full owner
 census, so a refusal and a success are equally auditable.
 
-## Connecting `bro fleet` / `bro`
+## Connecting `bro`
 
-The `bro` CLI and `bro fleet` TUI resolve the daemon URL in this order:
-
-1. Explicit `--daemon-url <URL>` flag
-2. `BLACKBOX_FLEET_DAEMON_URL` env var
-3. `BBOX_PORT` env var (default 7264) → `http://127.0.0.1:{port}`
-
-To point a client at the throwaway daemon:
+For MCP calls and guidance rendering, the daemon URL resolves from an explicit
+`--daemon-url`, then `BLACKBOX_MCP_URL`, then config `[client].daemon_url`,
+then the loopback daemon port. Use an explicit URL for a throwaway daemon:
 
 ```bash
-# Option A: use the same BBOX_PORT
-BBOX_PORT=7299 bro fleet
-
-# Option B: explicit flag
-bro fleet --daemon-url http://127.0.0.1:7299
-
-# Option C: env var
-BLACKBOX_FLEET_DAEMON_URL=http://127.0.0.1:7299 bro fleet
+bro mcp call bbox_stats '{}' --daemon-url http://127.0.0.1:7299
 ```
 
 ## Teardown
