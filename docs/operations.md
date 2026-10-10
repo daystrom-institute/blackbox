@@ -272,6 +272,11 @@ forward the signed-in user as `X-Forwarded-Email` (or `X-Forwarded-User`).
 Every request without that header is answered with a 401 page, and a request
 whose peer is not loopback is refused. The main listener never serves the UI.
 
+`/threads` lists threads with status and project filters and links each to
+its notes, participants and linked entities. `/bros` is the task roster, kept
+live over server-sent events, and `/bros/<task>` shows one task's status,
+dispatch parameters, report and an event tail that streams while it runs.
+
 ### Local dev daemon
 
 A local daemon for live validation runs from its own binary path, port and

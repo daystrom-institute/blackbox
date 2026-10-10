@@ -353,3 +353,150 @@ tfoot td {
     top: 0;
   }
 }
+
+/* Threads */
+
+.quiet {
+  color: var(--text-muted);
+}
+
+.prose {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.badge {
+  display: inline-block;
+  padding: 0 0.35rem;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  color: var(--text-muted);
+  font-size: 0.8em;
+}
+
+.filters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 1rem;
+  margin: 0 0 0.75rem;
+}
+
+.filters select {
+  max-width: 24rem;
+  font: inherit;
+}
+
+.filters button {
+  font: inherit;
+  padding: 0.15rem 0.75rem;
+}
+
+.pager {
+  margin: 0.5rem 0 0;
+  color: var(--text-muted);
+}
+
+.threads-table td .quiet {
+  font-size: 0.85em;
+}
+
+.detail-table th {
+  width: 11rem;
+  color: var(--text-muted);
+  font-weight: 600;
+}
+
+.thread-detail .panel,
+.task-live > .panel,
+#task-summary > .panel,
+.task-panels {
+  margin-bottom: 1rem;
+}
+
+.thread-notes {
+  margin: 0;
+  padding-left: 0;
+  list-style: none;
+}
+
+.thread-notes li {
+  padding: 0.5rem 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.note-meta {
+  color: var(--text-muted);
+  font-size: 0.85em;
+  margin-bottom: 0.2rem;
+}
+
+.thread-handoff,
+.task-report {
+  margin: 0;
+  padding: 0.5rem 0.75rem;
+  max-height: 32rem;
+  overflow: auto;
+  background: var(--surface-sunken);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* Bros */
+
+.roster-table .roster-name {
+  max-width: 24rem;
+}
+
+.task-panels {
+  grid-template-columns: repeat(auto-fill, minmax(24rem, 1fr));
+}
+
+.tail {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  max-height: 36rem;
+  overflow-y: auto;
+  font-size: 0.92em;
+}
+
+.tail-event {
+  display: grid;
+  grid-template-columns: 9rem 1fr;
+  gap: 0 0.75rem;
+  padding: 0.25rem 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.tail-kind {
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+}
+
+.tail-text {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.tail-event details {
+  grid-column: 2;
+}
+
+.tail-event summary {
+  cursor: pointer;
+  color: var(--text-muted);
+  font-size: 0.85em;
+}
+
+.tail-event pre {
+  margin: 0.25rem 0;
+  padding: 0.4rem 0.6rem;
+  background: var(--surface-sunken);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.tail-empty:not(:only-child) {
+  display: none;
+}
