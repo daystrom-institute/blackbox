@@ -23,7 +23,7 @@ lists.
 | Lane | Providers | Worker |
 |---|---|---|
 | `ClaudeCli` | `claude`, `glm`, `deepseek`, `minimax`, `kimi` | one `claude -p` child per dispatch |
-| `Codex` | `codex` | one `codex app-server` child per provider, one thread per dispatch |
+| `Codex` | `codex` | one `bro-codex` shim child per dispatch, fronting its own `codex app-server` |
 | `Harness` | `brodex`, `vibebh` (transitional, retiring) | one `bro-harness` child per dispatch |
 | `Workflow` | `workflow` | daemon-internal, no child |
 
@@ -126,12 +126,35 @@ transcripts.
 
 ## 2. Codex lane
 
-One `codex app-server` child per provider, JSON-RPC over stdio, hosts every
-dispatch as a thread. The executor keeps the child, hands out per-thread
-handles, and maps the session commands onto `turn/start`, `turn/steer`,
-`turn/interrupt`, `thread/start` and `thread/resume`; `item/*` notifications
-translate into the stream-json envelope the daemon already ingests. The
-account selects `CODEX_HOME`.
+The codex lane keeps the claude lane's process contract: one child per
+dispatch, user envelopes and claude-shaped `control_request`s on stdin, the
+stream-json envelope on stdout, exit at end of input, session log written by
+the executor. The child is the `bro-codex` shim, a checkout-host binary that
+owns one `codex app-server` child (JSON-RPC over stdio) for the life of the
+dispatch and translates between the two protocols:
+
+| stdin envelope | app-server |
+|---|---|
+| first user envelope | `thread/start` (or `thread/resume <id>` under `--resume`), then `turn/start` |
+| user envelope during a turn | `turn/steer` with the current turn id |
+| user envelope between turns | `turn/start` |
+| `control_request` interrupt | `turn/interrupt` |
+| `control_request` set_model | the next `turn/start` carries the model |
+| end of input | wait for the running turn, then `shutdown` and exit |
+
+| app-server notification | stdout envelope |
+|---|---|
+| `thread/started` | `system`/`init` with the thread id as `session_id` |
+| `item/agentMessage/delta` | `stream_event` text delta |
+| `item/completed` agentMessage, reasoning | `assistant` text and thinking blocks |
+| `item/started` and `item/completed` commandExecution, fileChange, mcpToolCall | `assistant` tool_use and `user` tool_result blocks |
+| `turn/completed` | `result` with usage, `is_error` on a failed turn |
+
+The shim performs no model loop, runs no tools and reads no provider config:
+the app-server owns all of that, with `approvalPolicy: never` and the sandbox
+the dispatch names. The account selects `CODEX_HOME`. The thread id is the
+session id the daemon records and resumes with. fleetd, the daemon and the
+session log see a worker indistinguishable from a claude-lane child.
 
 ## 3. Harness lane
 
