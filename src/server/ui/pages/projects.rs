@@ -27,8 +27,11 @@ use crate::server::state::ProjectRuntimeStatus;
 /// One catalog project as the list renders it.
 struct CatalogRow {
     project_id: String,
-    display_name: String,
-    scope: String,
+    /// What a person calls the project: an accepted alias, else the catalog
+    /// display name when it is not the id, else the registered root's
+    /// directory name. `None` when the catalog knows it by id alone.
+    label: Option<String>,
+    scope: Markup,
     active_attachments: usize,
     total_attachments: usize,
     /// The accepted publication state, `None` when the runtime has no view
@@ -37,9 +40,10 @@ struct CatalogRow {
     last_activation: Option<u64>,
 }
 
-/// A registered root as `bbox_project_list` reports it. Recorded paths are
-/// not rendered: a project is identified by id, and checkout paths belong to
-/// the lease-confined readers.
+/// A registered root as `bbox_project_list` reports it. The recorded path
+/// is rendered as text only, the way that tool already publishes it; the
+/// page never opens it, and the read is listed in the catalog ownership
+/// inventory to go with `ProjectRecord`.
 #[derive(Clone)]
 struct RootRow {
     project_id: String,
@@ -47,6 +51,9 @@ struct RootRow {
     is_git_repo: bool,
     registered_at: String,
     aliases: Vec<String>,
+    root: String,
+    /// The root's last path component, the name a person knows it by.
+    name: Option<String>,
 }
 
 /// The registered roots, ordered by project id.
@@ -61,6 +68,10 @@ fn registered_roots(ui: &UiState) -> Vec<RootRow> {
             is_git_repo: record.is_git_repo,
             registered_at: record.registered_at.clone(),
             aliases: record.aliases.iter().cloned().collect(),
+            root: record.canonical_path.clone(),
+            name: std::path::Path::new(&record.canonical_path)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned()),
         })
         .collect();
     rows.sort_by(|a, b| a.project_id.cmp(&b.project_id));
@@ -81,6 +92,11 @@ impl CatalogData {
     fn read(ui: &UiState) -> Self {
         let shared = &ui.shared;
         let (activations, activation_error) = activation_times(ui);
+        let records = registered_roots(ui);
+        let root_names: BTreeMap<&str, &str> = records
+            .iter()
+            .filter_map(|record| Some((record.project_id.as_str(), record.name.as_deref()?)))
+            .collect();
         let catalog = shared.project_authority.catalog_store().map(|store| {
             let state = store.snapshot().map_err(|error| error.to_string())?;
             let mut counts = BTreeMap::<&ProjectId, (usize, usize)>::new();
@@ -101,8 +117,8 @@ impl CatalogData {
                         counts.get(&project.project_id).copied().unwrap_or((0, 0));
                     CatalogRow {
                         project_id: id.to_string(),
-                        display_name: project.display_name.clone(),
-                        scope: scope_text(&project.scope),
+                        label: project_label(project, root_names.get(id).copied()),
+                        scope: scope_markup(&project.scope),
                         active_attachments: active,
                         total_attachments: total,
                         publisher: shared
@@ -112,10 +128,16 @@ impl CatalogData {
                     }
                 })
                 .collect();
-            rows.sort_by(|a, b| a.project_id.cmp(&b.project_id));
+            rows.sort_by(|a, b| {
+                a.label
+                    .as_deref()
+                    .unwrap_or(&a.project_id)
+                    .to_lowercase()
+                    .cmp(&b.label.as_deref().unwrap_or(&b.project_id).to_lowercase())
+                    .then_with(|| a.project_id.cmp(&b.project_id))
+            });
             Ok(rows)
         });
-        let records = registered_roots(ui);
         Self {
             catalog,
             activation_error,
@@ -143,21 +165,57 @@ fn activation_times(ui: &UiState) -> (BTreeMap<String, u64>, Option<String>) {
     }
 }
 
-fn scope_text(scope: &ProjectScope) -> String {
+/// The scope as a person reads it: the path inside the repository first,
+/// the repository identity shortened with the full value on hover.
+fn scope_markup(scope: &ProjectScope) -> Markup {
     match scope {
         ProjectScope::Published(scope) => {
-            format!(
-                "published {}:{}",
-                scope.repo_id(),
-                scope.bbox_root_relpath()
-            )
+            let relpath = scope.bbox_root_relpath();
+            let repo = scope.repo_id();
+            html! {
+                @if relpath == "." { "repository root" } @else { code { (relpath) } }
+                " in repo "
+                code title=(repo) { (short_id(repo)) }
+            }
         }
-        ProjectScope::LegacyLocal => "legacy local".to_string(),
-        ProjectScope::Connector(scope) => format!(
-            "connector {}:{}",
-            scope.connector_kind().as_str(),
-            scope.connector_source_id().as_str()
-        ),
+        ProjectScope::LegacyLocal => html! { "legacy local" },
+        ProjectScope::Connector(scope) => html! {
+            (scope.connector_kind().as_str()) " connector "
+            code { (scope.connector_source_id().as_str()) }
+        },
+    }
+}
+
+/// The first twelve characters of a long identifier; shorter ones as is.
+fn short_id(id: &str) -> &str {
+    match id.char_indices().nth(12) {
+        Some((end, _)) if id.len() > 16 => &id[..end],
+        _ => id,
+    }
+}
+
+/// The name a person uses for a catalog project.
+fn project_label(project: &CorpusProject, root_name: Option<&str>) -> Option<String> {
+    if let Some(alias) = project.operator_aliases.iter().next() {
+        return Some(alias.clone());
+    }
+    if project.display_name != project.project_id.as_str() {
+        return Some(project.display_name.clone());
+    }
+    root_name.map(str::to_string)
+}
+
+/// The project cell: the label first, the id beneath it.
+fn project_cell(project_id: &str, label: Option<&str>) -> Markup {
+    html! {
+        a href=(format!("/projects/{project_id}")) {
+            @match label {
+                Some(label) => { strong { (label) } }
+                None => { span.muted { "unnamed" } }
+            }
+        }
+        br;
+        code.muted title=(project_id) { (short_id(project_id)) }
     }
 }
 
@@ -235,12 +293,7 @@ fn render_catalog(data: &CatalogData) -> Markup {
                             tbody {
                                 @for row in rows {
                                     tr {
-                                        td {
-                                            a href=(format!("/projects/{}", row.project_id)) { code { (row.project_id) } }
-                                            @if row.display_name != row.project_id {
-                                                br; span.muted { (row.display_name) }
-                                            }
-                                        }
+                                        td { (project_cell(&row.project_id, row.label.as_deref())) }
                                         td { (row.scope) }
                                         td.num title=(format!("{} attached of {} recorded", row.active_attachments, row.total_attachments)) {
                                             (row.active_attachments) " / " (row.total_attachments)
@@ -274,6 +327,8 @@ fn render_catalog(data: &CatalogData) -> Markup {
                         thead {
                             tr {
                                 th scope="col" { "Project" }
+                                th scope="col" { "Root" }
+                                th scope="col" { "Aliases" }
                                 th scope="col" { "Repository" }
                                 th scope="col" { "Registered" }
                             }
@@ -281,10 +336,15 @@ fn render_catalog(data: &CatalogData) -> Markup {
                         tbody {
                             @for record in &data.records {
                                 tr {
-                                    td { a href=(format!("/projects/{}", record.project_id)) { code { (record.project_id) } } }
+                                    td { (project_cell(&record.project_id, record.aliases.first().map(String::as_str).or(record.name.as_deref()))) }
+                                    td { code { (record.root) } }
+                                    td {
+                                        @for alias in &record.aliases { code { (alias) } " " }
+                                        @if record.aliases.is_empty() { span.muted { "none" } }
+                                    }
                                     td {
                                         @match &record.repo_id {
-                                            Some(repo) => { code { (repo) } }
+                                            Some(repo) => { code title=(repo) { (short_id(repo)) } }
                                             None if record.is_git_repo => { "git, no repository id" }
                                             None => { span.muted { "not a git repository" } }
                                         }
@@ -321,6 +381,10 @@ struct GraphRow {
 
 struct DetailData {
     project_id: String,
+    /// See `project_label`; the id when nothing names the project.
+    label: String,
+    /// The registered root for this id, when one is recorded.
+    root: Option<RootRow>,
     identity: Identity,
     runtime: Option<ProjectRuntimeStatus>,
     activation: Result<Option<(u64, String, u64)>, String>,
@@ -400,8 +464,24 @@ impl Detail {
             })
             .map_err(|error| format!("{error:#}"));
         let graphs = read_graphs(ui, id);
+        let root = registered_roots(ui)
+            .into_iter()
+            .find(|record| record.project_id == id);
+        let label = match &identity {
+            Identity::Catalog { project, .. } => {
+                project_label(project, root.as_ref().and_then(|root| root.name.as_deref()))
+            }
+            Identity::Record(record) => record
+                .aliases
+                .first()
+                .cloned()
+                .or_else(|| record.name.clone()),
+        }
+        .unwrap_or_else(|| id.to_string());
         Detail::Found(Box::new(DetailData {
             project_id: id.to_string(),
+            label,
+            root,
             identity,
             runtime: shared.project_runtime_status(id),
             activation,
@@ -460,21 +540,27 @@ pub(crate) async fn detail_page(
 ) -> Response {
     let reader_ui = ui.clone();
     let reader_id = id.clone();
-    let content =
+    let (title, content) =
         match tokio::task::spawn_blocking(move || Detail::read(&reader_ui, &reader_id)).await {
-            Ok(Detail::Found(data)) => render_detail(&data),
+            Ok(Detail::Found(data)) => (format!("Project {}", data.label), render_detail(&data)),
             Ok(Detail::Unknown) => {
                 return super::placeholder::not_found(State(ui), Extension(principal)).await;
             }
-            Ok(Detail::Failed(error)) => error_fragment("bbox_project_catalog_get", &error),
-            Err(error) => error_fragment("bbox_project_catalog_get", &error.to_string()),
+            Ok(Detail::Failed(error)) => (
+                format!("Project {id}"),
+                error_fragment("bbox_project_catalog_get", &error),
+            ),
+            Err(error) => (
+                format!("Project {id}"),
+                error_fragment("bbox_project_catalog_get", &error.to_string()),
+            ),
         };
     html_response(
         StatusCode::OK,
         layout(
             &ui.shell(&principal),
             Some(Section::Projects),
-            &format!("Project {id}"),
+            &title,
             content,
         ),
     )
@@ -545,7 +631,7 @@ fn identity_table(data: &DetailData) -> Markup {
     match &data.identity {
         Identity::Catalog { project, epoch, .. } => {
             rows.push(("Display name".into(), html! { (project.display_name) }));
-            rows.push(("Scope".into(), html! { (scope_text(&project.scope)) }));
+            rows.push(("Scope".into(), scope_markup(&project.scope)));
             rows.push((
                 "Repository history".into(),
                 match &project.repo_history {
@@ -565,8 +651,12 @@ fn identity_table(data: &DetailData) -> Markup {
                 },
             ));
             rows.push(("Catalog epoch".into(), html! { (epoch) }));
+            if let Some(root) = &data.root {
+                rows.push(("Registered root".into(), html! { code { (root.root) } }));
+            }
         }
         Identity::Record(record) => {
+            rows.push(("Root".into(), html! { code { (record.root) } }));
             rows.push((
                 "Repository".into(),
                 match &record.repo_id {
@@ -873,8 +963,9 @@ mod tests {
                 "the catalog must link {project}: {body}"
             );
         }
-        assert!(body.contains("published repo_example:."), "{body}");
-        assert!(body.contains("published repo_example:remote"), "{body}");
+        assert!(body.contains("repository root"), "{body}");
+        assert!(body.contains("<code>remote</code>"), "{body}");
+        assert!(body.contains("title=\"repo_example\""), "{body}");
         assert!(body.contains("1 / 1"), "{body}");
         assert!(body.contains("0 / 0"), "{body}");
         assert!(body.contains("class=\"state state-"), "{body}");
@@ -887,7 +978,11 @@ mod tests {
         let (_fixture, shared) = seeded_catalog();
         let (status, body) = get(shared, &format!("/projects/{ATTACHED}")).await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert!(body.contains(&format!("Project {ATTACHED}")), "{body}");
+        // Titled by the registered root's directory name; the id stays in
+        // the identity table beside the root itself.
+        assert!(body.contains("<h1>Project never-mounted</h1>"), "{body}");
+        assert!(body.contains(&format!("<code>{ATTACHED}</code>")), "{body}");
+        assert!(body.contains("Registered root"), "{body}");
         for heading in [
             "Identity",
             "Transport ownership",
