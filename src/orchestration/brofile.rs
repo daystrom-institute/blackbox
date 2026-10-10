@@ -228,8 +228,12 @@ impl CodeMode {
 /// providers fail closed before environment or arg construction.
 pub fn provider_supports_defaults_suppression(provider: Provider) -> bool {
     // The claude CLI honors `--system-prompt ""`; the harness honors the same
-    // flag on every transport.
-    provider.is_dispatchable()
+    // flag on every transport. The codex app-server has no equivalent that
+    // leaves its own tool instructions intact.
+    match provider.lane() {
+        bro_core::ProviderLane::ClaudeCli | bro_core::ProviderLane::Harness => true,
+        bro_core::ProviderLane::Codex | bro_core::ProviderLane::Workflow => false,
+    }
 }
 
 /// Reject dispatch when the brofile demands suppression the provider
@@ -856,7 +860,9 @@ fn synthesized_account_env_for_home(
     let suffix = normalized_account_suffix(account_name)?;
 
     let (env_key, rel_path) = match provider {
-        Provider::Brodex => ("CODEX_HOME", format!(".codex{suffix}")),
+        // The codex app-server and the harness's Responses transport both
+        // read their ChatGPT login from `CODEX_HOME`.
+        Provider::Codex | Provider::Brodex => ("CODEX_HOME", format!(".codex{suffix}")),
         // GLM/DeepSeek/MiniMax/Kimi inherit credentials from fixed
         // Claude-compatible config dirs; vibe-bh authenticates via
         // MISTRAL_API_KEY, not accounts.
@@ -929,6 +935,9 @@ fn resolve_provider_env_for_locality(
             .as_deref()
             .and_then(|home| claude_config_dir_env(provider, home))
             .unwrap_or_default(),
+        // The codex lane needs no transport env: `CODEX_HOME` (or the
+        // app-server's default `~/.codex`) carries credentials and config.
+        Provider::Codex => HashMap::new(),
         // Brodex rides the harness on the OpenAI Responses transport against
         // the Codex/ChatGPT backend; CODEX_HOME (for OAuth) is supplied by the
         // account-env synthesis below, defaulting to ~/.codex in the harness.
@@ -1691,6 +1700,59 @@ mod tests {
         assert_eq!(
             env.get("CODEX_HOME").map(String::as_str),
             Some("/tmp/fake-home/.codex-account3")
+        );
+    }
+
+    #[test]
+    fn codex_lane_maps_an_account_to_codex_home_and_nothing_else() {
+        let store = temp_store();
+        let worker = temp_store();
+        let worker_home = worker.path().canonicalize().unwrap();
+        let locality = super::super::executor::WorkerLocality {
+            home: worker_home.clone(),
+            bro_home: worker_home.join("state/bro"),
+        };
+        let env = resolve_provider_env_for_locality(
+            Provider::Codex,
+            Some("account2"),
+            None,
+            store.path(),
+            None,
+            Some(&locality),
+        )
+        .unwrap();
+        assert_eq!(
+            env,
+            HashMap::from([(
+                "CODEX_HOME".to_string(),
+                worker_home
+                    .join(".codex-account2")
+                    .to_string_lossy()
+                    .into_owned()
+            )])
+        );
+        // The default account is the app-server's own `~/.codex`.
+        assert!(
+            resolve_provider_env_for_locality(
+                Provider::Codex,
+                None,
+                None,
+                store.path(),
+                None,
+                Some(&locality),
+            )
+            .is_none()
+        );
+        // No suppression flag the shim cannot honor.
+        assert!(!provider_supports_defaults_suppression(Provider::Codex));
+        assert!(
+            enforce_provider_defaults(
+                Provider::Codex,
+                Some(&BrofileContext {
+                    provider_defaults: Some(ProviderDefaultsMode::StrictSuppress),
+                }),
+            )
+            .is_err()
         );
     }
 

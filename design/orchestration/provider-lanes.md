@@ -130,13 +130,15 @@ dispatch and translates between the two protocols:
 | first user envelope | `thread/start` (or `thread/resume <id>` under `--resume`), then `turn/start` |
 | user envelope during a turn | `turn/steer` with the current turn id |
 | user envelope between turns | `turn/start` |
+| user envelope while the turn is being interrupted | queued; starts the next turn |
+| `/compact` user envelope | `thread/compact/start`, reported as a turn |
 | `control_request` interrupt | `turn/interrupt` |
 | `control_request` set_model | the next `turn/start` carries the model |
-| end of input | wait for the running turn, then `shutdown` and exit |
+| end of input | wait for the running turn, then close the app-server's stdin and exit |
 
-| app-server notification | stdout envelope |
+| app-server message | stdout envelope |
 |---|---|
-| `thread/started` | `system`/`init` with the thread id as `session_id` |
+| `thread/start` or `thread/resume` result | `system`/`init` with the thread id as `session_id` |
 | `item/agentMessage/delta` | `stream_event` text delta |
 | `item/completed` agentMessage, reasoning | `assistant` text and thinking blocks |
 | `item/started` and `item/completed` commandExecution, fileChange, mcpToolCall | `assistant` tool_use and `user` tool_result blocks |
@@ -144,9 +146,31 @@ dispatch and translates between the two protocols:
 
 The shim performs no model loop, runs no tools and reads no provider config:
 the app-server owns all of that, with `approvalPolicy: never` and the sandbox
-the dispatch names. The account selects `CODEX_HOME`. The thread id is the
-session id the daemon records and resumes with. fleetd, the daemon and the
-session log see a worker indistinguishable from a claude-lane child.
+the dispatch names (`danger-full-access` under
+`--dangerously-skip-permissions`). The app-server has no shutdown request;
+end of its input is its shutdown. The account selects `CODEX_HOME`, and with
+no model pinned the app-server's own config chooses the model.
+
+`--mcp-config` servers become `-c mcp_servers.<name>=…` overrides on the
+app-server command line, with `${VAR}` header secrets carried as
+`env_http_headers` / `bearer_token_env_var` names rather than values, and
+`mcp__<server>__<tool>` filters as each server's `enabled_tools` /
+`disabled_tools`. `--strict-mcp-config` asks the app-server for its effective
+config (`config/read`) and disables every server the dispatch did not define
+in the thread's config. `--append-system-prompt` is the thread's
+`developerInstructions` and `--json-schema` each turn's `outputSchema`. The
+lane has no provider-defaults suppression: `--system-prompt ""` has no
+app-server equivalent that keeps codex's own tool instructions, so strict
+suppression refuses the `codex` provider.
+
+The thread id is the session id the daemon records and resumes with. The
+app-server mints it, so a fresh codex dispatch starts its task `pending`,
+passes no `--session-id`, and adopts the id from the shim's `init`; the
+executor writes that dispatch's session log at the path pinned at spawn,
+named by the task id, and a resume (`--resume <thread>`) writes under the
+thread id. fleetd, the daemon and the session log otherwise see a worker
+indistinguishable from a claude-lane child. The indexer labels a dispatched
+Codex session `codex-dispatch`.
 
 ## 3. Harness lane
 

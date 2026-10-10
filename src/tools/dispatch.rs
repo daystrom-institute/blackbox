@@ -549,6 +549,14 @@ impl BlackboxServer {
             .as_ref()
             .and_then(|a| a.identity.session_id.clone())
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        // A worker that mints its own session id gets none from the dispatch;
+        // the scope and the task carry `pending` until the worker reports it.
+        let session_id =
+            if orchestration::providers::worker_assigns_session_id(request.provider.lane()) {
+                "pending".to_string()
+            } else {
+                session_id
+            };
         let ambient_ctx = orch::AmbientContext {
             task_id: Some(task_id.clone()),
             session_id: Some(session_id.clone()),

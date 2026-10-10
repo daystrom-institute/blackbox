@@ -122,7 +122,9 @@ impl ProviderMcp for Provider {
         // flag: claude's variadic `<tools...>` form would otherwise swallow
         // the flags that follow.
         let (deny_flag, allow_flag) = match self.lane() {
-            ProviderLane::ClaudeCli => ("--disallowedTools", "--allowedTools"),
+            ProviderLane::ClaudeCli | ProviderLane::Codex => {
+                ("--disallowedTools", "--allowedTools")
+            }
             ProviderLane::Harness => ("--deny-tools", "--allow-tools"),
             ProviderLane::Workflow => return args,
         };
@@ -158,7 +160,7 @@ impl ProviderMcp for Provider {
             return Vec::new();
         }
         match self.lane() {
-            ProviderLane::ClaudeCli | ProviderLane::Harness => {
+            ProviderLane::ClaudeCli | ProviderLane::Codex | ProviderLane::Harness => {
                 vec!["--mcp-config".into(), fleet_mcp_config_json(servers)]
             }
             ProviderLane::Workflow => Vec::new(),

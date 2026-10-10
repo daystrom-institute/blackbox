@@ -9,7 +9,8 @@ use super::Provider;
 use bro_core::ProviderLane;
 
 /// Resolve the provider binary name from env. The claude lane runs the
-/// vendor `claude` CLI (`CLAUDE_BIN` overrides); the harness lane runs the
+/// vendor `claude` CLI (`CLAUDE_BIN` overrides); the codex lane runs the
+/// `bro-codex` shim (`BRO_CODEX_BIN` overrides); the harness lane runs the
 /// standalone `bro-harness` binary (`BRO_HARNESS_BIN` overrides). Credentials
 /// and endpoints are selected via env (see brofile::resolve_provider_env).
 ///
@@ -18,6 +19,9 @@ use bro_core::ProviderLane;
 fn bin_with_env(provider: Provider) -> String {
     match provider.lane() {
         ProviderLane::ClaudeCli => std::env::var("CLAUDE_BIN").unwrap_or_else(|_| "claude".into()),
+        ProviderLane::Codex => {
+            std::env::var("BRO_CODEX_BIN").unwrap_or_else(|_| "bro-codex".into())
+        }
         ProviderLane::Harness => {
             std::env::var("BRO_HARNESS_BIN").unwrap_or_else(|_| "bro-harness".into())
         }
@@ -194,6 +198,11 @@ fn normalize_model_for_provider(provider: Provider, model: &str) -> String {
 /// catalog `.default` model here, at the single arg-building chokepoint, so
 /// every caller is covered.
 fn default_model(provider: Provider) -> Option<String> {
+    // The codex app-server's own config chooses the model when none is
+    // pinned, as it does for a terminal session.
+    if provider.lane() == ProviderLane::Codex {
+        return None;
+    }
     if !provider.is_dispatchable() {
         return None;
     }
@@ -329,10 +338,12 @@ impl ProviderExec for Provider {
             .is_some_and(ProviderDefaultsMode::suppresses);
 
         match self.lane() {
-            ProviderLane::ClaudeCli => {
+            // The codex lane's shim speaks the claude CLI's argv. It has no
+            // provider-defaults suppression: `--system-prompt` is claude-only.
+            lane @ (ProviderLane::ClaudeCli | ProviderLane::Codex) => {
                 let mut args = stream_json_base_args(prompt);
                 dispatch_context_append_flag(&mut args, dispatch_context);
-                if suppress_provider_defaults {
+                if suppress_provider_defaults && lane == ProviderLane::ClaudeCli {
                     args.extend([
                         "--system-prompt".into(),
                         EMPTY_SYSTEM_PROMPT_OVERRIDE.into(),
@@ -408,11 +419,11 @@ impl ProviderExec for Provider {
             .is_some_and(ProviderDefaultsMode::suppresses);
 
         match self.lane() {
-            ProviderLane::ClaudeCli => {
+            lane @ (ProviderLane::ClaudeCli | ProviderLane::Codex) => {
                 let mut args = vec!["--resume".into(), session_id.into()];
                 args.extend(stream_json_base_args(prompt));
                 dispatch_context_append_flag(&mut args, dispatch_context);
-                if suppress_provider_defaults {
+                if suppress_provider_defaults && lane == ProviderLane::ClaudeCli {
                     args.extend([
                         "--system-prompt".into(),
                         EMPTY_SYSTEM_PROMPT_OVERRIDE.into(),

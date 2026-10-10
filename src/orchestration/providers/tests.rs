@@ -26,7 +26,7 @@ fn provider_roundtrip_for_dispatchable_harness_providers() {
     }
     assert!(Provider::from_str("workflow").is_ok());
     assert!(Provider::from_str("claude").is_err());
-    assert!(Provider::from_str("codex").is_err());
+    assert_eq!(Provider::from_str("codex").ok(), Some(Provider::Codex));
     assert!(Provider::from_str("copilot").is_err());
     assert!(Provider::from_str("gemini").is_err());
 }
@@ -221,6 +221,11 @@ fn harness_exec_and_resume_args_use_stream_json() {
 fn providers_default_model_when_none_supplied() {
     for provider in Provider::ALL {
         let args = provider.build_exec_args("hi", None, "", None, None);
+        if provider.lane() == bro_core::ProviderLane::Codex {
+            // The app-server's own config picks the model.
+            assert!(!args.contains(&"--model".to_string()), "{provider:?}");
+            continue;
+        }
         assert!(
             args.contains(&"--model".to_string()),
             "{provider:?} raw dispatch must include --model"
@@ -266,8 +271,9 @@ fn dispatch_context_rides_its_own_flag_with_verbatim_prompt() {
                     );
                 }
                 // The claude lane renders persona then scope into one
-                // appended system prompt; the CLI has no typed slot.
-                bro_core::ProviderLane::ClaudeCli => {
+                // appended system prompt; the CLI has no typed slot. The
+                // codex shim takes the same text.
+                bro_core::ProviderLane::ClaudeCli | bro_core::ProviderLane::Codex => {
                     assert!(!args.contains(&"--dispatch-context".to_string()));
                     let idx = args
                         .iter()
@@ -720,7 +726,9 @@ fn harness_filter_args_emit_allow_and_deny_flags() {
 
     for provider in Provider::ALL {
         let (deny_flag, allow_flag) = match provider.lane() {
-            bro_core::ProviderLane::ClaudeCli => ("--disallowedTools", "--allowedTools"),
+            bro_core::ProviderLane::ClaudeCli | bro_core::ProviderLane::Codex => {
+                ("--disallowedTools", "--allowedTools")
+            }
             bro_core::ProviderLane::Harness => ("--deny-tools", "--allow-tools"),
             bro_core::ProviderLane::Workflow => unreachable!(),
         };
@@ -940,4 +948,107 @@ fn resolve_session_cwd_is_absent_for_harness_providers() {
     for provider in Provider::ALL {
         assert!(provider.resolve_session_cwd("any").is_none(), "{provider}");
     }
+}
+
+#[test]
+fn codex_lane_speaks_the_claude_cli_argv_without_claude_only_flags() {
+    let opts = ExecOpts {
+        model: Some("gpt-6-sol".into()),
+        effort: Some("high".into()),
+        output_schema: Some(r#"{"type":"object"}"#.into()),
+        provider_defaults: Some(
+            crate::orchestration::brofile::ProviderDefaultsMode::SuppressWhenSupported,
+        ),
+        code_mode: Some(crate::orchestration::brofile::CodeMode::Optional),
+        service_tier: Some("priority".into()),
+        ..Default::default()
+    };
+    let fresh = Provider::Codex.build_exec_args("hello", None, "pending", None, Some(&opts));
+    assert_eq!(&fresh[..2], ["-p", "hello"]);
+    for pair in [
+        ["--output-format", "stream-json"],
+        ["--model", "gpt-6-sol"],
+        ["--effort", "high"],
+        ["--json-schema", r#"{"type":"object"}"#],
+    ] {
+        assert!(fresh.windows(2).any(|w| w == pair), "{pair:?} in {fresh:?}");
+    }
+    assert!(fresh.contains(&"--dangerously-skip-permissions".to_string()));
+    // A fresh codex session has no id until the app-server mints the thread.
+    assert!(!fresh.contains(&"--session-id".to_string()), "{fresh:?}");
+    for absent in [
+        "--system-prompt",
+        "--output-schema",
+        "--code-mode",
+        "--service-tier",
+        "--dispatch-context",
+    ] {
+        assert!(
+            !fresh.contains(&absent.to_string()),
+            "{absent} in {fresh:?}"
+        );
+    }
+
+    let resume = Provider::Codex.build_resume_args("thread-1", "again", None, Some(&opts));
+    assert_eq!(&resume[..2], ["--resume", "thread-1"]);
+    assert!(
+        !resume.contains(&"--system-prompt".to_string()),
+        "{resume:?}"
+    );
+    assert!(
+        resume
+            .windows(2)
+            .any(|w| w == ["--json-schema", r#"{"type":"object"}"#])
+    );
+}
+
+#[test]
+fn codex_lane_binary_comes_from_bro_codex_bin() {
+    let mut env = crate::util::TestEnvGuard::new();
+    env.remove("BRO_CODEX_BIN");
+    assert_eq!(Provider::Codex.bin(), "bro-codex");
+    env.set("BRO_CODEX_BIN", "/opt/bin/bro-codex");
+    assert_eq!(Provider::Codex.bin(), "/opt/bin/bro-codex");
+}
+
+#[test]
+fn lane_properties_follow_the_lane() {
+    use bro_core::ProviderLane;
+    for lane in [ProviderLane::ClaudeCli, ProviderLane::Codex] {
+        assert!(supervisor_writes_event_log(lane));
+        assert!(closes_input_after_result(lane));
+    }
+    assert!(!supervisor_writes_event_log(ProviderLane::Harness));
+    assert!(!closes_input_after_result(ProviderLane::Harness));
+    assert!(worker_assigns_session_id(ProviderLane::Codex));
+    assert!(!worker_assigns_session_id(ProviderLane::ClaudeCli));
+    assert!(!worker_assigns_session_id(ProviderLane::Harness));
+}
+
+#[test]
+fn codex_lane_events_parse_as_the_claude_envelope() {
+    let mut sink = empty_sink();
+    Provider::Codex.parse_event(
+        &serde_json::json!({"type": "system", "subtype": "init", "session_id": "thread-7"}),
+        &mut sink,
+    );
+    Provider::Codex.parse_event(
+        &serde_json::json!({
+            "type": "result", "subtype": "success", "is_error": false,
+            "session_id": "thread-7", "result": "ok", "num_turns": 2,
+            "usage": {"input_tokens": 10, "output_tokens": 3, "cache_read_input_tokens": 90, "cache_creation_input_tokens": 0}
+        }),
+        &mut sink,
+    );
+    assert_eq!(sink.session_id.as_deref(), Some("thread-7"));
+    assert_eq!(sink.last_assistant_message.as_deref(), Some("ok"));
+    let usage = sink.usage.expect("usage");
+    assert_eq!(
+        (
+            usage.input_tokens,
+            usage.cached_input_tokens,
+            usage.output_tokens
+        ),
+        (10, 90, 3)
+    );
 }

@@ -625,7 +625,10 @@ fn claude_control_input(subtype: &str, request_id: String, fields: Value) -> Val
 fn control_input(lane: ProviderLane, subtype: &str, fields: Value) -> Value {
     let request_id = uuid::Uuid::new_v4().to_string();
     match lane {
-        ProviderLane::ClaudeCli => claude_control_input(subtype, request_id, fields),
+        // The codex shim takes the claude CLI's control shape.
+        ProviderLane::ClaudeCli | ProviderLane::Codex => {
+            claude_control_input(subtype, request_id, fields)
+        }
         ProviderLane::Harness | ProviderLane::Workflow => {
             harness_control_input(subtype, request_id, fields)
         }
@@ -816,10 +819,11 @@ pub fn interrupt_harness_task(task_id: &str, redirect: Option<String>) -> Result
                 .ok_or_else(|| format!("task {task_id} has no live harness control channel"))?;
             let closed = |_| format!("task {task_id} harness control channel is closed");
             match control.lane {
-                // The claude CLI has no redirect payload on its interrupt: the
-                // interrupt ends the turn and the redirect, queued right
-                // behind it on stdin, starts the next one.
-                ProviderLane::ClaudeCli => {
+                // The claude CLI and the codex shim have no redirect payload
+                // on their interrupt: the interrupt ends the turn and the
+                // redirect, queued right behind it on stdin, starts the next
+                // one.
+                ProviderLane::ClaudeCli | ProviderLane::Codex => {
                     control
                         .tx
                         .send(control_input(
@@ -3261,6 +3265,10 @@ async fn spawn_harness_child_task(
     harness_bin: Option<String>,
     origin: bro_core::Origin,
 ) -> Arc<Task> {
+    // A fresh session on a lane whose worker mints its own session id has no
+    // id yet: the task starts pending and adopts the id the worker's first
+    // event carries. A resume names the session the worker continues.
+    let session_id = fresh_session_id_for_lane(provider.lane(), &args, session_id);
     let self_mcp_url = std::env::var("BLACKBOX_MCP_URL")
         .ok()
         .filter(|url| !url.is_empty())
@@ -3494,6 +3502,17 @@ async fn spawn_harness_child_task(
     task
 }
 
+/// The session id a dispatch records before its worker reports one: the
+/// dispatch's own id, except for a fresh session on a lane whose worker mints
+/// the id, which starts `pending`.
+fn fresh_session_id_for_lane(lane: ProviderLane, args: &[String], session_id: String) -> String {
+    if providers::worker_assigns_session_id(lane) && !args.iter().any(|arg| arg == "--resume") {
+        "pending".to_string()
+    } else {
+        session_id
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prepare_harness_child_launch(
     task_id: String,
@@ -3540,10 +3559,11 @@ fn prepare_harness_child_launch(
                 set_cli_value_arg(&mut args, "--shell-env", serde_json::to_string(&shell_env)?);
             }
         }
-        // The claude CLI's shell children inherit the process env, so the
-        // non-secret project build env rides the child env directly. The
-        // harness-only tool defaults have no claude equivalent.
-        ProviderLane::ClaudeCli => {
+        // The claude CLI's shell children inherit the process env, as do the
+        // codex app-server's through the shim, so the non-secret project
+        // build env rides the child env directly. The harness-only tool
+        // defaults have no vendor CLI equivalent.
+        ProviderLane::ClaudeCli | ProviderLane::Codex => {
             if let Some(shell_env) = shell_env {
                 shell_env_for_process = shell_env;
             }
@@ -3596,8 +3616,9 @@ fn prepare_harness_child_launch(
         // The claude CLI loads exactly the servers named here (its own
         // user/project MCP config is skipped), with no tool-placement block
         // and header secrets referenced as `${VAR}` so argv never carries
-        // them.
-        ProviderLane::ClaudeCli => {
+        // them. The codex shim takes the same config and translates it into
+        // app-server MCP server overrides.
+        ProviderLane::ClaudeCli | ProviderLane::Codex => {
             if let Some(config) =
                 build_claude_mcp_config(&mut args, self_mcp_url, workspace_binding.is_some())?
             {
@@ -3692,9 +3713,9 @@ fn prepare_harness_child_launch(
         initial_messages: vec![harness_user_input(initial_prompt)],
         bro_home,
         event_log_path,
-        // A claude CLI child writes no session log of its own; the executor
+        // A vendor CLI child writes no session log of its own; the executor
         // that owns its stdout writes it at the pinned path.
-        supervisor_writes_event_log: lane == ProviderLane::ClaudeCli,
+        supervisor_writes_event_log: providers::supervisor_writes_event_log(lane),
     })
 }
 
@@ -3808,8 +3829,8 @@ fn spawn_harness_ingest_loop(
             // Stream partials never reach a session log: the harness drops
             // them from its own, and the mirror keeps the same shape.
             let is_stream_partial = event_type == "stream_event";
-            let ends_claude_turn =
-                provider.lane() == ProviderLane::ClaudeCli && event_type == "result";
+            let ends_cli_turn =
+                providers::closes_input_after_result(provider.lane()) && event_type == "result";
             if !is_stream_partial && let Some((path, file)) = mirror.as_mut() {
                 let record = serde_json::to_vec(&serde_json::json!({
                     "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
@@ -3863,13 +3884,14 @@ fn spawn_harness_ingest_loop(
                 let mut inner = task.inner.lock();
                 inner.harness_ingest_seq = inner.harness_ingest_seq.max(seq);
             }
-            // A claude CLI child idles after a turn until stdin closes.
+            // A vendor CLI child (the claude CLI, the codex shim) idles after
+            // a turn until stdin closes.
             // Dropping its control lane here closes stdin, so the child
             // finishes whatever input it already read and exits: the same
             // exit-when-idle contract the harness implements itself. A steer
             // that lands after this point is refused, as it would be after a
             // harness exit, and goes through resume instead.
-            if ends_claude_turn {
+            if ends_cli_turn {
                 harness_controls().write().remove(&task_id);
             }
         }
@@ -4121,9 +4143,14 @@ fn ingest_harness_event(
                 session_id_observed = true;
                 let observed_session_id = inner.session_id.clone();
                 if let Some(location) = inner.transcript_location.as_mut() {
-                    location
-                        .path
-                        .set_file_name(format!("{observed_session_id}.events.jsonl"));
+                    // A worker that writes its own log names it by the session
+                    // it observed; an executor-written log stays at the path
+                    // pinned in the spawn spec.
+                    if !providers::supervisor_writes_event_log(provider.lane()) {
+                        location
+                            .path
+                            .set_file_name(format!("{observed_session_id}.events.jsonl"));
+                    }
                     location.session_id = Some(observed_session_id);
                 }
             } else if inner.session_id != sid {
@@ -6283,6 +6310,144 @@ mod tests {
         assert_eq!(redirect["message"]["content"][0]["text"], "go left");
 
         harness_controls().write().remove(task_id);
+    }
+
+    #[test]
+    fn apply_session_command_maps_protocol_variants_to_codex_shim_wire() {
+        use bro_protocol::SessionCommand;
+
+        let task_id = "test-session-command-mapping-codex";
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        register_test_control(task_id, tx, ProviderLane::Codex);
+
+        apply_session_command(task_id, SessionCommand::UserTurn { text: "hi".into() }).unwrap();
+        assert_eq!(
+            rx.try_recv().unwrap()["message"]["content"][0]["text"],
+            "hi"
+        );
+
+        // The shim takes the claude CLI's nested control shape.
+        apply_session_command(task_id, SessionCommand::SetModel { model: "m2".into() }).unwrap();
+        let set_model = rx.try_recv().unwrap();
+        assert_eq!(set_model["request"]["subtype"], "set_model");
+        assert_eq!(set_model["request"]["model"], "m2");
+
+        interrupt_harness_task(task_id, Some("go left".into())).unwrap();
+        let interrupt = rx.try_recv().unwrap();
+        assert_eq!(interrupt["request"]["subtype"], "interrupt");
+        assert!(interrupt["request"].get("prompt").is_none());
+        let redirect = rx.try_recv().unwrap();
+        assert_eq!(redirect["message"]["content"][0]["text"], "go left");
+
+        harness_controls().write().remove(task_id);
+    }
+
+    #[test]
+    fn codex_lane_child_launch_composes_shim_argv_and_env() {
+        let mut env = crate::util::TestEnvGuard::new();
+        env.set("BLACKBOX_MCP_NAME", "selfbox");
+        env.set("BRO_CODEX_BIN", "/opt/bin/bro-codex");
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        env.set(
+            "BLACKBOX_CONFIG",
+            root.join("missing-config.toml").to_str().unwrap(),
+        );
+        let spec = prepare_harness_child_launch(
+            "task-codex".to_string(),
+            "pending".to_string(),
+            Provider::Codex,
+            vec![
+                "-p".to_string(),
+                "initial turn".to_string(),
+                "--disallowedTools".to_string(),
+                "mcp__selfbox__bro_exec".to_string(),
+                "--mcp-config".to_string(),
+                serde_json::json!({
+                    "mcpServers": {
+                        "external": {"type": "stdio", "command": "external-mcp"}
+                    },
+                    "tool_placement": {"mcp__external__inspect": "both"}
+                })
+                .to_string(),
+            ],
+            root.to_str(),
+            Some(HashMap::from([(
+                "CODEX_HOME".to_string(),
+                "/home/op/.codex-account2".to_string(),
+            )])),
+            Some(BTreeMap::from([(
+                "RUSTC_WRAPPER".to_string(),
+                "sccache".to_string(),
+            )])),
+            Some(BTreeMap::from([(
+                "mcp__external__inspect".to_string(),
+                "both".to_string(),
+            )])),
+            Some(BTreeMap::from([(
+                "default:file_read.offset".to_string(),
+                serde_json::json!("10"),
+            )])),
+            None,
+            &root,
+            Some("http://127.0.0.1:7264/mcp?surface=default"),
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(spec.bin_override.as_deref(), Some("/opt/bin/bro-codex"));
+        assert_eq!(spec.initial_messages.len(), 1);
+        assert!(!spec.argv.iter().any(|arg| arg == "initial turn"));
+        let flag = |name: &str| {
+            spec.argv
+                .iter()
+                .position(|a| a == name)
+                .map(|at| spec.argv[at + 1].clone())
+        };
+        assert_eq!(flag("--input-format").as_deref(), Some("stream-json"));
+        assert!(spec.argv.iter().any(|a| a == "--replay-user-messages"));
+        assert!(spec.argv.iter().any(|a| a == "--strict-mcp-config"));
+        assert_eq!(
+            flag("--disallowedTools").as_deref(),
+            Some("mcp__selfbox__bro_exec")
+        );
+        for harness_only in [
+            "--exit-when-idle",
+            "--daemon-worker",
+            "--cwd",
+            "--capability-mcp-server",
+            "--additional-context",
+            "--shell-env",
+            "--session-id",
+        ] {
+            assert!(
+                !spec.argv.iter().any(|arg| arg == harness_only),
+                "{harness_only} leaked"
+            );
+        }
+        let config: Value = serde_json::from_str(&flag("--mcp-config").unwrap()).unwrap();
+        assert!(config.get("tool_placement").is_none(), "{config}");
+        assert_eq!(config["mcpServers"]["external"]["command"], "external-mcp");
+        assert_eq!(config["mcpServers"]["selfbox"]["type"], "http");
+
+        let env = spec.env.as_map();
+        assert_eq!(env.get("RUSTC_WRAPPER"), Some(&"sccache".to_string()));
+        assert_eq!(
+            env.get("CODEX_HOME"),
+            Some(&"/home/op/.codex-account2".to_string())
+        );
+        assert!(!env.contains_key("BRO_HARNESS_PROVIDER"));
+        assert_eq!(spec.cwd.as_deref(), root.to_str());
+        // No session yet: the task id is the supervision key and names the
+        // executor-written log.
+        assert_eq!(spec.session_id, "task-codex");
+        assert!(spec.supervisor_writes_event_log);
+        assert_eq!(
+            spec.event_log_path,
+            root.join("harness-sessions")
+                .join("task-codex.events.jsonl")
+        );
     }
 
     #[test]
@@ -9067,12 +9232,12 @@ mod tests {
         let root = dir.path().canonicalize().unwrap();
         let task = mk_ingest_task("task-pending-location", "pending");
         task.inner.lock().transcript_location =
-            harness_transcript_location(Provider::Minimax, &root, "pending", Some("/repo"));
+            harness_transcript_location(Provider::Brodex, &root, "pending", Some("/repo"));
         let (tx, _rx) = tokio::sync::broadcast::channel(16);
 
         ingest_harness_event(
             &task,
-            Provider::Minimax,
+            Provider::Brodex,
             serde_json::json!({
                 "type": "system",
                 "subtype": "init",
@@ -9091,6 +9256,65 @@ mod tests {
                 .join("resolved-session.events.jsonl")
         );
         assert_eq!(location.session_id.as_deref(), Some("resolved-session"));
+    }
+
+    /// A codex-lane worker mints its thread id, so a fresh task starts pending
+    /// and adopts the id from the shim's init event. Its log is written by the
+    /// executor at the path pinned in the spawn spec, so the location keeps
+    /// that path and only learns the session id.
+    #[test]
+    fn codex_init_event_adopts_the_thread_id_and_keeps_the_pinned_log_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let task = mk_ingest_task("task-codex", "pending");
+        let pinned = root
+            .join("harness-sessions")
+            .join("task-codex.events.jsonl");
+        task.inner.lock().transcript_location =
+            harness_transcript_location(Provider::Codex, &root, "pending", Some("/repo")).map(
+                |mut location| {
+                    location.path = pinned.clone();
+                    location
+                },
+            );
+        let (tx, _rx) = tokio::sync::broadcast::channel(16);
+
+        ingest_harness_event(
+            &task,
+            Provider::Codex,
+            serde_json::json!({
+                "type": "system",
+                "subtype": "init",
+                "session_id": "thread-1",
+            }),
+            &tx,
+            "task-codex",
+        );
+
+        let inner = task.inner.lock();
+        assert_eq!(inner.session_id, "thread-1");
+        assert_ne!(inner.status, TaskStatus::Failed, "{}", inner.stderr);
+        let location = inner.transcript_location.as_ref().unwrap();
+        assert_eq!(location.path, pinned);
+        assert_eq!(location.session_id.as_deref(), Some("thread-1"));
+    }
+
+    #[test]
+    fn a_fresh_codex_dispatch_starts_pending_and_a_resume_keeps_its_thread() {
+        let fresh = vec!["-p".to_string(), "hi".to_string()];
+        assert_eq!(
+            fresh_session_id_for_lane(ProviderLane::Codex, &fresh, "minted".into()),
+            "pending"
+        );
+        let resume = vec!["--resume".to_string(), "thread-1".to_string()];
+        assert_eq!(
+            fresh_session_id_for_lane(ProviderLane::Codex, &resume, "thread-1".into()),
+            "thread-1"
+        );
+        assert_eq!(
+            fresh_session_id_for_lane(ProviderLane::ClaudeCli, &fresh, "minted".into()),
+            "minted"
+        );
     }
 
     #[test]

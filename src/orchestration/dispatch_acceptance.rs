@@ -17,7 +17,9 @@ mod acceptance {
     /// A stub standing in for `bro-harness`. It records what it was started
     /// with under `<root>/child-<pid>/` (argv, cwd, the provider it was told to
     /// be, the path it was run as, and environment variable names, never
-    /// values), appends every stdin line it receives, ends a turn with an
+    /// values), appends every stdin line it receives, and, when it was given
+    /// no session, mints `stub-thread-<pid>` and reports it in an `init`
+    /// event the way the codex shim reports its thread. It ends a turn with an
     /// error result and keeps running when a line mentions TURN_FAIL,
     /// finishes its turn when a line mentions FINISH, and records a
     /// termination signal before exiting on one.
@@ -34,6 +36,10 @@ mod acceptance {
              \x20 case \"$prev\" in --session-id|--resume) session=$a;; esac\n\
              \x20 prev=$a\n\
              done\n\
+             if [ -z \"$session\" ]; then\n\
+             \x20 session=stub-thread-$$\n\
+             \x20 printf '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"%s\"}}\\n' \"$session\"\n\
+             fi\n\
              env | sed 's/=.*//' | sort > \"$out/env-names\"\n\
              printf '%s\\n' \"$PWD\" > \"$out/cwd\"\n\
              printf '%s\\n' \"$0\" > \"$out/bin\"\n\
@@ -382,6 +388,105 @@ mod acceptance {
         let cancelled = parsed(&plane.server.bro_cancel(call(json!({ "task_id": task }))));
         assert_eq!(cancelled["status"], "cancelled", "{cancelled}");
         await_file(&child.join("signal"), "term").await;
+    }
+
+    /// A codex-lane dispatch through fleetd launches `BRO_CODEX_BIN` with the
+    /// claude CLI argv and no session id, adopts the thread id the worker
+    /// reports first, gets its session log written by fleetd at the path the
+    /// spawn pinned, has its stdin closed once the turn's result arrives, and
+    /// resumes by that thread id.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_codex_lane_child_adopts_its_thread_id_and_resumes_by_it() {
+        let mut plane = Plane::start().await;
+        let codex_stub = plane.root.join("recording-codex.sh");
+        std::os::unix::fs::symlink(plane.root.join("recording-harness.sh"), &codex_stub)
+            .expect("codex stub link");
+        plane._env.set("BRO_CODEX_BIN", &codex_stub);
+        let cwd = plane.cwd();
+        let (task, _, child) = plane
+            .exec(json!({ "prompt": "first turn", "provider": "codex", "cwd": cwd }))
+            .await;
+        await_file(&child.join("stdin"), "first turn").await;
+
+        let launched = argv(&child);
+        assert_eq!(flag(&launched, "--input-format"), Some("stream-json"), "{launched:?}");
+        assert!(launched.iter().any(|a| a == "--replay-user-messages"));
+        for absent in [
+            "--session-id",
+            "--resume",
+            "--exit-when-idle",
+            "--daemon-worker",
+            "--cwd",
+            "--shell-env",
+            "--system-prompt",
+        ] {
+            assert!(!launched.iter().any(|a| a == absent), "{absent} in {launched:?}");
+        }
+        assert_eq!(read(&child, "bin").trim(), codex_stub.to_string_lossy());
+        assert_eq!(read(&child, "cwd").trim(), cwd);
+        assert_eq!(read(&child, "provider").trim(), "");
+
+        // The task adopts the thread the worker reported.
+        let pid = child
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix("child-"))
+            .expect("child pid")
+            .to_string();
+        let thread = format!("stub-thread-{pid}");
+        let deadline = tokio::time::Instant::now() + super::smoke::DEADLINE;
+        loop {
+            let status = plane.status(&task);
+            if status["sessionId"] == thread.as_str() {
+                assert_eq!(status["status"], "running", "{status}");
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the task never adopted {thread}: {status}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        // The result ends the turn: stdin closes, and fleetd has logged the
+        // whole stream at the path pinned at spawn, named by the task.
+        assert_eq!(plane.steer(&task, "TURN_FAIL")["status"], "steered");
+        await_file(&child.join("stdin-closed"), "").await;
+        let log = plane
+            .root
+            .join("bro")
+            .join("harness-sessions")
+            .join(format!("{task}.events.jsonl"));
+        let logged = await_file(&log, "stub turn failed").await;
+        assert!(logged.contains(&format!("\"session_id\":\"{thread}\"")), "{logged}");
+        assert!(logged.contains("\"subtype\":\"init\""), "{logged}");
+
+        let cancelled = parsed(&plane.server.bro_cancel(call(json!({ "task_id": task }))));
+        assert_eq!(cancelled["status"], "cancelled", "{cancelled}");
+        await_file(&child.join("signal"), "term").await;
+
+        // Resume names the thread; the resumed task records it from the start.
+        let resumed = parsed(
+            &plane
+                .server
+                .bro_resume(call(json!({
+                    "prompt": "second turn",
+                    "session_id": thread,
+                    "provider": "codex",
+                    "cwd": cwd,
+                })))
+                .await,
+        );
+        let resumed_task = resumed["taskId"].as_str().expect("resume taskId").to_string();
+        let second = plane.next_child().await;
+        await_file(&second.join("stdin"), "second turn").await;
+        let second_argv = argv(&second);
+        assert_eq!(flag(&second_argv, "--resume"), Some(thread.as_str()), "{second_argv:?}");
+        assert_eq!(read(&second, "bin").trim(), codex_stub.to_string_lossy());
+        assert_eq!(plane.status(&resumed_task)["sessionId"], thread.as_str());
+        let cancelled = parsed(&plane.server.bro_cancel(call(json!({ "task_id": resumed_task }))));
+        assert_eq!(cancelled["status"], "cancelled", "{cancelled}");
+        await_file(&second.join("signal"), "term").await;
     }
 
     /// A turn that ends in an error result does not end the worker. The task

@@ -8,6 +8,17 @@ out explicitly under `Changed` or `Removed`.
 
 ## Unreleased
 
+- The dispatch plane gains a codex lane. The `codex` provider runs one
+  `bro-codex` child per dispatch (`BRO_CODEX_BIN`, a new checkout-host
+  binary), which fronts its own `codex app-server` and speaks the claude
+  lane's stream-json stdio contract: steer, interrupt, set_model, compaction,
+  per-turn results with usage, and exit at end of input. The account selects
+  `CODEX_HOME`. The app-server mints the thread id, so a fresh codex task
+  starts pending and adopts it; dispatched sessions index as
+  `codex-dispatch`. `codex` is no longer a serde alias of `brodex`: the
+  bundled brofiles that relied on it now name `brodex`, and a brofile that
+  says `provider: codex` dispatches to the new lane.
+
 - The dispatch plane gains a claude CLI lane: GLM, DeepSeek, MiniMax and Kimi
   now run as `claude -p` children against their `~/.claude-*` config dirs
   instead of `bro-harness`.
