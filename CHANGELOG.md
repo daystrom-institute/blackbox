@@ -13,6 +13,9 @@ out explicitly under `Changed` or `Removed`.
   that forwards `X-Forwarded-Email`. It renders the page shell and an
   overview of threads, bros, projects, index health and open gaps.
 
+- The operator web UI adds thread pages (filtered list and thread detail) and
+  bros pages (a live roster and a task page with a streaming event tail).
+
 - HTTP task launches and resumes now report origin `control`, with the same
   interactive MCP policy. Stored `cockpit` origins remain readable. Removed
   unused cockpit dispatch/transcript types and TUI design/backlog documents;
