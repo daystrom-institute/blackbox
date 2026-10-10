@@ -182,6 +182,8 @@ tokio-util = { version = "0.7", features = ["rt"] }
 # HTTP server (for /tail endpoint outside MCP)
 axum = { version = "0.8", features = ["macros"] }
 http = "1"
+# Compile-time HTML templates for the operator web UI.
+maud = { version = "0.27", features = ["axum"] }
 
 # IDs
 uuid = { version = "1", features = ["v4"] }

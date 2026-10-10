@@ -55,6 +55,12 @@ pub async fn run() -> anyhow::Result<()> {
     // listener; the initial lifecycle pass itself is spawned below.
     let port = cfg.daemon.port;
     let listener = tokio::net::TcpListener::bind(format!("{bind_host}:{port}")).await?;
+    // The operator UI listener, when configured. A non-loopback address is
+    // refused before its socket opens.
+    let ui_listener = match cfg.daemon.ui_listen.as_deref() {
+        Some(ui_listen) => Some(super::ui::bind_ui_listener(ui_listen).await?),
+        None => None,
+    };
 
     start_background_tasks(shared.clone()).await?;
     // Dial fleetd and re-attach whatever survived our restart now, rather than
@@ -64,6 +70,15 @@ pub async fn run() -> anyhow::Result<()> {
     // MCP service
     let ct = CancellationToken::new();
     let app = build_http_app(shared.clone(), &cfg, &ct)?;
+    if let Some(ui_listener) = ui_listener {
+        let ui_addr = ui_listener.local_addr()?;
+        super::ui::spawn_ui_server(
+            ui_listener,
+            super::ui::build_ui_router(super::ui::UiState::new(shared.clone())),
+            ct.clone(),
+        );
+        tracing::info!("operator UI listening on http://{ui_addr}/");
+    }
 
     // Bind address resolved above (hoisted so SharedState gets the
     // loopback flag). Default `127.0.0.1`; BBOX_BIND=0.0.0.0 opens

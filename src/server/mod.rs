@@ -53,6 +53,7 @@ pub mod storage_gc;
 pub mod store_helpers;
 pub mod surface;
 pub mod tail;
+mod ui;
 
 pub(crate) use routes::*;
 pub use run::run;
