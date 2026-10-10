@@ -5415,7 +5415,7 @@ fn control_body_page(
 }
 
 /// Return the tail of `s` that fits within `max_bytes` on a char boundary.
-fn tail_str_safe(s: &str, max_bytes: usize) -> String {
+pub(crate) fn tail_str_safe(s: &str, max_bytes: usize) -> String {
     if s.len() <= max_bytes {
         return s.to_string();
     }
@@ -5581,7 +5581,10 @@ pub(crate) fn control_task_status_json(
     Ok(out)
 }
 
-fn compact_status_event(event: &Value) -> Option<Value> {
+/// The status projection of one retained event: stream partials dropped,
+/// thinking blocks stripped, long strings bounded. `bro_status` event
+/// previews and the operator UI task tail share it.
+pub(crate) fn compact_status_event(event: &Value) -> Option<Value> {
     if event.get("type").and_then(Value::as_str) == Some("stream_event") {
         return None;
     }
