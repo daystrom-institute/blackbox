@@ -248,6 +248,7 @@ pub struct ProviderLaunch {
     pub argv: Vec<String>,
     pub codex: Option<bro_protocol::CodexSessionConfig>,
     pub prompt: Option<String>,
+    pub errors: Vec<String>,
 }
 
 impl From<Vec<String>> for ProviderLaunch {
@@ -276,9 +277,35 @@ impl ProviderLaunch {
             config.disallowed_tools = super::mcp_args::expand_filter_patterns(&filters.disallow);
         } else {
             use super::dispatch_prelude::ProviderMcp;
+            if provider.lane() == ProviderLane::ClaudeCli && !filters.allow.is_empty() {
+                self.errors.push(
+                    "Claude CLI cannot enforce a global tool allowlist across native and MCP tools"
+                        .into(),
+                );
+            }
             self.argv.extend(provider.build_filter_args(filters));
         }
     }
+}
+
+fn cli_launch(provider: Provider, argv: Vec<String>, opts: Option<&ExecOpts>) -> ProviderLaunch {
+    let mut launch = ProviderLaunch::from(argv);
+    if provider.lane() == ProviderLane::ClaudeCli
+        && let Some(opts) = opts
+    {
+        for (name, present) in [
+            ("code_mode", opts.code_mode.is_some()),
+            ("edit_discipline", opts.edit_discipline.is_some()),
+            ("service_tier", opts.service_tier.is_some()),
+        ] {
+            if present {
+                launch
+                    .errors
+                    .push(format!("Claude CLI does not support {name}"));
+            }
+        }
+    }
+    launch
 }
 
 fn codex_launch(
@@ -310,6 +337,7 @@ fn codex_launch(
             });
     ProviderLaunch {
         argv: Vec::new(),
+        errors: Vec::new(),
         prompt: Some(prompt.into()),
         codex: Some(bro_protocol::CodexSessionConfig {
             resume: resume.map(str::to_string),
@@ -428,7 +456,7 @@ impl ProviderExec for Provider {
             .and_then(|o| o.provider_defaults)
             .is_some_and(ProviderDefaultsMode::suppresses);
 
-        match self.lane() {
+        let argv = match self.lane() {
             ProviderLane::ClaudeCli => {
                 let mut args = stream_json_base_args(prompt);
                 dispatch_context_append_flag(&mut args, dispatch_context);
@@ -486,8 +514,8 @@ impl ProviderExec for Provider {
             }
             ProviderLane::Codex => unreachable!("Codex uses typed launch settings"),
             ProviderLane::Workflow => Vec::new(),
-        }
-        .into()
+        };
+        cli_launch(*self, argv, opts)
     }
 
     fn build_resume_args(
@@ -512,7 +540,7 @@ impl ProviderExec for Provider {
             .and_then(|o| o.provider_defaults)
             .is_some_and(ProviderDefaultsMode::suppresses);
 
-        match self.lane() {
+        let argv = match self.lane() {
             ProviderLane::ClaudeCli => {
                 let mut args = vec!["--resume".into(), session_id.into()];
                 args.extend(stream_json_base_args(prompt));
@@ -566,7 +594,7 @@ impl ProviderExec for Provider {
             }
             ProviderLane::Codex => unreachable!("Codex uses typed launch settings"),
             ProviderLane::Workflow => Vec::new(),
-        }
-        .into()
+        };
+        cli_launch(*self, argv, opts)
     }
 }

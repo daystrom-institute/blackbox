@@ -272,6 +272,16 @@ pub async fn spawn_worker(spec: WorkerSpawnSpec) -> anyhow::Result<WorkerChild> 
     }
     command.env("BRO_HOME", &spec.bro_home);
 
+    let session_log = if spec.supervisor_writes_event_log || spec.codex.is_some() {
+        Some(
+            bro_worker::SessionLogWriter::open(&spec.event_log_path)
+                .await
+                .map_err(|e| anyhow::anyhow!("cannot open worker event log: {e}"))?,
+        )
+    } else {
+        None
+    };
+
     let mut child = command
         .spawn()
         .map_err(|error| anyhow::anyhow!("spawn {bin}: {error}"))?;
@@ -296,11 +306,6 @@ pub async fn spawn_worker(spec: WorkerSpawnSpec) -> anyhow::Result<WorkerChild> 
     // the replay window and the cockpit read exists on this host either way.
     let (events_tx, events_rx) = mpsc::unbounded_channel::<String>();
     let (stdout_done_tx, stdout_done_rx) = oneshot::channel::<()>();
-    let session_log = if spec.supervisor_writes_event_log && spec.codex.is_none() {
-        bro_worker::SessionLogWriter::open(&spec.event_log_path).await
-    } else {
-        None
-    };
     let adapter = if let Some(config) = spec.codex.clone() {
         let stdin = stdin.ok_or_else(|| anyhow::anyhow!("Codex stdin missing"))?;
         let stdout = stdout.ok_or_else(|| anyhow::anyhow!("Codex stdout missing"))?;
@@ -312,38 +317,40 @@ pub async fn spawn_worker(spec: WorkerSpawnSpec) -> anyhow::Result<WorkerChild> 
             stdout,
             control_rx,
             events_tx,
-            spec.event_log_path.clone(),
+            session_log.expect("native worker log"),
         )))
     } else {
         if let Some(stdin) = stdin {
             spawn_control_writer(spec.session_id.clone(), stdin, control_rx);
         }
-        if let Some(stdout) = stdout {
-            tokio::spawn(async move {
-                let mut lines = tokio::io::BufReader::new(stdout).lines();
-                let mut session_log = session_log;
-                while let Ok(Some(line)) = lines.next_line().await {
-                    let line = if let Some(log) = session_log.as_mut() {
-                        match log.record_provider_event(spec.provider, &line).await {
-                            Ok(line) => line,
-                            Err(_) => break,
-                        }
-                    } else {
-                        line
-                    };
-                    if events_tx.send(line).is_err() {
-                        break;
-                    }
-                }
-                if let Some(log) = session_log.as_mut() {
-                    log.finish().await;
-                }
-                let _ = stdout_done_tx.send(());
-            });
+        if let Some(log) = session_log {
+            let stdout = stdout.ok_or_else(|| anyhow::anyhow!("CLI stdout missing"))?;
+            drop(stdout_done_tx);
+
+            Some(tokio::spawn(bro_worker::relay_cli(
+                tokio::io::BufReader::new(stdout),
+                log,
+                spec.provider,
+                events_tx,
+                |_| {},
+            )))
         } else {
-            let _ = stdout_done_tx.send(());
+            if let Some(stdout) = stdout {
+                tokio::spawn(async move {
+                    let mut lines = tokio::io::BufReader::new(stdout).lines();
+
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        if events_tx.send(line).is_err() {
+                            break;
+                        }
+                    }
+                    let _ = stdout_done_tx.send(());
+                });
+            } else {
+                let _ = stdout_done_tx.send(());
+            }
+            None
         }
-        None
     };
 
     // stderr: accumulate a bounded tail for the terminal outcome.
@@ -366,7 +373,7 @@ pub async fn spawn_worker(spec: WorkerSpawnSpec) -> anyhow::Result<WorkerChild> 
     let (outcome_tx, outcome_rx) = oneshot::channel::<WorkerOutcome>();
     tokio::spawn(async move {
         let (exit_code, adapter_error) = if let Some(adapter) = adapter {
-            bro_worker::codex::wait_for_child(child, adapter).await
+            bro_worker::wait_for_child(child, adapter, spec.provider.as_str()).await
         } else {
             (
                 child.wait().await.ok().and_then(|s| s.code()),
@@ -552,6 +559,35 @@ mod tests {
         tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cli_log_failures_refuse_spawn_or_stop_the_running_child() {
+        let root = tempfile::tempdir().unwrap();
+        let mut spec = sample_spec();
+        spec.bin_override = Some("/bin/sh".into());
+        spec.cwd = None;
+        spec.supervisor_writes_event_log = true;
+        spec.event_log_path = root.path().to_path_buf();
+        spec.argv = vec!["-c".into(), "exit 0".into()];
+        let error = match spawn_worker(spec.clone()).await {
+            Ok(_) => panic!("bad log admitted a worker"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("cannot open worker event log"));
+        spec.event_log_path = root.path().join("session.events.jsonl");
+        spec.argv = vec!["-c".into(), "printf 'not-json\\n'; exec sleep 60".into()];
+        let child = spawn_worker(spec).await.unwrap();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(3), child.outcome)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome.exit_code, Some(1));
+        assert!(
+            outcome.stderr_tail.contains("worker:"),
+            "{:?}",
+            outcome.stderr_tail
+        );
     }
 
     #[tokio::test]

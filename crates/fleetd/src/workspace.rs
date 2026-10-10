@@ -290,6 +290,10 @@ fn read_workspace_id(path: &Path) -> Result<Option<WorkspaceId>> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "Synchronous tests use isolated temporary directories."
+)]
 mod tests {
     use super::*;
 

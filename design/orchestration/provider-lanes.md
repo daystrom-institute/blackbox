@@ -42,8 +42,11 @@ The daemon spawns `claude` (or `CLAUDE_BIN`) with:
 [--session-id <uuid> | --resume <uuid>] [--model <id>] [--effort <level>]
 [--append-system-prompt <dispatch context>] [--system-prompt ""]
 [--json-schema <schema>] [--mcp-config <json> --strict-mcp-config]
-[--allowedTools <a,b>] [--disallowedTools <a,b>]
+[--disallowedTools <a,b>]
 ```
+
+`code_mode`, `edit_discipline` and `service_tier` have no supported mapping
+on this lane. Dispatch and resume refuse explicit values before spawning.
 
 The initial prompt never rides argv. It is the first stream-json `user`
 envelope on stdin, followed by later turns and controls. The session id the
@@ -74,7 +77,9 @@ and `--strict-mcp-config` keeps the config dir's own MCP servers out of the
 dispatch. Header secrets are `${VAR}` references expanded by the CLI from the
 child env; argv never carries a bearer. There are no flat capability aliases:
 tools are reached by their qualified `mcp__<server>__<tool>` names, and the
-allow/deny filters use those names on `--allowedTools` / `--disallowedTools`.
+deny filters use those names on `--disallowedTools`. Global tool allowlists
+are rejected before launch: `--allowedTools` grants permissions rather than
+restricting availability, and `--tools` only selects built-in tools.
 
 ### Dispatch context
 
@@ -112,6 +117,10 @@ stdout into `$BRO_HOME/harness-sessions/<session>.events.jsonl` as `{ts,
 event}` records, skipping `stream_event` partials, on every locality. That
 file remains the transcript the cockpit tails, the indexer ingests and
 closeout reads. Replayed user envelopes are the record of operator turns.
+The execution host opens and validates the durable log before launching a worker.
+It persists and sequences each durable event before relay. An unreadable or
+incomplete log refuses launch; a write or relay failure stops the worker and
+reports an error. Owner disconnection does not stop execution or logging.
 Harness-only system events (`context_pressure`, `harness_shell_sessions`,
 `instruction_read_timeout`, `harness_milestone`, `compaction_threshold`) do
 not exist on this lane and are not emulated; consumers treat them as absent.

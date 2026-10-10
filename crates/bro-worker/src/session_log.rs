@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
-use tokio::io::AsyncWriteExt as _;
+use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
 
 /// Appends `{ts, event}` records for a worker's stdout lines.
 pub struct SessionLogWriter {
@@ -23,47 +23,51 @@ pub struct SessionLogWriter {
 }
 
 impl SessionLogWriter {
-    /// Open (creating parents) the log at `path` for appending. A log that
-    /// cannot be opened is reported and skipped: the stdout relay must not
-    /// fail because the durable copy cannot be written.
-    pub async fn open(path: &Path) -> Option<Self> {
-        if let Some(parent) = path.parent()
-            && let Err(error) = tokio::fs::create_dir_all(parent).await
-        {
-            eprintln!(
-                "cannot create session log directory {}: {error}",
-                parent.display()
-            );
-            return None;
+    /// Open a durable append stream only after its existing sequence is readable.
+    /// Refuse incomplete or malformed tails instead of appending through damage.
+    pub async fn open(path: &Path) -> std::io::Result<Self> {
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
         }
-        match tokio::fs::OpenOptions::new()
+        let file = tokio::fs::OpenOptions::new()
             .create(true)
             .append(true)
+            .read(true)
             .open(path)
-            .await
-        {
-            Ok(file) => Some(Self {
-                path: path.to_path_buf(),
-                file,
-                next_seq: tokio::fs::read_to_string(path)
-                    .await
-                    .ok()
-                    .into_iter()
-                    .flat_map(|body| {
-                        body.lines()
-                            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-                            .collect::<Vec<_>>()
-                    })
-                    .filter_map(|record| record["event"]["seq"].as_u64())
-                    .max()
-                    .unwrap_or(0)
-                    .saturating_add(1),
-            }),
-            Err(error) => {
-                eprintln!("cannot open session log {}: {error}", path.display());
-                None
+            .await?;
+        if !file.metadata().await?.is_file() {
+            return Err(std::io::Error::other("session log must be a regular file"));
+        }
+        let mut reader = tokio::io::BufReader::new(tokio::fs::File::open(path).await?);
+        let mut line = String::new();
+        let mut last_seq = 0;
+        loop {
+            line.clear();
+            if reader.read_line(&mut line).await? == 0 {
+                break;
+            }
+            if !line.ends_with('\n') {
+                return Err(std::io::Error::other("incomplete session log record"));
+            }
+            let record: Value = serde_json::from_str(&line).map_err(std::io::Error::other)?;
+            if !record["event"].is_object() {
+                return Err(std::io::Error::other("invalid session log record"));
+            }
+            if let Some(seq) = record["event"].get("seq") {
+                let seq = seq
+                    .as_u64()
+                    .ok_or_else(|| std::io::Error::other("invalid session log sequence"))?;
+                last_seq = last_seq.max(seq);
             }
         }
+        let next_seq = last_seq
+            .checked_add(1)
+            .ok_or_else(|| std::io::Error::other("event sequence exhausted"))?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            file,
+            next_seq,
+        })
     }
 
     /// Give the first task log its provider session name without invalidating
@@ -82,21 +86,6 @@ impl SessionLogWriter {
             tokio::fs::hard_link(&self.path, target).await?;
         }
         Ok(())
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    /// Record one raw stdout line. Lines that are not JSON objects and
-    /// `stream_event` partials are not recorded.
-    pub async fn record_line(&mut self, line: &str) {
-        let Some(record) = session_log_record(line, SystemTime::now()) else {
-            return;
-        };
-        if let Err(error) = self.file.write_all(&record).await {
-            eprintln!("cannot append session log {}: {error}", self.path.display());
-        }
     }
 
     /// CLI init events do not identify the routed provider account themselves.
@@ -132,10 +121,6 @@ impl SessionLogWriter {
         self.file.write_all(&record).await?;
         self.file.flush().await?;
         Ok(line)
-    }
-
-    pub async fn finish(&mut self) {
-        let _ = self.file.flush().await;
     }
 }
 
@@ -219,6 +204,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn damaged_logs_refuse_resume_instead_of_resetting_the_sequence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.events.jsonl");
+        for content in [
+            "not json\n",
+            r#"{"event":{"seq":7}}"#,
+            "{}\n",
+            "{\"event\":{\"seq\":\"bad\"}}\n",
+            "{\"event\":{\"seq\":18446744073709551615}}\n",
+        ] {
+            tokio::fs::write(&path, content).await.unwrap();
+            assert!(SessionLogWriter::open(&path).await.is_err());
+            assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), content);
+        }
+        assert!(SessionLogWriter::open(dir.path()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn relay_continues_logging_without_an_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.events.jsonl");
+        let log = SessionLogWriter::open(&path).await.unwrap();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(rx);
+        crate::relay_cli(
+            &b"{\"type\":\"system\",\"subtype\":\"init\"}\n{\"type\":\"result\"}\n"[..],
+            log,
+            bro_core::Provider::Deepseek,
+            tx,
+            |_| {},
+        )
+        .await
+        .unwrap();
+        let rows: Vec<Value> = tokio::fs::read_to_string(&path)
+            .await
+            .unwrap()
+            .lines()
+            .map(|s| serde_json::from_str(s).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["event"]["provider"], "deepseek");
+        assert_eq!(rows[1]["event"]["seq"], 2);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn log_failure_is_propagated_before_an_event_can_be_relayed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLogWriter::open(&dir.path().join("session.events.jsonl"))
+            .await
+            .unwrap();
+        log.file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .await
+            .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let outcome = crate::relay_cli(
+            &b"{\"type\":\"result\"}\n"[..],
+            log,
+            bro_core::Provider::Glm,
+            tx,
+            |_| {},
+        )
+        .await;
+        assert!(outcome.is_err());
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
     async fn resume_preserves_sequence_and_the_pinned_replay_path() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("task.events.jsonl");
@@ -265,15 +320,17 @@ mod tests {
         let path = dir.path().join("sessions").join("s.events.jsonl");
         let mut writer = SessionLogWriter::open(&path).await.unwrap();
         writer
-            .record_line(r#"{"type":"system","subtype":"init"}"#)
-            .await;
+            .sequence_and_record(r#"{"type":"system","subtype":"init"}"#)
+            .await
+            .unwrap();
         writer
-            .record_line(r#"{"type":"stream_event","event":{"type":"message_start"}}"#)
-            .await;
+            .sequence_and_record(r#"{"type":"stream_event","event":{"type":"message_start"}}"#)
+            .await
+            .unwrap();
         writer
-            .record_line(r#"{"type":"result","is_error":false}"#)
-            .await;
-        writer.finish().await;
+            .sequence_and_record(r#"{"type":"result","is_error":false}"#)
+            .await
+            .unwrap();
 
         let body = tokio::fs::read_to_string(&path).await.unwrap();
         let lines: Vec<Value> = body

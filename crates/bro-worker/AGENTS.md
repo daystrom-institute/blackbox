@@ -10,6 +10,8 @@ Validate restrictions before spawn, fail closed on effective config errors,
 acknowledge controls only after native acceptance, and scope completion to the
 active thread and turn. Bound RPC and shutdown waits.
 
-Persist durable events with sequence numbers before relaying them. Preserve the
+Open and validate durable logs before spawning. Refuse damaged tails and propagate
+persistence errors to supervision so the worker stops. Persist durable events
+with sequence numbers before relaying them. Preserve the
 pinned recovery path when adopting a provider session id. Tests use isolated
 scripted app-server pipes and temporary logs, never real provider homes.

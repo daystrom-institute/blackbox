@@ -101,15 +101,13 @@ impl ProviderMcp for Provider {
             return Vec::new();
         }
         let mut args = Vec::new();
-        // Both lanes take a comma-separated, fully-qualified allow/deny list
-        // (`mcp__<server>__<tool>`) enforced client-side. This is the client
-        // permission plane (recursion guard + brofile + per-dispatch); surface
-        // is separate and server-side via the MCP URL. One joined argument per
-        // flag: claude's variadic `<tools...>` form would otherwise swallow
-        // the flags that follow.
+        // Claude's allowedTools grants permissions; it does not restrict the
+        // available tools. ProviderLaunch rejects global allowlists on that
+        // lane. Denylists are enforceable on both lanes. Join each list into
+        // one argument so variadic CLI parsing cannot swallow following flags.
         let (deny_flag, allow_flag) = match self.lane() {
-            ProviderLane::ClaudeCli => ("--disallowedTools", "--allowedTools"),
-            ProviderLane::Harness => ("--deny-tools", "--allow-tools"),
+            ProviderLane::ClaudeCli => ("--disallowedTools", None),
+            ProviderLane::Harness => ("--deny-tools", Some("--allow-tools")),
             ProviderLane::Codex | ProviderLane::Workflow => return args,
         };
         let deny = expand_filter_patterns(&filters.disallow);
@@ -118,7 +116,9 @@ impl ProviderMcp for Provider {
             args.push(deny.join(","));
         }
         let allow = expand_filter_patterns(&filters.allow);
-        if !allow.is_empty() {
+        if let Some(allow_flag) = allow_flag
+            && !allow.is_empty()
+        {
             args.push(allow_flag.into());
             args.push(allow.join(","));
         }

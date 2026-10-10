@@ -8,6 +8,12 @@ out explicitly under `Changed` or `Removed`.
 
 ## Unreleased
 
+- CLI dispatch refuses unsupported execution settings instead of silently
+  dropping them. Claude dispatch rejects global tool allowlists that its
+  permission flags cannot enforce. Both execution hosts require readable durable
+  event logs before launch and stop a worker on event persistence failure. Resume refuses
+  malformed or incomplete log tails instead of resetting the event sequence.
+
 - Codex dispatch uses a native app-server adapter shared by fleetd and the
   local executor. Typed settings carry model, effort, service tier, schema,
   instructions and MCP policy; the host launches `codex app-server` directly

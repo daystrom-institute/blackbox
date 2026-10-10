@@ -282,6 +282,16 @@ impl HarnessExecutor for LocalExecutor {
         }
         cmd.env("BRO_HOME", &spec.bro_home);
 
+        let session_log = if spec.supervisor_writes_event_log || spec.codex.is_some() {
+            Some(
+                bro_worker::SessionLogWriter::open(&spec.event_log_path)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("cannot open worker event log: {e}"))?,
+            )
+        } else {
+            None
+        };
+
         let mut child = cmd
             .spawn()
             .map_err(|e| anyhow::anyhow!("spawn {bin}: {e}"))?;
@@ -307,11 +317,6 @@ impl HarnessExecutor for LocalExecutor {
         let (events_tx, events_rx) = mpsc::unbounded_channel::<String>();
         let (stdout_done_tx, stdout_done_rx) = oneshot::channel::<()>();
         let tee_id_out = spec.task_id.clone();
-        let session_log = if spec.supervisor_writes_event_log && spec.codex.is_none() {
-            bro_worker::SessionLogWriter::open(&spec.event_log_path).await
-        } else {
-            None
-        };
         let adapter = if let Some(config) = spec.codex.clone() {
             let stdin = stdin.ok_or_else(|| anyhow::anyhow!("Codex stdin missing"))?;
             let stdout = stdout.ok_or_else(|| anyhow::anyhow!("Codex stdout missing"))?;
@@ -323,43 +328,47 @@ impl HarnessExecutor for LocalExecutor {
                 stdout,
                 control_rx,
                 events_tx,
-                spec.event_log_path.clone(),
+                session_log.expect("native worker log"),
             )))
         } else {
             if let Some(stdin) = stdin {
                 spawn_control_writer(spec.task_id.clone(), stdin, control_rx);
             }
-            if let Some(stdout) = stdout {
-                tokio::spawn(async move {
-                    let reader = tokio::io::BufReader::new(stdout);
-                    let mut lines = reader.lines();
-                    let mut tee = open_harness_tee(&tee_id_out, "stdout.jsonl");
-                    let mut session_log = session_log;
-                    while let Ok(Some(line)) = lines.next_line().await {
+            if let Some(log) = session_log {
+                let stdout = stdout.ok_or_else(|| anyhow::anyhow!("CLI stdout missing"))?;
+                drop(stdout_done_tx);
+                let mut tee = open_harness_tee(&tee_id_out, "stdout.jsonl");
+                Some(tokio::spawn(bro_worker::relay_cli(
+                    tokio::io::BufReader::new(stdout),
+                    log,
+                    provider,
+                    events_tx,
+                    move |line| {
                         if let Some(w) = tee.as_mut() {
-                            w.try_write_line(&line);
+                            w.try_write_line(line);
                         }
-                        let line = if let Some(log) = session_log.as_mut() {
-                            match log.record_provider_event(provider, &line).await {
-                                Ok(line) => line,
-                                Err(_) => break,
-                            }
-                        } else {
-                            line
-                        };
-                        if events_tx.send(line).is_err() {
-                            break;
-                        }
-                    }
-                    if let Some(log) = session_log.as_mut() {
-                        log.finish().await;
-                    }
-                    let _ = stdout_done_tx.send(());
-                });
+                    },
+                )))
             } else {
-                let _ = stdout_done_tx.send(());
+                if let Some(stdout) = stdout {
+                    tokio::spawn(async move {
+                        let mut lines = tokio::io::BufReader::new(stdout).lines();
+                        let mut tee = open_harness_tee(&tee_id_out, "stdout.jsonl");
+                        while let Ok(Some(line)) = lines.next_line().await {
+                            if let Some(w) = tee.as_mut() {
+                                w.try_write_line(&line);
+                            }
+                            if events_tx.send(line).is_err() {
+                                break;
+                            }
+                        }
+                        let _ = stdout_done_tx.send(());
+                    });
+                } else {
+                    let _ = stdout_done_tx.send(());
+                }
+                None
             }
-            None
         };
 
         // stderr collection: accumulate the full stream (teeing raw lines) and
@@ -392,7 +401,7 @@ impl HarnessExecutor for LocalExecutor {
         let (outcome_tx, outcome_rx) = oneshot::channel::<WorkerOutcome>();
         tokio::spawn(async move {
             let (exit_code, adapter_error) = if let Some(adapter) = adapter {
-                bro_worker::codex::wait_for_child(child, adapter).await
+                bro_worker::wait_for_child(child, adapter, provider.as_str()).await
             } else {
                 (
                     child.wait().await.ok().and_then(|s| s.code()),
@@ -586,6 +595,47 @@ mod absolute_bin_tests {
 #[cfg(test)]
 mod child_env_tests {
     use super::{HarnessExecutor, LocalExecutor, WorkerSpawnSpec};
+
+    #[tokio::test]
+    async fn cli_log_failures_refuse_spawn_or_stop_the_running_child() {
+        let root = tempfile::tempdir().unwrap();
+        let mut spec = WorkerSpawnSpec {
+            task_id: "t".into(),
+            session_id: "s".into(),
+            workspace_id: None,
+            workspace_scope: None,
+            provider: bro_core::Provider::Glm,
+            bin_override: None,
+            argv: vec![],
+            cwd: None,
+            env: Default::default(),
+            env_unset: vec![],
+            initial_messages: vec![],
+            bro_home: root.path().into(),
+            event_log_path: root.path().join("log"),
+            supervisor_writes_event_log: true,
+            codex: None,
+        };
+        spec.bin_override = Some("/bin/sh".into());
+        spec.cwd = None;
+        spec.supervisor_writes_event_log = true;
+        spec.event_log_path = root.path().to_path_buf();
+        spec.argv = vec!["-c".into(), "exit 0".into()];
+        let error = match LocalExecutor.spawn(spec.clone()).await {
+            Ok(_) => panic!("bad log admitted a worker"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("cannot open worker event log"));
+        spec.event_log_path = root.path().join("session.events.jsonl");
+        spec.argv = vec!["-c".into(), "printf 'not-json\\n'; exec sleep 60".into()];
+        let child = LocalExecutor.spawn(spec).await.unwrap();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(3), child.outcome)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome.exit_code, Some(1));
+        assert!(outcome.stderr.contains("worker:"), "{:?}", outcome.stderr);
+    }
 
     /// The child environment is the daemon's minus `env_unset`, then the spec
     /// env: a variable on the scrub list is not inherited, and the same

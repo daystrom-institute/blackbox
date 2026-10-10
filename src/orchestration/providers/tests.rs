@@ -732,7 +732,7 @@ fn model_catalogs_have_defaults() {
 }
 
 #[test]
-fn harness_filter_args_emit_allow_and_deny_flags() {
+fn filter_args_preserve_restrictions_or_reject_unsupported_allowlists() {
     let filters = McpFilters {
         disallow: vec!["mcp__blackbox__bro_*".into()],
         allow: vec!["mcp__blackbox__bbox_*".into()],
@@ -757,8 +757,8 @@ fn harness_filter_args_emit_allow_and_deny_flags() {
             continue;
         }
         let (deny_flag, allow_flag) = match provider.lane() {
-            bro_core::ProviderLane::ClaudeCli => ("--disallowedTools", "--allowedTools"),
-            bro_core::ProviderLane::Harness => ("--deny-tools", "--allow-tools"),
+            bro_core::ProviderLane::ClaudeCli => ("--disallowedTools", None),
+            bro_core::ProviderLane::Harness => ("--deny-tools", Some("--allow-tools")),
             bro_core::ProviderLane::Codex | bro_core::ProviderLane::Workflow => unreachable!(),
         };
         let args = provider.build_filter_args(&filters);
@@ -769,11 +769,33 @@ fn harness_filter_args_emit_allow_and_deny_flags() {
         assert!(args[deny_idx + 1].contains("mcp__blackbox__bro_exec"));
         assert!(args[deny_idx + 1].contains(','));
 
-        let allow_idx = args
-            .iter()
-            .position(|a| a == allow_flag)
-            .unwrap_or_else(|| panic!("{allow_flag} present for {provider}"));
-        assert!(args[allow_idx + 1].contains("mcp__blackbox__bbox_stats"));
+        if let Some(allow_flag) = allow_flag {
+            let allow_idx = args
+                .iter()
+                .position(|a| a == allow_flag)
+                .unwrap_or_else(|| panic!("{allow_flag} present for {provider}"));
+            assert!(args[allow_idx + 1].contains("mcp__blackbox__bbox_stats"));
+        } else {
+            for allow in [vec!["Read".into()], filters.allow.clone()] {
+                let filters = McpFilters {
+                    allow,
+                    disallow: filters.disallow.clone(),
+                };
+                for mut launch in [
+                    provider.build_exec_args("hi", None, "pending", None, None),
+                    provider.build_resume_args("session", "hi", None, None),
+                ] {
+                    launch.apply_filters(*provider, &filters);
+                    assert!(
+                        launch
+                            .errors
+                            .iter()
+                            .any(|error| error.contains("allowlist"))
+                    );
+                }
+            }
+            assert!(!args.iter().any(|arg| arg == "--allowedTools"));
+        }
     }
 }
 

@@ -3544,17 +3544,6 @@ async fn spawn_harness_child_task(
     task
 }
 
-/// The session id a dispatch records before its worker reports one: the
-/// dispatch's own id, except for a fresh session on a lane whose worker mints
-/// the id, which starts `pending`.
-fn fresh_session_id_for_lane(lane: ProviderLane, args: &[String], session_id: String) -> String {
-    if providers::worker_assigns_session_id(lane) && !args.iter().any(|arg| arg == "--resume") {
-        "pending".to_string()
-    } else {
-        session_id
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn prepare_harness_child_launch(
     task_id: String,
@@ -3573,6 +3562,7 @@ fn prepare_harness_child_launch(
     workspace_identity: Option<bro_protocol::WorkerWorkspaceIdentity>,
 ) -> anyhow::Result<bro_protocol::WorkerSpawnSpec> {
     let launch = launch.into();
+    anyhow::ensure!(launch.errors.is_empty(), "{}", launch.errors.join("; "));
     let mut args = launch.argv;
     let mut codex = launch.codex;
     anyhow::ensure!(
@@ -6415,6 +6405,67 @@ mod tests {
         assert_eq!(redirect["command"]["text"], "go left");
 
         harness_controls().write().remove(task_id);
+    }
+
+    #[test]
+    fn claude_cli_rejects_unsupported_dispatch_settings_before_spawn() {
+        use brofile::{CodeMode, EditDiscipline};
+        use providers::ExecOpts;
+        let root = tempfile::tempdir().unwrap();
+        for (field, options) in [
+            (
+                "code_mode",
+                ExecOpts {
+                    code_mode: Some(CodeMode::Only),
+                    ..Default::default()
+                },
+            ),
+            (
+                "edit_discipline",
+                ExecOpts {
+                    edit_discipline: Some(EditDiscipline::Structured),
+                    ..Default::default()
+                },
+            ),
+            (
+                "service_tier",
+                ExecOpts {
+                    service_tier: Some("priority".into()),
+                    ..Default::default()
+                },
+            ),
+        ] {
+            for provider in [
+                Provider::Glm,
+                Provider::Deepseek,
+                Provider::Minimax,
+                Provider::Kimi,
+            ] {
+                for launch in [
+                    provider.build_exec_args("hi", None, "s", None, Some(&options)),
+                    provider.build_resume_args("s", "hi", None, Some(&options)),
+                ] {
+                    let error = prepare_harness_child_launch(
+                        "t".into(),
+                        "s".into(),
+                        provider,
+                        launch,
+                        root.path().to_str(),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        root.path(),
+                        None,
+                        None,
+                        None,
+                    )
+                    .unwrap_err();
+                    assert!(error.to_string().contains(field), "{error}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -9299,24 +9350,6 @@ mod tests {
         let location = inner.transcript_location.as_ref().unwrap();
         assert_eq!(location.path, pinned);
         assert_eq!(location.session_id.as_deref(), Some("thread-1"));
-    }
-
-    #[test]
-    fn a_fresh_codex_dispatch_starts_pending_and_a_resume_keeps_its_thread() {
-        let fresh = vec!["-p".to_string(), "hi".to_string()];
-        assert_eq!(
-            fresh_session_id_for_lane(ProviderLane::Codex, &fresh, "minted".into()),
-            "pending"
-        );
-        let resume = vec!["--resume".to_string(), "thread-1".to_string()];
-        assert_eq!(
-            fresh_session_id_for_lane(ProviderLane::Codex, &resume, "thread-1".into()),
-            "thread-1"
-        );
-        assert_eq!(
-            fresh_session_id_for_lane(ProviderLane::ClaudeCli, &fresh, "minted".into()),
-            "minted"
-        );
     }
 
     #[test]
