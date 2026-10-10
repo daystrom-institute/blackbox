@@ -199,7 +199,7 @@ For MCP calls and guidance rendering, the daemon URL resolves from an explicit
 then the loopback daemon port. Use an explicit URL for a throwaway daemon:
 
 ```bash
-bro mcp call bbox_stats '{}' --daemon-url http://127.0.0.1:7299
+bro mcp call bbox_stats '{}' --surface ops --daemon-url http://127.0.0.1:7299
 ```
 
 ## Teardown
