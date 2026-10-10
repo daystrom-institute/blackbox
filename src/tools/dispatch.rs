@@ -4133,7 +4133,10 @@ mod tests {
                 .resolve_resume_target(Some("external-session"), Some("glm"), None)
                 .is_ok()
         );
-        assert_eq!(server.state.task_store.read().all_tasks().len(), cases.len());
+        assert_eq!(
+            server.state.task_store.read().all_tasks().len(),
+            cases.len()
+        );
     }
 
     #[tokio::test]
