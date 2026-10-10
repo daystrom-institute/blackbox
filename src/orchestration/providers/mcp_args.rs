@@ -102,8 +102,8 @@ impl ProviderMcp for Provider {
         }
         let mut args = Vec::new();
         // Claude's allowedTools grants permissions; it does not restrict the
-        // available tools. ProviderLaunch rejects global allowlists on that
-        // lane. Denylists are enforceable on both lanes. Join each list into
+        // available tools. ProviderLaunch compiles closed allowlists separately.
+        // Denylists are enforceable on both lanes. Join each list into
         // one argument so variadic CLI parsing cannot swallow following flags.
         let (deny_flag, allow_flag) = match self.lane() {
             ProviderLane::ClaudeCli => ("--disallowedTools", None),
@@ -150,6 +150,44 @@ impl ProviderMcp for Provider {
             ProviderLane::Codex | ProviderLane::Workflow => Vec::new(),
         }
     }
+}
+
+/// Restrict native availability with --tools and deny the complement of the
+/// daemon-owned MCP catalog. The launch composer must also enforce strict MCP
+/// configuration containing only this daemon, whose catalog is known here.
+pub(super) fn claude_allowlist_args(filters: &McpFilters) -> anyhow::Result<Vec<String>> {
+    let allowed = expand_filter_patterns(&filters.allow);
+    let universe = crate::tool_docs::all_tool_names();
+    let mut native = Vec::new();
+    for name in &allowed {
+        if let Some(tool) = mcp::McpToolRef::parse(name) {
+            anyhow::ensure!(
+                tool.is_blackbox() && universe.contains(&tool.pattern.as_str()),
+                "Claude CLI allowlist requires tools from the daemon-owned MCP catalog: {name}"
+            );
+        } else {
+            anyhow::ensure!(
+                !name.is_empty()
+                    && name != "default"
+                    && !name.starts_with("mcp__")
+                    && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+                "Claude CLI allowlist requires exact native tool names: {name}"
+            );
+            native.push(name.as_str());
+        }
+    }
+    let mut denied = expand_filter_patterns(&filters.disallow);
+    for tool in universe {
+        let name = format!("mcp__{}__{tool}", crate::util::blackbox_mcp_name());
+        if !allowed.contains(&name) && !denied.contains(&name) {
+            denied.push(name);
+        }
+    }
+    let mut args = vec!["--tools".into(), native.join(",")];
+    if !denied.is_empty() {
+        args.extend(["--disallowedTools".into(), denied.join(",")]);
+    }
+    Ok(args)
 }
 
 /// Build a Claude/harness `--mcp-config` JSON blob (`{"mcpServers":{…}}`) from a

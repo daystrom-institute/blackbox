@@ -270,7 +270,7 @@ pub(crate) struct StatusParams {
     /// Maximum bytes per body page: default/max 4096, minimum 4.
     #[serde(default)]
     pub(crate) limit: Option<usize>,
-    /// Include accounting and execution-owner transcript coordinates. Default
+    /// Include accounting and daemon transcript coordinates. Default
     /// false. These coordinates are not caller-local filesystem paths.
     #[serde(default)]
     pub(crate) debug: bool,

@@ -175,7 +175,7 @@ impl Provider {
             Provider::Glm => &[StructuredOutput, ToolUse, Resume],
             Provider::Deepseek => &[StructuredOutput, ToolUse, Resume],
             Provider::Minimax => &[StructuredOutput, ToolUse, Resume],
-            // Kimi via bro-harness (Anthropic transport). Structured output
+            // Kimi via the claude CLI (Anthropic transport). Structured output
             // delivered via the same forced `final_result` terminal tool.
             Provider::Kimi => &[StructuredOutput, ToolUse, Resume],
             // Mistral via bro-harness (chat-completions transport). Structured
@@ -542,42 +542,42 @@ static DEEPSEEK_MODELS: &[ModelInfo] = &[
     // compatibility aliases. https://api-docs.deepseek.com/quick_start/pricing/
     ModelInfo {
         id: "deepseek-flash",
-        description: "DeepSeek V4.1 Flash, vision and 1M context via bro-harness",
+        description: "DeepSeek V4.1 Flash, vision and 1M context via the claude CLI",
         default: true,
         efforts: &[],
         default_effort: Some("high"),
     },
     ModelInfo {
         id: "deepseek-v4-pro",
-        description: "DeepSeek V4 Pro via bro-harness (legacy model)",
+        description: "DeepSeek V4 Pro via the claude CLI (legacy model)",
         default: false,
         efforts: &[],
         default_effort: None,
     },
     ModelInfo {
         id: "deepseek-v4-flash",
-        description: "Legacy alias for DeepSeek V4.1 Flash via bro-harness",
+        description: "Legacy alias for DeepSeek V4.1 Flash via the claude CLI",
         default: false,
         efforts: &[],
         default_effort: None,
     },
     ModelInfo {
         id: "deepseek-v4-flash-vision-exp",
-        description: "Legacy vision alias for DeepSeek V4.1 Flash via bro-harness",
+        description: "Legacy vision alias for DeepSeek V4.1 Flash via the claude CLI",
         default: false,
         efforts: &[],
         default_effort: Some("high"),
     },
     ModelInfo {
         id: "deepseek-reasoner",
-        description: "Legacy DeepSeek reasoning model via bro-harness",
+        description: "Legacy DeepSeek reasoning model via the claude CLI",
         default: false,
         efforts: &[],
         default_effort: None,
     },
     ModelInfo {
         id: "deepseek-chat",
-        description: "Legacy DeepSeek chat model via bro-harness",
+        description: "Legacy DeepSeek chat model via the claude CLI",
         default: false,
         efforts: &[],
         default_effort: None,
@@ -586,7 +586,7 @@ static DEEPSEEK_MODELS: &[ModelInfo] = &[
 
 static MINIMAX_MODELS: &[ModelInfo] = &[ModelInfo {
     id: "MiniMax-M3",
-    description: "MiniMax M3 via Anthropic-compatible bro-harness transport",
+    description: "MiniMax M3 via Anthropic-compatible claude CLI transport",
     default: true,
     efforts: &[],
     default_effort: None,
@@ -605,35 +605,35 @@ static MINIMAX_MODELS: &[ModelInfo] = &[ModelInfo {
 static KIMI_MODELS: &[ModelInfo] = &[
     ModelInfo {
         id: "k3",
-        description: "Kimi K3 flagship, 1M context, always-reasoning, via Anthropic-compatible bro-harness transport",
+        description: "Kimi K3 flagship, 1M context, always-reasoning, via Anthropic-compatible claude CLI transport",
         default: true,
         efforts: &[],
         default_effort: None,
     },
     ModelInfo {
         id: "kimi-k2.7-code",
-        description: "Kimi K2.7 Code, 256K coding model via bro-harness",
+        description: "Kimi K2.7 Code, 256K coding model via the claude CLI",
         default: false,
         efforts: &[],
         default_effort: None,
     },
     ModelInfo {
         id: "kimi-k2.7-code-highspeed",
-        description: "Kimi K2.7 Code high-speed variant, 256K via bro-harness",
+        description: "Kimi K2.7 Code high-speed variant, 256K via the claude CLI",
         default: false,
         efforts: &[],
         default_effort: None,
     },
     ModelInfo {
         id: "kimi-k2.6",
-        description: "Kimi K2.6 general-purpose, 256K via bro-harness",
+        description: "Kimi K2.6 general-purpose, 256K via the claude CLI",
         default: false,
         efforts: &[],
         default_effort: None,
     },
     ModelInfo {
         id: "kimi-k2.5",
-        description: "Kimi K2.5 prior-generation, 256K via bro-harness",
+        description: "Kimi K2.5 prior-generation, 256K via the claude CLI",
         default: false,
         efforts: &[],
         default_effort: None,

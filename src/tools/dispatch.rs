@@ -802,10 +802,9 @@ impl BlackboxServer {
         )
         .await
         else {
-            let inner = dispatched.task.inner.lock();
-            return Self::err_text(&format!(
-                "bro_exec defect: provider did not publish a concrete session id within {SESSION_ID_HANDSHAKE_TIMEOUT_SECS:.0}s (taskId={}, provider={}, status={:?}, exitCode={:?}). Inspect with bro_status(task_id=\"{}\", tail=20).",
-                inner.id, inner.provider, inner.status, inner.exit_code, inner.id
+            return Self::err_text(&orch::task_session_id_error(
+                &dispatched.task,
+                SESSION_ID_HANDSHAKE_TIMEOUT_SECS,
             ));
         };
 

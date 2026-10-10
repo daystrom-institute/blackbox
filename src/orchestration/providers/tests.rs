@@ -786,12 +786,10 @@ fn filter_args_preserve_restrictions_or_reject_unsupported_allowlists() {
                     provider.build_resume_args("session", "hi", None, None),
                 ] {
                     launch.apply_filters(*provider, &filters);
-                    assert!(
-                        launch
-                            .errors
-                            .iter()
-                            .any(|error| error.contains("allowlist"))
-                    );
+                    assert!(launch.errors.is_empty(), "{:?}", launch.errors);
+                    assert!(launch.claude_restricted_mcp);
+                    assert!(launch.argv.iter().any(|arg| arg == "--tools"));
+                    assert!(!launch.argv.iter().any(|arg| arg == "--allowedTools"));
                 }
             }
             assert!(!args.iter().any(|arg| arg == "--allowedTools"));
@@ -804,6 +802,45 @@ fn empty_filters_emit_no_args() {
     let filters = McpFilters::default();
     for provider in Provider::ALL {
         assert!(provider.build_filter_args(&filters).is_empty());
+    }
+}
+
+#[test]
+fn claude_allowlist_closes_native_and_mcp_availability() {
+    let filters = McpFilters {
+        allow: vec!["Read".into(), "mcp__blackbox__bbox_thread".into()],
+        disallow: vec!["mcp__blackbox__bbox_thread".into()],
+    };
+    let mut launch = Provider::Deepseek.build_exec_args("hi", None, "pending", None, None);
+    launch.apply_filters(Provider::Deepseek, &filters);
+    assert!(launch.errors.is_empty());
+    let args = launch.argv;
+    let value = |flag| args.windows(2).find(|pair| pair[0] == flag).unwrap()[1].clone();
+    assert_eq!(value("--tools"), "Read");
+    let denied = value("--disallowedTools");
+    // Explicit denial wins even when the same tool is allowed.
+    assert!(
+        denied
+            .split(',')
+            .any(|name| name == "mcp__blackbox__bbox_thread")
+    );
+    for name in crate::tool_docs::all_tool_names() {
+        assert!(
+            denied
+                .split(',')
+                .any(|denied| denied == format!("mcp__blackbox__{name}"))
+        );
+    }
+    for unsupported in ["default", "Bash(*)", "*", "mcp__external__read"] {
+        let mut launch = Provider::Kimi.build_exec_args("hi", None, "pending", None, None);
+        launch.apply_filters(
+            Provider::Kimi,
+            &McpFilters {
+                allow: vec![unsupported.into()],
+                disallow: vec![],
+            },
+        );
+        assert!(!launch.errors.is_empty(), "{unsupported}");
     }
 }
 

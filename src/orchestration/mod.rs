@@ -3679,9 +3679,23 @@ fn prepare_harness_child_launch(
             args = vec!["app-server".to_string()];
         }
         ProviderLane::ClaudeCli => {
-            if let Some(config) =
-                build_claude_mcp_config(&mut args, self_mcp_url, workspace_binding.is_some())?
-            {
+            let config =
+                build_claude_mcp_config(&mut args, self_mcp_url, workspace_binding.is_some())?;
+            let config = if launch.claude_restricted_mcp {
+                let config = config.unwrap_or_else(|| "{\"mcpServers\":{}}".into());
+                let parsed: Value = serde_json::from_str(&config)?;
+                let servers = parsed["mcpServers"].as_object().expect("validated MCP map");
+                anyhow::ensure!(
+                    servers.keys().all(|name| {
+                        self_mcp_url.is_some() && name == &crate::util::blackbox_mcp_name()
+                    }),
+                    "Claude CLI allowlist cannot include external MCP servers with unknown tool catalogs"
+                );
+                Some(config)
+            } else {
+                config
+            };
+            if let Some(config) = config {
                 set_cli_value_arg(&mut args, "--mcp-config", config);
                 ensure_cli_flag(&mut args, "--strict-mcp-config");
             }
@@ -4688,6 +4702,29 @@ pub async fn wait_for_task_session_id_with_timeout(
     .flatten()
 }
 
+/// Describe a missing provider session ID using the worker's current outcome.
+/// A worker that refused startup is different from one still handshaking.
+pub fn task_session_id_error(task: &Task, timeout_secs: f64) -> String {
+    let inner = task.inner.lock();
+    let outcome = if inner.status.is_terminal() {
+        "task ended before publishing a session id".to_string()
+    } else {
+        format!(
+            "provider did not publish a session id within {timeout_secs:.0}s; task is still active"
+        )
+    };
+    let stderr = inner.stderr.trim();
+    let reason = if stderr.is_empty() {
+        String::new()
+    } else {
+        format!(" Reason: {}", tail_str_safe(stderr, 1024))
+    };
+    format!(
+        "bro_exec: {outcome} (taskId={}, provider={}, status={:?}, exitCode={:?}).{reason} Inspect with bro_status(task_id=\"{}\", debug=true, tail=20).",
+        inner.id, inner.provider, inner.status, inner.exit_code, inner.id
+    )
+}
+
 /// What [`cancel_task`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CancelOutcome {
@@ -5041,7 +5078,7 @@ fn task_view_json_from_inner(
     if transcript_coordinates {
         if let Some(ref location) = inner.transcript_location {
             obj["transcriptLocation"] = serde_json::to_value(location).unwrap_or(Value::Null);
-            obj["transcriptLocationOwner"] = json!("execution_worker");
+            obj["transcriptLocationOwner"] = json!("daemon");
         }
         if let Some(ref cursor) = inner.transcript_cursor {
             obj["transcriptCursor"] = serde_json::to_value(cursor).unwrap_or(Value::Null);
@@ -6214,6 +6251,67 @@ mod tests {
             spec.event_log_path,
             root.join("harness-sessions").join("sess-cli.events.jsonl")
         );
+    }
+
+    #[test]
+    fn claude_allowlist_refuses_unknown_mcp_catalogs_and_closes_ambient_config() {
+        let mut env = crate::util::TestEnvGuard::new();
+        env.set("BLACKBOX_MCP_NAME", "blackbox");
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        env.set("BLACKBOX_CONFIG", root.join("missing.toml"));
+        for external in [false, true] {
+            let mut launch = Provider::Glm.build_exec_args("hi", None, "pending", None, None);
+            launch.apply_filters(
+                Provider::Glm,
+                &mcp::McpFilters {
+                    allow: vec!["Read".into()],
+                    disallow: vec![],
+                },
+            );
+            if external {
+                launch.argv.extend([
+                    "--mcp-config".into(),
+                    r#"{"mcpServers":{"outside":{"type":"http","url":"https://example.test/mcp"}}}"#.into(),
+                ]);
+            }
+            let result = prepare_harness_child_launch(
+                "allow-task".into(),
+                "pending".into(),
+                Provider::Glm,
+                launch,
+                root.to_str(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                &root,
+                None,
+                None,
+                None,
+            );
+            if external {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("external MCP servers")
+                );
+            } else {
+                let spec = result.unwrap();
+                assert!(spec.argv.iter().any(|a| a == "--strict-mcp-config"));
+                let config = spec
+                    .argv
+                    .windows(2)
+                    .find(|p| p[0] == "--mcp-config")
+                    .unwrap();
+                assert_eq!(
+                    serde_json::from_str::<Value>(&config[1]).unwrap(),
+                    json!({"mcpServers":{}})
+                );
+            }
+        }
     }
 
     #[test]
@@ -8648,6 +8746,48 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn session_handshake_failure_reports_startup_reason_without_timeout_claim() {
+        let task = test_task("startup-refusal", TaskStatus::Failed, Provider::Codex);
+        {
+            let mut inner = task.inner.lock();
+            inner.session_id = "pending".into();
+            inner.exit_code = Some(1);
+            inner.stderr = "Codex cannot enforce a global tool allowlist".into();
+        }
+        assert!(
+            wait_for_task_session_id_with_timeout(&task, 15.0)
+                .await
+                .is_none()
+        );
+        let error = task_session_id_error(&task, 15.0);
+        assert!(error.contains("Codex cannot enforce a global tool allowlist"));
+        assert!(error.contains("taskId=startup-refusal"));
+        assert!(error.contains("exitCode=Some(1)"));
+        assert!(!error.contains("within 15s"));
+        assert!(!error.contains("still active"));
+    }
+
+    #[tokio::test]
+    async fn session_handshake_timeout_retains_active_task_and_bounds_unicode_stderr() {
+        let task = test_task("slow-start", TaskStatus::Running, Provider::Codex);
+        {
+            let mut inner = task.inner.lock();
+            inner.session_id = "pending".into();
+            inner.stderr = format!("{}latest diagnostic", "界".repeat(2000));
+        }
+        assert!(
+            wait_for_task_session_id_with_timeout(&task, 0.001)
+                .await
+                .is_none()
+        );
+        let error = task_session_id_error(&task, 15.0);
+        assert!(error.contains("within 15s; task is still active"));
+        assert!(error.contains("latest diagnostic"));
+        assert!(error.len() < 1400);
+        assert_eq!(task.inner.lock().status, TaskStatus::Running);
+    }
+
     #[test]
     fn status_shape_matches_failed_task_with_events_and_stderr() {
         let failed = task_with(
@@ -10684,7 +10824,7 @@ mod tests {
             });
             inner.transcript_location = harness_transcript_location(
                 Provider::Glm,
-                std::path::Path::new("/worker-only"),
+                std::path::Path::new("/daemon-store"),
                 "s",
                 None,
             );
@@ -10709,7 +10849,7 @@ mod tests {
         assert_eq!(full["transcriptAvailable"], true);
         let debug = mcp_task_status_json(&task, "summary", None, None, 0, true).unwrap();
         assert!(debug["usage"].is_object());
-        assert_eq!(debug["transcriptLocationOwner"], "execution_worker");
+        assert_eq!(debug["transcriptLocationOwner"], "daemon");
     }
 
     #[test]

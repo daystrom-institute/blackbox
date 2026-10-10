@@ -7,7 +7,7 @@ topic:
   - orchestration
   - providers
   - process-isolation
-brief: "The dispatch plane runs vendor CLIs: the claude CLI lane for Claude and the Anthropic-compatible endpoints, the codex app-server lane for Codex. The daemon composes argv, environment, controls and event handling per lane."
+brief: "The dispatch plane runs vendor CLIs: the claude CLI lane for Anthropic-compatible endpoints, the codex app-server lane for Codex. The daemon composes argv, environment, controls and event handling per lane."
 ---
 
 # Provider lanes
@@ -42,11 +42,17 @@ The daemon spawns `claude` (or `CLAUDE_BIN`) with:
 [--session-id <uuid> | --resume <uuid>] [--model <id>] [--effort <level>]
 [--append-system-prompt <dispatch context>] [--system-prompt ""]
 [--json-schema <schema>] [--mcp-config <json> --strict-mcp-config]
-[--disallowedTools <a,b>]
+[--tools <native-tool-list>] [--disallowedTools <a,b>]
 ```
 
 `code_mode`, `edit_discipline` and `service_tier` have no supported mapping
 on this lane. Dispatch and resume refuse explicit values before spawning.
+
+A nonempty allowlist restricts built-in availability through `--tools` and
+denies every unlisted tool in the daemon-owned MCP catalog. Explicit denials
+still win. This requires strict MCP configuration containing only this daemon;
+external MCP catalogs and non-exact native allow patterns are refused. Permission
+grants such as `--allowedTools` do not implement availability restrictions.
 
 The initial prompt never rides argv. It is the first stream-json `user`
 envelope on stdin, followed by later turns and controls. The session id the

@@ -249,6 +249,8 @@ pub struct ProviderLaunch {
     pub codex: Option<bro_protocol::CodexSessionConfig>,
     pub prompt: Option<String>,
     pub errors: Vec<String>,
+    /// A Claude allowlist requires a closed MCP inventory owned by this daemon.
+    pub claude_restricted_mcp: bool,
 }
 
 impl From<Vec<String>> for ProviderLaunch {
@@ -278,10 +280,14 @@ impl ProviderLaunch {
         } else {
             use super::dispatch_prelude::ProviderMcp;
             if provider.lane() == ProviderLane::ClaudeCli && !filters.allow.is_empty() {
-                self.errors.push(
-                    "Claude CLI cannot enforce a global tool allowlist across native and MCP tools"
-                        .into(),
-                );
+                match super::mcp_args::claude_allowlist_args(filters) {
+                    Ok(args) => {
+                        self.claude_restricted_mcp = true;
+                        self.argv.extend(args);
+                    }
+                    Err(error) => self.errors.push(error.to_string()),
+                }
+                return;
             }
             self.argv.extend(provider.build_filter_args(filters));
         }
@@ -338,6 +344,7 @@ fn codex_launch(
     ProviderLaunch {
         argv: Vec::new(),
         errors: Vec::new(),
+        claude_restricted_mcp: false,
         prompt: Some(prompt.into()),
         codex: Some(bro_protocol::CodexSessionConfig {
             resume: resume.map(str::to_string),

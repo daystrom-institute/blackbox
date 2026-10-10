@@ -261,7 +261,7 @@ Three reasons the doc rejects that:
    registry" signal.
 
 2. **Many-manifests-to-one-brofile reuse.** A single brofile (e.g.
-   `code-reviewer-persona`) can back multiple agents that differ
+   an operator-installed `code-reviewer-persona`) can back multiple agents that differ
    only in cuing or filter overlay: `code-reviewer-strict`,
    `code-reviewer-quick`, `code-reviewer-security-only`. The
    manifest layer is where these distinct cuings live; the brofile
@@ -329,6 +329,9 @@ lands; B2-B4 and downstream phases stay structurally identical.
 
 The manifest is a JSON object stored in the agent artifact under the
 `manifest` field. The full agent JSON has:
+
+The example requires an operator-installed `code-reviewer-persona` brofile;
+that name is illustrative, not a bundled artifact.
 
 ```json
 {

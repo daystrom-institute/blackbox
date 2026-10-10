@@ -8,12 +8,17 @@ out explicitly under `Changed` or `Removed`.
 
 ## Unreleased
 
+- Dispatch errors include the worker startup failure instead of reporting an
+  expired session handshake when the worker has already stopped. Transcript
+  diagnostics identify the daemon that owns the stored receipt path.
+
 - Workers include the resolved provider executable's directory in PATH so
   env-based CLI launchers can find their runtime under a service supervisor.
 
 - CLI dispatch refuses unsupported execution settings instead of silently
-  dropping them. Claude dispatch rejects global tool allowlists that its
-  permission flags cannot enforce. Both execution hosts require readable durable
+  dropping them. Claude dispatch enforces exact native tool allowlists with
+  `--tools` and restricts MCP tools to a known daemon catalog. Allowlists with
+  external MCP servers or unsupported native patterns are rejected. Both execution hosts require readable durable
   event logs before launch and stop a worker on event persistence failure. Resume refuses
   malformed or incomplete log tails instead of resetting the event sequence.
 
@@ -30,7 +35,7 @@ out explicitly under `Changed` or `Removed`.
   now run as `claude -p` children against their `~/.claude-*` config dirs
   instead of `bro-harness`.
   Persona and scope ride `--append-system-prompt`, structured output
-  `--json-schema`, tool filters `--allowedTools`/`--disallowedTools`, and the
+  `--json-schema`, tool denials `--disallowedTools`, and the
   daemon MCP server `--mcp-config --strict-mcp-config`. The executor that owns
   a claude child's stdout writes its session log (fleetd included), and the
   daemon closes the child's stdin after a turn's result; fleetd learns an

@@ -757,9 +757,9 @@ agentic-corpus §2.1).
 **Components.**
 - `examples/agents/code-reviewer.json` — full manifest for the
   example in §4.1 of the design doc; brofile_ref to a separately-
-  installed `code-reviewer-persona` brofile.
-- `examples/agents/code-reviewer-persona.json` — the brofile
-  artifact.
+  installed, operator-supplied `code-reviewer-persona` brofile.
+- A matching brofile supplied by the installer. The persona name in the
+  manifest is illustrative and must resolve in the installed catalog.
 - `examples/agents/diff-narrator.json` — chainable-before
   code-reviewer (composition demo).
 - `examples/agents/badgey.json` — placeholder pointer to badgey-impl

@@ -793,7 +793,8 @@ always hold; daily cap configurable (high default per A6).
   predicate (default 50, configurable).
 - `examples/agentic-corpus/packets/bro-trust/per-brofile.json` — composed
   by entry-quality gate via `Apply{packet=bro-trust, expect=trusted}`.
-- Brofile: `digest-extractor` (Sonnet 4.6 with extraction-focused lens).
+- Brofile: an operator-installed extraction persona on a supported provider.
+  The workflow must resolve that brofile before dispatch.
 - Hook ops: `read_session`, `parse_json`, `validate_schema`,
   `apply_entry` / `surface_to_inbox` / `log_reject`.
 - Routing packet: `task-completed` signal → `start_arc auto-digest-arc`
