@@ -137,13 +137,8 @@ pub(crate) struct ExecParams {
     /// resolved brofile's `service_tier`.
     #[serde(default)]
     pub(crate) service_tier: Option<String>,
-    /// **Internal.** Spawn-time origin override (Slice 1b). The MCP
-    /// `bro_exec` tool ignores this and dispatches as
-    /// `Origin::AgentDispatch`; the daemon's HTTP control handler
-    /// (`/control/exec`) sets it to `Origin::Cockpit` so the roster
-    /// can tab cockpit-launched tasks separately from peer-bros-launched
-    /// ones. Not part of the public MCP schema — clients should not set
-    /// it.
+    /// Internal transport classification. HTTP control sets `Origin::Control`;
+    /// MCP launches use `Origin::AgentDispatch`. Caller JSON cannot set this.
     #[serde(default, skip_deserializing)]
     #[schemars(skip)]
     pub(crate) origin_override: Option<bro_core::Origin>,
@@ -211,12 +206,8 @@ pub(crate) struct ResumeParams {
     #[serde(skip_deserializing)]
     #[schemars(skip)]
     pub(crate) coerce_workspace: Option<bool>,
-    /// **Internal.** Spawn-time origin override, mirroring the slot on
-    /// `ExecParams`: the MCP `bro_resume` tool ignores it and resumes as
-    /// `Origin::AgentDispatch`; the daemon's `/control/resume` handler sets
-    /// it to `Origin::Cockpit` so a cockpit-driven follow-up turn stays in
-    /// the fleet roster tab instead of jumping to the dispatched-agents tab.
-    /// Not part of the public MCP schema — clients should not set it.
+    /// Internal transport classification, matching `ExecParams`.
+    /// Caller JSON cannot set this field.
     #[serde(default, skip_deserializing)]
     #[schemars(skip)]
     pub(crate) origin_override: Option<bro_core::Origin>,
@@ -689,15 +680,9 @@ mod tests {
         assert_eq!(resume.cwd.as_deref(), Some("/repo/r2"));
     }
 
-    /// Contract with the fleet cockpit's `/control/resume` body
-    /// (`bro-fleet-client::resume_body`): every field the cockpit sends must
-    /// deserialize under `deny_unknown_fields`. Regression guard: the
-    /// 2026-06-10 deny_unknown_fields hardening turned the cockpit's
-    /// previously-silently-dropped `pin_model`/`pin_effort` into a 422 on
-    /// every fleet resume (axum Json rejection), which the cockpit surfaced
-    /// as a wiped transcript + "HTTP status client error" flash.
+    /// HTTP resume bodies use the same parameter shape as the MCP tool.
     #[test]
-    fn resume_params_accept_cockpit_resume_body() {
+    fn resume_params_accept_control_resume_body() {
         let body = serde_json::json!({
             "provider": "brodex",
             "session_id": "sess-1",
@@ -709,7 +694,7 @@ mod tests {
             "service_tier": "priority",
         });
         let p: ResumeParams =
-            serde_json::from_value(body).expect("cockpit resume body must deserialize");
+            serde_json::from_value(body).expect("control resume body must deserialize");
         assert_eq!(p.pin_model.as_deref(), Some("gpt-5.2-codex"));
         assert_eq!(p.pin_effort.as_deref(), Some("high"));
         assert_eq!(p.service_tier.as_deref(), Some("priority"));

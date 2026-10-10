@@ -1,25 +1,9 @@
-//! Dispatch command-plane DTOs.
-//!
-//! `DispatchSpec`/`ResumeSpec` are the shape of a "start / continue an entrypoint
-//! agent" request the fleet cockpit builds and the daemon services over
-//! `/control/{exec,resume}`. They live at the contract bottom (§2 control plane)
-//! so a thin client can name them without linking the daemon; the byte transport
-//! (today a hand-built JSON body) is a thin layer above this schema.
-//!
-//! `CloseoutRequest`/`CloseoutOutcome` are the wire shape for the phased
-//! `/control/closeout` endpoint (design/fleet-tui/closeout-command.md §4.1,
-//! Gap B "Config vs wire boundary"). The daemon translates the wire DTO into
-//! the `bro_tools` internal `CloseoutRequest` and returns the structured
-//! `CloseoutOutcome` directly (§4.3 "Direct path returns the driver's
-//! structured PhaseResult") — no transcript parsing, no collapsed legacy tool
-//! JSON. The `PhaseResult` shape is duplicated here (and on the
-//! `bro_tools` side) on purpose: bro-protocol stays free of bro-tools and
-//! vice versa; the daemon bridges them.
+//! HTTP closeout request and result contracts, plus provider service-tier values.
+//! The daemon translates these types to the worktree driver's internal types.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use bro_core::Provider;
 use serde::{Deserialize, Serialize};
 
 /// Codex/OpenAI Responses priority-routing value used by `/fast`.
@@ -27,124 +11,6 @@ pub const SERVICE_TIER_PRIORITY: &str = "priority";
 /// Explicit standard-routing sentinel. The Responses request body drops it, but
 /// the harness persists it so resume does not fall back to an ambient fast tier.
 pub const SERVICE_TIER_DEFAULT: &str = "default";
-
-/// What to dispatch as a new top-level entrypoint agent. The cockpit's
-/// composer fills this in; cwd/model are optional and resolved per dispatch
-/// (no stickiness on the agent itself — provider is fixed at spawn, §4).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DispatchSpec {
-    pub provider: Provider,
-    pub prompt: String,
-    pub cwd: Option<String>,
-    pub model: Option<String>,
-    /// Effort/thinking level passed to the provider CLI's `--effort`.
-    pub effort: Option<String>,
-    /// Extra env overrides for the child (e.g. MCP injection wiring). The
-    /// cockpit's TUI-local config (§5.2) feeds this; `None` for a bare launch.
-    pub env_overrides: Option<HashMap<String, String>>,
-    /// Display name persisted with the task (stored in `bro_label`) so it
-    /// survives a cockpit reload. Defaults to the initial prompt's head.
-    pub name: Option<String>,
-    /// Code-mode for harness-backed providers (`off`/`optional`/`only`),
-    /// forwarded to the daemon as `ExecParams.code_mode`. Set on new roster
-    /// dispatches from the cockpit's `/config` toggle; `None` ⇒ harness default.
-    /// Resume does not carry this — the session restores its persisted value.
-    pub code_mode: Option<String>,
-    /// Edit discipline for the new session (`free`/`structured`), forwarded to
-    /// the daemon as `ExecParams.edit_discipline`. `None` ⇒ the brofile's
-    /// value, else `free`. Resume does not carry this: the session keeps the
-    /// value it was dispatched with.
-    pub edit_discipline: Option<String>,
-    /// Service tier for supported providers. `priority` is the Codex `/fast`
-    /// tier; `default` is the standard-routing sentinel. Resume normally
-    /// restores the persisted value, but `ResumeSpec.service_tier` can override
-    /// it for a specific continuation.
-    pub service_tier: Option<String>,
-    /// Per-dispatch tool argument defaults, forwarded to the daemon as
-    /// `ExecParams.tool_defaults`. Keys are `<flavor>:<tool-pattern>.<param>`;
-    /// the daemon merges them over the ambient and brofile defaults.
-    pub tool_defaults: Option<BTreeMap<String, serde_json::Value>>,
-}
-
-impl DispatchSpec {
-    pub fn new(provider: Provider, prompt: impl Into<String>) -> Self {
-        Self {
-            provider,
-            prompt: prompt.into(),
-            cwd: None,
-            model: None,
-            effort: None,
-            env_overrides: None,
-            name: None,
-            code_mode: None,
-            edit_discipline: None,
-            service_tier: None,
-            tool_defaults: None,
-        }
-    }
-}
-
-/// Resume a prior (Interrupted / reloaded) session and continue it with a new
-/// turn — `--resume <session_id> -p <prompt>` (§5: steering an Interrupted
-/// session auto-resumes). The harness/Claude CLI reloads the on-disk transcript.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ResumeSpec {
-    pub provider: Provider,
-    pub session_id: String,
-    pub prompt: String,
-    pub cwd: Option<String>,
-    pub model: Option<String>,
-    pub effort: Option<String>,
-    pub name: Option<String>,
-    pub env_overrides: Option<HashMap<String, String>>,
-    /// Explicit service-tier override for this continuation. `None` defers to
-    /// the restored session/brofile/harness default; `Some("default")` clears
-    /// back to standard routing while still persisting that choice.
-    pub service_tier: Option<String>,
-    /// Per-dispatch tool argument defaults for this continuation, forwarded
-    /// to the daemon as `ResumeParams.tool_defaults`. They apply to this
-    /// resumed invocation only.
-    pub tool_defaults: Option<BTreeMap<String, serde_json::Value>>,
-}
-
-impl ResumeSpec {
-    pub fn new(
-        provider: Provider,
-        session_id: impl Into<String>,
-        prompt: impl Into<String>,
-    ) -> Self {
-        Self {
-            provider,
-            session_id: session_id.into(),
-            prompt: prompt.into(),
-            cwd: None,
-            model: None,
-            effort: None,
-            name: None,
-            env_overrides: None,
-            service_tier: None,
-            tool_defaults: None,
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// /control/closeout wire DTOs (design/fleet-tui/closeout-command.md §4.1)
-//
-// `CloseoutRequest` is the cockpit→daemon payload. The daemon is responsible
-// for resolving `target` (defaults to the base repo's current branch — not
-// "main") and applying the same pre-driver safety guards the existing
-// `exit_worktree` tool applies (managed-worktree, branch-prefix eligibility,
-// detached-HEAD refusal, confirm gate). It then translates this DTO into a
-// `bro_tools::fleet_worktree::CloseoutRequest` and calls
-// `run_closeout_phases`.
-//
-// The `CloseoutOutcome` / `PhaseResult` / `CloseoutPhase` / `CloseoutErrorClass`
-// wire shapes are intentionally a separate type family from the `bro_tools`
-// internal types so the contract crate stays free of `bro-tools` and the
-// driver crate stays free of `bro-protocol`. The daemon converts between
-// them; clients depend only on this DTO module.
-// ---------------------------------------------------------------------------
 
 /// One of the discrete phases of the closeout sequence (mirrors
 /// `bro_tools::fleet_worktree::CloseoutPhase` — the daemon bridges).
@@ -230,12 +96,8 @@ pub enum CloseoutOutcome {
     Failed(PhaseResult),
 }
 
-/// Fully-resolved closeout hooks on the wire (design/fleet-tui/closeout-command.md
-/// §3 Gap B, §4.4). The cockpit strict-loads the project's `project_closeout`
-/// config, resolves which scriptlets apply for the worktree's base repo, and
-/// sends this resolved shape; the daemon translates it into the `bro_tools`
-/// local `CloseoutHooks` and the driver runs each scriptlet at the matching
-/// phase boundary.
+/// Caller-resolved closeout hooks. The daemon translates them to the worktree
+/// driver's internal type and runs them at the matching phase boundaries.
 ///
 /// Event keys are `"pre_push" | "pre_remove" | "post_success" | "on_discard"`
 /// (kept stringly so the contract crate need not duplicate the event enum;
@@ -263,33 +125,11 @@ pub struct CloseoutHooksWire {
 
 /// Wire DTO for `/control/closeout`.
 ///
-/// Field semantics (mirrors `ExitWorktreeInput` on the tool side):
-///
-/// * `worktree` — required; the managed-worktree path the closeout targets.
-/// * `disposition` — `"keep"`, `"preflight"`, `"discard"`, `"publish"`,
-///   `"merge"`, or `"adopt"`. Mutating dispositions (`discard` / `publish` /
-///   `merge` / `adopt`) require `confirm = true`.
-/// * `confirm` — required `true` for any mutating disposition. The handler
-///   refuses otherwise (matches the tool's pre-driver guard).
-/// * `target` — optional; the daemon resolves it to the base repo's current
-///   branch when absent (operator-decided default; NOT "main"). The
-///   `bro_tools` tool keeps its own "main" default — only this endpoint
-///   defaults to current branch.
-/// * `commit_message` — required for `disposition = "publish"`.
-/// * `paths` — explicit pathspecs to stage for `publish`. Empty means stage
-///   every changed path in the managed worktree (mirrors the tool's default).
-/// * `allow_branch_prefixes` — optional; the daemon defaults to
-///   `["bro-fleet/"]` when absent. Detached HEAD always refuses.
-/// * `dry_run` — optional (`#[serde(default)]`, default `false`). When
-///   `true`, the driver runs `phase_preflight` for the supplied disposition
-///   and STOPS — no mutation. This replaces the older pattern of overloading
-///   `disposition = "preflight"`, which the phased driver did not recognize
-///   (caught every `--dry-run` in the cockpit with a `got preflight`
-///   failure). The cockpit's `/closeout <disposition> --dry-run` sends the
-///   REAL disposition (e.g. `publish`) with `dry_run = true`; the daemon
-///   runs preflight for that disposition, surfaces readiness without
-///   committing/pushing/merging, and returns. The non-dry-run path is
-///   byte-identical (default `false` ⇒ unchanged behavior).
+/// Mutating dispositions require `confirm=true`; publishing also requires a
+/// commit message. An absent target resolves to the stored fork branch, then
+/// the base checkout's current branch, then main. Empty publish paths stage all
+/// changed paths. Absent branch prefixes default to `bro-fleet/`.
+/// `dry_run=true` checks readiness for the requested disposition without mutation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CloseoutRequest {
     pub worktree: String,
@@ -308,9 +148,8 @@ pub struct CloseoutRequest {
     #[serde(default)]
     pub dry_run: bool,
     /// Fully-resolved project closeout hooks (see `CloseoutHooksWire`). Absent
-    /// means no hooks run. The cockpit resolves these from `project_closeout`
-    /// config; the daemon translates to the `bro_tools` local type and the
-    /// driver fires them at phase boundaries. Skipped entirely on `dry_run`.
+    /// means no hooks run. The daemon translates to the driver
+    /// type. Skipped entirely on `dry_run`.
     #[serde(default)]
     pub closeout_hooks: Option<CloseoutHooksWire>,
 }

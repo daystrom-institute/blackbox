@@ -108,9 +108,8 @@ For Ratatui specifically, boost files importing `ratatui::prelude::*`,
 ## Relationship to preview snapshots
 
 `bbox_ui_component_locator` should return `preview_fixtures` when it recognizes a
-screen that has a deterministic preview. For fleet, those names should line up
-with `bro fleet snapshot` fixtures from
-`design/fleet-tui/ratatui-snapshot-preview.md`.
+screen that has a deterministic preview. Fixture names should resolve to
+preview targets provided by the indexed project.
 
 The locator answers "where should I edit and what should I compare?" The snapshot
 preview answers "what did the UI actually render after the edit?"

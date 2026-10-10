@@ -15,29 +15,8 @@ pub use provider::{Capability, EffortInfo, ModelInfo, Provider, ProviderLane};
 // Task origin
 // ---------------------------------------------------------------------------
 //
-// Where a daemon task was spawned FROM. Read at creation time and persisted
-// alongside the task so the fleet roster (design/fleet-tui/daemon-roster-and-
-// tail-unification.md §4.1) can group/tab tasks by their source. The cockpit
-// HUD and the fleet TUI both need this distinction:
-//   - `AgentDispatch` covers the bro_* MCP tools invoked by another bro / by
-//     the operator from the cockpit chat. The bulk of fleet traffic.
-//   - `Cockpit` covers cockpit dispatches that bypass the bro_exec MCP
-//     tool but still go through the same spawn funnel. Same intent as
-//     AgentDispatch but with a separate UI tab so cockpit-launched tasks
-//     are visually distinguishable from peer-bros-launched ones.
-//   - `Workflow` covers workflow runtime dispatches.
-//   - `Atom` covers catalog atom invocations and resumes.
-//   - `Cron` / `Webhook` cover the scheduled / HTTP-triggered ingress paths
-//     (added in their respective slices; V1 records them as the canonical
-//     labels so the roster can light up dedicated tabs as soon as the
-//     ingress paths actually use them).
-//   - `Unknown` is the conservative default for any creation site not
-//     yet classified. The design spec (Slice 1b) audits every spawn site;
-//     unclassified sites are gaps and should be re-graded.
-//
-// New variants: ADD, do not reorder. The serde representation is a string
-// (lowercase variant name); old persisted records missing the field
-// decode to `Unknown` (see TaskStore::load back-compat).
+// Task origins are persisted as lowercase strings. Missing origins decode to
+// Unknown. Keep legacy variants readable when their launch surfaces disappear.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Origin {
@@ -49,6 +28,8 @@ pub enum Origin {
     Atom,
     Cron,
     Webhook,
+    /// Tasks launched through the daemon HTTP control API.
+    Control,
 }
 
 impl Origin {
@@ -64,6 +45,7 @@ impl Origin {
             Origin::Atom => "atom",
             Origin::Cron => "cron",
             Origin::Webhook => "webhook",
+            Origin::Control => "control",
         }
     }
 }
@@ -185,6 +167,16 @@ impl BroError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn control_and_legacy_cockpit_origins_keep_distinct_wire_names() {
+        for (wire, origin) in [("control", Origin::Control), ("cockpit", Origin::Cockpit)] {
+            let json = format!("\"{wire}\"");
+            assert_eq!(serde_json::from_str::<Origin>(&json).unwrap(), origin);
+            assert_eq!(serde_json::to_string(&origin).unwrap(), json);
+            assert_eq!(origin.as_wire(), wire);
+        }
+    }
 
     #[test]
     fn workspace_id_round_trips() {

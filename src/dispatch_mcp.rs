@@ -1,5 +1,5 @@
 pub const DEFAULT_DISPATCH_SURFACE: &str = "default";
-pub const COCKPIT_DISPATCH_SURFACE: &str = "interactive";
+pub const CONTROL_DISPATCH_SURFACE: &str = "interactive";
 pub const WORKFLOW_AGENT_SURFACE: &str = "agent-internal";
 
 pub fn dispatch_mcp_url(bind_host: &str, port: u16) -> String {
@@ -14,7 +14,7 @@ pub fn dispatch_mcp_url_with_surface(bind_host: &str, port: u16, surface: &str) 
 pub fn dispatch_mcp_surface_for_origin(origin: bro_core::Origin) -> &'static str {
     match origin {
         bro_core::Origin::Workflow => WORKFLOW_AGENT_SURFACE,
-        bro_core::Origin::Cockpit => COCKPIT_DISPATCH_SURFACE,
+        bro_core::Origin::Control | bro_core::Origin::Cockpit => CONTROL_DISPATCH_SURFACE,
         _ => DEFAULT_DISPATCH_SURFACE,
     }
 }
@@ -48,11 +48,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cockpit_dispatch_uses_the_interactive_surface() {
-        assert_eq!(
-            dispatch_mcp_surface_for_origin(bro_core::Origin::Cockpit),
-            COCKPIT_DISPATCH_SURFACE
-        );
+    fn control_and_legacy_cockpit_dispatch_use_the_interactive_surface() {
+        for origin in [bro_core::Origin::Control, bro_core::Origin::Cockpit] {
+            assert_eq!(
+                dispatch_mcp_surface_for_origin(origin),
+                CONTROL_DISPATCH_SURFACE
+            );
+        }
     }
 
     #[test]

@@ -605,7 +605,7 @@ while True: time.sleep(1)
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn control_routes_run_the_lifecycle_as_cockpit_tasks() {
+    async fn control_routes_run_the_lifecycle_as_control_tasks() {
         use axum::extract::State as AxumState;
         let mut plane = Plane::start().await;
         let cwd = plane.cwd();
@@ -613,7 +613,7 @@ while True: time.sleep(1)
             AxumState(plane.state.clone()),
             axum::Json(
                 serde_json::from_value(json!({
-                    "prompt": "cockpit turn",
+                    "prompt": "control turn",
                     "provider": "brodex",
                     "cwd": cwd,
                     "tool_defaults": { "default:shell_run.timeout_ms": 30000 },
@@ -626,8 +626,8 @@ while True: time.sleep(1)
         let task = exec["taskId"].as_str().expect("taskId").to_string();
         let session = exec["sessionId"].as_str().expect("sessionId").to_string();
         let child = plane.next_child().await;
-        await_file(&child.join("stdin"), "cockpit turn").await;
-        assert_eq!(plane.origin(&task), bro_core::Origin::Cockpit);
+        await_file(&child.join("stdin"), "control turn").await;
+        assert_eq!(plane.origin(&task), bro_core::Origin::Control);
         let context: Value = serde_json::from_str(
             flag(&argv(&child), "--additional-context").expect("additional context"),
         )
@@ -641,7 +641,7 @@ while True: time.sleep(1)
             AxumState(plane.state.clone()),
             axum::Json(
                 serde_json::from_value(json!({
-                    "prompt": "cockpit follow-up",
+                    "prompt": "control follow-up",
                     "session_id": session,
                     "provider": "brodex",
                     "cwd": cwd,
@@ -653,8 +653,8 @@ while True: time.sleep(1)
         let resumed = parsed(&resumed.0);
         let resumed_task = resumed["taskId"].as_str().expect("resume taskId").to_string();
         let second = plane.next_child().await;
-        await_file(&second.join("stdin"), "cockpit follow-up").await;
-        assert_eq!(plane.origin(&resumed_task), bro_core::Origin::Cockpit);
+        await_file(&second.join("stdin"), "control follow-up").await;
+        assert_eq!(plane.origin(&resumed_task), bro_core::Origin::Control);
         let waited = plane.finish(&resumed_task).await;
         assert_eq!(waited["status"], "completed", "{waited}");
     }

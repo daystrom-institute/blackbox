@@ -183,12 +183,13 @@ Domain home for the dispatch plane. Boundary contract:
   lanes. The pseudo-provider `workflow` remains non-dispatchable in either
   mode.
 
-## Cockpit dispatches use the interactive MCP surface
+## HTTP control dispatches use the interactive MCP surface
 
-- `Origin::Cockpit` workers use `surface=interactive`, which retains the
+- `Origin::Control` and legacy `Origin::Cockpit` workers use
+  `surface=interactive`, which retains the
   model-facing `bbox_render` capability required by the managed-workspace
   locality wrapper. The external-client `default` surface deliberately hides
-  lifecycle tools including `bbox_render`, so routing a cockpit worker there
+  lifecycle tools including `bbox_render`, so routing a control worker there
   makes checkout-local render impossible even when workspace authority is
   valid. Workflow workers remain on `agent-internal`; every other origin
   dispatches on `default`.

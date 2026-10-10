@@ -1,11 +1,7 @@
-//! Builtin `report` tool — the agent's status/needs signal for the fleet
-//! cockpit (design/fleet-tui/fleet-tui.md §2.2).
+//! Builtin status and input-needs reporting on the session event stream.
 //!
-//! When the agent calls `report`, the harness emits a `report` stream-json line
-//! that the cockpit reads to drive the **Waiting** bucket (when `needs_input`)
-//! and the per-row summary. It is a harness builtin holding its own [`Emitter`]
-//! handle, registered beside the bro-tools builtins; unpinned in normal CLI mode
-//! and pinned in fleet mode (via `PinPolicy::also_pin`).
+//! Each call emits a `report` envelope through the shared [`Emitter`].
+//! Tool availability follows the session's pin policy.
 
 use crate::emit::Emitter;
 use async_trait::async_trait;

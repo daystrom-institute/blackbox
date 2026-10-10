@@ -8,6 +8,11 @@ out explicitly under `Changed` or `Removed`.
 
 ## Unreleased
 
+- HTTP task launches and resumes now report origin `control`, with the same
+  interactive MCP policy. Stored `cockpit` origins remain readable. Removed
+  unused cockpit dispatch/transcript types and TUI design/backlog documents;
+  task control contracts live with the daemon runtime documentation.
+
 - Removed the unused Fleet client engine, roster mirror, transcript parser and
   cockpit configuration writers. `bro-config` owns shared connection settings,
   MCP server definitions and dispatch environment settings. Existing config

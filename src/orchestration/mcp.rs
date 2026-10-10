@@ -590,9 +590,7 @@ fn parse_copilot_mcp_pattern(pattern: &str) -> Option<(&str, &str)> {
 /// matcher that recurses per `*` split point: that is exponential, and
 /// because it runs while the per-dispatch tool-surface lock is held, a
 /// pathological multi-`*` pattern wedges the WHOLE daemon (every
-/// thread/knowledge op stalls for minutes). Surfaced by the
-/// closeout dogfooding run — see
-/// design/fleet-tui/closeout-command.md §6 and thread-de03a2c5 Note 5.
+/// thread/knowledge op stalls for minutes).
 pub fn glob_match(pattern: &str, text: &str) -> bool {
     let p: Vec<char> = pattern.chars().collect();
     let t: Vec<char> = text.chars().collect();

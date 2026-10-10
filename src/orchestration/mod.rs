@@ -3009,19 +3009,14 @@ fn project_dispatch_shell_env(
     (!env.is_empty()).then_some(env)
 }
 
-/// Resolve fleet.json `mcpServers` into provider dispatch args for one
-/// dispatch. Cockpit-origin only, by policy: operator MCP servers (whose
-/// `$secret` refs resolve at injection) reach the agents the operator
-/// live-drives from the cockpit — never automation origins
-/// (workflow/atom/cron/webhook), which keep their restricted tool surfaces.
-///
-/// The injection rides the harness CLI argv (`--mcp-config`), so the same
-/// args would drive a standalone `bro-harness` subprocess unchanged — the
-/// daemon never reaches into the harness `McpConfig` directly
-/// (harness-process-boundary.md §2). Best-effort like the dispatch env: a
-/// missing/malformed fleet.json injects nothing.
-fn fleet_mcp_dispatch_args(provider: Provider, origin: bro_core::Origin) -> Vec<String> {
-    if origin != bro_core::Origin::Cockpit {
+/// Resolve operator MCP servers for HTTP control tasks and legacy cockpit tasks.
+/// Other origins retain their restricted MCP surfaces. Missing or malformed
+/// fleet.json yields no additional servers.
+fn control_mcp_dispatch_args(provider: Provider, origin: bro_core::Origin) -> Vec<String> {
+    if !matches!(
+        origin,
+        bro_core::Origin::Control | bro_core::Origin::Cockpit
+    ) {
         return Vec::new();
     }
     let cfg = bro_config::DispatchConfig::load();
@@ -3211,12 +3206,15 @@ async fn spawn_reserved_dispatch(
     // process env below. Resolved here so every dispatch path — bro_exec,
     // agent dispatch, workflows, cockpit — behaves identically.
     let dispatch_shell_env = project_dispatch_shell_env(cwd.as_deref());
-    // Cockpit dispatches additionally carry the operator's fleet.json
+    // HTTP control dispatches additionally carry the operator's fleet.json
     // `mcpServers`, injected as `--mcp-config` argv and merged with the
     // daemon's complete self-MCP catalog before the child is spawned.
     let mut args: providers::ProviderLaunch = args.into();
     if let Some(config) = &mut args.codex {
-        if origin == bro_core::Origin::Cockpit {
+        if matches!(
+            origin,
+            bro_core::Origin::Control | bro_core::Origin::Cockpit
+        ) {
             let fleet = bro_config::DispatchConfig::load();
             match providers::codex_fleet_mcp_servers(&fleet.mcp_servers) {
                 Ok(servers) => config.mcp_servers.extend(servers),
@@ -3224,7 +3222,7 @@ async fn spawn_reserved_dispatch(
             }
         }
     } else {
-        args.extend(fleet_mcp_dispatch_args(provider, origin));
+        args.extend(control_mcp_dispatch_args(provider, origin));
     }
     if provider.is_dispatchable() {
         return spawn_harness_child_task(
@@ -7802,7 +7800,7 @@ mod tests {
     }
 
     #[test]
-    fn fleet_mcp_dispatch_args_is_cockpit_only() {
+    fn control_mcp_dispatch_args_excludes_non_control_origins() {
         // The gate must short-circuit BEFORE any fleet.json read: automation
         // origins inject nothing regardless of operator config (and the test
         // stays isolated from the host's real fleet.json).
@@ -7816,14 +7814,14 @@ mod tests {
             Origin::Webhook,
         ] {
             assert!(
-                fleet_mcp_dispatch_args(Provider::Glm, origin).is_empty(),
+                control_mcp_dispatch_args(Provider::Glm, origin).is_empty(),
                 "{origin} must not receive fleet MCP servers"
             );
         }
     }
 
     #[test]
-    fn fleet_mcp_dispatch_args_cockpit_injects_fleet_servers() {
+    fn control_mcp_dispatch_args_preserves_operator_servers() {
         // Cockpit origin end-to-end: fleet.json beside the selected config
         // (BLACKBOX_CONFIG keys the lookup, keeping the test off the host's
         // real config) lands in the dispatch argv as `--mcp-config`, and
@@ -7846,21 +7844,23 @@ mod tests {
         env.set("BLACKBOX_CONFIG", config_path.to_str().unwrap());
         env.set("BLACKBOX_MCP_NAME", "selfbox");
 
-        let mut args = fleet_mcp_dispatch_args(Provider::Glm, bro_core::Origin::Cockpit);
-        assert_eq!(args[0], "--mcp-config");
+        for origin in [bro_core::Origin::Control, bro_core::Origin::Cockpit] {
+            let mut args = control_mcp_dispatch_args(Provider::Glm, origin);
+            assert_eq!(args[0], "--mcp-config");
 
-        let config = build_harness_mcp_config(
-            &mut args,
-            None,
-            Some("http://127.0.0.1:7264/mcp?surface=default"),
-            false,
-        )
-        .unwrap()
-        .unwrap();
-        let config: Value = serde_json::from_str(&config).unwrap();
-        assert!(args.is_empty(), "--mcp-config consumed from argv");
-        assert!(config["mcpServers"]["tmux"].is_object());
-        assert!(config["mcpServers"]["selfbox"].is_object());
+            let config = build_harness_mcp_config(
+                &mut args,
+                None,
+                Some("http://127.0.0.1:7264/mcp?surface=default"),
+                false,
+            )
+            .unwrap()
+            .unwrap();
+            let config: Value = serde_json::from_str(&config).unwrap();
+            assert!(args.is_empty(), "--mcp-config consumed from argv");
+            assert!(config["mcpServers"]["tmux"].is_object());
+            assert!(config["mcpServers"]["selfbox"].is_object());
+        }
     }
 
     #[test]
@@ -8345,6 +8345,32 @@ mod tests {
         let rows: Vec<Value> =
             serde_json::from_str(&store.serialize_snapshot(50).unwrap()).unwrap();
         rows.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn task_store_preserves_control_and_legacy_cockpit_origins() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let rows: Vec<Value> = ["control", "cockpit"]
+            .into_iter()
+            .map(|origin| {
+                let mut row = persisted_task_fixture(origin);
+                row["origin"] = json!(origin);
+                row
+            })
+            .collect();
+        std::fs::write(root.join("tasks.json"), serde_json::to_vec(&rows).unwrap()).unwrap();
+        let loaded = TaskStore::load(&root, u64::MAX);
+        assert_eq!(loaded.all_tasks().len(), 2);
+        assert!(loaded.quarantined_rows.is_empty());
+        let saved: Vec<Value> =
+            serde_json::from_str(&loaded.serialize_snapshot(50).unwrap()).unwrap();
+        for origin in ["control", "cockpit"] {
+            let task = loaded.get(origin).unwrap();
+            assert_eq!(task.inner.lock().origin.as_wire(), origin);
+            assert!(!task.inner.lock().workflow_owned);
+            assert!(saved.iter().any(|row| row["origin"] == origin));
+        }
     }
 
     #[test]

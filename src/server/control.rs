@@ -1,4 +1,4 @@
-//! Bro execution and Fleet control HTTP handlers.
+//! Bro task and session control HTTP handlers.
 //!
 //! These routes delegate to the bro task/session plane and remain independent
 //! of workflow admission, arc execution, and application event routing.
@@ -35,13 +35,8 @@ pub(crate) async fn control_exec_handler(
     AxumState(state): AxumState<Arc<SharedState>>,
     axum::Json(mut req): axum::Json<ExecParams>,
 ) -> axum::Json<CallToolResult> {
-    // The HTTP control handler (`/control/exec`) bypasses the MCP
-    // bro_exec tool surface but routes through the same spawn funnel.
-    // Force the origin to Cockpit so the roster tab groups
-    // cockpit-launched tasks separately from peer-bros-launched ones
-    // (which carry AgentDispatch). The MCP bro_exec path itself
-    // defaults to AgentDispatch and ignores this override slot.
-    req.origin_override = Some(bro_core::Origin::Cockpit);
+    // Transport-owned classification cannot be supplied through MCP arguments.
+    req.origin_override = Some(bro_core::Origin::Control);
     axum::Json(BlackboxServer::new(state).bro_exec(Parameters(req)).await)
 }
 
@@ -49,28 +44,15 @@ pub(crate) async fn control_resume_handler(
     AxumState(state): AxumState<Arc<SharedState>>,
     axum::Json(mut req): axum::Json<ResumeParams>,
 ) -> axum::Json<CallToolResult> {
-    // Same origin pinning as `/control/exec`: a cockpit-driven resume is a
-    // cockpit task. Without this the resumed follow-up turn spawns as
-    // AgentDispatch and the roster row jumps from the fleet tab to the
-    // dispatched-agents tab mid-conversation.
-    req.origin_override = Some(bro_core::Origin::Cockpit);
+    req.origin_override = Some(bro_core::Origin::Control);
     axum::Json(BlackboxServer::new(state).bro_resume(Parameters(req)).await)
 }
 
 // ── /control/closeout - phased closeout driver endpoint ────────────────────
 //
-// design/fleet-tui/closeout-command.md §4.1, Phase 3a (daemon-side). The
-// endpoint applies the SAME pre-driver safety guards `exit_worktree` applies
-// (managed-worktree, branch-prefix eligibility, detached-HEAD refusal,
-// confirm gate) by reusing `bro_tools::fleet_worktree::prepare_closeout_request`
-// (the shared entry extracted in Phase 1) - no silent duplication-with-drift.
-// It then resolves `target` to the worktree's FORK-POINT branch (the branch it
-// diverged from at dispatch, persisted in branch-scoped config) when the caller
-// omits it, falling back to the base repo's current branch and then "main"
-// (operator-decided default; the tool's default stays "main").
-// Finally it calls `run_closeout_phases` and returns the STRUCTURED
-// `CloseoutOutcome` directly (§4.3 - NOT a collapsed/rendered legacy tool
-// JSON). Guard/validation failures return a 4xx with a clear error body.
+// Share managed-worktree, branch-prefix, detached-HEAD and confirmation guards
+// with the worktree tool. Resolve absent targets from the stored fork branch,
+// then the base checkout branch, then main. Return structured phase outcomes.
 pub(crate) async fn control_closeout_handler(
     AxumState(state): AxumState<Arc<SharedState>>,
     axum::Json(req): axum::Json<bro_protocol::CloseoutRequest>,
@@ -152,12 +134,8 @@ pub(crate) async fn control_closeout_handler(
         Some(req.worktree.as_str())
     };
 
-    // The cockpit creates managed worktrees under its fleet/agent store
-    // (`bro_home/{fleet,agent}/worktrees`), NOT the legacy
-    // `<repo_parent>/.bro-fleet-worktrees` convention the tool path assumes.
-    // Pass those store roots so the managed-worktree guard accepts the
-    // worktrees the cockpit actually produces (without them, `/closeout`
-    // refuses every real fleet worktree - dogfooding finding).
+    // Retain recognition of existing fleet/agent store roots alongside the
+    // worktree tool's repo-adjacent managed roots.
     let extra_managed_roots = crate::managed_worktrees::cockpit_managed_worktree_roots();
 
     // Shared pre-driver guard: managed-worktree, branch-prefix, detached-HEAD,
@@ -198,9 +176,8 @@ pub(crate) async fn control_closeout_handler(
     driver_req.paths = req.paths.clone();
     driver_req.dry_run = req.dry_run;
     let was_dry_run = driver_req.dry_run;
-    // Resolved project closeout hooks (the cockpit strict-loaded fleet.json and
-    // sent them fully resolved). Translate the wire shape into the bro_tools
-    // local type; the driver fires them at phase boundaries. Skipped on dry_run.
+    // Translate caller-resolved hooks to driver policy. Hooks run at phase
+    // boundaries and are skipped on dry runs.
     driver_req.closeout_hooks = req.closeout_hooks.as_ref().map(to_driver_hooks);
     let teardown_checkout_id = bbox_corpus_core::identity::read_checkout_id(
         &driver_req.worktree.join(".bbox/local/checkout-id"),
@@ -296,7 +273,7 @@ pub(crate) async fn control_closeout_handler(
     // The status code reflects whether the endpoint reached the driver, not
     // the success of the driver (which already failed above with 4xx). A
     // failed phase is still a valid HTTP outcome - the structured error
-    // class is the signal the cockpit routes on, not the HTTP status.
+    // class identifies the failed phase independently of HTTP status.
     let status = StatusCode::OK;
     (status, axum::Json(json!(wire_outcome))).into_response()
 }
@@ -426,28 +403,7 @@ pub(crate) async fn control_status_handler(
 
 // ── /control/roster - daemon-authoritative fleet roster snapshot ─────────
 //
-// Slice 1a of design/fleet-tui/daemon-roster-and-tail-unification.md §3
-// item 2. A pure-addition read-only endpoint that projects every task
-// currently in `state.task_store` into a `RosterSummaryV1` and wraps
-// them in a versioned `RosterSnapshotV1` envelope. No new task fields,
-// no client-side change yet, no SSE - that is Slice 2.
-//
-// Two design notes for the derivation:
-//
-// 1. `model` is best-effort, scanned from the task's recorded event
-//    buffer. The fleet client uses the same logic at
-//    `crates/bro-fleet-client/src/fleet.rs:1355-1363`; we inline the
-//    scan here because the touched-file list for this slice is
-//    daemon-side only (the design explicitly defers client changes).
-//
-// 2. `last_event_at` is NOT a stored field - the daemon has no
-//    per-event arrival stamp on V1 (the client stamps it from
-//    `eventCount` growth today, fleet.rs:1301). We derive it from
-//    `max(started_at, completed_at)`: for a live task this is the
-//    spawn time, for a terminal task this is the completion time.
-//    Coarse, but it stays within "no new task fields" and the
-//    derivation is documented in the DTO doc-comment in
-//    `crates/bro-protocol/src/lib.rs`.
+// Serve the daemon's materialized roster without locking each task.
 pub(crate) async fn control_roster_handler(
     AxumState(state): AxumState<Arc<SharedState>>,
 ) -> impl axum::response::IntoResponse {
@@ -460,16 +416,11 @@ pub(crate) async fn control_roster_handler(
     // a snapshot's `version` is never older than the tasks it lists.
     // The lock here is the view's brief read guard, NOT a per-task
     // inner mutex - fleet polling no longer contends with event
-    // ingest on busy tasks (wave 6a).
+    // ingest on busy tasks.
     let tasks = state.roster_view.snapshot();
     let version = state.roster_events().current_version();
 
-    // D27: stamp the daemon's build identity on the snapshot so the
-    // fleet cockpit can detect long-lived cockpits still running
-    // stale binaries across upgrades. Both fields are additive
-    // `Option<String>` - older daemons that pre-date the build.rs
-    // and the protocol field simply emit `None` and the cockpit
-    // treats the snapshot as identity-unknown (zero visual change).
+    // Include build identity so clients can diagnose daemon upgrades.
     let daemon_version = Some(env!("CARGO_PKG_VERSION").to_string());
     let daemon_build_id = Some(env!("BLACKBOX_BUILD_ID").to_string());
 
@@ -556,7 +507,7 @@ mod tests {
     use crate::orchestration::providers::Provider;
     use axum::response::IntoResponse;
 
-    /// /control/closeout (Phase 3a, design/fleet-tui/closeout-command.md §4.1)
+    /// /control/closeout
     /// validates the request before reaching the driver: a disposition not in
     /// the keep/preflight/discard/publish/merge/adopt set returns 400 with a
     /// clear error body. This is the cheapest guard-level assertion - the

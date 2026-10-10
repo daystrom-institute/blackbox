@@ -198,7 +198,7 @@ impl Tool for ExitWorktree {
 }
 
 // ---------------------------------------------------------------------------
-// Phased closeout driver (Phase 1 of design/fleet-tui/closeout-command.md)
+// Phased managed-worktree closeout driver
 //
 // Decomposes the closeout git sequence (the operator-accepted decomposition)
 // into discrete phases with hook seams and a structured per-phase result:
@@ -3348,7 +3348,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Phased closeout driver — new tests (Phase 1 of design/fleet-tui/closeout-command.md)
+    // Phased managed-worktree closeout tests
     //
     // These call `run_closeout_phases` directly (not through the `exit_worktree`
     // tool) and assert on the structured per-phase result. They prove the

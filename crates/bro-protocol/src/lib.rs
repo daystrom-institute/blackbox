@@ -10,21 +10,19 @@ mod codex;
 mod dispatch;
 mod dispatch_context;
 mod fleetd;
-mod transcript;
 mod worker;
 
 pub use codex::{CodexInput, CodexSessionConfig};
 
 pub use dispatch::{
     CloseoutErrorClass, CloseoutHooksWire, CloseoutOutcome, CloseoutPhase, CloseoutRequest,
-    DispatchSpec, PhaseResult, ResumeSpec, SERVICE_TIER_DEFAULT, SERVICE_TIER_PRIORITY,
+    PhaseResult, SERVICE_TIER_DEFAULT, SERVICE_TIER_PRIORITY,
 };
 pub use dispatch_context::{DISPATCH_CONTEXT_VERSION, DispatchContext, DispatchScope};
 pub use fleetd::{
     BearerToken, DaemonToFleetd, FLEETD_PROTOCOL_VERSION, FleetdToDaemon, SessionState,
     SessionSummary,
 };
-pub use transcript::{TodoItem, TodoItemStatus, TodoState, TranscriptItem};
 pub use worker::{
     InvalidWorkerWorkspaceScope, InvalidWorkspaceBindingToken, REDACTED, SecretEnv,
     WORKSPACE_BINDING_ENV, WORKSPACE_BINDING_HEADER, WORKSPACE_SCOPE_ENV, WorkerSpawnSpec,
@@ -87,16 +85,8 @@ pub struct TaskSnapshot {
     pub interrupted: bool,
 }
 
-/// Summary DTO for one fleet task, projected by the daemon for the
-/// roster snapshot endpoint (Slice 1a of
-/// design/fleet-tui/daemon-roster-and-tail-unification.md §3 item 1).
-///
-/// Contract: the DTO carries NO event payloads. Roster traffic is a
-/// summary plane — a verbose unfocused agent's transcript must not be
-/// able to balloon the snapshot, and the 80KB MCP-cap truncation class
-/// (cf. cf87a52) cannot occur on this path because the events field
-/// is simply absent. A test in this crate asserts the DTO serializes
-/// without an `events` field.
+/// Bounded task summary projected by the daemon for roster observation.
+/// Event payloads are excluded so transcript volume cannot grow the snapshot.
 ///
 /// Field provenance is intentionally explicit:
 /// - `task_id` / `status` / `provider` / `cost` / `turns` / `cwd` /

@@ -782,9 +782,8 @@ impl BlackboxServer {
                     // bro_exec carries no output schema (structured output is delivered
                     // via agent dispatch from the manifest, not generic exec).
                     output_schema: None,
-                    // Default the bro_exec origin to AgentDispatch; the cockpit
-                    // control handler overrides this to Cockpit via the
-                    // `origin_override` slot on ExecParams.
+                    // MCP dispatch defaults to AgentDispatch. HTTP control handlers
+                    // set the internal origin override to Control.
                     origin: p.origin_override.unwrap_or(bro_core::Origin::AgentDispatch),
                 },
                 admission,
@@ -1008,10 +1007,8 @@ impl BlackboxServer {
                 p.tool_defaults.as_ref(),
             ),
             harness_bin,
-            // bro_resume is the user-facing MCP tool for resuming an existing
-            // session — same source class as bro_exec. The HTTP control plane
-            // (`/control/resume`) overrides this to Cockpit, exactly like
-            // `/control/exec`, so cockpit follow-up turns don't jump tabs.
+            // HTTP resume retains control classification; MCP resume uses
+            // the same AgentDispatch classification as MCP exec.
             p.origin_override.unwrap_or(bro_core::Origin::AgentDispatch),
         )
         .await;
@@ -3874,6 +3871,7 @@ mod tests {
             .unwrap();
         for origin in [
             bro_core::Origin::AgentDispatch,
+            bro_core::Origin::Control,
             bro_core::Origin::Cockpit,
             bro_core::Origin::Unknown,
         ] {
@@ -4037,6 +4035,7 @@ mod tests {
                 .unwrap();
             for requested_origin in [
                 None,
+                Some(bro_core::Origin::Control),
                 Some(bro_core::Origin::Cockpit),
                 Some(bro_core::Origin::Workflow),
             ] {
@@ -4107,6 +4106,7 @@ mod tests {
         let server = test_server(&tmp);
         for (id, origin) in [
             ("direct", bro_core::Origin::AgentDispatch),
+            ("control", bro_core::Origin::Control),
             ("cockpit", bro_core::Origin::Cockpit),
             ("legacy", bro_core::Origin::Unknown),
             ("cron", bro_core::Origin::Cron),

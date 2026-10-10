@@ -27,16 +27,11 @@ preserved capabilities, migration contracts and verification gates.
 - [Consultant Runtime - Badgey dissolution](agents/consultant-runtime.md)
 - [Atom Capability Runtime](atoms/atom-capability-runtime.md)
 
-## Provider Transport & Cockpit (moved out)
+## Provider execution and control
 
-The custom provider harness and the fleet cockpit are **top-level** design
-clusters now — daemon-independent abstractions, not orchestration sub-topics. See
-the [Design Corpus](../design-corpus.md) Topic Hubs:
-
-- [Bro-Harness](../bro-harness/bro-harness.md) — the custom headless agent
-  (transports, tool surface, clipboard, chaining, hooks, diagnostics, neuralyze).
-- [Fleet TUI](../fleet-tui/fleet-tui.md) — `bro fleet`, the multi-provider
-  live-driving cockpit.
+- [Bro-Harness](../bro-harness/bro-harness.md): the standalone coding-agent runtime.
+- [Task control plane](../daemon-runtime/control-plane.md): dispatch, task
+  observation and managed-worktree closeout.
 
 ## Workflow Execution
 

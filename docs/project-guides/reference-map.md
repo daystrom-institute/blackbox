@@ -48,8 +48,8 @@ or system memories and link/pointer from here.
   (`crates/bro-harness`, `crates/bro-tools`): transports, tool surface,
   clipboard, tool chaining, hooks, diagnostics, neuralyze. Daemon-independent by
   invariant; separate from `orchestration/`.
-- `design/fleet-tui/` - top-level home for `bro fleet`, the in-process
-  multi-provider cockpit for live-driving entrypoint agents.
+- `design/daemon-runtime/control-plane.md` - headless task control, roster
+  observation and managed-worktree closeout.
 - `design/daemon-runtime/` - topic home for blackboxd's execution
   architecture: tokio topology, plane isolation, lock discipline, and
   persistence actors.

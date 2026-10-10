@@ -26,8 +26,8 @@ describes behavior that matters for implementation, verify it against the code,
 - [Bro-Harness](bro-harness/bro-harness.md) - the custom headless coding agent:
   transports, tool surface, clipboard, tool chaining, hooks, diagnostics,
   neuralyze. Daemon-independent by invariant.
-- [Fleet TUI](fleet-tui/fleet-tui.md) - `bro fleet`, the multi-provider cockpit
-  for live-driving many concurrent entrypoint agents in-process.
+- [Task control plane](daemon-runtime/control-plane.md) - headless dispatch,
+  task observation and managed-worktree closeout.
 - [Daemon Runtime](daemon-runtime/daemon-runtime.md) - blackboxd's execution
   architecture: tokio topology, plane isolation, lock discipline, and
   persistence actors.

@@ -1,14 +1,13 @@
 //! The transport-agnostic tool-calling loop.
 //!
-//! Two entry modes, both built on one [`Session`]:
+//! Entry modes share one [`Session`]:
 //!
 //! - **One-shot** (default): resolve a single prompt, run one user turn to
 //!   completion, emit `result`, persist, exit.
 //! - **Bidirectional** (`--input-format stream-json`): keep a persistent session
 //!   alive, reading successive user-turn messages and `control_request`s
 //!   (interrupt, set_model, …) from stdin as NDJSON, and `/compact` as an
-//!   in-stream slash command. This is the fleet-cockpit control plane
-//!   (design/fleet-tui/fleet-tui.md §2). Wire shapes follow the Claude Agent
+//!   in-stream slash command. Wire shapes follow the Claude Agent
 //!   SDK control protocol (hyperclaude SDK_PROTOCOL.md / NDJSON_FORMAT.md).
 //! - **Daemon child** (`--input-format stream-json --exit-when-idle`): wait for
 //!   the daemon's first stdin turn, drain that turn and buffered controls, then
