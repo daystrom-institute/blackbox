@@ -8,6 +8,11 @@ out explicitly under `Changed` or `Removed`.
 
 ## Unreleased
 
+- The daemon can serve a read-only operator web UI on a loopback-only
+  listener (`daemon.ui_listen`, `BBOX_UI_LISTEN`) behind an identity proxy
+  that forwards `X-Forwarded-Email`. It renders the page shell and an
+  overview of threads, bros, projects, index health and open gaps.
+
 - HTTP task launches and resumes now report origin `control`, with the same
   interactive MCP policy. Stored `cockpit` origins remain readable. Removed
   unused cockpit dispatch/transcript types and TUI design/backlog documents;
