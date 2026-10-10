@@ -41,6 +41,24 @@ fn snapshot_max_age_days_from_env() -> u64 {
         .unwrap_or(DEFAULT_SNAPSHOT_MAX_AGE_DAYS)
 }
 
+/// The maintenance pass's schedule as this process resolves it: the first
+/// pass runs `initial_delay` after start, then one pass every `interval`.
+pub(crate) struct StorageGcSchedule {
+    pub(crate) interval: std::time::Duration,
+    pub(crate) initial_delay: std::time::Duration,
+    /// Inactive snapshots older than this many days are pruned; `0` disables
+    /// age-based retention.
+    pub(crate) snapshot_max_age_days: u64,
+}
+
+pub(crate) fn storage_gc_schedule() -> StorageGcSchedule {
+    StorageGcSchedule {
+        interval: storage_gc_interval_from_env(),
+        initial_delay: storage_gc_initial_delay_from_env(),
+        snapshot_max_age_days: snapshot_max_age_days_from_env(),
+    }
+}
+
 pub(crate) fn spawn_storage_gc_thread(state: Arc<SharedState>, interval: std::time::Duration) {
     let _ = std::thread::Builder::new()
         .name("blackbox-storage-gc".into())

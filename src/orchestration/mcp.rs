@@ -73,6 +73,24 @@ impl SecretString {
     }
 }
 
+/// What a reply may show of one stored header or environment value. A plain
+/// value is always withheld; a `$secret` reference shows only the name of the
+/// environment variable it reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ValueDisclosure<'a> {
+    Withheld,
+    EnvReference(&'a str),
+}
+
+impl SecretString {
+    pub(crate) fn disclosure(&self) -> ValueDisclosure<'_> {
+        match self {
+            Self::Plain(_) => ValueDisclosure::Withheld,
+            Self::Secret { name } => ValueDisclosure::EnvReference(name),
+        }
+    }
+}
+
 impl From<String> for SecretString {
     fn from(s: String) -> Self {
         Self::Plain(s)
@@ -119,7 +137,7 @@ pub enum McpServerConfig {
 /// Endpoint origins identify the service without exposing userinfo or opaque
 /// credential-bearing paths, queries, and fragments. Malformed endpoints fail
 /// closed instead of echoing their raw input.
-fn endpoint_origin(raw: &str) -> Option<String> {
+pub(crate) fn endpoint_origin(raw: &str) -> Option<String> {
     let url = reqwest::Url::parse(raw).ok()?;
     matches!(url.scheme(), "http" | "https").then(|| url.origin().ascii_serialization())
 }
@@ -128,9 +146,9 @@ fn redacted_values(values: &BTreeMap<String, SecretString>) -> serde_json::Value
     values
         .iter()
         .map(|(key, value)| {
-            let view = match value {
-                SecretString::Plain(_) => serde_json::json!({"redacted": true}),
-                SecretString::Secret { name } => serde_json::json!({"$secret": name}),
+            let view = match value.disclosure() {
+                ValueDisclosure::Withheld => serde_json::json!({"redacted": true}),
+                ValueDisclosure::EnvReference(name) => serde_json::json!({"$secret": name}),
             };
             (key.clone(), view)
         })
@@ -416,6 +434,11 @@ impl McpStore {
 
 pub fn global_store_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| crate::util::bro_home_dir(&h).join("mcp.json"))
+}
+
+/// The daemon-owned global store `bro_mcp` manages; absent is empty.
+pub(crate) fn load_global_store() -> Result<McpStore> {
+    McpStore::load(&global_store_path().context("resolving home dir")?)
 }
 
 pub fn project_store_path(project_dir: &Path) -> PathBuf {
@@ -817,7 +840,7 @@ fn action_list(p: &McpToolParams) -> Result<String> {
     let scope = validate_selection(p)?;
     let eff = match scope {
         "global" => {
-            let global = McpStore::load(&global_store_path().context("home dir")?)?;
+            let global = load_global_store()?;
             resolve_effective(&global, None, false)
         }
         "project" => {

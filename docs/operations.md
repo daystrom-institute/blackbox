@@ -276,6 +276,14 @@ whose peer is not loopback is refused. The main listener never serves the UI.
 its notes, participants and linked entities. `/bros` is the task roster, kept
 live over server-sent events, and `/bros/<task>` shows one task's status,
 dispatch parameters, report and an event tail that streams while it runs.
+`/projects` lists the project catalog and registered roots, and
+`/projects/{id}` shows one project's attachments, publisher status, transport
+ownership and graphs. `/system` shows index, doctor, storage and GC, embedding,
+provider, allocator, gap and runtime-metric panels, and `/config` shows the
+effective daemon config, the surface table with each surface's visible tools,
+global brofiles and the global MCP servers. Every secret-bearing config field,
+every token or credential file path, and every MCP header or environment
+value renders as `[redacted]`.
 
 ### Local dev daemon
 

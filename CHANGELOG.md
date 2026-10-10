@@ -26,6 +26,8 @@ out explicitly under `Changed` or `Removed`.
 
 - The operator web UI adds thread pages (filtered list and thread detail) and
   bros pages (a live roster and a task page with a streaming event tail).
+- The operator web UI adds projects, system and configuration pages; the
+  configuration page renders every secret field and token path as redacted.
 
 - HTTP task launches and resumes now report origin `control`, with the same
   interactive MCP policy. Stored `cockpit` origins remain readable. Removed

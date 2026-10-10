@@ -694,7 +694,7 @@ pub struct ProjectArtifactConfig {
 }
 
 /// Resolved path configuration (computed from inputs, not from TOML)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ResolvedPathConfig {
     pub state_dir: PathBuf,
     pub knowledge_path: PathBuf,
