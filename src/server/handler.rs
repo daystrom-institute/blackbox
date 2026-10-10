@@ -654,8 +654,16 @@ impl ServerHandler for BlackboxServer {
         // handshake revisions carry. A sessionless revision requires it.
         let sessionless =
             serves_sessionless_revision(self.scope_pinned(), context.protocol_version().as_ref());
+        // The principal an access token named at the gate, for the per-call
+        // telemetry line; never an authorization input.
+        let principal = context
+            .extensions
+            .get::<http::request::Parts>()
+            .and_then(|parts| parts.extensions.get::<super::mcp_oauth::McpPrincipal>())
+            .cloned();
         let tcc = ToolCallContext::new(server.as_ref(), request, context);
-        let mut response = server.tool_router.call(tcc).await?;
+        let mut response =
+            super::mcp_oauth::with_call_principal(principal, server.tool_router.call(tcc)).await?;
         if sessionless && let CallToolResponse::Complete(result) = &mut response {
             result.result_type = Some(rmcp::model::ResultType::COMPLETE);
         }

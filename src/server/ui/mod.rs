@@ -25,12 +25,11 @@ use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{MethodRouter, get};
+use axum::routing::get;
 use maud::{DOCTYPE, Markup, html};
 use tokio_util::sync::CancellationToken;
 
 use super::{BlackboxServer, SharedState};
-use shell::Section;
 
 /// Forwarded identity headers, in precedence order.
 const PRINCIPAL_HEADERS: [&str; 2] = ["x-forwarded-email", "x-forwarded-user"];
@@ -152,8 +151,29 @@ pub(crate) fn spawn_ui_server(
 pub(crate) fn build_ui_router(state: UiState) -> Router {
     Router::new()
         .route("/", get(pages::overview::page))
-        .route("/threads", placeholder(Section::Threads))
-        .route("/bros", placeholder(Section::Bros))
+        .route("/threads", get(pages::threads::list_page))
+        .route("/threads/{id}", get(pages::threads::detail_page))
+        .route(
+            "/fragments/threads/table",
+            get(pages::threads::table_fragment),
+        )
+        .route(
+            "/fragments/threads/{id}",
+            get(pages::threads::detail_fragment),
+        )
+        .route("/bros", get(pages::bros::roster_page))
+        .route("/bros/{task}", get(pages::bros::task_page))
+        .route("/fragments/bros/rows", get(pages::bros::rows_fragment))
+        .route(
+            "/fragments/bros/{task}/summary",
+            get(pages::bros::summary_fragment),
+        )
+        .route(
+            "/fragments/bros/{task}/tail",
+            get(pages::bros::tail_fragment),
+        )
+        .route("/streams/bros", get(pages::bros::roster_stream))
+        .route("/streams/bros/{task}/tail", get(pages::bros::task_stream))
         .route("/projects", get(pages::projects::page))
         .route("/system", get(pages::system::page))
         .route("/config", get(pages::configuration::page))
@@ -172,15 +192,6 @@ pub(crate) fn build_ui_router(state: UiState) -> Router {
         .fallback(pages::placeholder::not_found)
         .layer(axum::middleware::from_fn(require_principal))
         .with_state(Arc::new(state))
-}
-
-fn placeholder(section: Section) -> MethodRouter<Arc<UiState>> {
-    get(
-        move |State(ui): State<Arc<UiState>>,
-              axum::Extension(principal): axum::Extension<Principal>| async move {
-            pages::placeholder::page(&ui, &principal, section)
-        },
-    )
 }
 
 /// Admit a request only from a loopback peer carrying a forwarded identity.
@@ -522,25 +533,5 @@ mod tests {
                 assets::IMMUTABLE_CACHE_CONTROL
             );
         }
-    }
-
-    #[tokio::test]
-    async fn unbuilt_sections_render_inside_the_shell() {
-        let dir = tempfile::tempdir().unwrap();
-        let identity = [("x-forwarded-email", "operator@example.test")];
-        for uri in ["/threads", "/bros"] {
-            let (status, _, body) =
-                send(ui_router(&dir), request(uri, Some(PROXY_PEER), &identity)).await;
-            assert_eq!(status, StatusCode::OK, "{uri}");
-            assert!(body.contains("not yet available"), "{uri}: {body}");
-            assert!(body.contains(&format!("href=\"{uri}\" aria-current=\"page\"")));
-        }
-        let (status, _, body) = send(
-            ui_router(&dir),
-            request("/no-such-page", Some(PROXY_PEER), &identity),
-        )
-        .await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
-        assert!(body.contains("operator@example.test"));
     }
 }

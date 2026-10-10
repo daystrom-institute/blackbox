@@ -377,6 +377,104 @@ struct RawDaemonConfig {
     /// connection's address only, never on forwarded headers.
     #[serde(default)]
     pub mcp_trusted_peer_networks: Vec<String>,
+    /// OAuth access tokens admitted on `/mcp` and `/control/*` beside the
+    /// service bearer (`[daemon.mcp_oauth]`). Absent leaves the gate as the
+    /// service bearer alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_oauth: Option<RawMcpOAuthConfig>,
+}
+
+/// `[daemon.mcp_oauth]` as written. Every field is optional here so a
+/// partial set, from the file, the environment or both, is reported as a
+/// configuration error instead of being silently ignored.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct RawMcpOAuthConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audience: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_group: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jwks_uri: Option<String>,
+}
+
+/// Resolved `[daemon.mcp_oauth]`: the authorization server whose access
+/// tokens the MCP gate admits.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpOAuthConfig {
+    /// The token issuer, compared for equality with the `iss` claim.
+    pub issuer: String,
+    /// The resource URL this daemon answers as; the `aud` claim must
+    /// contain it, and its origin hosts the protected resource metadata.
+    pub audience: String,
+    /// The group the `groups` claim must contain.
+    pub required_group: String,
+    /// The JWKS location. Absent, it is read from the issuer's OpenID
+    /// discovery document.
+    pub jwks_uri: Option<String>,
+}
+
+/// Validate `[daemon.mcp_oauth]`: issuer, audience and required group are
+/// required together, the URLs are absolute `http` or `https` URLs, and a
+/// JWKS location without the rest is as partial as any other subset.
+fn resolve_mcp_oauth(raw: Option<RawMcpOAuthConfig>) -> Result<Option<McpOAuthConfig>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let field = |value: Option<String>, name: &str| -> Result<Option<String>> {
+        match value {
+            None => Ok(None),
+            Some(value) if value.trim().is_empty() || value.trim() != value => anyhow::bail!(
+                "daemon.mcp_oauth.{name} must be non-empty without surrounding whitespace"
+            ),
+            Some(value) => Ok(Some(value)),
+        }
+    };
+    let issuer = field(raw.issuer, "issuer")?;
+    let audience = field(raw.audience, "audience")?;
+    let required_group = field(raw.required_group, "required_group")?;
+    let jwks_uri = field(raw.jwks_uri, "jwks_uri")?;
+    let (issuer, audience, required_group) = match (issuer, audience, required_group) {
+        (None, None, None) if jwks_uri.is_none() => return Ok(None),
+        (Some(issuer), Some(audience), Some(required_group)) => (issuer, audience, required_group),
+        (issuer, audience, required_group) => {
+            let missing: Vec<&str> = [
+                ("issuer", issuer.is_none()),
+                ("audience", audience.is_none()),
+                ("required_group", required_group.is_none()),
+            ]
+            .into_iter()
+            .filter_map(|(name, missing)| missing.then_some(name))
+            .collect();
+            anyhow::bail!(
+                "daemon.mcp_oauth needs issuer, audience and required_group together \
+                 (BBOX_MCP_OAUTH_ISSUER, BBOX_MCP_OAUTH_AUDIENCE, BBOX_MCP_OAUTH_GROUP); missing: {}",
+                missing.join(", ")
+            )
+        }
+    };
+    for (name, value) in [
+        ("issuer", Some(&issuer)),
+        ("audience", Some(&audience)),
+        ("jwks_uri", jwks_uri.as_ref()),
+    ] {
+        let Some(value) = value else { continue };
+        let rest = value
+            .strip_prefix("https://")
+            .or_else(|| value.strip_prefix("http://"));
+        if rest.is_none_or(|rest| rest.is_empty() || rest.starts_with('/')) {
+            anyhow::bail!(
+                "daemon.mcp_oauth.{name} must be an absolute http or https URL: {value:?}"
+            );
+        }
+    }
+    Ok(Some(McpOAuthConfig {
+        issuer,
+        audience,
+        required_group,
+        jwks_uri,
+    }))
 }
 
 /// Which executor turns a resolved spawn spec into a supervised worker.
@@ -658,6 +756,10 @@ pub struct DaemonConfig {
     pub mcp_require_bearer: bool,
     pub service_token_file: Option<PathBuf>,
     pub mcp_trusted_peer_networks: Vec<String>,
+    /// OAuth access tokens admitted beside the service bearer; see
+    /// `[daemon.mcp_oauth]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_oauth: Option<McpOAuthConfig>,
 }
 
 /// Index configuration
@@ -1166,6 +1268,7 @@ impl Config {
                 mcp_require_bearer: false,
                 service_token_file: None,
                 mcp_trusted_peer_networks: Vec::new(),
+                mcp_oauth: None,
             },
             index: RawIndexConfig {
                 reindex_interval_secs: default_index_reindex_interval_secs(),
@@ -1214,6 +1317,14 @@ impl Config {
 
 /// A boolean env override: `true`/`1`/`yes`/`on` or `false`/`0`/`no`/`off`,
 /// case-insensitive. Anything else is no override.
+/// The `[daemon.mcp_oauth]` field an environment override sets.
+#[derive(Clone, Copy)]
+enum McpOAuthSlot {
+    Issuer,
+    Audience,
+    RequiredGroup,
+}
+
 fn parse_env_bool(value: &str) -> Option<bool> {
     match value.trim().to_ascii_lowercase().as_str() {
         "true" | "1" | "yes" | "on" => Some(true),
@@ -1367,6 +1478,23 @@ fn apply_explicit_env(raw: RawConfig) -> RawConfig {
             .filter(|network| !network.is_empty())
             .map(str::to_string)
             .collect();
+    }
+    for (name, slot) in [
+        ("BBOX_MCP_OAUTH_ISSUER", McpOAuthSlot::Issuer),
+        ("BBOX_MCP_OAUTH_AUDIENCE", McpOAuthSlot::Audience),
+        ("BBOX_MCP_OAUTH_GROUP", McpOAuthSlot::RequiredGroup),
+    ] {
+        if let Ok(value) = std::env::var(name)
+            && !value.trim().is_empty()
+        {
+            let oauth = raw.daemon.mcp_oauth.get_or_insert_with(Default::default);
+            let value = Some(value.trim().to_string());
+            match slot {
+                McpOAuthSlot::Issuer => oauth.issuer = value,
+                McpOAuthSlot::Audience => oauth.audience = value,
+                McpOAuthSlot::RequiredGroup => oauth.required_group = value,
+            }
+        }
     }
 
     // poller_min_interval_secs
@@ -1571,6 +1699,7 @@ pub fn load_with(options: LoadOptions) -> Result<Config> {
     )?;
     validate_checkout_lifecycle_writer_wait_ms(raw.daemon.checkout_lifecycle_writer_wait_ms)?;
     validate_mcp_allowed_hosts(&raw.daemon.mcp_allowed_hosts)?;
+    let mcp_oauth = resolve_mcp_oauth(raw.daemon.mcp_oauth.take())?;
 
     let fleetd_token_file = raw
         .daemon
@@ -1609,6 +1738,7 @@ pub fn load_with(options: LoadOptions) -> Result<Config> {
             mcp_require_bearer: raw.daemon.mcp_require_bearer,
             service_token_file: raw.daemon.service_token_file,
             mcp_trusted_peer_networks: raw.daemon.mcp_trusted_peer_networks,
+            mcp_oauth,
         },
         index: IndexConfig {
             reindex_interval_secs: raw.index.reindex_interval_secs,
@@ -2553,6 +2683,113 @@ bind = "0.0.0.0"
                 "{invalid}"
             );
         }
+    }
+
+    #[test]
+    fn mcp_oauth_resolves_from_file_and_environment_and_refuses_partial_sets() {
+        let _guard = bbox_util::util::test_env_lock();
+        let dir = tempdir().unwrap();
+        let home = dir.path().canonicalize().unwrap();
+        let clear = || unsafe {
+            env::remove_var("BBOX_MCP_OAUTH_ISSUER");
+            env::remove_var("BBOX_MCP_OAUTH_AUDIENCE");
+            env::remove_var("BBOX_MCP_OAUTH_GROUP");
+        };
+        unsafe {
+            env::set_var("HOME", &home);
+            env::set_var("XDG_CONFIG_HOME", home.join(".config"));
+            env::set_var("XDG_DATA_HOME", home.join(".local/share"));
+            env::set_var("XDG_STATE_HOME", home.join(".local/state"));
+            env::remove_var("BLACKBOX_CONFIG");
+        }
+        clear();
+        let load = |text: &str| {
+            let path = home.join("oauth.toml");
+            std::fs::write(&path, text).unwrap();
+            load_with(LoadOptions {
+                config_path: Some(path),
+                ..Default::default()
+            })
+        };
+
+        assert_eq!(load("").unwrap().daemon.mcp_oauth, None);
+
+        let full = "[daemon.mcp_oauth]\nissuer = \"https://sso.example.test/realms/estate\"\naudience = \"https://corpus.example.test:7264/mcp\"\nrequired_group = \"bbox-users\"\n";
+        let config = load(full).unwrap();
+        assert_eq!(
+            config.daemon.mcp_oauth,
+            Some(McpOAuthConfig {
+                issuer: "https://sso.example.test/realms/estate".into(),
+                audience: "https://corpus.example.test:7264/mcp".into(),
+                required_group: "bbox-users".into(),
+                jwks_uri: None,
+            })
+        );
+        let with_jwks = load(&format!(
+            "{full}jwks_uri = \"https://sso.example.test/realms/estate/certs\"\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            with_jwks.daemon.mcp_oauth.unwrap().jwks_uri.as_deref(),
+            Some("https://sso.example.test/realms/estate/certs")
+        );
+
+        // Every partial set is an error naming what is missing.
+        for (text, missing) in [
+            (
+                "[daemon.mcp_oauth]\nissuer = \"https://sso.example.test/realms/estate\"\n",
+                "audience, required_group",
+            ),
+            (
+                "[daemon.mcp_oauth]\naudience = \"https://corpus.example.test/mcp\"\nrequired_group = \"g\"\n",
+                "issuer",
+            ),
+            (
+                "[daemon.mcp_oauth]\njwks_uri = \"https://sso.example.test/certs\"\n",
+                "issuer, audience, required_group",
+            ),
+        ] {
+            let error = format!("{:#}", load(text).unwrap_err());
+            assert!(
+                error.contains(&format!("missing: {missing}")),
+                "{text}: {error}"
+            );
+        }
+        for bad in [
+            "[daemon.mcp_oauth]\nissuer = \"sso.example.test\"\naudience = \"https://c.example.test/mcp\"\nrequired_group = \"g\"\n",
+            "[daemon.mcp_oauth]\nissuer = \"https://sso.example.test\"\naudience = \"https:///mcp\"\nrequired_group = \"g\"\n",
+            "[daemon.mcp_oauth]\nissuer = \"https://sso.example.test\"\naudience = \"https://c.example.test/mcp\"\nrequired_group = \" g\"\n",
+        ] {
+            assert!(load(bad).is_err(), "{bad}");
+        }
+
+        // The environment completes or overrides the file, field by field.
+        unsafe {
+            env::set_var("BBOX_MCP_OAUTH_AUDIENCE", "https://corpus.example.test/mcp");
+            env::set_var("BBOX_MCP_OAUTH_GROUP", "operators");
+        }
+        let completed =
+            load("[daemon.mcp_oauth]\nissuer = \"https://sso.example.test/realms/estate\"\n")
+                .unwrap()
+                .daemon
+                .mcp_oauth
+                .unwrap();
+        assert_eq!(completed.audience, "https://corpus.example.test/mcp");
+        assert_eq!(completed.required_group, "operators");
+        // A partial environment over an empty file is as partial as a file.
+        let error = format!("{:#}", load("").unwrap_err());
+        assert!(error.contains("missing: issuer"), "{error}");
+        unsafe {
+            env::set_var(
+                "BBOX_MCP_OAUTH_ISSUER",
+                "https://sso.example.test/realms/other",
+            );
+        }
+        let from_env = load("").unwrap().daemon.mcp_oauth.unwrap();
+        assert_eq!(from_env.issuer, "https://sso.example.test/realms/other");
+        assert_eq!(from_env.audience, "https://corpus.example.test/mcp");
+        assert_eq!(from_env.required_group, "operators");
+        clear();
     }
 
     #[test]

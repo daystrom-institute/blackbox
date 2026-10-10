@@ -672,14 +672,19 @@ impl Threads {
         })
     }
 
-    /// The id/name finder shared by the get paths. Accepts bare `<8hex>` as
-    /// a fallback for canonical `thread-<8hex>`, matching the schema regex.
+    /// The thread with this id. Accepts bare `<8hex>` as a fallback for
+    /// canonical `thread-<8hex>`, matching the schema regex.
+    pub fn thread_by_id(&self, id: &str) -> Option<&Thread> {
+        self.store
+            .threads
+            .iter()
+            .find(|t| t.id == id || t.id.strip_prefix("thread-") == Some(id))
+    }
+
+    /// The id/name finder shared by the get paths.
     fn find_thread<'a>(&'a self, p: &ThreadParams) -> Result<&'a Thread> {
         let thread = if let Some(id) = p.id.as_deref() {
-            self.store
-                .threads
-                .iter()
-                .find(|t| t.id == id || t.id.strip_prefix("thread-") == Some(id))
+            self.thread_by_id(id)
         } else if let Some(name) = p.name.as_deref() {
             let name_lower = name.to_lowercase();
             self.store.threads.iter().find(|t| {
@@ -1209,7 +1214,9 @@ impl Threads {
 
     // ── blackbox_thread_list (query) ───────────────────────────────
 
-    fn matching_threads(&self, p: &ThreadListParams) -> Result<Vec<&Thread>> {
+    /// Threads matching a list filter, ordered by last activity descending
+    /// then id. The bounded MCP page and in-process readers share it.
+    pub fn matching_threads(&self, p: &ThreadListParams) -> Result<Vec<&Thread>> {
         let status_filter = p
             .status
             .as_deref()

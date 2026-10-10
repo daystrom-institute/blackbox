@@ -244,41 +244,9 @@ impl BlackboxServer {
         Parameters(p): Parameters<ThreadListToolParams>,
     ) -> CallToolResult {
         Self::run("bbox_thread_list", || {
-            // Normalize a managed fleet worktree project filter to its registered
-            // base so list-before-open (create etiquette) sees base-keyed threads
-            // from inside a worktree and doesn't drive duplicate opens.
             let limit = p.limit.unwrap_or(20);
             let offset = p.offset.unwrap_or(0);
-            let mut p = p.filters;
-            if let Some(raw) = p.project.clone() {
-                // Catalog-mode ledger arm (plan §8.2): path-only threads still
-                // keyed under one of this project's historical paths stay
-                // visible after relocation. Empty in bridge mode.
-                p.project_ledger_paths = self.filter_ledger_paths(&raw);
-                // Query-side ids come from the resolver (§8.2): a resolving
-                // project filter also arms the id arm.
-                if p.project_id.is_none() {
-                    p.project_id = self
-                        .resolve_project_filter(&raw)
-                        .and_then(|resolution| resolution.project_id().map(str::to_owned));
-                }
-                // Audit A02: filter-lane base rewrite only. The write-lease
-                // resolver has no place in a read path; unmanaged literals
-                // keep their substring semantics (None).
-                if let Some(base) = self.rescope_project_filter_value(&raw) {
-                    p.project = Some(base);
-                }
-            } else if let Some(raw_id) = p.project_id.clone() {
-                // A caller-supplied id is a selector, not an assertion: it
-                // resolves through the engine to the canonical id (and the
-                // ledger arm), and an unknown id simply matches nothing.
-                if let Some(resolution) = self.resolve_project_filter(&raw_id)
-                    && let Some(resolved) = resolution.project_id()
-                {
-                    p.project_id = Some(resolved.to_owned());
-                    p.project_ledger_paths = self.ledger_historical_paths(resolved);
-                }
-            }
+            let p = self.thread_list_filters(p.filters);
             Ok(serde_json::to_string(
                 &self
                     .state
@@ -287,6 +255,47 @@ impl BlackboxServer {
                     .thread_list_page(&p, limit, offset)?,
             )?)
         })
+    }
+}
+
+impl BlackboxServer {
+    /// Resolve a thread-list filter's project selector. `bbox_thread_list`
+    /// and the operator UI share it so both list the same threads for the
+    /// same selector. Resolution may probe the filesystem.
+    pub(crate) fn thread_list_filters(&self, mut p: ThreadListParams) -> ThreadListParams {
+        // Normalize a managed fleet worktree project filter to its registered
+        // base so list-before-open (create etiquette) sees base-keyed threads
+        // from inside a worktree and doesn't drive duplicate opens.
+        if let Some(raw) = p.project.clone() {
+            // Catalog-mode ledger arm (plan §8.2): path-only threads still
+            // keyed under one of this project's historical paths stay
+            // visible after relocation. Empty in bridge mode.
+            p.project_ledger_paths = self.filter_ledger_paths(&raw);
+            // Query-side ids come from the resolver (§8.2): a resolving
+            // project filter also arms the id arm.
+            if p.project_id.is_none() {
+                p.project_id = self
+                    .resolve_project_filter(&raw)
+                    .and_then(|resolution| resolution.project_id().map(str::to_owned));
+            }
+            // Audit A02: filter-lane base rewrite only. The write-lease
+            // resolver has no place in a read path; unmanaged literals
+            // keep their substring semantics (None).
+            if let Some(base) = self.rescope_project_filter_value(&raw) {
+                p.project = Some(base);
+            }
+        } else if let Some(raw_id) = p.project_id.clone() {
+            // A caller-supplied id is a selector, not an assertion: it
+            // resolves through the engine to the canonical id (and the
+            // ledger arm), and an unknown id simply matches nothing.
+            if let Some(resolution) = self.resolve_project_filter(&raw_id)
+                && let Some(resolved) = resolution.project_id()
+            {
+                p.project_id = Some(resolved.to_owned());
+                p.project_ledger_paths = self.ledger_historical_paths(resolved);
+            }
+        }
+        p
     }
 }
 

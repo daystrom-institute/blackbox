@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use bbox_config::config::{
     CodeCollectionConfig, CodeCollectionProducerConfig, Config, ConnectorProducerConfig,
     ConnectorProfile, ConnectorScopeGrant, DaemonConfig, ExecutorKind, IndexConfig, LspConfig,
-    ProducerScopeClaimPolicy, ProvenanceConfig, ProviderConfig, ResolvedPathConfig,
+    McpOAuthConfig, ProducerScopeClaimPolicy, ProvenanceConfig, ProviderConfig, ResolvedPathConfig,
     RetainedConversationSource, SourceConnectorsConfig, TranscriptConfig,
 };
 
@@ -190,6 +190,7 @@ fn daemon_rows(rows: &mut Rows, daemon: &DaemonConfig) {
         mcp_require_bearer,
         service_token_file,
         mcp_trusted_peer_networks,
+        mcp_oauth,
     } = daemon;
     rows.text("port", port);
     rows.text("bind", bind);
@@ -225,6 +226,26 @@ fn daemon_rows(rows: &mut Rows, daemon: &DaemonConfig) {
     rows.text("mcp_require_bearer", mcp_require_bearer);
     rows.secret("service_token_file", service_token_file.is_some());
     rows.list("mcp_trusted_peer_networks", mcp_trusted_peer_networks);
+    match mcp_oauth {
+        None => rows.push("mcp_oauth", ConfigValue::Unset),
+        Some(oauth) => rows.nested("mcp_oauth", |rows| mcp_oauth_rows(rows, oauth)),
+    }
+}
+
+/// The OAuth authorization server the MCP gate trusts. Nothing here is a
+/// credential: the issuer, audience and key set location are public URLs
+/// and the group is a name.
+fn mcp_oauth_rows(rows: &mut Rows, oauth: &McpOAuthConfig) {
+    let McpOAuthConfig {
+        issuer,
+        audience,
+        required_group,
+        jwks_uri,
+    } = oauth;
+    rows.url("issuer", Some(issuer));
+    rows.url("audience", Some(audience));
+    rows.text("required_group", required_group);
+    rows.url("jwks_uri", jwks_uri.as_deref());
 }
 
 fn index_rows(rows: &mut Rows, index: &IndexConfig) {
@@ -533,6 +554,12 @@ pub(crate) mod tests {
         daemon.admin_token_file = Some("/run/sentinel-admin-token-file".into());
         daemon.service_token_file = Some("/run/sentinel-service-token-file".into());
         daemon.mcp_trusted_peer_networks = vec!["10.0.0.0/8".into()];
+        daemon.mcp_oauth = Some(McpOAuthConfig {
+            issuer: "https://issuer.example.test/realms/test".into(),
+            audience: "https://daemon.example.test/mcp".into(),
+            required_group: "operators".into(),
+            jwks_uri: Some("https://issuer.example.test/keys".into()),
+        });
 
         config.index.reindex_startup_delay_secs = Some(5);
         config.index.background_full_reindex_ticks = Some(3);

@@ -109,31 +109,14 @@ impl BlackboxServer {
             })
             .collect();
         let total = selected.len();
-        selected.sort_by(|a, b| {
-            b.started_at
-                .or(b.last_event_at)
-                .unwrap_or(0)
-                .cmp(&a.started_at.or(a.last_event_at).unwrap_or(0))
-                .then_with(|| a.task_id.as_str().cmp(b.task_id.as_str()))
-        });
+        selected.sort_by(dashboard_order);
         let entries: Vec<Value> = selected
             .into_iter()
             .skip(offset)
             .take(limit)
             .map(|s| {
                 let task_id_str = s.task_id.as_str().to_string();
-
-                // Recompute `elapsed` from summary timestamps so the
-                // dashboard row matches the legacy projection
-                // (terminal: `last_event_at - started_at`; live:
-                // `now - started_at`).
-                let elapsed = match (s.started_at, s.last_event_at) {
-                    (Some(start), Some(end)) if s.status.is_terminal() => {
-                        orch::format_elapsed(start, Some(end))
-                    }
-                    (Some(start), _) => orch::format_elapsed(start, None),
-                    _ => "0s".to_string(),
-                };
+                let elapsed = dashboard_elapsed(&s);
 
                 let has_last_message = s
                     .has_last_message
@@ -741,6 +724,32 @@ fn validate_object_name(name: &str) -> anyhow::Result<()> {
         "name must be an exact stored brofile name, not a path"
     );
     Ok(())
+}
+
+/// Dashboard row order: most recently started first, then task id. Shared
+/// by `bro_dashboard` and the operator UI roster.
+pub(crate) fn dashboard_order(
+    a: &bro_protocol::RosterSummaryV1,
+    b: &bro_protocol::RosterSummaryV1,
+) -> std::cmp::Ordering {
+    b.started_at
+        .or(b.last_event_at)
+        .unwrap_or(0)
+        .cmp(&a.started_at.or(a.last_event_at).unwrap_or(0))
+        .then_with(|| a.task_id.as_str().cmp(b.task_id.as_str()))
+}
+
+/// A dashboard row's `elapsed`, recomputed from summary timestamps: terminal
+/// tasks run from `started_at` to `last_event_at`, live tasks from
+/// `started_at` to now.
+pub(crate) fn dashboard_elapsed(s: &bro_protocol::RosterSummaryV1) -> String {
+    match (s.started_at, s.last_event_at) {
+        (Some(start), Some(end)) if s.status.is_terminal() => {
+            orch::format_elapsed(start, Some(end))
+        }
+        (Some(start), _) => orch::format_elapsed(start, None),
+        _ => "0s".to_string(),
+    }
 }
 
 /// Pick the `broLabel` value for a `bro_dashboard` row:

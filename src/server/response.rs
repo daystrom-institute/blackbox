@@ -130,16 +130,17 @@ impl BlackboxServer {
         F: FnOnce() -> anyhow::Result<String>,
     {
         let start = std::time::Instant::now();
+        let principal = super::mcp_oauth::call_principal();
         match op() {
             Ok(text) => {
                 let ms = start.elapsed().as_secs_f64() * 1000.0;
                 let response = Self::bounded_response(&text, None, false, Some(tool));
-                tracing::info!(target: "blackbox::tool", tool, elapsed_ms = ms, bytes = Self::response_bytes(&response), is_error = response.is_error, "response");
+                tracing::info!(target: "blackbox::tool", tool, principal = principal.as_ref().map(super::mcp_oauth::McpPrincipal::as_str), elapsed_ms = ms, bytes = Self::response_bytes(&response), is_error = response.is_error, "response");
                 response
             }
             Err(e) => {
                 let ms = start.elapsed().as_secs_f64() * 1000.0;
-                tracing::warn!(target: "blackbox::tool", tool, elapsed_ms = ms, error = %e, "err");
+                tracing::warn!(target: "blackbox::tool", tool, principal = principal.as_ref().map(super::mcp_oauth::McpPrincipal::as_str), elapsed_ms = ms, error = %e, "err");
                 Self::err_text(&format!("Error: {e:#}"))
             }
         }
@@ -152,16 +153,17 @@ impl BlackboxServer {
         F: FnOnce() -> anyhow::Result<(String, Value)>,
     {
         let start = std::time::Instant::now();
+        let principal = super::mcp_oauth::call_principal();
         match op() {
             Ok((text, structured)) => {
                 let ms = start.elapsed().as_secs_f64() * 1000.0;
                 let response = Self::bounded_response(&text, Some(structured), false, Some(tool));
-                tracing::info!(target: "blackbox::tool", tool, elapsed_ms = ms, bytes = Self::response_bytes(&response), is_error = response.is_error, "response");
+                tracing::info!(target: "blackbox::tool", tool, principal = principal.as_ref().map(super::mcp_oauth::McpPrincipal::as_str), elapsed_ms = ms, bytes = Self::response_bytes(&response), is_error = response.is_error, "response");
                 response
             }
             Err(e) => {
                 let ms = start.elapsed().as_secs_f64() * 1000.0;
-                tracing::warn!(target: "blackbox::tool", tool, elapsed_ms = ms, error = %e, "err");
+                tracing::warn!(target: "blackbox::tool", tool, principal = principal.as_ref().map(super::mcp_oauth::McpPrincipal::as_str), elapsed_ms = ms, error = %e, "err");
                 Self::err_text(&format!("Error: {e:#}"))
             }
         }
@@ -174,6 +176,7 @@ impl BlackboxServer {
         F: FnOnce() -> anyhow::Result<String> + Send + 'static,
     {
         let start = std::time::Instant::now();
+        let principal = super::mcp_oauth::call_principal();
         let result = tokio::task::spawn_blocking(op)
             .await
             .map_err(|e| anyhow::anyhow!("blocking task failed: {e}"))
@@ -183,12 +186,12 @@ impl BlackboxServer {
             Ok(text) => {
                 let ms = start.elapsed().as_secs_f64() * 1000.0;
                 let response = Self::bounded_response(&text, None, false, Some(tool));
-                tracing::info!(target: "blackbox::tool", tool, elapsed_ms = ms, bytes = Self::response_bytes(&response), is_error = response.is_error, "response");
+                tracing::info!(target: "blackbox::tool", tool, principal = principal.as_ref().map(super::mcp_oauth::McpPrincipal::as_str), elapsed_ms = ms, bytes = Self::response_bytes(&response), is_error = response.is_error, "response");
                 response
             }
             Err(e) => {
                 let ms = start.elapsed().as_secs_f64() * 1000.0;
-                tracing::warn!(target: "blackbox::tool", tool, elapsed_ms = ms, error = %e, "err");
+                tracing::warn!(target: "blackbox::tool", tool, principal = principal.as_ref().map(super::mcp_oauth::McpPrincipal::as_str), elapsed_ms = ms, error = %e, "err");
                 Self::err_text(&format!("Error: {e:#}"))
             }
         }
@@ -200,6 +203,7 @@ impl BlackboxServer {
         F: FnOnce() -> anyhow::Result<(String, Value)> + Send + 'static,
     {
         let start = std::time::Instant::now();
+        let principal = super::mcp_oauth::call_principal();
         let result = tokio::task::spawn_blocking(op)
             .await
             .map_err(|e| anyhow::anyhow!("blocking task failed: {e}"))
@@ -209,12 +213,12 @@ impl BlackboxServer {
             Ok((text, structured)) => {
                 let ms = start.elapsed().as_secs_f64() * 1000.0;
                 let response = Self::bounded_response(&text, Some(structured), false, Some(tool));
-                tracing::info!(target: "blackbox::tool", tool, elapsed_ms = ms, bytes = Self::response_bytes(&response), is_error = response.is_error, "response");
+                tracing::info!(target: "blackbox::tool", tool, principal = principal.as_ref().map(super::mcp_oauth::McpPrincipal::as_str), elapsed_ms = ms, bytes = Self::response_bytes(&response), is_error = response.is_error, "response");
                 response
             }
             Err(e) => {
                 let ms = start.elapsed().as_secs_f64() * 1000.0;
-                tracing::warn!(target: "blackbox::tool", tool, elapsed_ms = ms, error = %e, "err");
+                tracing::warn!(target: "blackbox::tool", tool, principal = principal.as_ref().map(super::mcp_oauth::McpPrincipal::as_str), elapsed_ms = ms, error = %e, "err");
                 Self::err_text(&format!("Error: {e:#}"))
             }
         }
