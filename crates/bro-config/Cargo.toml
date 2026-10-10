@@ -1,0 +1,16 @@
+[package]
+name = "bro-config"
+version = "0.0.1"
+edition = "2024"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+http = "1"
+tracing = "0.1"
+dirs = "6"
+toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3"

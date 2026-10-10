@@ -1,13 +1,4 @@
-//! Minimal config resolution — the slice the fleet client needs without
-//! linking the daemon's full `config` module.
-//!
-//! Resolves three things, faithfully to the daemon's precedence so the cockpit
-//! finds the SAME `fleet.json` and `bro_home/fleet` store the daemon would:
-//!   - the selected `config.toml` path (`BLACKBOX_CONFIG` → XDG default),
-//!   - `bro_home` (`BRO_HOME` → config `[paths].bro_home` → `state_dir/bro`),
-//!   - the daemon port (config `[daemon].port` → 7264),
-//!   - the daemon base URL a client should target
-//!     (`BLACKBOX_MCP_URL` → config `[client].daemon_url` → loopback:port).
+//! Connection settings shared by headless clients and dispatch configuration.
 
 use std::path::PathBuf;
 
@@ -18,8 +9,6 @@ use serde::Deserialize;
 struct PartialConfig {
     #[serde(default)]
     daemon: PartialDaemon,
-    #[serde(default)]
-    paths: PartialPaths,
     #[serde(default)]
     client: PartialClient,
 }
@@ -43,14 +32,6 @@ struct PartialDaemon {
     port: Option<u16>,
 }
 
-#[derive(Debug, Default, Deserialize)]
-struct PartialPaths {
-    #[serde(default)]
-    bro_home: Option<String>,
-    #[serde(default)]
-    state_dir: Option<String>,
-}
-
 fn home_dir() -> PathBuf {
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"))
 }
@@ -64,13 +45,6 @@ fn expand_tilde(s: &str) -> PathBuf {
     } else {
         PathBuf::from(s)
     }
-}
-
-fn env_path(var: &str) -> Option<PathBuf> {
-    std::env::var(var)
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .map(|s| expand_tilde(&s))
 }
 
 /// Default `config.toml` location (`$XDG_CONFIG_HOME/blackbox/config.toml`).
@@ -94,32 +68,6 @@ fn load_partial() -> PartialConfig {
         .unwrap_or_default()
 }
 
-/// `$BLACKBOX_STATE_DIR`, else config `[paths].state_dir`, else
-/// `$XDG_STATE_HOME/blackbox` (`~/.local/state/blackbox` fallback).
-fn state_dir(cfg: &PartialConfig) -> PathBuf {
-    if let Some(p) = env_path("BLACKBOX_STATE_DIR") {
-        return p;
-    }
-    if let Some(s) = &cfg.paths.state_dir {
-        return expand_tilde(s);
-    }
-    let xdg = dirs::state_dir().unwrap_or_else(|| home_dir().join(".local").join("state"));
-    xdg.join("blackbox")
-}
-
-/// The cockpit's `bro_home`: `$BRO_HOME`, else config `[paths].bro_home`, else
-/// `state_dir/bro`. Matches the daemon's resolution so the fleet store lines up.
-pub fn bro_home() -> PathBuf {
-    if let Some(p) = env_path("BRO_HOME") {
-        return p;
-    }
-    let cfg = load_partial();
-    if let Some(s) = &cfg.paths.bro_home {
-        return expand_tilde(s);
-    }
-    state_dir(&cfg).join("bro")
-}
-
 /// The daemon port from `[daemon].port`, else 7264.
 pub fn daemon_port() -> u16 {
     load_partial().daemon.port.unwrap_or(7264)
@@ -128,9 +76,7 @@ pub fn daemon_port() -> u16 {
 /// The daemon base URL a CLI should target when no `--daemon-url` is given:
 /// `BLACKBOX_MCP_URL` (the value the daemon exports to dispatched agents,
 /// with its `/mcp` path and query stripped down to the origin), else config
-/// `[client].daemon_url`, else `http://127.0.0.1:<daemon_port>`. On an estate
-/// whose daemon is remote, one of the first two is what makes
-/// `bro workspace-binding mint` reach it without a flag.
+/// `[client].daemon_url`, else `http://127.0.0.1:<daemon_port>`.
 pub fn daemon_url() -> String {
     daemon_url_from(
         std::env::var("BLACKBOX_MCP_URL").ok().as_deref(),
@@ -257,12 +203,12 @@ pub fn client_bearer() -> anyhow::Result<Option<String>> {
 
 /// Default request headers for a daemon HTTP client: the bearer when one is
 /// configured, nothing otherwise.
-pub fn bearer_headers() -> anyhow::Result<reqwest::header::HeaderMap> {
-    let mut headers = reqwest::header::HeaderMap::new();
+pub fn bearer_headers() -> anyhow::Result<http::header::HeaderMap> {
+    let mut headers = http::header::HeaderMap::new();
     if let Some(token) = client_bearer()? {
-        let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))?;
+        let mut value = http::header::HeaderValue::from_str(&format!("Bearer {token}"))?;
         value.set_sensitive(true);
-        headers.insert(reqwest::header::AUTHORIZATION, value);
+        headers.insert(http::header::AUTHORIZATION, value);
     }
     Ok(headers)
 }
@@ -272,8 +218,39 @@ mod bearer_tests {
     use super::*;
 
     #[test]
+    fn selected_config_supplies_connection_and_bearer_defaults() {
+        let _guard = crate::test_env_lock();
+        let _config = crate::SavedEnv::capture("BLACKBOX_CONFIG");
+        let _token = crate::SavedEnv::capture("BLACKBOX_CLIENT_TOKEN_FILE");
+        let _mcp = crate::SavedEnv::capture("BLACKBOX_MCP_URL");
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let token = dir.path().join("client.token");
+        std::fs::write(&token, "b".repeat(64)).unwrap();
+        std::fs::write(&config, format!(
+            "[daemon]\nport = 7301\n[client]\ndaemon_url = 'https://example.test/'\ntoken_file = '{}'\n",
+            token.display()
+        )).unwrap();
+        // SAFETY: all environment-mutating tests hold the shared lock.
+        unsafe {
+            std::env::set_var("BLACKBOX_CONFIG", &config);
+            std::env::remove_var("BLACKBOX_CLIENT_TOKEN_FILE");
+            std::env::remove_var("BLACKBOX_MCP_URL");
+        }
+        assert_eq!(daemon_port(), 7301);
+        assert_eq!(daemon_url(), "https://example.test");
+        assert_eq!(client_bearer().unwrap(), Some("b".repeat(64)));
+        std::fs::write(&config, "").unwrap();
+        assert_eq!(daemon_port(), 7264);
+        assert_eq!(daemon_url(), "http://127.0.0.1:7264");
+        assert!(bearer_headers().unwrap().is_empty());
+    }
+
+    #[test]
     #[allow(clippy::disallowed_methods)]
     fn the_client_bearer_comes_from_the_env_file_and_is_checked() {
+        let _guard = crate::test_env_lock();
+        let _restore = crate::SavedEnv::capture("BLACKBOX_CLIENT_TOKEN_FILE");
         let dir = tempfile::tempdir().unwrap();
         let good = dir.path().join("good.token");
         std::fs::write(&good, format!("{}\n", "a".repeat(64))).unwrap();
@@ -286,7 +263,7 @@ mod bearer_tests {
             Some("a".repeat(64).as_str())
         );
         let headers = bearer_headers().unwrap();
-        assert!(headers[reqwest::header::AUTHORIZATION].is_sensitive());
+        assert!(headers[http::header::AUTHORIZATION].is_sensitive());
         unsafe { std::env::set_var("BLACKBOX_CLIENT_TOKEN_FILE", &bad) };
         assert!(client_bearer().is_err());
         unsafe { std::env::set_var("BLACKBOX_CLIENT_TOKEN_FILE", dir.path().join("missing")) };

@@ -1167,8 +1167,8 @@ dependencies = [
  "bbox-vectors",
  "bbox-visual-store",
  "bbox-whiteboards",
+ "bro-config",
  "bro-core",
- "bro-fleet-client",
  "bro-protocol",
  "bro-rpc",
  "bro-tools",
@@ -1268,7 +1268,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "bbox-util",
- "bro-fleet-client",
+ "bro-config",
  "clap",
  "futures-util",
  "libc",
@@ -1293,31 +1293,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "bro-config"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "dirs",
+ "http",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml",
+ "tracing",
+]
+
+[[package]]
 name = "bro-core"
 version = "0.0.1"
 dependencies = [
  "serde",
  "serde_json",
  "strum",
-]
-
-[[package]]
-name = "bro-fleet-client"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "bro-core",
- "bro-protocol",
- "dirs",
- "parking_lot",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "toml",
- "tracing",
- "uuid",
 ]
 
 [[package]]

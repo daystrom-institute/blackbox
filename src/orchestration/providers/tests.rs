@@ -937,7 +937,7 @@ fn fleet_mcp_args_converts_client_local_map() {
     // The client-local fleet.json shape: secret values are opaque JSON the
     // thin client never resolves; the daemon-side conversion must carry the
     // `$secret` ref through to injection-time resolution.
-    let parsed: std::collections::BTreeMap<String, bro_fleet_client::McpServerConfig> =
+    let parsed: std::collections::BTreeMap<String, bro_config::McpServerConfig> =
         serde_json::from_value(serde_json::json!({
             "tmux": {
                 "type": "stdio",

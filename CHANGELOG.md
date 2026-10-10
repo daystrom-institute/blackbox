@@ -8,6 +8,11 @@ out explicitly under `Changed` or `Removed`.
 
 ## Unreleased
 
+- Removed the unused Fleet client engine, roster mirror, transcript parser and
+  cockpit configuration writers. `bro-config` owns shared connection settings,
+  MCP server definitions and dispatch environment settings. Existing config
+  paths are preserved and unused cockpit settings are ignored without rewrites.
+
 - Removed `bro fleet` and `bro agent`, their terminal rendering stack, classifier
   companion and cockpit-only dependencies. `bro mcp`, `bro render` and
   `bro tail` remain available.

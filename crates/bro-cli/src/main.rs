@@ -70,7 +70,7 @@ impl From<TailArgs> for TailSelectors {
 // ── Tail stream printer ─────────────────────────────────────────────
 
 fn tail_url(sel: &TailSelectors) -> String {
-    let port = bro_fleet_client::daemon_port();
+    let port = bro_config::daemon_port();
     let mut url = format!("http://127.0.0.1:{port}/tail");
     let mut params = Vec::new();
     if !sel.bros.is_empty() {
@@ -95,7 +95,7 @@ async fn run_tail_stream_printer(sel: TailSelectors) -> anyhow::Result<()> {
     let url = tail_url(&sel);
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
-        .default_headers(bro_fleet_client::bearer_headers()?)
+        .default_headers(bro_config::bearer_headers()?)
         .build()?;
 
     loop {

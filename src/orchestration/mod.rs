@@ -2011,10 +2011,7 @@ impl TaskStore {
         self.persist_with_event_limit(store_dir, MAX_PERSISTED_EVENTS);
     }
 
-    /// Full-history persist (no per-task event cap). The fleet client was the
-    /// only production caller; with the §7 fleet-daemon-only cut its own mirror
-    /// store owns this now (`bro-fleet-client`). Retained (allow-dead) for the
-    /// persistence-contract test and any future full-history daemon path.
+    /// Full-history persistence for snapshot contract tests.
     #[allow(dead_code)]
     pub fn persist_all_events(&self, store_dir: &std::path::Path) {
         self.persist_with_event_limit(store_dir, usize::MAX);
@@ -3007,7 +3004,7 @@ fn project_dispatch_shell_env(
 ) -> Option<std::collections::BTreeMap<String, String>> {
     let cwd = std::path::Path::new(cwd?);
     let base = worktree_base_repo(cwd).unwrap_or_else(|| cwd.to_path_buf());
-    let cfg = bro_fleet_client::FleetConfig::load();
+    let cfg = bro_config::DispatchConfig::load();
     let env = cfg.project_dispatch_for(&base)?.env.clone();
     (!env.is_empty()).then_some(env)
 }
@@ -3027,7 +3024,7 @@ fn fleet_mcp_dispatch_args(provider: Provider, origin: bro_core::Origin) -> Vec<
     if origin != bro_core::Origin::Cockpit {
         return Vec::new();
     }
-    let cfg = bro_fleet_client::FleetConfig::load();
+    let cfg = bro_config::DispatchConfig::load();
     providers::fleet_mcp_args(provider, &cfg.mcp_servers)
 }
 
@@ -3220,7 +3217,7 @@ async fn spawn_reserved_dispatch(
     let mut args: providers::ProviderLaunch = args.into();
     if let Some(config) = &mut args.codex {
         if origin == bro_core::Origin::Cockpit {
-            let fleet = bro_fleet_client::FleetConfig::load();
+            let fleet = bro_config::DispatchConfig::load();
             match providers::codex_fleet_mcp_servers(&fleet.mcp_servers) {
                 Ok(servers) => config.mcp_servers.extend(servers),
                 Err(error) => config.errors.push(error.to_string()),
@@ -9724,6 +9721,45 @@ mod tests {
         assert!(!raw.contains("IMPORTANT:"), "{raw}");
         // And it round-trips through the harness's strict parser.
         assert_eq!(bro_protocol::DispatchContext::parse(&raw).unwrap(), payload);
+    }
+
+    #[test]
+    fn dispatch_environment_reads_shared_config_for_linked_worktrees() {
+        let _guard = crate::util::test_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let base = root.join("repo");
+        let worktree = root.join("worktree");
+        std::fs::create_dir_all(base.join(".git/worktrees/fixture")).unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            format!(
+                "gitdir: {}\n",
+                base.join(".git/worktrees/fixture").display()
+            ),
+        )
+        .unwrap();
+        let previous = std::env::var_os("BLACKBOX_CONFIG");
+        // SAFETY: the test holds the shared environment lock.
+        unsafe {
+            std::env::set_var("BLACKBOX_CONFIG", root.join("config.toml"));
+        }
+        std::fs::write(root.join("fleet.json"), serde_json::to_vec(&serde_json::json!({
+            "project_dispatch": {base.to_string_lossy().as_ref(): {"env":{"FIXTURE_ENV":"preserved"}}},
+            "display": {"showReports":false}
+        })).unwrap()).unwrap();
+        let actual = project_dispatch_shell_env(worktree.to_str());
+        let absent = project_dispatch_shell_env(None);
+        // SAFETY: restore the caller's environment before releasing the lock.
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("BLACKBOX_CONFIG", value),
+                None => std::env::remove_var("BLACKBOX_CONFIG"),
+            }
+        }
+        assert_eq!(actual.unwrap()["FIXTURE_ENV"], "preserved");
+        assert!(absent.is_none());
     }
 
     #[test]

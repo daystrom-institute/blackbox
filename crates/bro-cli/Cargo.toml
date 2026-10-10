@@ -1,4 +1,4 @@
-# Headless daemon client. Shared configuration stays in bro-fleet-client.
+# Headless daemon client. Shared configuration stays in bro-config.
 [package]
 name = "bro-cli"
 version = "0.0.1"
@@ -9,7 +9,7 @@ name = "bro"
 path = "src/main.rs"
 
 [dependencies]
-bro-fleet-client = { path = "../bro-fleet-client" }
+bro-config = { path = "../bro-config" }
 bbox-util = { path = "../bbox-util" }
 # Restore conventional SIGPIPE behavior for piped output.
 libc = "0.2"

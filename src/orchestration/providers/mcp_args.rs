@@ -212,7 +212,7 @@ pub fn fleet_mcp_config_json(servers: &BTreeMap<String, mcp::McpServerConfig>) -
 
 /// Codex dispatch must not silently omit malformed or unresolved servers.
 pub fn codex_fleet_mcp_servers(
-    servers: &BTreeMap<String, bro_fleet_client::McpServerConfig>,
+    servers: &BTreeMap<String, bro_config::McpServerConfig>,
 ) -> anyhow::Result<BTreeMap<String, Value>> {
     servers
         .iter()
@@ -247,12 +247,12 @@ fn to_json_object(m: &BTreeMap<String, String>) -> Value {
     )
 }
 
-/// Fleet MCP injection for one dispatch: convert fleet.json's client-local
+/// Fleet MCP injection for one dispatch: convert fleet.json's shared
 /// server map and translate it to the provider's dispatch args
 /// (`--mcp-config <json>` for the harness providers). Empty map → no args.
 pub fn fleet_mcp_args(
     provider: Provider,
-    servers: &BTreeMap<String, bro_fleet_client::McpServerConfig>,
+    servers: &BTreeMap<String, bro_config::McpServerConfig>,
 ) -> Vec<String> {
     if servers.is_empty() {
         return Vec::new();
@@ -260,14 +260,14 @@ pub fn fleet_mcp_args(
     provider.build_fleet_mcp_args(&daemon_servers_from_fleet(servers))
 }
 
-/// Convert the client-local fleet.json MCP server map (header/env values kept
-/// as opaque JSON by the thin client, which never resolves secrets) into the
+/// Convert the fleet.json MCP server map (header/env values kept
+/// as opaque JSON by the configuration reader) into the
 /// daemon shape (`SecretString`-typed). The serde wire forms mirror by design
 /// (`type`-tagged, lowercase; plain string or `{"$secret": ENV}` values), so
 /// conversion is a JSON round-trip; a server that doesn't fit the daemon
 /// shape is skipped with a warning rather than failing the dispatch.
 fn daemon_servers_from_fleet(
-    servers: &BTreeMap<String, bro_fleet_client::McpServerConfig>,
+    servers: &BTreeMap<String, bro_config::McpServerConfig>,
 ) -> BTreeMap<String, mcp::McpServerConfig> {
     let mut out = BTreeMap::new();
     for (name, cfg) in servers {

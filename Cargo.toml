@@ -12,7 +12,7 @@ members = [
     "crates/bro-harness",
     "crates/bro-lsp",
     "crates/bro-cli",
-    "crates/bro-fleet-client",
+    "crates/bro-config",
     "crates/bro-transcript",
     "crates/bro-code-mode",
     "crates/bro-apply-patch",
@@ -136,7 +136,7 @@ bro-worker = { path = "crates/bro-worker" }
 bro-protocol = { path = "crates/bro-protocol" }
 bro-rpc = { path = "crates/bro-rpc" }
 bro-transcript = { path = "crates/bro-transcript" }
-bro-fleet-client = { path = "crates/bro-fleet-client" }
+bro-config = { path = "crates/bro-config" }
 # Fleet closeout and daemon-owned tool paths share bro-tools primitives.
 bro-tools = { path = "crates/bro-tools" }
 

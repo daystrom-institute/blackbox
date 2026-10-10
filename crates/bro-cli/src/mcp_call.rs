@@ -121,7 +121,7 @@ impl McpClient {
         let mcp_url = mcp_url.to_string();
         // The configured daemon bearer rides every request of this client,
         // the handshake included.
-        let bearer = bro_fleet_client::bearer_headers()?;
+        let bearer = bro_config::bearer_headers()?;
         let client = if initialization_headers.is_empty() && bearer.is_empty() {
             reqwest::Client::new()
         } else {
@@ -206,9 +206,9 @@ impl McpClient {
 
 /// The daemon base URL when no `--daemon-url` is given: `BLACKBOX_MCP_URL`'s
 /// origin, else config `[client].daemon_url`, else loopback on the configured
-/// port. See `bro_fleet_client::daemon_url`.
+/// port. See `bro_config::daemon_url`.
 pub(crate) fn default_base_url() -> String {
-    bro_fleet_client::daemon_url()
+    bro_config::daemon_url()
 }
 
 fn parse_arguments(raw: &str) -> anyhow::Result<Value> {

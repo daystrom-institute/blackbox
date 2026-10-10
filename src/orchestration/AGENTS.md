@@ -74,11 +74,8 @@ Domain home for the dispatch plane. Boundary contract:
   only `ambient_ctx.tool_arg_defaults()` silently strips operator grants
   (that is the hole that made every RX-V1 consumer refusal-only in live
   dispatches until the channel landed).
-- bro-fleet-client forwards `DispatchSpec`/`ResumeSpec.tool_defaults` as
-  the per-dispatch lane on `/control/exec` and `/control/resume`, which
-  deserialize the same `ExecParams`/`ResumeParams` as the MCP tools. The
-  cockpit sets no per-dispatch defaults of its own, so its grants come from
-  the brofile lane unless a caller fills the spec field.
+- `/control/exec` and `/control/resume` deserialize the same
+  `ExecParams`/`ResumeParams` as the MCP tools, including per-dispatch grants.
 
 ## Task terminal state follows the worker
 
