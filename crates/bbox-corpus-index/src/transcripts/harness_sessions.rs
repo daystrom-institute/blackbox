@@ -55,6 +55,7 @@ const HARNESS_PROVIDERS: &[Provider] = &[
     Provider::Deepseek,
     Provider::Minimax,
     Provider::Kimi,
+    Provider::Codex,
     Provider::Brodex,
     Provider::VibeBh,
 ];
@@ -123,6 +124,7 @@ impl HarnessSessionsAdapter {
 /// milestone (scanned from the head of the file).
 #[derive(Debug, Default, Clone)]
 struct SessionMeta {
+    session_id: Option<String>,
     provider: Option<String>,
     transport: Option<String>,
     model: Option<String>,
@@ -172,6 +174,18 @@ fn read_session_meta(path: &Path) -> SessionMeta {
             continue;
         };
         let event = &v["event"];
+        if event["type"] == "system"
+            && event["subtype"] == "init"
+            && event["provider"].as_str().is_some()
+        {
+            return SessionMeta {
+                session_id: event["session_id"].as_str().map(str::to_string),
+                provider: event["provider"].as_str().map(str::to_string),
+                model: event["model"].as_str().map(str::to_string),
+                cwd: event["cwd"].as_str().map(str::to_string),
+                ..Default::default()
+            };
+        }
         if event["type"].as_str() != Some("harness_milestone") {
             continue;
         }
@@ -182,6 +196,7 @@ fn read_session_meta(path: &Path) -> SessionMeta {
             continue;
         }
         return SessionMeta {
+            session_id: None,
             provider: event["provider"].as_str().map(str::to_string),
             transport: event["transport"].as_str().map(str::to_string),
             model: event["model"].as_str().map(str::to_string),
@@ -251,6 +266,11 @@ impl TranscriptReadAdapter for HarnessSessionsAdapter {
                 continue;
             };
             let meta = read_session_meta(&path);
+            // The initial task path is a replay alias of the canonical session
+            // log. Index only the provider session name, including its resumes.
+            if meta.session_id.as_ref().is_some_and(|id| id != &session_id) {
+                continue;
+            }
             // Each file is owned by exactly one provider instance so the
             // registry's per-adapter scans never double-index it.
             if meta.resolve_provider() != self.provider {
@@ -460,6 +480,31 @@ mod tests {
     }
 
     #[test]
+    fn codex_init_attributes_the_canonical_log_and_skips_its_task_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().join("thread-1.events.jsonl");
+        std::fs::write(&canonical, format!("{}\n", json!({"ts":"2026-01-01T00:00:00Z", "event":{"type":"system","subtype":"init","provider":"codex","session_id":"thread-1","cwd":"/repo"}}))).unwrap();
+        std::fs::hard_link(&canonical, dir.path().join("task-1.events.jsonl")).unwrap();
+        let adapter = HarnessSessionsAdapter::new(Provider::Codex, dir.path().to_path_buf());
+        let locations = adapter
+            .scan_locations(TranscriptScanTarget::Sessions)
+            .unwrap();
+        assert_eq!(locations.len(), 1);
+        assert_eq!(locations[0].session_id.as_deref(), Some("thread-1"));
+        assert_eq!(
+            locations[0].source,
+            TranscriptSource::Harness(Provider::Codex)
+        );
+        let fallback = HarnessSessionsAdapter::new(Provider::Glm, dir.path().to_path_buf());
+        assert!(
+            fallback
+                .scan_locations(TranscriptScanTarget::Sessions)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn scan_attributes_sessions_to_the_recorded_provider() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
@@ -528,6 +573,7 @@ mod tests {
         ];
         for (fields, expected) in cases {
             let meta = SessionMeta {
+                session_id: None,
                 provider: None,
                 transport: fields["transport"].as_str().map(str::to_string),
                 model: fields["model"].as_str().map(str::to_string),

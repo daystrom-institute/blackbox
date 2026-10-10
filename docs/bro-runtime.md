@@ -107,7 +107,7 @@ A brofile is a reusable provider/persona/lens/filter bundle:
 
 ```text
 bro_brofile(action="list")
-bro_brofile(action="get", name="rust-refactor-persona")
+bro_brofile(action="get", name="java-refactor-persona")
 ```
 
 List before create. Brofiles are often installed through the artifact catalog

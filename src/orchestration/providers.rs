@@ -17,13 +17,47 @@ mod session;
 #[cfg(test)]
 mod tests;
 
+use bro_core::ProviderLane;
 pub use bro_core::{Capability, Provider};
 
+/// Whether the executor that owns the worker's stdout writes the session log.
+/// A vendor CLI lane's child keeps no log under `BRO_HOME`; the harness writes
+/// its own.
+pub fn supervisor_writes_event_log(lane: ProviderLane) -> bool {
+    match lane {
+        ProviderLane::ClaudeCli | ProviderLane::Codex => true,
+        ProviderLane::Harness | ProviderLane::Workflow => false,
+    }
+}
+
+/// Whether the worker runs until its stdin closes, so the daemon drops the
+/// control lane after each turn's `result`. The harness exits when idle on
+/// its own (`--exit-when-idle`).
+pub fn closes_input_after_result(lane: ProviderLane) -> bool {
+    match lane {
+        ProviderLane::ClaudeCli | ProviderLane::Codex => true,
+        ProviderLane::Harness | ProviderLane::Workflow => false,
+    }
+}
+
+/// Whether the worker mints its own session id when a session starts. The
+/// codex app-server assigns the thread id, which then becomes the session id,
+/// so a fresh dispatch on that lane starts `pending` and adopts the id the
+/// worker's first event carries.
+pub fn worker_assigns_session_id(lane: ProviderLane) -> bool {
+    match lane {
+        ProviderLane::Codex => true,
+        ProviderLane::ClaudeCli | ProviderLane::Harness | ProviderLane::Workflow => false,
+    }
+}
+
 pub use events::{AssistantPreview, Disruption, EventSink, Usage};
-pub use exec_args::{ExecOpts, dispatch_path_env, exec_opts_with_provider_defaults, resolve_bin};
+pub use exec_args::{
+    ExecOpts, ProviderLaunch, dispatch_path_env, exec_opts_with_provider_defaults, resolve_bin,
+};
 #[cfg(test)]
 use mcp_args::MatchState;
-pub use mcp_args::fleet_mcp_args;
+pub use mcp_args::{codex_fleet_mcp_servers, fleet_mcp_args};
 
 /// Bring every provider dispatch trait into scope with one glob import:
 /// `use crate::orchestration::providers::dispatch_prelude::*;`

@@ -19,6 +19,7 @@ name = "fleetd"
 path = "src/main.rs"
 
 [dependencies]
+bro-worker = { path = "../bro-worker" }
 bro-core = { path = "../bro-core" }
 bro-protocol = { path = "../bro-protocol" }
 bro-rpc = { path = "../bro-rpc" }

@@ -148,6 +148,17 @@ impl Registry {
         self.lock().get(session_id).map(|e| e.control.clone())
     }
 
+    /// Close the session's stdin after everything already queued: the
+    /// registry's sender is the last one alive between messages, so replacing
+    /// it with a sender to a dropped receiver drains the writer and shuts the
+    /// child's stdin. Later `Control` messages for the session are discarded.
+    pub fn end_input(&self, session_id: &str) {
+        if let Some(entry) = self.lock().get_mut(session_id) {
+            let (closed, _) = mpsc::unbounded_channel::<Value>();
+            entry.control = closed;
+        }
+    }
+
     pub fn killer(&self, session_id: &str) -> Option<Arc<WorkerKill>> {
         self.lock().get(session_id).map(|e| e.killer.clone())
     }

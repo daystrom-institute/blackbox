@@ -380,6 +380,13 @@ pub struct WorkerSpawnSpec {
     /// sides of the historical dual derivation (daemon transcript location and
     /// child-side `BRO_HOME` resolution) flow from this spec.
     pub event_log_path: PathBuf,
+    /// The child writes no event log of its own (a vendor CLI worker), so the
+    /// executor that owns its stdout writes [`Self::event_log_path`] from the
+    /// relayed envelope. A harness child writes its own and leaves this false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub supervisor_writes_event_log: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex: Option<crate::CodexSessionConfig>,
 }
 
 #[cfg(test)]
@@ -412,6 +419,8 @@ mod tests {
             initial_messages: vec![json!({"type": "user", "message": {"role": "user"}})],
             bro_home: PathBuf::from("/state/bro"),
             event_log_path: PathBuf::from("/state/bro/harness-sessions/sess-xyz.events.jsonl"),
+            supervisor_writes_event_log: false,
+            codex: None,
         }
     }
 

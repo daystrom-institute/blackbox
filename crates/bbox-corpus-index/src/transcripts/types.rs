@@ -55,6 +55,9 @@ impl TranscriptSource {
     /// and serialized form.
     pub fn label(&self) -> &'static str {
         match self {
+            // A dispatched Codex session log, distinct from the interactive
+            // `codex` source the CLI's own session files belong to.
+            Self::Harness(Provider::Codex) => "codex-dispatch",
             Self::Harness(Provider::Brodex) => "brodex",
             Self::Harness(Provider::VibeBh) => "vibebh",
             Self::Harness(Provider::Glm) => "glm",
@@ -94,6 +97,7 @@ impl<'de> Deserialize<'de> for TranscriptSource {
         match raw.as_str() {
             "claude" => Ok(Self::Claude),
             "codex" => Ok(Self::Codex),
+            "codex-dispatch" => Ok(Self::Harness(Provider::Codex)),
             "slack" => Ok(Self::Slack),
             other => other.parse::<Provider>().map(Self::Harness).map_err(|_| {
                 serde::de::Error::custom(format!("unknown transcript source: {other}"))

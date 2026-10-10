@@ -79,9 +79,8 @@ pub(crate) fn format_progress_snapshot(tasks: &[Arc<orch::Task>]) -> (String, bo
 
 /// Load the effective tool filter set for a dispatch (global + project
 /// overlay + default recursion guard unless `allow_recursion`), then
-/// translate to provider-specific CLI args.
+/// pass the resolved policy to the provider launch composer.
 pub(crate) struct DispatchFilters {
-    pub(crate) args: Vec<String>,
     pub(crate) filters: orchestration::mcp::McpFilters,
 }
 
@@ -133,7 +132,7 @@ pub(crate) fn combine_dispatch_filters(
 /// bridge mode, the accepted store in catalog mode. This function never reads
 /// a project path itself.
 pub(crate) fn resolve_dispatch_filters(
-    provider: Provider,
+    _provider: Provider,
     project: Option<&orchestration::mcp::McpStore>,
     allow_recursion: bool,
     _task_id: &str,
@@ -165,10 +164,7 @@ pub(crate) fn resolve_dispatch_filters(
         eff.filters.merge_from(extra);
     }
 
-    let args = provider.build_filter_args(&eff.filters);
-
     Ok(DispatchFilters {
-        args,
         filters: eff.filters,
     })
 }

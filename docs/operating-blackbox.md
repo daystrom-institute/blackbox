@@ -62,7 +62,9 @@ install -m 755 target/release/{bbox-code-collector,bbox-transcript-collector} ~/
 ```
 
 Kickstart the collectors after installing them. New sessions pick up a new
-`bro-harness` without a restart.
+`bro-harness` without a restart. The Codex adapter is linked into the daemon
+and fleetd; install and restart fleetd when updating it. Both peers must use
+fleet protocol version 2.
 
 Gate the roll with `scripts/converge-gate --drain` and reopen admission with
 `scripts/converge-gate --clear` (`docs/converge-gate.md`). The daemon admits

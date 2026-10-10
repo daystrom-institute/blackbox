@@ -1,8 +1,0 @@
-{
-  "name": "contradiction-lifecycle",
-  "version": 1,
-  "provider": "claude",
-  "model": "sonnet-4.6",
-  "effort": "medium",
-  "lens": "Review the supplied knowledge claims for supersession, temporal scope, migration state and whether an apparent conflict is historical evolution. Ground judgments in corpus evidence. Return findings with claim IDs, proposed relationship, rationale, evidence refs and uncertainty. Do not modify knowledge or invent missing evidence. The caller owns review rounds and authorizes any durable changes."
-}

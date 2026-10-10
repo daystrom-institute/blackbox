@@ -6,26 +6,24 @@ use crate::orchestration::brofile::{
 use std::path::PathBuf;
 
 use super::Provider;
+use bro_core::ProviderLane;
 
-/// Resolve the harness/provider binary name from env. GLM/DeepSeek/MiniMax/
-/// Kimi/Brodex/VibeBh ride the custom harness instead of a vendor CLI;
-/// transport + credentials are selected via env (see
-/// brofile::resolve_provider_env).
+/// Resolve the provider binary name from env. The claude lane runs the
+/// vendor `claude` CLI (`CLAUDE_BIN` overrides); the codex lane runs the
+/// `codex app-server` adapter (`CODEX_BIN` overrides); the harness lane runs the
+/// standalone `bro-harness` binary (`BRO_HARNESS_BIN` overrides). Credentials
+/// and endpoints are selected via env (see brofile::resolve_provider_env).
 ///
-/// Harness providers dispatch through this standalone binary. blackboxd builds
-/// the argv and child environment, then communicates only through stdin/stdout
-/// NDJSON plus the daemon's MCP endpoint.
+/// Dispatch composes a typed invocation and environment for the execution
+/// host. Each lane owns its provider protocol and uses the daemon MCP endpoint.
 fn bin_with_env(provider: Provider) -> String {
-    match provider {
-        Provider::Glm
-        | Provider::Deepseek
-        | Provider::Minimax
-        | Provider::Kimi
-        | Provider::Brodex
-        | Provider::VibeBh => {
+    match provider.lane() {
+        ProviderLane::ClaudeCli => std::env::var("CLAUDE_BIN").unwrap_or_else(|_| "claude".into()),
+        ProviderLane::Codex => std::env::var("CODEX_BIN").unwrap_or_else(|_| "codex".into()),
+        ProviderLane::Harness => {
             std::env::var("BRO_HARNESS_BIN").unwrap_or_else(|_| "bro-harness".into())
         }
-        Provider::Workflow => "workflow".into(),
+        ProviderLane::Workflow => "workflow".into(),
     }
 }
 
@@ -142,9 +140,9 @@ pub struct ExecOpts {
     /// forwards `priority` to OpenAI Responses as Codex `/fast`; `default` is
     /// persisted in session state but dropped from the request body.
     pub service_tier: Option<String>,
-    /// JSON schema for structured output. When set, emitted as
-    /// `--output-schema <json>` to the harness, which registers a synthetic
-    /// `final_result` terminal tool.
+    /// JSON schema for structured output. The claude lane passes it as
+    /// `--json-schema <json>`; the harness lane as `--output-schema <json>`,
+    /// which registers a synthetic `final_result` terminal tool.
     pub output_schema: Option<String>,
 }
 
@@ -192,24 +190,17 @@ fn normalize_model_for_provider(provider: Provider, model: &str) -> String {
     }
 }
 
-/// Providers that dispatch through `bro-harness` have NO built-in default
-/// model — unlike the `claude`/`codex` CLIs, the harness bails with
-/// `no --model …` when none is passed. The allocator path fills a model, but
-/// raw `bro_exec { provider }` (no tier/pin) does not, so a model-less harness
-/// dispatch dies silently with exit 1 and zero events. Default to the catalog
-/// `.default` model here, at the single arg-building chokepoint, so every
-/// caller is covered. Returns None for CLI-backed providers, which have their
-/// own defaults.
-fn harness_default_model(provider: Provider) -> Option<String> {
-    if !matches!(
-        provider,
-        Provider::Glm
-            | Provider::Deepseek
-            | Provider::Minimax
-            | Provider::Kimi
-            | Provider::Brodex
-            | Provider::VibeBh
-    ) {
+/// The model a dispatch runs when the caller pins none. The harness has no
+/// built-in default and bails with `no --model …`; the claude-compatible
+/// endpoints need a wire id that their config dir may not pin. Both get the
+/// catalog `.default` model here, at the single arg-building chokepoint, so
+/// every caller is covered.
+fn default_model(provider: Provider) -> Option<String> {
+    // Codex's typed composer supplies its catalog default separately.
+    if provider.lane() == ProviderLane::Codex {
+        return None;
+    }
+    if !provider.is_dispatchable() {
         return None;
     }
     provider
@@ -237,7 +228,7 @@ pub trait ProviderExec {
         session_id: &str,
         cwd: Option<&str>,
         opts: Option<&ExecOpts>,
-    ) -> Vec<String>;
+    ) -> ProviderLaunch;
     /// Build the args for resuming an existing session. Resume passes the
     /// full dispatch context too — persona included (the harness places it
     /// idempotently in the system slot; dropping it on resume was the old
@@ -248,11 +239,102 @@ pub trait ProviderExec {
         prompt: &str,
         dispatch_context: Option<&bro_protocol::DispatchContext>,
         opts: Option<&ExecOpts>,
-    ) -> Vec<String>;
+    ) -> ProviderLaunch;
 }
 
-/// Serialize the payload for the `--dispatch-context` flag. The DTO is plain
-/// strings/enums, so serialization cannot fail in practice.
+/// Provider invocation before execution-host composition.
+#[derive(Debug, Clone, Default)]
+pub struct ProviderLaunch {
+    pub argv: Vec<String>,
+    pub codex: Option<bro_protocol::CodexSessionConfig>,
+    pub prompt: Option<String>,
+}
+
+impl From<Vec<String>> for ProviderLaunch {
+    fn from(argv: Vec<String>) -> Self {
+        Self {
+            argv,
+            ..Self::default()
+        }
+    }
+}
+impl std::ops::Deref for ProviderLaunch {
+    type Target = Vec<String>;
+    fn deref(&self) -> &Self::Target {
+        &self.argv
+    }
+}
+impl std::ops::DerefMut for ProviderLaunch {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.argv
+    }
+}
+impl ProviderLaunch {
+    pub fn apply_filters(&mut self, provider: Provider, filters: &super::super::mcp::McpFilters) {
+        if let Some(config) = &mut self.codex {
+            config.allowed_tools = super::mcp_args::expand_filter_patterns(&filters.allow);
+            config.disallowed_tools = super::mcp_args::expand_filter_patterns(&filters.disallow);
+        } else {
+            use super::dispatch_prelude::ProviderMcp;
+            self.argv.extend(provider.build_filter_args(filters));
+        }
+    }
+}
+
+fn codex_launch(
+    prompt: &str,
+    resume: Option<&str>,
+    context: Option<&bro_protocol::DispatchContext>,
+    opts: Option<&ExecOpts>,
+) -> ProviderLaunch {
+    let opts = opts.cloned().unwrap_or_default();
+    let mut errors = Vec::new();
+    if opts.code_mode.is_some() || opts.edit_discipline.is_some() {
+        errors.push("Codex does not support harness code_mode or edit_discipline".into());
+    }
+    if opts
+        .provider_defaults
+        .is_some_and(ProviderDefaultsMode::suppresses)
+    {
+        errors.push("Codex does not support provider-default suppression".into());
+    }
+    let output_schema =
+        opts.output_schema
+            .as_deref()
+            .and_then(|raw| match serde_json::from_str(raw) {
+                Ok(value) => Some(value),
+                Err(error) => {
+                    errors.push(format!("invalid output schema: {error}"));
+                    None
+                }
+            });
+    ProviderLaunch {
+        argv: Vec::new(),
+        prompt: Some(prompt.into()),
+        codex: Some(bro_protocol::CodexSessionConfig {
+            resume: resume.map(str::to_string),
+            model: opts.model.or_else(|| {
+                if resume.is_some() {
+                    return None;
+                }
+                Provider::Codex
+                    .models()
+                    .iter()
+                    .find(|model| model.default)
+                    .map(|model| model.id.to_string())
+            }),
+            effort: opts.effort,
+            service_tier: opts.service_tier,
+            developer_instructions: context.and_then(render_dispatch_context_text),
+            output_schema,
+            errors,
+            ..Default::default()
+        }),
+    }
+}
+
+/// Serialize the payload for the harness `--dispatch-context` flag. The DTO is
+/// plain strings/enums, so serialization cannot fail in practice.
 fn dispatch_context_flag(args: &mut Vec<String>, ctx: Option<&bro_protocol::DispatchContext>) {
     if let Some(ctx) = ctx
         && let Ok(json) = serde_json::to_string(ctx)
@@ -261,23 +343,65 @@ fn dispatch_context_flag(args: &mut Vec<String>, ctx: Option<&bro_protocol::Disp
     }
 }
 
+/// Render the dispatch context for the claude lane's `--append-system-prompt`:
+/// the persona verbatim, then the scope ids as a fixed-order block. The claude
+/// CLI has no typed slot for either, so the daemon composes the text; the
+/// same text rides fresh dispatch and resume alike.
+pub fn render_dispatch_context_text(ctx: &bro_protocol::DispatchContext) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(persona) = ctx.persona.as_deref()
+        && !persona.trim().is_empty()
+    {
+        parts.push(persona.trim_end().to_string());
+    }
+    if let Some(scope) = ctx.scope.as_ref()
+        && !scope.is_empty()
+    {
+        let mut block = String::from("## Dispatch scope\n");
+        for (key, value) in scope.fields() {
+            block.push_str(&format!("- {key}: {value}\n"));
+        }
+        parts.push(block.trim_end().to_string());
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n\n"))
+    }
+}
+
+fn dispatch_context_append_flag(
+    args: &mut Vec<String>,
+    ctx: Option<&bro_protocol::DispatchContext>,
+) {
+    if let Some(text) = ctx.and_then(render_dispatch_context_text) {
+        args.extend(["--append-system-prompt".into(), text]);
+    }
+}
+
+/// The stream-json flags both lanes share: the harness deliberately mirrors
+/// the claude CLI's headless surface.
+fn stream_json_base_args(prompt: &str) -> Vec<String> {
+    vec![
+        "-p".into(),
+        prompt.into(),
+        "--output-format".into(),
+        "stream-json".into(),
+        "--verbose".into(),
+        "--include-partial-messages".into(),
+        "--dangerously-skip-permissions".into(),
+    ]
+}
+
 impl ProviderExec for Provider {
     fn bin(&self) -> String {
         bin_with_env(*self)
     }
 
     fn bin_with_config(&self, _cfg: &ProviderConfig) -> String {
-        match self {
-            // Harness providers share one binary selected by BRO_HARNESS_BIN.
-            // No dedicated per-provider config override today.
-            Provider::Glm
-            | Provider::Deepseek
-            | Provider::Minimax
-            | Provider::Kimi
-            | Provider::Brodex
-            | Provider::VibeBh => bin_with_env(*self),
-            Provider::Workflow => "workflow".into(),
-        }
+        // Each lane shares one binary selected by env. No dedicated
+        // per-provider config override today.
+        bin_with_env(*self)
     }
 
     fn build_exec_args(
@@ -287,11 +411,14 @@ impl ProviderExec for Provider {
         session_id: &str,
         _cwd: Option<&str>,
         opts: Option<&ExecOpts>,
-    ) -> Vec<String> {
+    ) -> ProviderLaunch {
+        if *self == Provider::Codex {
+            return codex_launch(prompt, None, dispatch_context, opts);
+        }
         let model = opts
             .and_then(|o| o.model.as_deref())
             .map(|m| normalize_model_for_provider(*self, m))
-            .or_else(|| harness_default_model(*self));
+            .or_else(|| default_model(*self));
         let effort = opts.and_then(|o| o.effort.as_deref());
         let code_mode = opts.and_then(|o| o.code_mode);
         let edit_discipline = opts.and_then(|o| o.edit_discipline);
@@ -301,22 +428,32 @@ impl ProviderExec for Provider {
             .and_then(|o| o.provider_defaults)
             .is_some_and(ProviderDefaultsMode::suppresses);
 
-        match self {
-            Provider::Glm
-            | Provider::Deepseek
-            | Provider::Minimax
-            | Provider::Kimi
-            | Provider::Brodex
-            | Provider::VibeBh => {
-                let mut args = vec![
-                    "-p".into(),
-                    prompt.into(),
-                    "--output-format".into(),
-                    "stream-json".into(),
-                    "--verbose".into(),
-                    "--include-partial-messages".into(),
-                    "--dangerously-skip-permissions".into(),
-                ];
+        match self.lane() {
+            ProviderLane::ClaudeCli => {
+                let mut args = stream_json_base_args(prompt);
+                dispatch_context_append_flag(&mut args, dispatch_context);
+                if suppress_provider_defaults {
+                    args.extend([
+                        "--system-prompt".into(),
+                        EMPTY_SYSTEM_PROMPT_OVERRIDE.into(),
+                    ]);
+                }
+                if !session_id.is_empty() && session_id != "pending" {
+                    args.extend(["--session-id".into(), session_id.into()]);
+                }
+                if let Some(m) = model.as_deref() {
+                    args.extend(["--model".into(), m.into()]);
+                }
+                if let Some(e) = effort {
+                    args.extend(["--effort".into(), e.into()]);
+                }
+                if let Some(schema) = output_schema {
+                    args.extend(["--json-schema".into(), schema.into()]);
+                }
+                args
+            }
+            ProviderLane::Harness => {
+                let mut args = stream_json_base_args(prompt);
                 dispatch_context_flag(&mut args, dispatch_context);
                 if suppress_provider_defaults {
                     args.extend([
@@ -347,8 +484,10 @@ impl ProviderExec for Provider {
                 }
                 args
             }
-            Provider::Workflow => Vec::new(),
+            ProviderLane::Codex => unreachable!("Codex uses typed launch settings"),
+            ProviderLane::Workflow => Vec::new(),
         }
+        .into()
     }
 
     fn build_resume_args(
@@ -357,11 +496,14 @@ impl ProviderExec for Provider {
         prompt: &str,
         dispatch_context: Option<&bro_protocol::DispatchContext>,
         opts: Option<&ExecOpts>,
-    ) -> Vec<String> {
+    ) -> ProviderLaunch {
+        if *self == Provider::Codex {
+            return codex_launch(prompt, Some(session_id), dispatch_context, opts);
+        }
         let model = opts
             .and_then(|o| o.model.as_deref())
             .map(|m| normalize_model_for_provider(*self, m))
-            .or_else(|| harness_default_model(*self));
+            .or_else(|| default_model(*self));
         let effort = opts.and_then(|o| o.effort.as_deref());
         let code_mode = opts.and_then(|o| o.code_mode);
         let service_tier = opts.and_then(|o| o.service_tier.as_deref());
@@ -370,24 +512,31 @@ impl ProviderExec for Provider {
             .and_then(|o| o.provider_defaults)
             .is_some_and(ProviderDefaultsMode::suppresses);
 
-        match self {
-            Provider::Glm
-            | Provider::Deepseek
-            | Provider::Minimax
-            | Provider::Kimi
-            | Provider::Brodex
-            | Provider::VibeBh => {
-                let mut args = vec![
-                    "--resume".into(),
-                    session_id.into(),
-                    "-p".into(),
-                    prompt.into(),
-                    "--output-format".into(),
-                    "stream-json".into(),
-                    "--verbose".into(),
-                    "--include-partial-messages".into(),
-                    "--dangerously-skip-permissions".into(),
-                ];
+        match self.lane() {
+            ProviderLane::ClaudeCli => {
+                let mut args = vec!["--resume".into(), session_id.into()];
+                args.extend(stream_json_base_args(prompt));
+                dispatch_context_append_flag(&mut args, dispatch_context);
+                if suppress_provider_defaults {
+                    args.extend([
+                        "--system-prompt".into(),
+                        EMPTY_SYSTEM_PROMPT_OVERRIDE.into(),
+                    ]);
+                }
+                if let Some(m) = model.as_deref() {
+                    args.extend(["--model".into(), m.into()]);
+                }
+                if let Some(e) = effort {
+                    args.extend(["--effort".into(), e.into()]);
+                }
+                if let Some(schema) = output_schema {
+                    args.extend(["--json-schema".into(), schema.into()]);
+                }
+                args
+            }
+            ProviderLane::Harness => {
+                let mut args = vec!["--resume".into(), session_id.into()];
+                args.extend(stream_json_base_args(prompt));
                 dispatch_context_flag(&mut args, dispatch_context);
                 if suppress_provider_defaults {
                     args.extend([
@@ -415,7 +564,9 @@ impl ProviderExec for Provider {
                 }
                 args
             }
-            Provider::Workflow => Vec::new(),
+            ProviderLane::Codex => unreachable!("Codex uses typed launch settings"),
+            ProviderLane::Workflow => Vec::new(),
         }
+        .into()
     }
 }

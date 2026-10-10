@@ -396,6 +396,8 @@ fn spec_for(stub: &Path, session_id: &str, event_log_path: PathBuf) -> WorkerSpa
             .map(Path::to_path_buf)
             .unwrap_or_default(),
         event_log_path,
+        supervisor_writes_event_log: false,
+        codex: None,
     }
 }
 

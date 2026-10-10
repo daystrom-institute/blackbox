@@ -6,11 +6,14 @@
 use bro_core::{BroError, Origin, Provider, SessionId, TaskId};
 use serde::{Deserialize, Serialize};
 
+mod codex;
 mod dispatch;
 mod dispatch_context;
 mod fleetd;
 mod transcript;
 mod worker;
+
+pub use codex::{CodexInput, CodexSessionConfig};
 
 pub use dispatch::{
     CloseoutErrorClass, CloseoutHooksWire, CloseoutOutcome, CloseoutPhase, CloseoutRequest,

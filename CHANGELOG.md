@@ -8,6 +8,28 @@ out explicitly under `Changed` or `Removed`.
 
 ## Unreleased
 
+- Codex dispatch uses a native app-server adapter shared by fleetd and the
+  local executor. Typed settings carry model, effort, service tier, schema,
+  instructions and MCP policy; the host launches `codex app-server` directly
+  via `CODEX_BIN`. Controls use native RPC, failures are explicit, and sequenced
+  event logs support reconnect and resume under the provider thread identity.
+  Dispatched sessions index as `codex-dispatch`. Fleet protocol version 2
+  requires updating both the daemon and fleetd. `codex` is a distinct provider;
+  existing Responses-harness brofiles name `brodex`.
+
+- The dispatch plane gains a claude CLI lane: GLM, DeepSeek, MiniMax and Kimi
+  now run as `claude -p` children against their `~/.claude-*` config dirs
+  instead of `bro-harness`.
+  Persona and scope ride `--append-system-prompt`, structured output
+  `--json-schema`, tool filters `--allowedTools`/`--disallowedTools`, and the
+  daemon MCP server `--mcp-config --strict-mcp-config`. The executor that owns
+  a claude child's stdout writes its session log (fleetd included), and the
+  daemon closes the child's stdin after a turn's result; fleetd learns an
+  `EndInput` message for that. Brodex and VibeBh stay on the harness lane.
+  The legacy `claude` provider alias is gone, and the catalog brofiles that
+  declared it (the refactor, review, supervision and agentic-corpus
+  personas) are removed.
+
 - The daemon's `/admin/*` HTTP plane now requires a loopback peer or
   `Authorization: Bearer <token>` matching the owner-readable 64-hex token
   file configured via `daemon.admin_token_file`

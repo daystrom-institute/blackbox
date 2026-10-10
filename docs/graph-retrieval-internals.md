@@ -237,10 +237,9 @@ ordering rule live in
 
 ## Provider behavior
 
-The dispatch plane contains zero provider CLIs; providers dispatch
-through the standalone `bro-harness` binary. The code-owned catalog in
-`crates/bro-core/src/provider.rs` is the authority: `claude` survives
-only as a serde alias to `glm` and `codex` as an alias to `brodex`. See
+Provider routing is code-owned in `crates/bro-core/src/provider.rs`.
+The Codex adapter speaks app-server directly; compatible endpoints use the
+Claude CLI, and remaining harness providers use `bro-harness`. See
 [Provider & Agent Surfaces](../PROJECT.md#provider--agent-surfaces)
 rather than re-inventorying providers here.
 

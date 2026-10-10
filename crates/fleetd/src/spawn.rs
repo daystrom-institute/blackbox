@@ -130,14 +130,15 @@ pub fn dispatch_path_env() -> String {
 /// The raw binary name for a spec, before path resolution: the spec's
 /// override, else `BRO_HARNESS_BIN`, else the default harness name.
 pub fn raw_bin_for(spec: &WorkerSpawnSpec) -> String {
+    let (env, default) = match spec.provider.lane() {
+        bro_core::ProviderLane::Codex => ("CODEX_BIN", "codex"),
+        bro_core::ProviderLane::ClaudeCli => ("CLAUDE_BIN", "claude"),
+        _ => ("BRO_HARNESS_BIN", DEFAULT_HARNESS_BIN),
+    };
     spec.bin_override
         .clone()
-        .or_else(|| {
-            std::env::var("BRO_HARNESS_BIN")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-        })
-        .unwrap_or_else(|| DEFAULT_HARNESS_BIN.to_string())
+        .or_else(|| std::env::var(env).ok().filter(|v| !v.trim().is_empty()))
+        .unwrap_or_else(|| default.into())
 }
 
 /// Resolve a binary name to an absolute path using a login shell, so a CLI
@@ -232,6 +233,13 @@ pub async fn ensure_absolute_bin_executable(bin: &str) -> anyhow::Result<()> {
 
 /// Spawn the worker described by `spec` and return its live lanes.
 pub async fn spawn_worker(spec: WorkerSpawnSpec) -> anyhow::Result<WorkerChild> {
+    anyhow::ensure!(
+        (spec.provider == bro_core::Provider::Codex) == spec.codex.is_some(),
+        "Codex requires typed app-server settings"
+    );
+    if let Some(config) = &spec.codex {
+        bro_worker::codex::validate(config)?;
+    }
     let raw_bin = raw_bin_for(&spec);
     ensure_absolute_bin_executable(&raw_bin).await?;
     // Login-shell resolution shells out, so it must not block the reactor.
@@ -281,28 +289,62 @@ pub async fn spawn_worker(spec: WorkerSpawnSpec) -> anyhow::Result<WorkerChild> 
     for message in spec.initial_messages {
         let _ = control_tx.send(message);
     }
-    if let Some(stdin) = stdin {
-        spawn_control_writer(spec.session_id.clone(), stdin, control_rx);
-    }
 
-    // Event lane: raw stdout lines out for relay. No tee here: teeing is a
-    // daemon-side transcript concern, and the harness child already writes
-    // its own durable event log under the spec's BRO_HOME.
+    // Event lane: raw stdout lines out for relay. No debugging tee here: that
+    // is a daemon-side transcript concern. A worker that writes no session
+    // log of its own gets one at the spec's pinned path, so the durable log
+    // the replay window and the cockpit read exists on this host either way.
     let (events_tx, events_rx) = mpsc::unbounded_channel::<String>();
     let (stdout_done_tx, stdout_done_rx) = oneshot::channel::<()>();
-    if let Some(stdout) = stdout {
-        tokio::spawn(async move {
-            let mut lines = tokio::io::BufReader::new(stdout).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                if events_tx.send(line).is_err() {
-                    break;
-                }
-            }
-            let _ = stdout_done_tx.send(());
-        });
+    let session_log = if spec.supervisor_writes_event_log && spec.codex.is_none() {
+        bro_worker::SessionLogWriter::open(&spec.event_log_path).await
     } else {
-        let _ = stdout_done_tx.send(());
-    }
+        None
+    };
+    let adapter = if let Some(config) = spec.codex.clone() {
+        let stdin = stdin.ok_or_else(|| anyhow::anyhow!("Codex stdin missing"))?;
+        let stdout = stdout.ok_or_else(|| anyhow::anyhow!("Codex stdout missing"))?;
+        drop(stdout_done_tx);
+        Some(tokio::spawn(bro_worker::codex::run(
+            config,
+            spec.cwd.clone().unwrap_or_else(|| ".".into()),
+            stdin,
+            stdout,
+            control_rx,
+            events_tx,
+            spec.event_log_path.clone(),
+        )))
+    } else {
+        if let Some(stdin) = stdin {
+            spawn_control_writer(spec.session_id.clone(), stdin, control_rx);
+        }
+        if let Some(stdout) = stdout {
+            tokio::spawn(async move {
+                let mut lines = tokio::io::BufReader::new(stdout).lines();
+                let mut session_log = session_log;
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let line = if let Some(log) = session_log.as_mut() {
+                        match log.record_provider_event(spec.provider, &line).await {
+                            Ok(line) => line,
+                            Err(_) => break,
+                        }
+                    } else {
+                        line
+                    };
+                    if events_tx.send(line).is_err() {
+                        break;
+                    }
+                }
+                if let Some(log) = session_log.as_mut() {
+                    log.finish().await;
+                }
+                let _ = stdout_done_tx.send(());
+            });
+        } else {
+            let _ = stdout_done_tx.send(());
+        }
+        None
+    };
 
     // stderr: accumulate a bounded tail for the terminal outcome.
     let (stderr_done_tx, stderr_done_rx) = oneshot::channel::<String>();
@@ -323,10 +365,21 @@ pub async fn spawn_worker(spec: WorkerSpawnSpec) -> anyhow::Result<WorkerChild> 
     // ordering LocalExecutor enforces.
     let (outcome_tx, outcome_rx) = oneshot::channel::<WorkerOutcome>();
     tokio::spawn(async move {
-        let status = child.wait().await;
+        let (exit_code, adapter_error) = if let Some(adapter) = adapter {
+            bro_worker::codex::wait_for_child(child, adapter).await
+        } else {
+            (
+                child.wait().await.ok().and_then(|s| s.code()),
+                String::new(),
+            )
+        };
         let _ = stdout_done_rx.await;
-        let stderr_tail = stderr_done_rx.await.unwrap_or_default();
-        let exit_code = status.ok().and_then(|status| status.code());
+        let stderr_tail = format!(
+            "{}{}",
+            stderr_done_rx.await.unwrap_or_default(),
+            adapter_error
+        );
+
         let _ = outcome_tx.send(WorkerOutcome {
             exit_code,
             stderr_tail,
@@ -472,16 +525,24 @@ mod tests {
         assert_eq!(raw_bin_for(&spec), "/opt/custom-harness");
     }
 
-    /// With no override and no env, the default harness name is used and
-    /// `Command::spawn` produces the familiar not-found error.
+    /// With no override or environment, use the provider lane executable.
     #[test]
     fn raw_bin_falls_back_to_the_default_name() {
         let mut spec = sample_spec();
         spec.bin_override = None;
-        // BRO_HARNESS_BIN is not set in the nextest process for this test;
-        // nextest is process-per-test, so this does not race a sibling.
-        if std::env::var("BRO_HARNESS_BIN").is_err() {
-            assert_eq!(raw_bin_for(&spec), DEFAULT_HARNESS_BIN);
+        for (provider, variable, expected) in [
+            (bro_core::Provider::Glm, "CLAUDE_BIN", "claude"),
+            (bro_core::Provider::Codex, "CODEX_BIN", "codex"),
+            (
+                bro_core::Provider::Brodex,
+                "BRO_HARNESS_BIN",
+                DEFAULT_HARNESS_BIN,
+            ),
+        ] {
+            spec.provider = provider;
+            if std::env::var(variable).is_err() {
+                assert_eq!(raw_bin_for(&spec), expected);
+            }
         }
     }
 
@@ -585,6 +646,8 @@ mod tests {
             initial_messages: vec![],
             bro_home: PathBuf::from("/state/bro"),
             event_log_path: PathBuf::from("/state/bro/sess-1.events.jsonl"),
+            supervisor_writes_event_log: false,
+            codex: None,
         }
     }
 }

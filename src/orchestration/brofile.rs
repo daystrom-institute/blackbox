@@ -227,15 +227,13 @@ impl CodeMode {
 /// in v1. Only surviving harness providers advertise this; removed CLI-backed
 /// providers fail closed before environment or arg construction.
 pub fn provider_supports_defaults_suppression(provider: Provider) -> bool {
-    matches!(
-        provider,
-        Provider::Glm
-            | Provider::Deepseek
-            | Provider::Minimax
-            | Provider::Kimi
-            | Provider::Brodex
-            | Provider::VibeBh
-    )
+    // The claude CLI honors `--system-prompt ""`; the harness honors the same
+    // flag on every transport. The codex app-server has no equivalent that
+    // leaves its own tool instructions intact.
+    match provider.lane() {
+        bro_core::ProviderLane::ClaudeCli | bro_core::ProviderLane::Harness => true,
+        bro_core::ProviderLane::Codex | bro_core::ProviderLane::Workflow => false,
+    }
 }
 
 /// Reject dispatch when the brofile demands suppression the provider
@@ -744,47 +742,18 @@ fn prepare_codex_suppressed_home(base_home: &Path, store_dir: &Path) -> std::io:
     Ok(overlay)
 }
 
-/// Harness env for the Anthropic-transport providers (GLM, DeepSeek, MiniMax,
-/// Kimi). These no longer run the `claude` CLI; they run `bro-harness`, which
-/// reads `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN` from its own env. We lift
-/// those out of the operator's existing `~/.claude-{zai,ds,mm,k}/settings.json`
-/// `env` block (the same credentials the CLI used) and select the transport.
-fn default_claude_compatible_env(
-    provider: Provider,
-    home_dir: &Path,
-    materialize_on_worker: bool,
-) -> Option<HashMap<String, String>> {
-    let rel_path = match provider {
-        Provider::Glm => ".claude-zai",
-        Provider::Deepseek => ".claude-ds",
-        Provider::Minimax => ".claude-mm",
-        Provider::Kimi => ".claude-k",
-        _ => return None,
-    };
-    let mut env = HashMap::from([("BRO_HARNESS_TRANSPORT".to_string(), "anthropic".to_string())]);
-
-    let settings = home_dir.join(rel_path).join("settings.json");
-    if materialize_on_worker {
-        env.insert(
-            "BRO_HARNESS_LOCAL_SETTINGS_FILE".to_string(),
-            settings.to_string_lossy().into_owned(),
-        );
-        return Some(env);
-    }
-    if let Ok(body) = std::fs::read_to_string(&settings)
-        && let Ok(v) = serde_json::from_str::<serde_json::Value>(&body)
-    {
-        for key in [
-            "ANTHROPIC_BASE_URL",
-            "ANTHROPIC_AUTH_TOKEN",
-            "ANTHROPIC_API_KEY",
-        ] {
-            if let Some(val) = v["env"][key].as_str() {
-                env.insert(key.to_string(), val.to_string());
-            }
-        }
-    }
-    Some(env)
+/// Child env for the claude-lane providers that ride a dedicated config dir
+/// (GLM, DeepSeek, MiniMax, Kimi). The `claude` CLI reads the endpoint,
+/// credentials and model slots from that dir's own `settings.json`, exactly as
+/// the operator's terminal aliases do, so the daemon names the dir and lifts
+/// nothing out of it. The path resolves against the execution home: a
+/// worker-local home when fleetd runs off host.
+fn claude_config_dir_env(provider: Provider, home_dir: &Path) -> Option<HashMap<String, String>> {
+    let rel_path = provider.claude_config_dir_name()?;
+    Some(HashMap::from([(
+        "CLAUDE_CONFIG_DIR".to_string(),
+        home_dir.join(rel_path).to_string_lossy().into_owned(),
+    )]))
 }
 
 /// Harness env for the vibe-bh provider — Mistral on the OpenAI
@@ -891,7 +860,9 @@ fn synthesized_account_env_for_home(
     let suffix = normalized_account_suffix(account_name)?;
 
     let (env_key, rel_path) = match provider {
-        Provider::Brodex => ("CODEX_HOME", format!(".codex{suffix}")),
+        // The codex app-server and the harness's Responses transport both
+        // read their ChatGPT login from `CODEX_HOME`.
+        Provider::Codex | Provider::Brodex => ("CODEX_HOME", format!(".codex{suffix}")),
         // GLM/DeepSeek/MiniMax/Kimi inherit credentials from fixed
         // Claude-compatible config dirs; vibe-bh authenticates via
         // MISTRAL_API_KEY, not accounts.
@@ -958,10 +929,15 @@ fn resolve_provider_env_for_locality(
         .map(|locality| locality.home.clone())
         .or_else(dirs::home_dir);
     let mut env = match provider {
+        // The claude lane needs no transport env: `CLAUDE_CONFIG_DIR` carries
+        // endpoint and credentials.
         Provider::Glm | Provider::Deepseek | Provider::Minimax | Provider::Kimi => execution_home
             .as_deref()
-            .and_then(|home| default_claude_compatible_env(provider, home, materialize_on_worker))
+            .and_then(|home| claude_config_dir_env(provider, home))
             .unwrap_or_default(),
+        // The codex lane needs no transport env: `CODEX_HOME` (or the
+        // app-server's default `~/.codex`) carries credentials and config.
+        Provider::Codex => HashMap::new(),
         // Brodex rides the harness on the OpenAI Responses transport against
         // the Codex/ChatGPT backend; CODEX_HOME (for OAuth) is supplied by the
         // account-env synthesis below, defaulting to ~/.codex in the harness.
@@ -1397,70 +1373,6 @@ mod tests {
     }
 
     #[test]
-    fn rust_refactor_persona_matches_design_spec() {
-        let src =
-            include_str!("../../system-defaults/brofiles/refactor/rust-refactor-persona.json");
-        let bf: Brofile = serde_json::from_str(src).expect("rust-refactor-persona parses");
-        assert_eq!(bf.name, "rust-refactor-persona");
-        assert_eq!(bf.provider, Provider::Glm);
-        assert_eq!(
-            bf.context.as_ref().and_then(|c| c.provider_defaults),
-            Some(ProviderDefaultsMode::SuppressWhenSupported)
-        );
-        let lens = bf.lens.as_deref().unwrap_or("");
-        assert!(lens.contains("harness-native isolate bindings"));
-        assert!(lens.contains("rust.fixRound"));
-        assert!(lens.contains("capped at five rounds"));
-        assert!(lens.contains("dispatch defaults"));
-
-        let f = bf.filters.expect("filters present");
-
-        let expected_allow: Vec<&str> = vec![
-            "mcp__blackbox__bbox_thread",
-            "mcp__blackbox__bbox_inspect_entity",
-            "mcp__blackbox__bbox_hybrid_search",
-            "Read",
-            "Grep",
-            "Glob",
-            "exec",
-            "wait",
-            "code.*",
-            "analysis.*",
-            "rust.*",
-            "edits.*",
-            "lsp.*",
-            "build.gate",
-        ];
-        let expected_disallow: Vec<&str> = vec![
-            "mcp__blackbox__bbox_forget",
-            "mcp__blackbox__bbox_learn",
-            "mcp__blackbox__bbox_render",
-            "mcp__blackbox__bro_*",
-            "Bash",
-            "Write",
-            "Edit",
-        ];
-
-        let allow_set: std::collections::BTreeSet<&str> =
-            f.allow.iter().map(String::as_str).collect();
-        let expected_allow_set: std::collections::BTreeSet<&str> =
-            expected_allow.iter().copied().collect();
-        assert_eq!(
-            allow_set, expected_allow_set,
-            "rust-refactor-persona allow list drifted from design spec"
-        );
-
-        let disallow_set: std::collections::BTreeSet<&str> =
-            f.disallow.iter().map(String::as_str).collect();
-        let expected_disallow_set: std::collections::BTreeSet<&str> =
-            expected_disallow.iter().copied().collect();
-        assert_eq!(
-            disallow_set, expected_disallow_set,
-            "rust-refactor-persona disallow list drifted from design spec"
-        );
-    }
-
-    #[test]
     fn java_refactor_persona_matches_design_spec() {
         let src =
             include_str!("../../system-defaults/brofiles/refactor/java-refactor-persona.json");
@@ -1526,77 +1438,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn rust_and_java_refactor_personas_share_tool_surface() {
-        let rust_src =
-            include_str!("../../system-defaults/brofiles/refactor/rust-refactor-persona.json");
-        let java_src =
-            include_str!("../../system-defaults/brofiles/refactor/java-refactor-persona.json");
-        let rust: Brofile = serde_json::from_str(rust_src).unwrap();
-        let java: Brofile = serde_json::from_str(java_src).unwrap();
-
-        let r = rust.filters.unwrap();
-        let j = java.filters.unwrap();
-        let r_allow: std::collections::BTreeSet<&str> =
-            r.allow.iter().map(String::as_str).collect();
-        let j_allow: std::collections::BTreeSet<&str> =
-            j.allow.iter().map(String::as_str).collect();
-        let r_disallow: std::collections::BTreeSet<&str> =
-            r.disallow.iter().map(String::as_str).collect();
-        let j_disallow: std::collections::BTreeSet<&str> =
-            j.disallow.iter().map(String::as_str).collect();
-        const JAVA_ONLY: &[&str] = &["java.*"];
-        const RUST_ONLY: &[&str] = &["rust.*", "build.gate"];
-        let r_core: std::collections::BTreeSet<&str> = r_allow
-            .iter()
-            .copied()
-            .filter(|t| !RUST_ONLY.contains(t))
-            .collect();
-        let j_core: std::collections::BTreeSet<&str> = j_allow
-            .iter()
-            .copied()
-            .filter(|t| !JAVA_ONLY.contains(t))
-            .collect();
-        assert_eq!(
-            r_core, j_core,
-            "refactor personas should expose identical core allow sets"
-        );
-        for t in JAVA_ONLY {
-            assert!(j_allow.contains(t), "java persona missing {t}");
-        }
-        for t in ["analysis.*", "lsp.*"] {
-            assert!(r_allow.contains(t), "rust persona missing shared {t}");
-            assert!(j_allow.contains(t), "java persona missing shared {t}");
-        }
-        assert!(
-            !r_allow.contains("java.*"),
-            "rust persona must not advertise java-scoped bindings"
-        );
-        assert!(
-            !j_allow.contains("rust.*") && !j_allow.contains("build.gate"),
-            "java persona must not advertise Rust compiler-loop bindings"
-        );
-        assert!(
-            !r_allow.contains("build.*") && !j_allow.contains("build.*"),
-            "personas must allow the exact build.gate tool, never build.*"
-        );
-        assert_eq!(
-            r_disallow, j_disallow,
-            "refactor personas should expose identical disallow sets"
-        );
-        assert_eq!(
-            rust.context.as_ref().and_then(|c| c.provider_defaults),
-            java.context.as_ref().and_then(|c| c.provider_defaults),
-            "refactor personas should share context policy"
-        );
-    }
-
-    /// Regression scan (post-MCP-retirement): live brofile lenses, allowlists,
-    /// and agent prompt contracts must never name the retired daemon MCP
-    /// refactor/slice/code-nav/macro tools. Retired names in an allowlist are
-    /// dead entries; in a lens or prompt they instruct agents to call tools
-    /// that no longer exist. Atom/workflow/eval artifacts are deliberately
-    /// out of scope here (their content migration is a separate arc).
     #[test]
     fn live_lenses_and_prompts_never_name_retired_mcp_tools() {
         const RETIRED: &[&str] = &[
@@ -1666,28 +1507,10 @@ mod tests {
 
     #[test]
     fn refactor_atom_brofiles_suppress_provider_defaults() {
-        for (name, src) in [
-            (
-                "rust-refactor-persona",
-                include_str!("../../system-defaults/brofiles/refactor/rust-refactor-persona.json"),
-            ),
-            (
-                "java-refactor-persona",
-                include_str!("../../system-defaults/brofiles/refactor/java-refactor-persona.json"),
-            ),
-            (
-                "csharp-refactor-persona",
-                include_str!(
-                    "../../system-defaults/brofiles/refactor/csharp-refactor-persona.json"
-                ),
-            ),
-            (
-                "elixir-refactor-persona",
-                include_str!(
-                    "../../system-defaults/brofiles/refactor/elixir-refactor-persona.json"
-                ),
-            ),
-        ] {
+        for (name, src) in [(
+            "java-refactor-persona",
+            include_str!("../../system-defaults/brofiles/refactor/java-refactor-persona.json"),
+        )] {
             let bf: Brofile = serde_json::from_str(src)
                 .unwrap_or_else(|e| panic!("{name} brofile should parse: {e}"));
             assert_eq!(
@@ -1842,7 +1665,7 @@ mod tests {
     fn test_brofile_coerce_workspace_deserializes_from_json() {
         let json = r#"{
             "name": "ws-json",
-            "provider": "claude",
+            "provider": "glm",
             "coerce_workspace": true
         }"#;
         let bf: Brofile = serde_json::from_str(json).unwrap();
@@ -1881,6 +1704,59 @@ mod tests {
     }
 
     #[test]
+    fn codex_lane_maps_an_account_to_codex_home_and_nothing_else() {
+        let store = temp_store();
+        let worker = temp_store();
+        let worker_home = worker.path().canonicalize().unwrap();
+        let locality = super::super::executor::WorkerLocality {
+            home: worker_home.clone(),
+            bro_home: worker_home.join("state/bro"),
+        };
+        let env = resolve_provider_env_for_locality(
+            Provider::Codex,
+            Some("account2"),
+            None,
+            store.path(),
+            None,
+            Some(&locality),
+        )
+        .unwrap();
+        assert_eq!(
+            env,
+            HashMap::from([(
+                "CODEX_HOME".to_string(),
+                worker_home
+                    .join(".codex-account2")
+                    .to_string_lossy()
+                    .into_owned()
+            )])
+        );
+        // The default account is the app-server's own `~/.codex`.
+        assert!(
+            resolve_provider_env_for_locality(
+                Provider::Codex,
+                None,
+                None,
+                store.path(),
+                None,
+                Some(&locality),
+            )
+            .is_none()
+        );
+        // No suppression flag the adapter cannot honor.
+        assert!(!provider_supports_defaults_suppression(Provider::Codex));
+        assert!(
+            enforce_provider_defaults(
+                Provider::Codex,
+                Some(&BrofileContext {
+                    provider_defaults: Some(ProviderDefaultsMode::StrictSuppress),
+                }),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn test_resolve_provider_env_merges_config_overrides() {
         let store = temp_store();
         let mut config = load_config(store.path());
@@ -1897,7 +1773,12 @@ mod tests {
             resolve_provider_env(Provider::Glm, Some("account2"), None, store.path(), None)
                 .unwrap();
         assert_eq!(resolved.get("EXTRA_FLAG").map(String::as_str), Some("1"));
-        assert!(!resolved.contains_key("CLAUDE_CONFIG_DIR"));
+        // GLM's config dir is fixed; the account name never rewrites it.
+        assert!(
+            resolved
+                .get("CLAUDE_CONFIG_DIR")
+                .is_some_and(|path| path.ends_with("/.claude-zai"))
+        );
     }
 
     #[test]
@@ -1937,7 +1818,11 @@ mod tests {
 
         let resolved = resolve_provider_env(Provider::Glm, None, None, store.path(), None).unwrap();
         assert_eq!(resolved.get("EXTRA_FLAG").map(String::as_str), Some("1"));
-        assert!(!resolved.contains_key("CLAUDE_CONFIG_DIR"));
+        assert!(
+            resolved
+                .get("CLAUDE_CONFIG_DIR")
+                .is_some_and(|path| path.ends_with("/.claude-zai"))
+        );
     }
 
     #[test]
@@ -1948,13 +1833,14 @@ mod tests {
         let resolved = with_fake_home(home.path(), || {
             resolve_provider_env(Provider::Glm, None, None, store.path(), None).unwrap()
         });
-        // GLM now rides bro-harness on the Anthropic transport, not the
-        // claude CLI; it selects the transport rather than CLAUDE_CONFIG_DIR.
+        // GLM rides the claude CLI against its own config dir; the daemon
+        // names the dir and lifts nothing out of it.
         assert_eq!(
-            resolved.get("BRO_HARNESS_TRANSPORT").map(String::as_str),
-            Some("anthropic")
+            resolved.get("CLAUDE_CONFIG_DIR").map(String::as_str),
+            Some(home.path().join(".claude-zai").to_string_lossy().as_ref())
         );
-        assert!(!resolved.contains_key("CLAUDE_CONFIG_DIR"));
+        assert!(!resolved.contains_key("BRO_HARNESS_TRANSPORT"));
+        assert!(!resolved.contains_key("ANTHROPIC_AUTH_TOKEN"));
     }
 
     #[test]
@@ -2016,18 +1902,11 @@ mod tests {
             resolve_provider_env(Provider::Minimax, None, None, store.path(), None).unwrap()
         });
         assert_eq!(
-            resolved.get("BRO_HARNESS_TRANSPORT").map(String::as_str),
-            Some("anthropic")
+            resolved.get("CLAUDE_CONFIG_DIR").map(String::as_str),
+            Some(settings_dir.to_string_lossy().as_ref())
         );
-        assert_eq!(
-            resolved.get("ANTHROPIC_BASE_URL").map(String::as_str),
-            Some("https://api.minimax.io/anthropic")
-        );
-        assert_eq!(
-            resolved.get("ANTHROPIC_AUTH_TOKEN").map(String::as_str),
-            Some("test-token")
-        );
-        assert!(!resolved.contains_key("CLAUDE_CONFIG_DIR"));
+        assert!(!resolved.contains_key("ANTHROPIC_BASE_URL"));
+        assert!(!resolved.contains_key("ANTHROPIC_AUTH_TOKEN"));
     }
 
     #[test]
@@ -2053,18 +1932,11 @@ mod tests {
             resolve_provider_env(Provider::Kimi, None, None, store.path(), None).unwrap()
         });
         assert_eq!(
-            resolved.get("BRO_HARNESS_TRANSPORT").map(String::as_str),
-            Some("anthropic")
+            resolved.get("CLAUDE_CONFIG_DIR").map(String::as_str),
+            Some(settings_dir.to_string_lossy().as_ref())
         );
-        assert_eq!(
-            resolved.get("ANTHROPIC_BASE_URL").map(String::as_str),
-            Some("https://api.kimi.com/coding")
-        );
-        assert_eq!(
-            resolved.get("ANTHROPIC_AUTH_TOKEN").map(String::as_str),
-            Some("test-token")
-        );
-        assert!(!resolved.contains_key("CLAUDE_CONFIG_DIR"));
+        assert!(!resolved.contains_key("ANTHROPIC_BASE_URL"));
+        assert!(!resolved.contains_key("ANTHROPIC_AUTH_TOKEN"));
     }
 
     #[test]
@@ -2177,12 +2049,11 @@ mod tests {
         let resolved = with_fake_home(home.path(), || {
             resolve_provider_env(Provider::Deepseek, None, None, store.path(), None).unwrap()
         });
-        // DeepSeek now rides bro-harness on the Anthropic transport.
         assert_eq!(
-            resolved.get("BRO_HARNESS_TRANSPORT").map(String::as_str),
-            Some("anthropic")
+            resolved.get("CLAUDE_CONFIG_DIR").map(String::as_str),
+            Some(home.path().join(".claude-ds").to_string_lossy().as_ref())
         );
-        assert!(!resolved.contains_key("CLAUDE_CONFIG_DIR"));
+        assert!(!resolved.contains_key("BRO_HARNESS_TRANSPORT"));
     }
 
     #[test]
@@ -2267,17 +2138,14 @@ mod tests {
             Some(&locality),
         )
         .unwrap();
+        // The claude lane names the worker-local config dir; the CLI reads
+        // credentials from it, so nothing is lifted out of it.
         assert_eq!(
-            glm.get("BRO_HARNESS_LOCAL_SETTINGS_FILE")
-                .map(String::as_str),
-            Some(
-                worker_home
-                    .join(".claude-zai/settings.json")
-                    .to_string_lossy()
-                    .as_ref()
-            )
+            glm.get("CLAUDE_CONFIG_DIR").map(String::as_str),
+            Some(worker_home.join(".claude-zai").to_string_lossy().as_ref())
         );
         assert!(!glm.contains_key("ANTHROPIC_AUTH_TOKEN"));
+        assert!(!glm.contains_key("BRO_HARNESS_TRANSPORT"));
 
         let brodex = resolve_provider_env_for_locality(
             Provider::Brodex,

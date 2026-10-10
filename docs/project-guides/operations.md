@@ -8,9 +8,9 @@ operator HTTP routes such as `/tail`, `/roster`, `/control/*`, and `/admin/*`. `
 orchestration control plane (thin HTTP adapters over the `bro_*` dispatch/control
 tools) shared by every external driver — the fleet client, future bridges.
 
-Checkout hosts run only satellites: `fleetd` (which execs `bro-harness` per
-session), `bbox-code-collector`, `bbox-transcript-collector`, and the `bro`
-CLI. A throwaway local daemon for live validation
+Checkout hosts run only satellites: `fleetd` (which execs one worker per
+session: `claude`, `codex app-server` or `bro-harness`, by provider lane),
+`bbox-code-collector`, `bbox-transcript-collector`, and the `bro` CLI. A throwaway local daemon for live validation
 (`docs/operations-isolated-dev-daemon.md`) uses its own binary path and state
 dir so it never touches the deployed daemon's state. Ask before restarting or
 mutating shared services unless the user has explicitly asked for that

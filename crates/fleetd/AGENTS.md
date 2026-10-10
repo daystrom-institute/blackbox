@@ -101,18 +101,29 @@ The ordering rules are copied deliberately and must stay in step:
 
 Deliberate deltas, all documented at their call sites:
 
-1. **Bin fallback is `BRO_HARNESS_BIN` else `bro-harness`**, not the daemon's
-   provider-keyed `Provider::bin()`. fleetd supervises harness workers only;
-   there is no `Provider::Workflow` lane here.
+1. **Binary selection follows the provider lane.** An explicit spec override
+   wins, then `CODEX_BIN`, `CLAUDE_BIN`, or `BRO_HARNESS_BIN`, then the lane's
+   default executable. Codex settings are typed; `bro-worker` drives its
+   app-server RPC and shares session logging with the local executor.
 2. **stderr is a bounded tail** (`STDERR_TAIL_MAX_BYTES`), not the child's
    entire stderr. The daemon hands stderr over an in-process channel and can
    afford the whole thing; fleetd has to fit it in a bounded RPC frame. Whole
    lines are dropped from the front, so a snapshot is never a half-line.
-3. **No `open_harness_tee`.** Teeing raw stdio is a daemon-side transcript
-   concern, and the harness child already writes its own durable event log
-   under the spec's `BRO_HOME`.
+3. **No `open_harness_tee`.** Teeing raw stdio for debugging is a
+   daemon-side concern. The durable session log is a different matter: a
+   harness child writes its own under the spec's `BRO_HOME`, while a vendor
+   CLI child writes none, so a spec with `supervisor_writes_event_log` makes
+   fleetd write `event_log_path` from the relayed envelope through
+   `bro_worker::SessionLogWriter`, the same writer the daemon's local
+   executor uses. The replay window and the cockpit read that file either
+   way.
 4. **fleetd's spawn is async** (`resolve_bin` runs in `spawn_blocking`), as is
    the daemon's `HarnessExecutor` seam.
+5. **`EndInput` closes a session's stdin.** The daemon drops a claude-lane
+   control lane after a turn's result; on a local executor that closes the
+   child's stdin by itself, so the fleetd relay sends `EndInput` and the
+   registry drops its sender. A worker that runs until end of input then
+   finishes its queued turns and exits.
 
 ## Accepted v1 limits (do not build these here)
 

@@ -60,29 +60,24 @@ The provider catalog is code-owned in `src/orchestration/providers.rs`. Do not
 copy full model inventories into `PROJECT.md`; they go stale. Keep this file to
 routing facts:
 
-- The dispatch plane contains ZERO provider CLIs. Claude is banned as a
-  dispatch provider (removed after the June 15, 2026 `-p` rug pull); `claude`
-  survives only as a serde alias to `glm` for legacy configs. Real Claude
-  models run only via the interactive harness's native agents, never the bro
-  plane. Note the glm lane's Z.AI endpoint maps claude-* model names to GLM
-  models server-side, so claude-* pins on glm brofiles do not run Claude.
-- GLM, DeepSeek, MiniMax, Kimi, Brodex, and VibeBh (all of `Provider::ALL`)
-  dispatch through the standalone `bro-harness` binary
-  (`crates/bro-harness`): GLM/DeepSeek/MiniMax/Kimi on the Anthropic transport,
-  Brodex on OpenAI Responses (Codex/ChatGPT backend), and VibeBh (Mistral) on
-  OpenAI chat completions. `blackboxd` does not link `bro-harness`,
-  `bro-code-mode`, or V8. It spawns one harness child per dispatch, sends
-  user/control messages over stdin NDJSON, ingests the Claude-compatible event
-  envelope from stdout, and projects daemon capabilities through the
-  server-filtered MCP endpoint. Transport credentials are selected via
-  per-child env in `brofile::resolve_provider_env`; shell grandchildren scrub
-  those credentials. `BRO_HARNESS_BIN` selects the executable and remains part
-  of the allocator availability gate; an ops-surface dispatch can name
-  another absolute path for its own session (`harness_bin`). See
+- Every dispatchable provider belongs to one lane (`Provider::lane()` in
+  `bro-core`), and the daemon composes argv, environment, controls and event
+  handling per lane. See `design/orchestration/provider-lanes.md`.
+- The claude CLI lane runs GLM, DeepSeek, MiniMax and Kimi as one `claude -p`
+  child per dispatch in stream-json mode (`CLAUDE_BIN` selects the
+  executable). Endpoint and credentials come from the fixed
+  `~/.claude-{zai,ds,mm,k}` config dirs, named through `CLAUDE_CONFIG_DIR`;
+  the daemon lifts nothing out of them. Claude itself is not a dispatch
+  provider. The executor that owns the child's stdout writes its session
+  log; the daemon closes stdin after a turn's result so the child exits.
+- Brodex (Codex/ChatGPT on OpenAI Responses) and VibeBh (Mistral on chat
+  completions) still dispatch through the standalone `bro-harness` binary
+  (`BRO_HARNESS_BIN`) until the codex app-server lane replaces Brodex.
+  `blackboxd` does not link `bro-harness`, `bro-code-mode`, or V8. See
   `design/bro-harness/harness-process-boundary.md`.
-- `codex` is a serde alias for Brodex (bro-harness/Responses); there is no
-  separate codex CLI path. The Copilot and Vibe-CLI provider lanes are
-  removed entirely.
+- Codex dispatches directly through app-server on the execution host.
+  Typed session settings and controls cross the executor boundary. The
+  adapter normalizes provider events for daemon observation and replay.
 - Provider binary overrides belong in config/env, not hard-coded call sites.
 
 Dispatch-capable providers apply a mechanical recursion guard for recursive

@@ -5918,6 +5918,7 @@ fn provider_tag(p: Provider) -> &'static str {
     match p {
         Provider::Glm => "glm",
         Provider::Deepseek => "ds",
+        Provider::Codex => "cdx",
         Provider::Brodex => "bdx",
         Provider::VibeBh => "vbh",
         Provider::Minimax => "mmx",
@@ -5930,6 +5931,7 @@ fn provider_color(p: Provider) -> Color {
     match p {
         Provider::Glm => Color::LightBlue,
         Provider::Deepseek => Color::LightCyan,
+        Provider::Codex => Color::Green,
         Provider::Brodex => Color::LightGreen,
         Provider::VibeBh => Color::LightRed,
         Provider::Minimax => Color::Yellow,

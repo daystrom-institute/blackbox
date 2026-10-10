@@ -230,6 +230,13 @@ impl HarnessExecutor for LocalExecutor {
     }
 
     async fn spawn(&self, spec: WorkerSpawnSpec) -> anyhow::Result<WorkerHandle> {
+        anyhow::ensure!(
+            (spec.provider == bro_core::Provider::Codex) == spec.codex.is_some(),
+            "Codex requires typed app-server settings"
+        );
+        if let Some(config) = &spec.codex {
+            bro_worker::codex::validate(config)?;
+        }
         let provider = spec.provider;
 
         // Final binary resolution stays executor-side. Login-shell resolution
@@ -292,33 +299,68 @@ impl HarnessExecutor for LocalExecutor {
         for msg in spec.initial_messages {
             let _ = control_tx.send(msg);
         }
-        if let Some(stdin) = stdin {
-            spawn_control_writer(spec.task_id.clone(), stdin, control_rx);
-        }
 
         // Event lane: pump raw stdout lines out for daemon-side ingest, teeing
-        // each raw line (the daemon no longer tees; it parses).
+        // each raw line (the daemon no longer tees; it parses). A worker that
+        // writes no session log of its own gets one here, at the spec's
+        // pinned path, in the same `{ts, event}` shape the harness writes.
         let (events_tx, events_rx) = mpsc::unbounded_channel::<String>();
         let (stdout_done_tx, stdout_done_rx) = oneshot::channel::<()>();
         let tee_id_out = spec.task_id.clone();
-        if let Some(stdout) = stdout {
-            tokio::spawn(async move {
-                let reader = tokio::io::BufReader::new(stdout);
-                let mut lines = reader.lines();
-                let mut tee = open_harness_tee(&tee_id_out, "stdout.jsonl");
-                while let Ok(Some(line)) = lines.next_line().await {
-                    if let Some(w) = tee.as_mut() {
-                        w.try_write_line(&line);
-                    }
-                    if events_tx.send(line).is_err() {
-                        break;
-                    }
-                }
-                let _ = stdout_done_tx.send(());
-            });
+        let session_log = if spec.supervisor_writes_event_log && spec.codex.is_none() {
+            bro_worker::SessionLogWriter::open(&spec.event_log_path).await
         } else {
-            let _ = stdout_done_tx.send(());
-        }
+            None
+        };
+        let adapter = if let Some(config) = spec.codex.clone() {
+            let stdin = stdin.ok_or_else(|| anyhow::anyhow!("Codex stdin missing"))?;
+            let stdout = stdout.ok_or_else(|| anyhow::anyhow!("Codex stdout missing"))?;
+            drop(stdout_done_tx);
+            Some(tokio::spawn(bro_worker::codex::run(
+                config,
+                spec.cwd.clone().unwrap_or_else(|| ".".into()),
+                stdin,
+                stdout,
+                control_rx,
+                events_tx,
+                spec.event_log_path.clone(),
+            )))
+        } else {
+            if let Some(stdin) = stdin {
+                spawn_control_writer(spec.task_id.clone(), stdin, control_rx);
+            }
+            if let Some(stdout) = stdout {
+                tokio::spawn(async move {
+                    let reader = tokio::io::BufReader::new(stdout);
+                    let mut lines = reader.lines();
+                    let mut tee = open_harness_tee(&tee_id_out, "stdout.jsonl");
+                    let mut session_log = session_log;
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        if let Some(w) = tee.as_mut() {
+                            w.try_write_line(&line);
+                        }
+                        let line = if let Some(log) = session_log.as_mut() {
+                            match log.record_provider_event(provider, &line).await {
+                                Ok(line) => line,
+                                Err(_) => break,
+                            }
+                        } else {
+                            line
+                        };
+                        if events_tx.send(line).is_err() {
+                            break;
+                        }
+                    }
+                    if let Some(log) = session_log.as_mut() {
+                        log.finish().await;
+                    }
+                    let _ = stdout_done_tx.send(());
+                });
+            } else {
+                let _ = stdout_done_tx.send(());
+            }
+            None
+        };
 
         // stderr collection: accumulate the full stream (teeing raw lines) and
         // hand it to the outcome. Mirrors the prior daemon-side accumulation,
@@ -349,10 +391,21 @@ impl HarnessExecutor for LocalExecutor {
         // fast fatal exit cannot race the stderr snapshot empty.
         let (outcome_tx, outcome_rx) = oneshot::channel::<WorkerOutcome>();
         tokio::spawn(async move {
-            let status = child.wait().await;
+            let (exit_code, adapter_error) = if let Some(adapter) = adapter {
+                bro_worker::codex::wait_for_child(child, adapter).await
+            } else {
+                (
+                    child.wait().await.ok().and_then(|s| s.code()),
+                    String::new(),
+                )
+            };
             let _ = stdout_done_rx.await;
-            let stderr = stderr_done_rx.await.unwrap_or_default();
-            let exit_code = status.ok().and_then(|s| s.code());
+            let stderr = format!(
+                "{}{}",
+                stderr_done_rx.await.unwrap_or_default(),
+                adapter_error
+            );
+
             let _ = outcome_tx.send(WorkerOutcome { exit_code, stderr });
         });
 
@@ -560,6 +613,8 @@ mod child_env_tests {
                 initial_messages: vec![],
                 bro_home: std::env::temp_dir(),
                 event_log_path: std::env::temp_dir().join("sess-1.events.jsonl"),
+                supervisor_writes_event_log: false,
+                codex: None,
             };
             let mut child = LocalExecutor.spawn(spec).await.unwrap();
             let line = child.events.recv().await;

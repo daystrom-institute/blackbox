@@ -1,7 +1,7 @@
 {
   "name": "gap-processing",
   "version": 3,
-  "provider": "codex",
+  "provider": "brodex",
   "model": "gpt-5.5",
   "effort": "high",
   "context": {

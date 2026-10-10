@@ -1201,6 +1201,7 @@ dependencies = [
  "bro-rpc",
  "bro-tools",
  "bro-transcript",
+ "bro-worker",
  "chrono",
  "clap",
  "cron",
@@ -1481,6 +1482,18 @@ version = "0.0.1"
 dependencies = [
  "serde_json",
  "strum 0.26.3",
+]
+
+[[package]]
+name = "bro-worker"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "bro-core",
+ "bro-protocol",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -2389,6 +2402,7 @@ dependencies = [
  "bro-core",
  "bro-protocol",
  "bro-rpc",
+ "bro-worker",
  "libc",
  "rcgen",
  "ring",

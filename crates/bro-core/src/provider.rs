@@ -31,22 +31,24 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "lowercase")]
 #[strum(serialize_all = "lowercase")]
 pub enum Provider {
-    #[serde(alias = "claude")]
+    /// GLM (Z.AI Coding Plan) through the `claude` CLI with
+    /// `CLAUDE_CONFIG_DIR=~/.claude-zai`.
     #[strum(serialize = "glm")]
     Glm,
+    /// DeepSeek through the `claude` CLI with `CLAUDE_CONFIG_DIR=~/.claude-ds`.
     Deepseek,
-    /// MiniMax ridden through `bro-harness` on the Anthropic Messages
-    /// transport. Credentials/base URL are lifted from the operator's
-    /// `~/.claude-mm/settings.json` env block.
+    /// MiniMax through the `claude` CLI with `CLAUDE_CONFIG_DIR=~/.claude-mm`.
     Minimax,
-    /// Kimi (Moonshot AI) ridden through `bro-harness` on the Anthropic
-    /// Messages transport. Credentials/base URL are lifted from the
-    /// operator's `~/.claude-k/settings.json` env block (the Kimi-for-Coding
-    /// subscription endpoint, `https://api.kimi.com/coding`).
+    /// Kimi (Moonshot AI) through the `claude` CLI with
+    /// `CLAUDE_CONFIG_DIR=~/.claude-k` (the Kimi-for-Coding subscription
+    /// endpoint).
     Kimi,
+    /// Codex through one `codex app-server` per dispatch, fronted by the
+    /// execution-host adapter. Accounts select a `CODEX_HOME`; the default account
+    /// uses the app-server's own `~/.codex`.
+    Codex,
     /// Codex/ChatGPT backend ridden through `bro-harness` (OpenAI Responses
     /// transport).
-    #[serde(alias = "codex")]
     Brodex,
     /// Mistral (vibe) ridden through `bro-harness` on the OpenAI
     /// **chat-completions** transport. `vibebh` launches the harness with
@@ -99,18 +101,58 @@ pub enum Capability {
     Resume,
 }
 
+/// The runtime a provider dispatches through. The daemon composes argv,
+/// environment, control messages and event handling per lane, never per
+/// provider: providers on one lane differ only in credentials and catalog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderLane {
+    /// One `claude -p` child per dispatch, stream-json on stdin and stdout.
+    ClaudeCli,
+    /// Native app-server RPC, owned by the execution-host adapter.
+    Codex,
+    /// One standalone `bro-harness` child per dispatch (transitional).
+    Harness,
+    /// Daemon-internal workflow engine; no child process.
+    Workflow,
+}
+
 impl Provider {
     pub const ALL: &[Provider] = &[
         Provider::Glm,
         Provider::Deepseek,
         Provider::Minimax,
         Provider::Kimi,
+        Provider::Codex,
         Provider::Brodex,
         Provider::VibeBh,
     ];
 
     pub fn is_dispatchable(&self) -> bool {
         !matches!(self, Provider::Workflow)
+    }
+
+    pub fn lane(&self) -> ProviderLane {
+        match self {
+            Provider::Glm | Provider::Deepseek | Provider::Minimax | Provider::Kimi => {
+                ProviderLane::ClaudeCli
+            }
+            Provider::Codex => ProviderLane::Codex,
+            Provider::Brodex | Provider::VibeBh => ProviderLane::Harness,
+            Provider::Workflow => ProviderLane::Workflow,
+        }
+    }
+
+    /// The `claude` CLI config dir name under the execution home that holds
+    /// this provider's credentials and endpoint.
+    pub fn claude_config_dir_name(&self) -> Option<&'static str> {
+        match self {
+            Provider::Glm => Some(".claude-zai"),
+            Provider::Deepseek => Some(".claude-ds"),
+            Provider::Minimax => Some(".claude-mm"),
+            Provider::Kimi => Some(".claude-k"),
+            _ => None,
+        }
     }
 
     /// Capabilities this provider offers regardless of model. Per-model
@@ -123,6 +165,9 @@ impl Provider {
     pub fn capabilities(&self) -> std::collections::HashSet<Capability> {
         use Capability::*;
         let v: &[Capability] = match self {
+            // The app-server delivers structured output through the turn's
+            // `outputSchema`.
+            Provider::Codex => &[StructuredOutput, ToolUse, Resume],
             // All harness-backed providers support structured output via the
             // forced `final_result` terminal tool (transport-agnostic — works
             // for every tool-using provider).
@@ -147,6 +192,7 @@ impl Provider {
             Provider::Deepseek => "deepseek",
             Provider::Minimax => "minimax",
             Provider::Kimi => "kimi",
+            Provider::Codex => "codex",
             Provider::Brodex => "brodex",
             Provider::VibeBh => "vibebh",
             Provider::Workflow => "workflow",
@@ -154,27 +200,11 @@ impl Provider {
     }
 
     pub fn supports_resume(&self) -> bool {
-        matches!(
-            self,
-            Provider::Glm
-                | Provider::Deepseek
-                | Provider::Minimax
-                | Provider::Kimi
-                | Provider::Brodex
-                | Provider::VibeBh
-        )
+        self.is_dispatchable()
     }
 
     pub fn is_streaming_json(&self) -> bool {
-        matches!(
-            self,
-            Provider::Glm
-                | Provider::Deepseek
-                | Provider::Minimax
-                | Provider::Kimi
-                | Provider::Brodex
-                | Provider::VibeBh
-        )
+        self.is_dispatchable()
     }
 
     pub fn models(&self) -> &'static [ModelInfo] {
@@ -305,7 +335,7 @@ fn models_for(provider: Provider) -> &'static [ModelInfo] {
         Provider::Deepseek => DEEPSEEK_MODELS,
         Provider::Minimax => MINIMAX_MODELS,
         Provider::Kimi => KIMI_MODELS,
-        Provider::Brodex => CODEX_MODELS,
+        Provider::Codex | Provider::Brodex => CODEX_MODELS,
         Provider::VibeBh => VIBEBH_MODELS,
         Provider::Workflow => &[],
     }
@@ -316,7 +346,7 @@ fn efforts_for(provider: Provider) -> &'static [EffortInfo] {
         Provider::Glm | Provider::Minimax => CLAUDE_EFFORTS,
         Provider::Deepseek => DEEPSEEK_EFFORTS,
         Provider::Kimi => KIMI_EFFORTS,
-        Provider::Brodex => CODEX_EFFORTS,
+        Provider::Codex | Provider::Brodex => CODEX_EFFORTS,
         Provider::VibeBh => VIBEBH_EFFORTS,
         Provider::Workflow => &[],
     }
@@ -327,7 +357,7 @@ fn prompt_cache_for(provider: Provider) -> PromptCacheCapability {
         Provider::Glm | Provider::Deepseek | Provider::Minimax | Provider::Kimi => {
             PromptCacheCapability::AnthropicCacheControl
         }
-        Provider::Brodex => PromptCacheCapability::OpenAiPromptTokenDetails,
+        Provider::Codex | Provider::Brodex => PromptCacheCapability::OpenAiPromptTokenDetails,
         Provider::VibeBh => PromptCacheCapability::ChatCompletionsPromptCacheKey,
         Provider::Workflow => PromptCacheCapability::NoneKnown,
     }
@@ -642,7 +672,7 @@ static KIMI_EFFORTS: &[EffortInfo] = &[
     },
 ];
 
-// Brodex uses the Codex/ChatGPT catalog's model-keyed effort levels, which
+// Codex and Brodex use the Codex/ChatGPT catalog's model-keyed effort levels, which
 // differ from the public API. Astra, Sol, and Terra expose `ultra`; Luna
 // stops at `max`. Pre-5.6 models keep their established effort set.
 const CODEX_PRE_56_EFFORTS: &[&str] = &["minimal", "low", "medium", "high", "xhigh"];
@@ -954,6 +984,43 @@ mod tests {
                 "missing Brodex model {slug}"
             );
         }
+    }
+
+    #[test]
+    fn codex_rides_its_own_lane_with_the_codex_catalog() {
+        let p = Provider::Codex;
+        assert_eq!(p.lane(), ProviderLane::Codex);
+        assert_eq!(p.as_str(), "codex");
+        assert_eq!("codex".parse::<Provider>().unwrap(), Provider::Codex);
+        assert_eq!(
+            serde_json::from_value::<Provider>(serde_json::json!("codex")).unwrap(),
+            Provider::Codex
+        );
+        assert_eq!(serde_json::to_value(p).unwrap(), "codex");
+        assert!(Provider::ALL.contains(&p));
+        assert!(p.is_dispatchable());
+        assert_eq!(
+            p.models().iter().map(|m| m.id).collect::<Vec<_>>(),
+            Provider::Brodex
+                .models()
+                .iter()
+                .map(|m| m.id)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            p.model_efforts("gpt-6-luna"),
+            ["low", "medium", "high", "xhigh", "max"]
+        );
+        assert_eq!(
+            p.prompt_cache(),
+            PromptCacheCapability::OpenAiPromptTokenDetails
+        );
+        assert!(p.capabilities().contains(&Capability::StructuredOutput));
+        // Brodex keeps its own name only.
+        assert_eq!(
+            serde_json::from_value::<Provider>(serde_json::json!("brodex")).unwrap(),
+            Provider::Brodex
+        );
     }
 
     #[test]

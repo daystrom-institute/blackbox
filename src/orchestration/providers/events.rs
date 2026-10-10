@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::Provider;
+use bro_core::ProviderLane;
 
 /// Mutable state that event parsing updates on a Task.
 #[derive(Debug, Default)]
@@ -265,14 +266,13 @@ impl ProviderEvents for Provider {
 
     /// Parse a streaming JSON event and update the sink.
     fn parse_event(&self, evt: &Value, sink: &mut EventSink) {
-        match self {
-            Provider::Glm
-            | Provider::Deepseek
-            | Provider::Minimax
-            | Provider::Kimi
-            | Provider::Brodex
-            | Provider::VibeBh => parse_claude_event(evt, sink),
-            Provider::Workflow => {}
+        match self.lane() {
+            // The claude CLI, the Codex adapter and the harness share one
+            // stream-json envelope.
+            ProviderLane::ClaudeCli | ProviderLane::Codex | ProviderLane::Harness => {
+                parse_claude_event(evt, sink)
+            }
+            ProviderLane::Workflow => {}
         }
     }
 

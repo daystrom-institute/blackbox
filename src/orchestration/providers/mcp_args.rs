@@ -5,6 +5,7 @@ use serde_json::Value;
 use crate::orchestration::mcp::{self, McpFilters};
 
 use super::Provider;
+use bro_core::ProviderLane;
 
 /// MCP/filter argument translation for a provider (daemon-side: reaches the MCP
 /// config + tool-docs universe). Part of the provider dispatch surface — see
@@ -100,46 +101,33 @@ impl ProviderMcp for Provider {
             return Vec::new();
         }
         let mut args = Vec::new();
-        match self {
-            // Harness providers take a comma-separated, fully-qualified
-            // allow/deny list (`mcp__<server>__<tool>`) that the harness
-            // enforces in-registry — its own flag names, since it doesn't
-            // accept claude's --allowedTools. This is the client permission
-            // plane (recursion guard + brofile + per-dispatch); surface is
-            // separate and server-side via the MCP URL.
-            Provider::Glm
-            | Provider::Deepseek
-            | Provider::Minimax
-            | Provider::Kimi
-            | Provider::Brodex
-            | Provider::VibeBh => {
-                let deny = expand_filter_patterns(&filters.disallow);
-                if !deny.is_empty() {
-                    args.push("--deny-tools".into());
-                    args.push(deny.join(","));
-                }
-                let allow = expand_filter_patterns(&filters.allow);
-                if !allow.is_empty() {
-                    args.push("--allow-tools".into());
-                    args.push(allow.join(","));
-                }
-            }
-            Provider::Workflow => {}
+        // Both lanes take a comma-separated, fully-qualified allow/deny list
+        // (`mcp__<server>__<tool>`) enforced client-side. This is the client
+        // permission plane (recursion guard + brofile + per-dispatch); surface
+        // is separate and server-side via the MCP URL. One joined argument per
+        // flag: claude's variadic `<tools...>` form would otherwise swallow
+        // the flags that follow.
+        let (deny_flag, allow_flag) = match self.lane() {
+            ProviderLane::ClaudeCli => ("--disallowedTools", "--allowedTools"),
+            ProviderLane::Harness => ("--deny-tools", "--allow-tools"),
+            ProviderLane::Codex | ProviderLane::Workflow => return args,
+        };
+        let deny = expand_filter_patterns(&filters.disallow);
+        if !deny.is_empty() {
+            args.push(deny_flag.into());
+            args.push(deny.join(","));
+        }
+        let allow = expand_filter_patterns(&filters.allow);
+        if !allow.is_empty() {
+            args.push(allow_flag.into());
+            args.push(allow.join(","));
         }
         args
     }
 
     #[allow(dead_code)]
     fn supports_dispatch_filter(&self) -> bool {
-        matches!(
-            self,
-            Provider::Glm
-                | Provider::Deepseek
-                | Provider::Minimax
-                | Provider::Kimi
-                | Provider::Brodex
-                | Provider::VibeBh
-        )
+        self.lane() != ProviderLane::Workflow
     }
 
     /// Translate a normalized fleet MCP server map into provider-native dispatch
@@ -155,16 +143,11 @@ impl ProviderMcp for Provider {
         if servers.is_empty() {
             return Vec::new();
         }
-        match self {
-            Provider::Glm
-            | Provider::Deepseek
-            | Provider::Minimax
-            | Provider::Kimi
-            | Provider::Brodex
-            | Provider::VibeBh => {
+        match self.lane() {
+            ProviderLane::ClaudeCli | ProviderLane::Harness => {
                 vec!["--mcp-config".into(), fleet_mcp_config_json(servers)]
             }
-            Provider::Workflow => Vec::new(),
+            ProviderLane::Codex | ProviderLane::Workflow => Vec::new(),
         }
     }
 }
@@ -175,47 +158,47 @@ impl ProviderMcp for Provider {
 /// can't resolve is skipped with a warning rather than failing the whole
 /// dispatch; the rest still load.
 pub fn fleet_mcp_config_json(servers: &BTreeMap<String, mcp::McpServerConfig>) -> String {
-    use mcp::McpServerConfig as C;
     let mut map = serde_json::Map::new();
     for (name, cfg) in servers {
-        let resolved = match cfg.resolve_secrets() {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(server = %name,
-                    "fleet MCP: skipping server (secret resolve failed): {e:#}");
-                continue;
+        match mcp_server_json(cfg) {
+            Ok(entry) => {
+                map.insert(name.clone(), entry);
             }
-        };
-        let mut entry = serde_json::Map::new();
-        match cfg {
-            C::Http { url, .. } => {
-                entry.insert("type".into(), "http".into());
-                entry.insert("url".into(), url.clone().into());
-                if !resolved.headers.is_empty() {
-                    entry.insert("headers".into(), to_json_object(&resolved.headers));
-                }
-            }
-            C::Sse { url, .. } => {
-                entry.insert("type".into(), "sse".into());
-                entry.insert("url".into(), url.clone().into());
-                if !resolved.headers.is_empty() {
-                    entry.insert("headers".into(), to_json_object(&resolved.headers));
-                }
-            }
-            C::Stdio { command, args, .. } => {
-                entry.insert("type".into(), "stdio".into());
-                entry.insert("command".into(), command.clone().into());
-                if !args.is_empty() {
-                    entry.insert("args".into(), args.clone().into());
-                }
-                if !resolved.env.is_empty() {
-                    entry.insert("env".into(), to_json_object(&resolved.env));
-                }
+            Err(error) => {
+                tracing::warn!(server = %name, "fleet MCP: skipping unresolved server: {error:#}")
             }
         }
-        map.insert(name.clone(), Value::Object(entry));
     }
-    serde_json::json!({ "mcpServers": Value::Object(map) }).to_string()
+    serde_json::json!({"mcpServers": map}).to_string()
+}
+
+/// Codex dispatch must not silently omit malformed or unresolved servers.
+pub fn codex_fleet_mcp_servers(
+    servers: &BTreeMap<String, bro_fleet_client::McpServerConfig>,
+) -> anyhow::Result<BTreeMap<String, Value>> {
+    servers
+        .iter()
+        .map(|(name, cfg)| {
+            let cfg: mcp::McpServerConfig = serde_json::from_value(serde_json::to_value(cfg)?)?;
+            Ok((name.clone(), mcp_server_json(&cfg)?))
+        })
+        .collect()
+}
+
+fn mcp_server_json(cfg: &mcp::McpServerConfig) -> anyhow::Result<Value> {
+    use mcp::McpServerConfig as C;
+    let resolved = cfg.resolve_secrets()?;
+    Ok(match cfg {
+        C::Http { url, .. } => {
+            serde_json::json!({"type":"http", "url":url, "headers":to_json_object(&resolved.headers)})
+        }
+        C::Sse { url, .. } => {
+            serde_json::json!({"type":"sse", "url":url, "headers":to_json_object(&resolved.headers)})
+        }
+        C::Stdio { command, args, .. } => {
+            serde_json::json!({"type":"stdio", "command":command, "args":args, "env":to_json_object(&resolved.env)})
+        }
+    })
 }
 
 fn to_json_object(m: &BTreeMap<String, String>) -> Value {
@@ -261,7 +244,7 @@ fn daemon_servers_from_fleet(
     out
 }
 
-fn expand_filter_patterns(patterns: &[String]) -> Vec<String> {
+pub(super) fn expand_filter_patterns(patterns: &[String]) -> Vec<String> {
     let universe: Vec<&str> = crate::tool_docs::all_tool_names();
     let mut out = Vec::new();
     for p in patterns.iter().map(|p| mcp::normalize_filter_pattern(p)) {
