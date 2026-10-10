@@ -4104,14 +4104,15 @@ mod tests {
     fn ordinary_resume_ownership_preserves_current_and_external_sessions() {
         let tmp = tempfile::tempdir().unwrap();
         let server = test_server(&tmp);
-        for (id, origin) in [
+        let cases = [
             ("direct", bro_core::Origin::AgentDispatch),
             ("control", bro_core::Origin::Control),
             ("cockpit", bro_core::Origin::Cockpit),
             ("legacy", bro_core::Origin::Unknown),
             ("cron", bro_core::Origin::Cron),
             ("webhook", bro_core::Origin::Webhook),
-        ] {
+        ];
+        for (id, origin) in cases {
             let task = orch::test_task(id, orch::TaskStatus::Completed, Provider::Glm);
             task.inner.lock().origin = origin;
             server
@@ -4132,7 +4133,7 @@ mod tests {
                 .resolve_resume_target(Some("external-session"), Some("glm"), None)
                 .is_ok()
         );
-        assert_eq!(server.state.task_store.read().all_tasks().len(), 5);
+        assert_eq!(server.state.task_store.read().all_tasks().len(), cases.len());
     }
 
     #[tokio::test]
