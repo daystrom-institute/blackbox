@@ -255,7 +255,10 @@ pub async fn spawn_worker(spec: WorkerSpawnSpec) -> anyhow::Result<WorkerChild> 
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .env("PATH", dispatch_path_env())
+        .env(
+            "PATH",
+            bro_worker::path_for_binary(&bin, &dispatch_path_env())?,
+        )
         .env("NO_COLOR", "1")
         .env("TERM", "dumb")
         .env("FORCE_COLOR", "0");
@@ -575,6 +578,30 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("cannot open worker event log"));
+        // Reproduce a service launching an env-based CLI with a sibling runtime
+        // absent from its inherited PATH. Both executables stay test-local.
+        use std::os::unix::fs::PermissionsExt;
+        let bin_dir = root.path().canonicalize().unwrap();
+        for (name, body) in [
+            ("provider", "#!/usr/bin/env bbox-fixture-runtime\n"),
+            (
+                "bbox-fixture-runtime",
+                "#!/bin/sh\nprintf '{\"type\":\"result\"}\\n'\n",
+            ),
+        ] {
+            let path = bin_dir.join(name);
+            tokio::fs::write(&path, body).await.unwrap();
+            tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .await
+                .unwrap();
+        }
+        spec.bin_override = Some(bin_dir.join("provider").to_str().unwrap().into());
+        spec.argv.clear();
+        spec.bro_home = bin_dir.clone();
+        spec.event_log_path = bin_dir.join("runtime.events.jsonl");
+        let child = spawn_worker(spec.clone()).await.unwrap();
+        assert_eq!(child.outcome.await.unwrap().exit_code, Some(0));
+        spec.bin_override = Some("/bin/sh".into());
         spec.event_log_path = root.path().join("session.events.jsonl");
         spec.argv = vec!["-c".into(), "printf 'not-json\\n'; exec sleep 60".into()];
         let child = spawn_worker(spec).await.unwrap();

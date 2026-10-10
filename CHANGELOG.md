@@ -8,6 +8,9 @@ out explicitly under `Changed` or `Removed`.
 
 ## Unreleased
 
+- Workers include the resolved provider executable's directory in PATH so
+  env-based CLI launchers can find their runtime under a service supervisor.
+
 - CLI dispatch refuses unsupported execution settings instead of silently
   dropping them. Claude dispatch rejects global tool allowlists that its
   permission flags cannot enforce. Both execution hosts require readable durable

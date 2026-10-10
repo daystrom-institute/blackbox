@@ -6,6 +6,19 @@ pub use session_log::{SessionLogWriter, rfc3339_millis, session_log_record};
 mod supervision;
 pub use supervision::wait_for_child;
 
+/// Env-based provider launchers need the runtimes installed beside the
+/// resolved executable, even when the supervisor has a minimal service PATH.
+pub fn path_for_binary(bin: &str, inherited: &str) -> anyhow::Result<std::ffi::OsString> {
+    let bin = std::path::Path::new(bin);
+    let directory = bin.is_absolute().then(|| bin.parent()).flatten();
+    Ok(std::env::join_paths(
+        directory
+            .into_iter()
+            .map(std::path::Path::to_path_buf)
+            .chain(std::env::split_paths(inherited)),
+    )?)
+}
+
 /// Relay CLI events only after their durable copy is written.
 pub async fn relay_cli<R, F>(
     mut stdout: R,
