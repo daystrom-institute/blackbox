@@ -154,9 +154,20 @@ pub(crate) fn build_ui_router(state: UiState) -> Router {
         .route("/", get(pages::overview::page))
         .route("/threads", placeholder(Section::Threads))
         .route("/bros", placeholder(Section::Bros))
-        .route("/projects", placeholder(Section::Projects))
-        .route("/system", placeholder(Section::System))
-        .route("/config", placeholder(Section::Configuration))
+        .route("/projects", get(pages::projects::page))
+        .route("/system", get(pages::system::page))
+        .route("/config", get(pages::configuration::page))
+        .route("/projects/{id}", get(pages::projects::detail_page))
+        .route("/fragments/projects", get(pages::projects::fragment))
+        .route(
+            "/fragments/projects/{id}",
+            get(pages::projects::detail_fragment),
+        )
+        .route("/fragments/system/{panel}", get(pages::system::fragment))
+        .route(
+            "/fragments/config/{section}",
+            get(pages::configuration::fragment),
+        )
         .route("/assets/{file}", get(assets::serve))
         .fallback(pages::placeholder::not_found)
         .layer(axum::middleware::from_fn(require_principal))
@@ -517,7 +528,7 @@ mod tests {
     async fn unbuilt_sections_render_inside_the_shell() {
         let dir = tempfile::tempdir().unwrap();
         let identity = [("x-forwarded-email", "operator@example.test")];
-        for uri in ["/threads", "/bros", "/projects", "/system", "/config"] {
+        for uri in ["/threads", "/bros"] {
             let (status, _, body) =
                 send(ui_router(&dir), request(uri, Some(PROXY_PEER), &identity)).await;
             assert_eq!(status, StatusCode::OK, "{uri}");
