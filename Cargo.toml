@@ -194,6 +194,10 @@ futures = "0.3"
 async-stream = "0.3"
 
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
+# RS256 verification of OAuth access tokens on the MCP gate. No default
+# features: keys come from a JWKS as RSA components, never PEM, and the ring
+# backend is the one the TLS stack already links.
+jsonwebtoken = { version = "9.3", default-features = false }
 # Pinned TLS to a remote fleetd (daemon.fleetd_endpoint = tls://...).
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 
