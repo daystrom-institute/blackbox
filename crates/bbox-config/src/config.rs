@@ -622,7 +622,6 @@ pub struct ResolvedPathConfig {
     pub global_common_md: PathBuf,
     pub global_claude_md: PathBuf,
     pub global_codex_md: PathBuf,
-    pub global_gemini_md: PathBuf,
     pub defaults_memories_dir: PathBuf,
     pub user_memories_dir: Option<PathBuf>,
 }
@@ -2184,12 +2183,6 @@ fn resolve_paths(
         .map(PathBuf::from)
         .unwrap_or_else(|| home_path.join(".codex").join("AGENTS.md"));
 
-    let global_gemini_md = std::env::var("BLACKBOX_GLOBAL_GEMINI_MD")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home_path.join(".gemini").join("GEMINI.md"));
-
     // defaults_memories_dir: 4-tier resolution
     //   1. BLACKBOX_DEFAULTS_DIR env var → $VAR/memories
     //   2. [paths].defaults_dir config field → $FIELD/memories
@@ -2253,7 +2246,6 @@ fn resolve_paths(
         global_common_md,
         global_claude_md,
         global_codex_md,
-        global_gemini_md,
         defaults_memories_dir,
         user_memories_dir,
     })

@@ -128,7 +128,7 @@ fn rescope_render_project(p: &mut RenderParams, projects: &[crate::projects::Pro
 impl BlackboxServer {
     #[tool(
         name = "bbox_render",
-        description = "Render entries into CLAUDE.md / AGENTS.md / GEMINI.md."
+        description = "Render entries into CLAUDE.md / AGENTS.md."
     )]
     pub(crate) async fn bbox_render(
         &self,
@@ -722,7 +722,6 @@ mod catalog_render_tests {
         env.set("BLACKBOX_GLOBAL_COMMON_MD", render_root.join("BLACKBOX.md"));
         env.set("BLACKBOX_GLOBAL_CLAUDE_MD", render_root.join("CLAUDE.md"));
         env.set("BLACKBOX_GLOBAL_CODEX_MD", render_root.join("AGENTS.md"));
-        env.set("BLACKBOX_GLOBAL_GEMINI_MD", render_root.join("GEMINI.md"));
         env.set("BLACKBOX_BACKUP_DIR", render_root.join("backups"));
         fixture.add_published_project(PROJECT, &CatalogFixture::scope("."));
         let server = fixture.server();
@@ -772,7 +771,6 @@ mod catalog_render_tests {
         env.set("BLACKBOX_GLOBAL_COMMON_MD", &common_path);
         env.set("BLACKBOX_GLOBAL_CLAUDE_MD", render_root.join("CLAUDE.md"));
         env.set("BLACKBOX_GLOBAL_CODEX_MD", render_root.join("AGENTS.md"));
-        env.set("BLACKBOX_GLOBAL_GEMINI_MD", render_root.join("GEMINI.md"));
         env.set("BLACKBOX_BACKUP_DIR", render_root.join("backups"));
         fixture.add_published_project(PROJECT, &CatalogFixture::scope("."));
         let server = fixture.server();
@@ -821,7 +819,6 @@ mod catalog_render_tests {
             "BLACKBOX_GLOBAL_COMMON_MD",
             "BLACKBOX_GLOBAL_CLAUDE_MD",
             "BLACKBOX_GLOBAL_CODEX_MD",
-            "BLACKBOX_GLOBAL_GEMINI_MD",
         ] {
             env.remove(key);
         }
@@ -863,7 +860,6 @@ mod catalog_render_tests {
             "BLACKBOX_GLOBAL_COMMON_MD",
             "BLACKBOX_GLOBAL_CLAUDE_MD",
             "BLACKBOX_GLOBAL_CODEX_MD",
-            "BLACKBOX_GLOBAL_GEMINI_MD",
         ] {
             env.remove(key);
         }
@@ -892,7 +888,7 @@ mod catalog_render_tests {
             "core rules render into the common body"
         );
         let providers: Vec<&str> = plan.providers.iter().map(|p| p.provider.as_str()).collect();
-        assert_eq!(providers, ["claude", "agents", "gemini"]);
+        assert_eq!(providers, ["claude", "agents"]);
         for provider in &plan.providers {
             assert!(
                 provider.body.contains("bbox_gap")

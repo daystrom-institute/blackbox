@@ -132,7 +132,7 @@ fn discover_project_roots(tree: &Path) -> Result<Vec<PathBuf>> {
                 reject_symlinks_beneath(tree, &path.join("gaps"))?;
                 if path.join("config.toml").is_file() || path.join("knowledge").is_dir() {
                     if let Some(project) = path.parent() {
-                        for provider_file in ["AGENTS.md", "CLAUDE.md", "GEMINI.md"] {
+                        for provider_file in ["AGENTS.md", "CLAUDE.md"] {
                             reject_candidate_symlink(tree, &project.join(provider_file))?;
                         }
                         roots.push(project.to_path_buf());
@@ -303,10 +303,7 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
-        git(
-            &root,
-            &["add", ".bbox", "AGENTS.md", "CLAUDE.md", "GEMINI.md"],
-        );
+        git(&root, &["add", ".bbox", "AGENTS.md", "CLAUDE.md"]);
         git(&root, &["commit", "-q", "-m", "seed"]);
         let first = evaluate(&candidate(&root)).unwrap();
         assert!(
@@ -326,7 +323,7 @@ mod tests {
         git(&root, &["commit", "-q", "-m", "stale knowledge"]);
         let stale = evaluate(&candidate(&root)).unwrap();
         assert!(!stale.ok);
-        assert_eq!(stale.content["render_mismatches"], serde_json::json!(3));
+        assert_eq!(stale.content["render_mismatches"], serde_json::json!(2));
     }
 
     #[test]
@@ -398,7 +395,6 @@ mod tests {
             ".bbox/gaps/gap.json",
             "AGENTS.md",
             "CLAUDE.md",
-            "GEMINI.md",
         ] {
             let repo = tempfile::tempdir().unwrap();
             let root = repo.path().canonicalize().unwrap();

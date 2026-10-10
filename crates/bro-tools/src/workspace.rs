@@ -324,7 +324,7 @@ fn is_allowed_external_instruction_doc(path: &Path) -> bool {
     };
     if matches!(
         name,
-        "AGENTS.md" | "BLACKBOX.md" | "CLAUDE.md" | "GEMINI.md" | "PROJECT.md" | "README.md"
+        "AGENTS.md" | "BLACKBOX.md" | "CLAUDE.md" | "PROJECT.md" | "README.md"
     ) {
         return true;
     }

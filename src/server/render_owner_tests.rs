@@ -312,7 +312,7 @@ async fn unbound_callers_render_covered_and_uncovered_remote_projects_through_th
                 .to_string()
                 .contains(owner.root(scope).to_str().unwrap())
         );
-        for file in ["CLAUDE.md", "AGENTS.md", "GEMINI.md"] {
+        for file in ["CLAUDE.md", "AGENTS.md"] {
             assert!(
                 std::fs::read_to_string(owner.root(scope).join(file))
                     .unwrap()
@@ -453,7 +453,7 @@ async fn receipt_hashes_are_the_owner_written_bytes() {
     let response = render_with_owner(&server, &owner, project_params(UNCOVERED)).await;
     let receipt: ProjectRenderReceiptV1 =
         serde_json::from_value(response["receipt"].clone()).unwrap();
-    assert_eq!(receipt.projections.len(), 3);
+    assert_eq!(receipt.projections.len(), 2);
     for projection in &receipt.projections {
         let bytes = std::fs::read(owner.root(&scope).join(&projection.file_name)).unwrap();
         assert_eq!(projection.projection_bytes, Some(bytes.len()));
@@ -473,7 +473,6 @@ async fn scope_both_renders_global_before_issuing_the_project_half() {
         "BLACKBOX_GLOBAL_COMMON_MD",
         "BLACKBOX_GLOBAL_CLAUDE_MD",
         "BLACKBOX_GLOBAL_CODEX_MD",
-        "BLACKBOX_GLOBAL_GEMINI_MD",
     ] {
         env.remove(key);
     }
@@ -500,7 +499,6 @@ async fn scope_both_renders_global_before_issuing_the_project_half() {
     env.set("BLACKBOX_GLOBAL_COMMON_MD", render_root.join("BLACKBOX.md"));
     env.set("BLACKBOX_GLOBAL_CLAUDE_MD", render_root.join("CLAUDE.md"));
     env.set("BLACKBOX_GLOBAL_CODEX_MD", render_root.join("AGENTS.md"));
-    env.set("BLACKBOX_GLOBAL_GEMINI_MD", render_root.join("GEMINI.md"));
     env.set("BLACKBOX_BACKUP_DIR", render_root.join("backups"));
     let response = render_with_owner(
         &server,

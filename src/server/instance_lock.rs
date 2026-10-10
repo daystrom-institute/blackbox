@@ -229,11 +229,6 @@ pub fn instance_lock_roots(cfg: &crate::config::Config) -> Vec<InstanceRoot> {
             "BLACKBOX_GLOBAL_CODEX_MD",
             paths.global_codex_md.clone(),
         ),
-        InstanceRoot::file(
-            "global Gemini render target",
-            "BLACKBOX_GLOBAL_GEMINI_MD",
-            paths.global_gemini_md.clone(),
-        ),
         InstanceRoot::file("gap store", "BLACKBOX_GAPS_PATH", paths.gaps_path.clone()),
         InstanceRoot::file(
             "thread store",
@@ -719,10 +714,6 @@ mod tests {
             "BLACKBOX_GLOBAL_CODEX_MD",
             state_dir.join("render").join("AGENTS.md"),
         );
-        env.set(
-            "BLACKBOX_GLOBAL_GEMINI_MD",
-            state_dir.join("render").join("GEMINI.md"),
-        );
         for var in [
             "BRO_HOME",
             "BLACKBOX_PACKETS_DIR",
@@ -1031,7 +1022,6 @@ mod tests {
             "global common render target",
             "global Claude render target",
             "global Codex render target",
-            "global Gemini render target",
             "gap store",
             "thread store",
             "notes store",

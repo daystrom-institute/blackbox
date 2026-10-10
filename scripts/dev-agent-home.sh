@@ -41,7 +41,6 @@ export TRANSCRIPT_SEARCH_CODEX_ROOT="${TRANSCRIPT_SEARCH_CODEX_ROOT:-$HOME/.code
 export BRO_HOME="${BRO_HOME:-$BLACKBOX_STATE_DIR/bro}"
 export BLACKBOX_GLOBAL_CLAUDE_MD="${BLACKBOX_GLOBAL_CLAUDE_MD:-$HOME/.claude-shared/CLAUDE.md}"
 export BLACKBOX_GLOBAL_CODEX_MD="${BLACKBOX_GLOBAL_CODEX_MD:-$HOME/.codex/AGENTS.md}"
-export BLACKBOX_GLOBAL_GEMINI_MD="${BLACKBOX_GLOBAL_GEMINI_MD:-$HOME/.gemini/GEMINI.md}"
 export RUST_LOG="${RUST_LOG:-blackbox=info}"
 export PATH="$HOME/.local/bin:$PATH"
 
@@ -91,7 +90,6 @@ write_seed_configs() {
   write_if_missing "$HOME/.claude.json" "$claude_json"
   write_if_missing "$HOME/.claude/.claude.json" "$claude_json"
   write_if_missing "$HOME/.codex/config.toml" "[mcp_servers.\"${BLACKBOX_MCP_NAME}\"]"$'\n'"url = \"http://127.0.0.1:${BBOX_PORT}/mcp\""
-  write_if_missing "$HOME/.gemini/GEMINI.md" "<!-- bb:managed-start -->"$'\n'"<!-- dev-agent placeholder; blackbox render owns this region -->"$'\n'"<!-- bb:managed-end -->"
   write_if_missing "$HOME/.claude-shared/CLAUDE.md" "<!-- bb:managed-start -->"$'\n'"<!-- dev-agent placeholder; blackbox render owns this region -->"$'\n'"<!-- bb:managed-end -->"
   write_if_missing "$HOME/.codex/AGENTS.md" "<!-- bb:managed-start -->"$'\n'"<!-- dev-agent placeholder; blackbox render owns this region -->"$'\n'"<!-- bb:managed-end -->"
 }
@@ -138,7 +136,6 @@ BLACKBOX_STATE_DIR=$BLACKBOX_STATE_DIR
 TRANSCRIPT_SEARCH_INDEX_PATH=$TRANSCRIPT_SEARCH_INDEX_PATH
 BLACKBOX_GLOBAL_CLAUDE_MD=$BLACKBOX_GLOBAL_CLAUDE_MD
 BLACKBOX_GLOBAL_CODEX_MD=$BLACKBOX_GLOBAL_CODEX_MD
-BLACKBOX_GLOBAL_GEMINI_MD=$BLACKBOX_GLOBAL_GEMINI_MD
 BRO_HOME=$BRO_HOME
 TRANSCRIPT_SEARCH_ROOTS=$TRANSCRIPT_SEARCH_ROOTS
 TRANSCRIPT_SEARCH_CODEX_ROOT=$TRANSCRIPT_SEARCH_CODEX_ROOT

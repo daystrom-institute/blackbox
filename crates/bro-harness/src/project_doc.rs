@@ -191,7 +191,6 @@ fn is_allowed_instruction_doc(path: &Path) -> bool {
             | "AGENTS.override.md"
             | "BLACKBOX.md"
             | "CLAUDE.md"
-            | "GEMINI.md"
             | "PROJECT.md"
             | "README.md"
     ) {

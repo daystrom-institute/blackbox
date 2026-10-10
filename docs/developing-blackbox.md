@@ -146,9 +146,8 @@ nix fmt
 ## Run a fully isolated dev-agent world with Nix
 
 An isolated dev daemon isolates its own state, but not the agent harnesses that
-may still auto-read `~/.claude-shared/CLAUDE.md`, `~/.codex/AGENTS.md`, or
-`~/.gemini/GEMINI.md`. For contained end-to-end testing, use the flake-backed
-dev harness instead:
+may still auto-read `~/.claude-shared/CLAUDE.md` or `~/.codex/AGENTS.md`. For
+contained end-to-end testing, use the flake-backed dev harness instead:
 
 ```bash
 nix develop .#dev-agent
@@ -176,7 +175,6 @@ What the harness does:
 - points rendered global memory at the fake home's real pickup paths:
   - `./.dev-agent/home/.claude-shared/CLAUDE.md`
   - `./.dev-agent/home/.codex/AGENTS.md`
-  - `./.dev-agent/home/.gemini/GEMINI.md`
 - leaves auth/session passthrough explicit via `./.dev-agent-links`
 
 `./.dev-agent-links` is TAB-separated:

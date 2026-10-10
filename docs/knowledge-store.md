@@ -4,7 +4,7 @@ Blackbox memory has lanes. Use the lane that matches how long the fact should
 matter and whether future agents should see it automatically.
 
 The rendered markdown files are not the source of truth. They are projections
-from the store into `CLAUDE.md`, `AGENTS.md`, and `GEMINI.md`.
+from the store into `CLAUDE.md` and `AGENTS.md`.
 
 ## Pick The Right Lane
 
@@ -144,7 +144,7 @@ references:
 
 ```text
 bbox_hybrid_search(
-  query="AGENTS.md CLAUDE.md GEMINI.md PROJECT.md instructions",
+  query="AGENTS.md CLAUDE.md PROJECT.md instructions",
   project="<project-selector>", doc_type="project_file", limit=5
 )
 ```

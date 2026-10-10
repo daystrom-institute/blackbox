@@ -3,7 +3,7 @@
 //!
 //! The daemon owns the knowledge store but may not be the host whose
 //! provider guidance files (`~/.blackbox/BLACKBOX.md`, `~/.claude/CLAUDE.md`,
-//! `~/.codex/AGENTS.md`, `~/.gemini/GEMINI.md`) should change: a remote
+//! `~/.codex/AGENTS.md`) should change: a remote
 //! daemon renders into its own `$HOME`, which no interactive session reads.
 //! This command asks the daemon for a global render PLAN computed against
 //! this host's common include path, then applies the plan through the same
@@ -41,7 +41,7 @@ struct RenderGlobalArgs {
     /// Preview the managed regions without writing anything
     #[arg(long)]
     check: bool,
-    /// Render one provider only (claude, agents, gemini); default: all
+    /// Render one provider only (claude, agents); default: all
     #[arg(long, value_name = "PROVIDER")]
     provider: Option<String>,
     /// Print the applied/previewed outcomes as JSON

@@ -54,7 +54,7 @@ pub enum Category {
 
 impl Category {
     /// Section heading used when rendering this category into the
-    /// managed CLAUDE.md / AGENTS.md / GEMINI.md block. Distinct from
+    /// managed CLAUDE.md / AGENTS.md block. Distinct from
     /// the serialized snake_case form; this is human-facing.
     pub fn heading(&self) -> &str {
         match self {

@@ -2268,12 +2268,12 @@ impl Knowledge {
         }
         persisted?;
         // Signal render-lifecycle state: entries are stored + indexed but NOT
-        // automatically rendered into provider markdown (CLAUDE.md / AGENTS.md /
-        // GEMINI.md). Making this explicit at the call site prevents the
+        // automatically rendered into provider markdown (CLAUDE.md / AGENTS.md).
+        // Making this explicit at the call site prevents the
         // "I learned it but it's not visible to providers yet" gap — the caller
         // can chain bbox_render or accept deferred rendering consciously.
         let message = format!(
-            "Created entry {id} [render_pending=true (call bbox_render to publish to CLAUDE.md/AGENTS.md/GEMINI.md)]"
+            "Created entry {id} [render_pending=true (call bbox_render to publish to CLAUDE.md/AGENTS.md)]"
         );
         Ok(LearnWriteResult {
             id,
@@ -2552,7 +2552,7 @@ impl Knowledge {
         let providers: Vec<&str> = if let Some(p) = provider {
             vec![p]
         } else {
-            vec!["claude", "agents", "gemini"]
+            vec!["claude", "agents"]
         };
         if do_project {
             validated_project_render_providers(provider)?;
@@ -2703,7 +2703,7 @@ impl Knowledge {
     pub fn check_project_render(&self, project_dir: &Path) -> Result<ProjectRenderCheck> {
         let project = project_dir.to_string_lossy();
         let mut mismatches = Vec::new();
-        let providers = ["claude", "agents", "gemini"];
+        let providers = ["claude", "agents"];
         for provider in providers {
             let path = project_dir.join(project_target_file(provider)?);
             let expected = self.project_projection(provider, &project, &project)?;
@@ -2828,7 +2828,7 @@ impl Knowledge {
         }
         let providers: Vec<&str> = match provider {
             Some(p) => vec![p],
-            None => vec!["claude", "agents", "gemini"],
+            None => vec!["claude", "agents"],
         };
         let mut plans = Vec::new();
         let mut satellites = Vec::new();
@@ -3184,7 +3184,7 @@ mod tests {
             )
             .unwrap();
         plan.validate().unwrap();
-        assert_eq!(plan.satellites.len(), 3);
+        assert_eq!(plan.satellites.len(), 2);
         assert_eq!(
             plan,
             kb.global_render_plan(
@@ -5926,42 +5926,6 @@ mod tests {
         assert!(
             memory_idx < project_idx,
             "claude should keep PROJECT.md include after project memory: {out}"
-        );
-    }
-
-    #[test]
-    fn render_project_body_places_gemini_project_include_before_memory() {
-        let (project_dir, mut kb) = mk_kb();
-        let project = project_dir.path().to_str().unwrap();
-        fs::write(project_dir.path().join(PROJECT_DOC_FILE), "# Project\n").unwrap();
-        kb.store.entries.push(KnowledgeEntry {
-            render_placement: Default::default(),
-            id: "mem00002".into(),
-            title: "Gemini local rule".into(),
-            content: "provider-specific project memory".into(),
-            cluster: None,
-            category: Category::Memory,
-            scope: Scope::Project,
-            project: Some(project.into()),
-            project_id: None,
-            providers: vec![],
-            priority: Priority::Standard,
-            render: true,
-            created_at: "2026-01-01T00:00:00Z".into(),
-            updated_at: "2026-01-01T00:00:00Z".into(),
-            recall_count: 0,
-            last_recalled: None,
-        });
-
-        let out = kb
-            .render_project_body("gemini", project, project)
-            .expect("render should succeed");
-
-        let project_idx = out.find("`PROJECT.md`").unwrap();
-        let memory_idx = out.find("**Gemini local rule**").unwrap();
-        assert!(
-            project_idx < memory_idx,
-            "gemini should keep PROJECT.md include before project memory: {out}"
         );
     }
 
