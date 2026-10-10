@@ -2,3 +2,5 @@
 
 pub(super) mod overview;
 pub(super) mod placeholder;
+
+pub(super) mod config_view;
