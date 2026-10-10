@@ -978,7 +978,11 @@ mod tests {
         let (_fixture, shared) = seeded_catalog();
         let (status, body) = get(shared, &format!("/projects/{ATTACHED}")).await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert!(body.contains(&format!("Project {ATTACHED}")), "{body}");
+        // Titled by the registered root's directory name; the id stays in
+        // the identity table beside the root itself.
+        assert!(body.contains("<h1>Project never-mounted</h1>"), "{body}");
+        assert!(body.contains(&format!("<code>{ATTACHED}</code>")), "{body}");
+        assert!(body.contains("Registered root"), "{body}");
         for heading in [
             "Identity",
             "Transport ownership",
