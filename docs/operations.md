@@ -162,6 +162,60 @@ leaves the Fleet client sending nothing, so with the gate on every one of
 its calls is refused with 401 (the warning names the file). An MCP client
 such as a Claude configuration sends its own `Authorization: Bearer` header.
 
+#### OAuth access tokens
+
+With the bearer gate on, the same planes can also admit a person's access
+token from an OpenID Connect issuer, so an interactive MCP client signs in
+through the standard MCP OAuth flow instead of carrying the service token.
+The service bearer keeps working beside it.
+
+```toml
+[daemon.mcp_oauth]
+issuer = "https://sso.example.com/realms/estate"
+audience = "https://corpus.example.com:7264/mcp"
+required_group = "bbox-users"
+# jwks_uri = "https://sso.example.com/realms/estate/protocol/openid-connect/certs"
+```
+
+`BBOX_MCP_OAUTH_ISSUER`, `BBOX_MCP_OAUTH_AUDIENCE` and `BBOX_MCP_OAUTH_GROUP`
+set or override the three required keys field by field. Issuer, audience and
+group are required together; any partial set, from the file, the environment
+or both, is a configuration error. `jwks_uri` is optional: absent, the daemon
+reads it from `<issuer>/.well-known/openid-configuration`. Configuring
+`[daemon.mcp_oauth]` while `daemon.mcp_require_bearer` is off stops startup.
+The audience is the resource URL clients use for `/mcp`; any other hostname
+the daemon answers on keeps bearer-only admission.
+
+The gate tries, in order: a loopback or trusted peer, the service bearer,
+then the access token. A token is admitted when it is RS256 with a `kid`
+published in the issuer's key set, `iss` equals `issuer`, `aud` contains
+`audience`, `exp` and `nbf` hold within 30 seconds of skew, and the `groups`
+claim contains `required_group` as an exact string (a group mapper that emits
+full paths needs the value with its leading `/`). The daemon names the caller
+by `email`, else `preferred_username`, else `sub`, and writes that principal
+on the per-call `blackbox::tool` log line and on a `blackbox::control`
+dispatch line. The principal is never an authorization input: surfaces still
+decide what a session sees.
+
+Keys are fetched directly from the issuer (no proxy) on the first token, not
+at startup, kept for five minutes, refetched early for an unknown `kid` at
+most every ten seconds, and kept when a refresh fails. A peer with twenty
+failed verifications in a minute is refused without verification until the
+minute ends.
+
+With OAuth configured every refusal carries the challenge
+`WWW-Authenticate: Bearer resource_metadata="<origin>/.well-known/oauth-protected-resource/mcp", scope="openid profile email groups"`,
+where `<origin>` is the audience's scheme, host and port. The daemon serves
+that protected resource metadata document (RFC 9728) without the gate:
+`resource` is the audience, `authorization_servers` names the issuer. Without
+OAuth the document is absent (404) and refusals stay bare.
+
+The realm needs a public client (PKCE, no secret) whose access tokens carry
+the audience in `aud` (an audience mapper) and the `groups` claim. A client
+configuration names that public client id and a fixed loopback callback port
+registered as the client's redirect URI; the client discovers everything else
+from the challenge and the metadata document.
+
 ### Checkout authority
 
 A daemon that holds no project checkout (the containerized corpus daemon,

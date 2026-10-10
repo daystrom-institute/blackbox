@@ -8,6 +8,17 @@ out explicitly under `Changed` or `Removed`.
 
 ## Unreleased
 
+- The `/mcp` and `/control/*` planes can admit OAuth access tokens beside the
+  service bearer. `[daemon.mcp_oauth]` (`issuer`, `audience`,
+  `required_group`, optional `jwks_uri`; `BBOX_MCP_OAUTH_ISSUER`,
+  `BBOX_MCP_OAUTH_AUDIENCE`, `BBOX_MCP_OAUTH_GROUP`) verifies RS256 tokens
+  against the issuer's key set, requires the group, and names the caller on
+  tool and control log lines. Refusals then carry a `resource_metadata`
+  challenge and the daemon serves
+  `/.well-known/oauth-protected-resource/mcp` ungated. It requires
+  `mcp_require_bearer`; a partial set is a configuration error. Without it
+  nothing changes.
+
 - HTTP task launches and resumes now report origin `control`, with the same
   interactive MCP policy. Stored `cockpit` origins remain readable. Removed
   unused cockpit dispatch/transcript types and TUI design/backlog documents;

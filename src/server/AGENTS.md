@@ -65,6 +65,19 @@
   non-loopback. The Host allowlist is rmcp's and applies to `/mcp` only.
   Nothing on `/healthz`, `/readyz`, `/tail` or `/internal/*` is gated here;
   the producer routes carry their own tokens.
+- With `[daemon.mcp_oauth]` configured (only legal with the bearer gate on),
+  the MCP gate order is fixed: loopback and trusted peers, then the service
+  bearer in constant time, then the access token (`mcp_oauth`). The service
+  bearer never reaches the JWT parser, and a peer over the failed
+  verification limit never reaches the key cache. Every refusal carries the
+  same `resource_metadata` challenge, whatever was presented; without OAuth
+  the refusal stays the bare `Bearer`. The protected resource metadata route
+  is mounted outside the gate and only when OAuth is configured.
+- Token material never reaches a log, a panic, a `Debug` rendering or an
+  error string: refusals are `mcp_oauth::Refusal` categories. The verified
+  principal rides the HTTP request extensions; `call_tool` scopes it as a
+  task-local for the per-call telemetry line, and the gate logs it on
+  `/control/*` dispatch. It is never an authorization input.
 - A refused scope (unknown surface, unauthenticated binding) must fail
   BEFORE any slot is set: resolution returns the whole scope or an error,
   and `pin_scope` sets every slot together, so no half-initialized handler
