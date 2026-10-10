@@ -79,17 +79,30 @@ pub(super) fn build_http_app(
 
     // The MCP bearer gate (`super::mcp_auth`) covers the nested `/mcp`
     // service and exactly the `/control/*` routes; off by default. A gate
-    // that is on but cannot load its token stops startup here.
-    let mcp_auth = super::mcp_auth::McpAuth::from_config(&cfg.daemon)?;
+    // that is on but cannot load its token, or OAuth configured without the
+    // gate, stops startup here.
+    let mcp_gate_state = super::mcp_auth::McpGate::from_config(&cfg.daemon)?;
     let mcp_gate = || {
         axum::middleware::from_fn_with_state(
-            mcp_auth.clone(),
+            mcp_gate_state.clone(),
             super::mcp_auth::authenticate_mcp_request,
         )
     };
     let mcp_routes = axum::Router::new()
         .nest_service("/mcp", mcp_service)
         .layer(mcp_gate());
+    // The protected resource metadata document is how an OAuth client finds
+    // the authorization server, so it is served outside the gate, and only
+    // when access tokens are admitted.
+    let oauth_metadata_routes = match mcp_gate_state.oauth() {
+        Some(oauth) => axum::Router::new()
+            .route(
+                super::mcp_oauth::METADATA_PATH,
+                axum::routing::get(super::mcp_oauth::protected_resource_metadata),
+            )
+            .with_state(oauth.clone()),
+        None => axum::Router::new(),
+    };
     // Generic orchestration control plane. These are thin HTTP adapters over
     // the `bro_*` dispatch/control tools, shared by every external driver
     // (the fleet client, future bridges). The canonical namespace is
@@ -150,7 +163,8 @@ pub(super) fn build_http_app(
         .merge(super::git_source::router(shared.clone()))
         .merge(super::knowledge_source::router(shared.clone()))
         .with_state(shared)
-        .merge(mcp_routes))
+        .merge(mcp_routes)
+        .merge(oauth_metadata_routes))
 }
 
 #[cfg(test)]

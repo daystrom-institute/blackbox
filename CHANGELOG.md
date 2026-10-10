@@ -8,6 +8,17 @@ out explicitly under `Changed` or `Removed`.
 
 ## Unreleased
 
+- The `/mcp` and `/control/*` planes can admit OAuth access tokens beside the
+  service bearer. `[daemon.mcp_oauth]` (`issuer`, `audience`,
+  `required_group`, optional `jwks_uri`; `BBOX_MCP_OAUTH_ISSUER`,
+  `BBOX_MCP_OAUTH_AUDIENCE`, `BBOX_MCP_OAUTH_GROUP`) verifies RS256 tokens
+  against the issuer's key set, requires the group, and names the caller on
+  tool and control log lines. Refusals then carry a `resource_metadata`
+  challenge and the daemon serves
+  `/.well-known/oauth-protected-resource/mcp` ungated. It requires
+  `mcp_require_bearer`; a partial set is a configuration error. Without it
+  nothing changes.
+
 - The daemon can serve a read-only operator web UI on a loopback-only
   listener (`daemon.ui_listen`, `BBOX_UI_LISTEN`) behind an identity proxy
   that forwards `X-Forwarded-Email`. It renders the page shell and an
