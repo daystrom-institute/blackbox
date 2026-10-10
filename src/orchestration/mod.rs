@@ -4365,10 +4365,17 @@ fn build_claude_mcp_config(
         };
         server.remove("exclude_tools");
         if let Some(headers) = server.get_mut("headers").and_then(Value::as_object_mut) {
-            for value in headers.values_mut() {
-                if let Some(reference) = value.as_str().and_then(|s| s.strip_prefix("$env:")) {
-                    *value = Value::String(format!("${{{reference}}}"));
-                }
+            for (name, value) in headers.iter_mut() {
+                let Some(reference) = value.as_str().and_then(|s| s.strip_prefix("$env:")) else {
+                    continue;
+                };
+                // The daemon's MCP gate reads the `Bearer` scheme; the other
+                // headers are verified raw.
+                *value = if name.eq_ignore_ascii_case("authorization") {
+                    Value::String(format!("Bearer ${{{reference}}}"))
+                } else {
+                    Value::String(format!("${{{reference}}}"))
+                };
             }
         }
     }
@@ -6129,7 +6136,7 @@ mod tests {
         if worker_mcp_bearer().is_some() {
             assert_eq!(
                 config["mcpServers"]["selfbox"]["headers"]["Authorization"],
-                format!("${{{WORKER_MCP_BEARER_ENV}}}")
+                format!("Bearer ${{{WORKER_MCP_BEARER_ENV}}}")
             );
         }
         // Build env rides the process env; the config dir and cwd ride their
