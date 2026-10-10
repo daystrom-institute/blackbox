@@ -33,9 +33,9 @@ not listed here.
 | `BBOX_BIND` | Bind address | `127.0.0.1` | `127.0.0.1` |
 | `BLACKBOX_MCP_NAME` | MCP server name advertised to clients | `blackbox` | `blackbox-dev-throwaway` |
 
-`BBOX_PORT` controls the loopback fallback for `bro`. MCP calls and guidance
-rendering can also use a configured remote URL, so pass `--daemon-url` explicitly
-when connecting those commands to an isolated daemon.
+The `bro` loopback fallback reads `[daemon].port` from its selected config.
+MCP calls and guidance rendering can also use a configured remote URL, so pass
+`--daemon-url` explicitly when connecting those commands to an isolated daemon.
 
 ### State isolation
 
