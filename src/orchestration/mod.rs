@@ -7417,12 +7417,14 @@ mod tests {
             )
             .unwrap();
         drop(events_tx);
-        outcome_tx
-            .send(executor::WorkerOutcome {
-                exit_code: Some(0),
-                stderr: String::new(),
-            })
-            .unwrap();
+        assert!(
+            outcome_tx
+                .send(executor::WorkerOutcome {
+                    exit_code: Some(0),
+                    stderr: String::new(),
+                })
+                .is_ok()
+        );
         assert!(wait_for_task_with_timeout(&task, Some(2.0)).await);
         assert_eq!(task.inner.lock().status, TaskStatus::Completed);
         assert_eq!(

@@ -315,7 +315,7 @@ pub struct EffortInfo {
 #[serde(rename_all = "snake_case")]
 pub enum PromptCacheCapability {
     /// Anthropic Messages-compatible `cache_control` breakpoints are emitted by
-    /// `bro-harness` and cache read/write counters are parsed when returned.
+    /// the provider runtime; cache read/write counters are parsed when returned.
     AnthropicCacheControl,
     /// OpenAI Responses-style server-side prompt caching reports cached input in
     /// `input_tokens_details.cached_tokens`; no explicit breakpoint is sent.

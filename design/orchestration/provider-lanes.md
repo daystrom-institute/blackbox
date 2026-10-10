@@ -83,9 +83,10 @@ and `--strict-mcp-config` keeps the config dir's own MCP servers out of the
 dispatch. Header secrets are `${VAR}` references expanded by the CLI from the
 child env; argv never carries a bearer. There are no flat capability aliases:
 tools are reached by their qualified `mcp__<server>__<tool>` names, and the
-deny filters use those names on `--disallowedTools`. Global tool allowlists
-are rejected before launch: `--allowedTools` grants permissions rather than
-restricting availability, and `--tools` only selects built-in tools.
+deny filters use those names on `--disallowedTools`. An allowlist combines
+`--tools` for built-ins with denials for unlisted daemon MCP tools. Because
+external server catalogs are not known here, a restricted dispatch refuses
+those servers before launch.
 
 ### Dispatch context
 
