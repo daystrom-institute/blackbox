@@ -662,9 +662,19 @@ pub(super) fn open_shared_state(
         }
     }
     let task_ttl = cfg.daemon.task_ttl_ms;
-    let task_store = TaskStore::load(&store_dir, task_ttl);
     let (tail_tx, _) = broadcast::channel::<TailEvent>(1024);
     let (roster_tx, _) = broadcast::channel::<bro_protocol::RosterDelta>(1024);
+    let roster_version = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let roster_view = Arc::new(orchestration::RosterView::new());
+    let task_store = TaskStore::load_with_roster_events(
+        &store_dir,
+        task_ttl,
+        Some(orchestration::RosterEventSink::with_view(
+            roster_version.clone(),
+            roster_tx.clone(),
+            roster_view.clone(),
+        )),
+    );
     let code_sources = Arc::new(super::code_source::CodeSourceRuntime::open(
         &cfg,
         &records_provider.records_snapshot().records,
@@ -906,9 +916,9 @@ pub(super) fn open_shared_state(
         code_view_refresh_nudge_rx: std::sync::Mutex::new(Some(code_view_refresh_nudge_rx)),
         task_store: Arc::new(RwLock::new(task_store)),
         tail_tx,
-        roster_version: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        roster_version,
         roster_tx,
-        roster_view: Arc::new(orchestration::RosterView::new()),
+        roster_view,
         store_dir: store_dir.clone(),
 
         resume_leases: Arc::new(orchestration::resume_lease::ResumeLeaseRegistry::new()),

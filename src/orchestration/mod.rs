@@ -2125,6 +2125,15 @@ impl TaskStore {
     /// reserve their IDs; invalid snapshots or failed exact-byte quarantine
     /// disable persistence so later writes cannot erase the input evidence.
     pub fn load(store_dir: &std::path::Path, ttl_ms: u64) -> Self {
+        Self::load_with_roster_events(store_dir, ttl_ms, None)
+    }
+
+    /// Restored workers publish to the same roster as newly dispatched ones.
+    pub(crate) fn load_with_roster_events(
+        store_dir: &std::path::Path,
+        ttl_ms: u64,
+        roster_events: Option<RosterEventSink>,
+    ) -> Self {
         let file = store_dir.join("tasks.json");
         let mut store = Self::new();
         let data = match std::fs::read(&file) {
@@ -2275,7 +2284,7 @@ impl TaskStore {
                 }),
                 notify: Arc::new(Notify::new()),
                 child_id: Mutex::new(None),
-                roster_events: None,
+                roster_events: roster_events.clone(),
             });
             store.insert_loaded(rec.id, task);
         }
@@ -7325,21 +7334,24 @@ mod tests {
             .write()
             .insert_reserved("adopt-task".to_string(), task.clone())
             .ok();
-        {
-            // Exactly the state `TaskStore::load` leaves behind for a task
-            // that was running when the daemon went down.
-            let mut inner = task.inner.lock();
-            inner.status = TaskStatus::Failed;
-            inner.recoverable = true;
-            inner.completed_at = Some(now_ms());
-            inner.harness_ingest_seq = 12;
-            inner.stderr.push_str(
-                "\n[blackbox] server restarted while task was running. \
-                 The provider session is still on disk; retry with \
-                 `bro_resume(session_id=...)` to continue the conversation \
-                 rather than starting a fresh session.",
-            );
-        }
+        task.inner.lock().harness_ingest_seq = 12;
+        store.read().persist(&root);
+        let view = Arc::new(RosterView::new());
+        let (roster_tx, _roster_rx) = tokio::sync::broadcast::channel(32);
+        let loaded = TaskStore::load_with_roster_events(
+            &root,
+            86_400_000,
+            Some(RosterEventSink::with_view(
+                Arc::new(AtomicU64::new(0)),
+                roster_tx,
+                view.clone(),
+            )),
+        );
+        view.rebuild_from_store(&loaded);
+        let task = loaded.get("adopt-task").unwrap();
+        let store = Arc::new(RwLock::new(loaded));
+        assert_eq!(task.inner.lock().status, TaskStatus::Failed);
+        assert!(task.inner.lock().recoverable);
 
         install_harness_executor(
             bbox_config::config::ExecutorKind::Local,
@@ -7350,8 +7362,8 @@ mod tests {
         );
 
         let (control_tx, _control_rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
-        let (_events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        let (_outcome_tx, outcome_rx) = tokio::sync::oneshot::channel();
+        let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (outcome_tx, outcome_rx) = tokio::sync::oneshot::channel();
         let cursor = readopt_harness_session(ReadoptedSession {
             session_id: "adopt-session".to_string(),
             task_id: "adopt-task".to_string(),
@@ -7393,6 +7405,29 @@ mod tests {
         assert!(
             harness_killers().read().contains_key("adopt-task"),
             "cancel must reach the re-adopted child"
+        );
+        assert_eq!(view.snapshot()[0].status, bro_protocol::TaskStatus::Running);
+        events_tx
+            .send(
+                serde_json::json!({
+                    "type":"result", "subtype":"success", "is_error":false,
+                    "session_id":"adopt-session", "seq":13, "result":"recovered",
+                })
+                .to_string(),
+            )
+            .unwrap();
+        drop(events_tx);
+        outcome_tx
+            .send(executor::WorkerOutcome {
+                exit_code: Some(0),
+                stderr: String::new(),
+            })
+            .unwrap();
+        assert!(wait_for_task_with_timeout(&task, Some(2.0)).await);
+        assert_eq!(task.inner.lock().status, TaskStatus::Completed);
+        assert_eq!(
+            view.snapshot()[0].status,
+            bro_protocol::TaskStatus::Completed
         );
     }
 

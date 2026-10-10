@@ -8,6 +8,9 @@ out explicitly under `Changed` or `Removed`.
 
 ## Unreleased
 
+- Tasks restored after daemon restart keep publishing roster updates through
+  recovery and completion, so dashboard status agrees with task status.
+
 - Dispatch errors include the worker startup failure instead of reporting an
   expired session handshake when the worker has already stopped. Transcript
   diagnostics identify the daemon that owns the stored receipt path.
