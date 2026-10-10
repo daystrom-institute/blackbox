@@ -130,11 +130,9 @@ fn print_outcomes(
             Some(backup) => println!("{prefix}{} (backup: {backup})", outcome.summary),
             None => println!("{prefix}{}", outcome.summary),
         }
-        if check {
-            if let Some(block) = &outcome.managed_block {
-                println!("--- proposed managed region for {} ---", outcome.path);
-                println!("{block}");
-            }
+        if check && let Some(block) = &outcome.managed_block {
+            println!("--- proposed managed region for {} ---", outcome.path);
+            println!("{block}");
         }
     }
     for diagnostic in &plan.diagnostics {

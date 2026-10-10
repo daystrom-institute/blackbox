@@ -209,7 +209,7 @@ state dir so it never touches the deployed daemon's state. See
 ~/.local/
 ├── bin/                        # checkout-host satellites and CLIs
 │   ├── blackbox                # offline administration CLI
-│   ├── bro                     # terminal TUI client
+│   ├── bro                     # headless daemon client
 │   ├── bro-harness             # model-turn runtime, exec'd by fleetd
 │   ├── fleetd                  # fleet supervisor
 │   ├── bbox-code-collector

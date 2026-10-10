@@ -18,7 +18,7 @@ struct TailSelectors {
 #[derive(Debug, Parser)]
 #[command(
     name = "bro",
-    about = "Terminal client for blackbox orchestration",
+    about = "Headless client for blackbox orchestration",
     version
 )]
 struct BroCli {

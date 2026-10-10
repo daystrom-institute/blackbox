@@ -369,12 +369,12 @@ fn print_content(result: &Value) -> anyhow::Result<bool> {
 
     let mut printed = false;
     for item in content {
-        if item.get("type").and_then(Value::as_str) == Some("text") {
-            if let Some(text) = item.get("text").and_then(Value::as_str) {
-                print_text(text);
-                printed = true;
-                continue;
-            }
+        if item.get("type").and_then(Value::as_str) == Some("text")
+            && let Some(text) = item.get("text").and_then(Value::as_str)
+        {
+            print_text(text);
+            printed = true;
+            continue;
         }
         println!("{}", pretty_json(item)?);
         printed = true;
