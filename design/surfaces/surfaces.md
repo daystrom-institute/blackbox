@@ -4,7 +4,7 @@ kind: design-hub
 corpus: blackbox-design
 topic:
   - surfaces
-brief: "Hub for Blackbox operator and agent-facing surfaces: MCP, workspace tools, and provider transcript read planes."
+brief: "Hub for Blackbox operator and agent-facing surfaces: MCP, workspace tools, provider transcript read planes, and the operator web UI."
 ---
 
 # Surfaces
@@ -18,6 +18,7 @@ callers reimplement corpus or orchestration policy.
 - [MCP Surfaces](mcp/mcp-surfaces-hub.md)
 - [Workspace Tools](workspace-tools/workspace-tools.md)
 - [Provider Transcript Read Plane](provider-transcripts/provider-transcript-read-plane-hub.md)
+- [Operator Web UI](web-ui/web-ui.md)
 
 ## Crosscuts
 
