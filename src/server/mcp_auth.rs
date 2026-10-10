@@ -15,20 +15,31 @@
 //! forwarded client from another; through an ingress the bearer is the
 //! whole gate. `X-Forwarded-For` is deliberately not read.
 //!
+//! With `[daemon.mcp_oauth]` configured (which requires the gate on), a
+//! request the peer and service bearer checks decline is offered to the
+//! access token verifier (`super::mcp_oauth`): the order is loopback and
+//! trusted peers, then the service bearer, then the token. An admitted token
+//! names a principal, which rides the request extensions. Every refusal then
+//! carries a challenge naming the protected resource metadata document and
+//! the scopes, the same challenge whatever was presented, instead of the
+//! bare `Bearer`.
+//!
 //! The gate is mounted over the nested `/mcp` service and over exactly the
 //! `/control/*` routes (`super::mcp::build_http_app`). It never covers
-//! `/healthz`, `/readyz`, `/tail`, `/internal/*`, or `/admin/*`, which has
-//! its own gate (`super::admin_auth`).
+//! `/healthz`, `/readyz`, `/tail`, `/internal/*`, the protected resource
+//! metadata document, or `/admin/*`, which has its own gate
+//! (`super::admin_auth`).
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use axum::extract::{ConnectInfo, Request, State};
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use bro_rpc::ServiceToken;
 
+use super::mcp_oauth::McpOAuth;
 use crate::config::DaemonConfig;
 
 /// One trusted peer network, `address/prefix`.
@@ -151,6 +162,50 @@ impl McpAuth {
     }
 }
 
+/// The gate as mounted: the peer and service bearer authority, and the
+/// access token verifier when `[daemon.mcp_oauth]` is configured.
+#[derive(Clone, Default)]
+pub(crate) struct McpGate {
+    auth: McpAuth,
+    oauth: Option<McpOAuth>,
+}
+
+impl McpGate {
+    /// Resolve the gate from configuration. Access tokens are an addition
+    /// to the bearer gate, so `[daemon.mcp_oauth]` with the gate off is a
+    /// startup error rather than a configuration that admits everyone.
+    pub(super) fn from_config(cfg: &DaemonConfig) -> anyhow::Result<Self> {
+        let auth = McpAuth::from_config(cfg)?;
+        let oauth = match &cfg.mcp_oauth {
+            None => None,
+            Some(_) if !auth.enabled() => anyhow::bail!(
+                "daemon.mcp_oauth is set but daemon.mcp_require_bearer (BBOX_MCP_REQUIRE_BEARER) is off"
+            ),
+            Some(oauth) => Some(McpOAuth::from_config(oauth)?),
+        };
+        Ok(Self { auth, oauth })
+    }
+
+    /// The access token verifier, when configured.
+    pub(crate) fn oauth(&self) -> Option<&McpOAuth> {
+        self.oauth.as_ref()
+    }
+
+    /// The refusal: the OAuth challenge when tokens are admitted, else the
+    /// bare scheme. Neither carries a code or a sentence.
+    fn refusal(&self) -> Response {
+        let challenge = self.oauth.as_ref().map_or_else(
+            || HeaderValue::from_static("Bearer"),
+            |oauth| oauth.challenge().clone(),
+        );
+        (
+            StatusCode::UNAUTHORIZED,
+            [(header::WWW_AUTHENTICATE, challenge)],
+        )
+            .into_response()
+    }
+}
+
 /// The credentials of an `Authorization` value in the `Bearer` scheme: the
 /// scheme name is case-insensitive (RFC 7235) and is followed by exactly one
 /// space; anything else is not a bearer at all.
@@ -167,8 +222,8 @@ fn bearer_credentials(value: &str) -> Option<&str> {
 
 /// The layer over `/mcp` and `/control/*`.
 pub(crate) async fn authenticate_mcp_request(
-    State(auth): State<McpAuth>,
-    request: Request,
+    State(gate): State<McpGate>,
+    mut request: Request,
     next: Next,
 ) -> Response {
     // A missing peer address is non-loopback: the daemon serves with
@@ -182,16 +237,39 @@ pub(crate) async fn authenticate_mcp_request(
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(bearer_credentials);
-    if auth.admits(peer, bearer) {
+    if gate.auth.admits(peer, bearer) {
         return next.run(request).await;
     }
-    // Bare: no code, no sentence. The refused caller learns the scheme and
-    // nothing about what was expected.
-    (
-        StatusCode::UNAUTHORIZED,
-        [(header::WWW_AUTHENTICATE, "Bearer")],
-    )
-        .into_response()
+    let (Some(oauth), Some(token)) = (gate.oauth.as_ref(), bearer) else {
+        // The refused caller learns the scheme and nothing about what was
+        // expected.
+        return gate.refusal();
+    };
+    match oauth.verify(peer, token).await {
+        Ok(principal) => {
+            if request.uri().path().starts_with("/control/") {
+                tracing::info!(
+                    target: "blackbox::control",
+                    method = %request.method(),
+                    path = request.uri().path(),
+                    principal = principal.as_str(),
+                    "dispatch"
+                );
+            }
+            request.extensions_mut().insert(principal);
+            next.run(request).await
+        }
+        Err(reason) => {
+            // The reason is a category; the token never reaches the log.
+            tracing::debug!(
+                target: "blackbox::mcp_auth",
+                peer = ?peer.map(|peer| peer.ip()),
+                %reason,
+                "access token refused"
+            );
+            gate.refusal()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -413,6 +491,274 @@ mod tests {
         cfg.mcp_require_bearer = false;
         cfg.service_token_file = None;
         assert!(!McpAuth::from_config(&cfg).unwrap().enabled());
+    }
+
+    use crate::server::mcp_oauth::test_support::{
+        AUDIENCE, KID, TestIssuer, now, sign, sign_hs256, unsigned,
+    };
+
+    /// An app with the gate on and access tokens admitted from `issuer`,
+    /// plus the service secret.
+    fn oauth_app(issuer: &TestIssuer) -> (axum::Router, String, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = Arc::new(SharedState::for_test(dir.path()));
+        let mut cfg = shared.config.read().clone();
+        let token_file = dir.path().join("service.token");
+        let secret = ServiceToken::load_or_create(&token_file)
+            .unwrap()
+            .expose_secret()
+            .to_string();
+        cfg.daemon.mcp_require_bearer = true;
+        cfg.daemon.service_token_file = Some(token_file);
+        cfg.daemon.mcp_oauth = Some(issuer.config());
+        let app = crate::server::mcp::build_http_app(
+            shared,
+            &cfg,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .unwrap();
+        (app, secret, dir)
+    }
+
+    fn gated_paths() -> Vec<(Method, &'static str, String)> {
+        vec![
+            (Method::POST, "/mcp?surface=readonly", initialize()),
+            (Method::POST, "/mcp?surface=readonly", sessionless_list()),
+            (Method::GET, "/mcp", String::new()),
+            (Method::DELETE, "/mcp", String::new()),
+            (Method::POST, "/control/exec", "{}".into()),
+            (Method::POST, "/control/resume", "{}".into()),
+            (Method::POST, "/control/closeout", "{}".into()),
+            (Method::POST, "/control/steer", "{}".into()),
+            (Method::POST, "/control/interrupt", "{}".into()),
+            (Method::GET, "/control/status/no-such-task", String::new()),
+            (Method::GET, "/control/roster", String::new()),
+            (
+                Method::DELETE,
+                "/control/roster/no-such-task",
+                String::new(),
+            ),
+            (Method::GET, "/control/roster/stream", String::new()),
+            (Method::GET, "/control/dashboard", String::new()),
+            (Method::POST, "/control/cancel", "{}".into()),
+        ]
+    }
+
+    /// The status and `WWW-Authenticate` value of one request; a refusal
+    /// carries no body.
+    async fn challenged(
+        app: &axum::Router,
+        request: Request<Body>,
+    ) -> (StatusCode, Option<String>) {
+        let response = app.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let challenge = response
+            .headers()
+            .get(header::WWW_AUTHENTICATE)
+            .map(|value| value.to_str().unwrap().to_string());
+        if status == StatusCode::UNAUTHORIZED {
+            let bytes = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            assert!(bytes.is_empty(), "a refusal carries no body");
+        }
+        (status, challenge)
+    }
+
+    /// With OAuth configured, a remote peer's valid access token is admitted
+    /// on every gated path beside the service bearer, and every invalid
+    /// token, like no bearer at all, is refused with the resource challenge.
+    #[tokio::test]
+    async fn with_oauth_a_valid_token_passes_every_mcp_and_control_path() {
+        let issuer = TestIssuer::start(&[KID]).await;
+        let (app, secret, _dir) = oauth_app(&issuer);
+        let expected = Some(
+            "Bearer resource_metadata=\"https://corpus.example.test:7264/.well-known/oauth-protected-resource/mcp\", scope=\"openid profile email groups\""
+                .to_string(),
+        );
+        let claims = issuer.claims();
+        let edited = |edits: serde_json::Value| {
+            let mut claims = claims.clone();
+            for (key, value) in edits.as_object().unwrap() {
+                claims[key] = value.clone();
+            }
+            sign(KID, &claims)
+        };
+        let refused_tokens = [
+            (
+                "wrong issuer",
+                edited(serde_json::json!({ "iss": "https://elsewhere.example.test/realms/test" })),
+            ),
+            (
+                "wrong audience",
+                edited(serde_json::json!({ "aud": "https://other.example.test/mcp" })),
+            ),
+            (
+                "missing group",
+                edited(serde_json::json!({ "groups": ["other"] })),
+            ),
+            ("expired", edited(serde_json::json!({ "exp": now() - 120 }))),
+            (
+                "not yet valid",
+                edited(serde_json::json!({ "nbf": now() + 120 })),
+            ),
+            ("unknown kid", sign("no-such-key", &claims)),
+            ("HS256", sign_hs256(KID, &claims)),
+            ("alg none", unsigned(KID, &claims)),
+            ("service bearer prefix", secret[..63].to_string()),
+        ];
+        let token = issuer.token();
+        for (index, (method, uri, body)) in gated_paths().iter().enumerate() {
+            // One peer per path keeps each under the failure limit.
+            let peer = SocketAddr::new(
+                IpAddr::V4(std::net::Ipv4Addr::new(10, 42, 1, index as u8 + 1)),
+                51000,
+            );
+            let none = challenged(&app, request(method.clone(), uri, Some(peer), None, body)).await;
+            assert_eq!(
+                none,
+                (StatusCode::UNAUTHORIZED, expected.clone()),
+                "{method} {uri}"
+            );
+            for (case, bad) in &refused_tokens {
+                let refused = challenged(
+                    &app,
+                    request(method.clone(), uri, Some(peer), Some(bad), body),
+                )
+                .await;
+                assert_eq!(
+                    refused,
+                    (StatusCode::UNAUTHORIZED, expected.clone()),
+                    "{method} {uri} {case}"
+                );
+            }
+            for (case, admitted) in [
+                (
+                    "token",
+                    request(method.clone(), uri, Some(peer), Some(&token), body),
+                ),
+                (
+                    "service bearer",
+                    request(method.clone(), uri, Some(peer), Some(&secret), body),
+                ),
+                (
+                    "loopback",
+                    request(method.clone(), uri, Some(LOOPBACK), None, body),
+                ),
+            ] {
+                let (status, _) = challenged(&app, admitted).await;
+                assert_ne!(status, StatusCode::UNAUTHORIZED, "{method} {uri} {case}");
+            }
+        }
+    }
+
+    /// The protected resource metadata document is served to anyone when
+    /// OAuth is configured and is absent otherwise.
+    #[tokio::test]
+    async fn the_metadata_document_is_ungated_and_absent_without_oauth() {
+        let issuer = TestIssuer::start(&[KID]).await;
+        let (oauth_router, _secret, _dir) = oauth_app(&issuer);
+        let get = || {
+            request(
+                Method::GET,
+                "/.well-known/oauth-protected-resource/mcp",
+                Some(REMOTE),
+                None,
+                "",
+            )
+        };
+        let response = oauth_router.oneshot(get()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        let document: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            document,
+            serde_json::json!({
+                "resource": AUDIENCE,
+                "authorization_servers": [issuer.issuer],
+                "bearer_methods_supported": ["header"],
+                "scopes_supported": ["openid", "profile", "email", "groups"],
+                "resource_name": "blackboxd MCP",
+            })
+        );
+        // Serving the document fetched nothing from the issuer.
+        assert_eq!((issuer.discovery_hits(), issuer.jwks_hits()), (0, 0));
+        for gate in [true, false] {
+            let (bare_router, _secret, _dir) = app(gate);
+            let response = bare_router.oneshot(get()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "gate {gate}");
+        }
+    }
+
+    /// Access tokens add to the bearer gate; configuring them with the gate
+    /// off is a startup error, never a daemon that admits everyone while
+    /// advertising OAuth.
+    #[tokio::test]
+    async fn oauth_needs_the_bearer_gate_on() {
+        let issuer = TestIssuer::start(&[KID]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let shared = SharedState::for_test(dir.path());
+        let mut cfg = shared.config.read().daemon.clone();
+        cfg.mcp_oauth = Some(issuer.config());
+        let error = McpGate::from_config(&cfg)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap();
+        assert!(error.contains("mcp_require_bearer"), "{error}");
+    }
+
+    /// The verified principal reaches the handler through the request
+    /// extensions; the service bearer and loopback name none.
+    #[tokio::test]
+    async fn the_principal_rides_the_request_extensions() {
+        let issuer = TestIssuer::start(&[KID]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let shared = SharedState::for_test(dir.path());
+        let mut cfg = shared.config.read().daemon.clone();
+        let token_file = dir.path().join("service.token");
+        let secret = ServiceToken::load_or_create(&token_file)
+            .unwrap()
+            .expose_secret()
+            .to_string();
+        cfg.mcp_require_bearer = true;
+        cfg.service_token_file = Some(token_file);
+        cfg.mcp_oauth = Some(issuer.config());
+        let gate = McpGate::from_config(&cfg).unwrap();
+        let app =
+            axum::Router::new()
+                .route(
+                    "/control/whoami",
+                    axum::routing::get(
+                        |principal: Option<
+                            axum::Extension<crate::server::mcp_oauth::McpPrincipal>,
+                        >| async move {
+                            principal.map(|p| p.0.to_string()).unwrap_or_default()
+                        },
+                    ),
+                )
+                .route_layer(axum::middleware::from_fn_with_state(
+                    gate,
+                    authenticate_mcp_request,
+                ));
+        let token = issuer.token();
+        for (peer, bearer, expected) in [
+            (Some(REMOTE), Some(token.as_str()), "operator@example.test"),
+            (Some(REMOTE), Some(secret.as_str()), ""),
+            (Some(LOOPBACK), Some(token.as_str()), ""),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(request(Method::GET, "/control/whoami", peer, bearer, ""))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            assert_eq!(std::str::from_utf8(&bytes).unwrap(), expected);
+        }
     }
 
     #[test]
