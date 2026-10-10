@@ -285,18 +285,31 @@ pub async fn spawn_worker(spec: WorkerSpawnSpec) -> anyhow::Result<WorkerChild> 
         spawn_control_writer(spec.session_id.clone(), stdin, control_rx);
     }
 
-    // Event lane: raw stdout lines out for relay. No tee here: teeing is a
-    // daemon-side transcript concern, and the harness child already writes
-    // its own durable event log under the spec's BRO_HOME.
+    // Event lane: raw stdout lines out for relay. No debugging tee here: that
+    // is a daemon-side transcript concern. A worker that writes no session
+    // log of its own gets one at the spec's pinned path, so the durable log
+    // the replay window and the cockpit read exists on this host either way.
     let (events_tx, events_rx) = mpsc::unbounded_channel::<String>();
     let (stdout_done_tx, stdout_done_rx) = oneshot::channel::<()>();
+    let session_log = if spec.supervisor_writes_event_log {
+        bro_protocol::SessionLogWriter::open(&spec.event_log_path).await
+    } else {
+        None
+    };
     if let Some(stdout) = stdout {
         tokio::spawn(async move {
             let mut lines = tokio::io::BufReader::new(stdout).lines();
+            let mut session_log = session_log;
             while let Ok(Some(line)) = lines.next_line().await {
+                if let Some(log) = session_log.as_mut() {
+                    log.record_line(&line).await;
+                }
                 if events_tx.send(line).is_err() {
                     break;
                 }
+            }
+            if let Some(log) = session_log.as_mut() {
+                log.finish().await;
             }
             let _ = stdout_done_tx.send(());
         });
@@ -585,6 +598,7 @@ mod tests {
             initial_messages: vec![],
             bro_home: PathBuf::from("/state/bro"),
             event_log_path: PathBuf::from("/state/bro/sess-1.events.jsonl"),
+            supervisor_writes_event_log: false,
         }
     }
 }

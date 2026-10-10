@@ -9,8 +9,11 @@ use serde::{Deserialize, Serialize};
 mod dispatch;
 mod dispatch_context;
 mod fleetd;
+mod session_log;
 mod transcript;
 mod worker;
+
+pub use session_log::{SessionLogWriter, rfc3339_millis, session_log_record};
 
 pub use dispatch::{
     CloseoutErrorClass, CloseoutHooksWire, CloseoutOutcome, CloseoutPhase, CloseoutRequest,

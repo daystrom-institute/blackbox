@@ -227,15 +227,9 @@ impl CodeMode {
 /// in v1. Only surviving harness providers advertise this; removed CLI-backed
 /// providers fail closed before environment or arg construction.
 pub fn provider_supports_defaults_suppression(provider: Provider) -> bool {
-    matches!(
-        provider,
-        Provider::Glm
-            | Provider::Deepseek
-            | Provider::Minimax
-            | Provider::Kimi
-            | Provider::Brodex
-            | Provider::VibeBh
-    )
+    // The claude CLI honors `--system-prompt ""`; the harness honors the same
+    // flag on every transport.
+    provider.is_dispatchable()
 }
 
 /// Reject dispatch when the brofile demands suppression the provider
@@ -744,47 +738,18 @@ fn prepare_codex_suppressed_home(base_home: &Path, store_dir: &Path) -> std::io:
     Ok(overlay)
 }
 
-/// Harness env for the Anthropic-transport providers (GLM, DeepSeek, MiniMax,
-/// Kimi). These no longer run the `claude` CLI; they run `bro-harness`, which
-/// reads `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN` from its own env. We lift
-/// those out of the operator's existing `~/.claude-{zai,ds,mm,k}/settings.json`
-/// `env` block (the same credentials the CLI used) and select the transport.
-fn default_claude_compatible_env(
-    provider: Provider,
-    home_dir: &Path,
-    materialize_on_worker: bool,
-) -> Option<HashMap<String, String>> {
-    let rel_path = match provider {
-        Provider::Glm => ".claude-zai",
-        Provider::Deepseek => ".claude-ds",
-        Provider::Minimax => ".claude-mm",
-        Provider::Kimi => ".claude-k",
-        _ => return None,
-    };
-    let mut env = HashMap::from([("BRO_HARNESS_TRANSPORT".to_string(), "anthropic".to_string())]);
-
-    let settings = home_dir.join(rel_path).join("settings.json");
-    if materialize_on_worker {
-        env.insert(
-            "BRO_HARNESS_LOCAL_SETTINGS_FILE".to_string(),
-            settings.to_string_lossy().into_owned(),
-        );
-        return Some(env);
-    }
-    if let Ok(body) = std::fs::read_to_string(&settings)
-        && let Ok(v) = serde_json::from_str::<serde_json::Value>(&body)
-    {
-        for key in [
-            "ANTHROPIC_BASE_URL",
-            "ANTHROPIC_AUTH_TOKEN",
-            "ANTHROPIC_API_KEY",
-        ] {
-            if let Some(val) = v["env"][key].as_str() {
-                env.insert(key.to_string(), val.to_string());
-            }
-        }
-    }
-    Some(env)
+/// Child env for the claude-lane providers that ride a dedicated config dir
+/// (GLM, DeepSeek, MiniMax, Kimi). The `claude` CLI reads the endpoint,
+/// credentials and model slots from that dir's own `settings.json`, exactly as
+/// the operator's terminal aliases do, so the daemon names the dir and lifts
+/// nothing out of it. The path resolves against the execution home: a
+/// worker-local home when fleetd runs off host.
+fn claude_config_dir_env(provider: Provider, home_dir: &Path) -> Option<HashMap<String, String>> {
+    let rel_path = provider.claude_config_dir_name()?;
+    Some(HashMap::from([(
+        "CLAUDE_CONFIG_DIR".to_string(),
+        home_dir.join(rel_path).to_string_lossy().into_owned(),
+    )]))
 }
 
 /// Harness env for the vibe-bh provider — Mistral on the OpenAI
@@ -892,6 +857,11 @@ fn synthesized_account_env_for_home(
 
     let (env_key, rel_path) = match provider {
         Provider::Brodex => ("CODEX_HOME", format!(".codex{suffix}")),
+        // The default Claude account is the CLI's own `~/.claude`; naming it
+        // explicitly would only shadow a config dir the operator may have
+        // relocated. Secondary accounts live in `~/.claude-account<N>`.
+        Provider::Claude if suffix.is_empty() => return None,
+        Provider::Claude => ("CLAUDE_CONFIG_DIR", format!(".claude{suffix}")),
         // GLM/DeepSeek/MiniMax/Kimi inherit credentials from fixed
         // Claude-compatible config dirs; vibe-bh authenticates via
         // MISTRAL_API_KEY, not accounts.
@@ -958,9 +928,13 @@ fn resolve_provider_env_for_locality(
         .map(|locality| locality.home.clone())
         .or_else(dirs::home_dir);
     let mut env = match provider {
+        // The claude lane needs no transport env: `CLAUDE_CONFIG_DIR` (or the
+        // CLI's default `~/.claude` for the primary Claude account) carries
+        // endpoint and credentials.
+        Provider::Claude => HashMap::new(),
         Provider::Glm | Provider::Deepseek | Provider::Minimax | Provider::Kimi => execution_home
             .as_deref()
-            .and_then(|home| default_claude_compatible_env(provider, home, materialize_on_worker))
+            .and_then(|home| claude_config_dir_env(provider, home))
             .unwrap_or_default(),
         // Brodex rides the harness on the OpenAI Responses transport against
         // the Codex/ChatGPT backend; CODEX_HOME (for OAuth) is supplied by the
@@ -1402,7 +1376,7 @@ mod tests {
             include_str!("../../system-defaults/brofiles/refactor/rust-refactor-persona.json");
         let bf: Brofile = serde_json::from_str(src).expect("rust-refactor-persona parses");
         assert_eq!(bf.name, "rust-refactor-persona");
-        assert_eq!(bf.provider, Provider::Glm);
+        assert_eq!(bf.provider, Provider::Claude);
         assert_eq!(
             bf.context.as_ref().and_then(|c| c.provider_defaults),
             Some(ProviderDefaultsMode::SuppressWhenSupported)
@@ -1897,7 +1871,12 @@ mod tests {
             resolve_provider_env(Provider::Glm, Some("account2"), None, store.path(), None)
                 .unwrap();
         assert_eq!(resolved.get("EXTRA_FLAG").map(String::as_str), Some("1"));
-        assert!(!resolved.contains_key("CLAUDE_CONFIG_DIR"));
+        // GLM's config dir is fixed; the account name never rewrites it.
+        assert!(
+            resolved
+                .get("CLAUDE_CONFIG_DIR")
+                .is_some_and(|path| path.ends_with("/.claude-zai"))
+        );
     }
 
     #[test]
@@ -1937,7 +1916,11 @@ mod tests {
 
         let resolved = resolve_provider_env(Provider::Glm, None, None, store.path(), None).unwrap();
         assert_eq!(resolved.get("EXTRA_FLAG").map(String::as_str), Some("1"));
-        assert!(!resolved.contains_key("CLAUDE_CONFIG_DIR"));
+        assert!(
+            resolved
+                .get("CLAUDE_CONFIG_DIR")
+                .is_some_and(|path| path.ends_with("/.claude-zai"))
+        );
     }
 
     #[test]
@@ -1948,13 +1931,46 @@ mod tests {
         let resolved = with_fake_home(home.path(), || {
             resolve_provider_env(Provider::Glm, None, None, store.path(), None).unwrap()
         });
-        // GLM now rides bro-harness on the Anthropic transport, not the
-        // claude CLI; it selects the transport rather than CLAUDE_CONFIG_DIR.
+        // GLM rides the claude CLI against its own config dir; the daemon
+        // names the dir and lifts nothing out of it.
         assert_eq!(
-            resolved.get("BRO_HARNESS_TRANSPORT").map(String::as_str),
-            Some("anthropic")
+            resolved.get("CLAUDE_CONFIG_DIR").map(String::as_str),
+            Some(home.path().join(".claude-zai").to_string_lossy().as_ref())
         );
-        assert!(!resolved.contains_key("CLAUDE_CONFIG_DIR"));
+        assert!(!resolved.contains_key("BRO_HARNESS_TRANSPORT"));
+        assert!(!resolved.contains_key("ANTHROPIC_AUTH_TOKEN"));
+    }
+
+    #[test]
+    fn test_resolve_provider_env_claude_accounts_select_config_dirs() {
+        let store = temp_store();
+        let home = temp_store();
+
+        // The primary account is the CLI's own ~/.claude: no env at all.
+        let primary = with_fake_home(home.path(), || {
+            resolve_provider_env(Provider::Claude, None, None, store.path(), None)
+        });
+        assert_eq!(primary, None);
+        let named_primary = with_fake_home(home.path(), || {
+            resolve_provider_env(Provider::Claude, Some("account1"), None, store.path(), None)
+        });
+        assert_eq!(named_primary, None);
+
+        // A secondary account selects its sibling config dir.
+        let second = with_fake_home(home.path(), || {
+            resolve_provider_env(Provider::Claude, Some("account2"), None, store.path(), None)
+                .unwrap()
+        });
+        assert_eq!(
+            second.get("CLAUDE_CONFIG_DIR").map(String::as_str),
+            Some(
+                home.path()
+                    .join(".claude-account2")
+                    .to_string_lossy()
+                    .as_ref()
+            )
+        );
+        assert_eq!(second.len(), 1, "{second:?}");
     }
 
     #[test]
@@ -2016,18 +2032,11 @@ mod tests {
             resolve_provider_env(Provider::Minimax, None, None, store.path(), None).unwrap()
         });
         assert_eq!(
-            resolved.get("BRO_HARNESS_TRANSPORT").map(String::as_str),
-            Some("anthropic")
+            resolved.get("CLAUDE_CONFIG_DIR").map(String::as_str),
+            Some(settings_dir.to_string_lossy().as_ref())
         );
-        assert_eq!(
-            resolved.get("ANTHROPIC_BASE_URL").map(String::as_str),
-            Some("https://api.minimax.io/anthropic")
-        );
-        assert_eq!(
-            resolved.get("ANTHROPIC_AUTH_TOKEN").map(String::as_str),
-            Some("test-token")
-        );
-        assert!(!resolved.contains_key("CLAUDE_CONFIG_DIR"));
+        assert!(!resolved.contains_key("ANTHROPIC_BASE_URL"));
+        assert!(!resolved.contains_key("ANTHROPIC_AUTH_TOKEN"));
     }
 
     #[test]
@@ -2053,18 +2062,11 @@ mod tests {
             resolve_provider_env(Provider::Kimi, None, None, store.path(), None).unwrap()
         });
         assert_eq!(
-            resolved.get("BRO_HARNESS_TRANSPORT").map(String::as_str),
-            Some("anthropic")
+            resolved.get("CLAUDE_CONFIG_DIR").map(String::as_str),
+            Some(settings_dir.to_string_lossy().as_ref())
         );
-        assert_eq!(
-            resolved.get("ANTHROPIC_BASE_URL").map(String::as_str),
-            Some("https://api.kimi.com/coding")
-        );
-        assert_eq!(
-            resolved.get("ANTHROPIC_AUTH_TOKEN").map(String::as_str),
-            Some("test-token")
-        );
-        assert!(!resolved.contains_key("CLAUDE_CONFIG_DIR"));
+        assert!(!resolved.contains_key("ANTHROPIC_BASE_URL"));
+        assert!(!resolved.contains_key("ANTHROPIC_AUTH_TOKEN"));
     }
 
     #[test]
@@ -2177,12 +2179,11 @@ mod tests {
         let resolved = with_fake_home(home.path(), || {
             resolve_provider_env(Provider::Deepseek, None, None, store.path(), None).unwrap()
         });
-        // DeepSeek now rides bro-harness on the Anthropic transport.
         assert_eq!(
-            resolved.get("BRO_HARNESS_TRANSPORT").map(String::as_str),
-            Some("anthropic")
+            resolved.get("CLAUDE_CONFIG_DIR").map(String::as_str),
+            Some(home.path().join(".claude-ds").to_string_lossy().as_ref())
         );
-        assert!(!resolved.contains_key("CLAUDE_CONFIG_DIR"));
+        assert!(!resolved.contains_key("BRO_HARNESS_TRANSPORT"));
     }
 
     #[test]
@@ -2267,17 +2268,14 @@ mod tests {
             Some(&locality),
         )
         .unwrap();
+        // The claude lane names the worker-local config dir; the CLI reads
+        // credentials from it, so nothing is lifted out of it.
         assert_eq!(
-            glm.get("BRO_HARNESS_LOCAL_SETTINGS_FILE")
-                .map(String::as_str),
-            Some(
-                worker_home
-                    .join(".claude-zai/settings.json")
-                    .to_string_lossy()
-                    .as_ref()
-            )
+            glm.get("CLAUDE_CONFIG_DIR").map(String::as_str),
+            Some(worker_home.join(".claude-zai").to_string_lossy().as_ref())
         );
         assert!(!glm.contains_key("ANTHROPIC_AUTH_TOKEN"));
+        assert!(!glm.contains_key("BRO_HARNESS_TRANSPORT"));
 
         let brodex = resolve_provider_env_for_locality(
             Provider::Brodex,

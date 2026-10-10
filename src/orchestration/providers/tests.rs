@@ -25,7 +25,7 @@ fn provider_roundtrip_for_dispatchable_harness_providers() {
         assert_eq!(Provider::from_str(p.as_str()).ok(), Some(*p));
     }
     assert!(Provider::from_str("workflow").is_ok());
-    assert!(Provider::from_str("claude").is_err());
+    assert_eq!(Provider::from_str("claude").ok(), Some(Provider::Claude));
     assert!(Provider::from_str("codex").is_err());
     assert!(Provider::from_str("copilot").is_err());
     assert!(Provider::from_str("gemini").is_err());
@@ -60,8 +60,8 @@ fn deepseek_flash_exec_resume_and_default_use_canonical_model() {
 
 #[test]
 fn harness_exec_and_resume_args_use_stream_json() {
-    let glm_opts = ExecOpts {
-        model: Some("zai-coding-plan/glm-5.1".into()),
+    let harness_opts = ExecOpts {
+        model: Some("gpt-5.6".into()),
         effort: Some("high".into()),
         provider_defaults: None,
         code_mode: Some(crate::orchestration::brofile::CodeMode::Only),
@@ -69,28 +69,74 @@ fn harness_exec_and_resume_args_use_stream_json() {
         service_tier: Some(SERVICE_TIER_PRIORITY.into()),
         output_schema: Some(r#"{"type":"object"}"#.into()),
     };
+    let harness =
+        Provider::Brodex.build_exec_args("hello", None, "sid-1", None, Some(&harness_opts));
+    assert_eq!(harness[0], "-p");
+    assert!(harness.contains(&"--output-format".to_string()));
+    assert!(harness.contains(&"stream-json".to_string()));
+    assert!(harness.contains(&"--session-id".to_string()));
+    assert!(harness.contains(&"sid-1".to_string()));
+    assert!(harness.contains(&"--model".to_string()));
+    assert!(harness.contains(&"gpt-5.6".to_string()));
+    assert!(harness.contains(&"--effort".to_string()));
+    // code_mode is emitted as `--code-mode <value>` for harness providers.
+    assert!(harness.contains(&"--code-mode".to_string()));
+    assert!(harness.contains(&"only".to_string()));
+    // service_tier is emitted as `--service-tier <value>` for harness providers.
+    assert!(harness.contains(&"--service-tier".to_string()));
+    assert!(harness.contains(&SERVICE_TIER_PRIORITY.to_string()));
+    // output_schema is emitted as `--output-schema <json>` for harness providers.
+    assert!(harness.contains(&"--output-schema".to_string()));
+    assert!(harness.contains(&r#"{"type":"object"}"#.to_string()));
+    assert!(
+        !harness.contains(&"--mcp-config".to_string()),
+        "standalone harness providers receive MCP config through the child launch path"
+    );
+
+    let harness_resume =
+        Provider::Brodex.build_resume_args("sid-2", "continue", None, Some(&harness_opts));
+    assert!(harness_resume.contains(&"--resume".to_string()));
+    assert!(harness_resume.contains(&"sid-2".to_string()));
+    assert!(harness_resume.contains(&"--service-tier".to_string()));
+    assert!(
+        !harness_resume.contains(&"--mcp-config".to_string()),
+        "resume receives daemon MCP config at child launch, not provider arg construction"
+    );
+
+    // The claude lane shares the stream-json base and the session flags, drops
+    // the harness-only flags, and carries structured output as --json-schema.
+    let glm_opts = ExecOpts {
+        model: Some("zai-coding-plan/glm-5.1".into()),
+        effort: Some("high".into()),
+        provider_defaults: None,
+        code_mode: Some(crate::orchestration::brofile::CodeMode::Only),
+        edit_discipline: Some(crate::orchestration::brofile::EditDiscipline::Structured),
+        service_tier: Some(SERVICE_TIER_PRIORITY.into()),
+        output_schema: Some(r#"{"type":"object"}"#.into()),
+    };
     let glm = Provider::Glm.build_exec_args("hello", None, "sid-1", None, Some(&glm_opts));
     assert_eq!(glm[0], "-p");
     assert!(glm.contains(&"--output-format".to_string()));
     assert!(glm.contains(&"stream-json".to_string()));
+    assert!(glm.contains(&"--dangerously-skip-permissions".to_string()));
     assert!(glm.contains(&"--session-id".to_string()));
     assert!(glm.contains(&"sid-1".to_string()));
     assert!(glm.contains(&"--model".to_string()));
     assert!(glm.contains(&"glm-5.1".to_string()));
     assert!(!glm.contains(&"zai-coding-plan/glm-5.1".to_string()));
     assert!(glm.contains(&"--effort".to_string()));
-    // code_mode is emitted as `--code-mode <value>` for harness providers.
-    assert!(glm.contains(&"--code-mode".to_string()));
-    assert!(glm.contains(&"only".to_string()));
-    // service_tier is emitted as `--service-tier <value>` for harness providers.
-    assert!(glm.contains(&"--service-tier".to_string()));
-    assert!(glm.contains(&SERVICE_TIER_PRIORITY.to_string()));
-    // output_schema is emitted as `--output-schema <json>` for harness providers.
-    assert!(glm.contains(&"--output-schema".to_string()));
-    assert!(glm.contains(&r#"{"type":"object"}"#.to_string()));
+    for harness_only in [
+        "--code-mode",
+        "--edit-discipline",
+        "--service-tier",
+        "--output-schema",
+        "--dispatch-context",
+    ] {
+        assert!(!glm.contains(&harness_only.to_string()), "{harness_only}");
+    }
     assert!(
-        !glm.contains(&"--mcp-config".to_string()),
-        "standalone harness providers receive MCP config through the child launch path"
+        glm.windows(2)
+            .any(|pair| pair == ["--json-schema", r#"{"type":"object"}"#])
     );
 
     let deepseek_opts = ExecOpts {
@@ -104,16 +150,12 @@ fn harness_exec_and_resume_args_use_stream_json() {
     };
     let deepseek =
         Provider::Deepseek.build_resume_args("sid-2", "continue", None, Some(&deepseek_opts));
-    assert!(deepseek.contains(&"--resume".to_string()));
-    assert!(deepseek.contains(&"sid-2".to_string()));
+    assert_eq!(&deepseek[..2], ["--resume", "sid-2"]);
     assert!(deepseek.contains(&"--model".to_string()));
     assert!(deepseek.contains(&"deepseek-v4-pro".to_string()));
     assert!(!deepseek.contains(&"deepseek/deepseek-v4-pro".to_string()));
-    // No code_mode set on resume ⇒ no flag emitted (session restores it).
     assert!(!deepseek.contains(&"--code-mode".to_string()));
-    // service_tier is still explicit on resume when supplied by the caller.
-    assert!(deepseek.contains(&"--service-tier".to_string()));
-    assert!(deepseek.contains(&SERVICE_TIER_DEFAULT.to_string()));
+    assert!(!deepseek.contains(&"--service-tier".to_string()));
     assert!(
         !deepseek.contains(&"--mcp-config".to_string()),
         "resume receives daemon MCP config at child launch, not provider arg construction"
@@ -176,9 +218,17 @@ fn harness_exec_and_resume_args_use_stream_json() {
 }
 
 #[test]
-fn harness_providers_default_model_when_none_supplied() {
+fn providers_default_model_when_none_supplied() {
     for provider in Provider::ALL {
         let args = provider.build_exec_args("hi", None, "", None, None);
+        if *provider == Provider::Claude {
+            // The operator's own claude settings pick the model.
+            assert!(
+                !args.contains(&"--model".to_string()),
+                "a raw Claude dispatch leaves the model to the CLI"
+            );
+            continue;
+        }
         assert!(
             args.contains(&"--model".to_string()),
             "{provider:?} raw dispatch must include --model"
@@ -207,25 +257,48 @@ fn dispatch_context_rides_its_own_flag_with_verbatim_prompt() {
             // The operator's prompt rides -p VERBATIM — no preamble glue.
             let p_idx = args.iter().position(|a| a == "-p").expect("-p present");
             assert_eq!(args[p_idx + 1], "one-line task", "{provider}");
-            // The payload rides its own flag and round-trips strictly.
-            let dc_idx = args
-                .iter()
-                .position(|a| a == "--dispatch-context")
-                .expect("--dispatch-context present");
-            let parsed = bro_protocol::DispatchContext::parse(&args[dc_idx + 1])
-                .expect("strict parse of daemon-authored payload");
-            assert_eq!(parsed, payload, "{provider}");
-            assert_eq!(parsed.persona.as_deref(), Some("You are a reviewer"));
-            assert_eq!(
-                parsed.scope.as_ref().unwrap().task.as_deref(),
-                Some("task-9")
-            );
+            match provider.lane() {
+                // The payload rides its own flag and round-trips strictly.
+                bro_core::ProviderLane::Harness => {
+                    let dc_idx = args
+                        .iter()
+                        .position(|a| a == "--dispatch-context")
+                        .expect("--dispatch-context present");
+                    let parsed = bro_protocol::DispatchContext::parse(&args[dc_idx + 1])
+                        .expect("strict parse of daemon-authored payload");
+                    assert_eq!(parsed, payload, "{provider}");
+                    assert_eq!(parsed.persona.as_deref(), Some("You are a reviewer"));
+                    assert_eq!(
+                        parsed.scope.as_ref().unwrap().task.as_deref(),
+                        Some("task-9")
+                    );
+                }
+                // The claude lane renders persona then scope into one
+                // appended system prompt; the CLI has no typed slot.
+                bro_core::ProviderLane::ClaudeCli => {
+                    assert!(!args.contains(&"--dispatch-context".to_string()));
+                    let idx = args
+                        .iter()
+                        .position(|a| a == "--append-system-prompt")
+                        .expect("--append-system-prompt present");
+                    let text = &args[idx + 1];
+                    assert!(text.starts_with("You are a reviewer"), "{text}");
+                    assert!(
+                        text.contains("## Dispatch scope\n- task: task-9\n"),
+                        "{text}"
+                    );
+                    assert!(text.contains("- session: sid-9"), "{text}");
+                }
+                bro_core::ProviderLane::Workflow => unreachable!(),
+            }
         }
     }
 
     // No payload ⇒ no flag (workload-retro bypass shape).
-    let bare = Provider::Glm.build_exec_args("hi", None, "sid", None, None);
+    let bare = Provider::Brodex.build_exec_args("hi", None, "sid", None, None);
     assert!(!bare.contains(&"--dispatch-context".to_string()));
+    let bare = Provider::Glm.build_exec_args("hi", None, "sid", None, None);
+    assert!(!bare.contains(&"--append-system-prompt".to_string()));
 }
 
 #[test]
@@ -654,18 +727,23 @@ fn harness_filter_args_emit_allow_and_deny_flags() {
     };
 
     for provider in Provider::ALL {
+        let (deny_flag, allow_flag) = match provider.lane() {
+            bro_core::ProviderLane::ClaudeCli => ("--disallowedTools", "--allowedTools"),
+            bro_core::ProviderLane::Harness => ("--deny-tools", "--allow-tools"),
+            bro_core::ProviderLane::Workflow => unreachable!(),
+        };
         let args = provider.build_filter_args(&filters);
         let deny_idx = args
             .iter()
-            .position(|a| a == "--deny-tools")
-            .expect("--deny-tools present");
+            .position(|a| a == deny_flag)
+            .unwrap_or_else(|| panic!("{deny_flag} present for {provider}"));
         assert!(args[deny_idx + 1].contains("mcp__blackbox__bro_exec"));
         assert!(args[deny_idx + 1].contains(','));
 
         let allow_idx = args
             .iter()
-            .position(|a| a == "--allow-tools")
-            .expect("--allow-tools present");
+            .position(|a| a == allow_flag)
+            .unwrap_or_else(|| panic!("{allow_flag} present for {provider}"));
         assert!(args[allow_idx + 1].contains("mcp__blackbox__bbox_stats"));
     }
 }

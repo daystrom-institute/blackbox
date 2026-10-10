@@ -9,7 +9,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt;
 
 mod provider;
-pub use provider::{Capability, EffortInfo, ModelInfo, Provider};
+pub use provider::{Capability, EffortInfo, ModelInfo, Provider, ProviderLane};
 
 // ---------------------------------------------------------------------------
 // Task origin

@@ -564,6 +564,12 @@ fn dispatch(state: Arc<Fleetd>, body: DaemonToFleetd) {
                 state.emit(unknown_session(&session_id));
             }
         }
+        DaemonToFleetd::EndInput { session_id } => {
+            // Idempotent: dropping the registry's sender closes the child's
+            // stdin once the writer drains; an unknown or already-ended
+            // session has nothing to close.
+            state.registry().end_input(&session_id);
+        }
         DaemonToFleetd::Kill { session_id } => {
             // Idempotent by construction: WorkerKill fires SIGTERM at most
             // once, and an unknown session is a no-op rather than an error

@@ -2165,20 +2165,11 @@ fn default_daemon_url() -> String {
 }
 
 /// Providers that speak the persistent bidirectional stream-json control
-/// protocol: the bro-harness providers GLM / DeepSeek / MiniMax / Kimi /
-/// Brodex / VibeBh (§2).
-/// Others are one-shot only. Public so the cockpit can tell whether a non-live
-/// agent is resumable.
+/// protocol: every dispatchable provider, on the claude CLI lane and the
+/// harness lane alike (§2). The workflow pseudo-provider is one-shot only.
+/// Public so the cockpit can tell whether a non-live agent is resumable.
 pub fn provider_supports_bidi(provider: Provider) -> bool {
-    matches!(
-        provider,
-        Provider::Glm
-            | Provider::Deepseek
-            | Provider::Minimax
-            | Provider::Kimi
-            | Provider::Brodex
-            | Provider::VibeBh
-    )
+    provider.is_dispatchable()
 }
 
 #[cfg(test)]

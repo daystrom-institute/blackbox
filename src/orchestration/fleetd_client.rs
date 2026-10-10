@@ -1254,10 +1254,23 @@ impl SessionRoute {
     /// [`CONTROL_REDELIVERY_WINDOW`] for a replacement connection when the
     /// owning one is down. Returns `false` once the session is gone.
     async fn deliver_control(&self, message: Value) -> bool {
-        let mut message = DaemonToFleetd::Control {
+        self.deliver_session_message(DaemonToFleetd::Control {
             session_id: self.session_id.clone(),
             message,
-        };
+        })
+        .await
+    }
+
+    /// Close the session's stdin on the worker host, with the same
+    /// redelivery window as a control message.
+    async fn deliver_end_input(&self) -> bool {
+        self.deliver_session_message(DaemonToFleetd::EndInput {
+            session_id: self.session_id.clone(),
+        })
+        .await
+    }
+
+    async fn deliver_session_message(&self, mut message: DaemonToFleetd) -> bool {
         let deadline = tokio::time::Instant::now() + CONTROL_REDELIVERY_WINDOW;
         loop {
             let connected = self.shared.connected.notified();
@@ -1292,9 +1305,13 @@ fn control_lane(route: SessionRoute) -> mpsc::UnboundedSender<Value> {
                     session_id = %route.session_id,
                     "fleetd session ended; closing its control lane"
                 );
-                break;
+                return;
             }
         }
+        // The daemon dropped its end of the lane: on a local executor that
+        // closes the child's stdin by itself, so the relay closes it on the
+        // worker host too.
+        route.deliver_end_input().await;
     });
     control_tx
 }
@@ -2352,6 +2369,7 @@ mod tests {
             initial_messages: vec![],
             bro_home: PathBuf::from("/nowhere"),
             event_log_path: PathBuf::from(format!("/nowhere/{session_id}.events.jsonl")),
+            supervisor_writes_event_log: false,
         }
     }
 

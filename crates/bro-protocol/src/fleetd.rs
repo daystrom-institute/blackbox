@@ -110,6 +110,10 @@ pub enum DaemonToFleetd {
     /// Deliver one control-lane message (user turn, `control_request`, ...) to
     /// a live session's stdin as an NDJSON line.
     Control { session_id: String, message: Value },
+    /// Close a live session's stdin after everything already delivered. A
+    /// worker that runs until end of input (the claude CLI) then finishes its
+    /// queued turns and exits. Unknown sessions are a no-op.
+    EndInput { session_id: String },
     /// Idempotent SIGTERM to a session's child. Unknown or already-exited
     /// sessions are a no-op, not an error.
     Kill { session_id: String },
@@ -322,6 +326,7 @@ mod tests {
             initial_messages: vec![json!({"type": "user"})],
             bro_home: PathBuf::from("/state/bro"),
             event_log_path: PathBuf::from("/state/bro/sess-1.events.jsonl"),
+            supervisor_writes_event_log: false,
         }
     }
 
@@ -344,6 +349,9 @@ mod tests {
             DaemonToFleetd::Control {
                 session_id: "sess-1".to_string(),
                 message: json!({"type": "user", "message": {"role": "user"}}),
+            },
+            DaemonToFleetd::EndInput {
+                session_id: "sess-1".to_string(),
             },
             DaemonToFleetd::Kill {
                 session_id: "sess-1".to_string(),

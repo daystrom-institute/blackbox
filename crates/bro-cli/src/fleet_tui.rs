@@ -5916,6 +5916,7 @@ fn composer_height(app: &App, area: Rect) -> u16 {
 
 fn provider_tag(p: Provider) -> &'static str {
     match p {
+        Provider::Claude => "cla",
         Provider::Glm => "glm",
         Provider::Deepseek => "ds",
         Provider::Brodex => "bdx",
@@ -5928,6 +5929,7 @@ fn provider_tag(p: Provider) -> &'static str {
 
 fn provider_color(p: Provider) -> Color {
     match p {
+        Provider::Claude => Color::LightYellow,
         Provider::Glm => Color::LightBlue,
         Provider::Deepseek => Color::LightCyan,
         Provider::Brodex => Color::LightGreen,

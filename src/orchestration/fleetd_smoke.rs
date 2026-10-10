@@ -255,6 +255,7 @@ mod smoke {
             initial_messages: Vec::new(),
             bro_home: home.to_path_buf(),
             event_log_path: log.to_path_buf(),
+            supervisor_writes_event_log: false,
         }
     }
 

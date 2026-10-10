@@ -148,6 +148,7 @@ mod acceptance {
             let mut env = crate::util::TestEnvGuard::new();
             env.remove("BLACKBOX_MCP_URL");
             env.set("BRO_HARNESS_BIN", &stub);
+            env.set("CLAUDE_BIN", &stub);
             let state = Arc::new(crate::server::state::SharedState::for_test(&store_dir));
             assert!(crate::orchestration::install_harness_executor_with_config(
                 bbox_config::config::ExecutorKind::Fleetd,
@@ -281,7 +282,7 @@ mod acceptance {
         let mut plane = Plane::start().await;
         let cwd = plane.cwd();
         let (task, session, child) = plane
-            .exec(json!({ "prompt": "first turn", "provider": "glm", "cwd": cwd }))
+            .exec(json!({ "prompt": "first turn", "provider": "brodex", "cwd": cwd }))
             .await;
         await_file(&child.join("stdin"), "first turn").await;
         assert_eq!(plane.status(&task)["status"], "running");
@@ -300,7 +301,7 @@ mod acceptance {
             .bro_resume(call(json!({
                 "prompt": "second turn",
                 "session_id": session,
-                "provider": "glm",
+                "provider": "brodex",
                 "cwd": cwd,
             })))
             .await;
@@ -319,6 +320,70 @@ mod acceptance {
         assert_eq!(plane.task_count(), 2);
     }
 
+    /// A claude-lane dispatch through fleetd launches the CLI's own argv,
+    /// gets its session log written by fleetd, and has its stdin closed by
+    /// the daemon once the turn's result arrives.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_claude_lane_child_gets_cli_argv_a_fleetd_written_log_and_end_of_input() {
+        let mut plane = Plane::start().await;
+        let cwd = plane.cwd();
+        let (task, session, child) = plane
+            .exec(json!({ "prompt": "first turn", "provider": "glm", "cwd": cwd }))
+            .await;
+        await_file(&child.join("stdin"), "first turn").await;
+
+        let launched = argv(&child);
+        assert_eq!(flag(&launched, "--input-format"), Some("stream-json"), "{launched:?}");
+        assert!(launched.iter().any(|a| a == "--replay-user-messages"));
+        for harness_only in ["--exit-when-idle", "--daemon-worker", "--cwd", "--shell-env"] {
+            assert!(!launched.iter().any(|a| a == harness_only), "{launched:?}");
+        }
+        assert_eq!(read(&child, "cwd").trim(), cwd);
+        assert_eq!(read(&child, "provider").trim(), "");
+        assert!(
+            read(&child, "env-names")
+                .lines()
+                .any(|name| name == "CLAUDE_CONFIG_DIR")
+        );
+
+        // The error result ends the turn: the daemon closes stdin, and fleetd
+        // has written the result into the session log at the pinned path.
+        assert_eq!(plane.steer(&task, "TURN_FAIL")["status"], "steered");
+        await_file(&child.join("stdin-closed"), "").await;
+        let log = plane
+            .root
+            .join("bro")
+            .join("harness-sessions")
+            .join(format!("{session}.events.jsonl"));
+        await_file(&log, "stub turn failed").await;
+        let record: Value = serde_json::from_str(
+            std::fs::read_to_string(&log)
+                .unwrap()
+                .lines()
+                .last()
+                .expect("one record"),
+        )
+        .unwrap();
+        assert_eq!(record["event"]["type"], "result");
+        assert!(record["ts"].as_str().unwrap().ends_with('Z'));
+
+        // The lane is gone, so a late steer is refused rather than queued.
+        let late = plane
+            .server
+            .bro_steer(call(json!({ "task_id": task, "prompt": "too late" })));
+        assert_eq!(late.is_error, Some(true), "{}", tool_text(&late));
+        assert!(
+            tool_text(&late).contains("no live harness control channel"),
+            "{}",
+            tool_text(&late)
+        );
+
+        // The stub stays alive after end of input; cancel finishes it.
+        let cancelled = parsed(&plane.server.bro_cancel(call(json!({ "task_id": task }))));
+        assert_eq!(cancelled["status"], "cancelled", "{cancelled}");
+        await_file(&child.join("signal"), "term").await;
+    }
+
     /// A turn that ends in an error result does not end the worker. The task
     /// stays running, so the coordinator can steer it and cancel it, and the
     /// cancelled session resumes as a new task on a new child.
@@ -327,7 +392,7 @@ mod acceptance {
         let mut plane = Plane::start().await;
         let cwd = plane.cwd();
         let (task, session, child) = plane
-            .exec(json!({ "prompt": "first turn", "provider": "glm", "cwd": cwd }))
+            .exec(json!({ "prompt": "first turn", "provider": "brodex", "cwd": cwd }))
             .await;
         await_file(&child.join("stdin"), "first turn").await;
 
@@ -366,7 +431,7 @@ mod acceptance {
             .bro_resume(call(json!({
                 "prompt": "continue",
                 "session_id": session,
-                "provider": "glm",
+                "provider": "brodex",
                 "cwd": cwd,
             })))
             .await;
@@ -395,7 +460,7 @@ mod acceptance {
             axum::Json(
                 serde_json::from_value(json!({
                     "prompt": "cockpit turn",
-                    "provider": "glm",
+                    "provider": "brodex",
                     "cwd": cwd,
                     "tool_defaults": { "default:shell_run.timeout_ms": 30000 },
                 }))
@@ -424,7 +489,7 @@ mod acceptance {
                 serde_json::from_value(json!({
                     "prompt": "cockpit follow-up",
                     "session_id": session,
-                    "provider": "glm",
+                    "provider": "brodex",
                     "cwd": cwd,
                 }))
                 .expect("resume body"),
@@ -445,11 +510,11 @@ mod acceptance {
         let mut plane = Plane::start().await;
         let cwd = plane.cwd();
         let (done, _, _) = plane
-            .exec(json!({ "prompt": "finishes", "provider": "glm", "cwd": cwd }))
+            .exec(json!({ "prompt": "finishes", "provider": "brodex", "cwd": cwd }))
             .await;
         assert_eq!(plane.finish(&done).await["status"], "completed");
         let (running, _, child) = plane
-            .exec(json!({ "prompt": "keeps running", "provider": "glm", "cwd": cwd }))
+            .exec(json!({ "prompt": "keeps running", "provider": "brodex", "cwd": cwd }))
             .await;
         await_file(&child.join("stdin"), "keeps running").await;
 
@@ -504,7 +569,7 @@ mod acceptance {
             json!({
                 "action": "create",
                 "name": "acceptance-bro",
-                "provider": "glm",
+                "provider": "brodex",
                 "account": "acceptance-account",
                 "model": "glm-5.3-flash",
                 "effort": "high",
@@ -552,7 +617,7 @@ mod acceptance {
         assert!(denied.contains(&"web_fetch"), "{denied:?}");
         // The brofile's provider and account reach the child. Only the name
         // of the account's variable is recorded, never its value.
-        assert_eq!(read(&child, "provider").trim(), "glm");
+        assert_eq!(read(&child, "provider").trim(), "brodex");
         assert!(
             read(&child, "env-names")
                 .lines()
@@ -563,10 +628,10 @@ mod acceptance {
         // A raw provider dispatch names a different provider and carries no
         // account environment.
         let (plain, _, plain_child) = plane
-            .exec(json!({ "prompt": "plain turn", "provider": "deepseek", "cwd": cwd }))
+            .exec(json!({ "prompt": "plain turn", "provider": "vibebh", "cwd": cwd }))
             .await;
         await_file(&plain_child.join("stdin"), "plain turn").await;
-        assert_eq!(read(&plain_child, "provider").trim(), "deepseek");
+        assert_eq!(read(&plain_child, "provider").trim(), "vibebh");
         assert!(
             !read(&plain_child, "env-names")
                 .lines()
@@ -581,7 +646,7 @@ mod acceptance {
             .bro_resume(call(json!({
                 "prompt": "routed follow-up",
                 "session_id": session,
-                "provider": "glm",
+                "provider": "brodex",
                 "cwd": cwd,
             })))
             .await;
@@ -612,7 +677,7 @@ mod acceptance {
             .bro_resume(call(json!({
                 "prompt": "third turn",
                 "session_id": session,
-                "provider": "glm",
+                "provider": "brodex",
                 "cwd": cwd,
             })))
             .await;
@@ -666,7 +731,7 @@ mod acceptance {
             json!({
                 "action": "create",
                 "name": "short-lived-bro",
-                "provider": "glm",
+                "provider": "brodex",
                 "model": "glm-5.3-flash",
                 "disallow_tools": ["glob"],
             }),
@@ -684,7 +749,7 @@ mod acceptance {
             .bro_resume(call(json!({
                 "prompt": "after the brofile was deleted",
                 "session_id": session,
-                "provider": "glm",
+                "provider": "brodex",
                 "cwd": cwd,
             })))
             .await;
@@ -705,7 +770,7 @@ mod acceptance {
 
         // A session that was never dispatched by name reports no brofile.
         let (plain, plain_session, plain_child) = plane
-            .exec(json!({ "prompt": "plain turn", "provider": "glm", "cwd": cwd }))
+            .exec(json!({ "prompt": "plain turn", "provider": "brodex", "cwd": cwd }))
             .await;
         await_file(&plain_child.join("stdin"), "plain turn").await;
         assert_eq!(plane.finish(&plain).await["status"], "completed");
@@ -714,7 +779,7 @@ mod acceptance {
             .bro_resume(call(json!({
                 "prompt": "plain follow-up",
                 "session_id": plain_session,
-                "provider": "glm",
+                "provider": "brodex",
                 "cwd": cwd,
             })))
             .await;
@@ -737,7 +802,7 @@ mod acceptance {
 
         let result = plane
             .server
-            .bro_exec(call(json!({ "prompt": "never runs", "provider": "glm", "cwd": cwd })))
+            .bro_exec(call(json!({ "prompt": "never runs", "provider": "brodex", "cwd": cwd })))
             .await;
         let exec = parsed(&result);
         let task = exec["taskId"].as_str().expect("taskId").to_string();
@@ -755,7 +820,7 @@ mod acceptance {
         let mut plane = Plane::start().await;
         let cwd = plane.cwd();
         let (task, _, child) = plane
-            .exec(json!({ "prompt": "first turn", "provider": "glm", "cwd": cwd }))
+            .exec(json!({ "prompt": "first turn", "provider": "brodex", "cwd": cwd }))
             .await;
         await_file(&child.join("stdin"), "first turn").await;
         // The stub answers with one report for its own session and one that
@@ -822,7 +887,7 @@ mod acceptance {
             json!({
                 "action": "create",
                 "name": "free-bro",
-                "provider": "glm",
+                "provider": "brodex",
                 "edit_discipline": "free",
             }),
         )
@@ -855,7 +920,7 @@ mod acceptance {
         assert_eq!(flag(&argv(&child), "--edit-discipline"), Some("free"));
         assert_eq!(plane.finish(&task).await["status"], "completed");
         let (task, _, child) = plane
-            .exec(json!({ "prompt": "plain turn", "provider": "glm", "cwd": cwd }))
+            .exec(json!({ "prompt": "plain turn", "provider": "brodex", "cwd": cwd }))
             .await;
         await_file(&child.join("stdin"), "plain turn").await;
         assert_eq!(flag(&argv(&child), "--edit-discipline"), None);
@@ -866,7 +931,7 @@ mod acceptance {
         let (task, _, child) = plane
             .exec(json!({
                 "prompt": "allocated turn",
-                "pin_provider": "glm",
+                "pin_provider": "brodex",
                 "cwd": cwd,
                 "edit_discipline": "structured",
             }))
@@ -886,7 +951,7 @@ mod acceptance {
             .server
             .bro_exec(call(json!({
                 "prompt": "must not start",
-                "provider": "glm",
+                "provider": "brodex",
                 "cwd": cwd,
                 "edit_discipline": "structured",
                 "code_mode": "off",
@@ -905,7 +970,7 @@ mod acceptance {
             .bro_brofile(call(json!({
                 "action": "create",
                 "name": "contradictory-bro",
-                "provider": "glm",
+                "provider": "brodex",
                 "code_mode": "off",
                 "edit_discipline": "structured",
             })))
@@ -913,7 +978,7 @@ mod acceptance {
         assert_eq!(invalid.is_error, Some(true), "{}", tool_text(&invalid));
         assert!(
             serde_json::from_value::<crate::tools::bro_params::ExecParams>(json!({
-                "prompt": "x", "provider": "glm", "edit_discipline": "strict",
+                "prompt": "x", "provider": "brodex", "edit_discipline": "strict",
             }))
             .is_err()
         );
@@ -939,7 +1004,7 @@ mod acceptance {
             let result = server
                 .bro_exec(call(json!({
                     "prompt": "never runs",
-                    "provider": "glm",
+                    "provider": "brodex",
                     "cwd": cwd,
                     "harness_bin": bin,
                 })))
@@ -955,7 +1020,7 @@ mod acceptance {
             axum::Json(
                 serde_json::from_value(json!({
                     "prompt": "never runs",
-                    "provider": "glm",
+                    "provider": "brodex",
                     "cwd": cwd,
                     "harness_bin": selected,
                 }))
@@ -975,7 +1040,7 @@ mod acceptance {
         let result = ops
             .bro_exec(call(json!({
                 "prompt": "first turn",
-                "provider": "glm",
+                "provider": "brodex",
                 "cwd": cwd,
                 "harness_bin": selected,
             })))
@@ -996,7 +1061,7 @@ mod acceptance {
             call(json!({
                 "prompt": prompt,
                 "session_id": session,
-                "provider": "glm",
+                "provider": "brodex",
                 "cwd": cwd,
             }))
         };
@@ -1024,7 +1089,7 @@ mod acceptance {
 
         // A dispatch that names no binary still runs the configured one.
         let (task, _, child) = plane
-            .exec(json!({ "prompt": "plain turn", "provider": "glm", "cwd": cwd }))
+            .exec(json!({ "prompt": "plain turn", "provider": "brodex", "cwd": cwd }))
             .await;
         assert_eq!(read(&child, "bin").trim(), configured.to_string_lossy());
         assert!(plane.status(&task).get("harnessBin").is_none());

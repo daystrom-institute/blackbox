@@ -56,6 +56,9 @@ impl TranscriptSource {
     /// and serialized form.
     pub fn label(&self) -> &'static str {
         match self {
+            // A dispatched Claude session log, distinct from the interactive
+            // `claude` source the CLI's own project transcripts belong to.
+            Self::Harness(Provider::Claude) => "claude-dispatch",
             Self::Harness(Provider::Brodex) => "brodex",
             Self::Harness(Provider::VibeBh) => "vibebh",
             Self::Harness(Provider::Glm) => "glm",
@@ -93,6 +96,7 @@ impl<'de> Deserialize<'de> for TranscriptSource {
         let raw = String::deserialize(deserializer)?;
         match raw.as_str() {
             "claude" => Ok(Self::Claude),
+            "claude-dispatch" => Ok(Self::Harness(Provider::Claude)),
             "codex" => Ok(Self::Codex),
             "gemini" => Ok(Self::Gemini),
             "slack" => Ok(Self::Slack),

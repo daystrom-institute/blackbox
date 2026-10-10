@@ -13,17 +13,11 @@ pub trait ProviderSession {
 
 impl ProviderSession for Provider {
     fn resolve_session_cwd(&self, _session_id: &str) -> Option<std::path::PathBuf> {
-        match self {
-            // Harness providers persist sessions in their own store
-            // (~/.bro-harness), not the claude projects dir; no cwd-aware
-            // discovery, so resume needs an explicit project_dir.
-            Provider::Glm
-            | Provider::Deepseek
-            | Provider::Minimax
-            | Provider::Kimi
-            | Provider::Brodex
-            | Provider::VibeBh => None,
-            Provider::Workflow => None,
-        }
+        // Neither lane offers cwd-aware session discovery here: the harness
+        // persists sessions in its own store, and a claude-lane session's
+        // cwd is recorded on the daemon task rather than looked up in the
+        // CLI's projects dir. Resume needs an explicit project_dir.
+        let _ = self;
+        None
     }
 }

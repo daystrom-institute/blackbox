@@ -29,6 +29,7 @@ use crate::transcripts::adapters::TranscriptAdapterRegistry;
 use crate::transcripts::types::{
     TranscriptCursor, TranscriptLocation, TranscriptSource, TranscriptStorage,
 };
+use bro_core::ProviderLane;
 use providers::dispatch_prelude::*;
 use providers::{EventSink, Provider, Usage};
 use supervision::SupervisionState;
@@ -439,7 +440,13 @@ pub fn readopt_harness_session(session: ReadoptedSession) -> Option<u64> {
     harness_killers()
         .write()
         .insert(task_id.clone(), killer.clone());
-    harness_controls().write().insert(task_id.clone(), control);
+    harness_controls().write().insert(
+        task_id.clone(),
+        HarnessControl {
+            tx: control,
+            lane: provider.lane(),
+        },
+    );
     task.emit_roster_updated();
     if stop_worker {
         killer.kill();
@@ -535,11 +542,28 @@ fn record_declined_readoption(
     task.emit_roster_updated();
 }
 
-fn harness_controls() -> &'static RwLock<HashMap<String, tokio::sync::mpsc::UnboundedSender<Value>>>
-{
-    static CONTROLS: OnceLock<RwLock<HashMap<String, tokio::sync::mpsc::UnboundedSender<Value>>>> =
-        OnceLock::new();
+/// A live worker's stdin control lane plus the lane whose wire shapes it
+/// speaks. Dropping the last clone closes the child's stdin.
+#[derive(Clone)]
+struct HarnessControl {
+    tx: tokio::sync::mpsc::UnboundedSender<Value>,
+    lane: ProviderLane,
+}
+
+fn harness_controls() -> &'static RwLock<HashMap<String, HarnessControl>> {
+    static CONTROLS: OnceLock<RwLock<HashMap<String, HarnessControl>>> = OnceLock::new();
     CONTROLS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+#[cfg(test)]
+fn register_test_control(
+    task_id: &str,
+    tx: tokio::sync::mpsc::UnboundedSender<Value>,
+    lane: ProviderLane,
+) {
+    harness_controls()
+        .write()
+        .insert(task_id.to_string(), HarnessControl { tx, lane });
 }
 
 /// Task-id -> idempotent kill switch for executor-backed harness workers.
@@ -562,6 +586,8 @@ fn harness_user_input(text: String) -> Value {
     })
 }
 
+/// The harness control shape: `subtype` and the payload fields sit flat on
+/// the `control_request` envelope.
 fn harness_control_input(subtype: &str, request_id: String, fields: Value) -> Value {
     let mut raw = match fields {
         Value::Object(object) => Value::Object(object),
@@ -575,6 +601,35 @@ fn harness_control_input(subtype: &str, request_id: String, fields: Value) -> Va
     object.insert("subtype".to_string(), Value::String(subtype.to_string()));
     object.insert("request_id".to_string(), Value::String(request_id));
     raw
+}
+
+/// The claude CLI control shape: `subtype` and the payload fields nest under
+/// `request`, and the CLI answers with a `control_response` carrying the same
+/// `request_id`.
+fn claude_control_input(subtype: &str, request_id: String, fields: Value) -> Value {
+    let mut request = match fields {
+        Value::Object(object) => Value::Object(object),
+        _ => serde_json::json!({}),
+    };
+    request
+        .as_object_mut()
+        .expect("normalized JSON object")
+        .insert("subtype".to_string(), Value::String(subtype.to_string()));
+    serde_json::json!({
+        "type": "control_request",
+        "request_id": request_id,
+        "request": request,
+    })
+}
+
+fn control_input(lane: ProviderLane, subtype: &str, fields: Value) -> Value {
+    let request_id = uuid::Uuid::new_v4().to_string();
+    match lane {
+        ProviderLane::ClaudeCli => claude_control_input(subtype, request_id, fields),
+        ProviderLane::Harness | ProviderLane::Workflow => {
+            harness_control_input(subtype, request_id, fields)
+        }
+    }
 }
 
 // ── Task-store persist actor (control-plane starvation fix) ─────────────────
@@ -715,7 +770,7 @@ pub fn apply_session_command(
 ) -> Result<(), String> {
     use bro_protocol::SessionCommand;
 
-    let tx = harness_controls()
+    let control = harness_controls()
         .read()
         .get(task_id)
         .cloned()
@@ -723,21 +778,21 @@ pub fn apply_session_command(
 
     let input = match command {
         SessionCommand::UserTurn { text } => harness_user_input(text),
-        SessionCommand::Interrupt => harness_control_input(
-            "interrupt",
-            uuid::Uuid::new_v4().to_string(),
-            serde_json::json!({}),
-        ),
-        SessionCommand::SetModel { model } => harness_control_input(
+        SessionCommand::Interrupt => {
+            control_input(control.lane, "interrupt", serde_json::json!({}))
+        }
+        SessionCommand::SetModel { model } => control_input(
+            control.lane,
             "set_model",
-            uuid::Uuid::new_v4().to_string(),
             serde_json::json!({"model": model}),
         ),
         // `/compact` is an in-stream slash command, not a control_request.
         SessionCommand::Compact => harness_user_input("/compact".to_string()),
     };
 
-    tx.send(input)
+    control
+        .tx
+        .send(input)
         .map_err(|_| format!("task {task_id} harness control channel is closed"))
 }
 
@@ -754,17 +809,36 @@ pub fn interrupt_harness_task(task_id: &str, redirect: Option<String>) -> Result
         // control's raw so the harness dequeues it immediately on cancel. This
         // payload shape has no SessionCommand variant, so it stays inline.
         Some(prompt) => {
-            let tx = harness_controls()
+            let control = harness_controls()
                 .read()
                 .get(task_id)
                 .cloned()
                 .ok_or_else(|| format!("task {task_id} has no live harness control channel"))?;
-            tx.send(harness_control_input(
-                "interrupt",
-                uuid::Uuid::new_v4().to_string(),
-                serde_json::json!({"prompt": prompt}),
-            ))
-            .map_err(|_| format!("task {task_id} harness control channel is closed"))
+            let closed = |_| format!("task {task_id} harness control channel is closed");
+            match control.lane {
+                // The claude CLI has no redirect payload on its interrupt: the
+                // interrupt ends the turn and the redirect, queued right
+                // behind it on stdin, starts the next one.
+                ProviderLane::ClaudeCli => {
+                    control
+                        .tx
+                        .send(control_input(
+                            control.lane,
+                            "interrupt",
+                            serde_json::json!({}),
+                        ))
+                        .map_err(closed)?;
+                    control.tx.send(harness_user_input(prompt)).map_err(closed)
+                }
+                ProviderLane::Harness | ProviderLane::Workflow => control
+                    .tx
+                    .send(control_input(
+                        control.lane,
+                        "interrupt",
+                        serde_json::json!({"prompt": prompt}),
+                    ))
+                    .map_err(closed),
+            }
         }
         None => apply_session_command(task_id, bro_protocol::SessionCommand::Interrupt),
     }
@@ -3109,15 +3183,7 @@ async fn spawn_reserved_dispatch(
     // daemon's complete self-MCP catalog before the child is spawned.
     let mut args = args;
     args.extend(fleet_mcp_dispatch_args(provider, origin));
-    if matches!(
-        provider,
-        Provider::Glm
-            | Provider::Deepseek
-            | Provider::Minimax
-            | Provider::Kimi
-            | Provider::Brodex
-            | Provider::VibeBh
-    ) {
+    if provider.is_dispatchable() {
         return spawn_harness_child_task(
             task_id,
             provider,
@@ -3386,7 +3452,13 @@ async fn spawn_harness_child_task(
     // harness_controls). No await runs between insert and here, so no steer can
     // race a missing registration.
     harness_killers().write().insert(task_id.clone(), killer);
-    harness_controls().write().insert(task_id.clone(), control);
+    harness_controls().write().insert(
+        task_id.clone(),
+        HarnessControl {
+            tx: control,
+            lane: provider.lane(),
+        },
+    );
 
     // Emit tail + system started events (unchanged from the inline path).
     let cursor = task.next_live_cursor();
@@ -3443,22 +3515,39 @@ fn prepare_harness_child_launch(
         .or_else(|| take_cli_value_arg(&mut args, "--prompt"))
         .ok_or_else(|| anyhow::anyhow!("harness child launch requires an initial prompt"))?;
 
+    let lane = provider.lane();
     set_cli_value_arg(&mut args, "--input-format", "stream-json".to_string());
     ensure_cli_flag(&mut args, "--replay-user-messages");
-    ensure_cli_flag(&mut args, "--exit-when-idle");
-    ensure_cli_flag(&mut args, "--daemon-worker");
-    if let Some(cwd) = cwd {
-        set_cli_value_arg(&mut args, "--cwd", cwd.to_string());
-    }
-    if let Some(tool_defaults) = tool_defaults {
-        set_cli_value_arg(
-            &mut args,
-            "--additional-context",
-            serde_json::to_string(&tool_defaults)?,
-        );
-    }
-    if let Some(shell_env) = shell_env {
-        set_cli_value_arg(&mut args, "--shell-env", serde_json::to_string(&shell_env)?);
+    // The claude CLI keeps running until stdin closes; the daemon closes it
+    // after the turn's `result` (see the ingest loop), which is what the
+    // harness flags below express for the harness lane.
+    let mut shell_env_for_process: BTreeMap<String, String> = BTreeMap::new();
+    match lane {
+        ProviderLane::Harness | ProviderLane::Workflow => {
+            ensure_cli_flag(&mut args, "--exit-when-idle");
+            ensure_cli_flag(&mut args, "--daemon-worker");
+            if let Some(cwd) = cwd {
+                set_cli_value_arg(&mut args, "--cwd", cwd.to_string());
+            }
+            if let Some(tool_defaults) = tool_defaults {
+                set_cli_value_arg(
+                    &mut args,
+                    "--additional-context",
+                    serde_json::to_string(&tool_defaults)?,
+                );
+            }
+            if let Some(shell_env) = shell_env {
+                set_cli_value_arg(&mut args, "--shell-env", serde_json::to_string(&shell_env)?);
+            }
+        }
+        // The claude CLI's shell children inherit the process env, so the
+        // non-secret project build env rides the child env directly. The
+        // harness-only tool defaults have no claude equivalent.
+        ProviderLane::ClaudeCli => {
+            if let Some(shell_env) = shell_env {
+                shell_env_for_process = shell_env;
+            }
+        }
     }
 
     // The spec's `session_id` is the SUPERVISION key: fleetd registries, the
@@ -3486,30 +3575,49 @@ fn prepare_harness_child_launch(
         _ => None,
     };
 
-    if let Some(config) = build_harness_mcp_config(
-        &mut args,
-        tool_placement,
-        self_mcp_url,
-        workspace_binding.is_some(),
-    )? {
-        set_cli_value_arg(&mut args, "--mcp-config", config);
-    }
-    if self_mcp_url.is_some() {
-        set_cli_value_arg(
-            &mut args,
-            "--capability-mcp-server",
-            crate::util::blackbox_mcp_name(),
-        );
+    match lane {
+        ProviderLane::Harness | ProviderLane::Workflow => {
+            if let Some(config) = build_harness_mcp_config(
+                &mut args,
+                tool_placement,
+                self_mcp_url,
+                workspace_binding.is_some(),
+            )? {
+                set_cli_value_arg(&mut args, "--mcp-config", config);
+            }
+            if self_mcp_url.is_some() {
+                set_cli_value_arg(
+                    &mut args,
+                    "--capability-mcp-server",
+                    crate::util::blackbox_mcp_name(),
+                );
+            }
+        }
+        // The claude CLI loads exactly the servers named here (its own
+        // user/project MCP config is skipped), with no tool-placement block
+        // and header secrets referenced as `${VAR}` so argv never carries
+        // them.
+        ProviderLane::ClaudeCli => {
+            if let Some(config) =
+                build_claude_mcp_config(&mut args, self_mcp_url, workspace_binding.is_some())?
+            {
+                set_cli_value_arg(&mut args, "--mcp-config", config);
+                ensure_cli_flag(&mut args, "--strict-mcp-config");
+            }
+        }
     }
 
-    // Environment: provider credentials + BRO_HARNESS_PROVIDER ride the spec's
-    // SecretEnv. BRO_HOME is pinned on its own field (the executor sets it), so
-    // it is intentionally NOT placed in `env`; because BRO_HOME is already in
-    // BLACKBOX_SERVICE_ENV_VARS the scrub-key set is byte-identical either way.
-    let mut env: std::collections::BTreeMap<String, String> =
-        env_overrides.unwrap_or_default().into_iter().collect();
-    env.entry("BRO_HARNESS_PROVIDER".to_string())
-        .or_insert_with(|| provider.as_str().to_string());
+    // Environment: provider credentials (+ BRO_HARNESS_PROVIDER on the harness
+    // lane) ride the spec's SecretEnv. BRO_HOME is pinned on its own field
+    // (the executor sets it), so it is intentionally NOT placed in `env`;
+    // because BRO_HOME is already in BLACKBOX_SERVICE_ENV_VARS the scrub-key
+    // set is byte-identical either way.
+    let mut env: std::collections::BTreeMap<String, String> = shell_env_for_process;
+    env.extend(env_overrides.unwrap_or_default());
+    if lane == ProviderLane::Harness {
+        env.entry("BRO_HARNESS_PROVIDER".to_string())
+            .or_insert_with(|| provider.as_str().to_string());
+    }
     // The worker presents the daemon service bearer to its own MCP server
     // whenever the daemon has one, whether or not the gate is on, so turning
     // the gate on needs no change on the worker side.
@@ -3584,6 +3692,9 @@ fn prepare_harness_child_launch(
         initial_messages: vec![harness_user_input(initial_prompt)],
         bro_home,
         event_log_path,
+        // A claude CLI child writes no session log of its own; the executor
+        // that owns its stdout writes it at the pinned path.
+        supervisor_writes_event_log: lane == ProviderLane::ClaudeCli,
     })
 }
 
@@ -3693,7 +3804,13 @@ fn spawn_harness_ingest_loop(
             let Ok(evt) = serde_json::from_str::<Value>(&line) else {
                 continue;
             };
-            if let Some((path, file)) = mirror.as_mut() {
+            let event_type = evt.get("type").and_then(Value::as_str).unwrap_or("");
+            // Stream partials never reach a session log: the harness drops
+            // them from its own, and the mirror keeps the same shape.
+            let is_stream_partial = event_type == "stream_event";
+            let ends_claude_turn =
+                provider.lane() == ProviderLane::ClaudeCli && event_type == "result";
+            if !is_stream_partial && let Some((path, file)) = mirror.as_mut() {
                 let record = serde_json::to_vec(&serde_json::json!({
                     "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
                     "event": &evt,
@@ -3745,6 +3862,15 @@ fn spawn_harness_ingest_loop(
             if let Some(seq) = seq {
                 let mut inner = task.inner.lock();
                 inner.harness_ingest_seq = inner.harness_ingest_seq.max(seq);
+            }
+            // A claude CLI child idles after a turn until stdin closes.
+            // Dropping its control lane here closes stdin, so the child
+            // finishes whatever input it already read and exits: the same
+            // exit-when-idle contract the harness implements itself. A steer
+            // that lands after this point is refused, as it would be after a
+            // harness exit, and goes through resume instead.
+            if ends_claude_turn {
+                harness_controls().write().remove(&task_id);
             }
         }
         if let Some((path, mut file)) = mirror
@@ -4170,6 +4296,56 @@ fn build_harness_mcp_config(
             .and_then(Value::as_object)
             .is_none_or(serde_json::Map::is_empty)
     {
+        Ok(None)
+    } else {
+        Ok(Some(serde_json::to_string(&config)?))
+    }
+}
+
+/// The claude-lane `--mcp-config` payload: the caller's servers plus the
+/// transient daemon capability server, in the CLI's own `{"mcpServers":{…}}`
+/// shape. Header secrets are `${VAR}` references the CLI expands from the
+/// child env, never literal values in argv. The harness-only
+/// `tool_placement` block and `exclude_tools` list are not emitted.
+fn build_claude_mcp_config(
+    args: &mut Vec<String>,
+    self_mcp_url: Option<&str>,
+    workspace_bound: bool,
+) -> anyhow::Result<Option<String>> {
+    let raw_mcp_config = take_cli_value_arg(args, "--mcp-config");
+    let mut config: Value = match raw_mcp_config {
+        Some(raw) => serde_json::from_str(&raw)?,
+        None => serde_json::json!({}),
+    };
+    let config_object = config
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("--mcp-config must be a JSON object"))?;
+    config_object.remove("tool_placement");
+    let servers = config_object
+        .entry("mcpServers")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("--mcp-config mcpServers must be a JSON object"))?;
+    add_transient_blackbox_mcp_server(
+        servers,
+        self_mcp_url,
+        workspace_bound,
+        worker_mcp_bearer().is_some(),
+    );
+    for server in servers.values_mut() {
+        let Some(server) = server.as_object_mut() else {
+            continue;
+        };
+        server.remove("exclude_tools");
+        if let Some(headers) = server.get_mut("headers").and_then(Value::as_object_mut) {
+            for value in headers.values_mut() {
+                if let Some(reference) = value.as_str().and_then(|s| s.strip_prefix("$env:")) {
+                    *value = Value::String(format!("${{{reference}}}"));
+                }
+            }
+        }
+    }
+    if servers.is_empty() {
         Ok(None)
     } else {
         Ok(Some(serde_json::to_string(&config)?))
@@ -5781,7 +5957,7 @@ mod tests {
         let spec = prepare_harness_child_launch(
             "task-bound".to_string(),
             "pending".to_string(),
-            Provider::Glm,
+            Provider::Brodex,
             vec!["-p".to_string(), "work".to_string()],
             root.to_str(),
             None,
@@ -5833,6 +6009,119 @@ mod tests {
     }
 
     #[test]
+    fn claude_lane_child_launch_composes_cli_argv_and_env() {
+        let mut env = crate::util::TestEnvGuard::new();
+        env.set("BLACKBOX_MCP_NAME", "selfbox");
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        env.set(
+            "BLACKBOX_CONFIG",
+            root.join("missing-config.toml").to_str().unwrap(),
+        );
+        let spec = prepare_harness_child_launch(
+            "task-cli".to_string(),
+            "sess-cli".to_string(),
+            Provider::Glm,
+            vec![
+                "-p".to_string(),
+                "initial turn".to_string(),
+                "--model".to_string(),
+                "glm-test".to_string(),
+                "--mcp-config".to_string(),
+                serde_json::json!({
+                    "mcpServers": {
+                        "external": {"type": "stdio", "command": "external-mcp"}
+                    },
+                    "tool_placement": {"mcp__external__inspect": "both"}
+                })
+                .to_string(),
+            ],
+            root.to_str(),
+            Some(HashMap::from([(
+                "CLAUDE_CONFIG_DIR".to_string(),
+                "/home/op/.claude-zai".to_string(),
+            )])),
+            Some(BTreeMap::from([(
+                "RUSTC_WRAPPER".to_string(),
+                "sccache".to_string(),
+            )])),
+            Some(BTreeMap::from([(
+                "mcp__external__inspect".to_string(),
+                "both".to_string(),
+            )])),
+            Some(BTreeMap::from([(
+                "default:file_read.offset".to_string(),
+                serde_json::json!("10"),
+            )])),
+            None,
+            &root,
+            Some("http://127.0.0.1:7264/mcp?surface=default"),
+            None,
+            None,
+        )
+        .unwrap();
+
+        // The prompt rides stdin; the CLI's stream-json flags are present.
+        assert_eq!(spec.initial_messages.len(), 1);
+        assert!(!spec.argv.iter().any(|arg| arg == "initial turn"));
+        let ifmt = spec
+            .argv
+            .iter()
+            .position(|a| a == "--input-format")
+            .expect("--input-format present");
+        assert_eq!(spec.argv[ifmt + 1], "stream-json");
+        assert!(spec.argv.iter().any(|a| a == "--replay-user-messages"));
+        assert!(spec.argv.iter().any(|a| a == "--strict-mcp-config"));
+        // Harness-only flags never reach the CLI.
+        for flag in [
+            "--exit-when-idle",
+            "--daemon-worker",
+            "--cwd",
+            "--capability-mcp-server",
+            "--additional-context",
+            "--shell-env",
+        ] {
+            assert!(!spec.argv.iter().any(|arg| arg == flag), "{flag} leaked");
+        }
+        // The MCP config is the CLI's own shape: no tool placement, no
+        // exclude list, and the bearer as a `${VAR}` reference.
+        let mcp_config_index = spec
+            .argv
+            .iter()
+            .position(|arg| arg == "--mcp-config")
+            .unwrap();
+        let config: Value = serde_json::from_str(&spec.argv[mcp_config_index + 1]).unwrap();
+        assert!(config.get("tool_placement").is_none(), "{config}");
+        assert_eq!(config["mcpServers"]["external"]["command"], "external-mcp");
+        assert_eq!(config["mcpServers"]["selfbox"]["type"], "http");
+        assert!(
+            config["mcpServers"]["selfbox"]
+                .get("exclude_tools")
+                .is_none()
+        );
+        if worker_mcp_bearer().is_some() {
+            assert_eq!(
+                config["mcpServers"]["selfbox"]["headers"]["Authorization"],
+                format!("${{{WORKER_MCP_BEARER_ENV}}}")
+            );
+        }
+        // Build env rides the process env; the config dir and cwd ride their
+        // own fields; no harness provider marker.
+        let env = spec.env.as_map();
+        assert_eq!(env.get("RUSTC_WRAPPER"), Some(&"sccache".to_string()));
+        assert_eq!(
+            env.get("CLAUDE_CONFIG_DIR"),
+            Some(&"/home/op/.claude-zai".to_string())
+        );
+        assert!(!env.contains_key("BRO_HARNESS_PROVIDER"));
+        assert_eq!(spec.cwd.as_deref(), root.to_str());
+        assert_eq!(
+            spec.event_log_path,
+            root.join("harness-sessions").join("sess-cli.events.jsonl")
+        );
+    }
+
+    #[test]
     fn prepare_harness_child_launch_composes_worker_spec() {
         // config::load() reads $BLACKBOX_CONFIG / XDG; point it at a missing
         // path under a tempdir so composition never touches real config state.
@@ -5854,7 +6143,7 @@ mod tests {
         let spec = prepare_harness_child_launch(
             "task-1".to_string(),
             "sess-1".to_string(),
-            Provider::Glm,
+            Provider::Brodex,
             args,
             Some("/repo/x"),
             None, // env_overrides
@@ -5932,7 +6221,7 @@ mod tests {
 
         let task_id = "test-session-command-mapping";
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        harness_controls().write().insert(task_id.to_string(), tx);
+        register_test_control(task_id, tx, ProviderLane::Harness);
 
         apply_session_command(task_id, SessionCommand::UserTurn { text: "hi".into() }).unwrap();
         let user = rx.try_recv().unwrap();
@@ -5953,6 +6242,45 @@ mod tests {
         apply_session_command(task_id, SessionCommand::Compact).unwrap();
         let compact = rx.try_recv().unwrap();
         assert_eq!(compact["message"]["content"][0]["text"], "/compact");
+
+        harness_controls().write().remove(task_id);
+    }
+
+    #[test]
+    fn apply_session_command_maps_protocol_variants_to_claude_cli_wire() {
+        use bro_protocol::SessionCommand;
+
+        let task_id = "test-session-command-mapping-claude";
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        register_test_control(task_id, tx, ProviderLane::ClaudeCli);
+
+        apply_session_command(task_id, SessionCommand::UserTurn { text: "hi".into() }).unwrap();
+        let user = rx.try_recv().unwrap();
+        assert_eq!(user["type"], "user");
+        assert_eq!(user["message"]["content"][0]["text"], "hi");
+
+        // The claude CLI nests the subtype and payload under `request`.
+        apply_session_command(task_id, SessionCommand::Interrupt).unwrap();
+        let interrupt = rx.try_recv().unwrap();
+        assert_eq!(interrupt["type"], "control_request");
+        assert_eq!(interrupt["request"]["subtype"], "interrupt");
+        assert!(interrupt.get("subtype").is_none());
+        assert!(interrupt["request_id"].is_string());
+
+        apply_session_command(task_id, SessionCommand::SetModel { model: "m2".into() }).unwrap();
+        let set_model = rx.try_recv().unwrap();
+        assert_eq!(set_model["request"]["subtype"], "set_model");
+        assert_eq!(set_model["request"]["model"], "m2");
+
+        // Interrupt-and-redirect is an interrupt followed by the redirect as
+        // the next queued user turn.
+        interrupt_harness_task(task_id, Some("go left".into())).unwrap();
+        let interrupt = rx.try_recv().unwrap();
+        assert_eq!(interrupt["request"]["subtype"], "interrupt");
+        assert!(interrupt["request"].get("prompt").is_none());
+        let redirect = rx.try_recv().unwrap();
+        assert_eq!(redirect["type"], "user");
+        assert_eq!(redirect["message"]["content"][0]["text"], "go left");
 
         harness_controls().write().remove(task_id);
     }
@@ -6081,7 +6409,7 @@ mod tests {
         let spec = prepare_harness_child_launch(
             "task-b".to_string(),
             "sess-b".to_string(),
-            Provider::Glm,
+            Provider::Brodex,
             vec![
                 "-p".to_string(),
                 "turn".to_string(),
@@ -6132,7 +6460,7 @@ mod tests {
         let spec = prepare_harness_child_launch(
             "task-c".to_string(),
             "sess-c".to_string(),
-            Provider::Glm,
+            Provider::Brodex,
             vec!["-p".to_string(), "turn".to_string()],
             root.to_str(),
             None,
@@ -6164,7 +6492,7 @@ mod tests {
         let spec = prepare_harness_child_launch(
             "task-x".to_string(),
             "sess-x".to_string(),
-            Provider::Glm,
+            Provider::Brodex,
             vec![
                 "-p".to_string(),
                 "initial turn".to_string(),
@@ -6225,7 +6553,7 @@ mod tests {
         }
         assert_eq!(
             spec.env.as_map().get("BRO_HARNESS_PROVIDER"),
-            Some(&"glm".to_string())
+            Some(&"brodex".to_string())
         );
         // BRO_HOME is pinned on its own field, not duplicated into env.
         assert!(!spec.env.as_map().contains_key("BRO_HOME"));
@@ -6301,7 +6629,7 @@ mod tests {
         let store_dir = root.join("store");
         let failed = spawn_task_with_tool_placement(
             "child-error".to_string(),
-            Provider::Glm,
+            Provider::Brodex,
             vec![
                 "-p".to_string(),
                 "fail".to_string(),
@@ -6326,7 +6654,7 @@ mod tests {
         env.set("BRO_HARNESS_BIN", &healthy_bin);
         let healthy = spawn_task_with_tool_placement(
             "child-healthy".to_string(),
-            Provider::Glm,
+            Provider::Brodex,
             vec![
                 "-p".to_string(),
                 "succeed".to_string(),
@@ -6395,7 +6723,7 @@ mod tests {
         let (tail_tx, _) = tokio::sync::broadcast::channel(32);
         let task = spawn_task_with_tool_placement(
             "steer-after-error".to_string(),
-            Provider::Glm,
+            Provider::Brodex,
             vec![
                 "-p".to_string(),
                 "start".to_string(),
@@ -6469,7 +6797,7 @@ mod tests {
         let task = spawn_with_pre_minted_id(
             "seam-task".to_string(),
             SpawnTaskParams {
-                provider: Provider::Glm,
+                provider: Provider::Brodex,
                 args: vec!["-p".to_string(), "hello".to_string()],
                 session_id: "pending".to_string(),
                 cwd: Some(root.to_string_lossy().into_owned()),

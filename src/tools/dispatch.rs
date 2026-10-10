@@ -3111,8 +3111,14 @@ mod tests {
     fn resume_leaves_code_mode_and_service_tier_to_the_session() {
         let tmp = tempfile::tempdir().unwrap();
         let server = test_server(&tmp);
-        save_resume_brofile(&server, "moded-bro", Provider::Glm);
-        seed_named_session(&server, "moded-task", "moded-session", "moded-bro");
+        save_resume_brofile(&server, "moded-bro", Provider::Brodex);
+        seed_named_session_for(
+            &server,
+            "moded-task",
+            "moded-session",
+            "moded-bro",
+            Provider::Brodex,
+        );
 
         // A fresh dispatch from this brofile carries both.
         let (_, _, fresh, ..) = server
@@ -3125,7 +3131,7 @@ mod tests {
             Some(orchestration::brofile::EditDiscipline::Structured)
         );
         let fresh_args =
-            Provider::Glm.build_exec_args("fresh", None, "moded-session", None, Some(&fresh));
+            Provider::Brodex.build_exec_args("fresh", None, "moded-session", None, Some(&fresh));
         assert!(
             fresh_args
                 .windows(2)
@@ -3136,7 +3142,7 @@ mod tests {
         // A resume restores the brofile's model and policy, and passes neither
         // code mode nor service tier, so the harness keeps what it saved.
         let (_, _, _, opts, _, _, filters, _, _, _, brofile) = server
-            .resolve_resume_target(Some("moded-session"), Some("glm"), None)
+            .resolve_resume_target(Some("moded-session"), Some("brodex"), None)
             .unwrap();
         let opts = opts.unwrap();
         assert_eq!(opts.model.as_deref(), Some("brofile-model"));
@@ -3145,7 +3151,8 @@ mod tests {
         assert_eq!(opts.service_tier, None);
         assert!(filters.is_some());
         assert_eq!(brofile.unwrap().unrestored, None);
-        let args = Provider::Glm.build_resume_args("moded-session", "continue", None, Some(&opts));
+        let args =
+            Provider::Brodex.build_resume_args("moded-session", "continue", None, Some(&opts));
         assert!(!args.iter().any(|arg| arg == "--code-mode"), "{args:?}");
         assert!(!args.iter().any(|arg| arg == "--service-tier"), "{args:?}");
         assert!(
@@ -3155,7 +3162,17 @@ mod tests {
     }
 
     fn seed_named_session(server: &BlackboxServer, task_id: &str, session: &str, bro: &str) {
-        let task = orch::test_task(task_id, orch::TaskStatus::Completed, Provider::Glm);
+        seed_named_session_for(server, task_id, session, bro, Provider::Glm);
+    }
+
+    fn seed_named_session_for(
+        server: &BlackboxServer,
+        task_id: &str,
+        session: &str,
+        bro: &str,
+        provider: Provider,
+    ) {
+        let task = orch::test_task(task_id, orch::TaskStatus::Completed, provider);
         {
             let mut inner = task.inner.lock();
             inner.session_id = session.to_string();

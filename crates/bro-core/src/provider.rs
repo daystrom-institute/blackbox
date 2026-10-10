@@ -31,18 +31,21 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "lowercase")]
 #[strum(serialize_all = "lowercase")]
 pub enum Provider {
-    #[serde(alias = "claude")]
+    /// Anthropic Claude through the `claude` CLI in headless stream-json
+    /// mode. Accounts select a `CLAUDE_CONFIG_DIR`; the default account uses
+    /// the operator's `~/.claude`.
+    Claude,
+    /// GLM (Z.AI Coding Plan) through the `claude` CLI with
+    /// `CLAUDE_CONFIG_DIR=~/.claude-zai`.
     #[strum(serialize = "glm")]
     Glm,
+    /// DeepSeek through the `claude` CLI with `CLAUDE_CONFIG_DIR=~/.claude-ds`.
     Deepseek,
-    /// MiniMax ridden through `bro-harness` on the Anthropic Messages
-    /// transport. Credentials/base URL are lifted from the operator's
-    /// `~/.claude-mm/settings.json` env block.
+    /// MiniMax through the `claude` CLI with `CLAUDE_CONFIG_DIR=~/.claude-mm`.
     Minimax,
-    /// Kimi (Moonshot AI) ridden through `bro-harness` on the Anthropic
-    /// Messages transport. Credentials/base URL are lifted from the
-    /// operator's `~/.claude-k/settings.json` env block (the Kimi-for-Coding
-    /// subscription endpoint, `https://api.kimi.com/coding`).
+    /// Kimi (Moonshot AI) through the `claude` CLI with
+    /// `CLAUDE_CONFIG_DIR=~/.claude-k` (the Kimi-for-Coding subscription
+    /// endpoint).
     Kimi,
     /// Codex/ChatGPT backend ridden through `bro-harness` (OpenAI Responses
     /// transport).
@@ -101,8 +104,23 @@ pub enum Capability {
     Resume,
 }
 
+/// The runtime a provider dispatches through. The daemon composes argv,
+/// environment, control messages and event handling per lane, never per
+/// provider: providers on one lane differ only in credentials and catalog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderLane {
+    /// One `claude -p` child per dispatch, stream-json on stdin and stdout.
+    ClaudeCli,
+    /// One standalone `bro-harness` child per dispatch (transitional).
+    Harness,
+    /// Daemon-internal workflow engine; no child process.
+    Workflow,
+}
+
 impl Provider {
     pub const ALL: &[Provider] = &[
+        Provider::Claude,
         Provider::Glm,
         Provider::Deepseek,
         Provider::Minimax,
@@ -115,6 +133,31 @@ impl Provider {
         !matches!(self, Provider::Workflow)
     }
 
+    pub fn lane(&self) -> ProviderLane {
+        match self {
+            Provider::Claude
+            | Provider::Glm
+            | Provider::Deepseek
+            | Provider::Minimax
+            | Provider::Kimi => ProviderLane::ClaudeCli,
+            Provider::Brodex | Provider::VibeBh => ProviderLane::Harness,
+            Provider::Workflow => ProviderLane::Workflow,
+        }
+    }
+
+    /// The `claude` CLI config dir name under the execution home that holds
+    /// this provider's credentials and endpoint, when it is not the default
+    /// `~/.claude`.
+    pub fn claude_config_dir_name(&self) -> Option<&'static str> {
+        match self {
+            Provider::Glm => Some(".claude-zai"),
+            Provider::Deepseek => Some(".claude-ds"),
+            Provider::Minimax => Some(".claude-mm"),
+            Provider::Kimi => Some(".claude-k"),
+            _ => None,
+        }
+    }
+
     /// Capabilities this provider offers regardless of model. Per-model
     /// overrides are NOT modeled today (matches daystrom's per-provider
     /// flag) — when that becomes a real distinction (e.g. only
@@ -125,6 +168,8 @@ impl Provider {
     pub fn capabilities(&self) -> std::collections::HashSet<Capability> {
         use Capability::*;
         let v: &[Capability] = match self {
+            // The claude CLI delivers structured output through `--json-schema`.
+            Provider::Claude => &[StructuredOutput, ToolUse, Resume],
             // All harness-backed providers support structured output via the
             // forced `final_result` terminal tool (transport-agnostic — works
             // for every tool-using provider).
@@ -145,6 +190,7 @@ impl Provider {
 
     pub fn as_str(&self) -> &'static str {
         match self {
+            Provider::Claude => "claude",
             Provider::Glm => "glm",
             Provider::Deepseek => "deepseek",
             Provider::Minimax => "minimax",
@@ -156,27 +202,11 @@ impl Provider {
     }
 
     pub fn supports_resume(&self) -> bool {
-        matches!(
-            self,
-            Provider::Glm
-                | Provider::Deepseek
-                | Provider::Minimax
-                | Provider::Kimi
-                | Provider::Brodex
-                | Provider::VibeBh
-        )
+        self.is_dispatchable()
     }
 
     pub fn is_streaming_json(&self) -> bool {
-        matches!(
-            self,
-            Provider::Glm
-                | Provider::Deepseek
-                | Provider::Minimax
-                | Provider::Kimi
-                | Provider::Brodex
-                | Provider::VibeBh
-        )
+        self.is_dispatchable()
     }
 
     pub fn models(&self) -> &'static [ModelInfo] {
@@ -303,6 +333,7 @@ pub enum PromptCacheCapability {
 
 fn models_for(provider: Provider) -> &'static [ModelInfo] {
     match provider {
+        Provider::Claude => CLAUDE_MODELS,
         Provider::Glm => GLM_MODELS,
         Provider::Deepseek => DEEPSEEK_MODELS,
         Provider::Minimax => MINIMAX_MODELS,
@@ -315,7 +346,7 @@ fn models_for(provider: Provider) -> &'static [ModelInfo] {
 
 fn efforts_for(provider: Provider) -> &'static [EffortInfo] {
     match provider {
-        Provider::Glm | Provider::Minimax => CLAUDE_EFFORTS,
+        Provider::Claude | Provider::Glm | Provider::Minimax => CLAUDE_EFFORTS,
         Provider::Deepseek => DEEPSEEK_EFFORTS,
         Provider::Kimi => KIMI_EFFORTS,
         Provider::Brodex => CODEX_EFFORTS,
@@ -326,9 +357,11 @@ fn efforts_for(provider: Provider) -> &'static [EffortInfo] {
 
 fn prompt_cache_for(provider: Provider) -> PromptCacheCapability {
     match provider {
-        Provider::Glm | Provider::Deepseek | Provider::Minimax | Provider::Kimi => {
-            PromptCacheCapability::AnthropicCacheControl
-        }
+        Provider::Claude
+        | Provider::Glm
+        | Provider::Deepseek
+        | Provider::Minimax
+        | Provider::Kimi => PromptCacheCapability::AnthropicCacheControl,
         Provider::Brodex => PromptCacheCapability::OpenAiPromptTokenDetails,
         Provider::VibeBh => PromptCacheCapability::ChatCompletionsPromptCacheKey,
         Provider::Workflow => PromptCacheCapability::NoneKnown,
@@ -360,6 +393,58 @@ static CLAUDE_EFFORTS: &[EffortInfo] = &[
         id: "max",
         description: "Maximum reasoning depth",
         default: false,
+    },
+];
+
+static CLAUDE_MODELS: &[ModelInfo] = &[
+    ModelInfo {
+        id: "claude-opus-5-5",
+        description: "Claude Opus 5.5",
+        default: true,
+        efforts: &[],
+        default_effort: None,
+    },
+    ModelInfo {
+        id: "claude-fable-5-1",
+        description: "Claude Fable 5.1",
+        default: false,
+        efforts: &[],
+        default_effort: None,
+    },
+    ModelInfo {
+        id: "claude-sonnet-5-5",
+        description: "Claude Sonnet 5.5",
+        default: false,
+        efforts: &[],
+        default_effort: None,
+    },
+    ModelInfo {
+        id: "claude-haiku-5-5",
+        description: "Claude Haiku 5.5",
+        default: false,
+        efforts: &[],
+        default_effort: None,
+    },
+    ModelInfo {
+        id: "opus",
+        description: "Latest Opus alias resolved by the claude CLI",
+        default: false,
+        efforts: &[],
+        default_effort: None,
+    },
+    ModelInfo {
+        id: "sonnet",
+        description: "Latest Sonnet alias resolved by the claude CLI",
+        default: false,
+        efforts: &[],
+        default_effort: None,
+    },
+    ModelInfo {
+        id: "haiku",
+        description: "Latest Haiku alias resolved by the claude CLI",
+        default: false,
+        efforts: &[],
+        default_effort: None,
     },
 ];
 

@@ -297,22 +297,36 @@ impl HarnessExecutor for LocalExecutor {
         }
 
         // Event lane: pump raw stdout lines out for daemon-side ingest, teeing
-        // each raw line (the daemon no longer tees; it parses).
+        // each raw line (the daemon no longer tees; it parses). A worker that
+        // writes no session log of its own gets one here, at the spec's
+        // pinned path, in the same `{ts, event}` shape the harness writes.
         let (events_tx, events_rx) = mpsc::unbounded_channel::<String>();
         let (stdout_done_tx, stdout_done_rx) = oneshot::channel::<()>();
         let tee_id_out = spec.task_id.clone();
+        let session_log = if spec.supervisor_writes_event_log {
+            bro_protocol::SessionLogWriter::open(&spec.event_log_path).await
+        } else {
+            None
+        };
         if let Some(stdout) = stdout {
             tokio::spawn(async move {
                 let reader = tokio::io::BufReader::new(stdout);
                 let mut lines = reader.lines();
                 let mut tee = open_harness_tee(&tee_id_out, "stdout.jsonl");
+                let mut session_log = session_log;
                 while let Ok(Some(line)) = lines.next_line().await {
                     if let Some(w) = tee.as_mut() {
                         w.try_write_line(&line);
                     }
+                    if let Some(log) = session_log.as_mut() {
+                        log.record_line(&line).await;
+                    }
                     if events_tx.send(line).is_err() {
                         break;
                     }
+                }
+                if let Some(log) = session_log.as_mut() {
+                    log.finish().await;
                 }
                 let _ = stdout_done_tx.send(());
             });
@@ -560,6 +574,7 @@ mod child_env_tests {
                 initial_messages: vec![],
                 bro_home: std::env::temp_dir(),
                 event_log_path: std::env::temp_dir().join("sess-1.events.jsonl"),
+                supervisor_writes_event_log: false,
             };
             let mut child = LocalExecutor.spawn(spec).await.unwrap();
             let line = child.events.recv().await;
