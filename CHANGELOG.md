@@ -13,6 +13,9 @@ out explicitly under `Changed` or `Removed`.
   that forwards `X-Forwarded-Email`. It renders the page shell and an
   overview of threads, bros, projects, index health and open gaps.
 
+- The operator web UI adds projects, system and configuration pages; the
+  configuration page renders every secret field and token path as redacted.
+
 - HTTP task launches and resumes now report origin `control`, with the same
   interactive MCP policy. Stored `cockpit` origins remain readable. Removed
   unused cockpit dispatch/transcript types and TUI design/backlog documents;

@@ -218,6 +218,15 @@ forward the signed-in user as `X-Forwarded-Email` (or `X-Forwarded-User`).
 Every request without that header is answered with a 401 page, and a request
 whose peer is not loopback is refused. The main listener never serves the UI.
 
+`/projects` lists the project catalog and registered roots, and
+`/projects/{id}` shows one project's attachments, publisher status, transport
+ownership and graphs. `/system` shows index, doctor, storage and GC, embedding,
+provider, allocator, gap and runtime-metric panels, and `/config` shows the
+effective daemon config, the surface table with each surface's visible tools,
+global brofiles and the global MCP servers. Every secret-bearing config field,
+every token or credential file path, and every MCP header or environment
+value renders as `[redacted]`.
+
 ### Local dev daemon
 
 A local daemon for live validation runs from its own binary path, port and
