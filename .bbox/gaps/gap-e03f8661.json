@@ -19,14 +19,14 @@
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/refactor-tools/java-method-body-reindent-hygiene",
   "notes": "Still open after the var-resolution/nested-region tranche. Compile-passing helper body indentation residue remains a separate hygiene/extractor polish item. The calculation reprobe reproduced the issue after successful extraction and hygiene: helper body indentation stayed at source nesting depth.",
-  "resolution": "acknowledged",
+  "resolution": "addressed",
   "project_id": "89bd722f",
   "task_id": "c6a99057-3c65-43d8-8cbd-adfb8f37ca49",
   "session_id": "2dd5b5e5-b448-49b4-8bb9-01d50a81f4eb",
   "provider": "deepseek",
   "thread_id": "thread-8d968b2d",
   "created_at": "2026-06-14T04:39:59Z",
-  "updated_at": "2026-09-23T23:33:36Z",
-  "resolved_at": "2026-09-23T23:33:36Z",
-  "resolution_note": "issue: https://github.com/daystrom-institute/blackbox/issues/26"
+  "updated_at": "2026-10-11T19:45:52Z",
+  "resolved_at": "2026-10-11T19:45:52Z",
+  "resolution_note": "Transferred to https://github.com/daystrom-institute/blackbox/issues/26, now the canonical implementation work item. Helper reindentation still computes a common whitespace prefix including nonblank comment lines, so shallower comments can preserve unwanted source nesting. Verified against accepted beta 93c2d391a8d6b8d2d760b88b1acdadbafc7a3ea4. Gap triage is complete; the GitHub issue remains open and this transfer does not claim the capability is implemented."
 }

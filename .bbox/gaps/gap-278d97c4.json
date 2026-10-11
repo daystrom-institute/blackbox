@@ -1,0 +1,20 @@
+{
+  "id": "gap-278d97c4",
+  "title": "Fleet TCP connections have no pre-authentication deadline",
+  "gap_kind": "tooling",
+  "domain": "fleetd",
+  "wanted_capability": "Bound the time an unauthenticated TCP peer can retain a fleetd connection through TLS, protocol negotiation and the first authentication envelope.",
+  "fallback_used": "Keep the existing restricted transport until the separately authorized cutover; no service mutation during hygiene.",
+  "evidence": [
+    "thread-ac066062 note 5",
+    "beta/blackbox-v2 93c2d391a8d6b8d2d760b88b1acdadbafc7a3ea4: crates/fleetd/src/server.rs:386-440"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/fleetd/preauth-deadline",
+  "notes": "Static audit confirms TLS accept and the first authentication read_body have no deadline. bro_rpc::accept already bounds protocol negotiation internally; that portion of the older thread observation is obviated. No load test or exposure claim. Other connections continue to be served. Tracked by https://github.com/daystrom-institute/blackbox/issues/127.",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "created_at": "2026-10-11T18:22:19Z",
+  "updated_at": "2026-10-11T18:22:19Z"
+}

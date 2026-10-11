@@ -13,10 +13,10 @@
   "impact": "low",
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/project-catalog/producer-claims-offline-revoke-unlocked",
-  "resolution": "acknowledged",
+  "resolution": "addressed",
   "project_id": "89bd722f",
   "created_at": "2026-09-23T19:52:14Z",
-  "updated_at": "2026-09-24T04:03:14Z",
-  "resolved_at": "2026-09-24T04:03:14Z",
-  "resolution_note": "issue: https://github.com/daystrom-institute/blackbox/issues/55"
+  "updated_at": "2026-10-11T19:14:59Z",
+  "resolved_at": "2026-10-11T19:14:59Z",
+  "resolution_note": "Addressed by https://github.com/daystrom-institute/blackbox/issues/55 via PR #96, delivered in commit 9162172b. Offline revoke acquires the exclusive lifetime lock before opening the claims store and holds it through durable flush. Regression coverage checks refusal without writing while a daemon holds the lock and excludes daemon startup until flush completes. Verified against accepted beta commit 93c2d391a8d6b8d2d760b88b1acdadbafc7a3ea4."
 }

@@ -1,0 +1,20 @@
+{
+  "id": "gap-607d1fb0",
+  "title": "Eval reference refresh depends on a retired MCP tool",
+  "gap_kind": "eval_coverage",
+  "domain": "eval-refresh",
+  "wanted_capability": "Refresh content-addressed expected refs for retained retrieval evals using supported authoritative inputs.",
+  "fallback_used": "Static inspection only; no provider calls or eval runs.",
+  "evidence": [
+    "thread-b0683efb notes 2-4",
+    "beta/blackbox-v2 93c2d391a8d6b8d2d760b88b1acdadbafc7a3ea4: eval/scripts/refresh_expected_refs.py:117"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "eval_coverage/eval-refresh/removed-project-refs-tool",
+  "notes": "Script still invokes bbox_refactor_project_refs, absent from the surviving MCP surface. Earlier gap-b44fe7ac recorded the original script delivery, not this later retired dependency. Keeping versus retiring the eval suite remains an explicit unresolved choice.",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "created_at": "2026-10-11T18:22:19Z",
+  "updated_at": "2026-10-11T18:22:19Z"
+}

@@ -17,11 +17,11 @@
   "blocking_level": "workaround_available",
   "dedupe_key": "refactor_primitive/java-refactor/lsp-backed-isolate-organize-imports",
   "notes": "Traced 2026-09-23: java.organizeImports and java.hygiene (crates/bro-harness/src/bindings/java_transforms.rs, crates/bbox-refactor/src/java/hygiene.rs and imports.rs) are syntax_only with no LSP-backed mode. The harness now owns a JDTLS session pool (bro-lsp Language::Java) and exposes lsp.assist, but SessionPool::code_action sends no CodeActionContext.only filter and no Java hygiene tool routes through JDTLS source.organizeImports, so an lsp_verified import organization for touched files is still unavailable.",
-  "resolution": "acknowledged",
+  "resolution": "addressed",
   "project_id": "89bd722f",
   "thread_id": "thread-8d968b2d",
   "created_at": "2026-06-14T00:53:07Z",
-  "updated_at": "2026-09-23T23:33:33Z",
-  "resolved_at": "2026-09-23T23:33:33Z",
-  "resolution_note": "issue: https://github.com/daystrom-institute/blackbox/issues/23"
+  "updated_at": "2026-10-11T19:45:52Z",
+  "resolved_at": "2026-10-11T19:45:52Z",
+  "resolution_note": "Transferred to https://github.com/daystrom-institute/blackbox/issues/23, now the canonical implementation work item. Java import organization and hygiene remain syntax-only; the requested fail-closed JDTLS-backed mode remains unimplemented. Verified against accepted beta 93c2d391a8d6b8d2d760b88b1acdadbafc7a3ea4. Gap triage is complete; the GitHub issue remains open and this transfer does not claim the capability is implemented."
 }
