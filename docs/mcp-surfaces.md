@@ -84,4 +84,5 @@ bro mcp call <tool> '<json>' --surface ops
 The built-in agent-facing surfaces hide `bbox_stats`, `bro_prune`,
 `bro_allocator_*`, `bro_mcp`, project administration other than
 `bbox_project_list`, `bbox_reindex`, `bbox_reembed`, `bbox_embed_*`,
-`bbox_storage_*`, `bbox_edge_compact`, `bbox_doctor` and `bbox_artifact_*`.
+`bbox_storage_*`, `bbox_edge_compact`, `bbox_doctor`, `bbox_thread_rekey` and
+`bbox_artifact_*`.

@@ -347,6 +347,29 @@ bbox_thread_list(status="open")          # investigation continuity
 bbox_embed_status()                      # confirm no embedding errors
 ```
 
+### Re-keying threads to a project
+
+A thread stores the raw `project` selector it was opened with and, when the
+resolver knew the project at open time, the project id. List matching decides
+by id when both the row and the query carry one; a row without an id falls back
+to its raw selector, which stops matching anything once that path no longer
+resolves (a removed linked worktree, for example). `bbox_thread_list` reports
+such a row with `project_selector` and no `project_id`.
+
+`bbox_thread_rekey` (on `ops`) stamps a project id on named rows. `project` is a
+project id, operator alias or registered path and must resolve, or the whole
+call is refused. Each row names a thread id and its `expected_project`, the
+`project_selector` value read from the list. A row is stamped only when it has
+no project id and its raw selector equals `expected_project`; the raw selector
+is kept, and a row that already carries a project id is never overwritten.
+`dry_run` defaults to true and writes nothing; the applied call persists the
+store and reindexes each stamped row. Every call requires an `audit_reason`.
+
+```bash
+bro mcp call bbox_thread_rekey '{"project":"alpha","rows":[{"id":"thread-7f01324e","expected_project":"/work/alpha-wt"}],"audit_reason":"worktree removed"}' --surface ops
+bro mcp call bbox_thread_rekey '{"project":"alpha","rows":[{"id":"thread-7f01324e","expected_project":"/work/alpha-wt"}],"dry_run":false,"audit_reason":"worktree removed"}' --surface ops
+```
+
 ### Knowledge transport cutover (offline and operator-authorized)
 
 The knowledge cutover ceremony is an offline catalog mutation. Preflight is

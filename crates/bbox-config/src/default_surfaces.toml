@@ -34,6 +34,7 @@ disallow = [
     "bbox_storage_*",
     "bbox_edge_compact",
     "bbox_doctor",
+    "bbox_thread_rekey",
     "bbox_artifact_*",
 ]
 
@@ -63,6 +64,7 @@ disallow = [
     "bbox_storage_*",
     "bbox_edge_compact",
     "bbox_doctor",
+    "bbox_thread_rekey",
     "bbox_artifact_*",
 ]
 
@@ -97,6 +99,7 @@ disallow = [
     "bbox_storage_*",
     "bbox_edge_compact",
     "bbox_doctor",
+    "bbox_thread_rekey",
     "bbox_artifact_*",
 ]
 
