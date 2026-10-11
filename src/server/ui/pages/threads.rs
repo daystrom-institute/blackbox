@@ -731,6 +731,11 @@ mod tests {
         let (_, none) = get(shared.clone(), "/threads?status=resolved").await;
         assert!(none.contains("No threads match these filters."), "{none}");
 
+        let (status, fragment) = get(shared.clone(), "/fragments/threads/table?status=open").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!fragment.contains("<html"), "a fragment renders no shell");
+        assert!(fragment.contains(&beta) && !fragment.contains(&format!("/threads/{alpha}")));
+
         // A resolved thread is opt-in: hidden by default, listed under `all`
         // and under its own status.
         mutate(
@@ -765,11 +770,6 @@ mod tests {
         let (status, invalid) = get(shared.clone(), "/threads?status=bogus").await;
         assert_eq!(status, StatusCode::OK);
         assert!(invalid.contains("error-fragment") && invalid.contains("bbox_thread_list"));
-
-        let (status, fragment) = get(shared, "/fragments/threads/table?status=open").await;
-        assert_eq!(status, StatusCode::OK);
-        assert!(!fragment.contains("<html"), "a fragment renders no shell");
-        assert!(fragment.contains(&beta) && !fragment.contains(&format!("/threads/{alpha}")));
     }
 
     #[tokio::test]
