@@ -1,18 +1,29 @@
 //! `/threads` and `/threads/{id}`: the thread list with status and project
 //! filters, and one thread's notes, participants and linked entities.
 //!
-//! The list reads through the filter resolution and matcher that
-//! `bbox_thread_list` uses; the detail reads the same stored record that
-//! `bbox_thread` pages. Both run on the blocking pool: the project resolver
-//! may probe the filesystem and the store lock can wait behind a write.
+//! The list reads through the matcher that `bbox_thread_list` uses; the
+//! detail reads the same stored record that `bbox_thread` pages. Both run
+//! on the blocking pool: the project resolver may probe the filesystem and
+//! the store lock can wait behind a write.
+//!
+//! Threads are keyed to a project id when the resolver knew the project at
+//! the time they were opened, else to the raw selector the caller passed.
+//! The project filter offers one choice per project, not per stored key:
+//! every stored key is resolved through the resolver the tool's filter lane
+//! uses, keys that name the same project fold into one choice labelled with
+//! the project's name, and a selector no project claims stays a choice of
+//! its own under the selector itself. Selecting a choice lists the threads
+//! stored under any of its keys; a project value the choices do not cover
+//! falls through to the tool's own filter semantics.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use axum::Extension;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::Response;
+use bbox_corpus_core::project_selector::ProjectSelectorRequest;
 use bbox_threads::threads::{EdgeTarget, Thread, ThreadListParams, ThreadOrigin, ThreadStatus};
 use chrono::{DateTime, Utc};
 use maud::{Markup, html};
@@ -21,6 +32,7 @@ use serde::Deserialize;
 use super::super::shell::{Section, empty_state, error_fragment, layout};
 use super::super::{Principal, UiState, html_response};
 use super::display::{age, encode_component, parse_rfc3339, preview};
+use super::projects::project_names;
 
 /// Rows per list page.
 const PAGE_SIZE: usize = 100;
@@ -128,13 +140,130 @@ fn status_label(status: &ThreadStatus) -> Markup {
     }
 }
 
-/// The project a thread is keyed to, as `bbox_thread_list` reports it: the
+/// The key a thread is stored under, as `bbox_thread_list` reports it: the
 /// resolver's project id when stamped, else the stored selector.
 fn thread_project(thread: &Thread) -> Option<&str> {
     thread
         .project_id
         .as_deref()
         .or_else(|| (!thread.project.is_empty()).then_some(thread.project.as_str()))
+}
+
+/// One choice on the project filter: the stored keys that name one project,
+/// or one selector no project claims.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProjectChoice {
+    /// The query value: the project id, else the selector itself.
+    value: String,
+    /// The option text: the project's name, else its id, else the selector.
+    label: String,
+    /// The project behind the choice; absent for an unclaimed selector.
+    project_id: Option<String>,
+    /// Every stored key that selects this choice.
+    keys: BTreeSet<String>,
+}
+
+impl ProjectChoice {
+    /// How a row names its project: the choice's label and value, with the
+    /// stored key kept for the hover text.
+    fn reference(&self, key: &str) -> ProjectRef {
+        ProjectRef {
+            value: self.value.clone(),
+            label: self.label.clone(),
+            project_id: self.project_id.clone(),
+            key: key.to_string(),
+        }
+    }
+}
+
+/// A thread's project as a page names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProjectRef {
+    value: String,
+    label: String,
+    project_id: Option<String>,
+    key: String,
+}
+
+/// The project filter choices for `keys`, plus the resolution of every key
+/// and of `extra` (a query value that may not be a stored key): keys the
+/// resolver maps to one project fold into that project's choice, the rest
+/// stand alone. Resolution runs over one catalog snapshot; when the
+/// resolver is unavailable every key stands alone.
+fn project_choices(
+    ui: &UiState,
+    keys: &BTreeSet<String>,
+    extra: Option<&str>,
+) -> (Vec<ProjectChoice>, BTreeMap<String, Option<String>>) {
+    let wanted: BTreeSet<&str> = keys.iter().map(String::as_str).chain(extra).collect();
+    let resolved: BTreeMap<String, Option<String>> = ui
+        .server
+        .with_project_resolver(|engine| {
+            wanted
+                .iter()
+                .map(|raw| {
+                    let id = engine
+                        .resolve(&ProjectSelectorRequest::filter(*raw))
+                        .ok()
+                        .and_then(|resolution| resolution.project_id().map(str::to_owned));
+                    (raw.to_string(), id)
+                })
+                .collect()
+        })
+        .unwrap_or_else(|_| wanted.iter().map(|raw| (raw.to_string(), None)).collect());
+
+    let mut by_project: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
+    let mut literals: Vec<&str> = Vec::new();
+    for key in keys {
+        match resolved.get(key).and_then(Option::as_deref) {
+            Some(id) => {
+                by_project.entry(id).or_default().insert(key.clone());
+            }
+            None => literals.push(key),
+        }
+    }
+    let names = project_names(ui);
+    let mut choices: Vec<ProjectChoice> = by_project
+        .into_iter()
+        .map(|(id, keys)| ProjectChoice {
+            value: id.to_string(),
+            label: names.get(id).cloned().unwrap_or_else(|| id.to_string()),
+            project_id: Some(id.to_string()),
+            keys,
+        })
+        .collect();
+    choices.sort_by(|a, b| {
+        a.label
+            .to_lowercase()
+            .cmp(&b.label.to_lowercase())
+            .then_with(|| a.value.cmp(&b.value))
+    });
+    choices.extend(literals.into_iter().map(|key| ProjectChoice {
+        value: key.to_string(),
+        label: key.to_string(),
+        project_id: None,
+        keys: BTreeSet::from([key.to_string()]),
+    }));
+    (choices, resolved)
+}
+
+/// The choice a filter value selects: by value, then by the project the
+/// value resolves to, then by stored key.
+fn select_choice<'c>(
+    choices: &'c [ProjectChoice],
+    resolved: &BTreeMap<String, Option<String>>,
+    wanted: &str,
+) -> Option<&'c ProjectChoice> {
+    choices
+        .iter()
+        .find(|choice| choice.value == wanted)
+        .or_else(|| {
+            let id = resolved.get(wanted)?.as_deref()?;
+            choices
+                .iter()
+                .find(|choice| choice.project_id.as_deref() == Some(id))
+        })
+        .or_else(|| choices.iter().find(|choice| choice.keys.contains(wanted)))
 }
 
 fn thread_title(thread: &Thread) -> String {
@@ -153,7 +282,7 @@ struct ThreadRow {
     title: String,
     workflow: bool,
     status: ThreadStatus,
-    project: Option<String>,
+    project: Option<ProjectRef>,
     notes: usize,
     updated: Option<DateTime<Utc>>,
 }
@@ -161,8 +290,11 @@ struct ThreadRow {
 struct ListData {
     rows: Vec<ThreadRow>,
     total: usize,
-    /// Every project a stored thread is keyed to, for the filter choices.
-    projects: Vec<String>,
+    /// The filter choices: one per project a stored thread names, then one
+    /// per selector no project claims.
+    projects: Vec<ProjectChoice>,
+    /// The value of the choice the query selected, when it named one.
+    selected: Option<String>,
     /// Whether the store holds any thread at all.
     store_empty: bool,
 }
@@ -170,19 +302,23 @@ struct ListData {
 /// `bbox_thread_list` reader: every status and origin, filtered by the
 /// query, newest activity first.
 fn read_list(ui: &UiState, query: &ListQuery) -> anyhow::Result<ListData> {
-    let (projects, project_ids, store_empty) = {
+    let (keys, store_empty) = {
         let store = ui.shared.threads.read();
         let all = store.all();
-        let projects: BTreeSet<String> = all
+        let keys: BTreeSet<String> = all
             .iter()
             .filter_map(|thread| thread_project(thread).map(str::to_string))
             .collect();
-        let project_ids: BTreeSet<String> = all
-            .iter()
-            .filter_map(|thread| thread.project_id.clone())
-            .collect();
-        (projects, project_ids, all.is_empty())
+        (keys, all.is_empty())
     };
+    let (choices, resolved) = project_choices(ui, &keys, query.project());
+    let selected = query
+        .project()
+        .and_then(|wanted| select_choice(&choices, &resolved, wanted));
+    let choice_of: BTreeMap<&str, &ProjectChoice> = choices
+        .iter()
+        .flat_map(|choice| choice.keys.iter().map(move |key| (key.as_str(), choice)))
+        .collect();
 
     // The store's default already hides resolved and promoted threads; the
     // page opts into them with `all` or by naming one of them.
@@ -197,17 +333,22 @@ fn read_list(ui: &UiState, query: &ListQuery) -> anyhow::Result<ListData> {
         include_workflows: Some(true),
         ..ThreadListParams::default()
     };
-    if let Some(project) = query.project() {
-        if project_ids.contains(project) {
-            filters.project_id = Some(project.to_string());
-        } else {
-            filters.project = Some(project.to_string());
-        }
+    // A value the choices cover selects its stored keys here; any other
+    // value keeps the tool's own filter semantics.
+    if let (Some(project), None) = (query.project(), selected) {
+        filters.project = Some(project.to_string());
     }
     let filters = ui.server.thread_list_filters(filters);
 
     let store = ui.shared.threads.read();
-    let matching = store.matching_threads(&filters)?;
+    let matching: Vec<&Thread> = store
+        .matching_threads(&filters)?
+        .into_iter()
+        .filter(|thread| match selected {
+            Some(choice) => thread_project(thread).is_some_and(|key| choice.keys.contains(key)),
+            None => true,
+        })
+        .collect();
     let total = matching.len();
     let rows = matching
         .into_iter()
@@ -218,7 +359,8 @@ fn read_list(ui: &UiState, query: &ListQuery) -> anyhow::Result<ListData> {
             title: thread_title(thread),
             workflow: thread.origin == Some(ThreadOrigin::Workflow),
             status: thread.status.clone(),
-            project: thread_project(thread).map(str::to_string),
+            project: thread_project(thread)
+                .and_then(|key| Some(choice_of.get(key)?.reference(key))),
             notes: thread.notes.len(),
             updated: parse_rfc3339(&thread.last_activity),
         })
@@ -226,7 +368,8 @@ fn read_list(ui: &UiState, query: &ListQuery) -> anyhow::Result<ListData> {
     Ok(ListData {
         rows,
         total,
-        projects: projects.into_iter().collect(),
+        selected: selected.map(|choice| choice.value.clone()),
+        projects: choices,
         store_empty,
     })
 }
@@ -253,7 +396,7 @@ pub(crate) async fn list_page(
     let (query, data) = list_data(&ui, query).await;
     let content = html! {
         @if let Ok(data) = &data {
-            (filter_form(&query, &data.projects))
+            (filter_form(&query, data))
         }
         div id="threads-table" {
             (list_table(&query, &data, Utc::now()))
@@ -279,9 +422,12 @@ pub(crate) async fn table_fragment(
     html_response(StatusCode::OK, list_table(&query, &data, Utc::now()))
 }
 
-fn filter_form(query: &ListQuery, projects: &[String]) -> Markup {
+fn filter_form(query: &ListQuery, data: &ListData) -> Markup {
     let status = query.status().unwrap_or("live");
     let project = query.project();
+    // The choice the query selected, so a value given as a path or an
+    // alias still shows its project selected.
+    let current = data.selected.as_deref();
     html! {
         form.filters method="get" action="/threads" {
             label {
@@ -296,9 +442,9 @@ fn filter_form(query: &ListQuery, projects: &[String]) -> Markup {
                 "Project "
                 select name="project" {
                     option value="" selected[project.is_none()] { "all projects" }
-                    @for candidate in projects {
-                        option value=(candidate) selected[Some(candidate.as_str()) == project] {
-                            (preview(candidate, 80))
+                    @for choice in &data.projects {
+                        option value=(choice.value) selected[Some(choice.value.as_str()) == current] {
+                            (preview(&choice.label, 80))
                         }
                     }
                 }
@@ -346,12 +492,7 @@ fn list_table(query: &ListQuery, data: &Result<ListData, String>, now: DateTime<
                                 div.quiet { code { (row.id) } }
                             }
                             td { (status_label(&row.status)) }
-                            td {
-                                @match &row.project {
-                                    Some(project) => { code title=(project) { (preview(project, 60)) } }
-                                    None => { span.quiet { "none" } }
-                                }
-                            }
+                            td { (project_cell(row.project.as_ref())) }
                             td.num { (row.notes) }
                             td { (age(row.updated, now)) }
                         }
@@ -377,12 +518,49 @@ fn list_table(query: &ListQuery, data: &Result<ListData, String>, now: DateTime<
     }
 }
 
-/// `bbox_thread` reader: the stored record for this id.
-async fn read_thread(ui: &Arc<UiState>, id: String) -> Result<Option<Thread>, String> {
+/// A thread's project: the name linking to the threads it filters, with the
+/// stored key on hover.
+fn project_cell(project: Option<&ProjectRef>) -> Markup {
+    html! {
+        @match project {
+            Some(project) => {
+                a href=(format!("/threads?project={}", encode_component(&project.value)))
+                    title=(project.key) {
+                    (preview(&project.label, 60))
+                }
+            }
+            None => { span.quiet { "none" } }
+        }
+    }
+}
+
+/// `bbox_thread` reader: the stored record for this id, with its project
+/// named the way the list names it.
+async fn read_thread(
+    ui: &Arc<UiState>,
+    id: String,
+) -> Result<Option<(Thread, Option<ProjectRef>)>, String> {
     let reader_ui = ui.clone();
-    tokio::task::spawn_blocking(move || reader_ui.shared.threads.read().thread_by_id(&id).cloned())
-        .await
-        .map_err(|error| error.to_string())
+    tokio::task::spawn_blocking(move || {
+        let thread = reader_ui.shared.threads.read().thread_by_id(&id).cloned()?;
+        let project = thread_project(&thread).map(|key| {
+            let (choices, _) =
+                project_choices(&reader_ui, &BTreeSet::from([key.to_string()]), None);
+            choices
+                .into_iter()
+                .find(|choice| choice.keys.contains(key))
+                .map(|choice| choice.reference(key))
+                .unwrap_or_else(|| ProjectRef {
+                    value: key.to_string(),
+                    label: key.to_string(),
+                    project_id: None,
+                    key: key.to_string(),
+                })
+        });
+        Some((thread, project))
+    })
+    .await
+    .map_err(|error| error.to_string())
 }
 
 /// `GET /threads/{id}`
@@ -392,10 +570,10 @@ pub(crate) async fn detail_page(
     Path(id): Path<String>,
 ) -> Response {
     let (status, title, content) = match read_thread(&ui, id.clone()).await {
-        Ok(Some(thread)) => (
+        Ok(Some((thread, project))) => (
             StatusCode::OK,
             thread_title(&thread),
-            thread_detail(&thread, Utc::now()),
+            thread_detail(&thread, project.as_ref(), Utc::now()),
         ),
         Ok(None) => (
             StatusCode::NOT_FOUND,
@@ -425,7 +603,10 @@ pub(crate) async fn detail_fragment(
     Path(id): Path<String>,
 ) -> Response {
     match read_thread(&ui, id.clone()).await {
-        Ok(Some(thread)) => html_response(StatusCode::OK, thread_detail(&thread, Utc::now())),
+        Ok(Some((thread, project))) => html_response(
+            StatusCode::OK,
+            thread_detail(&thread, project.as_ref(), Utc::now()),
+        ),
         Ok(None) => html_response(StatusCode::NOT_FOUND, missing_thread(&id)),
         Err(error) => html_response(StatusCode::OK, error_fragment("bbox_thread", &error)),
     }
@@ -438,7 +619,7 @@ fn missing_thread(id: &str) -> Markup {
     }
 }
 
-fn thread_detail(thread: &Thread, now: DateTime<Utc>) -> Markup {
+fn thread_detail(thread: &Thread, project: Option<&ProjectRef>, now: DateTime<Utc>) -> Markup {
     html! {
         div.thread-detail {
             section.panel aria-labelledby="thread-summary" {
@@ -460,13 +641,14 @@ fn thread_detail(thread: &Thread, now: DateTime<Utc>) -> Markup {
                         tr {
                             th scope="row" { "Project" }
                             td {
-                                @match thread_project(thread) {
-                                    Some(project) => {
-                                        a href=(format!("/threads?project={}", encode_component(project))) {
-                                            code { (project) }
-                                        }
+                                (project_cell(project))
+                                @if let Some(project) = project {
+                                    @if let Some(id) = &project.project_id {
+                                        " " a.quiet href=(format!("/projects/{}", encode_component(id))) { "project page" }
                                     }
-                                    None => { span.quiet { "none" } }
+                                    @if project.key != project.label {
+                                        div.quiet { code { (project.key) } }
+                                    }
                                 }
                             }
                         }
@@ -770,6 +952,136 @@ mod tests {
         let (status, invalid) = get(shared.clone(), "/threads?status=bogus").await;
         assert_eq!(status, StatusCode::OK);
         assert!(invalid.contains("error-fragment") && invalid.contains("bbox_thread_list"));
+    }
+
+    /// A project the registry learns about between two thread opens: the
+    /// first thread is stored under its raw path alone, the second carries
+    /// the project id. The filter offers one choice for both, named after
+    /// the project and valued by its id, and selects both however the
+    /// project is named.
+    #[tokio::test]
+    async fn project_filter_folds_stored_keys_into_one_named_choice() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = Arc::new(SharedState::for_test(dir.path()));
+        let repo = tempfile::tempdir().unwrap();
+        let alpha = repo.path().canonicalize().unwrap().join("alpha-repo");
+        std::fs::create_dir_all(&alpha).unwrap();
+        let alpha = alpha.to_string_lossy().into_owned();
+
+        mutate(
+            &shared,
+            serde_json::json!({"action": "open", "topic": "Before registration", "project": alpha}),
+        );
+        let project_id = shared
+            .project_authority
+            .bridge_registry()
+            .unwrap()
+            .write()
+            .register_path(&alpha)
+            .unwrap()
+            .project_id;
+        // Stored the way the tool stores a resolved open: the path and the
+        // id, which the daemon sets from the resolver and never reads from
+        // the wire.
+        {
+            let mut params: crate::threads::ThreadParams = serde_json::from_value(
+                serde_json::json!({"action": "open", "topic": "After registration", "project": alpha}),
+            )
+            .unwrap();
+            params.project_id = Some(project_id.clone());
+            shared.threads.write().thread(&params).unwrap();
+        }
+        mutate(
+            &shared,
+            serde_json::json!({"action": "open", "topic": "Elsewhere", "project": "/work/elsewhere"}),
+        );
+        {
+            let store = shared.threads.read();
+            let keyed = |topic: &str| {
+                let thread = store
+                    .all()
+                    .iter()
+                    .find(|thread| thread.topic == topic)
+                    .unwrap();
+                (thread.project.clone(), thread.project_id.clone())
+            };
+            assert_eq!(keyed("Before registration"), (alpha.clone(), None));
+            assert_eq!(
+                keyed("After registration"),
+                (alpha.clone(), Some(project_id.clone()))
+            );
+        }
+
+        let (status, body) = get(shared.clone(), "/threads").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let choice = format!("<option value=\"{project_id}\">alpha-repo</option>");
+        assert!(body.contains(&choice), "{body}");
+        assert_eq!(
+            body.matches("alpha-repo</option>").count(),
+            1,
+            "one choice for the project, whatever keys its threads carry: {body}"
+        );
+        assert!(
+            !body.contains(&format!("<option value=\"{alpha}\"")),
+            "the raw path is not a choice of its own: {body}"
+        );
+        assert!(
+            body.contains("<option value=\"/work/elsewhere\">/work/elsewhere</option>"),
+            "{body}"
+        );
+        assert!(
+            body.contains(&format!(
+                "href=\"/threads?project={project_id}\" title=\"{alpha}\">alpha-repo</a>"
+            )),
+            "a path-keyed row names the project and keeps its key on hover: {body}"
+        );
+        assert!(
+            body.contains(&format!(
+                "href=\"/threads?project={project_id}\" title=\"{project_id}\">alpha-repo</a>"
+            )),
+            "{body}"
+        );
+
+        for value in [project_id.clone(), super::encode_component(&alpha)] {
+            let (_, listed) = get(shared.clone(), &format!("/threads?project={value}")).await;
+            assert!(
+                listed.contains("Before registration") && listed.contains("After registration"),
+                "{value}: {listed}"
+            );
+            assert!(!listed.contains("Elsewhere"), "{value}: {listed}");
+            assert!(
+                listed.contains(&format!("<option value=\"{project_id}\" selected>")),
+                "{value}: {listed}"
+            );
+        }
+        let (_, elsewhere) = get(shared.clone(), "/threads?project=%2Fwork%2Felsewhere").await;
+        assert!(elsewhere.contains("Elsewhere") && !elsewhere.contains("registration"));
+        // A value no choice covers keeps the tool's substring semantics.
+        let (_, substring) = get(shared.clone(), "/threads?project=elsewhere").await;
+        assert!(substring.contains("Elsewhere") && !substring.contains("registration"));
+        let (_, none) = get(shared.clone(), "/threads?project=nothing-stored").await;
+        assert!(none.contains("No threads match these filters."), "{none}");
+
+        let after = {
+            let store = shared.threads.read();
+            store
+                .all()
+                .iter()
+                .find(|thread| thread.topic == "After registration")
+                .unwrap()
+                .id
+                .clone()
+        };
+        let (_, detail) = get(shared.clone(), &format!("/threads/{after}")).await;
+        assert!(
+            detail.contains(&format!("href=\"/threads?project={project_id}\"")),
+            "{detail}"
+        );
+        assert!(detail.contains(">alpha-repo</a>"), "{detail}");
+        assert!(
+            detail.contains(&format!("href=\"/projects/{project_id}\"")),
+            "{detail}"
+        );
     }
 
     #[tokio::test]

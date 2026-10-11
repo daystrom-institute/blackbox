@@ -273,7 +273,11 @@ Every request without that header is answered with a 401 page, and a request
 whose peer is not loopback is refused. The main listener never serves the UI.
 
 `/threads` lists threads with status and project filters and links each to
-its notes, participants and linked entities. `/bros` is the task roster, kept
+its notes, participants and linked entities. The project filter offers one
+choice per project: every key a thread is stored under (a project id or the
+raw selector it was opened with) is resolved through the project resolver,
+keys that name the same project fold into one choice under the project's
+name, and a selector no project claims stays a choice of its own. `/bros` is the task roster, kept
 live over server-sent events, and `/bros/<task>` shows one task's status,
 dispatch parameters, report and an event tail that streams while it runs.
 `/projects` lists the project catalog and registered roots, and
