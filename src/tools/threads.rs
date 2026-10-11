@@ -475,6 +475,134 @@ mod tests {
             "worktree-scoped list should surface the base-keyed thread: {body}"
         );
     }
+
+    /// A daemon with no checkout authority learns a base checkout's linked
+    /// worktree from its producer's presence. A thread opened from inside
+    /// that worktree keys to the base project and store key, writes nothing
+    /// at the worktree path, and lists under the base project.
+    #[tokio::test]
+    async fn bbox_thread_from_reported_linked_worktree_keys_to_the_base_project() {
+        use crate::server::producer_auth::{ProducerAuthRuntime, ProducerGrant};
+        use crate::server::state::catalog_fixture::CatalogFixture;
+        use bbox_code_source::{
+            LinkedWorktreeV1, PRODUCER_COMMAND_SCHEMA_VERSION, ProducerCommandPollRequestV1,
+            ProducerPresenceV1,
+        };
+
+        const PROJECT: &str = "p_00000000000000000000000000000001";
+        const CHECKOUT_ID: &str = "0123456789abcdef0123456789abcdef";
+        let fixture = CatalogFixture::new();
+        let scope = CatalogFixture::scope(".");
+        fixture.add_published_project(PROJECT, &scope);
+        let base = fixture.root().join("work").join("alpha");
+        std::fs::create_dir_all(&base).unwrap();
+        fixture.attach_overlay_checkout(
+            PROJECT,
+            &scope,
+            &base,
+            "att_11111111111111111111111111111111",
+            CHECKOUT_ID,
+            true,
+        );
+        let worktree = fixture
+            .root()
+            .join("workspaces")
+            .join("alpha")
+            .join("feature");
+        std::fs::create_dir_all(worktree.join("src")).unwrap();
+        let worktree_dir = worktree.to_string_lossy().into_owned();
+        let base_dir = base.to_string_lossy().into_owned();
+
+        let server = fixture.server_without_checkout_authority();
+        let catalog = fixture.store().snapshot().unwrap();
+        server.state.code_sources.install_auth_for_test(Arc::new(
+            ProducerAuthRuntime::for_test_catalog(
+                vec![(
+                    bro_rpc::ServiceToken::parse("8".repeat(64)).unwrap(),
+                    ProducerGrant {
+                        producer_id: "producer-a".into(),
+                        projects: std::collections::BTreeMap::from([(
+                            scope.clone(),
+                            PROJECT.to_string(),
+                        )]),
+                    },
+                )],
+                catalog.catalog(),
+            ),
+        ));
+
+        // Before any report the worktree path names no project.
+        assert!(server.project_filter_identity(&worktree_dir).is_err());
+
+        server.state.producer_commands.poll(
+            "producer-a",
+            ProducerCommandPollRequestV1 {
+                schema_version: PRODUCER_COMMAND_SCHEMA_VERSION,
+                presence: ProducerPresenceV1 {
+                    enroll_roots: Vec::new(),
+                    host_label: "checkout-host-a".into(),
+                    config_path: "/etc/blackbox/code-collector.toml".into(),
+                    service_label: None,
+                    collector_version: "0.0.1".into(),
+                    interval_secs: Some(120),
+                    linked_worktrees: vec![LinkedWorktreeV1 {
+                        base_checkout_id: CHECKOUT_ID.into(),
+                        worktree_dir: worktree_dir.clone(),
+                    }],
+                },
+            },
+        );
+        assert_eq!(
+            server.project_filter_identity(&worktree_dir).as_deref(),
+            Ok(PROJECT)
+        );
+        // No carrier: the open writes no snapshot into the worktree.
+        assert_eq!(server.resolve_worktree_scope_and_dir(&worktree_dir), None);
+
+        let open = server
+            .bbox_thread(Parameters(
+                ThreadParams {
+                    topic: Some("trace the alias lane".into()),
+                    project: Some(worktree.join("src").to_string_lossy().into_owned()),
+                    ..tp("open")
+                }
+                .into(),
+            ))
+            .await;
+        assert_ne!(open.is_error, Some(true), "open failed: {open:?}");
+        let thread = server
+            .state
+            .threads
+            .read()
+            .all()
+            .first()
+            .expect("one thread")
+            .clone();
+        assert_eq!(thread.project, base_dir, "keyed to the base store key");
+        assert_eq!(thread.project_id.as_deref(), Some(PROJECT));
+        assert_eq!(thread.record_dir, None);
+        assert!(
+            !worktree.join(".bbox").exists(),
+            "nothing is written at the worktree path"
+        );
+
+        for project in [PROJECT.to_string(), worktree_dir.clone()] {
+            let list = server.bbox_thread_list(Parameters(
+                ThreadListParams {
+                    project: Some(project.clone()),
+                    ..tlp()
+                }
+                .into(),
+            ));
+            assert_ne!(list.is_error, Some(true), "list failed: {list:?}");
+            let body = format!("{:?}", list.content);
+            assert!(
+                body.contains("trace the alias lane"),
+                "project={project} should list the thread: {body}"
+            );
+        }
+    }
+
     fn ttp(
         inner: ThreadParams,
         detail: Option<String>,

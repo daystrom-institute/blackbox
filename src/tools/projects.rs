@@ -1367,6 +1367,7 @@ mod tests {
                     service_label: Some("collector".into()),
                     collector_version: "0.0.1".into(),
                     interval_secs: None,
+                    linked_worktrees: Vec::new(),
                 },
             },
         );
@@ -1402,6 +1403,7 @@ mod tests {
                         config_path: "/etc/blackbox/collector.toml".into(),
                         service_label: Some("collector".into()),
                         collector_version: "0.0.1".into(),
+                        linked_worktrees: Vec::new(),
                         interval_secs: None,
                     },
                 },

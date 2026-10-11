@@ -463,6 +463,85 @@ async fn run_checkout_mutation_lane(
     }
 }
 
+/// The linked worktrees git currently reports for each configured base
+/// checkout, keyed by the base's durable checkout identity. Read-only: a
+/// base without a recorded checkout id is skipped, never minted one. A base
+/// whose listing fails is logged and omitted so the poll still reports the
+/// rest.
+fn linked_worktree_reports(config: &CollectorConfig) -> Vec<bbox_code_source::LinkedWorktreeV1> {
+    let mut checkouts = std::collections::BTreeSet::new();
+    for project in &config.projects {
+        let Some(checkout) = project
+            .root
+            .canonicalize()
+            .ok()
+            .and_then(|root| bbox_corpus_core::git::git_root_for_path(&root))
+            .and_then(|root| root.canonicalize().ok())
+        else {
+            continue;
+        };
+        checkouts.insert(checkout);
+    }
+    let mut reports = std::collections::BTreeSet::new();
+    for checkout in checkouts {
+        if require_main_worktree(&checkout).is_err() {
+            continue;
+        }
+        let base_checkout_id = match bbox_corpus_core::identity::read_checkout_id(
+            &checkout.join(".bbox").join("local").join("checkout-id"),
+        ) {
+            Ok(Some(id)) => id,
+            Ok(None) => continue,
+            Err(error) => {
+                tracing::warn!(
+                    checkout = %checkout.display(),
+                    error = %error,
+                    "reading base checkout id for linked worktree report failed"
+                );
+                continue;
+            }
+        };
+        let listed = bbox_corpus_core::git::list_worktree_paths(&checkout);
+        // A successful listing always names the main worktree itself.
+        if !listed.iter().any(|path| *path == checkout) {
+            tracing::warn!(
+                checkout = %checkout.display(),
+                "listing linked worktrees failed; omitting this checkout's worktrees"
+            );
+            continue;
+        }
+        for worktree in listed.into_iter().filter(|path| *path != checkout) {
+            let Some(worktree_dir) = worktree.to_str() else {
+                continue;
+            };
+            let report = bbox_code_source::LinkedWorktreeV1 {
+                base_checkout_id: base_checkout_id.clone(),
+                worktree_dir: worktree_dir.to_string(),
+            };
+            match report.validate() {
+                Ok(()) => {
+                    reports.insert(report);
+                }
+                Err(error) => tracing::warn!(
+                    worktree = %worktree.display(),
+                    error = %error,
+                    "skipping unreportable linked worktree"
+                ),
+            }
+        }
+    }
+    let mut reports = reports.into_iter().collect::<Vec<_>>();
+    if reports.len() > bbox_code_source::MAX_PRODUCER_LINKED_WORKTREES {
+        tracing::warn!(
+            reported = reports.len(),
+            limit = bbox_code_source::MAX_PRODUCER_LINKED_WORKTREES,
+            "too many linked worktrees; reporting the first ones only"
+        );
+        reports.truncate(bbox_code_source::MAX_PRODUCER_LINKED_WORKTREES);
+    }
+    reports
+}
+
 async fn apply_producer_commands(runtime: &Runtime, config: &CollectorConfig) -> Result<usize> {
     let presence = ProducerPresenceV1 {
         enroll_roots: config
@@ -475,6 +554,7 @@ async fn apply_producer_commands(runtime: &Runtime, config: &CollectorConfig) ->
         service_label: config.service_label.clone(),
         collector_version: env!("CARGO_PKG_VERSION").into(),
         interval_secs: Some(config.interval_secs.max(1)),
+        linked_worktrees: linked_worktree_reports(config),
     };
     let poll = ProducerCommandPollRequestV1 {
         schema_version: PRODUCER_COMMAND_SCHEMA_VERSION,
@@ -3644,6 +3724,7 @@ fn validate_loaded_config(config: &CollectorConfig) -> Result<()> {
         service_label: config.service_label.clone(),
         collector_version: env!("CARGO_PKG_VERSION").into(),
         interval_secs: Some(config.interval_secs.max(1)),
+        linked_worktrees: Vec::new(),
     }
     .validate()
     .map_err(|error| anyhow!("invalid producer presence configuration: {error}"))
@@ -5400,6 +5481,81 @@ mod tests {
         let loaded = load_config(&config_path, DuplicateHandling::Error).unwrap();
         assert_eq!(loaded.enrolled_projects.len(), 1);
         server.abort();
+    }
+
+    /// Each configured base checkout reports the linked worktrees git lists
+    /// for it, keyed by its recorded checkout id: never the base itself,
+    /// once per checkout however many projects share it, and nothing for a
+    /// checkout with no recorded identity or a root that is not a checkout.
+    #[test]
+    fn linked_worktree_reports_list_each_base_checkouts_worktrees() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let repo = root.join("alpha");
+        fs::create_dir_all(&repo).unwrap();
+        init_fixture_repo(&repo);
+        let worktree = root.join("workspaces").join("alpha-feature");
+        fs::create_dir_all(worktree.parent().unwrap()).unwrap();
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "feature",
+                worktree.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let worktree = worktree.canonicalize().unwrap();
+        let mut config = mutation_config(&repo, PublishedScope::try_new("repo-a", ".").unwrap());
+
+        // No recorded identity: nothing is reported and none is minted.
+        assert!(linked_worktree_reports(&config).is_empty());
+        assert!(!repo.join(".bbox/local/checkout-id").exists());
+
+        let checkout_id = bbox_corpus_core::identity::ensure_checkout_id(&repo).unwrap();
+        fs::create_dir_all(repo.join("service")).unwrap();
+        config.projects.push(ProjectConfig {
+            root: repo.join("service"),
+            scope: PublishedScope::try_new("repo-a", "service").unwrap(),
+            git_history: false,
+            provenance: false,
+            published_knowledge: None,
+        });
+        config.projects.push(ProjectConfig {
+            root: root.join("not-a-checkout"),
+            scope: PublishedScope::try_new("repo-b", ".").unwrap(),
+            git_history: false,
+            provenance: false,
+            published_knowledge: None,
+        });
+        let expected = vec![bbox_code_source::LinkedWorktreeV1 {
+            base_checkout_id: checkout_id,
+            worktree_dir: worktree.to_string_lossy().into_owned(),
+        }];
+        let reports = linked_worktree_reports(&config);
+        assert_eq!(reports, expected);
+
+        // The reports ride a presence that validates.
+        let presence = ProducerPresenceV1 {
+            enroll_roots: Vec::new(),
+            host_label: config.host_label.clone(),
+            config_path: config.config_path.to_string_lossy().into_owned(),
+            service_label: None,
+            collector_version: "0.0.1".into(),
+            interval_secs: Some(1),
+            linked_worktrees: reports,
+        };
+        presence.validate().unwrap();
+
+        // A removed worktree leaves the report on the next listing.
+        git(
+            &repo,
+            &["worktree", "remove", "--force", worktree.to_str().unwrap()],
+        );
+        assert!(linked_worktree_reports(&config).is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

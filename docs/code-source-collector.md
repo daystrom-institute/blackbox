@@ -178,6 +178,30 @@ scaffolding, sidecar update, and catalog onboarding procedure as the host-shell
 `add` command. The response names any project files that still need to be
 committed on the returned published ref.
 
+The presence also lists, for each configured base checkout that carries a
+recorded `.bbox/local/checkout-id`, the linked worktrees `git worktree list`
+reports for it: the base checkout id and each worktree's canonical directory,
+never the base itself. The collector only reads; it never mints a checkout id
+for this report. A base whose listing fails is logged and omitted, and the
+poll still reports the rest. The daemon derives a live alias view from fresh
+presences only, so a worktree is aliased exactly as long as git keeps reporting
+it and its producer keeps polling; nothing about it is stored. An entry is
+accepted when its checkout id names an active base attachment and the
+reporting producer's grant covers that attachment's published scope. Its
+alias root is the worktree directory joined with the attachment's project
+root relpath, so a subtree project aliases the same subtree inside the
+worktree. A worktree reported by more than one producer, and an alias root
+that maps to more than one attachment, are dropped and logged once.
+
+Filter-class project selectors (list filters, `?project=`, the operator UI)
+resolve a path inside an aliased worktree to its base: the base project id and
+the base store key, exactly as the base path resolves. Selection-class
+selectors never alias, and an alias never makes a worktree a write target: a
+thread opened from one is stamped with the base project and writes no record
+into the worktree. The presence request refuses unknown fields, so a daemon
+must accept the worktree report before a collector that sends it reaches that
+daemon.
+
 `interval_secs` controls source collection. Queued gap and knowledge edits
 poll independently at `mutation_interval_secs` (default 10 seconds, minimum
 1 second), so a long source-scan interval does not delay admitted edits.

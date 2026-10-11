@@ -606,6 +606,7 @@ async fn owner_failures_refuse_with_setup_and_never_open_a_daemon_checkout() {
                         service_label: None,
                         collector_version: "0.0.1".into(),
                         interval_secs: None,
+                        linked_worktrees: Vec::new(),
                     },
                 },
             )

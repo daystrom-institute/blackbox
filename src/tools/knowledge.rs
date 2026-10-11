@@ -222,13 +222,18 @@ fn rescope_project_filter(
         return diagnostic;
     };
     // The alias dir is where checkout-local rows land: the v1 checkout root,
-    // or the catalog attachment's own project dir under the key-to-base rule.
-    let checkout_dir = match &ctx.attachment {
-        ResolvedAttachment::V1Compat { checkout_dir, .. } => checkout_dir.clone(),
-        ResolvedAttachment::Catalog {
-            checkout_project_dir,
-            ..
-        } => checkout_project_dir.clone(),
+    // the catalog attachment's own project dir under the key-to-base rule,
+    // or the reported linked-worktree alias root the selector matched.
+    let checkout_dir = match (&ctx.worktree_alias_root, &ctx.attachment) {
+        (Some(alias_root), _) => alias_root.clone(),
+        (None, ResolvedAttachment::V1Compat { checkout_dir, .. }) => checkout_dir.clone(),
+        (
+            None,
+            ResolvedAttachment::Catalog {
+                checkout_project_dir,
+                ..
+            },
+        ) => checkout_project_dir.clone(),
     };
     if checkout_dir != ctx.store_key {
         p.project_alias = Some(checkout_dir);
