@@ -87,7 +87,7 @@ impl ToolCategory {
                 "Read-only storage inventory for edge sidecar hygiene. Operator tools, served on the `ops` surface: `bro mcp call <tool> '<json>' --surface ops`."
             }
             Self::Operations => {
-                "Day-2 operational health surfaces: aggregate daemon/corpus/route status with classified findings and suggested next commands. Operator tools, served on the `ops` surface: `bro mcp call <tool> '<json>' --surface ops`."
+                "Day-2 operational surfaces: aggregate daemon/corpus/route status with classified findings and suggested next commands, and the thread project re-key repair. Operator tools, served on the `ops` surface: `bro mcp call <tool> '<json>' --surface ops`."
             }
         }
     }
@@ -615,6 +615,15 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         summary: "Diagnose Blackbox health with ranked, paginated findings. format selects summary text or JSON; detail=full returns exact bounded body pages (cursor/body_limit). Narrow with section: the section name is validated before collection and collects only that section.",
         when_to_use: "Use as the first call when asking \"what do I need to know about Blackbox right now?\"; replaces the scattered manual smoke checklist (bbox_stats, bbox_embed_status, bbox_project_list) with one ranked surface. Route findings distinguish real failures (action) from opt-in absence like unconfigured visual chunk kinds (info). Default detail=summary returns up to 20 findings (max 100) ordered worst severity, section, then message; next_offset continues. Section status is separate from the findings page. detail=full returns a JSON envelope with exact body pages (body_limit default/max 4096 bytes, minimum 4). Concatenate body.text and replay body.next_cursor as cursor with the same section and format. Health is collected on each page; changed evidence rejects continuation, so restart without cursor. A requested section is validated BEFORE collection and collects only that section's existing producer instead of the full report. format=json does not imply full detail. Restart pagination after a state change.",
         example: Some(r#"bbox_doctor(format="summary")"#),
+    },
+    ToolDoc {
+        name: "bbox_thread_rekey",
+        category: ToolCategory::Operations,
+        summary: "Operator repair: stamp a project id on thread rows that carry none, so the id decides list matching instead of a raw path no project resolves. `project` resolves Selection-class (project id, operator alias or registered path); an unresolved selector refuses the whole call. Each of `rows` (1 to 50) names a thread id and the raw `project` value it must carry; a row is stamped only when it has no project id and its raw value matches exactly, and the raw value is kept. A row that already carries a project id is never overwritten and reports that id. dry_run defaults to true and writes nothing. Requires a bounded audit_reason. Row outcomes: rekeyed, would_rekey, already_keyed, project_mismatch, unknown_id.",
+        when_to_use: "Use when `bbox_thread_list` shows threads with a `project_selector` (a raw path) and no `project_id`, the path no longer resolves to a project, and the operator knows which project the threads belong to. Copy each row's `project_selector` into `expected_project`, run once with the default dry run, then repeat with dry_run=false. A project_mismatch means the row's raw value changed since it was read: list it again. A stamped row keeps its raw path and keeps the stamped id; there is no overwrite.",
+        example: Some(
+            r#"bbox_thread_rekey(project="alpha", rows=[{"id":"thread-7f01324e","expected_project":"/work/alpha-wt"}], dry_run=false, audit_reason="worktree removed")"#,
+        ),
     },
     // ── Storage health ──────────────────────────────────────────────
     ToolDoc {

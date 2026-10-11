@@ -1,5 +1,5 @@
 use crate::server::BlackboxServer;
-use crate::threads::{ThreadListParams, ThreadParams};
+use crate::threads::{ThreadListParams, ThreadParams, ThreadRekeyOutcome};
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -71,6 +71,31 @@ impl From<ThreadParams> for ThreadToolParams {
             body_limit: None,
         }
     }
+}
+
+/// Most rows one `bbox_thread_rekey` call names. Keeps the per-row outcome
+/// report well inside the response budget.
+const MAX_REKEY_ROWS: usize = 50;
+/// Longest accepted `expected_project` value, in bytes.
+const MAX_REKEY_EXPECTED_PROJECT_BYTES: usize = 4096;
+/// Longest accepted thread id, in bytes.
+const MAX_REKEY_ID_BYTES: usize = 64;
+const MAX_REKEY_AUDIT_REASON_BYTES: usize = 1024;
+
+/// The `bbox_thread_rekey` operator tool's arguments.
+#[derive(Debug, serde::Deserialize, rmcp::schemars::JsonSchema)]
+pub(crate) struct ThreadRekeyParams {
+    /// Project selector (project id, operator alias or registered path),
+    /// resolved Selection-class: exactly one known project or a typed refusal.
+    pub project: String,
+    /// Rows to re-key, 1 to 50: each thread id with the raw `project` value
+    /// the row is expected to carry.
+    pub rows: Vec<crate::threads::ThreadRekeyRow>,
+    /// Report outcomes without writing. Defaults to true.
+    #[serde(default)]
+    pub dry_run: Option<bool>,
+    /// Bounded operator reason recorded with the operation.
+    pub audit_reason: String,
 }
 
 pub(crate) fn router() -> ToolRouter<BlackboxServer> {
@@ -255,6 +280,95 @@ impl BlackboxServer {
                     .thread_list_page(&p, limit, offset)?,
             )?)
         })
+    }
+    #[tool(
+        name = "bbox_thread_rekey",
+        description = "Operator repair: stamp a project id on thread rows that carry none, so the id decides list matching instead of a raw path no project resolves. `project` resolves Selection-class (project id, operator alias or registered path); an unresolved selector refuses the whole call. Each of `rows` (1 to 50) names a thread id and the raw `project` value it must carry; a row is stamped only when it has no project id and its raw value matches exactly, and the raw value is kept. A row that already carries a project id is never overwritten and reports that id. dry_run defaults to true and writes nothing. Requires a bounded audit_reason. Row outcomes: rekeyed, would_rekey, already_keyed, project_mismatch, unknown_id."
+    )]
+    pub(crate) async fn bbox_thread_rekey(
+        &self,
+        Parameters(p): Parameters<ThreadRekeyParams>,
+    ) -> CallToolResult {
+        const TOOL: &str = "bbox_thread_rekey";
+        let start = std::time::Instant::now();
+        let fail = |e: anyhow::Error| {
+            let ms = start.elapsed().as_secs_f64() * 1000.0;
+            tracing::warn!(target: "blackbox::tool", tool = TOOL, elapsed_ms = ms, error = %e, "err");
+            Self::err_text(&format!("Error: {e:#}"))
+        };
+        let dry_run = p.dry_run.unwrap_or(true);
+        // Resolution may probe the filesystem and the write guard may queue,
+        // so both run on the blocking pool, as `bbox_thread` does.
+        let server = self.clone();
+        let applied = tokio::task::spawn_blocking(move || {
+            let audit_reason = bounded_rekey_audit_reason(&p.audit_reason)?;
+            validate_rekey_rows(&p.rows)?;
+            let project_id = server.validate_project_selection(&p.project)?;
+            let report =
+                server
+                    .state
+                    .threads
+                    .write()
+                    .rekey_project_ids(&project_id, &p.rows, dry_run)?;
+            anyhow::Ok((project_id, audit_reason, report))
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("blocking task failed: {e}"))
+        .and_then(std::convert::identity);
+        let (project_id, audit_reason, report) = match applied {
+            Ok(applied) => applied,
+            Err(e) => return fail(e),
+        };
+
+        if !report.changed.is_empty() {
+            // Persist and index exactly as an open does, so the durable file
+            // and the index agree with the in-memory store.
+            if let Err(e) = self.state.persist_threads_durable().await {
+                return fail(e);
+            }
+            for thread in &report.changed {
+                self.state
+                    .index_writer
+                    .enqueue(crate::index::IndexWriteOp::UpsertThread(Box::new(
+                        thread.clone(),
+                    )));
+            }
+        }
+
+        let mut counts = std::collections::BTreeMap::<&str, usize>::new();
+        for row in &report.rows {
+            let key = match row.outcome {
+                ThreadRekeyOutcome::Rekeyed => "rekeyed",
+                ThreadRekeyOutcome::WouldRekey => "would_rekey",
+                ThreadRekeyOutcome::AlreadyKeyed { .. } => "already_keyed",
+                ThreadRekeyOutcome::ProjectMismatch { .. } => "project_mismatch",
+                ThreadRekeyOutcome::UnknownId => "unknown_id",
+            };
+            *counts.entry(key).or_default() += 1;
+        }
+        tracing::info!(
+            tool = TOOL,
+            project_id = %project_id,
+            dry_run,
+            rekeyed = report.changed.len(),
+            audit_reason = %audit_reason,
+            "thread project re-key"
+        );
+        let text = match serde_json::to_string(&serde_json::json!({
+            "status": "ok",
+            "dry_run": dry_run,
+            "project_id": project_id,
+            "audit_reason": audit_reason,
+            "counts": counts,
+            "rows": report.rows,
+        })) {
+            Ok(text) => text,
+            Err(e) => return fail(e.into()),
+        };
+        let response = Self::ok_text(&text);
+        let ms = start.elapsed().as_secs_f64() * 1000.0;
+        tracing::info!(target: "blackbox::tool", tool = TOOL, elapsed_ms = ms, bytes = text.len(), "ok");
+        response
     }
 }
 
@@ -1014,6 +1128,263 @@ mod tests {
             .unwrap()
             .expect("refresh completes once the view guard is released");
     }
+    fn rekey_params(
+        project: &str,
+        rows: serde_json::Value,
+        extra: serde_json::Value,
+    ) -> ThreadRekeyParams {
+        let mut args = serde_json::json!({
+            "project": project, "rows": rows, "audit_reason": "worktree removed",
+        });
+        for (key, value) in extra.as_object().unwrap() {
+            args[key] = value.clone();
+        }
+        serde_json::from_value(args).unwrap()
+    }
+
+    /// A registered project and a thread stored under a raw path no project
+    /// resolves, the shape a thread opened from a removed linked worktree
+    /// leaves behind.
+    fn rekey_fixture(tmp: &Path) -> (BlackboxServer, String, String, String) {
+        let root = tmp.canonicalize().unwrap();
+        let server = BlackboxServer::new(Arc::new(SharedState::for_test(&root)));
+        let alpha = root.join("alpha");
+        std::fs::create_dir_all(&alpha).unwrap();
+        let alpha = alpha.to_string_lossy().into_owned();
+        let project_id = server
+            .state
+            .project_authority
+            .bridge_registry()
+            .unwrap()
+            .write()
+            .register_path(&alpha)
+            .unwrap()
+            .project_id;
+        let created = server
+            .state
+            .threads
+            .write()
+            .thread(&ThreadParams {
+                topic: Some("opened from a removed worktree".into()),
+                project: Some("/work/alpha-wt".into()),
+                ..tp("open")
+            })
+            .unwrap();
+        let id = created.split_whitespace().nth(2).unwrap().to_string();
+        assert!(
+            server
+                .state
+                .threads
+                .read()
+                .thread_by_id(&id)
+                .unwrap()
+                .project_id
+                .is_none()
+        );
+        (server, alpha, project_id, id)
+    }
+
+    fn listed_ids(server: &BlackboxServer, project: &str) -> Vec<String> {
+        let listed = parse_json(&server.bbox_thread_list(Parameters(ThreadListToolParams {
+            filters: ThreadListParams {
+                project: Some(project.into()),
+                ..tlp()
+            },
+            ..Default::default()
+        })));
+        listed["threads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn thread_rekey_dry_runs_by_default_then_stamps_persists_and_lists_by_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (server, alpha, project_id, id) = rekey_fixture(tmp.path());
+        let store_path = tmp.path().canonicalize().unwrap().join("threads.json");
+        let rows = serde_json::json!([
+            {"id": id, "expected_project": "/work/alpha-wt"},
+            {"id": "thread-00000000", "expected_project": "/work/alpha-wt"},
+        ]);
+        assert!(!listed_ids(&server, &alpha).contains(&id));
+        let activity = server
+            .state
+            .threads
+            .read()
+            .thread_by_id(&id)
+            .unwrap()
+            .last_activity
+            .clone();
+
+        let dry = server
+            .bbox_thread_rekey(Parameters(rekey_params(
+                &alpha,
+                rows.clone(),
+                serde_json::json!({}),
+            )))
+            .await;
+        assert_ne!(dry.is_error, Some(true), "{}", text_of(&dry));
+        let dry = parse_json(&dry);
+        assert_eq!(dry["dry_run"], true);
+        assert_eq!(dry["project_id"], project_id.as_str());
+        assert_eq!(dry["rows"][0]["outcome"], "would_rekey");
+        assert_eq!(dry["rows"][1]["outcome"], "unknown_id");
+        assert_eq!(dry["counts"]["would_rekey"], 1);
+        assert!(
+            server
+                .state
+                .threads
+                .read()
+                .thread_by_id(&id)
+                .unwrap()
+                .project_id
+                .is_none(),
+            "a dry run writes nothing"
+        );
+
+        // The selector may be the project id or the registered path.
+        let applied = server
+            .bbox_thread_rekey(Parameters(rekey_params(
+                &project_id,
+                rows,
+                serde_json::json!({"dry_run": false}),
+            )))
+            .await;
+        assert_ne!(applied.is_error, Some(true), "{}", text_of(&applied));
+        let applied = parse_json(&applied);
+        assert_eq!(applied["dry_run"], false);
+        assert_eq!(applied["rows"][0]["outcome"], "rekeyed");
+        assert_eq!(applied["counts"]["rekeyed"], 1);
+
+        let row = server
+            .state
+            .threads
+            .read()
+            .thread_by_id(&id)
+            .unwrap()
+            .clone();
+        assert_eq!(row.project_id.as_deref(), Some(project_id.as_str()));
+        assert_eq!(row.project, "/work/alpha-wt");
+        assert_eq!(
+            row.last_activity, activity,
+            "a re-key is not thread activity"
+        );
+        // The durable file agrees with the in-memory store.
+        let reopened = crate::threads::Threads::open(&store_path).unwrap();
+        assert_eq!(
+            reopened.thread_by_id(&id).unwrap().project_id.as_deref(),
+            Some(project_id.as_str())
+        );
+        // The id arm now selects the row for the project's path.
+        assert!(listed_ids(&server, &alpha).contains(&id));
+
+        // No silent overwrite: a second call reports the existing id.
+        let again = parse_json(
+            &server
+                .bbox_thread_rekey(Parameters(rekey_params(
+                    &alpha,
+                    serde_json::json!([{"id": id, "expected_project": "/work/alpha-wt"}]),
+                    serde_json::json!({"dry_run": false}),
+                )))
+                .await,
+        );
+        assert_eq!(again["rows"][0]["outcome"], "already_keyed");
+        assert_eq!(again["rows"][0]["project_id"], project_id.as_str());
+    }
+
+    #[tokio::test]
+    async fn thread_rekey_refuses_a_stale_row_and_leaves_it_unkeyed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (server, alpha, _, id) = rekey_fixture(tmp.path());
+        let result = parse_json(
+            &server
+                .bbox_thread_rekey(Parameters(rekey_params(
+                    &alpha,
+                    serde_json::json!([{"id": id, "expected_project": "/work/alpha-elsewhere"}]),
+                    serde_json::json!({"dry_run": false}),
+                )))
+                .await,
+        );
+        assert_eq!(result["rows"][0]["outcome"], "project_mismatch");
+        assert_eq!(result["rows"][0]["project"], "/work/alpha-wt");
+        assert!(
+            server
+                .state
+                .threads
+                .read()
+                .thread_by_id(&id)
+                .unwrap()
+                .project_id
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_rekey_refuses_the_whole_call_on_invalid_input() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (server, alpha, _, id) = rekey_fixture(tmp.path());
+        let row = serde_json::json!([{"id": id, "expected_project": "/work/alpha-wt"}]);
+        let too_many: Vec<_> = (0..51)
+            .map(|i| serde_json::json!({"id": format!("thread-{i:08x}"), "expected_project": "/x"}))
+            .collect();
+        let cases = [
+            // An unresolved selector, including an id the resolver does not know.
+            (
+                rekey_params(
+                    "/work/alpha-wt",
+                    row.clone(),
+                    serde_json::json!({"dry_run": false}),
+                ),
+                "error.project_selector",
+            ),
+            (
+                rekey_params(
+                    "p_00000000000000000000000000000000",
+                    row.clone(),
+                    serde_json::json!({"dry_run": false}),
+                ),
+                "error.project_selector",
+            ),
+            (
+                rekey_params(&alpha, serde_json::json!([]), serde_json::json!({})),
+                "error.thread_rekey_rows",
+            ),
+            (
+                rekey_params(&alpha, serde_json::json!(too_many), serde_json::json!({})),
+                "error.thread_rekey_rows",
+            ),
+            (
+                rekey_params(
+                    &alpha,
+                    row.clone(),
+                    serde_json::json!({"audit_reason": " "}),
+                ),
+                "error.thread_rekey_audit_reason",
+            ),
+        ];
+        for (params, code) in cases {
+            let result = server.bbox_thread_rekey(Parameters(params)).await;
+            assert_eq!(result.is_error, Some(true), "{}", text_of(&result));
+            assert!(
+                text_of(&result).contains(code),
+                "{code}: {}",
+                text_of(&result)
+            );
+        }
+        assert!(
+            server
+                .state
+                .threads
+                .read()
+                .thread_by_id(&id)
+                .unwrap()
+                .project_id
+                .is_none()
+        );
+    }
 }
 
 fn validate_thread_get_detail(p: &ThreadToolParams) -> anyhow::Result<Option<String>> {
@@ -1146,6 +1517,42 @@ fn validate_thread_request(p: &ThreadToolParams) -> anyhow::Result<()> {
                 .is_some_and(|id| !id.trim().is_empty()),
             "id or name is required"
         );
+    }
+    Ok(())
+}
+
+fn bounded_rekey_audit_reason(raw: &str) -> anyhow::Result<String> {
+    let reason = raw.trim();
+    if reason.is_empty() {
+        anyhow::bail!("error.thread_rekey_audit_reason: audit_reason is required");
+    }
+    if reason.len() > MAX_REKEY_AUDIT_REASON_BYTES {
+        anyhow::bail!(
+            "error.thread_rekey_audit_reason: audit_reason exceeds {MAX_REKEY_AUDIT_REASON_BYTES} bytes"
+        );
+    }
+    Ok(reason.to_string())
+}
+
+fn validate_rekey_rows(rows: &[crate::threads::ThreadRekeyRow]) -> anyhow::Result<()> {
+    if rows.is_empty() || rows.len() > MAX_REKEY_ROWS {
+        anyhow::bail!(
+            "error.thread_rekey_rows: rows must name 1 to {MAX_REKEY_ROWS} threads, got {}",
+            rows.len()
+        );
+    }
+    for row in rows {
+        if row.id.trim().is_empty() || row.id.len() > MAX_REKEY_ID_BYTES {
+            anyhow::bail!(
+                "error.thread_rekey_rows: each row needs a thread id of 1 to {MAX_REKEY_ID_BYTES} bytes"
+            );
+        }
+        if row.expected_project.len() > MAX_REKEY_EXPECTED_PROJECT_BYTES {
+            anyhow::bail!(
+                "error.thread_rekey_rows: expected_project for {} exceeds {MAX_REKEY_EXPECTED_PROJECT_BYTES} bytes",
+                row.id
+            );
+        }
     }
     Ok(())
 }

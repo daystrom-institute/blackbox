@@ -261,6 +261,51 @@ pub struct ThreadStore {
     pub threads: Vec<Thread>,
 }
 
+/// One row of a project re-key request: the thread id and the raw `project`
+/// value the caller read for it. The value is a compare-and-set guard: a row
+/// whose stored `project` differs is refused, so a stale request never
+/// re-keys a row that moved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ThreadRekeyRow {
+    /// Thread id (`thread-<8 hex>`; the bare 8 hex form is accepted).
+    pub id: String,
+    /// The row's stored raw `project` value, compared exactly.
+    pub expected_project: String,
+}
+
+/// What a re-key did, or would do, to one requested row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum ThreadRekeyOutcome {
+    /// The row carried no project id and its raw `project` matched; the id
+    /// was stamped.
+    Rekeyed,
+    /// Dry run: the row would be stamped.
+    WouldRekey,
+    /// The row already carries a project id, which is never overwritten.
+    AlreadyKeyed { project_id: String },
+    /// The row's raw `project` differs from the expected value (bounded
+    /// preview of the stored value).
+    ProjectMismatch { project: String },
+    /// No thread with this id exists.
+    UnknownId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ThreadRekeyRowOutcome {
+    /// The id as requested.
+    pub id: String,
+    #[serde(flatten)]
+    pub outcome: ThreadRekeyOutcome,
+}
+
+pub struct ThreadRekeyReport {
+    /// One outcome per requested row, in request order.
+    pub rows: Vec<ThreadRekeyRowOutcome>,
+    /// The stamped rows, for the index and durable persist. Empty on a dry run.
+    pub changed: Vec<Thread>,
+}
+
 pub struct ThreadMutation {
     pub message: String,
     pub changed_thread: Option<Thread>,
@@ -565,6 +610,69 @@ impl Threads {
             }
         }
         Ok(updated)
+    }
+
+    /// Stamp `project_id` on the named rows that carry none. A row is stamped
+    /// only when its `project_id` is absent and its raw `project` equals the
+    /// row's `expected_project`; a row that already carries an id keeps it.
+    /// The raw `project` and `last_activity` are left as stored: a re-key
+    /// repairs identity and is not thread activity, so it never reorders the
+    /// list or resets idle age. A dry run reports the same outcomes and
+    /// changes nothing. Duplicate ids in one request are refused.
+    pub fn rekey_project_ids(
+        &mut self,
+        project_id: &str,
+        rows: &[ThreadRekeyRow],
+        dry_run: bool,
+    ) -> Result<ThreadRekeyReport> {
+        if project_id.trim().is_empty() {
+            anyhow::bail!("project id is required");
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for row in rows {
+            let canonical = row.id.strip_prefix("thread-").unwrap_or(&row.id);
+            if !seen.insert(canonical) {
+                anyhow::bail!("duplicate thread id in request: {}", row.id);
+            }
+        }
+        let mut outcomes = Vec::with_capacity(rows.len());
+        let mut changed = Vec::new();
+        for row in rows {
+            let id = row.id.as_str();
+            let thread = self
+                .store
+                .threads
+                .iter_mut()
+                .find(|t| t.id == id || t.id.strip_prefix("thread-") == Some(id));
+            let outcome = match thread {
+                None => ThreadRekeyOutcome::UnknownId,
+                Some(thread) => match thread.project_id.as_deref() {
+                    Some(existing) => ThreadRekeyOutcome::AlreadyKeyed {
+                        project_id: existing.to_owned(),
+                    },
+                    None if thread.project != row.expected_project => {
+                        ThreadRekeyOutcome::ProjectMismatch {
+                            project: thread_display(&thread.project),
+                        }
+                    }
+                    None if dry_run => ThreadRekeyOutcome::WouldRekey,
+                    None => {
+                        thread.project_id = Some(project_id.to_owned());
+                        enqueue_thread_embed(thread);
+                        changed.push(thread.clone());
+                        ThreadRekeyOutcome::Rekeyed
+                    }
+                },
+            };
+            outcomes.push(ThreadRekeyRowOutcome {
+                id: row.id.clone(),
+                outcome,
+            });
+        }
+        Ok(ThreadRekeyReport {
+            rows: outcomes,
+            changed,
+        })
     }
 
     // ── blackbox_thread (CRUD) ─────────────────────────────────────
@@ -2696,6 +2804,223 @@ mod tests {
             !miss.contains("thread-dddddddd"),
             "no ledger path must not match: {miss}"
         );
+    }
+
+    fn rekey_row(id: &str, expected_project: &str) -> ThreadRekeyRow {
+        ThreadRekeyRow {
+            id: id.into(),
+            expected_project: expected_project.into(),
+        }
+    }
+
+    fn keyed_open(threads: &mut Threads, topic: &str, project: &str, project_id: &str) -> String {
+        let created = threads
+            .thread(&ThreadParams {
+                topic: Some(topic.into()),
+                project: Some(project.into()),
+                project_id: Some(project_id.into()),
+                ..params("open")
+            })
+            .unwrap();
+        created.split_whitespace().nth(2).unwrap().to_string()
+    }
+
+    fn list_ids(threads: &Threads, p: &ThreadListParams) -> Vec<String> {
+        threads
+            .matching_threads(p)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.id.clone())
+            .collect()
+    }
+
+    #[test]
+    fn rekey_stamps_only_unkeyed_rows_whose_raw_project_matches() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let mut threads = Threads::open(&root.join("threads.json")).unwrap();
+        let stale = open_thread_id(&mut threads, "stale", "/work/alpha-gone");
+        let moved = open_thread_id(&mut threads, "moved", "/work/alpha-other");
+        let keyed = keyed_open(&mut threads, "keyed", "/work/alpha-gone", "p_existing");
+        set_last_activity(&mut threads, &stale, "2026-01-01T00:00:00Z");
+        set_last_activity(&mut threads, &moved, "2026-01-01T00:00:00Z");
+        let before: Vec<Thread> = threads.all().to_vec();
+
+        let report = threads
+            .rekey_project_ids(
+                "p_alpha",
+                &[
+                    rekey_row(&stale, "/work/alpha-gone"),
+                    rekey_row(&moved, "/work/alpha-gone"),
+                    rekey_row(&keyed, "/work/alpha-gone"),
+                    rekey_row("thread-00000000", "/work/alpha-gone"),
+                ],
+                false,
+            )
+            .unwrap();
+        let outcomes: Vec<_> = report.rows.iter().map(|r| r.outcome.clone()).collect();
+        assert_eq!(
+            outcomes,
+            vec![
+                ThreadRekeyOutcome::Rekeyed,
+                ThreadRekeyOutcome::ProjectMismatch {
+                    project: "/work/alpha-other".into()
+                },
+                ThreadRekeyOutcome::AlreadyKeyed {
+                    project_id: "p_existing".into()
+                },
+                ThreadRekeyOutcome::UnknownId,
+            ]
+        );
+        assert_eq!(report.changed.len(), 1);
+        assert_eq!(report.changed[0].id, stale);
+
+        let row = threads.thread_by_id(&stale).unwrap();
+        assert_eq!(row.project_id.as_deref(), Some("p_alpha"));
+        assert_eq!(row.project, "/work/alpha-gone", "raw project is kept");
+        assert_eq!(
+            row.last_activity, "2026-01-01T00:00:00Z",
+            "a re-key is not thread activity"
+        );
+        let original = before.iter().find(|t| t.id == stale).unwrap();
+        assert_eq!(row.topic, original.topic);
+        assert_eq!(row.status, original.status);
+        assert_eq!(row.created_at, original.created_at);
+        assert_eq!(row.notes, original.notes);
+        // Refused rows are untouched.
+        for id in [&moved, &keyed] {
+            let after = threads.thread_by_id(id).unwrap();
+            let original = before.iter().find(|t| &t.id == id).unwrap();
+            assert_eq!(after.project_id, original.project_id);
+            assert_eq!(after.project, original.project);
+            assert_eq!(after.last_activity, original.last_activity);
+        }
+
+        // A repeat is idempotent: the stamped row reports its id.
+        let again = threads
+            .rekey_project_ids("p_other", &[rekey_row(&stale, "/work/alpha-gone")], false)
+            .unwrap();
+        assert_eq!(
+            again.rows[0].outcome,
+            ThreadRekeyOutcome::AlreadyKeyed {
+                project_id: "p_alpha".into()
+            }
+        );
+        assert!(again.changed.is_empty());
+    }
+
+    #[test]
+    fn rekey_dry_run_reports_outcomes_and_writes_nothing() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let mut threads = Threads::open(&root.join("threads.json")).unwrap();
+        let stale = open_thread_id(&mut threads, "stale", "/work/alpha-gone");
+        let before = serde_json::to_string(&threads.snapshot().unwrap()).unwrap();
+
+        let report = threads
+            .rekey_project_ids(
+                "p_alpha",
+                &[
+                    rekey_row(&stale, "/work/alpha-gone"),
+                    rekey_row("thread-00000000", "/work/alpha-gone"),
+                ],
+                true,
+            )
+            .unwrap();
+        assert_eq!(report.rows[0].outcome, ThreadRekeyOutcome::WouldRekey);
+        assert_eq!(report.rows[1].outcome, ThreadRekeyOutcome::UnknownId);
+        assert!(report.changed.is_empty());
+        assert_eq!(
+            serde_json::to_string(&threads.snapshot().unwrap()).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn rekey_refuses_duplicate_ids_and_an_empty_project_id() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let mut threads = Threads::open(&root.join("threads.json")).unwrap();
+        let stale = open_thread_id(&mut threads, "stale", "/work/alpha-gone");
+        let bare = stale.strip_prefix("thread-").unwrap().to_string();
+        let error = threads
+            .rekey_project_ids(
+                "p_alpha",
+                &[
+                    rekey_row(&stale, "/work/alpha-gone"),
+                    rekey_row(&bare, "/work/alpha-gone"),
+                ],
+                false,
+            )
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("duplicate thread id"), "{error}");
+        assert!(
+            threads
+                .rekey_project_ids(" ", &[rekey_row(&stale, "/work/alpha-gone")], false)
+                .is_err()
+        );
+        assert!(threads.thread_by_id(&stale).unwrap().project_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn rekeyed_rows_persist_and_list_by_id_without_the_path_predicate() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let store_path = root.join("threads.json");
+        let threads = Arc::new(RwLock::new(Threads::open(&store_path).unwrap()));
+        let persister =
+            StorePersister::spawn("threads-test-rekey", threads.clone(), store_path.clone());
+        let stale = open_thread_id(&mut threads.write(), "stale", "/work/alpha-gone");
+        let elsewhere = open_thread_id(&mut threads.write(), "elsewhere", "/work/beta");
+
+        let by_id = ThreadListParams {
+            project: Some("/work/alpha".into()),
+            project_id: Some("p_alpha".into()),
+            ..Default::default()
+        };
+        // Before: a path-only row is matched by the path predicate alone, so
+        // the id query names no project the row's raw path could satisfy.
+        let id_only = ThreadListParams {
+            project: Some("/work/alpha-new".into()),
+            project_id: Some("p_alpha".into()),
+            ..Default::default()
+        };
+        assert!(!list_ids(&threads.read(), &id_only).contains(&stale));
+
+        let activity = threads
+            .read()
+            .thread_by_id(&stale)
+            .unwrap()
+            .last_activity
+            .clone();
+        let report = threads
+            .write()
+            .rekey_project_ids("p_alpha", &[rekey_row(&stale, "/work/alpha-gone")], false)
+            .unwrap();
+        assert_eq!(report.rows[0].outcome, ThreadRekeyOutcome::Rekeyed);
+        persister.request_durable().await.unwrap();
+
+        let reopened = Threads::open(&store_path).unwrap();
+        let row = reopened.thread_by_id(&stale).unwrap();
+        assert_eq!(row.project_id.as_deref(), Some("p_alpha"));
+        assert_eq!(row.project, "/work/alpha-gone");
+        assert_eq!(
+            row.last_activity, activity,
+            "a re-key is not thread activity"
+        );
+        // The id arm decides: the row matches a query whose path no longer
+        // names its raw key, and a different id excludes it even though the
+        // path would match.
+        assert_eq!(list_ids(&reopened, &id_only), vec![stale.clone()]);
+        assert_eq!(list_ids(&reopened, &by_id), vec![stale.clone()]);
+        let other_id = ThreadListParams {
+            project: Some("/work/alpha-gone".into()),
+            project_id: Some("p_other".into()),
+            ..Default::default()
+        };
+        assert!(list_ids(&reopened, &other_id).is_empty());
+        assert!(!list_ids(&reopened, &by_id).contains(&elsewhere));
     }
 }
 

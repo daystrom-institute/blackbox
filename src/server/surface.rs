@@ -344,6 +344,7 @@ mod tests {
         "bbox_storage_health",
         "bbox_edge_compact",
         "bbox_doctor",
+        "bbox_thread_rekey",
         "bbox_artifact_install",
         "bbox_artifact_list",
         "bbox_artifact_remove",
@@ -392,6 +393,22 @@ mod tests {
                     assert!(visible.contains(*name), "{surface} must serve {name}");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn thread_rekey_is_served_on_ops_only() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let srv = BlackboxServer::new(Arc::new(SharedState::for_test(tmp.path())));
+        assert!(
+            srv.surface_tools_for("ops")
+                .unwrap()
+                .contains("bbox_thread_rekey")
+        );
+        for surface in ["default", "interactive", "agent-internal", "readonly"] {
+            let visible = srv.surface_tools_for(surface).unwrap();
+            assert!(!visible.contains("bbox_thread_rekey"), "{surface}");
+            assert!(visible.contains("bbox_thread_list"), "{surface}");
         }
     }
 
