@@ -20,11 +20,10 @@ taxonomy MISSES**. The CLI is a **lens**, not a documentation target — every
 finding must be abstracted to a **generic** dimension that would apply to any
 harness.
 
-## Step 0 — tool surface
+## Tool access
 
-Same as MINE_CLI: if you are a bro-harness bro, your file/shell/grep tools may be
-**deferred** — `tool_search("shell"/"file read"/"grep")` to load them first.
-**READ-ONLY** on the target; scratch only to `/tmp`.
+Use the native provider's file and shell tools. The target CLI's source and
+binary are read-only; write scratch only under `/tmp`.
 
 ## Step 1 — know the current frontier
 

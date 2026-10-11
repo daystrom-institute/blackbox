@@ -14,17 +14,13 @@ A retrospective pass for an **outbound interactive agent session**: Codex,
 Claude, or another live agent working directly with an operator through the
 interactive tool surface. Use it to preserve friction and useful surprises from
 the live agent's point of view, especially when that experience differs from a
-dispatched bro or `bro-harness` session.
+dispatched native provider session.
 
 This is a manual, human-steered pass. Point the interactive agent at this
 document near the end of a meaningful session, especially when the session
 involved tool discovery, MCP setup, repo instructions, worktree/git closeout,
 or operator steering. The purpose is close to `bro_prune(retro=true)`: invite
-concrete substrate feedback without compelling the agent to invent any. Unlike
-`RETRO_HARNESS.md`, this does not focus on the `bro-harness` promise model or
-intern. It focuses on what the interactive agent actually had: its native tool
-catalog, MCP availability, shell environment, context/instruction stack, and
-conversation with the operator.
+concrete substrate feedback without compelling the agent to invent any.
 
 ## What this reflects on
 

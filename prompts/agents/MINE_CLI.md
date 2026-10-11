@@ -27,14 +27,10 @@ axes → evidence. (Finding *new* axes is a different job — see
   (compiled). State which.
 - `CONFIG` — the CLI's config dir, if any (e.g. `~/.claude`, `~/.vibe`).
 
-## Step 0 — tool surface (read this first)
+## Tool access
 
-If you are a **bro-harness bro**, your file-read / shell / grep / glob tools may
-be **deferred** behind `tool_search`. Call `tool_search` with queries like
-`"shell"`, `"bash"`, `"file read"`, `"grep"` to load them **before** concluding
-you lack tools. (Do not allow-list Claude tool names like `Read`/`Bash` — those
-do not match bro-harness's surface.) You are **READ-ONLY** on the target CLI's
-source/binary: never edit it; write scratch only under `/tmp`.
+Use the native provider's file and shell tools. The target CLI's source and
+binary are read-only; write scratch only under `/tmp`.
 
 ## Step 1 — ground in the research corpus (REQUIRED, in order)
 

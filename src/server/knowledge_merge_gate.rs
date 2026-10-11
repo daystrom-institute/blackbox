@@ -1,14 +1,14 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use bro_tools::fleet_worktree::{CandidateGateReport, CandidateTree};
+use bro_worktree::{CandidateGateReport, CandidateTree};
 
 /// Evaluate repo-owned knowledge and its generated projections from the
 /// immutable candidate tree, never from either live checkout.
 #[allow(clippy::disallowed_methods)]
 pub(crate) fn evaluate(candidate: &CandidateTree) -> Result<CandidateGateReport> {
     let tree = tempfile::tempdir().context("creating candidate-tree sandbox")?;
-    bro_tools::fleet_worktree::materialize_candidate_tree(candidate, tree.path())?;
+    bro_worktree::materialize_candidate_tree(candidate, tree.path())?;
     let tree_root = tree
         .path()
         .canonicalize()

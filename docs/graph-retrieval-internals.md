@@ -239,7 +239,7 @@ ordering rule live in
 
 Provider routing is code-owned in `crates/bro-core/src/provider.rs`.
 The Codex adapter speaks app-server directly; compatible endpoints use the
-Claude CLI, and remaining harness providers use `bro-harness`. See
+Claude CLI. See
 [Provider & Agent Surfaces](../PROJECT.md#provider--agent-surfaces)
 rather than re-inventorying providers here.
 

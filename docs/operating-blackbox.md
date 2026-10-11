@@ -54,15 +54,14 @@ is healthy, install the changed checkout-host satellites from the same commit:
 
 ```bash
 cargo build --release --bin blackbox
-cargo build --release -p bro-cli -p bro-harness -p fleetd \
+cargo build --release -p bro-cli -p fleetd \
   -p bbox-code-collector -p bbox-transcript-collector
 install -m 755 target/release/blackbox ~/.local/bin/blackbox
-install -m 755 target/release/{bro,bro-harness,fleetd} ~/.local/bin/
+install -m 755 target/release/{bro,fleetd} ~/.local/bin/
 install -m 755 target/release/{bbox-code-collector,bbox-transcript-collector} ~/.local/bin/
 ```
 
-Kickstart the collectors after installing them. New sessions pick up a new
-`bro-harness` without a restart. The Codex adapter is linked into the daemon
+Kickstart the collectors after installing them. The Codex adapter is linked into the daemon
 and fleetd; install and restart fleetd when updating it. Both peers must use
 fleet protocol version 2.
 
@@ -563,7 +562,6 @@ host with `bro render global`.
 |---|---|
 | `~/.local/bin/blackbox` | Offline administration CLI |
 | `~/.local/bin/bro` | Terminal TUI client |
-| `~/.local/bin/bro-harness` | Model-turn runtime exec'd by `fleetd` |
 | `~/.local/bin/fleetd` | Fleet supervisor binary (shared by prod and dev) |
 | `~/.local/bin/bbox-code-collector` | Checkout-source collector |
 | `~/.local/bin/bbox-transcript-collector` | Native transcript collector |

@@ -44,11 +44,9 @@ Use when the guidance should land in the provider-level managed files and affect
 ### Project render
 
 Use when the guidance belongs only to the current repo and its project-local memory files.
-Call `bbox_render(scope="project", project="<project-selector>")` from a managed
-bro-harness session bound to the owning checkout. Its locality client obtains
-and applies the render plan there. Direct remote MCP cannot write the caller's
-checkout; `error.render_locality_required` requires this owner execution lane,
-not a different daemon path or hand-authored internal transport parameters.
+Project renders require a client that applies the render plan in the owning
+checkout. Direct remote MCP returns `error.render_locality_required` when that
+execution locality is unavailable.
 
 ## What each verb is not
 

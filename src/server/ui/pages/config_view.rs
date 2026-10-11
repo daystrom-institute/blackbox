@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 
 use bbox_config::config::{
     CodeCollectionConfig, CodeCollectionProducerConfig, Config, ConnectorProducerConfig,
-    ConnectorProfile, ConnectorScopeGrant, DaemonConfig, ExecutorKind, IndexConfig, LspConfig,
-    McpOAuthConfig, ProducerScopeClaimPolicy, ProvenanceConfig, ProviderConfig, ResolvedPathConfig,
+    ConnectorProfile, ConnectorScopeGrant, DaemonConfig, ExecutorKind, IndexConfig, McpOAuthConfig,
+    ProducerScopeClaimPolicy, ProvenanceConfig, ProviderConfig, ResolvedPathConfig,
     RetainedConversationSource, SourceConnectorsConfig, TranscriptConfig,
 };
 
@@ -55,7 +55,6 @@ pub(crate) fn redacted_config(config: &Config) -> Vec<ConfigGroup> {
         source_connectors,
         provenance,
         providers,
-        lsp,
         transcripts,
         // Rendered as the surface table with each surface's visible tools.
         surfaces: _,
@@ -72,7 +71,6 @@ pub(crate) fn redacted_config(config: &Config) -> Vec<ConfigGroup> {
         }),
         group("provenance", |rows| provenance_rows(rows, provenance)),
         group("providers", |rows| provider_rows(rows, providers)),
-        group("lsp", |rows| lsp_rows(rows, lsp)),
         group("transcripts", |rows| transcript_rows(rows, transcripts)),
         group("paths", |rows| path_rows(rows, paths)),
     ]
@@ -428,32 +426,6 @@ fn provider_rows(rows: &mut Rows, providers: &ProviderConfig) {
     rows.list("extra_path", extra_path.iter().map(|path| path.display()));
 }
 
-fn lsp_rows(rows: &mut Rows, lsp: &LspConfig) {
-    let LspConfig {
-        idle_timeout_secs,
-        request_timeout_secs,
-        jdtls_init_timeout_secs,
-        jdtls_ready_timeout_secs,
-        rust_analyzer_init_timeout_secs,
-        roslyn_init_timeout_secs,
-        jdtls_bin,
-        rust_analyzer_bin,
-        roslyn_lsp_bin,
-    } = lsp;
-    rows.text("idle_timeout_secs", idle_timeout_secs);
-    rows.text("request_timeout_secs", request_timeout_secs);
-    rows.text("jdtls_init_timeout_secs", jdtls_init_timeout_secs);
-    rows.text("jdtls_ready_timeout_secs", jdtls_ready_timeout_secs);
-    rows.text(
-        "rust_analyzer_init_timeout_secs",
-        rust_analyzer_init_timeout_secs,
-    );
-    rows.text("roslyn_init_timeout_secs", roslyn_init_timeout_secs);
-    rows.optional("jdtls_bin", jdtls_bin.as_ref());
-    rows.optional("rust_analyzer_bin", rust_analyzer_bin.as_ref());
-    rows.optional("roslyn_lsp_bin", roslyn_lsp_bin.as_ref());
-}
-
 fn transcript_rows(rows: &mut Rows, transcripts: &TranscriptConfig) {
     let TranscriptConfig { roots, codex_root } = transcripts;
     rows.optional("roots", roots.as_ref());
@@ -618,10 +590,6 @@ pub(crate) mod tests {
         providers.vibe_session_dir = Some("/srv/vibe".into());
         providers.extra_path = vec!["/opt/bin".into()];
 
-        config.lsp.jdtls_bin = Some("/opt/jdtls".into());
-        config.lsp.rust_analyzer_bin = Some("/opt/rust-analyzer".into());
-        config.lsp.roslyn_lsp_bin = Some("/opt/roslyn".into());
-
         config.transcripts.roots = Some("/srv/transcripts".into());
         config.transcripts.codex_root = Some("/srv/codex".into());
 
@@ -668,7 +636,6 @@ pub(crate) mod tests {
                 "providers",
                 serde_json::to_value(&config.providers).unwrap(),
             ),
-            ("lsp", serde_json::to_value(&config.lsp).unwrap()),
             (
                 "transcripts",
                 serde_json::to_value(&config.transcripts).unwrap(),

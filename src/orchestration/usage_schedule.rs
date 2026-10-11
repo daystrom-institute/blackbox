@@ -84,7 +84,7 @@ mod tests {
 
     #[test]
     fn unknown_schedule_and_invalid_time_are_not_off_peak() {
-        assert_eq!(at(Provider::Brodex, "2026-09-07T06:00:00Z"), None);
+        assert_eq!(at(Provider::Codex, "2026-09-07T06:00:00Z"), None);
         assert_eq!(peak_usage(Provider::Glm, u64::MAX), None);
     }
 }

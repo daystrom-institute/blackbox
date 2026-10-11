@@ -1,7 +1,7 @@
 //! The daemon-side client for `fleetd`, the per-machine fleet supervisor.
 //!
 //! Slice 5 of `design/daemon-runtime/locality-first-decomposition.md`.
-//! [`FleetdExecutor`] implements the same [`HarnessExecutor`] seam
+//! [`FleetdExecutor`] implements the same [`WorkerExecutor`] seam
 //! [`super::executor::LocalExecutor`] does, so the daemon's dispatch
 //! composition is byte-identical either way: compose a fully-resolved
 //! [`WorkerSpawnSpec`], hand it to an executor, get back a [`WorkerHandle`].
@@ -67,7 +67,7 @@ use bro_rpc::{BuildIdentity, Envelope, HandshakeOptions, NegotiatedIo, ServiceTo
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpStream, UnixStream};
 
-use super::executor::{HarnessExecutor, WorkerHandle, WorkerKill, WorkerLocality, WorkerOutcome};
+use super::executor::{WorkerExecutor, WorkerHandle, WorkerKill, WorkerLocality, WorkerOutcome};
 
 /// Socket file name inside the state dir. Must match `fleetd::paths`, which
 /// the daemon deliberately does not link (fleetd's dependency ceiling runs the
@@ -935,7 +935,7 @@ impl FleetdExecutor {
 }
 
 #[async_trait]
-impl HarnessExecutor for FleetdExecutor {
+impl WorkerExecutor for FleetdExecutor {
     fn provider_binary_location(&self) -> super::executor::ProviderBinaryLocation {
         super::executor::ProviderBinaryLocation::ExecutorHost
     }

@@ -1,6 +1,6 @@
 //! The harness-worker execution seam.
 //!
-//! [`HarnessExecutor`] turns a fully-resolved [`WorkerSpawnSpec`] into a
+//! [`WorkerExecutor`] turns a fully-resolved [`WorkerSpawnSpec`] into a
 //! supervised child process, exposing the stdio control/event lanes, an
 //! idempotent kill, and a terminal outcome. [`LocalExecutor`] runs the child
 //! in-process on the daemon host; [`super::fleetd_client::FleetdExecutor`]
@@ -56,10 +56,10 @@ pub struct WorkerLocality {
     pub bro_home: PathBuf,
 }
 
-/// Host whose PATH is authoritative for the standalone harness binary.
+/// Host whose PATH is authoritative for the native provider binary.
 ///
 /// Local execution can reject an allocator lane when the daemon cannot resolve
-/// `bro-harness`. Fleetd execution must defer that check because fleetd owns
+/// the provider CLI. Fleetd execution must defer that check because fleetd owns
 /// the worker host's login-shell PATH and performs final binary resolution.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -178,7 +178,7 @@ pub struct WorkerHandle {
 /// `#[async_trait]` rather than a native `async fn` in the trait so the daemon
 /// can hold an executor behind `dyn`.
 #[async_trait]
-pub trait HarnessExecutor: Send + Sync {
+pub trait WorkerExecutor: Send + Sync {
     /// Host whose PATH decides whether the harness binary exists.
     fn provider_binary_location(&self) -> ProviderBinaryLocation {
         ProviderBinaryLocation::DaemonHost
@@ -219,7 +219,7 @@ pub trait HarnessExecutor: Send + Sync {
 pub struct LocalExecutor;
 
 #[async_trait]
-impl HarnessExecutor for LocalExecutor {
+impl WorkerExecutor for LocalExecutor {
     async fn inspect_workspace(
         &self,
         request: WorkspaceInspectionRequest,
@@ -230,6 +230,11 @@ impl HarnessExecutor for LocalExecutor {
     }
 
     async fn spawn(&self, spec: WorkerSpawnSpec) -> anyhow::Result<WorkerHandle> {
+        anyhow::ensure!(
+            spec.provider.is_dispatchable(),
+            "provider {} is retired",
+            spec.provider.as_str()
+        );
         anyhow::ensure!(
             (spec.provider == bro_core::Provider::Codex) == spec.codex.is_some(),
             "Codex requires typed app-server settings"
@@ -585,7 +590,7 @@ mod absolute_bin_tests {
             .await
             .unwrap();
         // A bare name or relative path is resolved later, as before.
-        ensure_absolute_bin_executable("bro-harness").await.unwrap();
+        ensure_absolute_bin_executable("claude").await.unwrap();
         ensure_absolute_bin_executable("./relative/harness")
             .await
             .unwrap();
@@ -594,7 +599,7 @@ mod absolute_bin_tests {
 
 #[cfg(test)]
 mod child_env_tests {
-    use super::{HarnessExecutor, LocalExecutor, WorkerSpawnSpec};
+    use super::{LocalExecutor, WorkerExecutor, WorkerSpawnSpec};
 
     #[tokio::test]
     async fn cli_log_failures_refuse_spawn_or_stop_the_running_child() {
@@ -666,7 +671,7 @@ mod child_env_tests {
     /// variable set by the spec reaches the child.
     #[tokio::test]
     async fn a_scrubbed_variable_reaches_the_child_only_through_the_spec_env() {
-        const VAR: &str = "BRO_HARNESS_MCP_HTTP_LIFECYCLE";
+        const VAR: &str = "BBOX_TEST_WORKER_SETTING";
         // SAFETY: nextest runs each test in its own process.
         unsafe { std::env::set_var(VAR, "inherited") };
         let seen_by_child = |env: std::collections::BTreeMap<String, String>| async move {

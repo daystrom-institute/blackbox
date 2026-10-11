@@ -1,7 +1,5 @@
 use crate::config::ProviderConfig;
-use crate::orchestration::brofile::{
-    BrofileContext, CodeMode, EditDiscipline, ProviderDefaultsMode,
-};
+use crate::orchestration::brofile::{BrofileContext, ProviderDefaultsMode};
 
 use std::path::PathBuf;
 
@@ -10,8 +8,7 @@ use bro_core::ProviderLane;
 
 /// Resolve the provider binary name from env. The claude lane runs the
 /// vendor `claude` CLI (`CLAUDE_BIN` overrides); the codex lane runs the
-/// `codex app-server` adapter (`CODEX_BIN` overrides); the harness lane runs the
-/// standalone `bro-harness` binary (`BRO_HARNESS_BIN` overrides). Credentials
+/// `codex app-server` adapter (`CODEX_BIN` overrides); only these native lanes are executable. Credentials
 /// and endpoints are selected via env (see brofile::resolve_provider_env).
 ///
 /// Dispatch composes a typed invocation and environment for the execution
@@ -20,9 +17,7 @@ fn bin_with_env(provider: Provider) -> String {
     match provider.lane() {
         ProviderLane::ClaudeCli => std::env::var("CLAUDE_BIN").unwrap_or_else(|_| "claude".into()),
         ProviderLane::Codex => std::env::var("CODEX_BIN").unwrap_or_else(|_| "codex".into()),
-        ProviderLane::Harness => {
-            std::env::var("BRO_HARNESS_BIN").unwrap_or_else(|_| "bro-harness".into())
-        }
+        ProviderLane::Retired => String::new(),
         ProviderLane::Workflow => "workflow".into(),
     }
 }
@@ -129,20 +124,11 @@ pub struct ExecOpts {
     pub model: Option<String>,
     pub effort: Option<String>,
     pub provider_defaults: Option<ProviderDefaultsMode>,
-    /// Code-mode to pass the harness as `--code-mode` (harness-backed providers
-    /// only). `None` ⇒ no flag emitted, so the harness applies its own
-    /// precedence (persisted session value → env → default `optional`).
-    pub code_mode: Option<CodeMode>,
-    /// Edit discipline to pass the harness as `--edit-discipline` on a
-    /// fresh dispatch. Never passed on resume: the session saved it.
-    pub edit_discipline: Option<EditDiscipline>,
-    /// Service tier passed to harness providers as `--service-tier`. Brodex
-    /// forwards `priority` to OpenAI Responses as Codex `/fast`; `default` is
-    /// persisted in session state but dropped from the request body.
+
+    /// Service tier for the native Codex session.
     pub service_tier: Option<String>,
     /// JSON schema for structured output. The claude lane passes it as
-    /// `--json-schema <json>`; the harness lane as `--output-schema <json>`,
-    /// which registers a synthetic `final_result` terminal tool.
+    /// `--json-schema <json>`; Codex uses its typed output schema.
     pub output_schema: Option<String>,
 }
 
@@ -299,11 +285,7 @@ fn cli_launch(provider: Provider, argv: Vec<String>, opts: Option<&ExecOpts>) ->
     if provider.lane() == ProviderLane::ClaudeCli
         && let Some(opts) = opts
     {
-        for (name, present) in [
-            ("code_mode", opts.code_mode.is_some()),
-            ("edit_discipline", opts.edit_discipline.is_some()),
-            ("service_tier", opts.service_tier.is_some()),
-        ] {
+        for (name, present) in [("service_tier", opts.service_tier.is_some())] {
             if present {
                 launch
                     .errors
@@ -322,9 +304,7 @@ fn codex_launch(
 ) -> ProviderLaunch {
     let opts = opts.cloned().unwrap_or_default();
     let mut errors = Vec::new();
-    if opts.code_mode.is_some() || opts.edit_discipline.is_some() {
-        errors.push("Codex does not support harness code_mode or edit_discipline".into());
-    }
+
     if opts
         .provider_defaults
         .is_some_and(ProviderDefaultsMode::suppresses)
@@ -368,16 +348,6 @@ fn codex_launch(
     }
 }
 
-/// Serialize the payload for the harness `--dispatch-context` flag. The DTO is
-/// plain strings/enums, so serialization cannot fail in practice.
-fn dispatch_context_flag(args: &mut Vec<String>, ctx: Option<&bro_protocol::DispatchContext>) {
-    if let Some(ctx) = ctx
-        && let Ok(json) = serde_json::to_string(ctx)
-    {
-        args.extend(["--dispatch-context".into(), json]);
-    }
-}
-
 /// Render the dispatch context for the claude lane's `--append-system-prompt`:
 /// the persona verbatim, then the scope ids as a fixed-order block. The claude
 /// CLI has no typed slot for either, so the daemon composes the text; the
@@ -414,8 +384,7 @@ fn dispatch_context_append_flag(
     }
 }
 
-/// The stream-json flags both lanes share: the harness deliberately mirrors
-/// the claude CLI's headless surface.
+/// Stream-json flags for the Claude CLI headless surface.
 fn stream_json_base_args(prompt: &str) -> Vec<String> {
     vec![
         "-p".into(),
@@ -455,9 +424,6 @@ impl ProviderExec for Provider {
             .map(|m| normalize_model_for_provider(*self, m))
             .or_else(|| default_model(*self));
         let effort = opts.and_then(|o| o.effort.as_deref());
-        let code_mode = opts.and_then(|o| o.code_mode);
-        let edit_discipline = opts.and_then(|o| o.edit_discipline);
-        let service_tier = opts.and_then(|o| o.service_tier.as_deref());
         let output_schema = opts.and_then(|o| o.output_schema.as_deref());
         let suppress_provider_defaults = opts
             .and_then(|o| o.provider_defaults)
@@ -487,37 +453,11 @@ impl ProviderExec for Provider {
                 }
                 args
             }
-            ProviderLane::Harness => {
-                let mut args = stream_json_base_args(prompt);
-                dispatch_context_flag(&mut args, dispatch_context);
-                if suppress_provider_defaults {
-                    args.extend([
-                        "--system-prompt".into(),
-                        EMPTY_SYSTEM_PROMPT_OVERRIDE.into(),
-                    ]);
-                }
-                if !session_id.is_empty() && session_id != "pending" {
-                    args.extend(["--session-id".into(), session_id.into()]);
-                }
-                if let Some(m) = model.as_deref() {
-                    args.extend(["--model".into(), m.into()]);
-                }
-                if let Some(e) = effort {
-                    args.extend(["--effort".into(), e.into()]);
-                }
-                if let Some(cm) = code_mode {
-                    args.extend(["--code-mode".into(), cm.as_str().into()]);
-                }
-                if let Some(discipline) = edit_discipline {
-                    args.extend(["--edit-discipline".into(), discipline.as_str().into()]);
-                }
-                if let Some(tier) = service_tier {
-                    args.extend(["--service-tier".into(), tier.into()]);
-                }
-                if let Some(schema) = output_schema {
-                    args.extend(["--output-schema".into(), schema.into()]);
-                }
-                args
+            ProviderLane::Retired => {
+                return ProviderLaunch {
+                    errors: vec!["provider is retired".into()],
+                    ..Default::default()
+                };
             }
             ProviderLane::Codex => unreachable!("Codex uses typed launch settings"),
             ProviderLane::Workflow => Vec::new(),
@@ -540,8 +480,6 @@ impl ProviderExec for Provider {
             .map(|m| normalize_model_for_provider(*self, m))
             .or_else(|| default_model(*self));
         let effort = opts.and_then(|o| o.effort.as_deref());
-        let code_mode = opts.and_then(|o| o.code_mode);
-        let service_tier = opts.and_then(|o| o.service_tier.as_deref());
         let output_schema = opts.and_then(|o| o.output_schema.as_deref());
         let suppress_provider_defaults = opts
             .and_then(|o| o.provider_defaults)
@@ -569,35 +507,11 @@ impl ProviderExec for Provider {
                 }
                 args
             }
-            ProviderLane::Harness => {
-                let mut args = vec!["--resume".into(), session_id.into()];
-                args.extend(stream_json_base_args(prompt));
-                dispatch_context_flag(&mut args, dispatch_context);
-                if suppress_provider_defaults {
-                    args.extend([
-                        "--system-prompt".into(),
-                        EMPTY_SYSTEM_PROMPT_OVERRIDE.into(),
-                    ]);
-                }
-                if let Some(m) = model.as_deref() {
-                    args.extend(["--model".into(), m.into()]);
-                }
-                if let Some(e) = effort {
-                    args.extend(["--effort".into(), e.into()]);
-                }
-                // Resume normally leaves this None — the harness restores the
-                // session's persisted code_mode. Emitted only if a caller
-                // explicitly overrides it on resume.
-                if let Some(cm) = code_mode {
-                    args.extend(["--code-mode".into(), cm.as_str().into()]);
-                }
-                if let Some(tier) = service_tier {
-                    args.extend(["--service-tier".into(), tier.into()]);
-                }
-                if let Some(schema) = output_schema {
-                    args.extend(["--output-schema".into(), schema.into()]);
-                }
-                args
+            ProviderLane::Retired => {
+                return ProviderLaunch {
+                    errors: vec!["provider is retired".into()],
+                    ..Default::default()
+                };
             }
             ProviderLane::Codex => unreachable!("Codex uses typed launch settings"),
             ProviderLane::Workflow => Vec::new(),

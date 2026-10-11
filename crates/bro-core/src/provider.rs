@@ -6,8 +6,7 @@
 //! crate. The *daemon-logic* methods (arg building, event parsing, MCP filter
 //! translation) are NOT here — they ride a `ProviderDispatch`-family trait
 //! implemented in `blackbox`, because their bodies reach daemon-internal types.
-//! See `design/bro-harness/harness-daemon-boundary.md` §2/§7 (the contract
-//! bottom + thin-client decoupling).
+//! Native execution lanes are documented in `design/orchestration/provider-lanes.md`.
 
 use serde::{Deserialize, Serialize};
 
@@ -47,17 +46,14 @@ pub enum Provider {
     /// execution-host adapter. Accounts select a `CODEX_HOME`; the default account
     /// uses the app-server's own `~/.codex`.
     Codex,
-    /// Codex/ChatGPT backend ridden through `bro-harness` (OpenAI Responses
-    /// transport).
-    Brodex,
-    /// Mistral (vibe) ridden through `bro-harness` on the OpenAI
-    /// **chat-completions** transport. `vibebh` launches the harness with
-    /// `BRO_HARNESS_TRANSPORT=openai-chat` + `BRO_HARNESS_CHAT_REASONING=mistral`
-    /// against the Mistral API. The exemplar completions-transport harness
-    /// provider — the template for future OpenAI-compatible endpoints.
-    #[serde(alias = "vibe-bh")]
-    #[strum(serialize = "vibebh", serialize = "vibe-bh")]
-    VibeBh,
+    /// Historical task/transcript identity. Not accepted for dispatch.
+    #[serde(rename = "brodex")]
+    #[strum(disabled)]
+    LegacyBrodex,
+    /// Historical task/transcript identity. Not accepted for dispatch.
+    #[serde(rename = "vibebh", alias = "vibe-bh")]
+    #[strum(disabled)]
+    LegacyVibeBh,
     Workflow,
 }
 
@@ -111,8 +107,8 @@ pub enum ProviderLane {
     ClaudeCli,
     /// Native app-server RPC, owned by the execution-host adapter.
     Codex,
-    /// One standalone `bro-harness` child per dispatch (transitional).
-    Harness,
+    /// Archival provider identity with no executable runtime.
+    Retired,
     /// Daemon-internal workflow engine; no child process.
     Workflow,
 }
@@ -124,12 +120,17 @@ impl Provider {
         Provider::Minimax,
         Provider::Kimi,
         Provider::Codex,
-        Provider::Brodex,
-        Provider::VibeBh,
     ];
 
     pub fn is_dispatchable(&self) -> bool {
-        !matches!(self, Provider::Workflow)
+        matches!(
+            self,
+            Provider::Glm
+                | Provider::Deepseek
+                | Provider::Minimax
+                | Provider::Kimi
+                | Provider::Codex
+        )
     }
 
     pub fn lane(&self) -> ProviderLane {
@@ -138,7 +139,7 @@ impl Provider {
                 ProviderLane::ClaudeCli
             }
             Provider::Codex => ProviderLane::Codex,
-            Provider::Brodex | Provider::VibeBh => ProviderLane::Harness,
+            Provider::LegacyBrodex | Provider::LegacyVibeBh => ProviderLane::Retired,
             Provider::Workflow => ProviderLane::Workflow,
         }
     }
@@ -171,7 +172,7 @@ impl Provider {
             // All harness-backed providers support structured output via the
             // forced `final_result` terminal tool (transport-agnostic — works
             // for every tool-using provider).
-            Provider::Brodex => &[StructuredOutput, ToolUse, Resume],
+            Provider::LegacyBrodex => &[],
             Provider::Glm => &[StructuredOutput, ToolUse, Resume],
             Provider::Deepseek => &[StructuredOutput, ToolUse, Resume],
             Provider::Minimax => &[StructuredOutput, ToolUse, Resume],
@@ -180,7 +181,7 @@ impl Provider {
             Provider::Kimi => &[StructuredOutput, ToolUse, Resume],
             // Mistral via bro-harness (chat-completions transport). Structured
             // output delivered via the same forced `final_result` terminal tool.
-            Provider::VibeBh => &[StructuredOutput, ToolUse, Resume],
+            Provider::LegacyVibeBh => &[],
             Provider::Workflow => &[],
         };
         v.iter().copied().collect()
@@ -188,14 +189,14 @@ impl Provider {
 
     pub fn as_str(&self) -> &'static str {
         match self {
-            Provider::Glm => "glm",
-            Provider::Deepseek => "deepseek",
-            Provider::Minimax => "minimax",
-            Provider::Kimi => "kimi",
-            Provider::Codex => "codex",
-            Provider::Brodex => "brodex",
-            Provider::VibeBh => "vibebh",
-            Provider::Workflow => "workflow",
+            Self::Glm => "glm",
+            Self::Deepseek => "deepseek",
+            Self::Minimax => "minimax",
+            Self::Kimi => "kimi",
+            Self::Codex => "codex",
+            Self::LegacyBrodex => "brodex",
+            Self::LegacyVibeBh => "vibebh",
+            Self::Workflow => "workflow",
         }
     }
 
@@ -335,8 +336,8 @@ fn models_for(provider: Provider) -> &'static [ModelInfo] {
         Provider::Deepseek => DEEPSEEK_MODELS,
         Provider::Minimax => MINIMAX_MODELS,
         Provider::Kimi => KIMI_MODELS,
-        Provider::Codex | Provider::Brodex => CODEX_MODELS,
-        Provider::VibeBh => VIBEBH_MODELS,
+        Provider::Codex => CODEX_MODELS,
+        Provider::LegacyBrodex | Provider::LegacyVibeBh => &[],
         Provider::Workflow => &[],
     }
 }
@@ -346,8 +347,8 @@ fn efforts_for(provider: Provider) -> &'static [EffortInfo] {
         Provider::Glm | Provider::Minimax => CLAUDE_EFFORTS,
         Provider::Deepseek => DEEPSEEK_EFFORTS,
         Provider::Kimi => KIMI_EFFORTS,
-        Provider::Codex | Provider::Brodex => CODEX_EFFORTS,
-        Provider::VibeBh => VIBEBH_EFFORTS,
+        Provider::Codex => CODEX_EFFORTS,
+        Provider::LegacyBrodex | Provider::LegacyVibeBh => &[],
         Provider::Workflow => &[],
     }
 }
@@ -357,8 +358,8 @@ fn prompt_cache_for(provider: Provider) -> PromptCacheCapability {
         Provider::Glm | Provider::Deepseek | Provider::Minimax | Provider::Kimi => {
             PromptCacheCapability::AnthropicCacheControl
         }
-        Provider::Codex | Provider::Brodex => PromptCacheCapability::OpenAiPromptTokenDetails,
-        Provider::VibeBh => PromptCacheCapability::ChatCompletionsPromptCacheKey,
+        Provider::Codex => PromptCacheCapability::OpenAiPromptTokenDetails,
+        Provider::LegacyBrodex | Provider::LegacyVibeBh => PromptCacheCapability::NoneKnown,
         Provider::Workflow => PromptCacheCapability::NoneKnown,
     }
 }
@@ -672,7 +673,7 @@ static KIMI_EFFORTS: &[EffortInfo] = &[
     },
 ];
 
-// Codex and Brodex use the Codex/ChatGPT catalog's model-keyed effort levels, which
+// Codex uses the Codex/ChatGPT catalog's model-keyed effort levels, which
 // differ from the public API. Astra, Sol, and Terra expose `ultra`; Luna
 // stops at `max`. Pre-5.6 models keep their established effort set.
 const CODEX_PRE_56_EFFORTS: &[&str] = &["minimal", "low", "medium", "high", "xhigh"];
@@ -843,65 +844,6 @@ static CODEX_EFFORTS: &[EffortInfo] = &[
     },
 ];
 
-// vibe-bh DOES take a model id (the harness `--model` flag is forwarded
-// verbatim as the chat-completions `model` field), unlike the vibe CLI. These
-// are real Mistral API model ids (verified live against /v1/models, 2026-06-01).
-static VIBEBH_MODELS: &[ModelInfo] = &[
-    ModelInfo {
-        id: "mistral-medium-3.5",
-        description: "Mistral Medium 3.5, reasoning-capable flagship via bro-harness",
-        default: true,
-        efforts: &[],
-        default_effort: None,
-    },
-    ModelInfo {
-        id: "mistral-vibe-cli-latest",
-        description: "Mistral vibe-CLI-tuned model via bro-harness",
-        default: false,
-        efforts: &[],
-        default_effort: None,
-    },
-    ModelInfo {
-        id: "magistral-medium-latest",
-        description: "Magistral Medium, dedicated reasoning model via bro-harness",
-        default: false,
-        efforts: &[],
-        default_effort: None,
-    },
-    ModelInfo {
-        id: "devstral-medium-latest",
-        description: "Devstral Medium, coding-tuned model via bro-harness",
-        default: false,
-        efforts: &[],
-        default_effort: None,
-    },
-    ModelInfo {
-        id: "devstral-small-latest",
-        description: "Devstral Small, fast low-cost coding model via bro-harness",
-        default: false,
-        efforts: &[],
-        default_effort: None,
-    },
-];
-
-// Mistral reasoning models accept reasoning_effort ∈ {none, high} only (verified
-// live — medium/low 400). The chat transport collapses any effort into that set,
-// but the catalog advertises just the two honest values. Default `high` to
-// showcase the reasoning path (mirrors vibe's own thinking="high" default);
-// pick `none` for a fast non-reasoning turn.
-static VIBEBH_EFFORTS: &[EffortInfo] = &[
-    EffortInfo {
-        id: "none",
-        description: "No reasoning — fastest, lowest cost",
-        default: false,
-    },
-    EffortInfo {
-        id: "high",
-        description: "Full reasoning (Mistral thinking)",
-        default: true,
-    },
-];
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -954,18 +896,18 @@ mod tests {
             PromptCacheCapability::AnthropicCacheControl
         );
         assert_eq!(
-            Provider::Brodex.prompt_cache(),
+            Provider::Codex.prompt_cache(),
             PromptCacheCapability::OpenAiPromptTokenDetails
         );
         assert_eq!(
-            Provider::VibeBh.prompt_cache(),
-            PromptCacheCapability::ChatCompletionsPromptCacheKey
+            Provider::LegacyVibeBh.prompt_cache(),
+            PromptCacheCapability::NoneKnown
         );
     }
 
     #[test]
     fn codex_variants_are_catalogued_with_keyed_efforts() {
-        let models = Provider::Brodex.models();
+        let models = Provider::Codex.models();
         // Sol is the default codex model.
         let default_model = models.iter().find(|m| m.default).unwrap();
         assert_eq!(default_model.id, "gpt-5.6-sol");
@@ -981,7 +923,7 @@ mod tests {
         ] {
             assert!(
                 models.iter().any(|m| m.id == slug),
-                "missing Brodex model {slug}"
+                "missing Codex model {slug}"
             );
         }
     }
@@ -999,14 +941,7 @@ mod tests {
         assert_eq!(serde_json::to_value(p).unwrap(), "codex");
         assert!(Provider::ALL.contains(&p));
         assert!(p.is_dispatchable());
-        assert_eq!(
-            p.models().iter().map(|m| m.id).collect::<Vec<_>>(),
-            Provider::Brodex
-                .models()
-                .iter()
-                .map(|m| m.id)
-                .collect::<Vec<_>>()
-        );
+
         assert_eq!(
             p.model_efforts("gpt-6-luna"),
             ["low", "medium", "high", "xhigh", "max"]
@@ -1016,16 +951,11 @@ mod tests {
             PromptCacheCapability::OpenAiPromptTokenDetails
         );
         assert!(p.capabilities().contains(&Capability::StructuredOutput));
-        // Brodex keeps its own name only.
-        assert_eq!(
-            serde_json::from_value::<Provider>(serde_json::json!("brodex")).unwrap(),
-            Provider::Brodex
-        );
     }
 
     #[test]
     fn ultra_is_model_keyed_sol_terra_yes_luna_no() {
-        let p = Provider::Brodex;
+        let p = Provider::Codex;
         for model in ["gpt-6.1-sol", "gpt-6-sol"] {
             assert_eq!(
                 p.model_efforts(model),
@@ -1052,7 +982,7 @@ mod tests {
 
     #[test]
     fn model_effort_infos_filters_to_model_and_default_resolves() {
-        let p = Provider::Brodex;
+        let p = Provider::Codex;
         let luna = p.model_effort_infos("gpt-5.6-luna");
         assert!(luna.iter().any(|e| e.id == "max"));
         assert!(!luna.iter().any(|e| e.id == "ultra"));
@@ -1103,11 +1033,36 @@ mod tests {
 
     #[test]
     fn unknown_model_falls_back_to_provider_wide_efforts() {
-        let p = Provider::Brodex;
+        let p = Provider::Codex;
         let wide: Vec<&str> = p.efforts().iter().map(|e| e.id).collect();
         assert_eq!(p.model_efforts("gpt-does-not-exist"), wide);
         // Providers with uniform efforts inherit for every model.
         let glm_wide: Vec<&str> = Provider::Glm.efforts().iter().map(|e| e.id).collect();
         assert_eq!(Provider::Glm.model_efforts("glm-5.2"), glm_wide);
+    }
+}
+
+#[cfg(test)]
+mod retirement_tests {
+    use super::*;
+    #[test]
+    fn removed_providers_are_archive_only() {
+        for (name, identity) in [
+            ("brodex", Provider::LegacyBrodex),
+            ("vibebh", Provider::LegacyVibeBh),
+            ("vibe-bh", Provider::LegacyVibeBh),
+        ] {
+            assert!(name.parse::<Provider>().is_err());
+            assert!(!Provider::ALL.contains(&identity));
+            assert!(!identity.is_dispatchable());
+            assert!(!identity.supports_resume());
+            assert!(identity.models().is_empty());
+            assert!(identity.efforts().is_empty());
+            assert_eq!(identity.lane(), ProviderLane::Retired);
+            assert_eq!(
+                serde_json::from_value::<Provider>(serde_json::json!(name)).unwrap(),
+                identity
+            );
+        }
     }
 }

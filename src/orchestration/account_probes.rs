@@ -2,10 +2,8 @@
 //!
 //! Fetch real per-account quota/headroom from each provider's usage surface and
 //! write it into the allocator [`ProbeStore`], so `quota_capacity` differentiates
-//! providers by genuine remaining headroom instead of every lane tying — a tie
-//! collapses tier selection onto the deterministic tiebreak (the brodex-wins
-//! symptom). The allocator already *consumes* these signals; this module is the
-//! producer that was designed (`acquire-drone.md` §6) but never implemented.
+//! providers by remaining headroom. The allocator consumes these signals
+//! when ranking eligible lanes.
 //!
 //! Each provider has a pure parser (unit-tested against the live response shape)
 //! plus an async fetch. `refresh_account_probes` runs them all and merges the
@@ -159,7 +157,7 @@ async fn probe_glm(client: &reqwest::Client, home: &Path, now: u64) -> Vec<(Stri
     out
 }
 
-// ── Brodex: ChatGPT usage-endpoint ──────────────────────────────────────────
+// ── Codex: ChatGPT usage-endpoint ──────────────────────────────────────────
 
 /// `(access_token, account_id)` from the codex CLI's `~/.codex/auth.json`.
 fn read_codex_auth(home: &Path) -> Option<(String, Option<String>)> {
@@ -229,11 +227,9 @@ async fn probe_codex(
             return Vec::new();
         }
     };
-    let mut out = Vec::new();
-    if let Some(rec) = parse_codex_usage(Provider::Brodex, &body, now) {
-        out.push((lane_key(Provider::Brodex, None), rec));
-    }
-    out
+    parse_codex_usage(Provider::Codex, &body, now)
+        .map(|record| vec![(lane_key(Provider::Codex, None), record)])
+        .unwrap_or_default()
 }
 
 // ── DeepSeek: balance ───────────────────────────────────────────────────────
@@ -402,14 +398,14 @@ mod tests {
                 "secondary_window": {"used_percent": 17}
             }
         });
-        let codex = parse_codex_usage(Provider::Brodex, &body, 9).unwrap();
+        let codex = parse_codex_usage(Provider::Codex, &body, 9).unwrap();
         assert_eq!(codex.five_hour_utilization, Some(0.0));
         assert_eq!(codex.seven_day_utilization, Some(0.17));
         assert!(matches!(codex.quota_status, QuotaStatus::Known));
-        // Brodex shares the same plan quota.
-        let brodex = parse_codex_usage(Provider::Brodex, &body, 9).unwrap();
-        assert_eq!(brodex.provider, Provider::Brodex);
-        assert_eq!(brodex.seven_day_utilization, Some(0.17));
+        // Usage is attributed to the native Codex lane.
+        let codex = parse_codex_usage(Provider::Codex, &body, 9).unwrap();
+        assert_eq!(codex.provider, Provider::Codex);
+        assert_eq!(codex.seven_day_utilization, Some(0.17));
     }
 
     #[test]
@@ -419,7 +415,7 @@ mod tests {
             "primary_window": {"used_percent": 100},
             "secondary_window": {"used_percent": 40}
         }});
-        let rec = parse_codex_usage(Provider::Brodex, &body, 0).unwrap();
+        let rec = parse_codex_usage(Provider::Codex, &body, 0).unwrap();
         assert!(matches!(rec.quota_status, QuotaStatus::Exhausted));
     }
 

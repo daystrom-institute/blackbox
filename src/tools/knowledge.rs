@@ -1845,13 +1845,13 @@ mod tests {
     fn exact_system_memory_response_returns_only_exact_memory() {
         init_system_memory();
         let out = exact_system_memory_response(&KnowledgeListParams {
-            query: Some("sm-refactor".into()),
+            query: Some("sm-gap-notes".into()),
             ..Default::default()
         })
         .expect("exact canonical system memory query should short-circuit");
 
-        assert!(out.contains("[system] sm-refactor"));
-        assert!(!out.contains("[system] sm-refactor-rust"));
+        assert!(out.contains("[system] sm-gap-notes"));
+        assert!(!out.contains("[system] sm-transcript-retrieval"));
         assert!(!out.contains("[bb-tool-reference]"));
         assert!(!out.contains("No entries found."));
     }
@@ -1861,7 +1861,7 @@ mod tests {
         init_system_memory();
         let out = exact_system_memory_response(&KnowledgeListParams {
             scope: Some("project".into()),
-            query: Some("sm-refactor".into()),
+            query: Some("sm-gap-notes".into()),
             ..Default::default()
         });
 
@@ -1981,13 +1981,12 @@ mod tests {
         init_system_memory();
         let out = exact_system_memory_response(&KnowledgeListParams {
             category: Some("system_memory".into()),
-            query: Some("refactor".into()),
+            query: Some("taxonomy".into()),
             ..Default::default()
         })
         .expect("system_memory + query should return filtered catalog");
 
-        assert!(out.contains("[system] sm-refactor"));
-        assert!(out.contains("[system] sm-refactor-rust"));
+        assert!(out.contains("[system] sm-persistence-taxonomy"));
         assert!(!out.contains("[system] sm-transcript-retrieval"));
     }
 
@@ -1996,7 +1995,7 @@ mod tests {
         init_system_memory();
         let out = exact_system_memory_response(&KnowledgeListParams {
             category: Some("memory".into()),
-            query: Some("sm-refactor".into()),
+            query: Some("sm-gap-notes".into()),
             ..Default::default()
         });
         assert!(out.is_none());
@@ -2536,9 +2535,13 @@ mod tests {
 
     #[test]
     fn exact_system_memory_read_pages_oversized_record() {
-        init_system_memory();
-        let memory =
-            system_memory::exact_query(Some("sm-refactor")).expect("canonical system memory");
+        let fixture = system_memory::SystemMemory {
+            id: "sm-large-fixture".into(),
+            title: "Large fixture".into(),
+            tags: vec!["fixture".into()],
+            content: "synthetic body\n".repeat(KNOWLEDGE_DETAIL_PAGE_BYTES),
+        };
+        let memory = &fixture;
         assert!(memory.content.len() > KNOWLEDGE_DETAIL_PAGE_BYTES);
         let p = KnowledgeListParams {
             query: Some(memory.id.clone()),

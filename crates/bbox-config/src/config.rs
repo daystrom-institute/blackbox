@@ -46,7 +46,7 @@ pub struct ConfigOverrides {
     pub daemon: DaemonOverrides,
     pub index: IndexOverrides,
     pub providers: ProviderOverrides,
-    pub lsp: LspOverrides,
+
     pub transcripts: TranscriptOverrides,
 }
 
@@ -82,19 +82,6 @@ pub struct ProviderOverrides {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct LspOverrides {
-    pub idle_timeout_secs: Option<u64>,
-    pub request_timeout_secs: Option<u64>,
-    pub jdtls_init_timeout_secs: Option<u64>,
-    pub jdtls_ready_timeout_secs: Option<u64>,
-    pub rust_analyzer_init_timeout_secs: Option<u64>,
-    pub roslyn_init_timeout_secs: Option<u64>,
-    pub jdtls_bin: Option<Option<String>>,
-    pub rust_analyzer_bin: Option<Option<String>>,
-    pub roslyn_lsp_bin: Option<Option<String>>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TranscriptOverrides {
     pub roots: Option<Option<String>>,
     pub codex_root: Option<Option<PathBuf>>,
@@ -111,7 +98,7 @@ struct RawConfig {
     pub source_connectors: RawSourceConnectorsConfig,
     pub provenance: RawProvenanceConfig,
     pub providers: RawProviderConfig,
-    pub lsp: RawLspConfig,
+
     pub transcripts: RawTranscriptConfig,
     #[serde(default)]
     pub surfaces: std::collections::BTreeMap<String, SurfaceConfig>,
@@ -582,49 +569,6 @@ struct RawProviderConfig {
     pub vibe_session_dir: Option<PathBuf>,
     #[serde(default)]
     pub extra_path: Vec<PathBuf>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct RawLspConfig {
-    #[serde(default = "default_lsp_idle_timeout_secs")]
-    pub idle_timeout_secs: u64,
-    #[serde(default = "default_lsp_request_timeout_secs")]
-    pub request_timeout_secs: u64,
-    #[serde(default = "default_lsp_jdtls_init_timeout_secs")]
-    pub jdtls_init_timeout_secs: u64,
-    #[serde(default = "default_lsp_jdtls_ready_timeout_secs")]
-    pub jdtls_ready_timeout_secs: u64,
-    #[serde(default = "default_lsp_rust_analyzer_init_timeout_secs")]
-    pub rust_analyzer_init_timeout_secs: u64,
-    #[serde(default = "default_lsp_roslyn_init_timeout_secs")]
-    pub roslyn_init_timeout_secs: u64,
-    pub jdtls_bin: Option<String>,
-    pub rust_analyzer_bin: Option<String>,
-    pub roslyn_lsp_bin: Option<String>,
-}
-
-fn default_lsp_idle_timeout_secs() -> u64 {
-    600
-}
-fn default_lsp_request_timeout_secs() -> u64 {
-    30
-}
-fn default_lsp_jdtls_init_timeout_secs() -> u64 {
-    60
-}
-// Post-`initialized` window for JDTLS to import the workspace (gradle /
-// maven build, classpath resolution, Buildship project load). Until this
-// drain completes, LSP queries see a "ready" session by protocol semantics
-// but JDTLS hasn't actually loaded a single project class — organize-imports
-// can't tell whether statics are used, references return empty, etc.
-fn default_lsp_jdtls_ready_timeout_secs() -> u64 {
-    60
-}
-fn default_lsp_rust_analyzer_init_timeout_secs() -> u64 {
-    60
-}
-fn default_lsp_roslyn_init_timeout_secs() -> u64 {
-    60
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1171,8 +1115,6 @@ pub struct ProviderConfig {
     pub extra_path: Vec<PathBuf>,
 }
 
-pub use bbox_corpus_core::lsp_config::LspConfig;
-
 /// Transcript configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranscriptConfig {
@@ -1229,7 +1171,7 @@ pub struct Config {
     pub source_connectors: SourceConnectorsConfig,
     pub provenance: ProvenanceConfig,
     pub providers: ProviderConfig,
-    pub lsp: LspConfig,
+
     pub transcripts: TranscriptConfig,
     /// MCP tool surfaces by name: built-in defaults merged with
     /// `[surfaces.<name>]` tables from the config file.
@@ -1288,17 +1230,7 @@ impl Config {
                 vibe_session_dir: None,
                 extra_path: Vec::new(),
             },
-            lsp: RawLspConfig {
-                idle_timeout_secs: default_lsp_idle_timeout_secs(),
-                request_timeout_secs: default_lsp_request_timeout_secs(),
-                jdtls_init_timeout_secs: default_lsp_jdtls_init_timeout_secs(),
-                jdtls_ready_timeout_secs: default_lsp_jdtls_ready_timeout_secs(),
-                rust_analyzer_init_timeout_secs: default_lsp_rust_analyzer_init_timeout_secs(),
-                roslyn_init_timeout_secs: default_lsp_roslyn_init_timeout_secs(),
-                jdtls_bin: None,
-                rust_analyzer_bin: None,
-                roslyn_lsp_bin: None,
-            },
+
             transcripts: RawTranscriptConfig {
                 roots: None,
                 codex_root: None,
@@ -1528,57 +1460,6 @@ fn apply_explicit_env(raw: RawConfig) -> RawConfig {
     }
 
     // LSP settings
-    if let Ok(timeout) = std::env::var("BLACKBOX_LSP_IDLE_SECS")
-        && !timeout.trim().is_empty()
-        && let Ok(t) = timeout.parse()
-    {
-        raw.lsp.idle_timeout_secs = t;
-    }
-    if let Ok(timeout) = std::env::var("BLACKBOX_JDTLS_TIMEOUT_SECS")
-        && !timeout.trim().is_empty()
-        && let Ok(t) = timeout.parse()
-    {
-        raw.lsp.request_timeout_secs = t;
-    }
-    if let Ok(timeout) = std::env::var("BLACKBOX_JDTLS_INIT_TIMEOUT_SECS")
-        && !timeout.trim().is_empty()
-        && let Ok(t) = timeout.parse()
-    {
-        raw.lsp.jdtls_init_timeout_secs = t;
-    }
-    if let Ok(timeout) = std::env::var("BLACKBOX_JDTLS_READY_TIMEOUT_SECS")
-        && !timeout.trim().is_empty()
-        && let Ok(t) = timeout.parse()
-    {
-        raw.lsp.jdtls_ready_timeout_secs = t;
-    }
-    if let Ok(timeout) = std::env::var("BLACKBOX_RUST_ANALYZER_INIT_TIMEOUT_SECS")
-        && !timeout.trim().is_empty()
-        && let Ok(t) = timeout.parse()
-    {
-        raw.lsp.rust_analyzer_init_timeout_secs = t;
-    }
-    if let Ok(bin) = std::env::var("BLACKBOX_JDTLS_BIN")
-        && !bin.trim().is_empty()
-    {
-        raw.lsp.jdtls_bin = Some(bin);
-    }
-    if let Ok(bin) = std::env::var("BLACKBOX_RUST_ANALYZER_BIN")
-        && !bin.trim().is_empty()
-    {
-        raw.lsp.rust_analyzer_bin = Some(bin);
-    }
-    if let Ok(timeout) = std::env::var("BLACKBOX_ROSLYN_INIT_TIMEOUT_SECS")
-        && !timeout.trim().is_empty()
-        && let Ok(t) = timeout.parse()
-    {
-        raw.lsp.roslyn_init_timeout_secs = t;
-    }
-    if let Ok(bin) = std::env::var("BLACKBOX_ROSLYN_LSP_BIN")
-        && !bin.trim().is_empty()
-    {
-        raw.lsp.roslyn_lsp_bin = Some(bin);
-    }
 
     // Provider bins
     macro_rules! set_provider_bin {
@@ -1775,17 +1656,7 @@ pub fn load_with(options: LoadOptions) -> Result<Config> {
             vibe_session_dir: raw.providers.vibe_session_dir,
             extra_path: raw.providers.extra_path,
         },
-        lsp: LspConfig {
-            idle_timeout_secs: raw.lsp.idle_timeout_secs,
-            request_timeout_secs: raw.lsp.request_timeout_secs,
-            jdtls_init_timeout_secs: raw.lsp.jdtls_init_timeout_secs,
-            jdtls_ready_timeout_secs: raw.lsp.jdtls_ready_timeout_secs,
-            rust_analyzer_init_timeout_secs: raw.lsp.rust_analyzer_init_timeout_secs,
-            roslyn_init_timeout_secs: raw.lsp.roslyn_init_timeout_secs,
-            jdtls_bin: raw.lsp.jdtls_bin,
-            rust_analyzer_bin: raw.lsp.rust_analyzer_bin,
-            roslyn_lsp_bin: raw.lsp.roslyn_lsp_bin,
-        },
+
         transcripts: TranscriptConfig {
             roots: raw.transcripts.roots,
             codex_root: raw.transcripts.codex_root,
@@ -2120,27 +1991,6 @@ fn apply_flag_overrides(mut raw: RawConfig, overrides: ConfigOverrides) -> RawCo
     }
 
     // Apply LSP overrides
-    if let Some(idle_timeout_secs) = overrides.lsp.idle_timeout_secs {
-        raw.lsp.idle_timeout_secs = idle_timeout_secs;
-    }
-    if let Some(request_timeout_secs) = overrides.lsp.request_timeout_secs {
-        raw.lsp.request_timeout_secs = request_timeout_secs;
-    }
-    if let Some(jdtls_init_timeout_secs) = overrides.lsp.jdtls_init_timeout_secs {
-        raw.lsp.jdtls_init_timeout_secs = jdtls_init_timeout_secs;
-    }
-    if let Some(jdtls_ready_timeout_secs) = overrides.lsp.jdtls_ready_timeout_secs {
-        raw.lsp.jdtls_ready_timeout_secs = jdtls_ready_timeout_secs;
-    }
-    if let Some(rust_analyzer_init_timeout_secs) = overrides.lsp.rust_analyzer_init_timeout_secs {
-        raw.lsp.rust_analyzer_init_timeout_secs = rust_analyzer_init_timeout_secs;
-    }
-    if let Some(jdtls_bin) = overrides.lsp.jdtls_bin {
-        raw.lsp.jdtls_bin = jdtls_bin;
-    }
-    if let Some(rust_analyzer_bin) = overrides.lsp.rust_analyzer_bin {
-        raw.lsp.rust_analyzer_bin = rust_analyzer_bin;
-    }
 
     // Apply transcript overrides
     if let Some(roots) = overrides.transcripts.roots {
@@ -2508,9 +2358,6 @@ mod tests {
         assert!(!config.daemon.no_checkout_authority);
 
         assert_eq!(config.index.reindex_interval_secs, 120);
-
-        assert_eq!(config.lsp.idle_timeout_secs, 600);
-        assert_eq!(config.lsp.request_timeout_secs, 30);
     }
 
     #[test]
@@ -3239,38 +3086,6 @@ port = 8000
     }
 
     #[test]
-    fn lsp_idle_default_is_600() {
-        let _guard = bbox_util::util::test_env_lock();
-
-        let dir = tempdir().unwrap();
-        let home = dir.path();
-        unsafe {
-            env::set_var("HOME", home);
-        }
-        unsafe {
-            env::set_var("XDG_CONFIG_HOME", home.join(".config"));
-        }
-        unsafe {
-            env::set_var("XDG_DATA_HOME", home.join(".local/share"));
-        }
-        unsafe {
-            env::set_var("XDG_STATE_HOME", home.join(".local/state"));
-        }
-        unsafe {
-            env::remove_var("BLACKBOX_CONFIG");
-        }
-        unsafe {
-            env::remove_var("BLACKBOX_LSP_IDLE_SECS");
-        }
-        unsafe {
-            env::remove_var("BBOX_PORT");
-        }
-
-        let config = load().unwrap();
-        assert_eq!(config.lsp.idle_timeout_secs, 600);
-    }
-
-    #[test]
     fn poller_min_default_is_5() {
         let _guard = bbox_util::util::test_env_lock();
 
@@ -3332,38 +3147,6 @@ port = 8000
 
         let config = load().unwrap();
         assert_eq!(config.daemon.shutdown_grace_secs, 15);
-    }
-
-    #[test]
-    fn jdtls_request_timeout_default_is_30() {
-        let _guard = bbox_util::util::test_env_lock();
-
-        let dir = tempdir().unwrap();
-        let home = dir.path();
-        unsafe {
-            env::set_var("HOME", home);
-        }
-        unsafe {
-            env::set_var("XDG_CONFIG_HOME", home.join(".config"));
-        }
-        unsafe {
-            env::set_var("XDG_DATA_HOME", home.join(".local/share"));
-        }
-        unsafe {
-            env::set_var("XDG_STATE_HOME", home.join(".local/state"));
-        }
-        unsafe {
-            env::remove_var("BLACKBOX_CONFIG");
-        }
-        unsafe {
-            env::remove_var("BLACKBOX_JDTLS_TIMEOUT_SECS");
-        }
-        unsafe {
-            env::remove_var("BBOX_PORT");
-        }
-
-        let config = load().unwrap();
-        assert_eq!(config.lsp.request_timeout_secs, 30);
     }
 
     #[test]
@@ -3734,49 +3517,6 @@ port = 8000
             config.paths.user_memories_dir,
             Some(home.join("memory-overlay"))
         );
-    }
-
-    #[test]
-    fn rust_analyzer_alias_no_longer_used() {
-        let _guard = bbox_util::util::test_env_lock();
-
-        let dir = tempdir().unwrap();
-        let home = dir.path();
-        unsafe {
-            env::set_var("HOME", home);
-        }
-        unsafe {
-            env::set_var("XDG_CONFIG_HOME", home.join(".config"));
-        }
-        unsafe {
-            env::set_var("XDG_DATA_HOME", home.join(".local/share"));
-        }
-        unsafe {
-            env::set_var("XDG_STATE_HOME", home.join(".local/state"));
-        }
-        unsafe {
-            env::remove_var("BLACKBOX_CONFIG");
-        }
-        unsafe {
-            env::remove_var("BBOX_PORT");
-        }
-        unsafe {
-            env::remove_var("BLACKBOX_RUST_ANALYZER_BIN");
-        }
-        unsafe {
-            env::set_var("RUST_ANALYZER_BIN", "/legacy/rust-analyzer");
-        }
-
-        let config = load().unwrap();
-        assert_ne!(
-            config.lsp.rust_analyzer_bin,
-            Some("/legacy/rust-analyzer".to_string()),
-            "RUST_ANALYZER_BIN should not be accepted after Phase 5"
-        );
-
-        unsafe {
-            env::remove_var("RUST_ANALYZER_BIN");
-        }
     }
 
     #[test]

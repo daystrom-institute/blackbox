@@ -4,7 +4,7 @@ This gets a deployment into the normal blackbox shape:
 
 - one corpus daemon (`blackboxd`) running as a containerized workload with one
   state volume
-- checkout hosts running only satellites: `fleetd` (which execs `bro-harness`
+- checkout hosts running only satellites: `fleetd` (which runs native provider sessions
   per session), the code and transcript collectors, and the `bro` CLI
 - every agent CLI pointed at the same MCP endpoint
 - one knowledge store rendered back into provider markdown
@@ -19,7 +19,7 @@ daemon from Claude, Codex, Copilot, and Vibe.
 git clone https://github.com/invidious9000/transcript-search.git
 cd transcript-search
 cargo build --release    # blackboxd, blackbox
-cargo build --release -p bro-cli -p bro-harness -p fleetd \
+cargo build --release -p bro-cli -p fleetd \
   -p bbox-code-collector -p bbox-transcript-collector
 ```
 
@@ -39,7 +39,7 @@ On each checkout host, install the satellites:
 ```bash
 install -d ~/.local/bin
 install -m 755 target/release/blackbox ~/.local/bin/blackbox
-install -m 755 target/release/{bro,bro-harness,fleetd} ~/.local/bin/
+install -m 755 target/release/{bro,fleetd} ~/.local/bin/
 install -m 755 target/release/{bbox-code-collector,bbox-transcript-collector} ~/.local/bin/
 ```
 
@@ -129,7 +129,7 @@ not collect Claude/Codex session files.
 
 ## 5. Render approved knowledge on the target host
 
-For project files, call this from a managed bro-harness session bound to the
+For project files, call this from a managed provider session bound to the
 owning checkout, where the locality client applies the daemon's render plan:
 
 ```text

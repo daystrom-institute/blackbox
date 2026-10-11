@@ -269,7 +269,7 @@ impl ProviderEvents for Provider {
         match self.lane() {
             // The claude CLI, the Codex adapter and the harness share one
             // stream-json envelope.
-            ProviderLane::ClaudeCli | ProviderLane::Codex | ProviderLane::Harness => {
+            ProviderLane::ClaudeCli | ProviderLane::Codex | ProviderLane::Retired => {
                 parse_claude_event(evt, sink)
             }
             ProviderLane::Workflow => {}
@@ -498,7 +498,7 @@ mod disruption_tests {
     fn detects_explicit_error_text_only_on_error_fields() {
         let err = json!({"type": "result", "is_error": true, "result": "Error: rate_limit_error — too many requests"});
         assert_eq!(
-            Provider::Brodex.detect_disruption(&err),
+            Provider::LegacyBrodex.detect_disruption(&err),
             Some(Disruption::RateLimited)
         );
         let ov = json!({"error": {"message": "the model is overloaded, please retry"}});

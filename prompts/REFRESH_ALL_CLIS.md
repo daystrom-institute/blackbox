@@ -50,11 +50,7 @@ tweak `MINE_CLI.md`, every future refresh inherits it.
 - `bro_exec` with `provider: glm` (`glm-5.1`) or `deepseek` (`deepseek-v4-pro`)
   — both are capable source readers. Balance across providers to avoid one
   account's rate limits.
-- **NO `allow_tools` filter.** bro-harness's tool names differ from Claude's
-  (`Read`/`Bash`/`Grep` won't match), so allow-listing them **starves** the bro
-  (observed: "I don't have shell"). The recursion guard + bro-harness's lack of a
-  built-in Edit/Write already bound the surface. Add `disallow_tools` only if you
-  have a specific reason.
+
 - `cwd` = the **source repo** (source mine) or `/home/invidious`
   (binary mine that needs `~/.local` + the CLI's config dir + `~/repos/<docs>`).
 - `pin_model`, `pin_effort: high`.

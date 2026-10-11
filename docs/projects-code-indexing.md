@@ -91,10 +91,8 @@ operation deletes the checkout.
 
 ## Code Navigation
 
-Structural code navigation is harness-native: the bro-harness `isolate`
-bindings (`code.*`, `analysis.*`, `lsp.*`) operate over source structure with
-no daemon MCP surface. See `docs/refactor.md` for the retirement details and
-`PROJECT.md` for the isolate recipes.
+Agents navigate and edit checkout files using their native provider tools.
+Blackbox supplies indexed source evidence through its corpus APIs.
 
 For source-aware search across docs/code/commits, use:
 

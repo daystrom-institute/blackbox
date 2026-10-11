@@ -34,7 +34,7 @@ under nextest.
 Concurrency enforcement (Phase 4, design/daemon-runtime/concurrency-model.md
 §5) rides the baseline: `cargo clippy` enforces the `clippy.toml`
 disallowed-methods gate (blocking fs/process calls deny in `src/tools/` and
-the harness crates; sanctioned actor contexts carry reasoned `#[allow]`s),
+provider adapter crates; sanctioned actor contexts carry reasoned `#[allow]`s),
 and `scripts/lint-concurrency.sh` is the handler-shape backstop — no new
 sync `#[tool]` handlers, no thread spawns in tool modules. Run it alongside
 clippy when touching MCP handlers.
@@ -47,65 +47,12 @@ Targeted recipes:
   start `blackboxd` or the relevant sidecar and confirm it initializes.
 - Render or knowledge changes: run render/knowledge tests and inspect generated
   markdown diffs. Do not hand-edit generated provider memory regions.
-- Refactor machinery (harness bindings and the `bbox-refactor` library):
-  `cargo nextest run --workspace -E 'package(bbox-refactor) |
-  package(bro-harness)'`; for LSP-backed paths also validate the language
-  server availability/failure mode.
 - Bro admission or event observation changes: run targeted tests and exercise
   the affected HTTP/tool path when behavior depends on runtime state.
 - Provider dispatch changes: verify arg construction for the affected provider
   and confirm recursion guard/MCP injection semantics.
 - Frontend/site/docs-only changes: run the docs/site build only when that surface
   is touched.
-
-**Isolate binding validation (`isolate` binary).** When working on the harness
-isolate bindings (`java.*`, `analysis.*`, `code.*`, `edits.*`, `lsp.*` under
-`crates/bro-harness/src/bindings`), validate a tool's behavior locally against
-a fixture or a real target root without running the full harness, dispatching a
-probe, or writing a Rust test. Build it with `cargo build -p bro-harness --bin
-isolate`, then:
-
-```bash
-isolate --list                                            # enumerate the surface
-isolate --root <dir> --describe <tool>                    # a tool's input schema
-isolate --root <dir> <tool> --args '<json>'               # run; pretty-print JSON
-isolate --root <dir> <tool> --args-file args.json \
-  --field /internal_helper_deps --strict
-isolate --root <dir> --cell 'const r = await tools.file_read({file_path:"src/Foo.java"}); text(r);'
-isolate --root <dir> --cell-file setup.js --cell-file verify.js
-```
-
-`--field <json-pointer>` extracts one result field (avoids a `jq`/`python` pipe);
-`--strict` rejects a run whose `file` arg is missing under `--root` (guards the
-silent empty-result footgun where a wrong path reads as empty instead of
-erroring). It builds a `ToolCx` rooted at `--root` and calls the binding directly
-— no agent loop, LLM, or daemon. `--cell` / `--cell-file` evaluates full
-code-mode JavaScript cells through the same `exec` runtime a harness consumer
-uses, including nested `tools.*` / namespace calls and session-scoped
-`store()` / `load()` across repeated cells in one invocation.
-
-A lane-built isolate is linux/amd64 and cannot run on the macOS host. Run
-syntax-tier probes pod-side through the cargo shim (`lane-run.sh <lane> --ref
-<ref> -- cargo run -p bro-harness --bin isolate -- --root <lane path> ...`);
-`lsp.*` probes run host-side and want a lane root with a warm RA build-data
-cache (cold-start on this workspace exceeds the default readiness budget).
-
-**Live validation of an unreleased harness build (`harness_bin`).** To run a
-real dispatch against a `bro-harness` built from a branch without replacing
-the installed one, pass `harness_bin` on `bro_exec` from the ops surface:
-`bro mcp call bro_exec '{"provider":"<provider>","cwd":"<project>","prompt":"...","harness_bin":"/absolute/path/to/bro-harness"}' --surface ops`.
-The parameter is refused on every other surface and for a relative path.
-`bro_status` shows the path as `harnessBin`. `bro_resume` takes no such
-parameter: the session keeps the binary it started with, and a resume after
-the file is gone fails with `harness_bin_unavailable` instead of falling back
-to the installed binary. Every other dispatch is unaffected.
-
-The path is run as given on the host that executes the worker, so the binary
-must be built for that host. A lane build is linux/amd64 and cannot be the
-harness of a worker on the macOS checkout host; build the arm64 binary on the
-Mac in a warm checkout (`cargo build -p bro-harness --bin bro-harness`) and
-pass that path. A lane-built binary is usable only by a fleetd that runs on
-linux/amd64.
 
 Do not record exact test counts in this file. Counts stale quickly and do not
 help an agent choose the right validation.
@@ -167,7 +114,7 @@ DEFAULT; the operator-local overlay repo `~/repos/bbox-cage` owns it (its
   do not substitute the moving `cargo +stable fmt` alias.
 - **What stays local**: file edits, single-crate checks and tests in a WARM
   checkout, and the arm64 macOS satellite binary builds and installs
-  (collectors, fleetd, bro, bro-harness) - the cluster produces Linux
+  (collectors, fleetd, bro) - the cluster produces Linux
   artifacts only. Warmth is the discriminator, not
   task size: a fresh `git worktree add` makes any build cold, and its first
   build/test run is a 20+ minute full-dependency compile plus syspolicyd
@@ -185,4 +132,3 @@ older worktrees carry older copies of this file.
 Contributors without the operator's estate: everything above degrades to
 the plain local commands in Validation; nothing in the repo depends on the
 cluster.
-

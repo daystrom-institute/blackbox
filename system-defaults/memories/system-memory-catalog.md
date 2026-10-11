@@ -36,33 +36,6 @@ Files in `system-defaults/memories/` use bare slugs such as
 - [sm-workflow-orchestration](workflow-orchestration.md) - caller composition and historical workflow records.
 - [sm-atoms](atoms.md) - retired atom execution and replacements.
 
-## Refactor Mechanization
-
-- [sm-refactor](refactor.md) - language routing, shared refactor surfaces, and
-  matrix.
-- [sm-refactor-rust](refactor-rust.md) - Rust tree-sitter inventory, writable
-  extraction, and rust-analyzer-backed plan rules.
-- [sm-refactor-java](refactor-java.md) - Java tree-sitter inventory, JDT
-  validation, and Java plan routing.
-- [sm-refactor-java-extract-class](refactor-java-extract-class.md) - composite
-  Java class extraction, capture analysis, and generated FIXME catalog.
-- [sm-refactor-typescript](refactor-typescript.md) - TypeScript and JavaScript
-  inventory and validation workflow.
-- [sm-refactor-python](refactor-python.md) - Python inventory and Pyright/Rope
-  validation workflow.
-- [sm-refactor-csharp](refactor-csharp.md) - C# inventory and Roslyn
-  validation workflow.
-- [sm-refactor-go](refactor-go.md) - Go inventory and gopls validation
-  workflow.
-- [sm-refactor-c-cpp](refactor-c-cpp.md) - C/C++ inventory and clang
-  validation workflow.
-
-## Harness And Provider Validation
-
-- [sm-live-provider-wire-probe](live-provider-wire-probe.md) - narrow live
-  HTTP probes of harness provider endpoints (GLM/DeepSeek/MiniMax/Mistral):
-  credential locations, wire shapes, cache validation, and token hygiene.
-
 ## How To Use
 
 Open this file in Obsidian and follow regular Markdown links to the target

@@ -20,8 +20,8 @@ or system memories and link/pointer from here.
   `docs/projects-code-indexing.md` - core corpus surfaces.
 - `system-defaults/memories/system-memory-catalog.md` - Obsidian navigation
   map for system memory runbooks; not loaded as a runtime memory.
-- `docs/refactor.md` - harness-native structural refactor tooling;
-  `system-defaults/memories/refactor*.md` - language-specific protocols.
+- `docs/refactor.md` - source editing through native provider tools.
+
 - `design/design-corpus.md` - Obsidian-friendly map for the design corpus.
 - `research/research-corpus.md` - map for the research corpus: a point-in-time,
   evidence-graded study of the external problem space (reference harnesses,
@@ -32,7 +32,6 @@ or system memories and link/pointer from here.
   source-grounded contracts for what each subsystem should be/do. Third sibling
   of `design/` (intent) and `research/` (description), distinct
   `corpus: blackbox-spec`; backfilled by inverting code + design + research.
-  First domain + charter: `specs/bro-harness/bro-harness-spec.md`.
 - `design/list-design-docs.sh` - list design docs whose frontmatter lifecycle
   is `proposed` or `partial`.
 - `design/connectors/` - topic home for remote-source connectors:
@@ -44,17 +43,13 @@ or system memories and link/pointer from here.
 - `design/orchestration/` - topic home for atoms, agents, workflows,
   supervision, phase decomposition, runtime allocation, and live handoff
   designs.
-- `design/bro-harness/` - top-level home for the custom headless coding agent
-  (`crates/bro-harness`, `crates/bro-tools`): transports, tool surface,
-  clipboard, tool chaining, hooks, diagnostics, neuralyze. Daemon-independent by
-  invariant; separate from `orchestration/`.
+
 - `design/daemon-runtime/control-plane.md` - headless task control, roster
   observation and managed-worktree closeout.
 - `design/daemon-runtime/` - topic home for blackboxd's execution
   architecture: tokio topology, plane isolation, lock discipline, and
   persistence actors.
-- `design/refactor-tools/` - topic home for structural refactor tools,
-  refactor atoms, Rust expansion, and Java refactor closure designs.
+
 - `design/integrations/` - topic home for editor/chat/external UI
   integrations such as Obsidian and Slack.
 - `design/surfaces/` - topic home for MCP surfaces, workspace tools, and

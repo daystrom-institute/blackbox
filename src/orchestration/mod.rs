@@ -61,9 +61,6 @@ const BLACKBOX_SERVICE_ENV_VARS: &[&str] = &[
 /// it. They are removed with the service variables and reach a worker only
 /// through an explicit account or per-dispatch env, which is applied after
 /// the removal.
-const WORKER_UNINHERITED_ENV_VARS: &[&str] = &["BRO_HARNESS_MCP_HTTP_LIFECYCLE"];
-
-const HARNESS_SPAWN_SCRUB_ENV: &str = "BRO_HARNESS_SPAWN_SCRUB";
 
 /// The worker-side variable that carries the daemon service bearer for the
 /// worker's own MCP server. The header in the worker's MCP config refers to
@@ -109,7 +106,7 @@ fn worker_mcp_bearer() -> Option<&'static bro_rpc::ServiceToken> {
 /// what unit tests and library consumers get: they have no daemon startup, and
 /// must never dial (or auto-start) a real supervisor as a side effect of
 /// calling a spawn helper.
-fn harness_executor() -> &'static Arc<dyn executor::HarnessExecutor> {
+fn harness_executor() -> &'static Arc<dyn executor::WorkerExecutor> {
     harness_executor_storage().get_or_init(|| Arc::new(executor::LocalExecutor))
 }
 
@@ -191,7 +188,7 @@ fn install_harness_executor_with_config(
         tail_tx,
         workspace_binding_authority,
     });
-    let executor: Arc<dyn executor::HarnessExecutor> = match kind {
+    let executor: Arc<dyn executor::WorkerExecutor> = match kind {
         bbox_config::config::ExecutorKind::Local => {
             tracing::info!(
                 "harness executor: local (workers are daemon children; a daemon restart \
@@ -218,8 +215,8 @@ fn install_harness_executor_with_config(
 /// purpose: if these were separate, a dispatch that ran before install would
 /// pin the local default in one cell while the installer wrote the other, and
 /// the daemon would silently keep spawning its own children.
-fn harness_executor_storage() -> &'static OnceLock<Arc<dyn executor::HarnessExecutor>> {
-    static EXECUTOR: OnceLock<Arc<dyn executor::HarnessExecutor>> = OnceLock::new();
+fn harness_executor_storage() -> &'static OnceLock<Arc<dyn executor::WorkerExecutor>> {
+    static EXECUTOR: OnceLock<Arc<dyn executor::WorkerExecutor>> = OnceLock::new();
     &EXECUTOR
 }
 
@@ -344,7 +341,7 @@ pub fn readopt_harness_session(session: ReadoptedSession) -> Option<u64> {
         let inner = task.inner.lock();
         if inner.workflow_owned
             || workflow_owned_for_origin(inner.origin)
-            || inner.provider == Provider::Workflow
+            || !inner.provider.is_dispatchable()
         {
             tracing::warn!(%task_id, "owner-managed task is not eligible for ordinary harness re-adoption");
             return None;
@@ -598,23 +595,6 @@ fn harness_user_input(text: String) -> Value {
     })
 }
 
-/// The harness control shape: `subtype` and the payload fields sit flat on
-/// the `control_request` envelope.
-fn harness_control_input(subtype: &str, request_id: String, fields: Value) -> Value {
-    let mut raw = match fields {
-        Value::Object(object) => Value::Object(object),
-        _ => serde_json::json!({}),
-    };
-    let object = raw.as_object_mut().expect("normalized JSON object");
-    object.insert(
-        "type".to_string(),
-        Value::String("control_request".to_string()),
-    );
-    object.insert("subtype".to_string(), Value::String(subtype.to_string()));
-    object.insert("request_id".to_string(), Value::String(request_id));
-    raw
-}
-
 /// The claude CLI control shape: `subtype` and the payload fields nest under
 /// `request`, and the CLI answers with a `control_response` carrying the same
 /// `request_id`.
@@ -649,8 +629,8 @@ fn control_input(lane: ProviderLane, subtype: &str, fields: Value) -> Value {
             serde_json::json!({"request_id": request_id, "command": command})
         }
         ProviderLane::ClaudeCli => claude_control_input(subtype, request_id, fields),
-        ProviderLane::Harness | ProviderLane::Workflow => {
-            harness_control_input(subtype, request_id, fields)
+        ProviderLane::Retired | ProviderLane::Workflow => {
+            unreachable!("retired providers have no control channel")
         }
     }
 }
@@ -799,6 +779,9 @@ pub fn apply_session_command(
         .cloned()
         .ok_or_else(|| format!("task {task_id} has no live harness control channel"))?;
 
+    if matches!(control.lane, ProviderLane::Retired | ProviderLane::Workflow) {
+        return Err("provider is retired".into());
+    }
     let input = match command {
         SessionCommand::UserTurn { text } => worker_user_input(control.lane, text),
         SessionCommand::Interrupt => {
@@ -857,14 +840,7 @@ pub fn interrupt_harness_task(task_id: &str, redirect: Option<String>) -> Result
                         .send(worker_user_input(control.lane, prompt))
                         .map_err(closed)
                 }
-                ProviderLane::Harness | ProviderLane::Workflow => control
-                    .tx
-                    .send(control_input(
-                        control.lane,
-                        "interrupt",
-                        serde_json::json!({"prompt": prompt}),
-                    ))
-                    .map_err(closed),
+                ProviderLane::Retired | ProviderLane::Workflow => Err("provider is retired".into()),
             }
         }
         None => apply_session_command(task_id, bro_protocol::SessionCommand::Interrupt),
@@ -2214,7 +2190,9 @@ impl TaskStore {
             if rec.status == TaskStatus::Running {
                 rec.status = TaskStatus::Failed;
                 rec.completed_at = Some(now_ms());
-                if workflow_owned {
+                if !rec.provider.is_dispatchable() {
+                    rec.stderr.push_str("\n[blackbox] provider runtime is retired; this task is retained for inspection and cannot resume.");
+                } else if workflow_owned {
                     rec.stderr.push_str(
                         "\n[blackbox] server restarted while an owner-managed task was running. \
                          Retained for inspection; ordinary bro resume/re-adoption is unavailable. \
@@ -2228,9 +2206,9 @@ impl TaskStore {
                          rather than starting a fresh session.",
                     );
                 }
-                rec.recoverable = !workflow_owned;
+                rec.recoverable = !workflow_owned && rec.provider.is_dispatchable();
             }
-            if workflow_owned {
+            if workflow_owned || !rec.provider.is_dispatchable() {
                 rec.recoverable = false;
             }
             // Old snapshots have only accumulated output. Recover a proven latest
@@ -2460,8 +2438,7 @@ pub struct AmbientContext {
 /// the agent is working in. The model keeps an explicit unscoped escape
 /// hatch: `resolve_project_filter` resolves an empty/whitespace `project`
 /// to None. Knowledge/note/learn `project` params must NEVER appear here —
-/// absence there means *global write scope*
-/// (design/bro-harness/tool-arg-defaulting.md §3.1).
+/// absence there means *global write scope*.
 const RETRIEVAL_PROJECT_DEFAULT_TOOLS: &[&str] = &["bbox_hybrid_search"];
 
 /// Gap-store tools whose `project` param is write-TARGETING, not write scope
@@ -2488,108 +2465,11 @@ impl AmbientContext {
             Some(s) => Some(s),
         }
     }
-
-    pub fn tool_arg_defaults(&self) -> Option<BTreeMap<String, String>> {
-        let mut defaults = BTreeMap::new();
-        // bbox_thread ids are deliberately NOT defaulted: the table is
-        // per-(tool,param), not per-action, and `resolve_thread_id` prefers
-        // `id` over `name` — a filled `id` would shadow name-based
-        // continue/resolve and convert missing-id errors on resolve/promote/
-        // rename into silent mutations of the ambient thread.
-
-        let cwd = self
-            .project_dir
-            .as_deref()
-            .map(str::trim)
-            .filter(|p| !p.is_empty());
-
-        // Worktree confinement pin (design/bro-harness/tool-arg-defaulting.md
-        // §5): when the dispatch cwd is a daemon-managed worktree, pin every
-        // tool's `cwd` and `project_dir` params to the canonical worktree
-        // root. A model passing a different tree (usually the primary
-        // checkout) is confused; the pin refuses with an explanatory error
-        // instead of letting the call land in the wrong tree. BOTH names are
-        // pinned because the pin guards by the literal param key present in
-        // the tool input, and the table applies in the harness BEFORE the
-        // daemon's serde alias normalization: dispatch tools advertise `cwd`
-        // (canonical, gap-6366c92d) but still accept `project_dir` as a
-        // deprecated alias, so a single-name pin would let the other
-        // spelling sail past. Safe as globs because the project-scoped
-        // coordination tools (threads/knowledge) take `project`, not
-        // `cwd`/`project_dir` — see the schema-drift tripwire test. Plain
-        // repo dispatches (`.git` directory) never pin.
-        let worktree = cwd.and_then(worktree_pin_target);
-        if let Some(worktree) = &worktree {
-            for key in ["pin:*.cwd", "pin:*.project_dir"] {
-                defaults.insert(key.to_string(), worktree.to_string_lossy().into_owned());
-            }
-        }
-
-        // Retrieval-read + code-nav scope defaults (gap-ae22a6b2 item 2,
-        // operator-approved). Read-scoped params only: eliding `project` on
-        // a retrieval search merely means "unscoped", and the model can
-        // still request an unscoped search explicitly — `resolve_project_filter`
-        // treats an empty/whitespace `project` as None. The knowledge/learn/
-        // thread `project` params stay excluded PERMANENTLY (§3.1: absence
-        // there means *global write scope*); see the exclusion test.
-        if let Some(cwd) = cwd {
-            // Raw dispatch cwd, canonicalized. Worktree paths are correct
-            // here because the server side resolves worktree/descendant
-            // paths to the registered base project via
-            // `resolve_base_project_for_scope`.
-            let canonical_cwd = std::path::Path::new(cwd)
-                .canonicalize()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_else(|_| cwd.to_string());
-            for tool in RETRIEVAL_PROJECT_DEFAULT_TOOLS {
-                defaults.insert(format!("default:mcp.{tool}.project"), canonical_cwd.clone());
-            }
-            // Gap write-targeting defaults (gap-b94129ba): same gating as the
-            // retrieval defaults — only filled when the model elides the
-            // param, and `scope="global"` / global gaps still win server-side.
-            for tool in GAP_WRITE_TARGET_DEFAULT_TOOLS {
-                defaults.insert(format!("default:mcp.{tool}.project"), canonical_cwd.clone());
-            }
-        }
-        (!defaults.is_empty()).then_some(defaults)
-    }
-}
-
-/// Merge tool argument defaults from broadest to most specific scope.
-///
-/// Ambient defaults describe the active task/session. Brofile defaults are
-/// durable persona grants, and per-dispatch defaults are operator grants for
-/// one invocation.
-pub fn merge_tool_arg_defaults(
-    ambient: Option<BTreeMap<String, String>>,
-    brofile: Option<&BTreeMap<String, serde_json::Value>>,
-    per_dispatch: Option<&BTreeMap<String, serde_json::Value>>,
-) -> Option<BTreeMap<String, serde_json::Value>> {
-    let mut merged: BTreeMap<String, serde_json::Value> = ambient
-        .unwrap_or_default()
-        .into_iter()
-        .map(|(key, value)| (key, serde_json::Value::String(value)))
-        .collect();
-    for defaults in [brofile, per_dispatch].into_iter().flatten() {
-        merged.extend(
-            defaults
-                .iter()
-                .map(|(key, value)| (key.clone(), value.clone())),
-        );
-    }
-    (!merged.is_empty()).then_some(merged)
 }
 
 impl AmbientContext {
-    /// Serialize this dispatch's typed ingredients (persona from the brofile
-    /// lens and the scope fields) into the `--dispatch-context` payload (dispatch-prompt-slots.md). The
-    /// harness owns composition; nothing here is prompt text.
-    ///
-    /// Recursion guarding (blocking sub-bro dispatch) stays mechanical via
-    /// provider tool-filter args appended to argv outside this function; no
-    /// text recursion guard is emitted. Recurring behavioral nudges belong in
-    /// the harness HookEngine/NudgeLedger so they can be triggered and
-    /// throttled by actual turn state.
+    /// Assemble persona and scope for the native provider adapter.
+    /// Recursion guarding is enforced separately through provider tool filters.
     pub fn dispatch_context(&self, lens: Option<&str>) -> bro_protocol::DispatchContext {
         use bro_protocol::DispatchScope;
 
@@ -2657,8 +2537,7 @@ pub struct SpawnTaskParams {
     pub tail_tx: tokio::sync::broadcast::Sender<tail::TailEvent>,
     pub roster_events: Option<RosterEventSink>,
     pub bro_label: Option<String>,
-    /// Absolute harness binary selected for this dispatch, when one was.
-    pub harness_bin: Option<String>,
+
     /// Spawn-time origin classification (Slice 1b). Determines which
     /// roster tab the task lands in. Defaults to `Unknown` at the field
     /// boundary so test helpers that build `SpawnTaskParams` directly
@@ -2670,7 +2549,7 @@ pub struct SpawnTaskParams {
 
 /// Dispatch against a task id the caller minted itself.
 ///
-/// Differs from [`spawn_task_with_tool_placement`] only in duplicate policy: a
+/// Differs from [`spawn_task_with_options`] only in duplicate policy: a
 /// pre-minted id that is already claimed is an ERROR here, not a silent
 /// return of the existing task, because a caller that minted its own id and
 /// finds it taken has a real bug rather than a retry. Everything downstream,
@@ -2682,7 +2561,7 @@ pub async fn spawn_with_pre_minted_id(
     params: SpawnTaskParams,
 ) -> Result<Arc<Task>, BroSpawnError> {
     params.task_store.write().reserve_id(&task_id)?;
-    Ok(spawn_reserved_dispatch(task_id, params, None, None).await)
+    Ok(spawn_reserved_dispatch(task_id, params).await)
 }
 
 fn failed_duplicate_task(
@@ -2971,7 +2850,7 @@ pub async fn spawn_task(
     bro_label: Option<String>,
     origin: bro_core::Origin,
 ) -> Arc<Task> {
-    spawn_task_with_tool_placement(
+    spawn_task_with_options(
         task_id,
         provider,
         args,
@@ -2983,9 +2862,6 @@ pub async fn spawn_task(
         tail_tx,
         roster_events,
         bro_label,
-        None,
-        None,
-        None,
         origin,
     )
     .await
@@ -3084,7 +2960,7 @@ fn worktree_base_repo(path: &std::path::Path) -> Option<std::path::PathBuf> {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn spawn_task_with_tool_placement(
+pub async fn spawn_task_with_options(
     task_id: String,
     provider: Provider,
     args: impl Into<providers::ProviderLaunch>,
@@ -3096,9 +2972,7 @@ pub async fn spawn_task_with_tool_placement(
     tail_tx: tokio::sync::broadcast::Sender<tail::TailEvent>,
     roster_events: Option<RosterEventSink>,
     bro_label: Option<String>,
-    tool_placement: Option<BTreeMap<String, String>>,
-    tool_defaults: Option<BTreeMap<String, serde_json::Value>>,
-    harness_bin: Option<String>,
+
     origin: bro_core::Origin,
 ) -> Arc<Task> {
     // Reservation happens HERE, ahead of the provider branch, so both entry
@@ -3135,11 +3009,9 @@ pub async fn spawn_task_with_tool_placement(
             tail_tx,
             roster_events,
             bro_label,
-            harness_bin,
+
             origin,
         },
-        tool_placement,
-        tool_defaults,
     )
     .await
 }
@@ -3155,12 +3027,7 @@ pub async fn spawn_task_with_tool_placement(
 /// reservation is released before returning a failed task, so a caller that
 /// retries the same id is not blocked by a stale claim.
 #[allow(clippy::too_many_arguments)]
-async fn spawn_reserved_dispatch(
-    task_id: String,
-    params: SpawnTaskParams,
-    tool_placement: Option<BTreeMap<String, String>>,
-    tool_defaults: Option<BTreeMap<String, serde_json::Value>>,
-) -> Arc<Task> {
+async fn spawn_reserved_dispatch(task_id: String, params: SpawnTaskParams) -> Arc<Task> {
     let SpawnTaskParams {
         provider,
         args,
@@ -3172,7 +3039,7 @@ async fn spawn_reserved_dispatch(
         tail_tx,
         roster_events,
         bro_label,
-        harness_bin,
+
         origin,
     } = params;
     // A session must never inherit the daemon's process cwd ($HOME under
@@ -3238,9 +3105,6 @@ async fn spawn_reserved_dispatch(
             tail_tx,
             roster_events.clone(),
             bro_label,
-            tool_placement,
-            tool_defaults,
-            harness_bin,
             origin,
         )
         .await;
@@ -3276,8 +3140,7 @@ async fn spawn_reserved_dispatch(
         roster_events,
         bro_label,
         anyhow::anyhow!(
-            "`{provider}` is not a dispatchable provider: it backs daemon-internal \
-             tasks only and has no worker binary. Set a real provider on the brofile."
+            "`{provider}` is not a dispatchable provider and has no worker runtime. Select a supported provider."
         ),
         origin,
     )
@@ -3297,9 +3160,7 @@ async fn spawn_harness_child_task(
     tail_tx: tokio::sync::broadcast::Sender<tail::TailEvent>,
     roster_events: Option<RosterEventSink>,
     bro_label: Option<String>,
-    tool_placement: Option<BTreeMap<String, String>>,
-    tool_defaults: Option<BTreeMap<String, serde_json::Value>>,
-    harness_bin: Option<String>,
+
     origin: bro_core::Origin,
 ) -> Arc<Task> {
     // A fresh session on a lane whose worker mints its own session id has no
@@ -3353,9 +3214,6 @@ async fn spawn_harness_child_task(
             cwd.as_deref(),
             env_overrides,
             shell_env,
-            tool_placement,
-            tool_defaults,
-            harness_bin.clone(),
             &store_dir,
             self_mcp_url.as_deref(),
             workspace_binding_authority,
@@ -3464,7 +3322,7 @@ async fn spawn_harness_child_task(
             interrupted: false,
             recoverable: false,
             transcript_location,
-            harness_bin,
+            harness_bin: None,
             transcript_cursor: None,
             live_cursor: 0,
             harness_ingest_seq: 0,
@@ -3557,14 +3415,17 @@ fn prepare_harness_child_launch(
     cwd: Option<&str>,
     env_overrides: Option<HashMap<String, String>>,
     shell_env: Option<BTreeMap<String, String>>,
-    tool_placement: Option<BTreeMap<String, String>>,
-    tool_defaults: Option<BTreeMap<String, serde_json::Value>>,
-    harness_bin: Option<String>,
+
     store_dir: &std::path::Path,
     self_mcp_url: Option<&str>,
     workspace_binding_authority: Option<&dyn WorkspaceBindingAuthority>,
     workspace_identity: Option<bro_protocol::WorkerWorkspaceIdentity>,
 ) -> anyhow::Result<bro_protocol::WorkerSpawnSpec> {
+    anyhow::ensure!(
+        provider.is_dispatchable(),
+        "provider {} is retired",
+        provider.as_str()
+    );
     let launch = launch.into();
     anyhow::ensure!(launch.errors.is_empty(), "{}", launch.errors.join("; "));
     let mut args = launch.argv;
@@ -3589,23 +3450,7 @@ fn prepare_harness_child_launch(
     // harness flags below express for the harness lane.
     let mut shell_env_for_process: BTreeMap<String, String> = BTreeMap::new();
     match lane {
-        ProviderLane::Harness | ProviderLane::Workflow => {
-            ensure_cli_flag(&mut args, "--exit-when-idle");
-            ensure_cli_flag(&mut args, "--daemon-worker");
-            if let Some(cwd) = cwd {
-                set_cli_value_arg(&mut args, "--cwd", cwd.to_string());
-            }
-            if let Some(tool_defaults) = tool_defaults {
-                set_cli_value_arg(
-                    &mut args,
-                    "--additional-context",
-                    serde_json::to_string(&tool_defaults)?,
-                );
-            }
-            if let Some(shell_env) = shell_env {
-                set_cli_value_arg(&mut args, "--shell-env", serde_json::to_string(&shell_env)?);
-            }
-        }
+        ProviderLane::Retired | ProviderLane::Workflow => anyhow::bail!("provider is retired"),
         // The claude CLI's shell children inherit the process env, as do the
         // codex app-server's, so the non-secret project
         // build env rides the child env directly. The harness-only tool
@@ -3643,23 +3488,7 @@ fn prepare_harness_child_launch(
     };
 
     match lane {
-        ProviderLane::Harness | ProviderLane::Workflow => {
-            if let Some(config) = build_harness_mcp_config(
-                &mut args,
-                tool_placement,
-                self_mcp_url,
-                workspace_binding.is_some(),
-            )? {
-                set_cli_value_arg(&mut args, "--mcp-config", config);
-            }
-            if self_mcp_url.is_some() {
-                set_cli_value_arg(
-                    &mut args,
-                    "--capability-mcp-server",
-                    crate::util::blackbox_mcp_name(),
-                );
-            }
-        }
+        ProviderLane::Retired | ProviderLane::Workflow => anyhow::bail!("provider is retired"),
         // Native Codex config is validated before crossing the executor boundary.
         // The adapter adds strict exclusions after reading effective host config.
         ProviderLane::Codex => {
@@ -3713,10 +3542,7 @@ fn prepare_harness_child_launch(
     // set is byte-identical either way.
     let mut env: std::collections::BTreeMap<String, String> = shell_env_for_process;
     env.extend(env_overrides.unwrap_or_default());
-    if lane == ProviderLane::Harness {
-        env.entry("BRO_HARNESS_PROVIDER".to_string())
-            .or_insert_with(|| provider.as_str().to_string());
-    }
+
     // The worker presents the daemon service bearer to its own MCP server
     // whenever the daemon has one, whether or not the gate is on, so turning
     // the gate on needs no change on the worker side.
@@ -3738,27 +3564,16 @@ fn prepare_harness_child_launch(
             serde_json::to_string(&binding.scope)?,
         );
     }
-    let mut scrub_keys = BLACKBOX_SERVICE_ENV_VARS
-        .iter()
-        .map(|key| (*key).to_string())
-        .collect::<std::collections::BTreeSet<_>>();
-    scrub_keys.extend(env.keys().cloned());
-    scrub_keys.insert(HARNESS_SPAWN_SCRUB_ENV.to_string());
-    env.insert(
-        HARNESS_SPAWN_SCRUB_ENV.to_string(),
-        scrub_keys.into_iter().collect::<Vec<_>>().join(","),
-    );
-
     // Binary override: BRO_HARNESS_BIN / provider config resolved daemon-side;
     // the final login-shell path resolution stays executor-side.
     // A dispatch that names its own binary wins over both.
-    let bin_override = Some(harness_bin.unwrap_or_else(|| {
+    let bin_override = Some({
         if let Ok(cfg) = blackbox::config::load() {
             provider.bin_with_config(&cfg.providers)
         } else {
             provider.bin()
         }
-    }));
+    });
 
     // A same-host executor shares the daemon's BRO_HOME. An off-host fleetd
     // writes snapshots, replay logs, and spill artifacts under its own
@@ -3785,7 +3600,6 @@ fn prepare_harness_child_launch(
         env: bro_protocol::SecretEnv::new(env),
         env_unset: BLACKBOX_SERVICE_ENV_VARS
             .iter()
-            .chain(WORKER_UNINHERITED_ENV_VARS)
             .map(|key| (*key).to_string())
             .collect(),
         initial_messages: vec![worker_user_input(lane, initial_prompt)],
@@ -4366,48 +4180,6 @@ fn ingest_harness_event(
     }
 }
 
-fn build_harness_mcp_config(
-    args: &mut Vec<String>,
-    tool_placement: Option<BTreeMap<String, String>>,
-    self_mcp_url: Option<&str>,
-    workspace_bound: bool,
-) -> anyhow::Result<Option<String>> {
-    let raw_mcp_config = take_cli_value_arg(args, "--mcp-config");
-    let mut config: Value = match raw_mcp_config {
-        Some(raw) => serde_json::from_str(&raw)?,
-        None => serde_json::json!({}),
-    };
-    let config_object = config
-        .as_object_mut()
-        .ok_or_else(|| anyhow::anyhow!("--mcp-config must be a JSON object"))?;
-    let servers_empty = {
-        let servers = config_object
-            .entry("mcpServers")
-            .or_insert_with(|| serde_json::json!({}))
-            .as_object_mut()
-            .ok_or_else(|| anyhow::anyhow!("--mcp-config mcpServers must be a JSON object"))?;
-        add_transient_blackbox_mcp_server(
-            servers,
-            self_mcp_url,
-            workspace_bound,
-            worker_mcp_bearer().is_some(),
-        );
-        servers.is_empty()
-    };
-    let placement = parse_dispatch_tool_placement(tool_placement)?;
-    config_object.insert("tool_placement".to_string(), Value::Object(placement));
-    if servers_empty
-        && config_object
-            .get("tool_placement")
-            .and_then(Value::as_object)
-            .is_none_or(serde_json::Map::is_empty)
-    {
-        Ok(None)
-    } else {
-        Ok(Some(serde_json::to_string(&config)?))
-    }
-}
-
 /// The claude-lane `--mcp-config` payload: the caller's servers plus the
 /// transient daemon capability server, in the CLI's own `{"mcpServers":{…}}`
 /// shape. Header secrets are `${VAR}` references the CLI expands from the
@@ -4517,24 +4289,6 @@ fn take_cli_value_arg(args: &mut Vec<String>, flag: &str) -> Option<String> {
         idx += 1;
     }
     found
-}
-
-fn parse_dispatch_tool_placement(
-    raw: Option<BTreeMap<String, String>>,
-) -> anyhow::Result<serde_json::Map<String, Value>> {
-    let mut out = serde_json::Map::new();
-    let Some(raw) = raw else {
-        return Ok(out);
-    };
-    for (name, placement) in raw {
-        if !matches!(placement.as_str(), "in-box" | "out-box" | "both") {
-            anyhow::bail!(
-                "invalid tool_placement for {name}: {placement}; expected in-box, out-box, or both"
-            );
-        }
-        out.insert(name, Value::String(placement));
-    }
-    Ok(out)
 }
 
 const HARNESS_TEE_CHANNEL_CAPACITY: usize = 256;
@@ -6066,88 +5820,6 @@ mod tests {
     }
 
     #[test]
-    fn managed_child_launch_keeps_workspace_capability_out_of_argv() {
-        let mut env = crate::util::TestEnvGuard::new();
-        env.set("BLACKBOX_MCP_NAME", "selfbox");
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        std::process::Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(&root)
-            .status()
-            .unwrap();
-        std::fs::write(
-            root.join(".git/blackbox-managed-checkout"),
-            format!("{}\n", bbox_corpus_core::git::MANAGED_CHECKOUT_MARKER_V1),
-        )
-        .unwrap();
-        env.set(
-            "BLACKBOX_CONFIG",
-            root.join("missing.toml").to_str().unwrap(),
-        );
-        let workspace_identity = bro_protocol::WorkerWorkspaceIdentity {
-            workspace_id: bro_core::WorkspaceId::parse(
-                bbox_corpus_core::identity::ensure_checkout_id(&root).unwrap(),
-            )
-            .unwrap(),
-            scope: bro_protocol::WorkerWorkspaceScope::try_new("test-repo", ".").unwrap(),
-        };
-
-        let spec = prepare_harness_child_launch(
-            "task-bound".to_string(),
-            "pending".to_string(),
-            Provider::Brodex,
-            vec!["-p".to_string(), "work".to_string()],
-            root.to_str(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            &root,
-            Some("http://127.0.0.1:7264/mcp?surface=agent-internal"),
-            Some(&FixedWorkspaceBindingAuthority),
-            Some(workspace_identity),
-        )
-        .unwrap();
-
-        let secret = "a".repeat(64);
-        assert!(spec.workspace_id.is_some());
-        assert_eq!(
-            spec.env.as_map().get(bro_protocol::WORKSPACE_BINDING_ENV),
-            Some(&secret)
-        );
-        assert!(!spec.env.as_map().contains_key("BRO_KNOWLEDGE_SOURCE_URL"));
-        assert_eq!(
-            serde_json::from_str::<bbox_corpus_core::identity::PublishedScope>(
-                spec.env
-                    .as_map()
-                    .get(bro_protocol::WORKSPACE_SCOPE_ENV)
-                    .unwrap()
-            )
-            .unwrap(),
-            bbox_corpus_core::identity::PublishedScope::try_new("test-repo", ".").unwrap()
-        );
-        assert!(!format!("{:?}", spec.argv).contains(&secret));
-        assert!(!format!("{spec:?}").contains(&secret));
-        let scrub = spec.env.as_map().get(HARNESS_SPAWN_SCRUB_ENV).unwrap();
-        assert!(scrub.contains(bro_protocol::WORKSPACE_BINDING_ENV));
-        assert!(scrub.contains(bro_protocol::WORKSPACE_SCOPE_ENV));
-        let raw_config = spec
-            .argv
-            .windows(2)
-            .find(|pair| pair[0] == "--mcp-config")
-            .map(|pair| pair[1].as_str())
-            .unwrap();
-        let config: Value = serde_json::from_str(raw_config).unwrap();
-        assert_eq!(
-            config["mcpServers"]["selfbox"]["headers"][bro_protocol::WORKSPACE_BINDING_HEADER],
-            format!("$env:{}", bro_protocol::WORKSPACE_BINDING_ENV)
-        );
-        assert!(!raw_config.contains(&secret));
-    }
-
-    #[test]
     fn claude_lane_child_launch_composes_cli_argv_and_env() {
         let mut env = crate::util::TestEnvGuard::new();
         env.set("BLACKBOX_MCP_NAME", "selfbox");
@@ -6184,15 +5856,6 @@ mod tests {
                 "RUSTC_WRAPPER".to_string(),
                 "sccache".to_string(),
             )])),
-            Some(BTreeMap::from([(
-                "mcp__external__inspect".to_string(),
-                "both".to_string(),
-            )])),
-            Some(BTreeMap::from([(
-                "default:file_read.offset".to_string(),
-                serde_json::json!("10"),
-            )])),
-            None,
             &root,
             Some("http://127.0.0.1:7264/mcp?surface=default"),
             None,
@@ -6290,9 +5953,6 @@ mod tests {
                 root.to_str(),
                 None,
                 None,
-                None,
-                None,
-                None,
                 &root,
                 None,
                 None,
@@ -6319,131 +5979,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn prepare_harness_child_launch_composes_worker_spec() {
-        // config::load() reads $BLACKBOX_CONFIG / XDG; point it at a missing
-        // path under a tempdir so composition never touches real config state.
-        let _env = crate::util::test_env_lock();
-        let tmp = tempfile::tempdir().unwrap();
-        let store = tmp.path().canonicalize().unwrap();
-        let cfg_path = store.join("missing-config.toml");
-        // SAFETY: guarded by test_env_lock; the test runtime is single-threaded.
-        unsafe {
-            std::env::set_var("BLACKBOX_CONFIG", &cfg_path);
-        }
-
-        let args = vec![
-            "-p".to_string(),
-            "do the thing".to_string(),
-            "-m".to_string(),
-            "some-model".to_string(),
-        ];
-        let spec = prepare_harness_child_launch(
-            "task-1".to_string(),
-            "sess-1".to_string(),
-            Provider::Brodex,
-            args,
-            Some("/repo/x"),
-            None, // env_overrides
-            None, // shell_env
-            None, // tool_placement
-            None, // tool_defaults
-            None,
-            &store,
-            None, // self_mcp_url
-            None, // workspace_binding_authority
-            None, // workspace_identity
-        )
-        .expect("compose spec");
-
-        // Hard rule: the prompt rides initial_messages, never argv.
-        assert!(
-            !spec.argv.iter().any(|a| a == "-p" || a == "do the thing"),
-            "prompt must not appear in argv: {:?}",
-            spec.argv
-        );
-        assert_eq!(spec.initial_messages.len(), 1);
-        assert_eq!(spec.initial_messages[0]["type"], "user");
-        assert_eq!(
-            spec.initial_messages[0]["message"]["content"][0]["text"],
-            "do the thing"
-        );
-
-        // Daemon-worker stream-json flags are present.
-        assert!(spec.argv.iter().any(|a| a == "--daemon-worker"));
-        assert!(spec.argv.iter().any(|a| a == "--exit-when-idle"));
-        assert!(spec.argv.iter().any(|a| a == "--replay-user-messages"));
-        let ifmt = spec
-            .argv
-            .iter()
-            .position(|a| a == "--input-format")
-            .expect("--input-format present");
-        assert_eq!(spec.argv[ifmt + 1], "stream-json");
-
-        // env_unset covers the full service scrub list.
-        for var in BLACKBOX_SERVICE_ENV_VARS {
-            assert!(
-                spec.env_unset.iter().any(|k| k == var),
-                "env_unset missing service var {var}"
-            );
-        }
-        // The scrub var is composed into env and lists the service vars.
-        let scrub = spec
-            .env
-            .as_map()
-            .get(HARNESS_SPAWN_SCRUB_ENV)
-            .expect("scrub var present in env");
-        assert!(scrub.contains("BRO_HOME"), "scrub list: {scrub}");
-        assert!(scrub.contains("BLACKBOX_MCP_URL"), "scrub list: {scrub}");
-        // BRO_HOME is pinned on its own field, not duplicated into env.
-        assert!(!spec.env.as_map().contains_key("BRO_HOME"));
-
-        // BRO_HOME and event_log_path share one pinned derivation.
-        assert_eq!(spec.bro_home, store);
-        assert_eq!(
-            spec.event_log_path,
-            store.join("harness-sessions").join("sess-1.events.jsonl")
-        );
-
-        assert_eq!(spec.cwd.as_deref(), Some("/repo/x"));
-
-        // SAFETY: guarded by test_env_lock; restore process env.
-        unsafe {
-            std::env::remove_var("BLACKBOX_CONFIG");
-        }
-    }
-
-    #[test]
-    fn apply_session_command_maps_protocol_variants_to_harness_wire() {
-        use bro_protocol::SessionCommand;
-
-        let task_id = "test-session-command-mapping";
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        register_test_control(task_id, tx, ProviderLane::Harness);
-
-        apply_session_command(task_id, SessionCommand::UserTurn { text: "hi".into() }).unwrap();
-        let user = rx.try_recv().unwrap();
-        assert_eq!(user["type"], "user");
-        assert_eq!(user["message"]["content"][0]["text"], "hi");
-
-        apply_session_command(task_id, SessionCommand::Interrupt).unwrap();
-        let interrupt = rx.try_recv().unwrap();
-        assert_eq!(interrupt["type"], "control_request");
-        assert_eq!(interrupt["subtype"], "interrupt");
-        assert!(interrupt["request_id"].is_string());
-
-        apply_session_command(task_id, SessionCommand::SetModel { model: "m2".into() }).unwrap();
-        let set_model = rx.try_recv().unwrap();
-        assert_eq!(set_model["subtype"], "set_model");
-        assert_eq!(set_model["model"], "m2");
-
-        apply_session_command(task_id, SessionCommand::Compact).unwrap();
-        let compact = rx.try_recv().unwrap();
-        assert_eq!(compact["message"]["content"][0]["text"], "/compact");
-
-        harness_controls().write().remove(task_id);
     }
 
     #[test]
@@ -6513,67 +6048,6 @@ mod tests {
     }
 
     #[test]
-    fn claude_cli_rejects_unsupported_dispatch_settings_before_spawn() {
-        use brofile::{CodeMode, EditDiscipline};
-        use providers::ExecOpts;
-        let root = tempfile::tempdir().unwrap();
-        for (field, options) in [
-            (
-                "code_mode",
-                ExecOpts {
-                    code_mode: Some(CodeMode::Only),
-                    ..Default::default()
-                },
-            ),
-            (
-                "edit_discipline",
-                ExecOpts {
-                    edit_discipline: Some(EditDiscipline::Structured),
-                    ..Default::default()
-                },
-            ),
-            (
-                "service_tier",
-                ExecOpts {
-                    service_tier: Some("priority".into()),
-                    ..Default::default()
-                },
-            ),
-        ] {
-            for provider in [
-                Provider::Glm,
-                Provider::Deepseek,
-                Provider::Minimax,
-                Provider::Kimi,
-            ] {
-                for launch in [
-                    provider.build_exec_args("hi", None, "s", None, Some(&options)),
-                    provider.build_resume_args("s", "hi", None, Some(&options)),
-                ] {
-                    let error = prepare_harness_child_launch(
-                        "t".into(),
-                        "s".into(),
-                        provider,
-                        launch,
-                        root.path().to_str(),
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        root.path(),
-                        None,
-                        None,
-                        None,
-                    )
-                    .unwrap_err();
-                    assert!(error.to_string().contains(field), "{error}");
-                }
-            }
-        }
-    }
-
-    #[test]
     fn codex_launch_uses_native_app_server_and_typed_config() {
         let mut env = crate::util::TestEnvGuard::new();
         let dir = tempfile::tempdir().unwrap();
@@ -6590,9 +6064,6 @@ mod tests {
             Provider::Codex,
             launch,
             root.to_str(),
-            None,
-            None,
-            None,
             None,
             None,
             &root,
@@ -6614,554 +6085,6 @@ mod tests {
             apply_session_command("no-such-live-task", bro_protocol::SessionCommand::Interrupt)
                 .unwrap_err();
         assert!(err.contains("no live harness control channel"));
-    }
-
-    #[test]
-    fn harness_mcp_config_strips_cli_arg_and_applies_dispatch_placement() {
-        let mut env = crate::util::TestEnvGuard::new();
-        env.set("BLACKBOX_MCP_NAME", "selfbox");
-
-        let mut args = vec![
-            "--model".to_string(),
-            "glm-test".to_string(),
-            "--mcp-config".to_string(),
-            serde_json::json!({
-                "mcpServers": {
-                    "external": {
-                        "type": "stdio",
-                        "command": "external-mcp",
-                        "args": ["--once"]
-                    },
-                    "selfbox": {
-                        "type": "stdio",
-                        "command": "must-not-shadow-daemon"
-                    }
-                },
-                "tool_placement": {
-                    "mcp__external__ignored_json_source": "both"
-                }
-            })
-            .to_string(),
-            "--effort".to_string(),
-            "low".to_string(),
-        ];
-        let config = build_harness_mcp_config(
-            &mut args,
-            Some(BTreeMap::from([(
-                "mcp__external__placed".to_string(),
-                "in-box".to_string(),
-            )])),
-            Some("http://127.0.0.1:7264/mcp?surface=default"),
-            false,
-        )
-        .unwrap()
-        .unwrap();
-        let config: Value = serde_json::from_str(&config).unwrap();
-
-        assert_eq!(
-            args,
-            vec![
-                "--model".to_string(),
-                "glm-test".to_string(),
-                "--effort".to_string(),
-                "low".to_string()
-            ]
-        );
-        assert_eq!(config["mcpServers"].as_object().unwrap().len(), 2);
-        assert!(config["mcpServers"]["external"].is_object());
-        assert_eq!(
-            config["mcpServers"]["selfbox"]["url"],
-            "http://127.0.0.1:7264/mcp?surface=default"
-        );
-        assert_eq!(config["mcpServers"]["selfbox"]["type"], "http");
-        assert!(config["mcpServers"]["selfbox"].get("command").is_none());
-        assert_eq!(config["tool_placement"]["mcp__external__placed"], "in-box");
-        assert!(
-            config["tool_placement"]
-                .get("mcp__external__ignored_json_source")
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn harness_mcp_config_uses_supplied_self_mcp_surface_url() {
-        let mut env = crate::util::TestEnvGuard::new();
-        env.set("BLACKBOX_MCP_NAME", "selfbox");
-        let mut args = Vec::new();
-
-        let config = build_harness_mcp_config(
-            &mut args,
-            None,
-            Some("http://127.0.0.1:7264/mcp?surface=agent-internal"),
-            false,
-        )
-        .unwrap()
-        .unwrap();
-        let config: Value = serde_json::from_str(&config).unwrap();
-
-        assert_eq!(
-            config["mcpServers"]["selfbox"]["url"],
-            "http://127.0.0.1:7264/mcp?surface=agent-internal"
-        );
-    }
-
-    /// With a service token configured, a worker's own MCP server carries
-    /// the bearer as an `$env:` header and the spec env carries the value,
-    /// scrubbed from shell grandchildren; an external server gets nothing.
-    #[test]
-    #[allow(clippy::disallowed_methods)]
-    fn a_worker_presents_the_service_bearer_to_its_own_mcp_server() {
-        let mut env = crate::util::TestEnvGuard::new();
-        env.set("BLACKBOX_MCP_NAME", "selfbox");
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        env.set(
-            "BLACKBOX_CONFIG",
-            root.join("missing-config.toml").to_str().unwrap(),
-        );
-        let token_file = root.join("service.token");
-        let secret = bro_rpc::ServiceToken::load_or_create(&token_file)
-            .unwrap()
-            .expose_secret()
-            .to_string();
-        // One process, one configuration: a second test in this process
-        // would find it set, so this test owns the only call.
-        configure_worker_mcp_bearer(Some(&token_file)).unwrap();
-        assert!(configure_worker_mcp_bearer(None).is_err());
-
-        let spec = prepare_harness_child_launch(
-            "task-b".to_string(),
-            "sess-b".to_string(),
-            Provider::Brodex,
-            vec![
-                "-p".to_string(),
-                "turn".to_string(),
-                "--mcp-config".to_string(),
-                serde_json::json!({
-                    "mcpServers": {
-                        "external": {"type": "http", "url": "http://127.0.0.1:9/mcp"}
-                    }
-                })
-                .to_string(),
-            ],
-            root.to_str(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            &root,
-            Some("http://127.0.0.1:7264/mcp?surface=default"),
-            None,
-            None,
-        )
-        .unwrap();
-        assert_eq!(
-            spec.env
-                .as_map()
-                .get(WORKER_MCP_BEARER_ENV)
-                .map(String::as_str),
-            Some(secret.as_str())
-        );
-        let scrub = spec.env.as_map().get(HARNESS_SPAWN_SCRUB_ENV).unwrap();
-        assert!(scrub.split(',').any(|key| key == WORKER_MCP_BEARER_ENV));
-        let mcp_config_index = spec
-            .argv
-            .iter()
-            .position(|arg| arg == "--mcp-config")
-            .unwrap();
-        let config: Value = serde_json::from_str(&spec.argv[mcp_config_index + 1]).unwrap();
-        assert_eq!(
-            config["mcpServers"]["selfbox"]["headers"]["Authorization"],
-            format!("$env:{WORKER_MCP_BEARER_ENV}")
-        );
-        assert!(config["mcpServers"]["external"]["headers"].is_null());
-        // The secret itself is never written into the config.
-        assert!(!spec.argv[mcp_config_index + 1].contains(&secret));
-
-        // Without a self MCP server there is nothing to present it to.
-        let spec = prepare_harness_child_launch(
-            "task-c".to_string(),
-            "sess-c".to_string(),
-            Provider::Brodex,
-            vec!["-p".to_string(), "turn".to_string()],
-            root.to_str(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            &root,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        assert!(spec.env.as_map().get(WORKER_MCP_BEARER_ENV).is_none());
-    }
-
-    #[test]
-    #[allow(clippy::disallowed_methods)]
-    fn child_launch_moves_prompt_to_stdin_and_preserves_session_policy() {
-        let mut env = crate::util::TestEnvGuard::new();
-        env.set("BLACKBOX_MCP_NAME", "selfbox");
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        // Isolate config::load() (bin resolution) from real config state.
-        env.set(
-            "BLACKBOX_CONFIG",
-            root.join("missing-config.toml").to_str().unwrap(),
-        );
-        let spec = prepare_harness_child_launch(
-            "task-x".to_string(),
-            "sess-x".to_string(),
-            Provider::Brodex,
-            vec![
-                "-p".to_string(),
-                "initial turn".to_string(),
-                "--model".to_string(),
-                "glm-test".to_string(),
-                "--mcp-config".to_string(),
-                serde_json::json!({
-                    "mcpServers": {
-                        "external": {"type": "stdio", "command": "external-mcp"}
-                    }
-                })
-                .to_string(),
-            ],
-            root.to_str(),
-            Some(HashMap::from([(
-                "ANTHROPIC_AUTH_TOKEN".to_string(),
-                "secret".to_string(),
-            )])),
-            Some(BTreeMap::from([(
-                "RUSTC_WRAPPER".to_string(),
-                "sccache".to_string(),
-            )])),
-            Some(BTreeMap::from([(
-                "mcp__external__inspect".to_string(),
-                "both".to_string(),
-            )])),
-            Some(BTreeMap::from([(
-                "default:file_read.offset".to_string(),
-                serde_json::json!("10"),
-            )])),
-            None,
-            &root,
-            Some("http://127.0.0.1:7264/mcp?surface=default"),
-            None,
-            None,
-        )
-        .unwrap();
-
-        // Prompt rides initial_messages, never argv.
-        assert_eq!(spec.initial_messages.len(), 1);
-        assert_eq!(
-            spec.initial_messages[0]["message"]["content"][0]["text"],
-            "initial turn"
-        );
-        assert!(!spec.argv.iter().any(|arg| arg == "initial turn"));
-        for flag in [
-            "--input-format",
-            "--replay-user-messages",
-            "--exit-when-idle",
-            "--daemon-worker",
-            "--cwd",
-            "--mcp-config",
-            "--capability-mcp-server",
-            "--additional-context",
-            "--shell-env",
-        ] {
-            assert!(spec.argv.iter().any(|arg| arg == flag), "missing {flag}");
-        }
-        assert_eq!(
-            spec.env.as_map().get("BRO_HARNESS_PROVIDER"),
-            Some(&"brodex".to_string())
-        );
-        // BRO_HOME is pinned on its own field, not duplicated into env.
-        assert!(!spec.env.as_map().contains_key("BRO_HOME"));
-        assert_eq!(spec.bro_home, root);
-        assert_eq!(
-            spec.event_log_path,
-            root.join("harness-sessions").join("sess-x.events.jsonl")
-        );
-        // env_unset carries the full service scrub list.
-        assert!(spec.env_unset.iter().any(|k| k == "BRO_HOME"));
-        // A harness lifecycle switch is never inherited from the spawner.
-        assert!(
-            spec.env_unset
-                .iter()
-                .any(|k| k == "BRO_HARNESS_MCP_HTTP_LIFECYCLE")
-        );
-        assert!(spec.env_unset.iter().any(|k| k == "BLACKBOX_MCP_URL"));
-        let scrub = spec
-            .env
-            .as_map()
-            .get(HARNESS_SPAWN_SCRUB_ENV)
-            .expect("child shell scrub list");
-        assert!(scrub.contains("ANTHROPIC_AUTH_TOKEN"));
-        assert!(scrub.contains("BRO_HOME"));
-
-        let raw_config = spec
-            .argv
-            .windows(2)
-            .find(|pair| pair[0] == "--mcp-config")
-            .map(|pair| pair[1].as_str())
-            .unwrap();
-        let config: Value = serde_json::from_str(raw_config).unwrap();
-        assert!(config["mcpServers"]["external"].is_object());
-        assert!(config["mcpServers"]["selfbox"].is_object());
-        assert_eq!(config["tool_placement"]["mcp__external__inspect"], "both");
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    #[allow(clippy::disallowed_methods)]
-    async fn harness_child_error_is_terminal_without_poisoning_sibling_process() {
-        use std::os::unix::fs::PermissionsExt;
-
-        fn write_fake_harness(path: &std::path::Path, event: &str) {
-            std::fs::write(
-                path,
-                format!("#!/bin/sh\nIFS= read -r input\nprintf '%s\\n' '{event}'\n"),
-            )
-            .unwrap();
-            let mut permissions = std::fs::metadata(path).unwrap().permissions();
-            permissions.set_mode(0o755);
-            std::fs::set_permissions(path, permissions).unwrap();
-        }
-
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        let failed_bin = root.join("failed-harness");
-        let healthy_bin = root.join("healthy-harness");
-        write_fake_harness(
-            &failed_bin,
-            r#"{"type":"result","is_error":true,"result":"child turn failed","session_id":"session-error"}"#,
-        );
-        write_fake_harness(
-            &healthy_bin,
-            r#"{"type":"result","is_error":false,"result":"sibling ok","session_id":"session-ok"}"#,
-        );
-
-        let mut env = crate::util::TestEnvGuard::new();
-        env.remove("BLACKBOX_MCP_URL");
-        env.set("BRO_HARNESS_BIN", &failed_bin);
-        let store = Arc::new(RwLock::new(TaskStore::new()));
-        let (tail_tx, _) = tokio::sync::broadcast::channel(32);
-        let store_dir = root.join("store");
-        let failed = spawn_task_with_tool_placement(
-            "child-error".to_string(),
-            Provider::Brodex,
-            vec![
-                "-p".to_string(),
-                "fail".to_string(),
-                "--model".to_string(),
-                "glm-test".to_string(),
-            ],
-            "session-error".to_string(),
-            Some(root.to_string_lossy().into_owned()),
-            None,
-            store_dir.clone(),
-            store.clone(),
-            tail_tx.clone(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            bro_core::Origin::AgentDispatch,
-        )
-        .await;
-
-        env.set("BRO_HARNESS_BIN", &healthy_bin);
-        let healthy = spawn_task_with_tool_placement(
-            "child-healthy".to_string(),
-            Provider::Brodex,
-            vec![
-                "-p".to_string(),
-                "succeed".to_string(),
-                "--model".to_string(),
-                "glm-test".to_string(),
-            ],
-            "session-ok".to_string(),
-            Some(root.to_string_lossy().into_owned()),
-            None,
-            store_dir,
-            store,
-            tail_tx,
-            None,
-            None,
-            None,
-            None,
-            None,
-            bro_core::Origin::AgentDispatch,
-        )
-        .await;
-
-        tokio::time::timeout(std::time::Duration::from_secs(5), wait_for_task(&failed))
-            .await
-            .expect("failed child terminates");
-        tokio::time::timeout(std::time::Duration::from_secs(5), wait_for_task(&healthy))
-            .await
-            .expect("healthy sibling terminates");
-
-        let failed_inner = failed.inner.lock();
-        assert_eq!(failed_inner.status, TaskStatus::Failed);
-        assert!(failed_inner.stderr.contains("child turn failed"));
-        drop(failed_inner);
-        assert_eq!(healthy.inner.lock().status, TaskStatus::Completed);
-    }
-
-    /// A failed turn is not a failed worker. The worker that emitted an error
-    /// result takes a queued steer as its next turn, so the task stays
-    /// running and steerable until the worker exits, and that exit's latest
-    /// result decides the outcome.
-    #[tokio::test]
-    async fn harness_task_stays_steerable_after_a_failed_turn() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        let bin = root.join("two-turn-harness");
-        std::fs::write(
-            &bin,
-            concat!(
-                "#!/bin/sh\n",
-                "IFS= read -r input\n",
-                "printf '%s\\n' '{\"type\":\"result\",\"is_error\":true,\"result\":\"turn one failed\",\"session_id\":\"session-steer\"}'\n",
-                "IFS= read -r steer\n",
-                "printf '%s\\n' '{\"type\":\"result\",\"is_error\":false,\"result\":\"turn two ok\",\"session_id\":\"session-steer\"}'\n",
-            ),
-        )
-        .unwrap();
-        let mut permissions = std::fs::metadata(&bin).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&bin, permissions).unwrap();
-
-        let mut env = crate::util::TestEnvGuard::new();
-        env.remove("BLACKBOX_MCP_URL");
-        env.set("BRO_HARNESS_BIN", &bin);
-        let store = Arc::new(RwLock::new(TaskStore::new()));
-        let (tail_tx, _) = tokio::sync::broadcast::channel(32);
-        let task = spawn_task_with_tool_placement(
-            "steer-after-error".to_string(),
-            Provider::Brodex,
-            vec![
-                "-p".to_string(),
-                "start".to_string(),
-                "--model".to_string(),
-                "glm-test".to_string(),
-            ],
-            "session-steer".to_string(),
-            Some(root.to_string_lossy().into_owned()),
-            None,
-            root.join("store"),
-            store,
-            tail_tx,
-            None,
-            None,
-            None,
-            None,
-            None,
-            bro_core::Origin::AgentDispatch,
-        )
-        .await;
-
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !task.inner.lock().stderr.contains("turn one failed") {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the failed turn is ingested"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert_eq!(task.inner.lock().status, TaskStatus::Running);
-        steer_harness_task("steer-after-error", "keep going".to_string())
-            .expect("the worker is still steerable after a failed turn");
-
-        tokio::time::timeout(std::time::Duration::from_secs(5), wait_for_task(&task))
-            .await
-            .expect("the worker exits after its second turn");
-        let inner = task.inner.lock();
-        assert_eq!(inner.status, TaskStatus::Completed);
-        assert!(inner.stderr.contains("turn one failed"));
-    }
-
-    /// The invariant slice 3 establishes: EVERY dispatch path that can produce
-    /// a harness worker goes through the executor seam, so when the executor
-    /// is fleetd no harness child is ever a direct daemon child.
-    ///
-    /// `spawn_with_pre_minted_id` is the path that used to bypass it (Badgey's
-    /// one-shot persona dispatch), which is why it is the one asserted here.
-    /// Two observable signatures of the seam, neither of which the old inline
-    /// spawn produced: the control lane is registered in `harness_controls`
-    /// (the seam's `WorkerHandle.control`), and the transcript location is
-    /// pinned from the spawn spec's `event_log_path` under `harness-sessions/`.
-    #[tokio::test]
-    async fn a_pre_minted_dispatch_goes_through_the_executor_seam() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        let harness_bin = root.join("seam-harness");
-        // Idle until stdin closes, so the worker is still live while we assert.
-        std::fs::write(&harness_bin, "#!/bin/sh\ncat > /dev/null\n").unwrap();
-        let mut permissions = std::fs::metadata(&harness_bin).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&harness_bin, permissions).unwrap();
-
-        let mut env = crate::util::TestEnvGuard::new();
-        env.remove("BLACKBOX_MCP_URL");
-        env.set("BRO_HARNESS_BIN", &harness_bin);
-
-        let store = Arc::new(RwLock::new(TaskStore::new()));
-        let (tail_tx, _rx) = tokio::sync::broadcast::channel(32);
-        let task = spawn_with_pre_minted_id(
-            "seam-task".to_string(),
-            SpawnTaskParams {
-                provider: Provider::Brodex,
-                args: vec!["-p".to_string(), "hello".to_string()].into(),
-                session_id: "pending".to_string(),
-                cwd: Some(root.to_string_lossy().into_owned()),
-                env_overrides: None,
-                store_dir: root.join("store"),
-                task_store: store.clone(),
-                tail_tx,
-                roster_events: None,
-                bro_label: None,
-                harness_bin: None,
-                origin: bro_core::Origin::AgentDispatch,
-            },
-        )
-        .await
-        .expect("pre-minted dispatch");
-
-        assert!(
-            harness_controls().read().contains_key("seam-task"),
-            "a seam dispatch registers its control lane; the old inline spawn did not"
-        );
-        let location = task
-            .inner
-            .lock()
-            .transcript_location
-            .clone()
-            .expect("the seam pins a transcript location from the spec");
-        assert!(
-            location.path.to_string_lossy().contains("harness-sessions"),
-            "location must come from the spec's event_log_path: {}",
-            location.path.display()
-        );
-        // A dispatch with no provider session yet keeps the task's session_id
-        // as the placeholder while the spec uses the unique task id as its
-        // supervision key, so the location records no provider session.
-        assert_eq!(location.session_id, None);
-
-        harness_killers()
-            .read()
-            .get("seam-task")
-            .expect("a seam dispatch registers a kill switch")
-            .kill();
     }
 
     /// `Provider::Workflow` backs daemon-internal tasks and has no worker
@@ -7187,7 +6110,7 @@ mod tests {
                 tail_tx,
                 roster_events: None,
                 bro_label: None,
-                harness_bin: None,
+
                 origin: bro_core::Origin::AgentDispatch,
             },
         )
@@ -7601,7 +6524,7 @@ mod tests {
     fn cancel_resends_the_stop_to_a_terminal_task_with_a_live_worker() {
         let directory = tempfile::tempdir().unwrap();
         let store = RwLock::new(TaskStore::new());
-        let task = test_task("resend-task", TaskStatus::Failed, Provider::Brodex);
+        let task = test_task("resend-task", TaskStatus::Failed, Provider::LegacyBrodex);
         let kills = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counted = kills.clone();
         harness_killers().write().insert(
@@ -7824,49 +6747,6 @@ mod tests {
     }
 
     #[test]
-    fn control_mcp_dispatch_args_preserves_operator_servers() {
-        // Cockpit origin end-to-end: fleet.json beside the selected config
-        // (BLACKBOX_CONFIG keys the lookup, keeping the test off the host's
-        // real config) lands in the dispatch argv as `--mcp-config`, and
-        // build_harness_mcp_config merges it with the transient blackbox
-        // server, the same consumption the child spawn path runs.
-        let dir = tempfile::tempdir().unwrap();
-        let config_path = dir.path().join("config.toml");
-        std::fs::write(&config_path, "").unwrap();
-        std::fs::write(
-            dir.path().join("fleet.json"),
-            serde_json::json!({
-                "mcpServers": {
-                    "tmux": {"type": "stdio", "command": "tmux-mcp"}
-                }
-            })
-            .to_string(),
-        )
-        .unwrap();
-        let mut env = crate::util::TestEnvGuard::new();
-        env.set("BLACKBOX_CONFIG", config_path.to_str().unwrap());
-        env.set("BLACKBOX_MCP_NAME", "selfbox");
-
-        for origin in [bro_core::Origin::Control, bro_core::Origin::Cockpit] {
-            let mut args = control_mcp_dispatch_args(Provider::Glm, origin);
-            assert_eq!(args[0], "--mcp-config");
-
-            let config = build_harness_mcp_config(
-                &mut args,
-                None,
-                Some("http://127.0.0.1:7264/mcp?surface=default"),
-                false,
-            )
-            .unwrap()
-            .unwrap();
-            let config: Value = serde_json::from_str(&config).unwrap();
-            assert!(args.is_empty(), "--mcp-config consumed from argv");
-            assert!(config["mcpServers"]["tmux"].is_object());
-            assert!(config["mcpServers"]["selfbox"].is_object());
-        }
-    }
-
-    #[test]
     fn protocol_task_snapshot_maps_status_and_error() {
         // Completed task → wire Completed, last_message carried, no error.
         let t = test_task("t1", TaskStatus::Completed, Provider::Glm);
@@ -7933,7 +6813,7 @@ mod tests {
         .unwrap();
 
         // test_task sets session_id = "sess-<id>".
-        let task = test_task("t-loc", TaskStatus::Completed, Provider::Brodex);
+        let task = test_task("t-loc", TaskStatus::Completed, Provider::LegacyBrodex);
         assert!(task.inner.lock().transcript_location.is_none());
 
         populate_transcript_handle(&task);
@@ -7945,7 +6825,7 @@ mod tests {
             .expect("harness task resolves its event-log transcript location");
         assert_eq!(
             location.source,
-            crate::transcripts::types::TranscriptSource::Harness(Provider::Brodex)
+            crate::transcripts::types::TranscriptSource::Harness(Provider::LegacyBrodex)
         );
         assert_eq!(location.path, log_path);
         assert_eq!(location.session_id.as_deref(), Some("sess-t-loc"));
@@ -8186,7 +7066,7 @@ mod tests {
         let expected = default_task_name_from_prompt(prompt).unwrap();
         assert_eq!(expected.chars().count(), DEFAULT_TASK_NAME_CHARS);
 
-        let task = test_task("task-name", TaskStatus::Completed, Provider::Brodex);
+        let task = test_task("task-name", TaskStatus::Completed, Provider::LegacyBrodex);
         task_store
             .write()
             .insert("task-name".to_string(), task.clone())
@@ -8225,7 +7105,7 @@ mod tests {
         let task = test_task(
             "task-dispatch-model",
             TaskStatus::Completed,
-            Provider::Brodex,
+            Provider::LegacyBrodex,
         );
         task_store
             .write()
@@ -8342,7 +7222,7 @@ mod tests {
         store
             .insert(
                 id.into(),
-                test_task(id, TaskStatus::Completed, Provider::Brodex),
+                test_task(id, TaskStatus::Completed, Provider::LegacyBrodex),
             )
             .unwrap();
         let rows: Vec<Value> =
@@ -8406,7 +7286,7 @@ mod tests {
                 loaded
                     .insert_reserved(
                         id.into(),
-                        test_task(id, TaskStatus::Running, Provider::Brodex)
+                        test_task(id, TaskStatus::Running, Provider::LegacyBrodex)
                     )
                     .is_err()
             );
@@ -8463,14 +7343,14 @@ mod tests {
             assert!(matches!(
                 loaded.insert(
                     "new-task".into(),
-                    test_task("new-task", TaskStatus::Completed, Provider::Brodex)
+                    test_task("new-task", TaskStatus::Completed, Provider::LegacyBrodex)
                 ),
                 Err(BroSpawnError::TaskStoreUnavailable)
             ));
             assert!(matches!(
                 loaded.insert_reserved(
                     "new-task".into(),
-                    test_task("new-task", TaskStatus::Completed, Provider::Brodex)
+                    test_task("new-task", TaskStatus::Completed, Provider::LegacyBrodex)
                 ),
                 Err(BroSpawnError::TaskStoreUnavailable)
             ));
@@ -8497,7 +7377,7 @@ mod tests {
         let result = spawn_with_pre_minted_id(
             "refused-task".into(),
             SpawnTaskParams {
-                provider: Provider::Brodex,
+                provider: Provider::LegacyBrodex,
                 args: vec![].into(),
                 session_id: "refused-session".into(),
                 cwd: None,
@@ -8507,7 +7387,7 @@ mod tests {
                 tail_tx,
                 roster_events: None,
                 bro_label: None,
-                harness_bin: None,
+
                 origin: bro_core::Origin::Cockpit,
             },
         )
@@ -8548,11 +7428,13 @@ mod tests {
         let root = tmp.path().canonicalize().unwrap();
         let mut rows = Vec::new();
         for (id, provider, origin, owned) in [
-            ("current", "brodex", "cockpit", false),
+            ("current", "codex", "cockpit", false),
             ("legacy-workflow-provider", "workflow", "unknown", false),
             ("legacy-workflow-origin", "glm", "workflow", false),
             ("legacy-atom", "glm", "atom", false),
             ("legacy-owned", "brodex", "unknown", true),
+            ("retired-brodex", "brodex", "unknown", false),
+            ("retired-vibe", "vibebh", "unknown", false),
         ] {
             let mut row = persisted_task_fixture(id);
             row["provider"] = json!(provider);
@@ -8585,6 +7467,15 @@ mod tests {
                 assert!(!inner.workflow_owned);
                 assert!(inner.recoverable);
                 assert!(inner.stderr.contains("bro_resume"));
+            } else if id.starts_with("retired-") {
+                assert!(!inner.workflow_owned);
+                assert!(!inner.recoverable);
+                assert!(inner.stderr.contains("runtime is retired"));
+                assert!(!inner.stderr.contains("bro_resume"));
+                assert_eq!(
+                    serde_json::to_value(inner.provider).unwrap(),
+                    row["provider"]
+                );
             } else {
                 assert!(inner.workflow_owned, "ownership lost for {id}");
                 assert!(
@@ -9066,7 +7957,7 @@ mod tests {
         let first = Arc::new(Task {
             inner: Mutex::new(TaskInner {
                 id: "task-known".to_string(),
-                provider: Provider::Brodex,
+                provider: Provider::LegacyBrodex,
                 session_id: "session-a".to_string(),
                 events: EventRing::new(),
                 model: None,
@@ -9107,7 +7998,7 @@ mod tests {
         let second = Arc::new(Task {
             inner: Mutex::new(TaskInner {
                 id: "task-known".to_string(),
-                provider: Provider::Brodex,
+                provider: Provider::LegacyBrodex,
                 session_id: "session-b".to_string(),
                 events: EventRing::new(),
                 model: None,
@@ -9293,7 +8184,13 @@ mod tests {
         evt["seq"] = json!(7);
         let task = mk_ingest_task("instruction-timeout", "fixture-session");
         let (tx, _) = tokio::sync::broadcast::channel(16);
-        ingest_harness_event(&task, Provider::Brodex, evt, &tx, "instruction-timeout");
+        ingest_harness_event(
+            &task,
+            Provider::LegacyBrodex,
+            evt,
+            &tx,
+            "instruction-timeout",
+        );
         assert_eq!(task.inner.lock().status, TaskStatus::Running);
         let status = mcp_task_status_json(&task, "summary", None, None, 5, false).unwrap();
         let recent = status["recentEvents"].as_array().unwrap();
@@ -9315,7 +8212,7 @@ mod tests {
     fn latest_assistant_preview_tracks_streams_without_replacing_the_result() {
         let task = mk_ingest_task("preview", "session-preview");
         let (tx, _) = tokio::sync::broadcast::channel(16);
-        let feed = |evt| ingest_harness_event(&task, Provider::Brodex, evt, &tx, "preview");
+        let feed = |evt| ingest_harness_event(&task, Provider::LegacyBrodex, evt, &tx, "preview");
         for text in ["Opening plan", "Latest findings"] {
             feed(
                 json!({"type":"stream_event", "event":{"type":"content_block_start", "content_block":{"type":"text", "text":""}}}),
@@ -9355,7 +8252,7 @@ mod tests {
         for text in ["Opening plan", "Final findings"] {
             ingest_harness_event(
                 &task,
-                Provider::Brodex,
+                Provider::LegacyBrodex,
                 json!({"type":"assistant", "message":{"content":[{"type":"text", "text":text}]}}),
                 &tx,
                 "preview-persist",
@@ -9488,12 +8385,12 @@ mod tests {
         let root = dir.path().canonicalize().unwrap();
         let task = mk_ingest_task("task-pending-location", "pending");
         task.inner.lock().transcript_location =
-            harness_transcript_location(Provider::Brodex, &root, "pending", Some("/repo"));
+            harness_transcript_location(Provider::LegacyBrodex, &root, "pending", Some("/repo"));
         let (tx, _rx) = tokio::sync::broadcast::channel(16);
 
         ingest_harness_event(
             &task,
-            Provider::Brodex,
+            Provider::LegacyBrodex,
             serde_json::json!({
                 "type": "system",
                 "subtype": "init",
@@ -9615,7 +8512,7 @@ mod tests {
         let task = Arc::new(Task {
             inner: Mutex::new(TaskInner {
                 id: "task-reserved".to_string(),
-                provider: Provider::Brodex,
+                provider: Provider::LegacyBrodex,
                 session_id: "session-a".to_string(),
                 events: EventRing::new(),
                 model: None,
@@ -9676,7 +8573,7 @@ mod tests {
         let task = spawn_with_pre_minted_id(
             "task-known-id".to_string(),
             SpawnTaskParams {
-                provider: Provider::Brodex,
+                provider: Provider::LegacyBrodex,
                 args: Vec::new().into(),
                 session_id: "observed-session".to_string(),
                 cwd: None,
@@ -9686,7 +8583,7 @@ mod tests {
                 tail_tx,
                 roster_events: None,
                 bro_label: None,
-                harness_bin: None,
+
                 // The legacy `spawn_with_pre_minted_id_tracks_known_id`
                 // test predates Slice 1b; pin origin to a sentinel
                 // value so a regression that drops the origin on
@@ -9818,294 +8715,6 @@ mod tests {
         assert_eq!(super::worktree_base_repo(&bad), None);
     }
 
-    #[test]
-    fn ambient_tool_defaults_need_a_dispatch_cwd() {
-        // Session, task and bro ids carry no tool default of their own.
-        let ctx = AmbientContext {
-            session_id: Some("sess-abc".into()),
-            task_id: Some("task-abc".into()),
-            bro_name: Some("executor".into()),
-            ..Default::default()
-        };
-        assert!(ctx.tool_arg_defaults().is_none());
-
-        // Blank ids are withheld, not emitted as empty defaults.
-        let blank = AmbientContext {
-            task_id: Some("  ".into()),
-            project_dir: Some("".into()),
-            ..Default::default()
-        };
-        assert!(blank.tool_arg_defaults().is_none());
-    }
-
-    #[test]
-    fn tool_default_dispatch_merge_preserves_json_types() {
-        let ambient = BTreeMap::from([("default:fixture.label".into(), "false".into())]);
-        let brofile = BTreeMap::from([("default:fixture.limit".into(), serde_json::json!(10))]);
-        let dispatch = BTreeMap::from([
-            ("default:fixture.limit".into(), serde_json::json!(20)),
-            ("default:fixture.enabled".into(), serde_json::json!(true)),
-        ]);
-        let merged =
-            merge_tool_arg_defaults(Some(ambient), Some(&brofile), Some(&dispatch)).unwrap();
-        let wire: serde_json::Value =
-            serde_json::from_str(&serde_json::to_string(&merged).unwrap()).unwrap();
-        assert_eq!(wire["default:fixture.label"], "false");
-        assert_eq!(wire["default:fixture.limit"], 20);
-        assert_eq!(wire["default:fixture.enabled"], true);
-    }
-
-    #[test]
-    fn tool_arg_defaults_merge_ambient_only() {
-        let ambient = BTreeMap::from([("default:fixture.session_id".into(), "sess-1".into())]);
-        assert_eq!(
-            merge_tool_arg_defaults(Some(ambient.clone()), None, None),
-            Some(
-                ambient
-                    .into_iter()
-                    .map(|(key, value)| (key, serde_json::Value::String(value)))
-                    .collect()
-            )
-        );
-    }
-
-    #[test]
-    fn tool_arg_defaults_merge_brofile_overlay() {
-        let ambient = BTreeMap::from([
-            ("default:fixture.session_id".into(), "sess-1".into()),
-            (
-                "default:rust.moveStructFields.acknowledge_repr".into(),
-                "false".into(),
-            ),
-        ]);
-        let brofile = BTreeMap::from([
-            (
-                "default:rust.moveStructFields.acknowledge_repr".into(),
-                "true".into(),
-            ),
-            (
-                "default:rust.migrateErrorType.acknowledge_public_api_change".into(),
-                "true".into(),
-            ),
-        ]);
-        let merged = merge_tool_arg_defaults(Some(ambient), Some(&brofile), None).unwrap();
-        assert_eq!(
-            merged
-                .get("default:rust.moveStructFields.acknowledge_repr")
-                .and_then(serde_json::Value::as_str),
-            Some("true")
-        );
-        assert_eq!(
-            merged
-                .get("default:fixture.session_id")
-                .and_then(serde_json::Value::as_str),
-            Some("sess-1")
-        );
-        assert_eq!(
-            merged
-                .get("default:rust.migrateErrorType.acknowledge_public_api_change")
-                .and_then(serde_json::Value::as_str),
-            Some("true")
-        );
-    }
-
-    #[test]
-    fn tool_arg_defaults_merge_per_dispatch_overlay() {
-        let brofile = BTreeMap::from([(
-            "default:rust.moveStructFields.acknowledge_repr".into(),
-            "true".into(),
-        )]);
-        let per_dispatch = BTreeMap::from([(
-            "default:rust.migrateTypeUsages.acknowledge_public_api_change".into(),
-            "true".into(),
-        )]);
-        let merged = merge_tool_arg_defaults(None, Some(&brofile), Some(&per_dispatch)).unwrap();
-        assert_eq!(
-            merged
-                .get("default:rust.moveStructFields.acknowledge_repr")
-                .and_then(serde_json::Value::as_str),
-            Some("true")
-        );
-        assert_eq!(
-            merged
-                .get("default:rust.migrateTypeUsages.acknowledge_public_api_change")
-                .and_then(serde_json::Value::as_str),
-            Some("true")
-        );
-    }
-
-    #[test]
-    fn tool_arg_defaults_merge_per_dispatch_wins_conflicts() {
-        let ambient = BTreeMap::from([(
-            "default:rust.moveStructFields.acknowledge_repr".into(),
-            "ambient".into(),
-        )]);
-        let brofile = BTreeMap::from([(
-            "default:rust.moveStructFields.acknowledge_repr".into(),
-            "brofile".into(),
-        )]);
-        let per_dispatch = BTreeMap::from([(
-            "default:rust.moveStructFields.acknowledge_repr".into(),
-            "dispatch".into(),
-        )]);
-        let merged =
-            merge_tool_arg_defaults(Some(ambient), Some(&brofile), Some(&per_dispatch)).unwrap();
-        assert_eq!(
-            merged
-                .get("default:rust.moveStructFields.acknowledge_repr")
-                .and_then(serde_json::Value::as_str),
-            Some("dispatch")
-        );
-    }
-
-    #[test]
-    fn ambient_tool_defaults_scope_retrieval_reads_to_plain_repo_cwd() {
-        // Plain repo (.git directory): retrieval `project` filters default to
-        // the canonicalized dispatch cwd; no worktree pin.
-        let dir = tempfile::tempdir().unwrap();
-        let repo = dir.path().canonicalize().unwrap().join("repo");
-        std::fs::create_dir_all(repo.join(".git")).unwrap();
-        std::fs::create_dir_all(repo.join("src")).unwrap();
-        let cwd = repo.join("src");
-        let cwd_str = cwd.to_string_lossy().into_owned();
-
-        let ctx = AmbientContext {
-            project_dir: Some(cwd_str.clone()),
-            ..Default::default()
-        };
-        let defaults = ctx.tool_arg_defaults().expect("retrieval-read defaults");
-        assert!(!defaults.contains_key("pin:*.project_dir"));
-        assert!(!defaults.contains_key("pin:*.cwd"));
-        assert_eq!(
-            defaults
-                .get("default:mcp.bbox_hybrid_search.project")
-                .map(String::as_str),
-            Some(cwd_str.as_str())
-        );
-    }
-
-    #[test]
-    fn ambient_tool_defaults_align_project_dir_defaults_with_worktree_pin() {
-        // Worktree dispatch from a subdir: the `project` filter defaults to
-        // the canonicalized cwd (server-side scope aliasing maps it to the
-        // base project), while the worktree pin targets the canonical
-        // worktree root.
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        let (_base, wt) = fake_linked_worktree(&root);
-        let cwd = wt.join("src");
-
-        let ctx = AmbientContext {
-            project_dir: Some(cwd.to_string_lossy().into_owned()),
-            ..Default::default()
-        };
-        let defaults = ctx.tool_arg_defaults().expect("worktree defaults");
-        let pin = defaults
-            .get("pin:*.project_dir")
-            .expect("worktree pin")
-            .clone();
-        assert_eq!(pin, wt.to_string_lossy());
-        // The canonical dispatch-param name is pinned alongside the alias:
-        // the pin guards by literal key, and the table applies before the
-        // daemon's serde alias normalization (gap-6366c92d).
-        assert_eq!(
-            defaults.get("pin:*.cwd").map(String::as_str),
-            Some(pin.as_str())
-        );
-        assert_eq!(
-            defaults
-                .get("default:mcp.bbox_hybrid_search.project")
-                .map(String::as_str),
-            Some(cwd.to_string_lossy().as_ref())
-        );
-    }
-
-    #[test]
-    fn ambient_tool_defaults_never_default_write_scope_params() {
-        // §3.1 permanent exclusion (gap-ae22a6b2): `project` on the
-        // knowledge/learn write tools means *global scope* when absent
-        // and must never be mechanically filled. bbox_thread ids are also
-        // excluded: the table is per-(tool,param), not per-action, and a
-        // filled `id` would shadow name-based lookups and silently mutate
-        // the ambient thread on resolve/promote/rename.
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        let (_base, wt) = fake_linked_worktree(&root);
-        let ctx = AmbientContext {
-            session_id: Some("sess-max".into()),
-            task_id: Some("task-max".into()),
-            project_dir: Some(wt.to_string_lossy().into_owned()),
-            bro_name: Some("executor".into()),
-            thread_id: Some("thread-12345678".into()),
-            work_item_id: Some("thread-87654321".into()),
-            ..Default::default()
-        };
-        let defaults = ctx.tool_arg_defaults().expect("maximal ambient defaults");
-        for key in defaults.keys() {
-            for excluded in [
-                "bbox_knowledge",
-                "bbox_learn",
-                // bbox_gaps (list): `project` is a result filter, None = all.
-                "bbox_gaps",
-                "bbox_thread",
-            ] {
-                assert!(
-                    !key.contains(excluded),
-                    "write-scope/coordination param leaked into defaults: {key}"
-                );
-            }
-        }
-        // Every `.project` default targets a retrieval read tool or a gap
-        // write-targeting tool (gap-b94129ba), nothing else.
-        for key in defaults.keys().filter(|k| k.ends_with(".project")) {
-            assert!(
-                super::RETRIEVAL_PROJECT_DEFAULT_TOOLS
-                    .iter()
-                    .chain(super::GAP_WRITE_TARGET_DEFAULT_TOOLS)
-                    .any(|tool| key == &format!("default:mcp.{tool}.project")),
-                "unexpected .project default: {key}"
-            );
-        }
-    }
-
-    #[test]
-    fn ambient_tool_defaults_fill_gap_write_targeting_from_cwd() {
-        // gap-b94129ba: the three gap mutation tools get a `project`
-        // write-targeting default from the canonicalized dispatch cwd,
-        // gated on project_dir presence exactly like the retrieval defaults.
-        let dir = tempfile::tempdir().unwrap();
-        let repo = dir.path().canonicalize().unwrap().join("repo");
-        std::fs::create_dir_all(repo.join(".git")).unwrap();
-        let cwd_str = repo.to_string_lossy().into_owned();
-
-        let ctx = AmbientContext {
-            project_dir: Some(cwd_str.clone()),
-            ..Default::default()
-        };
-        let defaults = ctx.tool_arg_defaults().expect("gap write-target defaults");
-        for tool in ["bbox_gap", "bbox_gap_resolve", "bbox_gap_update"] {
-            assert_eq!(
-                defaults
-                    .get(&format!("default:mcp.{tool}.project"))
-                    .map(String::as_str),
-                Some(cwd_str.as_str()),
-                "missing gap write-target default for {tool}"
-            );
-        }
-        // The list tool's `project` is a result filter — never defaulted.
-        assert!(!defaults.contains_key("default:mcp.bbox_gaps.project"));
-
-        // No project_dir → no gap defaults (same gate as retrieval reads).
-        let no_cwd = AmbientContext {
-            session_id: Some("sess-1".into()),
-            ..Default::default()
-        };
-        assert!(
-            no_cwd.tool_arg_defaults().is_none(),
-            "gap defaults must be gated on project_dir presence"
-        );
-    }
-
     /// Build a linked-worktree pair under `root`: a base repo whose
     /// `.git/worktrees/wt` backs a sibling worktree `wt` (`.git` file).
     fn fake_linked_worktree(root: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
@@ -10119,63 +8728,6 @@ mod tests {
         )
         .unwrap();
         (base, wt)
-    }
-
-    #[test]
-    fn ambient_tool_defaults_pin_project_dir_for_worktree_cwd() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        let (_base, wt) = fake_linked_worktree(&root);
-
-        // Dispatch cwd is a subdir of the worktree: the pin resolves to the
-        // canonical worktree root.
-        let ctx = AmbientContext {
-            session_id: Some("sess-wt".into()),
-            project_dir: Some(wt.join("src").to_string_lossy().into_owned()),
-            ..Default::default()
-        };
-        let defaults = ctx.tool_arg_defaults().expect("worktree pin");
-        for key in ["pin:*.project_dir", "pin:*.cwd"] {
-            assert_eq!(
-                defaults.get(key).map(String::as_str),
-                Some(wt.to_string_lossy().as_ref()),
-                "missing worktree pin {key}"
-            );
-        }
-
-        // A pending session still carries the worktree pin.
-        let pending = AmbientContext {
-            session_id: Some("pending".into()),
-            project_dir: Some(wt.to_string_lossy().into_owned()),
-            ..Default::default()
-        };
-        let defaults = pending.tool_arg_defaults().expect("pin");
-        for key in ["pin:*.project_dir", "pin:*.cwd"] {
-            assert_eq!(
-                defaults.get(key).map(String::as_str),
-                Some(wt.to_string_lossy().as_ref()),
-                "missing worktree pin {key}"
-            );
-        }
-    }
-
-    #[test]
-    fn ambient_tool_defaults_no_pin_for_plain_repo_cwd() {
-        // Plain repo (.git directory): a primary checkout dispatch must never
-        // get a project_dir pin.
-        let dir = tempfile::tempdir().unwrap();
-        let repo = dir.path().canonicalize().unwrap().join("repo");
-        std::fs::create_dir_all(repo.join(".git")).unwrap();
-        std::fs::create_dir_all(repo.join("src")).unwrap();
-
-        let ctx = AmbientContext {
-            session_id: Some("sess-plain".into()),
-            project_dir: Some(repo.join("src").to_string_lossy().into_owned()),
-            ..Default::default()
-        };
-        let defaults = ctx.tool_arg_defaults().expect("retrieval default");
-        assert!(!defaults.contains_key("pin:*.project_dir"));
-        assert!(!defaults.contains_key("pin:*.cwd"));
     }
 
     #[test]
@@ -10205,33 +8757,6 @@ mod tests {
             super::worktree_pin_target_with_roots(root.to_str().unwrap(), &[root.clone()]),
             None
         );
-    }
-
-    #[test]
-    fn project_dir_pin_glob_is_safe_for_project_scoped_tools() {
-        // `pin:*.cwd` / `pin:*.project_dir` glob every tool's `cwd` /
-        // `project_dir` params. That is safe
-        // (design/bro-harness/tool-arg-defaulting.md §3.1) because the
-        // project-scoped coordination tools take `project`, not
-        // `cwd`/`project_dir` — absence there means *global scope* and must
-        // stay free. Tripwire: if these adapters ever grow a `cwd` or
-        // `project_dir` param, re-check the globs before shipping.
-        for (name, src) in [
-            ("knowledge", include_str!("../tools/knowledge.rs")),
-            ("threads", include_str!("../tools/threads.rs")),
-        ] {
-            // Param-shaped matches only: the resolver attachment view's
-            // `checkout_project_dir` field (phase-2 §9.2) is internal data,
-            // not a wire param the pin glob could set.
-            assert!(
-                !src.contains("\"project_dir\"") && !src.contains("project_dir: Option<String>"),
-                "src/tools/{name}.rs now carries a project_dir param; re-check pin:*.project_dir glob safety"
-            );
-            assert!(
-                !src.contains("\"cwd\"") && !src.contains("cwd: Option<String>"),
-                "src/tools/{name}.rs now carries a cwd param; re-check pin:*.cwd glob safety"
-            );
-        }
     }
 
     #[test]
@@ -10544,7 +9069,7 @@ mod tests {
         let task = Arc::new(Task {
             inner: Mutex::new(TaskInner {
                 id: "t2".into(),
-                provider: Provider::Brodex,
+                provider: Provider::LegacyBrodex,
                 session_id: "s2".into(),
                 events: EventRing::new(),
                 model: None,
@@ -10794,7 +9319,7 @@ mod tests {
     fn successful_enter_worktree_updates_task_cwd() {
         let mut inner = TaskInner {
             id: "t5".into(),
-            provider: Provider::Brodex,
+            provider: Provider::LegacyBrodex,
             session_id: "s1".into(),
             events: EventRing::from_loaded(vec![serde_json::json!({
                 "type": "assistant",
@@ -10855,7 +9380,7 @@ mod tests {
     fn successful_exit_worktree_with_removed_worktree_restores_base_cwd() {
         let mut inner = TaskInner {
             id: "t6".into(),
-            provider: Provider::Brodex,
+            provider: Provider::LegacyBrodex,
             session_id: "s1".into(),
             events: EventRing::from_loaded(vec![serde_json::json!({
                 "type": "assistant",
@@ -11240,7 +9765,7 @@ mod async_tests {
         let task = Arc::new(Task {
             inner: Mutex::new(TaskInner {
                 id: "t-session".into(),
-                provider: Provider::Brodex,
+                provider: Provider::LegacyBrodex,
                 session_id: "pending".into(),
                 events: EventRing::new(),
                 model: None,
@@ -11293,7 +9818,7 @@ mod async_tests {
         let task = Arc::new(Task {
             inner: Mutex::new(TaskInner {
                 id: "t-session-terminal".into(),
-                provider: Provider::Brodex,
+                provider: Provider::LegacyBrodex,
                 session_id: "pending".into(),
                 events: EventRing::new(),
                 model: None,

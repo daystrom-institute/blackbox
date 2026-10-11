@@ -110,7 +110,7 @@ that the cluster build/converge path deploys (see "Where Heavy Work Runs" in
 This phase never builds, installs or restarts `blackboxd`, and it copies no
 system memories (they ship in the daemon's runtime image). It rebuilds the
 checkout-host satellites and CLIs from the beta code and reinstalls them:
-`bro`, `bro-harness`, `fleetd`, `bbox-code-collector`,
+`bro`, `fleetd`, `bbox-code-collector`,
 `bbox-transcript-collector`, and the offline `blackbox` CLI.
 
 First record the build id of the installed `fleetd`; F4 uses it to decide
@@ -121,13 +121,13 @@ whether `fleetd` changed:
 ```
 
 ```bash
-cargo build --release -p bro-cli -p bro-harness -p fleetd \
+cargo build --release -p bro-cli -p fleetd \
   -p bbox-code-collector -p bbox-transcript-collector
 cargo build --release --bin blackbox   # offline blackbox CLI (root package)
 
-ls -l target/release/{bro,bro-harness,fleetd,bbox-code-collector,bbox-transcript-collector,blackbox}   # ALL SIX must exist, freshly built
+ls -l target/release/{bro,fleetd,bbox-code-collector,bbox-transcript-collector,blackbox}   # ALL FIVE must exist, freshly built
 
-install -m 755 target/release/{bro,bro-harness,fleetd} ~/.local/bin/
+install -m 755 target/release/{bro,fleetd} ~/.local/bin/
 install -m 755 target/release/{bbox-code-collector,bbox-transcript-collector} ~/.local/bin/
 install -m 755 target/release/blackbox ~/.local/bin/
 ```
@@ -147,7 +147,7 @@ An unsigned satellite fails its first daemon dial on a TCC prompt you never
 see:
 
 ```bash
-for bin in bro bro-harness fleetd bbox-code-collector bbox-transcript-collector blackbox; do
+for bin in bro fleetd bbox-code-collector bbox-transcript-collector blackbox; do
   stablesign ~/.local/bin/$bin
 done
 codesign --verify --strict --verbose=2 ~/.local/bin/bbox-transcript-collector
@@ -218,7 +218,6 @@ launchctl kickstart -k "gui/$(id -u)/com.daystrom.fleetd"
 ```
 
 If the operator declines, leave it running and report the deferral.
-`bro-harness` needs no restart: new sessions pick up the new binary.
 
 Finally, check the deployed daemon (not a localhost port):
 
@@ -236,9 +235,9 @@ Return a tight summary:
   true orphans (path + branch + `beta/blackbox-v2..branch` commit count), fleet
   worktrees (listed, untouched).
 - **Disk:** `target/` size before → after clean; total reclaimed.
-- **Installed:** `bro --version` / `fleetd --version` / `bro-harness`
+- **Installed:** `bro --version` / `fleetd --version`
   version, PLUS the install mtimes
-  (`ls -l ~/.local/bin/{bro,bro-harness,fleetd,bbox-code-collector,bbox-transcript-collector,blackbox}`):
+  (`ls -l ~/.local/bin/{bro,fleetd,bbox-code-collector,bbox-transcript-collector,blackbox}`):
   all six must postdate this cleaning run; `--version` alone cannot detect a
   stale binary. Include the `codesign --verify` result.
 - **Services:** collectors restarted (pre/post pids from `launchctl print`) or

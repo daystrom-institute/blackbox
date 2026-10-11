@@ -1118,10 +1118,10 @@ pub(crate) async fn admin_brofile_upsert(
     // so existing ones are carried over and named in the response; a rewrite
     // must not silently lift them. An unreadable existing brofile is not
     // overwritten.
-    let (filters, edit_discipline) =
+    let filters =
         match orchestration::brofile::read_brofile(&req.name, "global", &state.store_dir, None) {
-            Ok(Some(existing)) => (existing.filters, existing.edit_discipline),
-            Ok(None) => (None, None),
+            Ok(Some(existing)) => existing.filters,
+            Ok(None) => None,
             Err(e) => {
                 return (
                     axum::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -1145,16 +1145,12 @@ pub(crate) async fn admin_brofile_upsert(
         coerce_workspace: None,
         runtime: None,
         context: None,
-        code_mode: None,
-        edit_discipline,
+
         service_tier: req.service_tier,
     };
     let mut kept = Vec::new();
     if bf.filters.is_some() {
         kept.push("filters");
-    }
-    if bf.edit_discipline.is_some() {
-        kept.push("edit_discipline");
     }
     if let Err(e) = orchestration::brofile::save_brofile(&bf, "global", &state.store_dir, None) {
         return (
@@ -1173,9 +1169,9 @@ mod tests {
     use crate::server::state::BlackboxServer;
 
     #[tokio::test]
-    async fn admin_brofile_upsert_keeps_existing_filters_and_edit_discipline() {
+    async fn admin_brofile_upsert_keeps_existing_filters() {
         use axum::response::IntoResponse;
-        use orchestration::brofile::{EditDiscipline, read_brofile, save_brofile};
+        use orchestration::brofile::{read_brofile, save_brofile};
         let tmp = tempfile::tempdir().unwrap();
         let state = Arc::new(SharedState::for_test(tmp.path()));
         let upsert = |model: &'static str, name: &'static str| {
@@ -1205,10 +1201,10 @@ mod tests {
                 .unwrap()
         };
 
-        // A brofile created by the route carries neither restriction.
+        // A new brofile has no filter restriction.
         assert_eq!(upsert("first-model", "plain").await["kept"], json!([]));
         let plain = stored("plain");
-        assert!(plain.filters.is_none() && plain.edit_discipline.is_none());
+        assert!(plain.filters.is_none());
 
         // Filters survive a rewrite of the other fields, and the response
         // says so.
@@ -1229,21 +1225,6 @@ mod tests {
             rewritten.filters.unwrap().disallow,
             vec!["glob".to_string()]
         );
-        assert_eq!(rewritten.edit_discipline, None);
-
-        // So does an edit discipline.
-        let mut strict = plain.clone();
-        strict.name = "strict".to_string();
-        strict.edit_discipline = Some(EditDiscipline::Structured);
-        save_brofile(&strict, "global", &state.store_dir, None).unwrap();
-        assert_eq!(
-            upsert("third-model", "strict").await["kept"],
-            json!(["edit_discipline"])
-        );
-        let rewritten = stored("strict");
-        assert_eq!(rewritten.model.as_deref(), Some("third-model"));
-        assert_eq!(rewritten.edit_discipline, Some(EditDiscipline::Structured));
-        assert!(rewritten.filters.is_none());
     }
 
     fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {

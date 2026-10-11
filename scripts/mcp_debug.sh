@@ -33,7 +33,7 @@ usage() {
     "  list-tools                    Call tools/list" \
     "  call <tool> [json-args]       Call an MCP tool, default args {}" \
     "  raw <json-rpc-payload>        POST a raw JSON-RPC payload on the session" \
-    "  brodex-high <prompt>          Convenience bro_exec against this debug daemon"
+    "  codex-high <prompt>          Convenience bro_exec against this debug daemon"
 }
 
 require_jq() {
@@ -425,7 +425,7 @@ sandbox_audit() {
     start >/dev/null
   fi
 
-  local provider="${1:-brodex}"
+  local provider="${1:-codex}"
   local project_dir="${2:-$ROOT}"
   local tail_count="${3:-80}"
   local prompt payload response task_id
@@ -434,7 +434,7 @@ sandbox_audit() {
     --arg provider "$provider" \
     --arg project_dir "$project_dir" \
     --arg prompt "$prompt" \
-    '{provider:$provider,project_dir:$project_dir,coerce_workspace:true,prompt:$prompt}')"
+    '{provider:$provider,project_dir:$project_dir,prompt:$prompt}')"
 
   response="$(call_tool_text bro_exec "$payload")"
   printf '%s\n' "$response" > "$STATE_DIR/last-sandbox-audit-exec.json"
@@ -452,11 +452,11 @@ sandbox_audit() {
   printf '\nRe-run later: %q observe %q %q\n' "$0" "$task_id" "$tail_count"
 }
 
-brodex_high() {
+codex_high() {
   require_jq
   local prompt="${1:?prompt required}"
   local payload
-  payload="$(jq -cn --arg prompt "$prompt" '{provider:"brodex",model:"gpt-5.5",effort:"high",prompt:$prompt}')"
+  payload="$(jq -cn --arg prompt "$prompt" '{provider:"codex",model:"gpt-5.5",effort:"high",prompt:$prompt}')"
   call_tool bro_exec "$payload"
 }
 
@@ -503,9 +503,9 @@ case "$cmd" in
     shift
     raw "${1:?json-rpc payload required}"
     ;;
-  brodex-high)
+  codex-high)
     shift
-    brodex_high "$*"
+    codex_high "$*"
     ;;
   ""|-h|--help|help)
     usage

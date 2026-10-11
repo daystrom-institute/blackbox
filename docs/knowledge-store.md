@@ -120,7 +120,7 @@ use `bbox_thread_list` and `bbox_thread`.
 ## Render
 
 Project render publishes standing memory through the checkout owner.
-In a managed bro-harness session bound to that checkout:
+In a managed provider session bound to that checkout:
 
 ```text
 bbox_render(scope="project", project="<project-selector>")
@@ -226,7 +226,7 @@ existing generated-file ownership check.
 
 Global render plans use wire kind `bbox.global_render_plan.v2`; project render
 transport uses version 2. Upgrade the daemon, `bro` global-render client, and
-`bro-harness` checkout renderer together: older versions cannot safely interpret the satellite contract.
+checkout-owner renderer together: older versions cannot safely interpret the satellite contract.
 `bro render global` assembles checksum-bound pages before writing any files;
 a stale generation restarts delivery from page one, with bounded retries.
 Project receipts and drift checks cover satellites as well as entrypoints.

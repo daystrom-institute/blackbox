@@ -19,13 +19,7 @@ reindex_interval_secs = 120
 [provenance]
 git_notes_namespace = "bb"
 
-[lsp]
-idle_timeout_secs = 600
-request_timeout_secs = 30
-jdtls_init_timeout_secs = 60
-rust_analyzer_init_timeout_secs = 60
 
-# Path overrides for dev instance
 [paths]
 # Use absolute path or ~/... (tilde will be expanded relative to $HOME)
 state_dir = "~/.local/state/blackbox-dev"

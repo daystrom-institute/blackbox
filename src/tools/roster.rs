@@ -323,21 +323,15 @@ impl BlackboxServer {
                     lens: p.lens.clone(),
                     model: p.model.clone(),
                     effort: p.effort.clone(),
-                    tool_defaults: p.tool_defaults.clone(),
+                    tool_defaults: None,
                     filters,
                     surface: p.surface.clone(),
                     coerce_workspace: p.coerce_workspace,
                     runtime: None,
                     context: p.context.clone(),
-                    code_mode: p.code_mode,
-                    edit_discipline: p.edit_discipline,
                     service_tier: p.service_tier.clone(),
                 };
-                if let Some(discipline) = bf.edit_discipline
-                    && let Err(error) = discipline.check_code_mode(bf.code_mode)
-                {
-                    return Self::err_text(&error);
-                }
+
                 if let Err(e) = brofile::save_brofile(&bf, scope, store_dir, project_dir) {
                     return Self::err_text(&format!("brofile save failed: {e}"));
                 }
@@ -663,13 +657,10 @@ fn validate_brofile_params(p: &BrofileParams) -> anyhow::Result<()> {
             || (p.lens.is_none()
                 && p.model.is_none()
                 && p.effort.is_none()
-                && p.tool_defaults.is_none()
                 && p.allow_tools.is_none()
                 && p.disallow_tools.is_none()
                 && p.surface.is_none()
                 && p.context.is_none()
-                && p.code_mode.is_none()
-                && p.edit_discipline.is_none()
                 && p.service_tier.is_none()),
         "persona configuration fields require action=create"
     );
@@ -792,9 +783,9 @@ mod tests {
             let args = match action {
                 "set_account" => json!({"action":action,"name":"synthetic"}),
                 "set_provider_default" => {
-                    json!({"action":action,"provider":"brodex","account":"synthetic"})
+                    json!({"action":action,"provider":"codex","account":"synthetic"})
                 }
-                _ => json!({"action":action,"provider":"brodex"}),
+                _ => json!({"action":action,"provider":"codex"}),
             };
             let params: BrofileParams = serde_json::from_value(args).unwrap();
             let result = server.bro_brofile_sync(Parameters(params));
@@ -829,7 +820,7 @@ mod tests {
         for args in [
             json!({"action":"list_accounts"}),
             json!({"action":"get_account","name":"synthetic"}),
-            json!({"action":"get_provider_default","provider":"brodex"}),
+            json!({"action":"get_provider_default","provider":"codex"}),
             json!({"action":"list_provider_defaults"}),
         ] {
             let reply = server.bro_brofile_sync(Parameters(serde_json::from_value(args).unwrap()));
@@ -860,7 +851,7 @@ mod tests {
                 args["name"] = json!("synthetic");
             }
             if action == "create" {
-                args["provider"] = json!("brodex");
+                args["provider"] = json!("codex");
             }
             let reply = server.bro_brofile_sync(Parameters(serde_json::from_value(args).unwrap()));
             assert_eq!(reply.is_error, Some(true));
@@ -875,7 +866,7 @@ mod tests {
         let account = "synthetic-界\"".repeat(4000);
         let reply = server.bro_brofile_sync(Parameters(
             serde_json::from_value(json!({
-                "action":"set_provider_default","provider":"brodex","account":account
+                "action":"set_provider_default","provider":"codex","account":account
             }))
             .unwrap(),
         ));
@@ -885,7 +876,7 @@ mod tests {
         let mut recovered = String::new();
         loop {
             let reply = server.bro_brofile_sync(Parameters(serde_json::from_value(json!({
-                "action":"get_provider_default","provider":"brodex","body_limit":4096,"cursor":cursor
+                "action":"get_provider_default","provider":"codex","body_limit":4096,"cursor":cursor
             })).unwrap()));
             assert_ne!(reply.is_error, Some(true));
             assert!(serde_json::to_vec(&reply).unwrap().len() < 16 * 1024);
@@ -944,8 +935,8 @@ mod tests {
         let server = BlackboxServer::new(Arc::new(state));
         for request in [
             json!({"action":"set_account", "name":"synthetic", "env":{"TOKEN":"synthetic-secret"}}),
-            json!({"action":"set_provider_default", "provider":"brodex", "account":"synthetic"}),
-            json!({"action":"clear_provider_default", "provider":"brodex"}),
+            json!({"action":"set_provider_default", "provider":"codex", "account":"synthetic"}),
+            json!({"action":"clear_provider_default", "provider":"codex"}),
         ] {
             let action = request["action"].as_str().unwrap().to_string();
             let params: BrofileParams = serde_json::from_value(request).unwrap();
@@ -1249,22 +1240,22 @@ mod tests {
         }
         assert!(summary["glm"]["peak_usage"].is_boolean());
         assert!(summary["deepseek"]["peak_usage"].is_boolean());
-        assert!(summary["brodex"].get("peak_usage").is_none());
+        assert!(summary["codex"].get("peak_usage").is_none());
         let detail = server.bro_providers(Parameters(ProvidersParams {
-            provider: Some("brodex".into()),
+            provider: Some("codex".into()),
         }));
         let detail: Value = serde_json::from_str(&extract_text(&detail)).unwrap();
         assert_eq!(detail.as_object().unwrap().len(), 1);
         assert!(
-            detail["brodex"]["models"]
+            detail["codex"]["models"]
                 .as_array()
                 .unwrap()
                 .iter()
                 .any(|model| model["id"] == "gpt-6-astra")
         );
-        assert_eq!(detail["brodex"]["defaultModel"], "gpt-5.6-sol");
+        assert_eq!(detail["codex"]["defaultModel"], "gpt-5.6-sol");
         for local_only in ["bin", "found", "path"] {
-            assert!(detail["brodex"].get(local_only).is_none());
+            assert!(detail["codex"].get(local_only).is_none());
         }
         let workflow = server.bro_providers(Parameters(ProvidersParams {
             provider: Some("workflow".into()),
@@ -1431,7 +1422,7 @@ mod tests {
             let server = test_server(&tmp);
             server.state.roster_view.upsert(
                 "unrelated-task".into(),
-                live_summary("unrelated-task", Provider::Brodex, 1_700_000_000_000),
+                live_summary("unrelated-task", Provider::Codex, 1_700_000_000_000),
             );
             for input in [
                 json!({"provider": "typo"}),
@@ -1557,7 +1548,7 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             let server = test_server(&tmp);
             let t = 1_700_000_000_000_u64;
-            let mut interrupted = terminal_summary("interrupted", Provider::Brodex, t, t + 1000);
+            let mut interrupted = terminal_summary("interrupted", Provider::Codex, t, t + 1000);
             interrupted.status = WireTaskStatus::Cancelled;
             interrupted.interrupted = true;
             interrupted.last_message_snippet = Some("partial output".to_string());

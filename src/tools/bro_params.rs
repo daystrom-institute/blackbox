@@ -1,7 +1,6 @@
 use crate::orchestration;
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 
 // ---------------------------------------------------------------------------
 // Bro tools (orchestration)
@@ -30,8 +29,7 @@ pub(crate) struct ExecParams {
     #[serde(default)]
     pub(crate) provider: Option<String>,
     /// Working directory for the dispatched session (absolute path). `cwd`
-    /// is the canonical name (the contract-bottom dispatch name,
-    /// design/bro-harness/tool-arg-defaulting.md §4); `project_dir` is
+    /// is the canonical name; `project_dir` is
     /// accepted as a deprecated alias for older callers and recordings.
     #[serde(default, alias = "project_dir")]
     pub(crate) cwd: Option<String>,
@@ -49,16 +47,7 @@ pub(crate) struct ExecParams {
     /// surfaced dotted form (`mcp__blackbox__.bro_*`).
     #[serde(default)]
     pub(crate) disallow_tools: Option<Vec<String>>,
-    /// Per-dispatch MCP placement map for standalone harness providers.
-    /// Keys are fully-qualified MCP names (`mcp__server__tool`); values are
-    /// `in-box`, `out-box`, or `both`.
-    #[serde(default)]
-    pub(crate) tool_placement: Option<BTreeMap<String, String>>,
-    /// Per-dispatch tool argument defaults with explicit JSON values (strings stay strings).
-    /// These override both ambient and
-    /// brofile defaults for this invocation only.
-    #[serde(default)]
-    pub(crate) tool_defaults: Option<BTreeMap<String, serde_json::Value>>,
+
     /// Retired compatibility flag, not part of the caller schema.
     #[serde(skip_deserializing)]
     #[schemars(skip)]
@@ -111,27 +100,7 @@ pub(crate) struct ExecParams {
     /// and uses availability scoring.
     #[serde(default)]
     pub(crate) selection_policy: Option<serde_json::Value>,
-    /// Per-dispatch code-mode override (`off`/`optional`/`only`) for
-    /// harness-backed providers. Overrides the resolved brofile's `code_mode`;
-    /// unset → brofile value, else harness default (`optional`). This is the
-    /// lane the Fleet TUI `/config` toggle rides for new roster dispatches.
-    #[serde(default)]
-    pub(crate) code_mode: Option<orchestration::brofile::CodeMode>,
-    /// Edit discipline for the session: `free` (default) or `structured`.
-    /// `structured` refuses the raw edit tools (`file_edit`, `file_write`,
-    /// `apply_patch`) flat, deferred and inside `exec` cells; edits go
-    /// through `edits.*`. It requires a code surface, so it is refused with
-    /// `code_mode: off`. The session keeps the value across resume. A
-    /// per-dispatch value overrides the brofile.
-    #[serde(default)]
-    pub(crate) edit_discipline: Option<orchestration::brofile::EditDiscipline>,
-    /// Absolute path of the harness binary to launch for this session
-    /// instead of the configured one, on the executing host. Accepted only
-    /// on the `ops` surface. The session
-    /// keeps the binary across resume; a path that is missing or not
-    /// executable fails the dispatch with `harness_bin_unavailable`.
-    #[serde(default)]
-    pub(crate) harness_bin: Option<String>,
+
     /// Per-dispatch service tier for support providers. `priority` is Codex
     /// `/fast`; `default` clears back to backend default. Overrides the
     /// resolved brofile's `service_tier`.
@@ -174,7 +143,7 @@ pub(crate) struct ResumeParams {
     /// deprecated alias.
     #[serde(default, alias = "project_dir")]
     pub(crate) cwd: Option<String>,
-    /// Per-resume service tier override. For Brodex, `priority` is fast mode
+    /// Per-resume service tier override. For Codex, `priority` is fast mode
     /// and `default` is the standard-routing sentinel persisted by the harness.
     /// When absent, resume defers to the brofile/session/harness default.
     #[serde(default)]
@@ -198,10 +167,7 @@ pub(crate) struct ResumeParams {
     /// surfaced dotted form (`mcp__blackbox__.bro_*`).
     #[serde(default)]
     pub(crate) disallow_tools: Option<Vec<String>>,
-    /// Per-dispatch tool argument defaults. These override ambient defaults
-    /// and named-bro defaults for this resumed invocation.
-    #[serde(default)]
-    pub(crate) tool_defaults: Option<BTreeMap<String, serde_json::Value>>,
+
     /// Retired compatibility flag, not part of the caller schema.
     #[serde(skip_deserializing)]
     #[schemars(skip)]
@@ -530,9 +496,7 @@ pub(crate) struct BrofileParams {
     pub(crate) effort: Option<String>,
     #[serde(default)]
     pub(crate) env: Option<std::collections::HashMap<String, String>>,
-    /// Durable tool argument defaults embedded in the brofile.
-    #[serde(default)]
-    pub(crate) tool_defaults: Option<BTreeMap<String, serde_json::Value>>,
+
     /// Brofile store to address: global (default) or project. list/get read
     /// only the selected store; project requires project_dir, and global
     /// rejects it. Unknown scopes are refused before any store access.
@@ -563,7 +527,7 @@ pub(crate) struct BrofileParams {
     pub(crate) disallow_tools: Option<Vec<String>>,
     /// Optional tool-surface selector embedded in the brofile. When set, the
     /// daemon folds this surface from the configured surface table into the
-    /// dispatch filter plane (harness-process-boundary.md §3).
+    /// dispatch filter plane.
     #[serde(default)]
     pub(crate) surface: Option<String>,
     /// Retired compatibility flag, not part of the caller schema.
@@ -574,22 +538,8 @@ pub(crate) struct BrofileParams {
     /// suppression for providers that support it.
     #[serde(default)]
     pub(crate) context: Option<orchestration::brofile::BrofileContext>,
-    /// Optional code-mode embedded in the brofile (`off`/`optional`/`only`).
-    /// Sets the authorial tool surface for harness-backed dispatches; unset →
-    /// harness default (`optional`).
-    #[serde(default)]
-    pub(crate) code_mode: Option<orchestration::brofile::CodeMode>,
-    /// Default edit discipline for sessions dispatched from this brofile:
-    /// `free` or `structured`; unset means `free`. `structured` refuses the
-    /// raw edit tools (`file_edit`, `file_write`, `apply_patch`) flat,
-    /// deferred and inside `exec` cells; edits go through `edits.*`. It
-    /// requires a code surface, so a brofile cannot combine it with
-    /// `code_mode: off`. A value given on `bro_exec` overrides this default
-    /// for that dispatch, and a started session keeps the value it was
-    /// dispatched with even if the brofile changes later.
-    #[serde(default)]
-    pub(crate) edit_discipline: Option<orchestration::brofile::EditDiscipline>,
-    /// Optional service tier embedded in the brofile. For Brodex, `priority`
+
+    /// Optional service tier embedded in the brofile. For Codex, `priority`
     /// is Codex `/fast`; `default` clears back to backend default.
     #[serde(default)]
     pub(crate) service_tier: Option<String>,
@@ -599,30 +549,8 @@ pub(crate) struct BrofileParams {
 mod tests {
     use super::*;
 
-    #[test]
-    fn exec_tool_defaults_decode_explicit_json_values() {
-        let params: ExecParams = serde_json::from_value(serde_json::json!({
-            "prompt":"synthetic fixture", "provider":"glm",
-            "tool_defaults":{
-                "default:shell_run.timeout_ms":30000,
-                "default:file_read.line_numbers":true,
-                "default:fixture.label":"false"
-            }
-        }))
-        .unwrap();
-        let defaults = params.tool_defaults.unwrap();
-        assert_eq!(defaults["default:shell_run.timeout_ms"], 30000);
-        assert_eq!(defaults["default:file_read.line_numbers"], true);
-        assert_eq!(defaults["default:fixture.label"], "false");
-        let schema = serde_json::to_value(rmcp::schemars::schema_for!(ExecParams)).unwrap();
-        assert_ne!(
-            schema["properties"]["tool_defaults"]["additionalProperties"]["type"],
-            "string"
-        );
-    }
-
     // Dispatch params advertise `cwd` (the contract-bottom canonical name,
-    // design/bro-harness/tool-arg-defaulting.md §4) and accept `project_dir`
+    // dispatch contract) and accept `project_dir`
     // as a deprecated alias so existing callers, atom templates, and
     // recorded workflows keep working (gap-6366c92d).
     #[test]
@@ -684,7 +612,7 @@ mod tests {
     #[test]
     fn resume_params_accept_control_resume_body() {
         let body = serde_json::json!({
-            "provider": "brodex",
+            "provider": "codex",
             "session_id": "sess-1",
             "prompt": "next turn",
             "allow_recursion": true,
@@ -698,5 +626,32 @@ mod tests {
         assert_eq!(p.pin_model.as_deref(), Some("gpt-5.2-codex"));
         assert_eq!(p.pin_effort.as_deref(), Some("high"));
         assert_eq!(p.service_tier.as_deref(), Some("priority"));
+    }
+}
+
+#[cfg(test)]
+mod retirement_schema_tests {
+    use super::{BrofileParams, ExecParams, ResumeParams, schemars};
+    #[test]
+    fn dispatch_schema_does_not_offer_custom_runtime_controls() {
+        for schema in [
+            serde_json::to_value(schemars::schema_for!(ExecParams)).unwrap(),
+            serde_json::to_value(schemars::schema_for!(ResumeParams)).unwrap(),
+            serde_json::to_value(schemars::schema_for!(BrofileParams)).unwrap(),
+        ] {
+            let properties = schema["properties"].as_object().unwrap();
+            for name in [
+                "harness_bin",
+                "code_mode",
+                "edit_discipline",
+                "tool_placement",
+                "tool_defaults",
+            ] {
+                assert!(
+                    !properties.contains_key(name),
+                    "retired control remains: {name}"
+                );
+            }
+        }
     }
 }

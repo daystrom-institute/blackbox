@@ -35,9 +35,7 @@ pub(crate) struct FreshDispatchRequest {
     pub(crate) allow_recursion: bool,
     pub(crate) allow_tools: Option<Vec<String>>,
     pub(crate) disallow_tools: Option<Vec<String>>,
-    pub(crate) tool_placement: Option<std::collections::BTreeMap<String, String>>,
-    pub(crate) brofile_tool_defaults: Option<BTreeMap<String, serde_json::Value>>,
-    pub(crate) tool_defaults: Option<BTreeMap<String, serde_json::Value>>,
+
     pub(crate) allocation_request: Option<orchestration::allocator::RuntimeRequest>,
     pub(crate) project_dir_for_lease: Option<String>,
     pub(crate) ambient_bro_name: Option<String>,
@@ -59,24 +57,13 @@ pub(crate) struct FreshDispatchRequest {
     /// initial enforce in resolve_*_target only sees the brofile's
     /// nominal provider, not the allocator's selected lane.
     pub(crate) brofile_context: Option<orchestration::brofile::BrofileContext>,
-    /// Resolved code-mode for this fresh dispatch (per-dispatch
-    /// `ExecParams.code_mode` override ?? brofile `code_mode`). Folded onto
-    /// `exec_opts` just before arg construction so it survives an allocator
-    /// rebuild of `exec_opts`. `None` ⇒ no `--code-mode` flag (harness default).
-    pub(crate) code_mode: Option<orchestration::brofile::CodeMode>,
-    /// Resolved edit discipline for this fresh dispatch (per-dispatch
-    /// override, else the brofile value). Folded onto `exec_opts` with
-    /// the code mode.
-    pub(crate) edit_discipline: Option<orchestration::brofile::EditDiscipline>,
-    /// Absolute harness binary for this dispatch, already checked against
-    /// the calling surface.
-    pub(crate) harness_bin: Option<String>,
+
     /// Resolved service tier for this fresh dispatch (per-dispatch override
     /// before brofile `service_tier`). Folded onto `exec_opts` after allocator
     /// rebuild so support-provider priority survives lane selection.
     pub(crate) service_tier: Option<String>,
     /// Resolved structured-output JSON schema for this fresh dispatch (from an
-    /// agent manifest's `outputs.schema`). Like `code_mode`, folded onto
+    /// agent manifest's `outputs.schema`). Folded onto
     /// `exec_opts` just before arg construction so it survives an allocator
     /// rebuild. `None` ⇒ no `--output-schema` flag (no structured output).
     pub(crate) output_schema: Option<String>,
@@ -274,8 +261,7 @@ fn allocator_status_runtime_request(
         allow_recursion: None,
         allow_tools: None,
         disallow_tools: None,
-        tool_placement: None,
-        tool_defaults: None,
+
         coerce_workspace: None,
         tier: p.tier.clone(),
         tier_ladder: p.tier_ladder.clone(),
@@ -292,9 +278,7 @@ fn allocator_status_runtime_request(
         capabilities: p.capabilities.clone(),
         durable: p.durable,
         selection_policy: p.selection_policy.clone(),
-        code_mode: None,
-        edit_discipline: None,
-        harness_bin: None,
+
         service_tier: None,
         origin_override: None,
         display_name: None,
@@ -507,16 +491,7 @@ impl BlackboxServer {
         );
         // Fold the resolved code-mode onto exec_opts AFTER any allocator rebuild
         // (which replaces exec_opts wholesale and would otherwise drop it).
-        if let Some(cm) = request.code_mode {
-            let mut o = request.exec_opts.take().unwrap_or_default();
-            o.code_mode = Some(cm);
-            request.exec_opts = Some(o);
-        }
-        if let Some(discipline) = request.edit_discipline {
-            let mut o = request.exec_opts.take().unwrap_or_default();
-            o.edit_discipline = Some(discipline);
-            request.exec_opts = Some(o);
-        }
+
         if let Some(service_tier) = request.service_tier.take() {
             let mut o = request.exec_opts.take().unwrap_or_default();
             o.service_tier = Some(service_tier);
@@ -597,7 +572,7 @@ impl BlackboxServer {
         if let Some(admission) = &admission {
             admission.mark_spawn_started();
         }
-        let task = orch::spawn_task_with_tool_placement(
+        let task = orch::spawn_task_with_options(
             task_id,
             request.provider,
             args,
@@ -609,13 +584,6 @@ impl BlackboxServer {
             self.state.tail_tx.clone(),
             Some(self.state.roster_events()),
             request.spawn_bro_label,
-            request.tool_placement,
-            orch::merge_tool_arg_defaults(
-                ambient_ctx.tool_arg_defaults(),
-                request.brofile_tool_defaults.as_ref(),
-                request.tool_defaults.as_ref(),
-            ),
-            request.harness_bin,
             request.origin,
         )
         .await;
@@ -670,7 +638,7 @@ impl BlackboxServer {
             env_overrides,
             cwd,
             brofile_filters,
-            brofile_tool_defaults,
+            _brofile_tool_defaults,
             brofile_coerce_workspace,
             brofile_context,
         ) = if p.bro.is_some() || p.provider.is_some() {
@@ -684,7 +652,7 @@ impl BlackboxServer {
             }
         } else if exec_params_have_runtime(&p) {
             (
-                Provider::Brodex,
+                Provider::Codex,
                 None,
                 None,
                 None,
@@ -725,31 +693,19 @@ impl BlackboxServer {
         }
         let coerce_workspace = p.coerce_workspace.unwrap_or(brofile_coerce_workspace);
         // Resolve code-mode: explicit per-dispatch override wins, else the
-        // brofile's code_mode (surfaced via the resolved ExecOpts before the
+        // resolved brofile options (before the
         // allocator may rebuild it). Folded onto exec_opts in
         // dispatch_fresh_bro_task right before arg construction.
-        let resolved_code_mode = p
-            .code_mode
-            .or_else(|| exec_opts.as_ref().and_then(|o| o.code_mode));
+
         // Edit discipline resolves the same way. A known code mode with no
         // code surface is refused here, before anything is spawned; the
         // harness checks again against the session it actually builds.
-        let resolved_edit_discipline = p
-            .edit_discipline
-            .or_else(|| exec_opts.as_ref().and_then(|o| o.edit_discipline));
-        if let Some(discipline) = resolved_edit_discipline
-            && let Err(error) = discipline.check_code_mode(resolved_code_mode)
-        {
-            return Self::err_text(&error);
-        }
+
         let resolved_service_tier = p
             .service_tier
             .clone()
             .or_else(|| exec_opts.as_ref().and_then(|o| o.service_tier.clone()));
-        let harness_bin = match self.checked_harness_bin(p.harness_bin.as_deref()) {
-            Ok(bin) => bin,
-            Err(error) => return Self::err_text(&error),
-        };
+
         let lease_brofile_context = brofile_context.clone();
         let dispatched = match self
             .dispatch_fresh_bro_task_with_admission(
@@ -765,9 +721,7 @@ impl BlackboxServer {
                     allow_recursion,
                     allow_tools: p.allow_tools.clone(),
                     disallow_tools: p.disallow_tools.clone(),
-                    tool_placement: p.tool_placement.clone(),
-                    brofile_tool_defaults,
-                    tool_defaults: p.tool_defaults.clone(),
+
                     allocation_request,
                     project_dir_for_lease: p.cwd.clone(),
                     ambient_bro_name: p.bro.clone(),
@@ -775,9 +729,7 @@ impl BlackboxServer {
                     display_name: p.display_name.clone(),
                     record_to_bro: p.bro.clone(),
                     brofile_context,
-                    code_mode: resolved_code_mode,
-                    edit_discipline: resolved_edit_discipline,
-                    harness_bin,
+
                     service_tier: resolved_service_tier,
                     // bro_exec carries no output schema (structured output is delivered
                     // via agent dispatch from the manifest, not generic exec).
@@ -866,7 +818,7 @@ impl BlackboxServer {
             env_overrides,
             cwd,
             brofile_filters,
-            brofile_tool_defaults,
+            _brofile_tool_defaults,
             brofile_coerce_workspace,
             runtime_lease,
             resume_brofile,
@@ -987,8 +939,8 @@ impl BlackboxServer {
         if let Some(admission) = &admission {
             admission.mark_spawn_started();
         }
-        let harness_bin = self.session_harness_bin(provider, &session_id);
-        let task = orch::spawn_task_with_tool_placement(
+
+        let task = orch::spawn_task_with_options(
             task_id,
             provider,
             args,
@@ -1000,13 +952,6 @@ impl BlackboxServer {
             self.state.tail_tx.clone(),
             Some(self.state.roster_events()),
             restored_bro_name,
-            None,
-            orch::merge_tool_arg_defaults(
-                ambient_ctx.tool_arg_defaults(),
-                brofile_tool_defaults.as_ref(),
-                p.tool_defaults.as_ref(),
-            ),
-            harness_bin,
             // HTTP resume retains control classification; MCP resume uses
             // the same AgentDispatch classification as MCP exec.
             p.origin_override.unwrap_or(bro_core::Origin::AgentDispatch),
@@ -2274,10 +2219,7 @@ impl BlackboxServer {
                         model: bf.model.clone(),
                         effort: bf.effort.clone(),
                         provider_defaults: None,
-                        // Resume restores the session's persisted code_mode; the
-                        // daemon does not re-pass it (mirrors --model).
-                        code_mode: None,
-                        edit_discipline: None,
+
                         // Resume restores the session's persisted service tier.
                         service_tier: None,
                         // Resume does not re-pass the output schema.
@@ -2347,7 +2289,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bro_steer",
-        description = "Queue a user steer into a running bro-harness process without cancelling the active turn."
+        description = "Queue a user steer into a running provider session without cancelling the active turn."
     )]
     pub(crate) fn bro_steer(&self, Parameters(p): Parameters<SteerParams>) -> CallToolResult {
         let task = match self.state.task_store.read().get(&p.task_id) {
@@ -2425,18 +2367,12 @@ impl BlackboxServer {
                 store_dir,
                 bf.context.as_ref(),
             );
-            let opts = if bf.model.is_some()
-                || bf.effort.is_some()
-                || bf.code_mode.is_some()
-                || bf.edit_discipline.is_some()
-                || bf.service_tier.is_some()
-            {
+            let opts = if bf.model.is_some() || bf.effort.is_some() || bf.service_tier.is_some() {
                 Some(ExecOpts {
                     model: bf.model.clone(),
                     effort: bf.effort.clone(),
                     provider_defaults: None,
-                    code_mode: bf.code_mode,
-                    edit_discipline: bf.edit_discipline,
+
                     service_tier: bf.service_tier.clone(),
                     output_schema: None,
                 })
@@ -2651,57 +2587,6 @@ impl BlackboxServer {
         Err("Provide session_id + provider".into())
     }
 
-    /// A dispatch may name its own harness binary only on the `ops` surface
-    /// and only by absolute path: the path is run as given on the executing
-    /// host, with no lookup that could resolve it differently there.
-    ///
-    /// The check is on the surface name this session pinned, not on the
-    /// surface table. Configuration can change which tools `ops` shows; it
-    /// cannot make a session on another surface read as `ops`, and a
-    /// configured surface under any other name never passes. A handler that
-    /// pinned nothing is `default` and is refused.
-    fn checked_harness_bin(&self, requested: Option<&str>) -> Result<Option<String>, String> {
-        let Some(bin) = requested else {
-            return Ok(None);
-        };
-        let surface = self
-            .surface
-            .get()
-            .map(|surface| surface.as_ref())
-            .unwrap_or("default");
-        if surface != "ops" {
-            return Err(format!(
-                "harness_bin is accepted only on the ops surface; this session is on `{surface}`"
-            ));
-        }
-        if !std::path::Path::new(bin).is_absolute() {
-            return Err("harness_bin must be an absolute path".to_string());
-        }
-        Ok(Some(bin.to_string()))
-    }
-
-    /// The harness binary a dispatch selected for the session, read from
-    /// the newest of its tasks that recorded one. A resume inherits it, so a
-    /// session never changes binary between turns. A task that failed before
-    /// its worker started records none, which is why this is not simply the
-    /// latest task: a failed resume must not release the session to the
-    /// configured binary.
-    fn session_harness_bin(&self, provider: Provider, session_id: &str) -> Option<String> {
-        self.state
-            .task_store
-            .read()
-            .all_tasks()
-            .iter()
-            .filter_map(|task| {
-                let inner = task.inner.lock();
-                (inner.provider == provider && inner.session_id == session_id)
-                    .then(|| inner.harness_bin.clone().map(|bin| (inner.started_at, bin)))
-                    .flatten()
-            })
-            .max_by_key(|(started_at, _)| *started_at)
-            .map(|(_, bin)| bin)
-    }
-
     /// The brofile a session was dispatched from, re-resolved for a resume.
     ///
     /// A named dispatch stamps the brofile name on its task. The session's
@@ -2741,12 +2626,7 @@ impl BlackboxServer {
                     // has started: the harness saved the values the first
                     // dispatch resolved, and an explicit flag on resume would
                     // override them. Only a per-resume parameter may do that.
-                    let opts = opts.map(|mut opts| {
-                        opts.code_mode = None;
-                        opts.edit_discipline = None;
-                        opts.service_tier = None;
-                        opts
-                    });
+
                     ResolvedResumeBrofile::Restored(RestoredResumeBrofile {
                         name,
                         lens,
@@ -3096,66 +2976,11 @@ mod tests {
             coerce_workspace: None,
             runtime: None,
             context: None,
-            code_mode: Some(orchestration::brofile::CodeMode::Only),
-            edit_discipline: Some(orchestration::brofile::EditDiscipline::Structured),
+
             service_tier: Some("priority".to_string()),
         };
         orchestration::brofile::save_brofile(&brofile, "global", &server.state.store_dir, None)
             .unwrap();
-    }
-
-    #[test]
-    fn resume_leaves_code_mode_and_service_tier_to_the_session() {
-        let tmp = tempfile::tempdir().unwrap();
-        let server = test_server(&tmp);
-        save_resume_brofile(&server, "moded-bro", Provider::Brodex);
-        seed_named_session_for(
-            &server,
-            "moded-task",
-            "moded-session",
-            "moded-bro",
-            Provider::Brodex,
-        );
-
-        // A fresh dispatch from this brofile carries both.
-        let (_, _, fresh, ..) = server
-            .resolve_exec_target(Some("moded-bro"), None, None)
-            .unwrap();
-        let fresh = fresh.unwrap();
-        assert!(fresh.code_mode.is_some() && fresh.service_tier.is_some());
-        assert_eq!(
-            fresh.edit_discipline,
-            Some(orchestration::brofile::EditDiscipline::Structured)
-        );
-        let fresh_args =
-            Provider::Brodex.build_exec_args("fresh", None, "moded-session", None, Some(&fresh));
-        assert!(
-            fresh_args
-                .windows(2)
-                .any(|pair| pair[0] == "--edit-discipline" && pair[1] == "structured"),
-            "{fresh_args:?}"
-        );
-
-        // A resume restores the brofile's model and policy, and passes neither
-        // code mode nor service tier, so the harness keeps what it saved.
-        let (_, _, _, opts, _, _, filters, _, _, _, brofile) = server
-            .resolve_resume_target(Some("moded-session"), Some("brodex"), None)
-            .unwrap();
-        let opts = opts.unwrap();
-        assert_eq!(opts.model.as_deref(), Some("brofile-model"));
-        assert_eq!(opts.code_mode, None);
-        assert_eq!(opts.edit_discipline, None);
-        assert_eq!(opts.service_tier, None);
-        assert!(filters.is_some());
-        assert_eq!(brofile.unwrap().unrestored, None);
-        let args =
-            Provider::Brodex.build_resume_args("moded-session", "continue", None, Some(&opts));
-        assert!(!args.iter().any(|arg| arg == "--code-mode"), "{args:?}");
-        assert!(!args.iter().any(|arg| arg == "--service-tier"), "{args:?}");
-        assert!(
-            !args.iter().any(|arg| arg == "--edit-discipline"),
-            "{args:?}"
-        );
     }
 
     fn seed_named_session(server: &BlackboxServer, task_id: &str, session: &str, bro: &str) {
@@ -3615,7 +3440,7 @@ mod tests {
             .write()
             .insert(
                 "other-provider".into(),
-                orch::test_task("other-provider", orch::TaskStatus::Failed, Provider::Brodex),
+                orch::test_task("other-provider", orch::TaskStatus::Failed, Provider::Codex),
             )
             .unwrap();
         let snapshot = server.state.store_dir.join("tasks.json");
@@ -3651,7 +3476,7 @@ mod tests {
                 .write()
                 .insert(
                     id.clone(),
-                    orch::test_task(&id, orch::TaskStatus::Failed, Provider::Brodex),
+                    orch::test_task(&id, orch::TaskStatus::Failed, Provider::Codex),
                 )
                 .unwrap();
         }
@@ -3772,8 +3597,7 @@ mod tests {
                 coerce_workspace: None,
                 runtime: None,
                 context: None,
-                code_mode: None,
-                edit_discipline: None,
+
                 service_tier: None,
             },
             "global",
@@ -3792,8 +3616,7 @@ mod tests {
             allow_recursion: None,
             allow_tools: None,
             disallow_tools: None,
-            tool_placement: None,
-            tool_defaults: None,
+
             coerce_workspace: None,
             tier: None,
             tier_ladder: None,
@@ -3810,9 +3633,7 @@ mod tests {
             capabilities: None,
             durable: None,
             selection_policy: None,
-            code_mode: None,
-            edit_discipline: None,
-            harness_bin: None,
+
             service_tier: None,
             origin_override: None,
             display_name: None,
@@ -3832,9 +3653,7 @@ mod tests {
             allow_recursion: false,
             allow_tools: None,
             disallow_tools: None,
-            tool_placement: None,
-            brofile_tool_defaults: None,
-            tool_defaults: None,
+
             allocation_request: None,
             project_dir_for_lease: None,
             ambient_bro_name: None,
@@ -3843,9 +3662,7 @@ mod tests {
             record_to_bro: None,
             origin,
             brofile_context: None,
-            code_mode: None,
-            edit_discipline: None,
-            harness_bin: None,
+
             service_tier: None,
             output_schema: None,
         }
@@ -4182,61 +3999,19 @@ mod tests {
     }
 
     #[test]
-    fn exec_params_tool_placement_parses() {
-        let params: ExecParams = serde_json::from_value(json!({
-            "prompt": "test",
-            "tool_placement": {
-                "mcp__sdk__placed": "in-box"
-            }
-        }))
-        .unwrap();
-
-        assert_eq!(
-            params
-                .tool_placement
-                .as_ref()
-                .and_then(|m| m.get("mcp__sdk__placed"))
-                .map(String::as_str),
-            Some("in-box")
-        );
-    }
-
-    #[test]
-    fn exec_params_tool_defaults_parse() {
-        let params: ExecParams = serde_json::from_value(json!({
-            "prompt": "test",
-            "tool_defaults": {
-                "default:rust.moveStructFields.acknowledge_repr": "true"
-            }
-        }))
-        .unwrap();
-
-        assert_eq!(
-            params
-                .tool_defaults
-                .as_ref()
-                .and_then(|defaults| {
-                    defaults.get("default:rust.moveStructFields.acknowledge_repr")
-                })
-                .and_then(Value::as_str),
-            Some("true")
-        );
-    }
-
-    #[test]
     fn exec_params_runtime_request_parses_operator_pins_and_preferences() {
         let mut params = params();
-        params.pin_provider = Some("brodex".into());
-        params.pin_account = Some("brodex-alt".into());
-        params.pin_model = Some("gpt-5.3-brodex-spark".into());
+        params.pin_provider = Some("codex".into());
+        params.pin_account = Some("codex-alt".into());
+        params.pin_model = Some("gpt-5.3-codex-spark".into());
         params.pin_effort = Some("low".into());
         params.prefer_provider = Some("glm".into());
         assert!(exec_params_have_runtime(&params));
         let request = exec_params_runtime_request(&params, None).unwrap().unwrap();
         let pin = request.pin.unwrap();
-        assert_eq!(pin.provider, Some(Provider::Brodex));
-        assert_eq!(pin.account.as_deref(), Some("brodex-alt"));
-        assert_eq!(pin.model.as_deref(), Some("gpt-5.3-brodex-spark"));
+        assert_eq!(pin.provider, Some(Provider::Codex));
+        assert_eq!(pin.account.as_deref(), Some("codex-alt"));
+        assert_eq!(pin.model.as_deref(), Some("gpt-5.3-codex-spark"));
         assert_eq!(pin.effort.as_deref(), Some("low"));
         assert_eq!(
             pin.authority,
@@ -4287,12 +4062,12 @@ mod tests {
             min_tier: None,
             max_tier: None,
             pool_name: Some("coding".into()),
-            pool_providers: Some(vec!["brodex".into()]),
-            pin_provider: Some("brodex".into()),
-            pin_account: Some("brodex-alt".into()),
-            pin_model: Some("gpt-5.3-brodex-spark".into()),
+            pool_providers: Some(vec!["codex".into()]),
+            pin_provider: Some("codex".into()),
+            pin_account: Some("codex-alt".into()),
+            pin_model: Some("gpt-5.3-codex-spark".into()),
             pin_effort: Some("low".into()),
-            prefer_provider: Some("brodex".into()),
+            prefer_provider: Some("codex".into()),
             capabilities: Some(vec!["tool_use".into()]),
             durable: Some(false),
             selection_policy: Some(serde_json::json!("availability")),
@@ -4314,19 +4089,19 @@ mod tests {
         );
         assert_eq!(
             request.pool.unwrap().providers,
-            vec![orchestration::providers::Provider::Brodex]
+            vec![orchestration::providers::Provider::Codex]
         );
         assert_eq!(
             request.pin.as_ref().and_then(|pin| pin.provider),
-            Some(orchestration::providers::Provider::Brodex)
+            Some(orchestration::providers::Provider::Codex)
         );
         assert_eq!(
             request.pin.as_ref().and_then(|pin| pin.account.as_deref()),
-            Some("brodex-alt")
+            Some("codex-alt")
         );
         assert_eq!(
             request.prefer.and_then(|prefer| prefer.provider),
-            Some(Provider::Brodex)
+            Some(Provider::Codex)
         );
         assert!(!request.durable);
         assert!(
@@ -4337,7 +4112,7 @@ mod tests {
     }
     fn update_probe_params() -> AllocatorProbeParams {
         AllocatorProbeParams {
-            provider: "brodex".into(),
+            provider: "codex".into(),
             account: None,
             clear: None,
             credential_status: Some("present".into()),
@@ -4422,7 +4197,7 @@ mod tests {
         let text = call_result_text(&result);
         assert!(
             text.contains("error.probe_persistence_failed")
-                && text.contains("clear for lane 'brodex:default'"),
+                && text.contains("clear for lane 'codex:default'"),
             "got: {text}"
         );
     }
@@ -4440,7 +4215,7 @@ mod tests {
         let result = server.bro_allocator_probe(Parameters(p));
         assert_ne!(result.is_error, Some(true));
         let body: serde_json::Value = serde_json::from_str(&call_result_text(&result)).unwrap();
-        assert_eq!(body["lane_key"], "brodex:default");
+        assert_eq!(body["lane_key"], "codex:default");
         assert_eq!(body["probe"]["credential_status"], "present");
         let preview = body["probe"]["raw_summary_preview"]
             .as_object()
@@ -4460,7 +4235,7 @@ mod tests {
         // exact same record reloads from disk.
         let reloaded = orchestration::allocator::probe_store_load(&server.state.store_dir);
         assert_eq!(
-            reloaded.records["brodex:default"].raw_summary.as_deref(),
+            reloaded.records["codex:default"].raw_summary.as_deref(),
             Some(long_summary.as_str())
         );
     }
@@ -4472,9 +4247,9 @@ mod tests {
         {
             let mut store = orchestration::allocator::probe_store_load(&server.state.store_dir);
             store.records.insert(
-                "brodex:default".into(),
+                "codex:default".into(),
                 orchestration::allocator::ProbeRecord {
-                    provider: Provider::Brodex,
+                    provider: Provider::Codex,
                     account: None,
                     credential_status: Default::default(),
                     quota_status: Default::default(),
@@ -4504,7 +4279,7 @@ mod tests {
         // Rewrite the stored record, then reuse the old revision-bound cursor.
         {
             let mut store = orchestration::allocator::probe_store_load(&server.state.store_dir);
-            store.records.get_mut("brodex:default").unwrap().raw_summary =
+            store.records.get_mut("codex:default").unwrap().raw_summary =
                 Some(format!("w").repeat(9_000));
             orchestration::allocator::probe_store_save(&server.state.store_dir, &store).unwrap();
         }
@@ -4582,7 +4357,7 @@ mod tests {
         let server = test_server(&tmp);
         {
             let mut store = orchestration::allocator::probe_store_load(&server.state.store_dir);
-            for provider in ["brodex", "glm", "deepseek"] {
+            for provider in ["codex", "glm", "deepseek"] {
                 store.records.insert(
                     format!("{provider}:default"),
                     orchestration::allocator::ProbeRecord {
@@ -4708,7 +4483,7 @@ mod tests {
             candidates: vec![orchestration::allocator::CandidateTrace {
                 peak_usage: None,
                 lane: orchestration::allocator::RuntimeLane {
-                    provider: Provider::Brodex,
+                    provider: Provider::Codex,
                     account: Some("acct".into()),
                     tier: Some("standard".into()),
                     model: None,

@@ -10,15 +10,13 @@ The crate is `blackbox` (`Cargo.toml`). Binary entry points:
 - `blackboxd` (`src/main.rs`) - daemon entry point; real startup lives in
   `blackbox::server::run()`.
 - `bro` (`crates/bro-cli/src/main.rs`) - headless MCP, guidance-render and event-tail client.
-- `bro-harness` (`crates/bro-harness`) - standalone model-turn runtime.
 - `blackbox` (`src/bin/blackbox.rs`) - offline administration.
 - Source collectors publish checkout files and native transcripts from their owning hosts.
 
 Core MCP namespaces:
 
 - `bbox_*` - transcript, knowledge, graph, and project primitives.
-  Structural refactor tooling is harness-native via the bro-harness isolate
-  bindings (see `docs/refactor.md`).
+  Agents perform source edits with their native provider tools.
 - `bro_*` - orchestration and dispatch primitives.
 
 External callers compose bro operations and use their harness for file,
@@ -47,9 +45,7 @@ Major code ownership boundaries:
   injection and recursion guard.
 - `config.rs` - config loader and env override allowlist.
 
-The `bbox-refactor` and `bbox-lsp` crates survive as libraries linked by the
-bro-harness bindings; the daemon does not wrap them in MCP tools or keep a
-warm LSP pool.
+Blackbox owns no refactoring engine, language-server pool, or model-turn runtime.
 
 Generated or rendered surfaces are not the authority. Prefer editing their source
 owners, then regenerating through the intended path.
@@ -70,11 +66,7 @@ routing facts:
   the daemon lifts nothing out of them. Claude itself is not a dispatch
   provider. The executor that owns the child's stdout writes its session
   log; the daemon closes stdin after a turn's result so the child exits.
-- Brodex (Codex/ChatGPT on OpenAI Responses) and VibeBh (Mistral on chat
-  completions) still dispatch through the standalone `bro-harness` binary
-  (`BRO_HARNESS_BIN`) until the codex app-server lane replaces Brodex.
-  `blackboxd` does not link `bro-harness`, `bro-code-mode`, or V8. See
-  `design/bro-harness/harness-process-boundary.md`.
+- The supported execution lanes are Claude CLI and Codex app-server.
 - Codex dispatches directly through app-server on the execution host.
   Typed session settings and controls cross the executor boundary. The
   adapter normalizes provider events for daemon observation and replay.
@@ -92,4 +84,3 @@ Installed brofiles are catalog data. Agents discover them with
 `bro_brofile(action="list")`; operators administer the catalog
 with the `bbox_artifact_*` tools on the `ops` surface. Explicit retired-kind
 artifact filters expose historical receipts without activating them.
-

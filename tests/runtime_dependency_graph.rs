@@ -8,26 +8,11 @@ fn daemon_manifest_does_not_link_harness_or_capability_implementation_crates() {
 
     assert!(
         !dependencies.contains_key("bro-harness"),
-        "blackboxd must spawn bro-harness instead of linking it"
+        "the custom harness must not be linked"
     );
     assert!(
         !dependencies.contains_key("bro-capabilities"),
         "daemon capability projection crosses MCP, not an in-process trait slot"
-    );
-}
-
-#[test]
-fn workspace_keeps_harness_as_independently_buildable_member() {
-    let manifest: toml::Value =
-        toml::from_str(include_str!("../Cargo.toml")).expect("parse workspace manifest");
-    let members = manifest["workspace"]["members"]
-        .as_array()
-        .expect("workspace members");
-
-    assert!(
-        members
-            .iter()
-            .any(|member| member.as_str() == Some("crates/bro-harness"))
     );
 }
 
@@ -64,6 +49,41 @@ fn daemon_lock_graph_excludes_harness_code_mode_and_v8() {
         assert!(
             !reachable.contains(forbidden),
             "{forbidden} must stay outside blackboxd's transitive dependency graph"
+        );
+    }
+}
+
+#[test]
+fn workspace_has_no_custom_harness_refactor_or_v8_packages() {
+    let lock: toml::Value = toml::from_str(include_str!("../Cargo.lock")).unwrap();
+    let manifest: toml::Value = toml::from_str(include_str!("../Cargo.toml")).unwrap();
+    for forbidden in [
+        "bro-harness",
+        "bro-tools",
+        "bro-capabilities",
+        "bro-code-mode",
+        "bro-apply-patch",
+        "bro-lsp",
+        "bbox-lsp",
+        "bbox-refactor",
+        "v8",
+        "deno_core",
+    ] {
+        assert!(
+            !lock["package"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|p| p["name"].as_str() == Some(forbidden)),
+            "retired package remains: {forbidden}"
+        );
+        assert!(
+            !manifest["workspace"]["members"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m.as_str() == Some(&format!("crates/{forbidden}"))),
+            "retired member remains: {forbidden}"
         );
     }
 }
