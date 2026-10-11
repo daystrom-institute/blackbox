@@ -8000,6 +8000,7 @@ mod tests {
                 service_label: None,
                 collector_version: "0.0.1".into(),
                 interval_secs: Some(900),
+                linked_worktrees: Vec::new(),
             },
         };
 

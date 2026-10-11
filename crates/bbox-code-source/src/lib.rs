@@ -330,12 +330,7 @@ impl CatalogOnboardRequestV1 {
         ) {
             return Err(ContractError::InvalidOnboardField("checkout_kind"));
         }
-        if self.checkout_id.len() != 32
-            || !self
-                .checkout_id
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit())
-        {
+        if !is_checkout_id(&self.checkout_id) {
             return Err(ContractError::InvalidOnboardField("checkout_id"));
         }
         if let Some(repo_id) = &self.committed_repo_id {
@@ -382,6 +377,7 @@ pub const MAX_PRODUCER_COMMAND_VERSION_BYTES: usize = 128;
 pub const MAX_PRODUCER_COMMAND_REF_BYTES: usize = 1024;
 pub const MAX_PRODUCER_COMMAND_ERROR_BYTES: usize = 4096;
 pub const MAX_ENROLL_RECEIPT_COMMIT_PATHS: usize = 64;
+pub const MAX_PRODUCER_LINKED_WORKTREES: usize = 256;
 
 /// A collector's source pass interval when its configuration names none.
 pub const DEFAULT_COLLECTOR_INTERVAL_SECS: u64 = 120;
@@ -399,6 +395,58 @@ pub struct ProducerPresenceV1 {
     /// against this cadence. Absent from collectors that predate it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interval_secs: Option<u64>,
+    /// The linked worktrees git currently reports for each configured base
+    /// checkout. The daemon derives live read-side aliases from them and
+    /// nothing durable. Absent from collectors that predate it, and omitted
+    /// when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub linked_worktrees: Vec<LinkedWorktreeV1>,
+}
+
+/// One linked worktree of a configured base checkout, as git reports it on
+/// the checkout host.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(deny_unknown_fields)]
+pub struct LinkedWorktreeV1 {
+    /// The base checkout's durable identity (`.bbox/local/checkout-id`),
+    /// the value its catalog attachment records as `checkout_id`.
+    pub base_checkout_id: String,
+    /// The worktree's canonical directory on the checkout host.
+    pub worktree_dir: String,
+}
+
+impl LinkedWorktreeV1 {
+    pub fn validate(&self) -> Result<(), ContractError> {
+        if !is_checkout_id(&self.base_checkout_id) {
+            return Err(ContractError::InvalidProducerCommandField(
+                "linked_worktrees.base_checkout_id",
+            ));
+        }
+        validate_absolute_command_path(&self.worktree_dir, "linked_worktrees.worktree_dir")?;
+        // The daemon matches these lexically, so only the normalized
+        // spelling is accepted: no `.` or `..` components, no repeated or
+        // trailing separators.
+        let path = Path::new(&self.worktree_dir);
+        if path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+            || path
+                .components()
+                .collect::<std::path::PathBuf>()
+                .as_os_str()
+                != std::ffi::OsStr::new(&self.worktree_dir)
+        {
+            return Err(ContractError::InvalidProducerCommandField(
+                "linked_worktrees.worktree_dir",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// A durable checkout identity: 32 hexadecimal characters.
+fn is_checkout_id(value: &str) -> bool {
+    value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 impl ProducerPresenceV1 {
@@ -409,6 +457,14 @@ impl ProducerPresenceV1 {
         for root in &self.enroll_roots {
             validate_absolute_command_path(root, "enroll_roots")?;
         }
+        if self.linked_worktrees.len() > MAX_PRODUCER_LINKED_WORKTREES {
+            return Err(ContractError::InvalidProducerCommandField(
+                "linked_worktrees",
+            ));
+        }
+        self.linked_worktrees
+            .iter()
+            .try_for_each(LinkedWorktreeV1::validate)?;
         validate_command_string(
             &self.host_label,
             MAX_PRODUCER_COMMAND_LABEL_BYTES,
@@ -1593,7 +1649,94 @@ mod tests {
             service_label: Some("collector-a".into()),
             collector_version: "0.0.1".into(),
             interval_secs: Some(120),
+            linked_worktrees: vec![LinkedWorktreeV1 {
+                base_checkout_id: "0123456789abcdef0123456789abcdef".into(),
+                worktree_dir: "/work/worktrees/alpha-feature".into(),
+            }],
         }
+    }
+
+    /// A presence from a collector that predates worktree reports still
+    /// decodes with none, an empty report is omitted on the wire, and a
+    /// current one round-trips its entries.
+    #[test]
+    fn presence_linked_worktrees_are_optional_on_the_wire() {
+        let legacy: ProducerPresenceV1 = serde_json::from_value(serde_json::json!({
+            "enroll_roots": [],
+            "host_label": "checkout-host-a",
+            "config_path": "/etc/blackbox/code-collector.toml",
+            "service_label": null,
+            "collector_version": "0.0.1",
+            "interval_secs": 120,
+        }))
+        .unwrap();
+        assert!(legacy.linked_worktrees.is_empty());
+        legacy.validate().unwrap();
+        assert!(
+            !serde_json::to_value(&legacy)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("linked_worktrees")
+        );
+
+        let current = valid_presence();
+        current.validate().unwrap();
+        let decoded: ProducerPresenceV1 =
+            serde_json::from_slice(&serde_json::to_vec(&current).unwrap()).unwrap();
+        assert_eq!(decoded, current);
+        assert_eq!(
+            decoded.linked_worktrees[0].worktree_dir,
+            "/work/worktrees/alpha-feature"
+        );
+
+        // Entries are closed: an unknown field refuses.
+        assert!(
+            serde_json::from_value::<LinkedWorktreeV1>(serde_json::json!({
+                "base_checkout_id": "0123456789abcdef0123456789abcdef",
+                "worktree_dir": "/work/worktrees/alpha-feature",
+                "branch": "main",
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn presence_linked_worktrees_are_bounded_and_validated() {
+        let mut too_many = valid_presence();
+        too_many.linked_worktrees =
+            vec![too_many.linked_worktrees[0].clone(); MAX_PRODUCER_LINKED_WORKTREES + 1];
+        assert!(too_many.validate().is_err());
+
+        let mut at_bound = valid_presence();
+        at_bound.linked_worktrees =
+            vec![at_bound.linked_worktrees[0].clone(); MAX_PRODUCER_LINKED_WORKTREES];
+        at_bound.validate().unwrap();
+
+        for (checkout_id, dir) in [
+            ("not-hex", "/work/worktrees/alpha"),
+            ("0123456789abcdef", "/work/worktrees/alpha"),
+            ("0123456789abcdef0123456789abcdef", "worktrees/alpha"),
+            ("0123456789abcdef0123456789abcdef", "/work/../alpha"),
+            ("0123456789abcdef0123456789abcdef", "/work/./alpha"),
+            ("0123456789abcdef0123456789abcdef", "/work//alpha"),
+            ("0123456789abcdef0123456789abcdef", "/work/alpha/"),
+            ("0123456789abcdef0123456789abcdef", "/work/al\npha"),
+        ] {
+            let mut presence = valid_presence();
+            presence.linked_worktrees = vec![LinkedWorktreeV1 {
+                base_checkout_id: checkout_id.into(),
+                worktree_dir: dir.into(),
+            }];
+            assert!(
+                presence.validate().is_err(),
+                "{checkout_id} {dir} must refuse"
+            );
+        }
+        let mut long_dir = valid_presence();
+        long_dir.linked_worktrees[0].worktree_dir =
+            format!("/{}", "x".repeat(MAX_PRODUCER_COMMAND_PATH_BYTES));
+        assert!(long_dir.validate().is_err());
     }
 
     fn valid_enroll_receipt() -> EnrollReceiptV1 {

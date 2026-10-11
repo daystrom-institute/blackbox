@@ -162,8 +162,10 @@ impl BlackboxServer {
 
     /// One shared resolver engine per call, over pinned snapshots
     /// (phase-2 §9.2): the bridge backend wraps the current records
-    /// snapshot, catalog mode wraps the strict pair. The closure holds the
-    /// engine for the resolution only; no lock or snapshot outlives it.
+    /// snapshot, catalog mode wraps the strict pair plus the live
+    /// linked-worktree alias view derived from fresh producer presences
+    /// (Filter lane only). The closure holds the engine for the resolution
+    /// only; no lock or snapshot outlives it.
     pub(crate) fn with_project_resolver<T>(
         &self,
         f: impl FnOnce(&bbox_indexing::project_resolver::ProjectResolverEngine<'_>) -> T,
@@ -177,10 +179,16 @@ impl BlackboxServer {
             }
             crate::server::state::ProjectAuthority::Catalog { store } => {
                 let state = store.snapshot().map_err(anyhow::Error::new)?;
+                let aliases = self.state.producer_commands.worktree_aliases(
+                    state.catalog(),
+                    state.attachments(),
+                    || self.state.code_sources.producer_auth().scope_grant_rows(),
+                );
                 let engine = bbox_indexing::project_resolver::ProjectResolverEngine::v2(
                     state.catalog(),
                     state.attachments(),
-                );
+                )
+                .with_worktree_aliases(&aliases);
                 Ok(f(&engine))
             }
         }
@@ -276,7 +284,10 @@ impl BlackboxServer {
     /// `fleet_worktree_scope_and_dir` call sites): Write-intent resolution
     /// through the engine, yielding `(durable store key, checkout dir)` only
     /// when the selector travelled through a managed non-base checkout. The
-    /// conservative write gate stays owned by the resolver backends.
+    /// conservative write gate stays owned by the resolver backends. A
+    /// resolution through a reported linked-worktree alias never yields a
+    /// checkout: the daemon writes nothing at a worktree path because of an
+    /// alias.
     pub(crate) fn resolve_worktree_scope_and_dir(&self, raw: &str) -> Option<(String, String)> {
         use bbox_corpus_core::project_catalog::AttachmentKind;
         use bbox_corpus_core::project_selector::SelectorClass;
@@ -293,6 +304,9 @@ impl BlackboxServer {
         let ProjectResolution::Attached(ctx) = outcome else {
             return None;
         };
+        if ctx.worktree_alias_root.is_some() {
+            return None;
+        }
         let checkout_dir = match &ctx.attachment {
             ResolvedAttachment::V1Compat {
                 checkout_dir,
@@ -308,8 +322,8 @@ impl BlackboxServer {
 
     /// Filter-side companion to [`Self::resolve_project_write`]: map a
     /// project FILTER value to its registered base only when it is a
-    /// recognized checkout alias (`None` otherwise — caller keeps the raw
-    /// value). Substring filters and other non-path values pass through
+    /// recognized checkout alias, a reported linked worktree included
+    /// (`None` otherwise — caller keeps the raw value). Substring filters and other non-path values pass through
     /// untouched, preserving each store's existing match semantics.
     ///
     /// Reimplemented on the shared engine (phase-2 §9.2): filter reads
@@ -317,15 +331,16 @@ impl BlackboxServer {
     pub(crate) fn rescope_project_filter_value(&self, raw: &str) -> Option<String> {
         match self.resolve_project_filter(raw)? {
             ProjectResolution::Attached(ctx) => {
-                let travelled_checkout = match &ctx.attachment {
-                    ResolvedAttachment::V1Compat { checkout_dir, .. } => {
-                        *checkout_dir != ctx.store_key
-                    }
-                    ResolvedAttachment::Catalog {
-                        checkout_project_dir,
-                        ..
-                    } => *checkout_project_dir != ctx.store_key,
-                };
+                let travelled_checkout = ctx.worktree_alias_root.is_some()
+                    || match &ctx.attachment {
+                        ResolvedAttachment::V1Compat { checkout_dir, .. } => {
+                            *checkout_dir != ctx.store_key
+                        }
+                        ResolvedAttachment::Catalog {
+                            checkout_project_dir,
+                            ..
+                        } => *checkout_project_dir != ctx.store_key,
+                    };
                 travelled_checkout.then_some(ctx.store_key)
             }
             ProjectResolution::Catalog(_) | ProjectResolution::LiteralFilter { .. } => None,

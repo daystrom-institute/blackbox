@@ -198,6 +198,7 @@ mod tests {
                     service_label: service_label.map(str::to_string),
                     collector_version: "1.0.0".to_string(),
                     interval_secs: None,
+                    linked_worktrees: Vec::new(),
                 },
             },
         );

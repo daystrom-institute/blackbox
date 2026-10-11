@@ -22,6 +22,16 @@
   canonicalize-pass-through (keying state under the subdir). The resolver
   returns None for that case under Write — the fallback decision stays
   explicit at call sites.
+- The catalog backend resolves only through recorded attachments, with one
+  read-side exception: on the Filter lane, after the attachment arm misses, a
+  caller-supplied path inside a linked worktree that a checkout-host producer
+  currently reports aliases to that worktree's active `Base` attachment
+  (`WorktreeAlias`, passed in through `with_worktree_aliases`). The outcome is
+  the base's project, attachment and store key, with `worktree_alias_root`
+  naming the alias; equal-depth alias ties fail closed. Selection-class
+  requests and the session fallback never alias, and an alias is never a
+  write target. The version-1 backend takes no alias view: its Read gate does
+  its own git probes.
 - Pool lanes are full clones rather than linked worktrees. Their exact
   `.git/blackbox-managed-checkout` marker plus a matching durable `repo_id`
   admits them through the conservative write gate. Never weaken this to

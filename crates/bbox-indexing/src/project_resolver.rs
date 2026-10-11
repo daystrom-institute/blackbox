@@ -11,7 +11,9 @@
 //!   strict-opened catalog/attachment pair: exact membership, unique
 //!   accepted alias, explicit typed scope, exact-or-deepest active
 //!   attachment containment, fail-closed ambiguity, and no identity
-//!   manufacture for unknown paths.
+//!   manufacture for unknown paths. On the Filter lane only, a path no
+//!   attachment contains may still resolve through a live linked-worktree
+//!   alias ([`WorktreeAlias`]) to its `Base` attachment.
 //!
 //! Two entry points express the governing §5.3 stopping points: [`resolve`]
 //! stops at the richest provable context (corpus callers), and
@@ -33,7 +35,7 @@ use bbox_corpus_core::project_record::ProjectRecord;
 use bbox_corpus_core::project_selector::{
     AttachedProjectContext, CatalogProjectContext, CompatibilityLane, ProjectResolution,
     ProjectResolveError, ProjectSelectorRequest, ResolvedAttachment, ResolvedProjectIdentity,
-    SelectorClass,
+    SelectorClass, WorktreeAlias,
 };
 
 use crate::projects::resolve_project_context;
@@ -48,6 +50,10 @@ pub enum ResolverBackend<'a> {
     V2 {
         catalog: &'a CatalogSnapshotV2,
         attachments: &'a AttachmentSnapshotV1,
+        /// Live linked-worktree aliases, consulted only on the Filter lane
+        /// after the attachment arm misses. Empty unless the caller supplies
+        /// a view ([`ProjectResolverEngine::with_worktree_aliases`]).
+        worktree_aliases: &'a [WorktreeAlias],
     },
 }
 
@@ -67,8 +73,22 @@ impl<'a> ProjectResolverEngine<'a> {
             backend: ResolverBackend::V2 {
                 catalog,
                 attachments,
+                worktree_aliases: &[],
             },
         }
+    }
+
+    /// Supply the live linked-worktree alias view to the catalog backend.
+    /// The version-1 backend ignores it: its Read gate does its own git
+    /// probes.
+    pub fn with_worktree_aliases(mut self, aliases: &'a [WorktreeAlias]) -> Self {
+        if let ResolverBackend::V2 {
+            worktree_aliases, ..
+        } = &mut self.backend
+        {
+            *worktree_aliases = aliases;
+        }
+        self
     }
 
     /// Resolve to the richest provable context. Corpus-only callers stop
@@ -83,7 +103,8 @@ impl<'a> ProjectResolverEngine<'a> {
             ResolverBackend::V2 {
                 catalog,
                 attachments,
-            } => v2_resolve(catalog, attachments, req),
+                worktree_aliases,
+            } => v2_resolve(catalog, attachments, worktree_aliases, req),
         }
     }
 
@@ -110,6 +131,7 @@ impl<'a> ProjectResolverEngine<'a> {
                 ResolverBackend::V2 {
                     catalog,
                     attachments,
+                    ..
                 } => v2_select_attachment(catalog, attachments, &ctx, req),
             },
         }
@@ -169,6 +191,7 @@ fn v1_resolve(
                 },
                 attachment,
                 store_key: ctx.host_root,
+                worktree_alias_root: None,
             }))
         }
         None => miss(req, raw),
@@ -213,6 +236,7 @@ fn v1_scope_arm(
             checkout_id: None,
         },
         store_key: record.canonical_path.clone(),
+        worktree_alias_root: None,
     }))
 }
 
@@ -223,6 +247,7 @@ fn v1_scope_arm(
 fn v2_resolve(
     catalog: &CatalogSnapshotV2,
     attachments: &AttachmentSnapshotV1,
+    worktree_aliases: &[WorktreeAlias],
     req: &ProjectSelectorRequest,
 ) -> Result<ProjectResolution, ProjectResolveError> {
     if let Some(raw) = req.selector.as_deref() {
@@ -287,6 +312,19 @@ fn v2_resolve(
         fs::canonicalize(path).unwrap_or_else(|_| lexical_normalize_selector_path(path));
     let selected = v2_path_attachment(attachments, &canonical)?;
     let Some(attachment) = selected else {
+        // Filter lane only: a caller-supplied path inside a reported linked
+        // worktree resolves to its base attachment. Selection-class callers
+        // and the session fallback never alias.
+        if req.class == SelectorClass::Filter
+            && req.selector.is_some()
+            && let Some((alias, base)) =
+                v2_worktree_alias(attachments, worktree_aliases, &canonical)?
+            && let Some(project) = catalog.projects.get(&base.project_id)
+        {
+            let mut ctx = v2_attached_context(catalog, attachments, project, base);
+            ctx.worktree_alias_root = Some(alias.alias_root.clone());
+            return Ok(ProjectResolution::Attached(ctx));
+        }
         return miss(req, raw);
     };
     if let Some(session_id) = session_checkout_id
@@ -366,6 +404,53 @@ fn v2_path_attachment<'s>(
     Ok(best.map(|(_, attachment)| attachment))
 }
 
+/// Exact alias root, then deepest containing alias root, among the live
+/// linked-worktree aliases. The match must name an active `Base`-kind
+/// attachment; anything else misses. Equal-depth ties between distinct
+/// aliases fail closed.
+fn v2_worktree_alias<'s, 'w>(
+    attachments: &'s AttachmentSnapshotV1,
+    worktree_aliases: &'w [WorktreeAlias],
+    canonical: &Path,
+) -> Result<Option<(&'w WorktreeAlias, &'s CheckoutAttachment)>, ProjectResolveError> {
+    let mut best: Option<(usize, &WorktreeAlias)> = None;
+    let mut tied = false;
+    for alias in worktree_aliases {
+        let root = Path::new(&alias.alias_root);
+        if !root.is_absolute() || !canonical.starts_with(root) {
+            continue;
+        }
+        let depth = root.components().count();
+        match &best {
+            Some((best_depth, best_alias)) if depth == *best_depth => {
+                if *best_alias != alias {
+                    tied = true;
+                }
+            }
+            Some((best_depth, _)) if depth > *best_depth => {
+                best = Some((depth, alias));
+                tied = false;
+            }
+            None => best = Some((depth, alias)),
+            _ => {}
+        }
+    }
+    if tied {
+        return Err(ProjectResolveError::selector_ambiguous(
+            "equal-depth linked-worktree aliases contain the path",
+        ));
+    }
+    let Some((_, alias)) = best else {
+        return Ok(None);
+    };
+    let base = attachments.attachments.values().find(|attachment| {
+        attachment.attachment_id.as_str() == alias.base_attachment_id
+            && attachment.status == AttachmentStatus::Attached
+            && attachment.kind == AttachmentKind::Base
+    });
+    Ok(base.map(|base| (alias, base)))
+}
+
 fn v2_catalog_outcome(project: &CorpusProject) -> ProjectResolution {
     ProjectResolution::Catalog(CatalogProjectContext {
         project: ResolvedProjectIdentity::Catalog {
@@ -411,6 +496,7 @@ fn v2_attached_context(
             capabilities: attachment.capabilities.clone(),
         },
         store_key: v2_store_key(attachments, project, attachment),
+        worktree_alias_root: None,
     }
 }
 
@@ -1326,5 +1412,243 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn alias(root: &Path, rel: &str, attachment_id: &str) -> WorktreeAlias {
+        WorktreeAlias {
+            alias_root: root.join(rel).to_str().unwrap().to_string(),
+            base_attachment_id: attachment_id.to_string(),
+        }
+    }
+
+    /// Reported linked-worktree aliases answer the Filter lane only, and a
+    /// match presents the base: the same project, attachment, and store key
+    /// resolving the base path yields, plus the alias root it went through.
+    #[test]
+    fn v2_filter_resolves_reported_worktree_alias_to_its_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        make_dirs(&root);
+        // One worktree exists on this host; the mono one does not, which is
+        // the zero-checkout-authority shape.
+        std::fs::create_dir_all(root.join("workspaces/solo-feature/src")).unwrap();
+        let fx = v2_fixture(&root);
+        let aliases = vec![
+            alias(
+                &root,
+                "workspaces/solo-feature",
+                "att_0000000000000000000000000000a001",
+            ),
+            alias(
+                &root,
+                "workspaces/mono-feature",
+                "att_0000000000000000000000000000c001",
+            ),
+            alias(
+                &root,
+                "workspaces/mono-feature/packages/leaf",
+                "att_0000000000000000000000000000c002",
+            ),
+        ];
+        let engine =
+            ProjectResolverEngine::v2(&fx.catalog, &fx.attachments).with_worktree_aliases(&aliases);
+        let filter = |path: &str| {
+            engine
+                .resolve(&ProjectSelectorRequest::filter(
+                    root.join(path).to_str().unwrap(),
+                ))
+                .unwrap()
+        };
+
+        let ProjectResolution::Attached(base) = filter("solo") else {
+            panic!("the base path resolves attached");
+        };
+        assert_eq!(base.worktree_alias_root, None);
+        for path in [
+            "workspaces/solo-feature",
+            "workspaces/solo-feature/src",
+            "workspaces/solo-feature/src/not-on-this-host",
+        ] {
+            let ProjectResolution::Attached(ctx) = filter(path) else {
+                panic!("{path} resolves through its alias");
+            };
+            assert_eq!(ctx.project, base.project, "{path}");
+            assert_eq!(ctx.attachment, base.attachment, "{path}");
+            assert_eq!(ctx.store_key, base.store_key, "{path}");
+            assert_eq!(
+                ctx.worktree_alias_root.as_deref(),
+                Some(root.join("workspaces/solo-feature").to_str().unwrap())
+            );
+        }
+
+        // A subtree project aliases the same subtree inside the worktree;
+        // the deepest alias root wins.
+        let leaf = filter("workspaces/mono-feature/packages/leaf/src");
+        assert_eq!(
+            leaf.project_id(),
+            Some("p_0000000000000000000000monoleaf00")
+        );
+        assert_eq!(
+            leaf.store_key(),
+            Some(root.join("mono/packages/leaf").to_str().unwrap())
+        );
+        let mono_root = filter("workspaces/mono-feature/docs");
+        assert_eq!(
+            mono_root.project_id(),
+            Some("p_0000000000000000000000monoroot00")
+        );
+
+        // The write-intent Filter request the worktree carrier probe makes
+        // sees the Base attachment, never a worktree checkout.
+        let mut write_filter =
+            ProjectSelectorRequest::filter(root.join("workspaces/solo-feature").to_str().unwrap());
+        write_filter.intent = ResolveIntent::Write;
+        let ProjectResolution::Attached(ctx) = engine.resolve(&write_filter).unwrap() else {
+            panic!("write-intent filter resolves through the alias");
+        };
+        assert!(matches!(
+            ctx.attachment,
+            ResolvedAttachment::Catalog {
+                kind: AttachmentKind::Base,
+                ..
+            }
+        ));
+
+        // Selection still misses for a worktree path, whatever the intent.
+        for intent in [ResolveIntent::Read, ResolveIntent::Write] {
+            let request = selection(
+                root.join("workspaces/solo-feature").to_str().unwrap(),
+                intent,
+            );
+            assert_eq!(
+                engine.resolve(&request).unwrap_err().code(),
+                "error.project_selector_unknown"
+            );
+            assert!(engine.resolve_attached(&request).is_err());
+        }
+
+        // The session fallback never aliases.
+        let request = ProjectSelectorRequest {
+            session: Some(SessionCheckoutRef {
+                checkout_id: None,
+                checkout_project_dir: Some(
+                    root.join("workspaces/solo-feature")
+                        .to_str()
+                        .unwrap()
+                        .to_string(),
+                ),
+            }),
+            class: SelectorClass::Filter,
+            ..Default::default()
+        };
+        assert!(matches!(
+            engine.resolve(&request).unwrap(),
+            ProjectResolution::LiteralFilter { .. }
+        ));
+
+        // Without a view, or outside every alias, the path stays literal.
+        let bare = ProjectResolverEngine::v2(&fx.catalog, &fx.attachments);
+        assert!(matches!(
+            bare.resolve(&ProjectSelectorRequest::filter(
+                root.join("workspaces/solo-feature").to_str().unwrap()
+            ))
+            .unwrap(),
+            ProjectResolution::LiteralFilter { .. }
+        ));
+        assert!(matches!(
+            filter("workspaces/other"),
+            ProjectResolution::LiteralFilter { .. }
+        ));
+    }
+
+    /// An alias resolves only to an active `Base`-kind attachment.
+    #[test]
+    fn v2_worktree_alias_requires_an_active_base_attachment() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        make_dirs(&root);
+        let mut fx = v2_fixture(&root);
+        let aliases = vec![
+            alias(
+                &root,
+                "workspaces/wt-of-worktree",
+                "att_0000000000000000000000000000b002",
+            ),
+            alias(
+                &root,
+                "workspaces/solo-feature",
+                "att_0000000000000000000000000000a001",
+            ),
+            alias(
+                &root,
+                "workspaces/unknown",
+                "att_0000000000000000000000000000f001",
+            ),
+        ];
+        let base_id = AttachmentId::parse("att_0000000000000000000000000000a001").unwrap();
+        let base = fx.attachments.attachments.get_mut(&base_id).unwrap();
+        base.status = AttachmentStatus::Detached;
+        base.detached_at = Some("2026-07-24T00:00:01Z".to_string());
+        let engine =
+            ProjectResolverEngine::v2(&fx.catalog, &fx.attachments).with_worktree_aliases(&aliases);
+        for path in [
+            "workspaces/wt-of-worktree",
+            "workspaces/solo-feature",
+            "workspaces/unknown",
+        ] {
+            assert!(
+                matches!(
+                    engine
+                        .resolve(&ProjectSelectorRequest::filter(
+                            root.join(path).to_str().unwrap()
+                        ))
+                        .unwrap(),
+                    ProjectResolution::LiteralFilter { .. }
+                ),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn v2_equal_depth_worktree_alias_tie_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        make_dirs(&root);
+        let fx = v2_fixture(&root);
+        let aliases = vec![
+            alias(
+                &root,
+                "workspaces/shared",
+                "att_0000000000000000000000000000a001",
+            ),
+            alias(
+                &root,
+                "workspaces/shared",
+                "att_0000000000000000000000000000c001",
+            ),
+        ];
+        let engine =
+            ProjectResolverEngine::v2(&fx.catalog, &fx.attachments).with_worktree_aliases(&aliases);
+        let error = engine
+            .resolve(&ProjectSelectorRequest::filter(
+                root.join("workspaces/shared/src").to_str().unwrap(),
+            ))
+            .expect_err("equal-depth aliases fail closed");
+        assert_eq!(error.code(), "error.project_selector_ambiguous");
+
+        // A repeated identical report is one alias, not a tie.
+        let repeated = vec![aliases[0].clone(), aliases[0].clone()];
+        let engine = ProjectResolverEngine::v2(&fx.catalog, &fx.attachments)
+            .with_worktree_aliases(&repeated);
+        assert_eq!(
+            engine
+                .resolve(&ProjectSelectorRequest::filter(
+                    root.join("workspaces/shared").to_str().unwrap(),
+                ))
+                .unwrap()
+                .project_id(),
+            Some("p_0000000000000000000000000000solo")
+        );
     }
 }

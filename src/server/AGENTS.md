@@ -45,7 +45,8 @@
   the question.
 - `scoped_for` reuses a resolved `?project=` selector from
   `ProjectSelectorCache`, keyed by the raw selector and valid for one
-  project authority epoch and a short TTL, so a sessionless request does not
+  project authority epoch, one linked-worktree alias generation and a short
+  TTL, so a sessionless request does not
   repeat the blocking project probe. `initialize` always resolves afresh and
   never reads or fills the cache. The surface and the workspace binding are
   never cached.

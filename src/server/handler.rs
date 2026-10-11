@@ -83,8 +83,11 @@ const PROJECT_SELECTOR_CACHE_ENTRIES: usize = 256;
 /// session. A session resolves its selector once at `initialize`; a
 /// sessionless client sends the same selector on every request, and each
 /// resolution is a blocking probe. An entry is reused only while the project
-/// authority epoch it was resolved under is current and it is younger than
-/// [`PROJECT_SELECTOR_TTL`]. Workspace bindings are never cached: they are
+/// authority epoch and the linked-worktree alias generation it was resolved
+/// under are both current and it is younger than [`PROJECT_SELECTOR_TTL`], so
+/// a worktree reported or withdrawn after a cached resolution takes effect at
+/// once. A producer grant reload is the one alias input neither key tracks;
+/// the TTL bounds it. Workspace bindings are never cached: they are
 /// authenticated on every request.
 ///
 /// The resolved project of a sessionless request is read by the dispatch
@@ -98,20 +101,39 @@ pub(crate) struct ProjectSelectorCache {
 
 struct CachedProjectSelector {
     resolved: String,
-    authority_epoch: u64,
+    authority: SelectorAuthority,
     resolved_at: std::time::Instant,
 }
 
+/// What a cached selector resolution depends on: the project authority
+/// epoch and the linked-worktree alias generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SelectorAuthority {
+    epoch: u64,
+    alias_generation: u64,
+}
+
 impl ProjectSelectorCache {
-    fn get(&self, raw: &str, authority_epoch: u64, now: std::time::Instant) -> Option<String> {
+    fn get(
+        &self,
+        raw: &str,
+        authority: SelectorAuthority,
+        now: std::time::Instant,
+    ) -> Option<String> {
         let entries = self.entries.lock();
         let entry = entries.get(raw)?;
-        (entry.authority_epoch == authority_epoch
+        (entry.authority == authority
             && now.saturating_duration_since(entry.resolved_at) < PROJECT_SELECTOR_TTL)
             .then(|| entry.resolved.clone())
     }
 
-    fn put(&self, raw: String, resolved: String, authority_epoch: u64, now: std::time::Instant) {
+    fn put(
+        &self,
+        raw: String,
+        resolved: String,
+        authority: SelectorAuthority,
+        now: std::time::Instant,
+    ) {
         let mut entries = self.entries.lock();
         if entries.len() >= PROJECT_SELECTOR_CACHE_ENTRIES && !entries.contains_key(&raw) {
             entries.clear();
@@ -120,7 +142,7 @@ impl ProjectSelectorCache {
             raw,
             CachedProjectSelector {
                 resolved,
-                authority_epoch,
+                authority,
                 resolved_at: now,
             },
         );
@@ -220,16 +242,19 @@ impl BlackboxServer {
             Some(project_id) => Some(project_id),
             None => match project_raw.clone() {
                 Some(raw) => {
-                    let authority_epoch = self
-                        .state
-                        .records_provider
-                        .records_snapshot()
-                        .authority_epoch;
+                    let authority = SelectorAuthority {
+                        epoch: self
+                            .state
+                            .records_provider
+                            .records_snapshot()
+                            .authority_epoch,
+                        alias_generation: self.state.producer_commands.worktree_alias_generation(),
+                    };
                     let cached = reuse_project_resolution
                         .then(|| {
                             self.state.project_selector_cache.get(
                                 &raw,
-                                authority_epoch,
+                                authority,
                                 std::time::Instant::now(),
                             )
                         })
@@ -261,7 +286,7 @@ impl BlackboxServer {
                                 self.state.project_selector_cache.put(
                                     raw,
                                     resolved.clone(),
-                                    authority_epoch,
+                                    authority,
                                     std::time::Instant::now(),
                                 );
                             }
@@ -790,29 +815,44 @@ mod tests {
     }
 
     #[test]
-    fn a_cached_project_selector_is_reused_only_under_its_epoch_and_age() {
+    fn a_cached_project_selector_is_reused_only_under_its_authority_and_age() {
+        let at = |epoch, alias_generation| SelectorAuthority {
+            epoch,
+            alias_generation,
+        };
         let cache = ProjectSelectorCache::default();
         let start = std::time::Instant::now();
-        assert_eq!(cache.get("alias", 7, start), None);
-        cache.put("alias".into(), "p_resolved".into(), 7, start);
-        assert_eq!(cache.get("alias", 7, start).as_deref(), Some("p_resolved"));
-        assert_eq!(cache.get("other", 7, start), None);
-        // A moved project authority invalidates at once.
-        assert_eq!(cache.get("alias", 8, start), None);
-        // So does age, whatever the epoch says.
-        let just_inside = start + PROJECT_SELECTOR_TTL - std::time::Duration::from_millis(1);
+        assert_eq!(cache.get("alias", at(7, 1), start), None);
+        cache.put("alias".into(), "p_resolved".into(), at(7, 1), start);
         assert_eq!(
-            cache.get("alias", 7, just_inside).as_deref(),
+            cache.get("alias", at(7, 1), start).as_deref(),
             Some("p_resolved")
         );
-        assert_eq!(cache.get("alias", 7, start + PROJECT_SELECTOR_TTL), None);
+        assert_eq!(cache.get("other", at(7, 1), start), None);
+        // A moved project authority invalidates at once.
+        assert_eq!(cache.get("alias", at(8, 1), start), None);
+        // So does a moved linked-worktree alias view.
+        assert_eq!(cache.get("alias", at(7, 2), start), None);
+        // So does age, whatever the authority says.
+        let just_inside = start + PROJECT_SELECTOR_TTL - std::time::Duration::from_millis(1);
+        assert_eq!(
+            cache.get("alias", at(7, 1), just_inside).as_deref(),
+            Some("p_resolved")
+        );
+        assert_eq!(
+            cache.get("alias", at(7, 1), start + PROJECT_SELECTOR_TTL),
+            None
+        );
         // A newer resolution replaces the entry.
-        cache.put("alias".into(), "p_moved".into(), 8, start);
-        assert_eq!(cache.get("alias", 8, start).as_deref(), Some("p_moved"));
+        cache.put("alias".into(), "p_moved".into(), at(8, 1), start);
+        assert_eq!(
+            cache.get("alias", at(8, 1), start).as_deref(),
+            Some("p_moved")
+        );
 
         // The table is bounded: filling it past the limit starts over.
         for index in 0..PROJECT_SELECTOR_CACHE_ENTRIES {
-            cache.put(format!("selector-{index}"), "p".into(), 8, start);
+            cache.put(format!("selector-{index}"), "p".into(), at(8, 1), start);
         }
         assert!(cache.entries.lock().len() <= PROJECT_SELECTOR_CACHE_ENTRIES);
     }
