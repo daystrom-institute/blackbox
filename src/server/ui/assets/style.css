@@ -590,3 +590,10 @@ tfoot td {
   max-height: 20rem;
   overflow-y: auto;
 }
+
+/* Roster finished-task toggle */
+
+.roster-toggle {
+  margin: 0 0 0.5rem;
+  font-size: 0.9em;
+}

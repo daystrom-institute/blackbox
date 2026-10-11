@@ -20,7 +20,7 @@ use std::convert::Infallible;
 use std::sync::Arc;
 
 use axum::Extension;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -83,14 +83,56 @@ fn task_href(task_id: &str) -> String {
 
 // ── Roster ──────────────────────────────────────────────────────────
 
-/// `bro_dashboard` reader: the roster view, running tasks first.
-fn roster_rows(ui: &UiState) -> Vec<RosterSummaryV1> {
+/// The roster's query string: finished tasks are opt-in.
+#[derive(Debug, Default, serde::Deserialize)]
+pub(crate) struct RosterQuery {
+    #[serde(default)]
+    finished: Option<String>,
+}
+
+impl RosterQuery {
+    fn include_finished(&self) -> bool {
+        matches!(
+            self.finished.as_deref().map(str::trim),
+            Some("1") | Some("true") | Some("yes")
+        )
+    }
+}
+
+/// The roster as the page lists it: the rows to show, running first, and
+/// how many finished tasks the view holds (shown or hidden).
+struct Roster {
+    rows: Vec<RosterSummaryV1>,
+    finished: usize,
+    include_finished: bool,
+}
+
+/// `bro_dashboard` reader: the roster view, running tasks first. Finished
+/// tasks (completed, failed, cancelled) are listed only when asked for.
+fn roster_rows(ui: &UiState, include_finished: bool) -> Roster {
     let mut rows = ui.shared.roster_view.snapshot();
+    let finished = rows.iter().filter(|s| s.status.is_terminal()).count();
+    if !include_finished {
+        rows.retain(|s| !s.status.is_terminal());
+    }
     rows.sort_by(|a, b| {
         let rank = |s: &RosterSummaryV1| roster_bucket(s.status, s.interrupted).2;
         rank(a).cmp(&rank(b)).then_with(|| dashboard_order(a, b))
     });
-    rows
+    Roster {
+        rows,
+        finished,
+        include_finished,
+    }
+}
+
+/// The roster routes with the finished flag carried along.
+fn roster_href(path: &str, include_finished: bool) -> String {
+    if include_finished {
+        format!("{path}?finished=1")
+    } else {
+        path.to_string()
+    }
 }
 
 /// The roster table body: one row per task, or one empty-state row so a
@@ -136,9 +178,22 @@ fn render_rows(rows: &[RosterSummaryV1], now: DateTime<Utc>) -> Markup {
     }
 }
 
-fn render_roster(rows: &[RosterSummaryV1], now: DateTime<Utc>) -> Markup {
+fn render_roster(roster: &Roster, now: DateTime<Utc>) -> Markup {
+    let include_finished = roster.include_finished;
     html! {
-        div.roster-live hx-ext="sse" sse-connect="/streams/bros" {
+        p.roster-toggle {
+            @if include_finished {
+                a href="/bros" { "Hide finished tasks" }
+            } @else if roster.finished == 0 {
+                span.muted { "No finished tasks on the roster." }
+            } @else {
+                a href="/bros?finished=1" {
+                    "Show " (roster.finished) " finished "
+                    @if roster.finished == 1 { "task" } @else { "tasks" }
+                }
+            }
+        }
+        div.roster-live hx-ext="sse" sse-connect=(roster_href("/streams/bros", include_finished)) {
             table.roster-table {
                 thead {
                     tr {
@@ -153,8 +208,8 @@ fn render_roster(rows: &[RosterSummaryV1], now: DateTime<Utc>) -> Markup {
                     }
                 }
                 tbody id="roster-rows" sse-swap="roster" hx-swap="innerHTML"
-                    hx-get="/fragments/bros/rows" hx-trigger="sse:resync" {
-                    (render_rows(rows, now))
+                    hx-get=(roster_href("/fragments/bros/rows", include_finished)) hx-trigger="sse:resync" {
+                    (render_rows(&roster.rows, now))
                 }
             }
         }
@@ -168,8 +223,9 @@ fn render_roster(rows: &[RosterSummaryV1], now: DateTime<Utc>) -> Markup {
 pub(crate) async fn roster_page(
     State(ui): State<Arc<UiState>>,
     Extension(principal): Extension<Principal>,
+    Query(query): Query<RosterQuery>,
 ) -> Response {
-    let content = render_roster(&roster_rows(&ui), Utc::now());
+    let content = render_roster(&roster_rows(&ui, query.include_finished()), Utc::now());
     html_response(
         StatusCode::OK,
         layout(&ui.shell(&principal), Some(Section::Bros), "Bros", content),
@@ -177,14 +233,21 @@ pub(crate) async fn roster_page(
 }
 
 /// `GET /fragments/bros/rows`: the roster table body.
-pub(crate) async fn rows_fragment(State(ui): State<Arc<UiState>>) -> Response {
-    html_response(StatusCode::OK, render_rows(&roster_rows(&ui), Utc::now()))
+pub(crate) async fn rows_fragment(
+    State(ui): State<Arc<UiState>>,
+    Query(query): Query<RosterQuery>,
+) -> Response {
+    html_response(
+        StatusCode::OK,
+        render_rows(&roster_rows(&ui, query.include_finished()).rows, Utc::now()),
+    )
 }
 
-fn rows_event(ui: &UiState) -> Event {
-    Event::default()
-        .event("roster")
-        .data(sse_html(render_rows(&roster_rows(ui), Utc::now())))
+fn rows_event(ui: &UiState, include_finished: bool) -> Event {
+    Event::default().event("roster").data(sse_html(render_rows(
+        &roster_rows(ui, include_finished).rows,
+        Utc::now(),
+    )))
 }
 
 fn resync_event(skipped: u64) -> Event {
@@ -197,15 +260,17 @@ fn resync_event(skipped: u64) -> Event {
 /// are folded into the next render.
 pub(crate) async fn roster_stream(
     State(ui): State<Arc<UiState>>,
+    Query(query): Query<RosterQuery>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let include_finished = query.include_finished();
     let mut rx = ui.shared.roster_tx.subscribe();
     let stream = async_stream::stream! {
-        yield Ok(rows_event(&ui));
+        yield Ok(rows_event(&ui, include_finished));
         loop {
             match rx.recv().await {
                 Ok(_) => {
                     while let Ok(_) | Err(TryRecvError::Lagged(_)) = rx.try_recv() {}
-                    yield Ok(rows_event(&ui));
+                    yield Ok(rows_event(&ui, include_finished));
                 }
                 Err(RecvError::Lagged(skipped)) => yield Ok(resync_event(skipped)),
                 Err(RecvError::Closed) => break,
@@ -815,11 +880,21 @@ mod tests {
         let shared = Arc::new(SharedState::for_test(dir.path()));
         seed(&shared);
 
-        let (status, body) = get(shared.clone(), "/bros").await;
+        // Finished tasks are opt-in: the default roster shows the running
+        // task and offers the finished one behind a link.
+        let (status, live) = get(shared.clone(), "/bros").await;
+        assert_eq!(status, StatusCode::OK, "{live}");
+        assert!(live.contains("href=\"/bros/t-run\""), "{live}");
+        assert!(!live.contains("href=\"/bros/t-done\""), "{live}");
+        assert!(live.contains("Show 1 finished task"), "{live}");
+        assert!(live.contains("sse-connect=\"/streams/bros\""));
+
+        let (status, body) = get(shared.clone(), "/bros?finished=1").await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert!(body.contains("href=\"/bros\" aria-current=\"page\""));
         assert!(body.contains("href=\"/bros/t-run\""), "{body}");
         assert!(body.contains("href=\"/bros/t-done\""));
+        assert!(body.contains("Hide finished tasks"), "{body}");
         assert!(body.contains("<span class=\"state state-running\">running</span>"));
         assert!(body.contains("<span class=\"state state-finished\">completed</span>"));
         assert!(body.contains("executor") && body.contains("reviewer"));
@@ -828,14 +903,18 @@ mod tests {
             body.contains("<td class=\"num\">1s</td>"),
             "terminal elapsed: {body}"
         );
-        assert!(body.contains("sse-connect=\"/streams/bros\""));
+        assert!(body.contains("sse-connect=\"/streams/bros?finished=1\""));
+        assert!(body.contains("hx-get=\"/fragments/bros/rows?finished=1\""));
         // The completed task started later, but running tasks come first.
         assert!(body.find("/bros/t-run").unwrap() < body.find("/bros/t-done").unwrap());
 
-        let (status, rows) = get(shared, "/fragments/bros/rows").await;
+        let (status, rows) = get(shared.clone(), "/fragments/bros/rows").await;
         assert_eq!(status, StatusCode::OK);
         assert!(!rows.contains("<html") && !rows.contains("<table"));
         assert!(rows.contains("href=\"/bros/t-run\""));
+        assert!(!rows.contains("href=\"/bros/t-done\""));
+        let (_, rows) = get(shared, "/fragments/bros/rows?finished=1").await;
+        assert!(rows.contains("href=\"/bros/t-done\""));
     }
 
     #[tokio::test]
