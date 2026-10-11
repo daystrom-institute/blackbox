@@ -1367,6 +1367,10 @@ impl BlackboxServer {
         let server = self.clone();
         Self::run_blocking("bbox_project_attach", move || {
             let audit_reason = bounded_audit_reason(&p.audit_reason)?;
+            // A linked worktree is never attached: it is not checkout
+            // authority, and the base attachment already covers it.
+            server.refuse_worktree_alias_selector(&p.project)?;
+            server.refuse_worktree_alias_selector(&p.path)?;
             let project_id = resolve_project_selection(&store, &p.project)?;
             server.require_local_catalog_admin(project_id.as_str(), "attach")?;
             let leases = server.catalog_admin_leases(&store, &project_id, p.expected_catalog_epoch)?;
@@ -1512,8 +1516,10 @@ impl BlackboxServer {
         let Some(store) = self.catalog_store() else {
             return Self::err_text(&catalog_inactive());
         };
+        let server = self.clone();
         Self::run_blocking("bbox_project_default_attachment", move || {
             let audit_reason = bounded_audit_reason(&p.audit_reason)?;
+            server.refuse_worktree_alias_selector(&p.project)?;
             let project_id = resolve_project_selection(&store, &p.project)?;
             let selection = p
                 .attachment_id
@@ -2984,6 +2990,7 @@ impl BlackboxServer {
         bbox_corpus_core::project_record::ProjectRecord,
         serde_json::Value,
     )> {
+        self.refuse_worktree_alias_selector(path)?;
         let probe = probe_checkout(path)?;
         let checkout_id = bbox_corpus_core::identity::ensure_checkout_id(&probe.checkout_dir)?;
         let display_name = probe
@@ -3077,6 +3084,8 @@ impl BlackboxServer {
             );
         }
         let dry_run = p.dry_run.unwrap_or(false);
+        self.refuse_worktree_alias_selector(&p.project)?;
+        self.refuse_worktree_alias_selector(&p.new_path)?;
         // Resolve the existing attachment through the shared engine: the
         // selector may be the OLD path, the project id, or an alias.
         let state = store
@@ -3188,6 +3197,7 @@ impl BlackboxServer {
         p: &bbox_indexing::projects::ProjectUnregisterParams,
     ) -> anyhow::Result<String> {
         let dry_run = p.dry_run.unwrap_or(false);
+        self.refuse_worktree_alias_selector(&p.project)?;
         let state = store
             .snapshot()
             .map_err(|error| anyhow::anyhow!("{error}"))?;
@@ -4664,6 +4674,203 @@ mod tests {
         use crate::server::state::catalog_fixture::CatalogFixture;
 
         covered_project_gap_write_enqueues(CatalogFixture::new_over_genesis_store()).await;
+    }
+
+    /// A daemon with no checkout authority learns a linked worktree of an
+    /// attached base from its producer's presence. Repo-owned writes made
+    /// from inside it queue against the base's project and scope with the
+    /// worktree project root as the delivery target; the same writes from
+    /// the base carry no target. Administration never acts through the
+    /// worktree: attaching it refuses with the typed alias error.
+    #[tokio::test]
+    async fn writes_from_a_reported_worktree_target_it_and_admin_refuses_it() {
+        use crate::server::producer_auth::{ProducerAuthRuntime, ProducerGrant};
+        use crate::server::state::catalog_fixture::CatalogFixture;
+        use bbox_code_source::{
+            LinkedWorktreeV1, PRODUCER_COMMAND_SCHEMA_VERSION, ProducerCommandPollRequestV1,
+            ProducerPresenceV1,
+        };
+        use bbox_stores::store_persister::StoreSnapshot as _;
+
+        const PROJECT_ID: &str = "p_worktree_target_00";
+        const ATTACHMENT_ID: &str = "att_00000000000000000000000000000e05";
+        const CHECKOUT_ID: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeee05";
+        let fixture = CatalogFixture::new();
+        let scope = PublishedScope::try_new("repo_worktree_target", ".").unwrap();
+        fixture.add_published_project(PROJECT_ID, &scope);
+        let base = fixture.root().join("work").join("alpha");
+        std::fs::create_dir_all(&base).unwrap();
+        fixture.attach_overlay_checkout(
+            PROJECT_ID,
+            &scope,
+            &base,
+            ATTACHMENT_ID,
+            CHECKOUT_ID,
+            true,
+        );
+        // The worktree exists only on the checkout host.
+        let worktree = fixture.root().join("workspaces").join("alpha-feature");
+        let worktree_dir = worktree.to_string_lossy().into_owned();
+        let mut server = fixture.server_without_checkout_authority();
+        cover_knowledge_transport_project(&mut server, PROJECT_ID, scope.clone());
+        let catalog = fixture.store().snapshot().unwrap();
+        server.state.code_sources.install_auth_for_test(Arc::new(
+            ProducerAuthRuntime::for_test_catalog(
+                vec![(
+                    bro_rpc::ServiceToken::parse("7".repeat(64)).unwrap(),
+                    ProducerGrant {
+                        producer_id: "producer-a".into(),
+                        projects: std::collections::BTreeMap::from([(
+                            scope.clone(),
+                            PROJECT_ID.to_string(),
+                        )]),
+                    },
+                )],
+                catalog.catalog(),
+            ),
+        ));
+        server.state.producer_commands.poll(
+            "producer-a",
+            ProducerCommandPollRequestV1 {
+                schema_version: PRODUCER_COMMAND_SCHEMA_VERSION,
+                presence: ProducerPresenceV1 {
+                    enroll_roots: Vec::new(),
+                    host_label: "checkout-host-a".into(),
+                    config_path: "/etc/blackbox/code-collector.toml".into(),
+                    service_label: None,
+                    collector_version: "0.0.1".into(),
+                    interval_secs: Some(120),
+                    linked_worktrees: vec![LinkedWorktreeV1 {
+                        base_checkout_id: CHECKOUT_ID.into(),
+                        worktree_dir: worktree_dir.clone(),
+                    }],
+                },
+            },
+        );
+
+        let gap = |project: String, dedupe: &str| -> crate::gaps::GapFileParams {
+            serde_json::from_value(serde_json::json!({
+                "title": format!("gap {dedupe}"),
+                "gap_kind": "tooling",
+                "domain": "test-domain",
+                "wanted_capability": "land where the work is",
+                "dedupe_key": format!("tooling/test-domain/{dedupe}"),
+                "scope": "project",
+                "project": project,
+            }))
+            .unwrap()
+        };
+        let newest = |server: &BlackboxServer| {
+            server
+                .state
+                .checkout_mutations
+                .read()
+                .snapshot()
+                .unwrap()
+                .mutations
+                .last()
+                .unwrap()
+                .mutation
+                .clone()
+        };
+        let expected_target = Some(bbox_code_source::CheckoutMutationTargetV1 {
+            worktree_project_dir: worktree_dir.clone(),
+        });
+
+        let from_worktree = server
+            .bbox_gap(Parameters(gap(
+                worktree.join("sub").to_string_lossy().into_owned(),
+                "from-worktree",
+            )))
+            .await;
+        let text = format!("{:?}", from_worktree.content);
+        assert_ne!(from_worktree.is_error, Some(true), "{text}");
+        assert!(text.contains("lands in linked worktree"), "{text}");
+        let queued = newest(&server);
+        assert_eq!(queued.scope, scope);
+        assert_eq!(queued.target, expected_target);
+        assert!(queued.relative_path.starts_with(".bbox/gaps/gap-"));
+        let filed: crate::gaps::GapNote =
+            serde_json::from_str(queued.content_json.as_deref().unwrap()).unwrap();
+        assert_eq!(filed.project_id.as_deref(), Some(PROJECT_ID));
+
+        // Branch-local: the published view and dedupe do not see it, so the
+        // same filing from the base is a new gap that lands in the base.
+        let from_base = server
+            .bbox_gap(Parameters(gap(
+                base.to_string_lossy().into_owned(),
+                "from-worktree",
+            )))
+            .await;
+        let text = format!("{:?}", from_base.content);
+        assert_ne!(from_base.is_error, Some(true), "{text}");
+        assert!(text.contains("lands in the base checkout"), "{text}");
+        let queued = newest(&server);
+        assert_eq!(queued.scope, scope);
+        assert_eq!(queued.target, None);
+
+        let learn = |project: String| crate::knowledge::LearnParams {
+            content: "Worktree knowledge travels with its branch.".into(),
+            category: "convention".into(),
+            scope: Some("project".into()),
+            project: Some(project),
+            ..Default::default()
+        };
+        let learned = server
+            .bbox_learn(Parameters(learn(
+                worktree.join("sub").to_string_lossy().into_owned(),
+            )))
+            .await;
+        let text = format!("{:?}", learned.content);
+        assert_ne!(learned.is_error, Some(true), "{text}");
+        let queued = newest(&server);
+        assert!(queued.relative_path.starts_with(".bbox/knowledge/"));
+        assert_eq!(queued.scope, scope);
+        assert_eq!(queued.target, expected_target);
+        let learned = server
+            .bbox_learn(Parameters(learn(PROJECT_ID.into())))
+            .await;
+        assert_ne!(learned.is_error, Some(true), "{learned:?}");
+        assert_eq!(newest(&server).target, None);
+
+        // Nothing was written at either path by the daemon.
+        assert!(!worktree.exists());
+        assert!(!base.join(".bbox/gaps").exists());
+
+        let attach = server
+            .bbox_project_attach(Parameters(ProjectAttachParams {
+                project: PROJECT_ID.into(),
+                path: worktree.join("sub").to_string_lossy().into_owned(),
+                expected_catalog_epoch: catalog.epoch(),
+                audit_reason: "attach a worktree".into(),
+            }))
+            .await;
+        assert_eq!(attach.is_error, Some(true));
+        let text = format!("{:?}", attach.content);
+        assert!(
+            text.contains(crate::tools::scope::WORKTREE_ALIAS_REFUSAL),
+            "{text}"
+        );
+        assert!(text.contains(PROJECT_ID), "{text}");
+
+        // Every other Selection caller refuses the alias with the same code.
+        let error = server
+            .validate_project_selection(&worktree_dir)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.starts_with(crate::tools::scope::WORKTREE_ALIAS_REFUSAL),
+            "{error}"
+        );
+        let error = server
+            .resolve_project_write(&worktree_dir)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            error.starts_with(crate::tools::scope::WORKTREE_ALIAS_REFUSAL),
+            "{error}"
+        );
     }
 
     async fn covered_project_gap_write_enqueues(

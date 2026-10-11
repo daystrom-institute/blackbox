@@ -5,6 +5,7 @@
 - Tokens are loaded from private files through `ServiceToken`, remain in process memory, and are sent only as bearer headers. Never log, serialize, export, or place them in URLs.
 - Remote servers require HTTPS. Loopback HTTP is test and same-host rollout only, and redirects stay disabled.
 - Only explicitly configured or enrolled main-worktree project roots are published. The committed durable scope at HEAD must exactly match the effective project entry.
+- Checkout mutations write only under a configured project root, or, for a mutation carrying a worktree `target`, under that target when it is at delivery time a linked worktree `git worktree list` reports for the project's base joined with the project's relpath. Anything else is acked `undeliverable` and nothing is written; a targeted mutation never falls back to the base. Worktrees are never enrolled or published.
 - Symlinks and special files are never followed. A file is re-read and rehashed before upload; any scan-to-upload change abandons that generation.
 - Git history is opt-in, exact-HEAD, complete, and shallow-clone refusing. Capture uses `StableGitRepository`; it uploads canonical commit fragments rather than packs, object databases, refs, or caller-selected corpus ids.
 - Each history pass probes the server with the cheap head identity (HEAD, object format, committed scope) before any history walk; the complete capture runs only on a probe miss, and the captured head is probed again before upload.

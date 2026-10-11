@@ -424,24 +424,30 @@ impl LinkedWorktreeV1 {
         }
         validate_absolute_command_path(&self.worktree_dir, "linked_worktrees.worktree_dir")?;
         // The daemon matches these lexically, so only the normalized
-        // spelling is accepted: no `.` or `..` components, no repeated or
-        // trailing separators.
-        let path = Path::new(&self.worktree_dir);
-        if path
-            .components()
-            .any(|component| matches!(component, std::path::Component::ParentDir))
-            || path
-                .components()
-                .collect::<std::path::PathBuf>()
-                .as_os_str()
-                != std::ffi::OsStr::new(&self.worktree_dir)
-        {
+        // spelling is accepted.
+        if !is_normalized_absolute_path(&self.worktree_dir) {
             return Err(ContractError::InvalidProducerCommandField(
                 "linked_worktrees.worktree_dir",
             ));
         }
         Ok(())
     }
+}
+
+/// Whether an absolute path is spelled in its normalized form: no `.` or
+/// `..` components and no repeated or trailing separators. Paths compared
+/// lexically across hosts accept only this spelling.
+fn is_normalized_absolute_path(value: &str) -> bool {
+    let path = Path::new(value);
+    path.is_absolute()
+        && !path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+        && path
+            .components()
+            .collect::<std::path::PathBuf>()
+            .as_os_str()
+            == std::ffi::OsStr::new(value)
 }
 
 /// A durable checkout identity: 32 hexadecimal characters.
@@ -737,12 +743,24 @@ pub const MAX_PROJECT_CONFIG_NAME_BYTES: usize = 128;
 pub const CHECKOUT_MUTATION_CAPABILITIES_HEADER: &str = "x-bbox-checkout-mutation-capabilities";
 /// Capability token for [`CheckoutMutationGuardV1`] preconditions.
 pub const CHECKOUT_MUTATION_CAPABILITY_GUARDED_V1: &str = "guarded-v1";
+/// Capability token for [`CheckoutMutationTargetV1`] linked-worktree
+/// delivery and the `undeliverable` outcome.
+pub const CHECKOUT_MUTATION_CAPABILITY_TARGETED_V1: &str = "targeted-v1";
 
 /// Whether a capabilities header value advertises guarded mutations.
 pub fn capabilities_support_guarded(header_value: &str) -> bool {
+    capabilities_include(header_value, CHECKOUT_MUTATION_CAPABILITY_GUARDED_V1)
+}
+
+/// Whether a capabilities header value advertises linked-worktree targets.
+pub fn capabilities_support_targeted(header_value: &str) -> bool {
+    capabilities_include(header_value, CHECKOUT_MUTATION_CAPABILITY_TARGETED_V1)
+}
+
+fn capabilities_include(header_value: &str, capability: &str) -> bool {
     header_value
         .split(',')
-        .any(|token| token.trim() == CHECKOUT_MUTATION_CAPABILITY_GUARDED_V1)
+        .any(|token| token.trim() == capability)
 }
 
 /// One repo-owned project configuration file the guarded mutation lane may
@@ -861,6 +879,37 @@ pub fn validate_guard_epoch(value: &str) -> Result<(), ContractError> {
     }
 }
 
+/// Where an unguarded repo-owned write lands when the caller worked inside
+/// a linked worktree of the scope's base checkout: that worktree's project
+/// root, never the base. The checkout owner delivers it only while the
+/// directory is a live linked worktree of the configured base for the scope,
+/// joined with the project's root relpath, and otherwise acks the mutation
+/// `undeliverable`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(deny_unknown_fields)]
+pub struct CheckoutMutationTargetV1 {
+    /// The worktree directory joined with the project's root relpath, as the
+    /// checkout host spells it: absolute, normalized, bounded.
+    pub worktree_project_dir: String,
+}
+
+impl CheckoutMutationTargetV1 {
+    pub fn validate(&self) -> Result<(), ContractError> {
+        if self.worktree_project_dir.len() > MAX_PRODUCER_COMMAND_PATH_BYTES
+            || self
+                .worktree_project_dir
+                .bytes()
+                .any(|byte| byte == 0 || byte.is_ascii_control())
+            || !is_normalized_absolute_path(&self.worktree_project_dir)
+        {
+            return Err(ContractError::InvalidCheckoutMutationField(
+                "target.worktree_project_dir must be a normalized absolute path",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CheckoutMutationV1 {
@@ -882,6 +931,12 @@ pub struct CheckoutMutationV1 {
     /// and gap mutations omit it, so their encoding is unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guard: Option<CheckoutMutationGuardV1>,
+    /// Present only on unguarded writes made from a linked worktree: the
+    /// worktree project root that receives them instead of the base
+    /// checkout. Absent mutations land in the base, and their encoding is
+    /// unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<CheckoutMutationTargetV1>,
 }
 
 impl CheckoutMutationV1 {
@@ -897,6 +952,15 @@ impl CheckoutMutationV1 {
             return Err(ContractError::InvalidCheckoutMutationField(
                 "relative_path must be a clean scope-relative path",
             ));
+        }
+        if let Some(target) = &self.target {
+            target.validate()?;
+            // Project configuration edits always go to the base checkout.
+            if self.guard.is_some() {
+                return Err(ContractError::InvalidCheckoutMutationField(
+                    "a guarded configuration mutation never carries a worktree target",
+                ));
+            }
         }
         let target = ProjectConfigTargetV1::from_relative_path(&self.relative_path);
         match &self.guard {
@@ -1022,13 +1086,19 @@ pub const CHECKOUT_MUTATION_OUTCOME_FAILED: &str = "failed";
 /// A guarded mutation whose precondition did not match the owner's current
 /// file. The owner left its bytes untouched.
 pub const CHECKOUT_MUTATION_OUTCOME_CONFLICTED: &str = "conflicted";
+/// A targeted mutation whose worktree is not, at delivery time, a live
+/// linked worktree of the configured base for its scope (removed, never one,
+/// the base itself, or missing). The owner wrote nothing anywhere; the
+/// `error` names why. Terminal: it never falls back to the base checkout.
+pub const CHECKOUT_MUTATION_OUTCOME_UNDELIVERABLE: &str = "undeliverable";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CheckoutMutationAckRequestV1 {
     pub schema_version: u32,
     pub mutation_id: String,
-    /// `applied`, `failed`, or (guarded mutations only) `conflicted`.
+    /// `applied`, `failed`, (guarded mutations only) `conflicted`, or
+    /// (targeted mutations only) `undeliverable`.
     pub outcome: String,
     pub error: Option<String>,
     /// sha256 of the bytes written, when outcome is `applied` on a write.
@@ -1050,8 +1120,20 @@ impl CheckoutMutationAckRequestV1 {
             CHECKOUT_MUTATION_OUTCOME_APPLIED
                 | CHECKOUT_MUTATION_OUTCOME_FAILED
                 | CHECKOUT_MUTATION_OUTCOME_CONFLICTED
+                | CHECKOUT_MUTATION_OUTCOME_UNDELIVERABLE
         ) {
             return Err(ContractError::InvalidCheckoutMutationField("outcome"));
+        }
+        if self.outcome == CHECKOUT_MUTATION_OUTCOME_UNDELIVERABLE
+            && (self
+                .error
+                .as_deref()
+                .is_none_or(|reason| reason.trim().is_empty())
+                || self.content_sha256.is_some())
+        {
+            return Err(ContractError::InvalidCheckoutMutationField(
+                "undeliverable requires a reason and claims no content",
+            ));
         }
         if let Some(error) = &self.error {
             if error.len() > MAX_CHECKOUT_MUTATION_REASON_BYTES {
@@ -1078,8 +1160,8 @@ impl CheckoutMutationAckRequestV1 {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CheckoutMutationAckResponseV1 {
-    /// `applied`, `failed`, `conflicted`, `already_settled` (duplicate
-    /// terminal ack), or `unknown_mutation`.
+    /// `applied`, `failed`, `conflicted`, `undeliverable`,
+    /// `already_settled` (duplicate terminal ack), or `unknown_mutation`.
     pub status: String,
 }
 
@@ -1596,6 +1678,7 @@ mod tests {
             reason: "bbox_gap(scope=project) via checkout-owner lane".into(),
             enqueued_at: "2026-08-12T00:00:00Z".into(),
             guard: None,
+            target: None,
         }
     }
 
@@ -2041,7 +2124,9 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(decoded.guard, None);
+        assert_eq!(decoded.target, None);
         decoded.validate().unwrap();
+        assert!(legacy.get("target").is_none());
         let ack = CheckoutMutationAckRequestV1 {
             schema_version: CHECKOUT_MUTATION_SCHEMA_VERSION,
             mutation_id: "cm-0123456789abcdef".into(),
@@ -2061,8 +2146,108 @@ mod tests {
         assert_eq!(guarded["guard"]["expected_sha256"], serde_json::Value::Null);
     }
 
+    fn targeted_gap_mutation() -> CheckoutMutationV1 {
+        CheckoutMutationV1 {
+            target: Some(CheckoutMutationTargetV1 {
+                worktree_project_dir: "/work/worktrees/alpha-feature".into(),
+            }),
+            ..valid_checkout_mutation()
+        }
+    }
+
+    /// A targeted mutation round-trips its worktree project root, and the
+    /// target is closed and validated: absolute, normalized, bounded.
+    #[test]
+    fn checkout_mutation_target_round_trips_and_validates() {
+        let targeted = targeted_gap_mutation();
+        targeted.validate().unwrap();
+        let encoded = serde_json::to_value(&targeted).unwrap();
+        assert_eq!(
+            encoded["target"]["worktree_project_dir"],
+            "/work/worktrees/alpha-feature"
+        );
+        let decoded: CheckoutMutationV1 = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, targeted);
+
+        for dir in [
+            "worktrees/alpha",
+            "/work/../alpha",
+            "/work/./alpha",
+            "/work//alpha",
+            "/work/alpha/",
+            "/work/al\npha",
+        ] {
+            let mut mutation = targeted_gap_mutation();
+            mutation.target = Some(CheckoutMutationTargetV1 {
+                worktree_project_dir: dir.into(),
+            });
+            assert!(mutation.validate().is_err(), "{dir:?} must refuse");
+        }
+        let mut long = targeted_gap_mutation();
+        long.target = Some(CheckoutMutationTargetV1 {
+            worktree_project_dir: format!("/{}", "x".repeat(MAX_PRODUCER_COMMAND_PATH_BYTES)),
+        });
+        assert!(long.validate().is_err());
+        assert!(
+            serde_json::from_value::<CheckoutMutationTargetV1>(serde_json::json!({
+                "worktree_project_dir": "/work/worktrees/alpha-feature",
+                "branch": "feature",
+            }))
+            .is_err()
+        );
+    }
+
+    /// Configuration edits go to the base: a guarded mutation never carries
+    /// a worktree target.
+    #[test]
+    fn guarded_mutation_with_a_target_is_refused() {
+        let mut guarded = guarded_config_mutation(".bbox/mcp.json");
+        guarded.validate().unwrap();
+        guarded.target = targeted_gap_mutation().target;
+        assert!(guarded.validate().is_err());
+    }
+
+    /// `undeliverable` is a closed outcome: it carries a bounded reason and
+    /// claims no content.
+    #[test]
+    fn undeliverable_ack_validates() {
+        let undeliverable = CheckoutMutationAckRequestV1 {
+            schema_version: CHECKOUT_MUTATION_SCHEMA_VERSION,
+            mutation_id: "cm-0123456789abcdef".into(),
+            outcome: CHECKOUT_MUTATION_OUTCOME_UNDELIVERABLE.into(),
+            error: Some("not a linked worktree of the configured base".into()),
+            content_sha256: None,
+            observed_sha256: None,
+        };
+        undeliverable.validate().unwrap();
+        let decoded: CheckoutMutationAckRequestV1 =
+            serde_json::from_slice(&serde_json::to_vec(&undeliverable).unwrap()).unwrap();
+        assert_eq!(decoded, undeliverable);
+
+        let mut no_reason = undeliverable.clone();
+        no_reason.error = None;
+        assert!(no_reason.validate().is_err());
+        no_reason.error = Some("  ".into());
+        assert!(no_reason.validate().is_err());
+
+        let mut long_reason = undeliverable.clone();
+        long_reason.error = Some("x".repeat(MAX_CHECKOUT_MUTATION_REASON_BYTES + 1));
+        assert!(long_reason.validate().is_err());
+
+        let mut with_content = undeliverable.clone();
+        with_content.content_sha256 = Some("a".repeat(64));
+        assert!(with_content.validate().is_err());
+
+        let mut with_observation = undeliverable;
+        with_observation.observed_sha256 = Some("b".repeat(64));
+        assert!(with_observation.validate().is_err());
+    }
+
     #[test]
     fn capability_header_parsing_is_exact() {
+        assert!(capabilities_support_targeted("guarded-v1, targeted-v1"));
+        assert!(!capabilities_support_targeted("guarded-v1"));
+        assert!(!capabilities_support_targeted("targeted-v1x"));
         assert!(capabilities_support_guarded("guarded-v1"));
         assert!(capabilities_support_guarded("other, guarded-v1"));
         assert!(!capabilities_support_guarded(""));

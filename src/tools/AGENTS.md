@@ -30,3 +30,11 @@
   concurrent agents and worktrees; durable writes key to the BASE project so
   every checkout sees them, while repo-owned files land in the writer's
   checkout to travel with its branch.
+- Selection-class resolution in the daemon (`resolve_project_selection`,
+  `validate_project_selection`, `resolve_project_write`) refuses a path that
+  resolves through a reported linked-worktree alias with
+  `error.project_selector_worktree_alias`. Only `covered_project_scope`, the
+  checkout-owner mutation lane, accepts it, and it turns the alias root into
+  the mutation's delivery target; it never becomes a daemon-side path.
+  Administration tools whose own engine has no alias view call
+  `refuse_worktree_alias_selector` on every path selector first.

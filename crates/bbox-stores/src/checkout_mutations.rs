@@ -24,6 +24,12 @@
 //! only while it is the newest row on its path and the publication still
 //! matches the base it was computed from, so a redelivery can never
 //! overwrite content that moved underneath it.
+//!
+//! A targeted row carries a linked worktree's project root and lands there,
+//! never in the base checkout. It is branch-local: it is no part of the
+//! outstanding overlay the published view and later edits read, and the
+//! owner may settle it `undeliverable`, a terminal failure that is never
+//! requeued and never redirected to the base.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -33,7 +39,8 @@ use serde::{Deserialize, Serialize};
 
 use bbox_code_source::{
     CHECKOUT_MUTATION_OUTCOME_APPLIED, CHECKOUT_MUTATION_OUTCOME_CONFLICTED,
-    CHECKOUT_MUTATION_OUTCOME_FAILED, CHECKOUT_MUTATION_SCHEMA_VERSION, CheckoutMutationGuardV1,
+    CHECKOUT_MUTATION_OUTCOME_FAILED, CHECKOUT_MUTATION_OUTCOME_UNDELIVERABLE,
+    CHECKOUT_MUTATION_SCHEMA_VERSION, CheckoutMutationGuardV1, CheckoutMutationTargetV1,
     CheckoutMutationV1, MAX_CHECKOUT_MUTATIONS_PER_POLL,
 };
 use bbox_corpus_core::identity::PublishedScope;
@@ -111,6 +118,17 @@ pub struct PendingCheckoutMutation {
     /// this records that the failure was chosen, by whom and from what.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub discarded: Option<MutationDiscard>,
+    /// A targeted row the owner could not deliver because its worktree was
+    /// not a live linked worktree of the configured base. The status is
+    /// `failed`, so a daemon without this field reads a settled failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub undeliverable: Option<MutationUndeliverable>,
+}
+
+/// Why the owner refused to deliver a targeted row. Nothing was written.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MutationUndeliverable {
+    pub reason: String,
 }
 
 /// A discarded row is `failed` with nothing else set: the conflict and the
@@ -204,9 +222,16 @@ pub struct MutationConflict {
 pub struct CheckoutMutationPoll {
     pub mutations: Vec<CheckoutMutationV1>,
     pub deferred: u64,
-    /// Guarded mutations withheld because the collector did not declare
-    /// guarded support.
+    /// Guarded or targeted mutations withheld because the collector did not
+    /// declare support for their shape.
     pub withheld_unsupported: Vec<String>,
+}
+
+/// The mutation shapes a polling collector declared it can apply.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CheckoutMutationOwnerSupport {
+    pub guarded: bool,
+    pub targeted: bool,
 }
 
 /// Delivery and publication state of one mutation, as a producer reports it.
@@ -229,6 +254,9 @@ pub enum CheckoutMutationProgress {
     Reconciled,
     /// Settled by an operator; the checkout was never touched for it.
     Discarded,
+    /// A targeted row whose worktree was not a live linked worktree of the
+    /// base when the owner received it. Nothing was written anywhere.
+    Undeliverable,
     Failed,
 }
 
@@ -298,6 +326,7 @@ impl CheckoutMutations {
             owner_unsupported_at: None,
             reconciled: None,
             discarded: None,
+            undeliverable: None,
         });
         Ok(true)
     }
@@ -318,6 +347,24 @@ impl CheckoutMutations {
         granted_scopes: &BTreeSet<PublishedScope>,
         guarded_supported: bool,
     ) -> CheckoutMutationPoll {
+        self.poll_for_owner(
+            granted_scopes,
+            CheckoutMutationOwnerSupport {
+                guarded: guarded_supported,
+                targeted: false,
+            },
+        )
+    }
+
+    /// [`Self::poll`] for a collector that declared `support`. A targeted
+    /// mutation goes only to a collector that declared targeted support; it
+    /// is never delivered without its target, which would land it in the
+    /// base checkout.
+    pub fn poll_for_owner(
+        &self,
+        granted_scopes: &BTreeSet<PublishedScope>,
+        support: CheckoutMutationOwnerSupport,
+    ) -> CheckoutMutationPoll {
         let mut poll = CheckoutMutationPoll::default();
         let mut guarded_paths = BTreeSet::new();
         for pending in &self.store.mutations {
@@ -334,7 +381,9 @@ impl CheckoutMutations {
                 poll.deferred += 1;
                 continue;
             }
-            if guarded && !guarded_supported {
+            if (guarded && !support.guarded)
+                || (pending.mutation.target.is_some() && !support.targeted)
+            {
                 poll.deferred += 1;
                 poll.withheld_unsupported
                     .push(pending.mutation.mutation_id.clone());
@@ -349,13 +398,14 @@ impl CheckoutMutations {
         poll
     }
 
-    /// Record that a poll withheld these guarded mutations from a collector
-    /// without guarded support. Returns whether any row changed.
+    /// Record that a poll withheld these guarded or targeted mutations from a
+    /// collector without support for their shape. Returns whether any row
+    /// changed.
     pub fn note_owner_unsupported(&mut self, mutation_ids: &[String], now: &str) -> bool {
         let mut changed = false;
         for row in &mut self.store.mutations {
             if row.status == CheckoutMutationStatus::Pending
-                && row.mutation.guard.is_some()
+                && (row.mutation.guard.is_some() || row.mutation.target.is_some())
                 && mutation_ids.contains(&row.mutation.mutation_id)
                 && row.owner_unsupported_at.is_none()
             {
@@ -410,6 +460,9 @@ impl CheckoutMutations {
         if outcome == CHECKOUT_MUTATION_OUTCOME_CONFLICTED && !guarded {
             anyhow::bail!("only a guarded checkout mutation can conflict");
         }
+        if outcome == CHECKOUT_MUTATION_OUTCOME_UNDELIVERABLE && pending.mutation.target.is_none() {
+            anyhow::bail!("only a targeted checkout mutation can be undeliverable");
+        }
         pending.attempts += 1;
         pending.acked_at = Some(now.to_string());
         match outcome {
@@ -427,6 +480,12 @@ impl CheckoutMutations {
                 pending.status = CheckoutMutationStatus::Failed;
                 pending.conflict = Some(MutationConflict { observed_sha256 });
                 pending.last_error = error;
+            }
+            CHECKOUT_MUTATION_OUTCOME_UNDELIVERABLE => {
+                let reason = error.unwrap_or_default();
+                pending.status = CheckoutMutationStatus::Failed;
+                pending.last_error = Some(format!("undeliverable: {reason}"));
+                pending.undeliverable = Some(MutationUndeliverable { reason });
             }
             other => anyhow::bail!("unknown checkout mutation outcome {other}"),
         }
@@ -550,6 +609,8 @@ impl CheckoutMutations {
                 "blocked_by": row.blocked_by,
                 "owner_unsupported_at": row.owner_unsupported_at,
                 "discarded": row.discarded,
+                "target": row.mutation.target.as_ref().map(|target| &target.worktree_project_dir),
+                "undeliverable": row.undeliverable.as_ref().map(|undeliverable| &undeliverable.reason),
             }));
         }
         serde_json::json!({ "counts": counts, "rows": rows })
@@ -582,9 +643,13 @@ impl CheckoutMutations {
             .filter(|row| row.mutation.mode == "write")
     }
 
+    /// Rows the published view and later edits overlay: everything not yet
+    /// settled into publication, except targeted rows, which are branch-local
+    /// until their branch reaches the published ref.
     pub fn outstanding_intents(&self) -> impl Iterator<Item = &PendingCheckoutMutation> {
         self.store.mutations.iter().filter(|row| {
             row.status != CheckoutMutationStatus::Failed
+                && row.mutation.target.is_none()
                 && match &row.publication {
                     Some(publication) => !publication.observed,
                     None => row.status == CheckoutMutationStatus::Pending,
@@ -870,6 +935,7 @@ impl CheckoutMutations {
                 epoch,
                 sequence,
             }),
+            target: None,
         };
         mutation
             .validate()
@@ -892,6 +958,7 @@ impl CheckoutMutations {
             owner_unsupported_at: None,
             reconciled: None,
             discarded: None,
+            undeliverable: None,
         });
         Ok(mutation)
     }
@@ -1089,6 +1156,9 @@ impl CheckoutMutations {
             CheckoutMutationStatus::Failed if row.discarded.is_some() => {
                 CheckoutMutationProgress::Discarded
             }
+            CheckoutMutationStatus::Failed if row.undeliverable.is_some() => {
+                CheckoutMutationProgress::Undeliverable
+            }
             CheckoutMutationStatus::Failed if row.conflict.is_some() => {
                 CheckoutMutationProgress::Conflicted
             }
@@ -1126,6 +1196,20 @@ impl CheckoutMutations {
         reason: String,
         now: String,
     ) -> Result<Vec<String>> {
+        self.enqueue_mutations_to(scope, None, mutations, reason, now)
+    }
+
+    /// [`Self::enqueue_tracked_mutations`], landing in `target` when given.
+    /// A targeted row tracks no publication base: it is branch-local, so the
+    /// published view never overlays it and publication never settles it.
+    pub fn enqueue_mutations_to(
+        &mut self,
+        scope: PublishedScope,
+        target: Option<CheckoutMutationTargetV1>,
+        mutations: Vec<(String, Option<String>, Option<String>)>,
+        reason: String,
+        now: String,
+    ) -> Result<Vec<String>> {
         let mut rows = Vec::new();
         let mut paths = BTreeSet::new();
         for (relative_path, content, base) in mutations {
@@ -1143,10 +1227,15 @@ impl CheckoutMutations {
                 reason: reason.clone(),
                 enqueued_at: now.clone(),
                 guard: None,
+                target: target.clone(),
             };
             mutation
                 .validate()
                 .map_err(|error| anyhow::anyhow!("{error}"))?;
+            let publication = target.is_none().then_some(MutationPublication {
+                base_content_json: base,
+                observed: false,
+            });
             rows.push(PendingCheckoutMutation {
                 mutation,
                 status: CheckoutMutationStatus::Pending,
@@ -1154,15 +1243,13 @@ impl CheckoutMutations {
                 last_error: None,
                 acked_at: None,
                 ack_content_sha256: None,
-                publication: Some(MutationPublication {
-                    base_content_json: base,
-                    observed: false,
-                }),
+                publication,
                 conflict: None,
                 blocked_by: None,
                 owner_unsupported_at: None,
                 reconciled: None,
                 discarded: None,
+                undeliverable: None,
             });
         }
         let ids = rows
@@ -1245,6 +1332,7 @@ impl CheckoutMutations {
             reason,
             enqueued_at: now,
             guard: None,
+            target: None,
         };
         let id = mutation.mutation_id.clone();
         self.enqueue(mutation)?;
@@ -1262,6 +1350,7 @@ fn attention_state(row: &PendingCheckoutMutation) -> &'static str {
             _ => "settled",
         },
         CheckoutMutationStatus::Failed if row.discarded.is_some() => "discarded",
+        CheckoutMutationStatus::Failed if row.undeliverable.is_some() => "undeliverable",
         CheckoutMutationStatus::Failed if row.conflict.is_some() => "conflicted",
         CheckoutMutationStatus::Failed if row.blocked_by.is_some() => "blocked",
         CheckoutMutationStatus::Failed => "failed",
@@ -1345,6 +1434,7 @@ mod tests {
             reason: "test".into(),
             enqueued_at: "2026-08-12T00:00:00Z".into(),
             guard: None,
+            target: None,
         }
     }
 
@@ -2612,5 +2702,202 @@ mod tests {
         assert!(id.starts_with("cm-"));
         assert_eq!(id.len(), 19);
         assert_ne!(id, store.mint_id());
+    }
+    fn worktree_target() -> CheckoutMutationTargetV1 {
+        CheckoutMutationTargetV1 {
+            worktree_project_dir: "/work/worktrees/alpha-feature".into(),
+        }
+    }
+
+    /// A targeted row is branch-local: it is delivered with its target only
+    /// to an owner that declared targeted support, and it never joins the
+    /// outstanding overlay the published view and later edits read.
+    #[test]
+    fn targeted_rows_are_withheld_from_untargeted_owners_and_never_overlay() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = CheckoutMutations::open(&dir.path().join("mutations.json")).unwrap();
+        let base = store
+            .enqueue_tracked_mutations(
+                scope(),
+                vec![(
+                    ".bbox/gaps/gap-0000000b.json".into(),
+                    Some("{}".into()),
+                    None,
+                )],
+                "base".into(),
+                "now".into(),
+            )
+            .unwrap();
+        let targeted = store
+            .enqueue_mutations_to(
+                scope(),
+                Some(worktree_target()),
+                vec![(
+                    ".bbox/gaps/gap-0000000a.json".into(),
+                    Some(r#"{"id":"gap-0000000a"}"#.into()),
+                    Some("{}".into()),
+                )],
+                "worktree".into(),
+                "now".into(),
+            )
+            .unwrap();
+        let row = store.get(&targeted[0]).unwrap();
+        assert_eq!(row.mutation.target, Some(worktree_target()));
+        assert!(row.publication.is_none(), "a targeted row tracks no base");
+        assert_eq!(
+            store
+                .outstanding_intents()
+                .map(|row| row.mutation.mutation_id.clone())
+                .collect::<Vec<_>>(),
+            base
+        );
+        assert_eq!(
+            store
+                .write_base(&scope(), ".bbox/gaps/gap-0000000a.json", None)
+                .unwrap(),
+            None,
+            "later edits start from the published view, not the worktree write"
+        );
+
+        let granted = BTreeSet::from([scope()]);
+        let legacy = store.poll(&granted, true);
+        assert_eq!(
+            legacy
+                .mutations
+                .iter()
+                .map(|mutation| mutation.mutation_id.clone())
+                .collect::<Vec<_>>(),
+            base
+        );
+        assert_eq!(legacy.withheld_unsupported, targeted);
+        assert!(store.note_owner_unsupported(&legacy.withheld_unsupported, "now"));
+        let upgraded = store.poll_for_owner(
+            &granted,
+            CheckoutMutationOwnerSupport {
+                guarded: true,
+                targeted: true,
+            },
+        );
+        assert_eq!(upgraded.mutations.len(), 2);
+        assert_eq!(upgraded.mutations[1].target, Some(worktree_target()));
+        assert!(upgraded.withheld_unsupported.is_empty());
+    }
+
+    /// `undeliverable` settles only a targeted row, terminally: it is listed
+    /// with its reason and target, never requeued, and never re-sent to
+    /// the base.
+    #[test]
+    fn undeliverable_settles_a_targeted_row_terminally() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = CheckoutMutations::open(&dir.path().join("mutations.json")).unwrap();
+        let untargeted = store
+            .enqueue_file_mutation(
+                scope(),
+                ".bbox/gaps/gap-0000000c.json".into(),
+                "write",
+                Some("{}".into()),
+                "base".into(),
+                "now".into(),
+            )
+            .unwrap();
+        assert!(
+            store
+                .ack(
+                    &untargeted,
+                    CHECKOUT_MUTATION_OUTCOME_UNDELIVERABLE,
+                    Some("not a worktree".into()),
+                    None,
+                    "now",
+                )
+                .is_err(),
+            "only a targeted row can be undeliverable"
+        );
+        let targeted = store
+            .enqueue_mutations_to(
+                scope(),
+                Some(worktree_target()),
+                vec![(
+                    ".bbox/gaps/gap-0000000d.json".into(),
+                    Some("{}".into()),
+                    None,
+                )],
+                "worktree".into(),
+                "now".into(),
+            )
+            .unwrap()
+            .remove(0);
+        let reason =
+            "/work/worktrees/alpha-feature is not a linked worktree of the configured base";
+        assert!(
+            store
+                .ack(
+                    &targeted,
+                    CHECKOUT_MUTATION_OUTCOME_UNDELIVERABLE,
+                    Some(reason.into()),
+                    None,
+                    "now",
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            store.progress(&targeted),
+            Some(CheckoutMutationProgress::Undeliverable)
+        );
+        assert_eq!(store.attention_state(&targeted), Some("undeliverable"));
+        assert_eq!(
+            store.requeue(&targeted, Some(None)),
+            Err(ReconcileRefusal::StateNotEligible("undeliverable".into()))
+        );
+        // A repeated ack does not rewrite the settlement.
+        assert!(
+            !store
+                .ack(
+                    &targeted,
+                    CHECKOUT_MUTATION_OUTCOME_APPLIED,
+                    None,
+                    None,
+                    "later"
+                )
+                .unwrap()
+        );
+        let poll = store.poll_for_owner(
+            &BTreeSet::from([scope()]),
+            CheckoutMutationOwnerSupport {
+                guarded: true,
+                targeted: true,
+            },
+        );
+        assert_eq!(poll.mutations.len(), 1);
+        assert_eq!(poll.mutations[0].mutation_id, untargeted);
+
+        let report = store.attention_report(&scope());
+        let row = report["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["mutation_id"] == targeted.as_str())
+            .unwrap();
+        assert_eq!(row["state"], "undeliverable");
+        assert_eq!(row["undeliverable"], reason);
+        assert_eq!(row["target"], "/work/worktrees/alpha-feature");
+        assert_eq!(report["counts"]["undeliverable"], 1);
+
+        // The settlement survives a reload, and a reader without the field
+        // still sees a terminal failure.
+        let path = dir.path().join("mutations.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&store.snapshot().unwrap()).unwrap(),
+        )
+        .unwrap();
+        let reopened = CheckoutMutations::open(&path).unwrap();
+        assert_eq!(
+            reopened.progress(&targeted),
+            Some(CheckoutMutationProgress::Undeliverable)
+        );
+        assert_eq!(
+            reopened.get(&targeted).unwrap().status,
+            CheckoutMutationStatus::Failed
+        );
     }
 }

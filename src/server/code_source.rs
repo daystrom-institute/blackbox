@@ -1405,9 +1405,9 @@ async fn claim_scope_for_onboard(
 /// Checkout-owner delivery lane: the collector polls pending repo-owned
 /// file mutations for the scopes its producer grant covers. Delivery never
 /// mutates the store; the ack endpoint is the mutation. The one exception
-/// is observability: guarded mutations withheld from a collector that did
-/// not declare guarded support are stamped so the refusal is visible to the
-/// producer that queued them.
+/// is observability: guarded or worktree-targeted mutations withheld from a
+/// collector that did not declare support for their shape are stamped so the
+/// refusal is visible to the producer that queued them.
 async fn poll_checkout_mutations(
     State(state): State<Arc<SharedState>>,
     Extension(grant): Extension<ProducerGrant>,
@@ -1417,11 +1417,16 @@ async fn poll_checkout_mutations(
     request
         .validate()
         .map_err(|error| HttpError::unprocessable("invalid_poll_request", error.to_string()))?;
-    let guarded_supported = headers
-        .get_all(bbox_code_source::CHECKOUT_MUTATION_CAPABILITIES_HEADER)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .any(bbox_code_source::capabilities_support_guarded);
+    let declared = || {
+        headers
+            .get_all(bbox_code_source::CHECKOUT_MUTATION_CAPABILITIES_HEADER)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+    };
+    let support = crate::checkout_mutations::CheckoutMutationOwnerSupport {
+        guarded: declared().any(bbox_code_source::capabilities_support_guarded),
+        targeted: declared().any(bbox_code_source::capabilities_support_targeted),
+    };
     let scopes: std::collections::BTreeSet<PublishedScope> =
         grant.projects.keys().cloned().collect();
     let persist_state = state.clone();
@@ -1430,7 +1435,7 @@ async fn poll_checkout_mutations(
         let poll = state
             .checkout_mutations
             .read()
-            .poll(&scopes, guarded_supported);
+            .poll_for_owner(&scopes, support);
         let noted = !poll.withheld_unsupported.is_empty()
             && state.checkout_mutations.write().note_owner_unsupported(
                 &poll.withheld_unsupported,
@@ -1443,7 +1448,7 @@ async fn poll_checkout_mutations(
         tracing::warn!(
             producer_id = %producer_id,
             withheld = poll.withheld_unsupported.len(),
-            "guarded checkout mutations withheld: the collector did not declare guarded-v1 support; upgrade it"
+            "checkout mutations withheld: the collector did not declare support for their shape (guarded-v1 or targeted-v1); upgrade it"
         );
     }
     if noted {
@@ -1651,6 +1656,8 @@ async fn ack_checkout_mutation(
         }));
     };
     require_scope(&grant, &scope)?;
+    let request_mutation_id = request.mutation_id.clone();
+    let request_error = request.error.clone();
     let persist_state = state.clone();
     let settled = blocking(move || {
         let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
@@ -1682,6 +1689,16 @@ async fn ack_checkout_mutation(
             return Err(HttpError::unprocessable("ack_digest_mismatch", mismatch));
         }
     };
+    if settled && outcome == bbox_code_source::CHECKOUT_MUTATION_OUTCOME_UNDELIVERABLE {
+        // Terminal: the worktree is gone or never was one, and the write is
+        // never redirected to the base checkout.
+        tracing::warn!(
+            producer_id = %grant.producer_id,
+            mutation_id = %request_mutation_id,
+            reason = %request_error.as_deref().unwrap_or_default(),
+            "checkout mutation undeliverable: its linked worktree is not a live worktree of the base"
+        );
+    }
     if !settled {
         // Known but already terminal: a duplicated ack after a crash or
         // retry must not rewrite history. The first ack may have settled in
@@ -8964,6 +8981,181 @@ mod tests {
             reason: "route test".into(),
             enqueued_at: "2026-08-12T00:00:00Z".into(),
             guard: None,
+            target: None,
+        }
+    }
+
+    /// A worktree-targeted mutation reaches only a collector that declared
+    /// targeted support, and an `undeliverable` ack settles it terminally:
+    /// it leaves the delivery queue, is never re-sent with or without its
+    /// target, and never becomes a base write.
+    #[tokio::test]
+    async fn undeliverable_ack_settles_a_targeted_mutation_terminally() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let catalog_projects_path = root.join("catalog").join("projects.json");
+        fs::create_dir_all(catalog_projects_path.parent().unwrap()).unwrap();
+        let scope = PublishedScope::try_new("repo_onboard", ".").unwrap();
+        let (state, token) = enabled_catalog_onboard_state(&root, &catalog_projects_path, &scope);
+        let target = bbox_code_source::CheckoutMutationTargetV1 {
+            worktree_project_dir: "/work/worktrees/alpha-feature".into(),
+        };
+        let targeted = state
+            .checkout_mutations
+            .write()
+            .enqueue_mutations_to(
+                scope.clone(),
+                Some(target.clone()),
+                vec![(
+                    ".bbox/gaps/gap-0123abcd.json".into(),
+                    Some("{\"id\":\"gap-0123abcd\"}".into()),
+                    None,
+                )],
+                "route test".into(),
+                "2026-08-12T00:00:00Z".into(),
+            )
+            .unwrap()
+            .remove(0);
+        state
+            .checkout_mutations
+            .write()
+            .enqueue(checkout_mutation(&scope, "cm-00000000000000bb"))
+            .unwrap();
+        let app = router(state.clone()).with_state(state.clone());
+        let poll = |capabilities: Option<&'static str>| {
+            let mut request = authenticated_request(
+                "POST",
+                "/internal/code-source/v1/checkout-mutations/poll",
+                &token,
+                Body::from(
+                    serde_json::to_vec(&CheckoutMutationPollRequestV1 {
+                        schema_version: bbox_code_source::CHECKOUT_MUTATION_SCHEMA_VERSION,
+                    })
+                    .unwrap(),
+                ),
+            );
+            if let Some(value) = capabilities {
+                request.headers_mut().insert(
+                    bbox_code_source::CHECKOUT_MUTATION_CAPABILITIES_HEADER,
+                    value.parse().unwrap(),
+                );
+            }
+            let app = app.clone();
+            async move {
+                let response = app.oneshot(request).await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+                serde_json::from_slice::<CheckoutMutationPollResponseV1>(&body).unwrap()
+            }
+        };
+        let ids = |page: &CheckoutMutationPollResponseV1| {
+            page.mutations
+                .iter()
+                .map(|mutation| mutation.mutation_id.clone())
+                .collect::<Vec<_>>()
+        };
+
+        // An owner without targeted support never receives it, so it can
+        // never land in the base.
+        let legacy = poll(Some("guarded-v1")).await;
+        assert_eq!(ids(&legacy), vec!["cm-00000000000000bb".to_string()]);
+        assert_eq!(legacy.deferred, 1);
+        assert!(
+            state
+                .checkout_mutations
+                .read()
+                .get(&targeted)
+                .unwrap()
+                .owner_unsupported_at
+                .is_some()
+        );
+        let current = poll(Some("guarded-v1, targeted-v1")).await;
+        assert_eq!(
+            ids(&current),
+            vec![targeted.clone(), "cm-00000000000000bb".to_string()]
+        );
+        assert_eq!(current.mutations[0].target, Some(target));
+
+        let ack = |mutation_id: &str| CheckoutMutationAckRequestV1 {
+            schema_version: bbox_code_source::CHECKOUT_MUTATION_SCHEMA_VERSION,
+            mutation_id: mutation_id.into(),
+            outcome: bbox_code_source::CHECKOUT_MUTATION_OUTCOME_UNDELIVERABLE.into(),
+            error: Some("/work/worktrees/alpha-feature is not a current linked worktree".into()),
+            content_sha256: None,
+            observed_sha256: None,
+        };
+        let send = |request: CheckoutMutationAckRequestV1| {
+            let app = app.clone();
+            let token = token.clone();
+            async move {
+                let response = app
+                    .oneshot(authenticated_request(
+                        "POST",
+                        "/internal/code-source/v1/checkout-mutations/ack",
+                        &token,
+                        Body::from(serde_json::to_vec(&request).unwrap()),
+                    ))
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+                (status, body)
+            }
+        };
+        // Only a targeted mutation can be undeliverable.
+        let (status, _) = send(ack("cm-00000000000000bb")).await;
+        assert!(!status.is_success(), "{status}");
+        assert_eq!(
+            state
+                .checkout_mutations
+                .read()
+                .progress("cm-00000000000000bb"),
+            Some(crate::checkout_mutations::CheckoutMutationProgress::Queued)
+        );
+
+        let (status, body) = send(ack(&targeted)).await;
+        assert_eq!(status, StatusCode::OK);
+        let settled: CheckoutMutationAckResponseV1 = serde_json::from_slice(&body).unwrap();
+        assert_eq!(settled.status, "undeliverable");
+        let (_, body) = send(ack(&targeted)).await;
+        let repeated: CheckoutMutationAckResponseV1 = serde_json::from_slice(&body).unwrap();
+        assert_eq!(repeated.status, "already_settled");
+
+        {
+            let queue = state.checkout_mutations.read();
+            assert_eq!(
+                queue.progress(&targeted),
+                Some(crate::checkout_mutations::CheckoutMutationProgress::Undeliverable)
+            );
+            assert!(
+                queue
+                    .outstanding_intents()
+                    .all(|row| row.mutation.mutation_id != targeted)
+            );
+            let report = queue.attention_report(&scope);
+            let row = report["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["mutation_id"] == targeted.as_str())
+                .unwrap()
+                .clone();
+            assert_eq!(row["state"], "undeliverable");
+            assert!(
+                row["undeliverable"]
+                    .as_str()
+                    .unwrap()
+                    .contains("not a current linked worktree")
+            );
+        }
+        for capabilities in [Some("guarded-v1"), Some("guarded-v1, targeted-v1"), None] {
+            let page = poll(capabilities).await;
+            assert!(!ids(&page).contains(&targeted), "{capabilities:?}");
+            assert!(
+                page.mutations
+                    .iter()
+                    .all(|mutation| mutation.target.is_none())
+            );
         }
     }
 

@@ -193,14 +193,21 @@ root relpath, so a subtree project aliases the same subtree inside the
 worktree. A worktree reported by more than one producer, and an alias root
 that maps to more than one attachment, are dropped and logged once.
 
-Filter-class project selectors (list filters, `?project=`, the operator UI)
-resolve a path inside an aliased worktree to its base: the base project id and
-the base store key, exactly as the base path resolves. Selection-class
-selectors never alias, and an alias never makes a worktree a write target: a
-thread opened from one is stamped with the base project and writes no record
-into the worktree. The presence request refuses unknown fields, so a daemon
-must accept the worktree report before a collector that sends it reaches that
-daemon.
+A project selector naming a path inside an aliased worktree resolves to its
+base on both selector classes: the base project id and the base store key,
+exactly as the base path resolves, with the alias root named on the result.
+Filter-class selectors (list filters, `?project=`, the operator UI) use it as
+the base. An alias match is never checkout authority and never a daemon-local
+write target: a thread opened from one is stamped with the base project and
+writes no record into the worktree, and every Selection-class caller except
+the checkout-owner mutation lane refuses it with
+`error.project_selector_worktree_alias`, naming the base selector to use.
+That covers local gap and knowledge writes, render output, checkout leases,
+and project administration (`bbox_project_register`, `bbox_project_init`,
+`bbox_project_attach`, `bbox_project_default_attachment`,
+`bbox_project_rename`, `bbox_project_unregister`, `bbox_project_eject`). The
+presence request refuses unknown fields, so a daemon must accept the worktree
+report before a collector that sends it reaches that daemon.
 
 `interval_secs` controls source collection. Queued gap and knowledge edits
 poll independently at `mutation_interval_secs` (default 10 seconds, minimum
@@ -218,13 +225,47 @@ acknowledgement of an already settled edit answers `already_settled` only
 after the settlement is durable in the daemon's queue, so a settlement that
 failed to persist is retried by the repeat rather than reported as done.
 
+A repo-owned write made from inside an aliased worktree (`bbox_gap`,
+`bbox_gap_update`, `bbox_gap_resolve`, `bbox_learn`, `bbox_forget` with a
+`project` selector in the worktree) lands in that worktree, never in the base
+checkout. The daemon queues it against the base's published scope with a
+`target` naming the worktree project root (the alias root), and the reply
+says where the file lands so the agent commits it on its branch. Writes from
+the base carry no target and land in the base as before. Guarded project
+configuration edits never carry a target: configuration always goes to the
+base.
+
+The collector delivers a targeted mutation only when, at delivery time, the
+target equals a linked worktree `git worktree list` reports for the
+configured project's base checkout, joined with that project's root relpath,
+and names an existing directory spelled canonically. The write root is then
+the target: the same path-escape check against that root, the same locked
+no-follow atomic replacement, and nothing outside it. A target that is not a
+current worktree of that base, is the base itself, or does not exist is
+acknowledged `undeliverable` with the reason, and nothing is written
+anywhere. The collector never writes outside a configured root or one of its
+live linked worktrees, and worktrees are never enrolled. An `undeliverable`
+outcome is terminal: the edit is never sent again and never redirected to the
+base. Targeted mutations go only to a collector that declares the
+`targeted-v1` capability; an older collector has them withheld and counted
+as deferred, and never receives them without their target.
+
+A gap or knowledge entry delivered into a worktree is branch-local until that
+branch reaches the project's published ref. Until then the published view
+does not contain it: `bbox_gaps`, gap dedupe, knowledge reads and the base
+overlay of queued edits do not see it, and `bbox_gap_update`,
+`bbox_gap_resolve` and id-addressed knowledge edits on an id the published
+view does not know keep their existing refusal.
+
 `bbox_project_publisher_status(project_id, detail="checkout_mutations")` lists
 a published project's queued edits that still need attention: pending,
-applied but not yet seen in publication, failed, conflicted, or blocked behind
-a predecessor. Each row carries the edit's id, path, mode, state, attempts,
-last error, enqueue and acknowledgement times, and the digests of its content,
-its acknowledged content and its publication base; file content is never
-returned. Settled edits are counted, not listed. `detail_path` and
+applied but not yet seen in publication, failed, conflicted, undeliverable,
+or blocked behind a predecessor. Each row carries the edit's id, path, mode,
+state, attempts, last error, enqueue and acknowledgement times, the digests of
+its content, its acknowledged content and its publication base, and, for a
+targeted edit, its worktree target and any undeliverable reason; file content
+is never returned. A targeted edit tracks no publication base: once applied in
+its worktree it is settled. Settled edits are counted, not listed. `detail_path` and
 `detail_states` narrow the listed rows; the counts stay whole.
 
 `bbox_project_checkout_mutation_reconcile` is the operator's way out when a
@@ -235,7 +276,8 @@ with later listed edits on its path is refused unless `cascade` discards them
 with it. `requeue` sends a failed or conflicted edit to the owner again, and
 is refused while later edits on the path still need attention or when the
 accepted publication for the path no longer matches the base the edit was
-computed from. Both take the row's `state` and `postimage_sha256` from the
+computed from. An undeliverable edit can be discarded but never requeued.
+Both take the row's `state` and `postimage_sha256` from the
 listing and refuse a row that has since changed, both are durable before they
 answer, and neither changes a file in the owning checkout. A discarded edit is
 stored as failed with a discard record, so an older daemon reads it as

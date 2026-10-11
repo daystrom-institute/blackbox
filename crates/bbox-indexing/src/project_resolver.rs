@@ -11,9 +11,11 @@
 //!   strict-opened catalog/attachment pair: exact membership, unique
 //!   accepted alias, explicit typed scope, exact-or-deepest active
 //!   attachment containment, fail-closed ambiguity, and no identity
-//!   manufacture for unknown paths. On the Filter lane only, a path no
-//!   attachment contains may still resolve through a live linked-worktree
-//!   alias ([`WorktreeAlias`]) to its `Base` attachment.
+//!   manufacture for unknown paths. A caller-supplied path no attachment
+//!   contains may still resolve through a live linked-worktree alias
+//!   ([`WorktreeAlias`]) to its `Base` attachment, on both selector classes;
+//!   the outcome names the alias so callers can refuse it where a worktree
+//!   must not act as checkout authority.
 //!
 //! Two entry points express the governing §5.3 stopping points: [`resolve`]
 //! stops at the richest provable context (corpus callers), and
@@ -50,7 +52,7 @@ pub enum ResolverBackend<'a> {
     V2 {
         catalog: &'a CatalogSnapshotV2,
         attachments: &'a AttachmentSnapshotV1,
-        /// Live linked-worktree aliases, consulted only on the Filter lane
+        /// Live linked-worktree aliases, consulted for a caller-supplied path
         /// after the attachment arm misses. Empty unless the caller supplies
         /// a view ([`ProjectResolverEngine::with_worktree_aliases`]).
         worktree_aliases: &'a [WorktreeAlias],
@@ -312,11 +314,10 @@ fn v2_resolve(
         fs::canonicalize(path).unwrap_or_else(|_| lexical_normalize_selector_path(path));
     let selected = v2_path_attachment(attachments, &canonical)?;
     let Some(attachment) = selected else {
-        // Filter lane only: a caller-supplied path inside a reported linked
-        // worktree resolves to its base attachment. Selection-class callers
-        // and the session fallback never alias.
-        if req.class == SelectorClass::Filter
-            && req.selector.is_some()
+        // A caller-supplied path inside a reported linked worktree resolves
+        // to its base attachment on either class, with the alias root named
+        // on the context. The session fallback never aliases.
+        if req.selector.is_some()
             && let Some((alias, base)) =
                 v2_worktree_alias(attachments, worktree_aliases, &canonical)?
             && let Some(project) = catalog.projects.get(&base.project_id)
@@ -1421,11 +1422,11 @@ mod tests {
         }
     }
 
-    /// Reported linked-worktree aliases answer the Filter lane only, and a
-    /// match presents the base: the same project, attachment, and store key
+    /// Reported linked-worktree aliases answer caller-supplied paths on both
+    /// selector classes, and a match presents the base: the same project, attachment, and store key
     /// resolving the base path yields, plus the alias root it went through.
     #[test]
-    fn v2_filter_resolves_reported_worktree_alias_to_its_base() {
+    fn v2_resolves_reported_worktree_alias_to_its_base() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         make_dirs(&root);
@@ -1514,17 +1515,33 @@ mod tests {
             }
         ));
 
-        // Selection still misses for a worktree path, whatever the intent.
+        // Selection presents the same base, alias named, whatever the
+        // intent: callers decide whether an alias may act.
         for intent in [ResolveIntent::Read, ResolveIntent::Write] {
             let request = selection(
-                root.join("workspaces/solo-feature").to_str().unwrap(),
+                root.join("workspaces/solo-feature/src").to_str().unwrap(),
                 intent,
             );
+            let ProjectResolution::Attached(ctx) = engine.resolve(&request).unwrap() else {
+                panic!("selection resolves through the alias");
+            };
+            assert_eq!(ctx.project, base.project);
+            assert_eq!(ctx.attachment, base.attachment);
+            assert_eq!(ctx.store_key, base.store_key);
             assert_eq!(
-                engine.resolve(&request).unwrap_err().code(),
+                ctx.worktree_alias_root.as_deref(),
+                Some(root.join("workspaces/solo-feature").to_str().unwrap())
+            );
+            let attached = engine.resolve_attached(&request).unwrap();
+            assert_eq!(attached.worktree_alias_root, ctx.worktree_alias_root);
+            // Without a view the worktree path still misses on Selection.
+            assert_eq!(
+                ProjectResolverEngine::v2(&fx.catalog, &fx.attachments)
+                    .resolve(&request)
+                    .unwrap_err()
+                    .code(),
                 "error.project_selector_unknown"
             );
-            assert!(engine.resolve_attached(&request).is_err());
         }
 
         // The session fallback never aliases.
