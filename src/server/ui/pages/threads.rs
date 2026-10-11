@@ -25,8 +25,27 @@ use super::display::{age, encode_component, parse_rfc3339, preview};
 /// Rows per list page.
 const PAGE_SIZE: usize = 100;
 
-/// Status filter choices, in display order. `all` lists every status.
-const STATUS_CHOICES: [&str; 5] = ["all", "open", "active", "resolved", "promoted"];
+/// Status filter choices, in display order, as `(value, label)`. `live`
+/// (the default) lists open and active threads; `all` lists every status;
+/// the rest select one.
+const STATUS_CHOICES: [(&str, &str); 6] = [
+    ("live", "open and active"),
+    ("all", "all statuses"),
+    ("open", "open"),
+    ("active", "active"),
+    ("resolved", "resolved"),
+    ("promoted", "promoted"),
+];
+
+/// What the status filter selects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatusSelection<'a> {
+    /// Open and active threads: the default, and what an unknown value means.
+    Live,
+    /// Every status, resolved and promoted included.
+    All,
+    One(&'a str),
+}
 
 /// The list's query string: plain GET parameters, so filtering works
 /// without JavaScript.
@@ -41,11 +60,21 @@ pub(crate) struct ListQuery {
 }
 
 impl ListQuery {
+    fn selection(&self) -> StatusSelection<'_> {
+        match self.status.as_deref().map(str::trim) {
+            None | Some("") | Some("live") => StatusSelection::Live,
+            Some("all") => StatusSelection::All,
+            Some(status) => StatusSelection::One(status),
+        }
+    }
+
+    /// The query value that names the selection, absent for the default.
     fn status(&self) -> Option<&str> {
-        self.status
-            .as_deref()
-            .map(str::trim)
-            .filter(|status| !status.is_empty() && *status != "all")
+        match self.selection() {
+            StatusSelection::Live => None,
+            StatusSelection::All => Some("all"),
+            StatusSelection::One(status) => Some(status),
+        }
     }
 
     fn project(&self) -> Option<&str> {
@@ -155,9 +184,16 @@ fn read_list(ui: &UiState, query: &ListQuery) -> anyhow::Result<ListData> {
         (projects, project_ids, all.is_empty())
     };
 
+    // The store's default already hides resolved and promoted threads; the
+    // page opts into them with `all` or by naming one of them.
+    let (status, include_resolved) = match query.selection() {
+        StatusSelection::Live => (None, false),
+        StatusSelection::All => (None, true),
+        StatusSelection::One(status) => (Some(status.to_string()), true),
+    };
     let mut filters = ThreadListParams {
-        status: query.status().map(str::to_string),
-        include_resolved: Some(true),
+        status,
+        include_resolved: Some(include_resolved),
         include_workflows: Some(true),
         ..ThreadListParams::default()
     };
@@ -244,15 +280,15 @@ pub(crate) async fn table_fragment(
 }
 
 fn filter_form(query: &ListQuery, projects: &[String]) -> Markup {
-    let status = query.status().unwrap_or("all");
+    let status = query.status().unwrap_or("live");
     let project = query.project();
     html! {
         form.filters method="get" action="/threads" {
             label {
                 "Status "
                 select name="status" {
-                    @for choice in STATUS_CHOICES {
-                        option value=(choice) selected[choice == status] { (choice) }
+                    @for (choice, label) in STATUS_CHOICES {
+                        option value=(choice) selected[choice == status] { (label) }
                     }
                 }
             }
@@ -694,6 +730,37 @@ mod tests {
 
         let (_, none) = get(shared.clone(), "/threads?status=resolved").await;
         assert!(none.contains("No threads match these filters."), "{none}");
+
+        // A resolved thread is opt-in: hidden by default, listed under `all`
+        // and under its own status.
+        mutate(
+            &shared,
+            serde_json::json!({"action": "resolve", "id": beta, "note": "shipped"}),
+        );
+        let (_, live) = get(shared.clone(), "/threads").await;
+        assert!(
+            live.contains(&format!("href=\"/threads/{alpha}\"")),
+            "{live}"
+        );
+        assert!(
+            !live.contains(&format!("href=\"/threads/{beta}\"")),
+            "{live}"
+        );
+        assert!(
+            live.contains("<option value=\"live\" selected>open and active</option>"),
+            "{live}"
+        );
+        let (_, all) = get(shared.clone(), "/threads?status=all").await;
+        assert!(all.contains(&format!("href=\"/threads/{beta}\"")), "{all}");
+        let (_, resolved) = get(shared.clone(), "/threads?status=resolved").await;
+        assert!(
+            resolved.contains(&format!("href=\"/threads/{beta}\"")),
+            "{resolved}"
+        );
+        assert!(
+            !resolved.contains(&format!("href=\"/threads/{alpha}\"")),
+            "{resolved}"
+        );
 
         let (status, invalid) = get(shared.clone(), "/threads?status=bogus").await;
         assert_eq!(status, StatusCode::OK);
