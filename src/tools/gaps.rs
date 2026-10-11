@@ -210,13 +210,45 @@ impl BlackboxServer {
     /// cutover-covered project. Covered projects mutate repo-owned state
     /// through the checkout-owner backchannel, never through a daemon-local
     /// checkout lease (a zero-authority daemon has none).
+    ///
+    /// This is the one Selection caller that accepts a reported
+    /// linked-worktree alias: the project and scope stay the base's, and the
+    /// alias root comes back as the delivery target, so the write lands in
+    /// that worktree and never in the base. `Ok(None)` = not covered; an
+    /// alias root the mutation contract refuses is an error, never a
+    /// fallback to the base.
     pub(crate) fn covered_project_scope(
         &self,
         raw: &str,
-    ) -> Option<(String, bbox_corpus_core::identity::PublishedScope)> {
-        let project_id = self.validate_project_selection(raw).ok()?;
-        self.covered_scope_for_project_id(&project_id)
-            .map(|scope| (project_id, scope))
+    ) -> anyhow::Result<Option<CoveredProject>> {
+        let Ok(resolution) = self.resolve_project_selection_through_worktrees(raw) else {
+            return Ok(None);
+        };
+        let Some(project_id) = resolution.project_id().map(str::to_owned) else {
+            return Ok(None);
+        };
+        let Some(scope) = self.covered_scope_for_project_id(&project_id) else {
+            return Ok(None);
+        };
+        let target = match &resolution {
+            bbox_corpus_core::project_selector::ProjectResolution::Attached(ctx) => {
+                ctx.worktree_alias_root.clone()
+            }
+            _ => None,
+        }
+        .map(|worktree_project_dir| {
+            let target = bbox_code_source::CheckoutMutationTargetV1 {
+                worktree_project_dir,
+            };
+            target.validate().map(|()| target).map_err(|error| {
+                anyhow::anyhow!(
+                    "{}: the linked worktree `{raw}` resolves through cannot carry a delivery target ({error}); nothing was queued",
+                    crate::tools::scope::WORKTREE_ALIAS_REFUSAL
+                )
+            })
+        })
+        .transpose()?;
+        Ok(Some((project_id, scope, target)))
     }
 
     /// Coverage and scope lookup by durable project id (for id-addressed
@@ -307,13 +339,42 @@ impl BlackboxServer {
         reason: &str,
         edit: impl FnOnce(&mut [crate::gaps::GapNote]) -> anyhow::Result<()>,
     ) -> anyhow::Result<String> {
-        self.edit_queued_gaps_with_snapshot_hook(project_id, scope, ids, reason, || {}, edit)
+        self.edit_queued_gaps_to(project_id, scope, None, ids, reason, edit)
+    }
+
+    /// [`Self::edit_queued_gaps`] whose rewritten files land in `target`, a
+    /// linked worktree's project root, when given. The edit still reads the
+    /// published view and the base overlay; the rewrite is branch-local.
+    fn edit_queued_gaps_to(
+        &self,
+        project_id: &str,
+        scope: bbox_corpus_core::identity::PublishedScope,
+        target: Option<bbox_code_source::CheckoutMutationTargetV1>,
+        ids: &[&str],
+        reason: &str,
+        edit: impl FnOnce(&mut [crate::gaps::GapNote]) -> anyhow::Result<()>,
+    ) -> anyhow::Result<String> {
+        self.edit_queued_gaps_core(project_id, scope, target, ids, reason, || {}, edit)
     }
 
     fn edit_queued_gaps_with_snapshot_hook(
         &self,
         project_id: &str,
         scope: bbox_corpus_core::identity::PublishedScope,
+        ids: &[&str],
+        reason: &str,
+        after_snapshot: impl FnMut(),
+        edit: impl FnOnce(&mut [crate::gaps::GapNote]) -> anyhow::Result<()>,
+    ) -> anyhow::Result<String> {
+        self.edit_queued_gaps_core(project_id, scope, None, ids, reason, after_snapshot, edit)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn edit_queued_gaps_core(
+        &self,
+        project_id: &str,
+        scope: bbox_corpus_core::identity::PublishedScope,
+        target: Option<bbox_code_source::CheckoutMutationTargetV1>,
         ids: &[&str],
         reason: &str,
         mut after_snapshot: impl FnMut(),
@@ -373,9 +434,14 @@ impl BlackboxServer {
                 ))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
-        let mutations = queue.enqueue_tracked_writes(
+        let destination = mutation_destination(project_id, target.as_ref());
+        let mutations = queue.enqueue_mutations_to(
             scope,
-            writes,
+            target,
+            writes
+                .into_iter()
+                .map(|(path, content, base)| (path, Some(content), base))
+                .collect(),
             reason.into(),
             bbox_util::util::now_iso(),
         )?;
@@ -383,7 +449,7 @@ impl BlackboxServer {
         self.state.checkout_mutations_persister.request();
         self.observe_gap_delivery(project_id);
         Ok(format!(
-            "queued {}; delivery and publication are asynchronous",
+            "queued {}; delivery and publication are asynchronous; {destination}",
             mutations.join(", ")
         ))
     }
@@ -417,7 +483,7 @@ impl BlackboxServer {
         raw: &str,
     ) -> anyhow::Result<Option<String>> {
         crate::gaps::parse_filing_gap_kind(&p.gap_kind)?;
-        let Some((project_id, scope)) = self.covered_project_scope(raw) else {
+        let Some((project_id, scope, target)) = self.covered_project_scope(raw)? else {
             return Ok(None);
         };
         let mut envelope = serde_json::json!({
@@ -481,11 +547,15 @@ impl BlackboxServer {
                 )));
             }
         }
-        let ids = queue.enqueue_tracked_writes(
+        let destination = mutation_destination(&project_id, target.as_ref());
+        let ids = queue.enqueue_mutations_to(
             scope,
+            target,
             vec![(
                 format!(".bbox/gaps/{id}.json"),
-                String::from_utf8(crate::gaps::committed_gap_note_bytes(&gap)?)?,
+                Some(String::from_utf8(crate::gaps::committed_gap_note_bytes(
+                    &gap,
+                )?)?),
                 None,
             )],
             format!("bbox_gap(project_id={project_id})"),
@@ -495,7 +565,7 @@ impl BlackboxServer {
         self.state.checkout_mutations_persister.request();
         self.observe_gap_delivery(&project_id);
         let delivery = format!(
-            "queued {}; delivery and publication are asynchronous",
+            "queued {}; delivery and publication are asynchronous; {destination}",
             ids.join(", ")
         );
         Ok(Some(format!(
@@ -600,10 +670,12 @@ impl BlackboxServer {
         &self,
         raw: Option<&str>,
         id: &str,
-    ) -> anyhow::Result<Option<(String, bbox_corpus_core::identity::PublishedScope)>> {
+    ) -> anyhow::Result<Option<CoveredProject>> {
         match raw {
-            Some(raw) => Ok(self.covered_project_scope(raw)),
-            None => self.covered_scope_for_gap_id(id),
+            Some(raw) => self.covered_project_scope(raw),
+            None => Ok(self
+                .covered_scope_for_gap_id(id)?
+                .map(|(project_id, scope)| (project_id, scope, None))),
         }
     }
 
@@ -653,12 +725,13 @@ impl BlackboxServer {
         p: &GapUpdateParams,
         raw: Option<&str>,
     ) -> anyhow::Result<Option<String>> {
-        let Some((project_id, scope)) = self.covered_mutation_target(raw, &p.id)? else {
+        let Some((project_id, scope, target)) = self.covered_mutation_target(raw, &p.id)? else {
             return Ok(None);
         };
-        let delivery = self.edit_queued_gaps(
+        let delivery = self.edit_queued_gaps_to(
             &project_id,
             scope,
+            target,
             &[&p.id],
             &format!("bbox_gap_update(project_id={project_id})"),
             |gaps| {
@@ -750,7 +823,7 @@ impl BlackboxServer {
         p: &GapResolveParams,
         raw: Option<&str>,
     ) -> anyhow::Result<Option<String>> {
-        let Some((project_id, scope)) = self.covered_mutation_target(raw, &p.id)? else {
+        let Some((project_id, scope, target)) = self.covered_mutation_target(raw, &p.id)? else {
             return Ok(None);
         };
         let resolution = match p.resolution.as_str() {
@@ -768,9 +841,10 @@ impl BlackboxServer {
             }
             ids.push(by);
         }
-        let delivery = self.edit_queued_gaps(
+        let delivery = self.edit_queued_gaps_to(
             &project_id,
             scope,
+            target,
             &ids,
             &format!("bbox_gap_resolve(project_id={project_id})"),
             |gaps| {
@@ -798,6 +872,32 @@ impl BlackboxServer {
             "Gap {} -> {} via the checkout-owner lane ({delivery})",
             p.id, p.resolution
         )))
+    }
+}
+
+/// A covered project a checkout-owner mutation targets: its id, its
+/// published scope, and the linked worktree project root the write lands in
+/// when the caller's selector resolved through one.
+pub(crate) type CoveredProject = (
+    String,
+    bbox_corpus_core::identity::PublishedScope,
+    Option<bbox_code_source::CheckoutMutationTargetV1>,
+);
+
+/// Where a queued repo-owned write lands, for the reply the caller reads to
+/// know what to commit.
+pub(crate) fn mutation_destination(
+    project_id: &str,
+    target: Option<&bbox_code_source::CheckoutMutationTargetV1>,
+) -> String {
+    match target {
+        Some(target) => format!(
+            "it lands in linked worktree {}, never the base checkout: commit it on that branch. \
+             It is branch-local until the branch reaches the project's published ref; listings, \
+             dedupe and id-addressed updates do not see it before then",
+            target.worktree_project_dir
+        ),
+        None => format!("it lands in the base checkout of project {project_id}"),
     }
 }
 

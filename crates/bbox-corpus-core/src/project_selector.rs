@@ -299,17 +299,20 @@ pub struct AttachedProjectContext {
     /// attachment dir (falling back to the resolving attachment's dir when
     /// no base attachment exists).
     pub store_key: String,
-    /// Set when a Filter-class path selector resolved through a reported
+    /// Set when a caller-supplied path selector resolved through a reported
     /// linked-worktree alias: the alias root it matched. The project,
     /// attachment, and store key are then the base attachment's, exactly as
-    /// resolving the base path yields. The worktree is never a write target:
-    /// the attachment names the base, and nothing here grants a path.
+    /// resolving the base path yields. An alias match is never checkout
+    /// authority and never a daemon-local write target: the attachment names
+    /// the base, and nothing here grants a path. The only consumer that may
+    /// use the root as a destination is the checkout-owner mutation lane,
+    /// which hands it to the owning collector as a delivery target.
     pub worktree_alias_root: Option<String>,
 }
 
 /// A linked worktree of an attached base checkout, as a checkout-host
-/// producer reports it live. Read-side only: the catalog backend consults it
-/// for Filter-class path selectors that no attachment contains, and maps a
+/// producer reports it live. The catalog backend consults it for
+/// caller-supplied path selectors that no attachment contains, and maps a
 /// match to the base attachment. It is never durable and carries no
 /// filesystem authority.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]

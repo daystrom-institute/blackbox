@@ -707,7 +707,11 @@ async fn apply_checkout_mutations(runtime: &Runtime, config: &CollectorConfig) -
         .request(reqwest::Method::POST, url)
         .header(
             bbox_code_source::CHECKOUT_MUTATION_CAPABILITIES_HEADER,
-            bbox_code_source::CHECKOUT_MUTATION_CAPABILITY_GUARDED_V1,
+            format!(
+                "{}, {}",
+                bbox_code_source::CHECKOUT_MUTATION_CAPABILITY_GUARDED_V1,
+                bbox_code_source::CHECKOUT_MUTATION_CAPABILITY_TARGETED_V1
+            ),
         )
         .json(&bbox_code_source::CheckoutMutationPollRequestV1 {
             schema_version: bbox_code_source::CHECKOUT_MUTATION_SCHEMA_VERSION,
@@ -805,6 +809,12 @@ impl MutationPageState {
                 content_sha256,
                 None,
             )),
+            Ok(MutationApplyOutcome::Undeliverable { reason }) => Some(ack(
+                bbox_code_source::CHECKOUT_MUTATION_OUTCOME_UNDELIVERABLE,
+                Some(bounded_mutation_text(reason)),
+                None,
+                None,
+            )),
             Ok(MutationApplyOutcome::Conflicted {
                 observed_sha256,
                 message,
@@ -842,6 +852,81 @@ enum MutationApplyOutcome {
         observed_sha256: Option<String>,
         message: String,
     },
+    /// The mutation's worktree target is not a live linked worktree of the
+    /// configured base; nothing was written anywhere.
+    Undeliverable { reason: String },
+}
+
+/// The write root for a targeted mutation: its worktree project root, when
+/// that is, right now, a linked worktree `git worktree list` reports for the
+/// configured base checkout, joined with the project's root relpath, and an
+/// existing directory spelled canonically. `Ok(Err(reason))` is the
+/// `undeliverable` verdict; `Err` is a fault reading the base (a listing that
+/// failed), which fails the mutation instead. The base itself is never a
+/// target, and nothing outside the configured root or one of its live
+/// worktrees is ever returned.
+fn worktree_delivery_root(
+    base_project_root: &Path,
+    target: &bbox_code_source::CheckoutMutationTargetV1,
+) -> Result<std::result::Result<PathBuf, String>> {
+    let checkout = bbox_corpus_core::git::git_root_for_path(base_project_root)
+        .with_context(|| {
+            format!(
+                "{} is not inside a Git checkout",
+                base_project_root.display()
+            )
+        })?
+        .canonicalize()
+        .context("canonicalizing the base checkout")?;
+    require_main_worktree(&checkout)?;
+    let relpath = base_project_root
+        .strip_prefix(&checkout)
+        .context("the configured project root is outside its checkout")?;
+    let requested = PathBuf::from(&target.worktree_project_dir);
+    if requested == base_project_root {
+        return Ok(Err(format!(
+            "{} is the configured base checkout, not a linked worktree of it",
+            target.worktree_project_dir
+        )));
+    }
+    let listed = bbox_corpus_core::git::list_worktree_paths(&checkout);
+    // A successful listing always names the main worktree itself.
+    if !listed.contains(&checkout) {
+        bail!(
+            "listing the linked worktrees of {} failed; the targeted mutation stays undelivered",
+            checkout.display()
+        );
+    }
+    let live = listed
+        .iter()
+        .filter(|worktree| **worktree != checkout)
+        .any(|worktree| {
+            let root = if relpath.as_os_str().is_empty() {
+                worktree.clone()
+            } else {
+                worktree.join(relpath)
+            };
+            root == requested
+        });
+    if !live {
+        return Ok(Err(format!(
+            "{} is not a current linked worktree of the configured base {}",
+            target.worktree_project_dir,
+            checkout.display()
+        )));
+    }
+    match requested.canonicalize() {
+        Ok(canonical) if canonical == requested && canonical.is_dir() => Ok(Ok(canonical)),
+        Ok(canonical) => Ok(Err(format!(
+            "{} resolves to {}, not to the worktree project directory itself",
+            target.worktree_project_dir,
+            canonical.display()
+        ))),
+        Err(error) => Ok(Err(format!(
+            "{} does not exist in the linked worktree: {error}",
+            target.worktree_project_dir
+        ))),
+    }
 }
 
 fn bounded_mutation_text(mut message: String) -> String {
@@ -1021,7 +1106,8 @@ impl MutationFence {
 }
 
 /// Apply one mutation byte-for-byte under the configured checkout root for
-/// its scope. Every path component is opened without following links and the
+/// its scope, or, for a targeted mutation, under the live linked worktree of
+/// that root it names ([`worktree_delivery_root`]). Every path component is opened without following links and the
 /// target's parent directory is locked across check and replacement, so a
 /// symlinked component or target, a special file, or a concurrent owner can
 /// never redirect or interleave the write. Writes are durable atomic
@@ -1044,10 +1130,27 @@ fn apply_checkout_mutation(
                 mutation.scope.repo_id()
             )
         })?;
-    let root = project
+    let base_root = project
         .root
         .canonicalize()
         .with_context(|| format!("canonicalizing {}", project.root.display()))?;
+    // A targeted mutation lands only in a live linked worktree of this base,
+    // never in the base and never anywhere else.
+    let root = match &mutation.target {
+        None => base_root,
+        Some(target) => match worktree_delivery_root(&base_root, target)? {
+            Ok(root) => root,
+            Err(reason) => {
+                tracing::warn!(
+                    mutation_id = %mutation.mutation_id,
+                    path = %mutation.relative_path,
+                    reason = %reason,
+                    "targeted checkout mutation undeliverable"
+                );
+                return Ok(MutationApplyOutcome::Undeliverable { reason });
+            }
+        },
+    };
     let (parent_relative, name) = match mutation.relative_path.rsplit_once('/') {
         Some((parent, name)) => (Some(parent), name),
         None => (None, mutation.relative_path.as_str()),
@@ -4177,6 +4280,7 @@ mod tests {
             reason: "collector test".into(),
             enqueued_at: "2026-08-12T00:00:00Z".into(),
             guard: None,
+            target: None,
         }
     }
 
@@ -4208,6 +4312,7 @@ mod tests {
                 // doubles as the queue sequence.
                 sequence: u64::from_str_radix(&id[3..], 16).unwrap(),
             }),
+            target: None,
         }
     }
 
@@ -5481,6 +5586,141 @@ mod tests {
         let loaded = load_config(&config_path, DuplicateHandling::Error).unwrap();
         assert_eq!(loaded.enrolled_projects.len(), 1);
         server.abort();
+    }
+
+    fn targeted(
+        mutation: bbox_code_source::CheckoutMutationV1,
+        worktree_project_dir: &Path,
+    ) -> bbox_code_source::CheckoutMutationV1 {
+        bbox_code_source::CheckoutMutationV1 {
+            target: Some(bbox_code_source::CheckoutMutationTargetV1 {
+                worktree_project_dir: worktree_project_dir.to_str().unwrap().into(),
+            }),
+            ..mutation
+        }
+    }
+
+    fn undeliverable(outcome: MutationApplyOutcome) -> String {
+        match outcome {
+            MutationApplyOutcome::Undeliverable { reason } => reason,
+            other => panic!("expected undeliverable, got {other:?}"),
+        }
+    }
+
+    /// A targeted mutation lands only in a live linked worktree of the
+    /// configured base, under that worktree's project root and never under
+    /// the base. Anything else, including the base itself, a directory that
+    /// is not a worktree of it, and a worktree since removed, is acked
+    /// undeliverable with nothing written. An untargeted mutation still
+    /// lands in the base.
+    #[test]
+    fn targeted_mutations_land_only_in_a_live_linked_worktree_of_the_base() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let repo = root.join("alpha");
+        fs::create_dir_all(repo.join("service")).unwrap();
+        init_fixture_repo(&repo);
+        let worktree = root.join("workspaces").join("alpha-feature");
+        fs::create_dir_all(worktree.parent().unwrap()).unwrap();
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "feature",
+                worktree.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let worktree = worktree.canonicalize().unwrap();
+        let scope = PublishedScope::try_new("repo-a", ".").unwrap();
+        let config = mutation_config(&repo, scope.clone());
+        const GAP: &str = ".bbox/gaps/gap-0000aaaa.json";
+        const CONTENT: &str = "{\"id\":\"gap-0000aaaa\"}";
+
+        let to_worktree = targeted(write_mutation(&scope, GAP, CONTENT), &worktree);
+        assert_eq!(
+            apply_checkout_mutation(&config, &to_worktree).unwrap(),
+            applied(Some(CONTENT))
+        );
+        assert_eq!(fs::read_to_string(worktree.join(GAP)).unwrap(), CONTENT);
+        assert!(
+            !repo.join(".bbox/gaps").exists(),
+            "nothing lands in the base"
+        );
+
+        // The page state acks the outcome with a contract-valid ack.
+        let mut page = MutationPageState::default();
+        let ack = page.process(&config, &to_worktree).unwrap();
+        assert_eq!(
+            ack.outcome,
+            bbox_code_source::CHECKOUT_MUTATION_OUTCOME_APPLIED
+        );
+
+        // Not a worktree of this base, and the base itself, are refused.
+        let stranger = root.join("elsewhere");
+        fs::create_dir_all(&stranger).unwrap();
+        for wrong in [&stranger, &repo] {
+            let mutation = targeted(write_mutation(&scope, GAP, CONTENT), wrong);
+            let reason = undeliverable(apply_checkout_mutation(&config, &mutation).unwrap());
+            assert!(reason.contains(wrong.to_str().unwrap()), "{reason}");
+            let ack = MutationPageState::default()
+                .process(&config, &mutation)
+                .unwrap();
+            assert_eq!(
+                ack.outcome,
+                bbox_code_source::CHECKOUT_MUTATION_OUTCOME_UNDELIVERABLE
+            );
+            ack.validate().unwrap();
+        }
+        assert!(!stranger.join(".bbox").exists());
+        assert!(!repo.join(".bbox/gaps").exists());
+
+        // A subtree project delivers into the same subtree of the worktree,
+        // and refuses the worktree's root.
+        let subtree = mutation_config(
+            &repo.join("service"),
+            PublishedScope::try_new("repo-a", "service").unwrap(),
+        );
+        let subtree_scope = subtree.projects[0].scope.clone();
+        fs::create_dir_all(worktree.join("service")).unwrap();
+        let nested = targeted(
+            write_mutation(&subtree_scope, GAP, CONTENT),
+            &worktree.join("service"),
+        );
+        assert_eq!(
+            apply_checkout_mutation(&subtree, &nested).unwrap(),
+            applied(Some(CONTENT))
+        );
+        assert!(worktree.join("service").join(GAP).is_file());
+        let at_root = targeted(write_mutation(&subtree_scope, GAP, CONTENT), &worktree);
+        undeliverable(apply_checkout_mutation(&subtree, &at_root).unwrap());
+
+        // The base-only path is unchanged.
+        let to_base = write_mutation(&scope, GAP, CONTENT);
+        assert_eq!(
+            apply_checkout_mutation(&config, &to_base).unwrap(),
+            applied(Some(CONTENT))
+        );
+        assert_eq!(fs::read_to_string(repo.join(GAP)).unwrap(), CONTENT);
+        fs::remove_file(repo.join(GAP)).unwrap();
+
+        // Once the worktree is removed, the same target is undeliverable
+        // and nothing is written anywhere.
+        git(
+            &repo,
+            &["worktree", "remove", "--force", worktree.to_str().unwrap()],
+        );
+        let after = targeted(
+            write_mutation(&scope, ".bbox/gaps/gap-0000bbbb.json", CONTENT),
+            &worktree,
+        );
+        let reason = undeliverable(apply_checkout_mutation(&config, &after).unwrap());
+        assert!(reason.contains("not a current linked worktree"), "{reason}");
+        assert!(!worktree.exists());
+        assert!(!repo.join(".bbox/gaps/gap-0000bbbb.json").exists());
     }
 
     /// Each configured base checkout reports the linked worktrees git lists

@@ -10,7 +10,8 @@
 
 use bbox_corpus_core::project_record::ResolvedCheckoutScope;
 use bbox_corpus_core::project_selector::{
-    ProjectResolution, ProjectSelectorRequest, ResolveIntent, ResolvedAttachment,
+    AttachedProjectContext, ProjectResolution, ProjectSelectorRequest, ResolveIntent,
+    ResolvedAttachment,
 };
 use bbox_indexing::checkout_access::{
     CheckoutAccessErrorCode, CheckoutAccessIntent, CheckoutAccessKind, CheckoutAccessRequest,
@@ -18,6 +19,31 @@ use bbox_indexing::checkout_access::{
 };
 
 use crate::server::BlackboxServer;
+
+/// Typed refusal code for a selector that resolved through a reported
+/// linked-worktree alias where the caller needs checkout authority or a
+/// daemon-local write target.
+pub(crate) const WORKTREE_ALIAS_REFUSAL: &str = "error.project_selector_worktree_alias";
+
+/// The refusal for an alias match on a path that must not act through a
+/// worktree. It names the base selector to use instead.
+pub(crate) fn worktree_alias_refusal(raw: &str, ctx: &AttachedProjectContext) -> anyhow::Error {
+    let alias_root = ctx.worktree_alias_root.as_deref().unwrap_or_default();
+    let project_id = ctx.project.project_id();
+    let base_dir = match &ctx.attachment {
+        ResolvedAttachment::Catalog {
+            checkout_project_dir,
+            ..
+        } => checkout_project_dir.as_str(),
+        ResolvedAttachment::V1Compat { checkout_dir, .. } => checkout_dir.as_str(),
+    };
+    anyhow::anyhow!(
+        "{WORKTREE_ALIAS_REFUSAL}: `{raw}` is inside linked worktree {alias_root} of project \
+         {project_id}. A linked worktree is never checkout authority or a daemon-local write \
+         target, so this operation does not act through it. Pass the base selector \
+         {project_id} (base checkout {base_dir}) to act on the base checkout"
+    )
+}
 
 pub(crate) struct ProjectWriteResolution {
     pub(crate) durable_scope: String,
@@ -83,6 +109,11 @@ impl BlackboxServer {
             }
         })?;
         let resolved = match engine_outcome {
+            // A worktree alias names the base attachment; the broker would
+            // lease the base checkout for a write made from the worktree.
+            Ok(ctx) if ctx.worktree_alias_root.is_some() => {
+                return Err(worktree_alias_refusal(raw, &ctx));
+            }
             Ok(ctx) => ctx,
             Err(error)
                 if error.code() == "error.project_selector_unknown"
@@ -197,12 +228,47 @@ impl BlackboxServer {
     /// Selection-class resolution to the richest provable context (phase-2
     /// §9.2, Selection/Read): corpus callers stop at a catalog context, path
     /// callers may still find an attachment inside. Misses and ambiguity
-    /// carry the §5.4 typed failure vocabulary.
+    /// carry the §5.4 typed failure vocabulary. A path inside a reported
+    /// linked worktree is refused with [`WORKTREE_ALIAS_REFUSAL`]: every
+    /// Selection caller but the checkout-owner mutation lane acts on the
+    /// resolved project as checkout authority or a local write target.
     pub(crate) fn resolve_project_selection(&self, raw: &str) -> anyhow::Result<ProjectResolution> {
+        match self.resolve_project_selection_through_worktrees(raw)? {
+            ProjectResolution::Attached(ctx) if ctx.worktree_alias_root.is_some() => {
+                Err(worktree_alias_refusal(raw, &ctx))
+            }
+            resolution => Ok(resolution),
+        }
+    }
+
+    /// [`Self::resolve_project_selection`] that also returns a resolution
+    /// through a reported linked-worktree alias, with
+    /// `worktree_alias_root` set. Only the checkout-owner mutation lane uses
+    /// it: the root becomes a delivery target the owning collector checks,
+    /// never a daemon-side path.
+    pub(crate) fn resolve_project_selection_through_worktrees(
+        &self,
+        raw: &str,
+    ) -> anyhow::Result<ProjectResolution> {
         self.with_project_resolver(|engine| {
             engine.resolve(&ProjectSelectorRequest::selection(raw, ResolveIntent::Read))
         })?
         .map_err(anyhow::Error::new)
+    }
+
+    /// Refuse a path selector that resolves through a reported
+    /// linked-worktree alias. For administration tools whose own resolution
+    /// takes no alias view, so a worktree path names the refusal instead of
+    /// reading as an unknown path. Every other outcome, errors included, is
+    /// left to the caller's own resolution.
+    pub(crate) fn refuse_worktree_alias_selector(&self, raw: &str) -> anyhow::Result<()> {
+        if let Ok(ProjectResolution::Attached(ctx)) =
+            self.resolve_project_selection_through_worktrees(raw)
+            && ctx.worktree_alias_root.is_some()
+        {
+            return Err(worktree_alias_refusal(raw, &ctx));
+        }
+        Ok(())
     }
 
     /// Boundary validation for explicit Selection-class project params

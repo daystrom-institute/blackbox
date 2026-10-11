@@ -261,6 +261,12 @@ pub(crate) fn catalog_attachment_target(
         }
         Err(error) => return Err(anyhow::Error::new(error)),
     };
+    // A lease target is checkout authority, which an alias never is.
+    if resolved.worktree_alias_root.is_some() {
+        return Err(crate::tools::scope::worktree_alias_refusal(
+            project_id, &resolved,
+        ));
+    }
     let ResolvedAttachment::Catalog { attachment_id, .. } = &resolved.attachment else {
         bail!("error.project_attachment_required: {project_id}");
     };

@@ -331,6 +331,16 @@ impl BlackboxServer {
         if !path.is_absolute() {
             return Self::err_text(&format!("Error: project path must be absolute: {}", p.path));
         }
+        // A linked worktree is never registered: it is not checkout
+        // authority, and its base registration already covers it.
+        let refusal = {
+            let server = self.clone();
+            let raw = p.path.clone();
+            tokio::task::spawn_blocking(move || server.refuse_worktree_alias_selector(&raw)).await
+        };
+        if let Ok(Err(error)) = refusal {
+            return Self::err_text(&format!("Error: {error:#}"));
+        }
         if tokio::fs::metadata(path).await.is_err() {
             let result = self.register_remote_project(&p).await;
             return match result {
@@ -701,6 +711,8 @@ impl BlackboxServer {
             if !path.is_absolute() {
                 anyhow::bail!("project path must be absolute: {}", p.path);
             }
+            // Never scaffold a linked worktree of an attached base.
+            server.refuse_worktree_alias_selector(&p.path)?;
             if !path.exists() {
                 anyhow::bail!(
                     "{}",
