@@ -18,10 +18,10 @@
   "blocking_level": "none",
   "dedupe_key": "workflow/harness/live-harness-self-validation-after-code-change",
   "notes": "Triage trace: still relevant. Each dispatch now spawns a fresh harness process, so an installed binary swap takes effect without restarts, but the binary remains one daemon-wide choice; there is no way to point a single dispatch at a worktree build.",
-  "resolution": "acknowledged",
+  "resolution": "addressed",
   "project_id": "89bd722f",
   "created_at": "2026-06-02T06:11:09Z",
-  "updated_at": "2026-09-24T11:03:18Z",
-  "resolved_at": "2026-09-24T11:03:18Z",
-  "resolution_note": "issue: https://github.com/daystrom-institute/blackbox/issues/85"
+  "updated_at": "2026-10-11T21:09:50Z",
+  "resolved_at": "2026-10-11T21:09:50Z",
+  "resolution_note": "Obsolete: PR #133 (https://github.com/daystrom-institute/blackbox/pull/133), deployed at 237007630ef5700a610550e0d3dabc610ad6f550, removes the custom bro-harness runtime and its per-dispatch harness binary surface. Worktree harness validation is no longer applicable; native provider execution remains. GitHub issue #85 is closed as not planned."
 }
