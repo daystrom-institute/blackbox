@@ -18,8 +18,10 @@
   "dedupe_key": "tooling/project-resolver/unattached-linked-worktree-threads-literal-keyed",
   "suggested_owner": "blackbox",
   "notes": "Sibling of the managed-lane resolution gaps gap-21ca1a19, gap-afe32407 and gap-5d393f54, which cover fleet-managed lanes; this one is the unmanaged linked worktree case on the cage daemon, and the stored-row consequence. Only base checkouts are attached today (bbox_project_catalog_get detail=attachments); the code collector enrolls the repos root only.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "project_id": "89bd722f",
   "created_at": "2026-10-11T02:41:16Z",
-  "updated_at": "2026-10-11T02:41:16Z"
+  "updated_at": "2026-10-11T04:06:08Z",
+  "resolved_at": "2026-10-11T04:06:08Z",
+  "resolution_note": "Addressed by #124 (collector reports linked worktrees in presence; the resolver aliases a worktree path to its base), #125 (bbox_thread_rekey; the 14 backlog threads are re-keyed) and #126 (gap and knowledge writes from a worktree land in that worktree). Deployed to the cage daemon and the checkout-host collector."
 }
