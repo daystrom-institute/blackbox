@@ -1,0 +1,25 @@
+{
+  "id": "gap-ae6b8cb1",
+  "title": "Threads opened from an unattached linked worktree are keyed to the raw worktree path and invisible to their project's filter",
+  "gap_kind": "tooling",
+  "domain": "project-resolver",
+  "wanted_capability": "A thread (or any project-keyed row) opened with project=<linked worktree path>, where the worktree belongs to a registered base checkout, should be keyed to that project's id. On the remote daemon the resolver sees only recorded attachments and cannot stat or git-probe checkout-host paths, so a linked worktree outside the repo and outside the collector enroll roots (an orca worktree under ~/orca/workspaces/<repo>/<name>) misses as an unregistered literal: the row stores the raw path with no project_id, and bbox_thread_list project=<base> (id arm, ledger arm, substring on the base path) never matches it. Wanted: the checkout-host collector reports the linked-worktree set of each attached checkout (git worktree list from the base) as read-gate aliases to the base, or sessions in such worktrees carry a selector that resolves; plus a re-key operation for rows already stored under a literal path (14 threads today, 8 of them live, across five projects; no tool re-keys a thread's project).",
+  "missing_primitive": "Resolver read-gate alias for unattached linked worktrees on a daemon without checkout authority; a thread project re-key operation.",
+  "fallback_used": "The operator UI threads page folds stored keys into one filter choice per resolved project; unresolved worktree-path keys stay separate choices labelled by the raw path.",
+  "evidence": [
+    "thread-f3648dd4",
+    "thread-449f24c5",
+    "thread-01dc2dd9",
+    "crates/bbox-indexing/src/project_resolver.rs (v2_path_attachment: exact or containing active attachment only)",
+    "src/tools/threads.rs (stamp_host_owned_thread_project: filter-lane resolution, literal miss stores the raw selector)"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/project-resolver/unattached-linked-worktree-threads-literal-keyed",
+  "suggested_owner": "blackbox",
+  "notes": "Sibling of the managed-lane resolution gaps gap-21ca1a19, gap-afe32407 and gap-5d393f54, which cover fleet-managed lanes; this one is the unmanaged linked worktree case on the cage daemon, and the stored-row consequence. Only base checkouts are attached today (bbox_project_catalog_get detail=attachments); the code collector enrolls the repos root only.",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "created_at": "2026-10-11T02:41:16Z",
+  "updated_at": "2026-10-11T02:41:16Z"
+}
