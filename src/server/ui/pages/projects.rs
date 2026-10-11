@@ -205,6 +205,39 @@ fn project_label(project: &CorpusProject, root_name: Option<&str>) -> Option<Str
     root_name.map(str::to_string)
 }
 
+/// Every project the daemon can name, as `project_id -> label`: catalog
+/// projects in catalog mode, registered roots in bridge mode, named the way
+/// [`project_label`] names them. A project known by id alone is absent.
+pub(super) fn project_names(ui: &UiState) -> BTreeMap<String, String> {
+    let roots = registered_roots(ui);
+    let mut names: BTreeMap<String, String> = roots
+        .iter()
+        .filter_map(|root| {
+            let label = root
+                .aliases
+                .first()
+                .cloned()
+                .or_else(|| root.name.clone())?;
+            Some((root.project_id.clone(), label))
+        })
+        .collect();
+    if let Some(store) = ui.shared.project_authority.catalog_store()
+        && let Ok(state) = store.snapshot()
+    {
+        for project in state.catalog().projects.values() {
+            let id = project.project_id.as_str();
+            let root_name = roots
+                .iter()
+                .find(|root| root.project_id == id)
+                .and_then(|root| root.name.as_deref());
+            if let Some(label) = project_label(project, root_name) {
+                names.insert(id.to_string(), label);
+            }
+        }
+    }
+    names
+}
+
 /// The project cell: the label first, the id beneath it.
 fn project_cell(project_id: &str, label: Option<&str>) -> Markup {
     html! {
