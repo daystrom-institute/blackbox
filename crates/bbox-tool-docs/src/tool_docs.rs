@@ -456,7 +456,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         summary: "Install a brofile from an inline artifact object or explicit HTTP(S) URL. Supply exactly one; caller filesystem paths are rejected. Workflow, agent, packet, atom, cron and team installation is retired.",
         when_to_use: "List before installing. The installer validates brofile JSON and records its version. Caller paths are never read by this tool.",
         example: Some(
-            r#"bbox_artifact_install(kind="brofile", artifact={"name":"reviewer","provider":"brodex","lens":"Review correctness and explain material findings."})"#,
+            r#"bbox_artifact_install(kind="brofile", artifact={"name":"reviewer","provider":"codex","lens":"Review correctness and explain material findings."})"#,
         ),
     },
     ToolDoc {
@@ -496,9 +496,9 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bro_resume",
         category: ToolCategory::Orchestration,
         summary: "Continue an existing session with a follow-up; single-flight per provider session. Optional request_key prevents duplicate continuation after a lost reply.",
-        when_to_use: "Use for follow-ups on an existing bro session. peak_usage has the bro_exec advisory contract, evaluated at the continuation attempt start. request_key has the same durable retry contract as bro_exec; use a new key for each intentional turn. Workflow/atom-owned sessions refuse ordinary resume. Do not use `bro_exec` again when you need continuity. Pass the `session_id` and `provider` returned by the original dispatch. The working-directory override is `cwd` (canonical; `project_dir` accepted as a deprecated alias), usually unnecessary because resume auto-resolves the session's recorded cwd. For Brodex, pass `service_tier=\"priority\"` to force fast routing for the continuation or `service_tier=\"default\"` to persist standard routing. `pin_model` / `pin_effort` override the model and reasoning effort for the resumed turns (absent ⇒ brofile/session default). Never call `bro_resume` on a session while its previous task is still running: first `bro_wait(task_id=...)`, or `bro_cancel(task_id=...)` if you are abandoning that turn. If a prior turn failed but the session is still useful, resume it with recovery context before starting a fresh `bro_exec`. See `sm-bro-dispatch-patterns` via `bbox_knowledge` for workflow shapes.",
+        when_to_use: "Use for follow-ups on an existing bro session. peak_usage has the bro_exec advisory contract, evaluated at the continuation attempt start. request_key has the same durable retry contract as bro_exec; use a new key for each intentional turn. Workflow/atom-owned sessions refuse ordinary resume. Do not use `bro_exec` again when you need continuity. Pass the `session_id` and `provider` returned by the original dispatch. The working-directory override is `cwd` (canonical; `project_dir` accepted as a deprecated alias), usually unnecessary because resume auto-resolves the session's recorded cwd. For Codex, pass `service_tier=\"priority\"` to force fast routing for the continuation or `service_tier=\"default\"` to persist standard routing. `pin_model` / `pin_effort` override the model and reasoning effort for the resumed turns (absent ⇒ brofile/session default). Never call `bro_resume` on a session while its previous task is still running: first `bro_wait(task_id=...)`, or `bro_cancel(task_id=...)` if you are abandoning that turn. If a prior turn failed but the session is still useful, resume it with recovery context before starting a fresh `bro_exec`. See `sm-bro-dispatch-patterns` via `bbox_knowledge` for workflow shapes.",
         example: Some(
-            r#"bro_resume(session_id="<sessionId>", provider="brodex", prompt="add tests for the edge case we discussed")"#,
+            r#"bro_resume(session_id="<sessionId>", provider="codex", prompt="add tests for the edge case we discussed")"#,
         ),
     },
     ToolDoc {
@@ -564,7 +564,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bro_steer",
         category: ToolCategory::Orchestration,
-        summary: "Queue a user steer into a running bro-harness process without cancelling the active turn.",
+        summary: "Queue a user steer into a running provider session without cancelling the active turn.",
         when_to_use: "Use when a running bro should incorporate extra direction but does not need to stop its current turn. If the task already finished, use bro_resume instead. Only live harness child processes are steerable.",
         example: Some(r#"bro_steer(task_id="...", prompt="Prefer the smaller scoped fix.")"#),
     },
@@ -586,7 +586,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bro_providers",
         category: ToolCategory::Orchestration,
         summary: "List provider summaries with current peak_usage advisories; pass provider to list its model slugs and reasoning efforts.",
-        when_to_use: "Discover providers with no arguments. Pass provider=\"brodex\" (or another returned provider id) for that provider's model slugs and model-specific effort support. peak_usage is the current provider schedule advisory: true during peak, false off-peak, omitted when no schedule is known. GLM uses weekdays 14:00-18:00 Singapore (UTC+8); DeepSeek uses weekdays 01:00-04:00 and 06:00-10:00 UTC. This does not measure quota or execution-worker availability.",
+        when_to_use: "Discover providers with no arguments. Pass provider=\"codex\" (or another returned provider id) for that provider's model slugs and model-specific effort support. peak_usage is the current provider schedule advisory: true during peak, false off-peak, omitted when no schedule is known. GLM uses weekdays 14:00-18:00 Singapore (UTC+8); DeepSeek uses weekdays 01:00-04:00 and 06:00-10:00 UTC. This does not measure quota or execution-worker availability.",
         example: None,
     },
     ToolDoc {

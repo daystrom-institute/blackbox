@@ -7,7 +7,7 @@ The corpus daemon runs as one containerized workload with one state volume
 (see `deploy/docker/README.md`); the image pins the state, index, vector and
 XDG roots under `/var/lib/blackbox`. Paths below are the defaults for a
 daemon's state root; apply them relative to that volume. Checkout hosts run
-only satellites: `fleetd`, `bro-harness`, `bro`, `bbox-code-collector` and
+only satellites: `fleetd`, `bro`, `bbox-code-collector` and
 `bbox-transcript-collector`.
 
 Maintenance tools named here other than `bbox_thread_list`,
@@ -68,7 +68,6 @@ memories). Checkout hosts install their satellites from source:
 ```
 ~/.local/bin/blackbox
 ~/.local/bin/bro
-~/.local/bin/bro-harness
 ~/.local/bin/fleetd
 ~/.local/bin/bbox-code-collector
 ~/.local/bin/bbox-transcript-collector
@@ -80,10 +79,10 @@ The workspace declares no `default-members`, so a bare
 
 ```bash
 cargo build --release                       # blackboxd, blackbox (root package)
-cargo build --release -p bro-cli -p bro-harness -p fleetd \
+cargo build --release -p bro-cli -p fleetd \
   -p bbox-code-collector -p bbox-transcript-collector
 install -m 755 target/release/blackbox ~/.local/bin/blackbox
-install -m 755 target/release/{bro,bro-harness,fleetd} ~/.local/bin/
+install -m 755 target/release/{bro,fleetd} ~/.local/bin/
 install -m 755 target/release/{bbox-code-collector,bbox-transcript-collector} ~/.local/bin/
 ```
 
@@ -302,7 +301,6 @@ state dir so it never touches the deployed daemon's state. See
 ├── bin/                        # checkout-host satellites and CLIs
 │   ├── blackbox                # offline administration CLI
 │   ├── bro                     # headless daemon client
-│   ├── bro-harness             # model-turn runtime, exec'd by fleetd
 │   ├── fleetd                  # fleet supervisor
 │   ├── bbox-code-collector
 │   └── bbox-transcript-collector
@@ -455,7 +453,7 @@ install the verified `target/release/blackbox` as `~/.local/bin/blackbox`,
 using the same backup and platform-signing procedure. It remains the entry
 point for offline catalog and transport maintenance.
 
-Update affected native `bro` and `bro-harness` binaries with a retained backup
+Update affected native `bro` and `fleetd` binaries with a retained backup
 and platform signing. After the daemon is healthy, refresh generated guidance
 on each operator host that consumes it:
 

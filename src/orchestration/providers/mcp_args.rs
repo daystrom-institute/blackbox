@@ -36,11 +36,8 @@ pub trait ProviderMcp {
     fn build_filter_args(&self, filters: &McpFilters) -> Vec<String>;
     #[allow(dead_code)]
     fn supports_dispatch_filter(&self) -> bool;
-    /// Translate a normalized fleet MCP server map into provider-native dispatch
-    /// args. Reached at dispatch spawn via [`fleet_mcp_args`]: the daemon
-    /// resolves fleet.json `mcpServers` and injects them as harness CLI argv
-    /// (`--mcp-config`), keeping the wire form on the harness's own CLI
-    /// contract (§7) rather than an in-process struct back-channel.
+    /// Translate the fleet MCP map into native Claude CLI arguments.
+    /// Codex configuration is delivered through its app-server adapter.
     fn build_fleet_mcp_args(&self, servers: &BTreeMap<String, mcp::McpServerConfig>)
     -> Vec<String>;
 }
@@ -105,10 +102,9 @@ impl ProviderMcp for Provider {
         // available tools. ProviderLaunch compiles closed allowlists separately.
         // Denylists are enforceable on both lanes. Join each list into
         // one argument so variadic CLI parsing cannot swallow following flags.
-        let (deny_flag, allow_flag) = match self.lane() {
+        let (deny_flag, allow_flag): (&str, Option<&str>) = match self.lane() {
             ProviderLane::ClaudeCli => ("--disallowedTools", None),
-            ProviderLane::Harness => ("--deny-tools", Some("--allow-tools")),
-            ProviderLane::Codex | ProviderLane::Workflow => return args,
+            ProviderLane::Codex | ProviderLane::Workflow | ProviderLane::Retired => return args,
         };
         let deny = expand_filter_patterns(&filters.disallow);
         if !deny.is_empty() {
@@ -127,7 +123,7 @@ impl ProviderMcp for Provider {
 
     #[allow(dead_code)]
     fn supports_dispatch_filter(&self) -> bool {
-        self.lane() != ProviderLane::Workflow
+        self.is_dispatchable()
     }
 
     /// Translate a normalized fleet MCP server map into provider-native dispatch
@@ -144,10 +140,10 @@ impl ProviderMcp for Provider {
             return Vec::new();
         }
         match self.lane() {
-            ProviderLane::ClaudeCli | ProviderLane::Harness => {
+            ProviderLane::ClaudeCli => {
                 vec!["--mcp-config".into(), fleet_mcp_config_json(servers)]
             }
-            ProviderLane::Codex | ProviderLane::Workflow => Vec::new(),
+            ProviderLane::Codex | ProviderLane::Workflow | ProviderLane::Retired => Vec::new(),
         }
     }
 }

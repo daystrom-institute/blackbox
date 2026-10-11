@@ -41,7 +41,7 @@ Resume the same provider session:
 ```text
 bro_resume(
   session_id="<session-id>",
-  provider="brodex",
+  provider="codex",
   prompt="now implement the smallest safe patch"
 )
 ```

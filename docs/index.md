@@ -15,8 +15,6 @@ The main operator binaries are:
 | `blackboxd` | HTTP-MCP corpus daemon. One containerized workload with one state volume. |
 | `blackbox` | Offline administration CLI for the project catalog and producer claims |
 | `bro` | Fleet and bro execution client |
-| `bro-harness` | Standalone model-turn runtime, exec'd by `fleetd` |
-| `isolate` | Native deterministic harness tools |
 | `fleetd` | Per-machine fleet supervisor that owns harness workers |
 | `bbox-code-collector` | Checkout-host publication of project source |
 | `bbox-transcript-collector` | Checkout-host publication of native session history |

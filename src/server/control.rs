@@ -59,7 +59,7 @@ pub(crate) async fn control_closeout_handler(
 ) -> axum::response::Response {
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
-    use bro_tools::fleet_worktree::{
+    use bro_worktree::{
         CloseoutOutcome as ToolOutcome, prepare_closeout_request,
         run_closeout_phases_with_candidate_gate,
     };
@@ -152,8 +152,8 @@ pub(crate) async fn control_closeout_handler(
             // to base-repo HEAD movement. Fall back to the base repo's current
             // branch only when no fork-point was captured (legacy worktrees /
             // tool-path dispatch), then to "main".
-            _ => bro_tools::fleet_worktree::fleet_base_branch(&cx_root)
-                .or_else(|| bro_tools::fleet_worktree::current_branch(base_repo).ok())
+            _ => bro_worktree::fleet_base_branch(&cx_root)
+                .or_else(|| bro_worktree::current_branch(base_repo).ok())
                 .unwrap_or_else(|| "main".to_string()),
         },
         req.allow_branch_prefixes.clone(),
@@ -190,18 +190,18 @@ pub(crate) async fn control_closeout_handler(
     // run on the blocking pool, never inline on a runtime worker (I2,
     // concurrency-model §5 Phase 4).
     let outcome = tokio::task::spawn_blocking(move || {
-        let gate = |candidate: &bro_tools::fleet_worktree::CandidateTree| {
+        let gate = |candidate: &bro_worktree::CandidateTree| {
             super::knowledge_merge_gate::evaluate(candidate)
         };
         run_closeout_phases_with_candidate_gate(&driver_req, Some(&gate))
     })
     .await
     .unwrap_or_else(|join_err| {
-        ToolOutcome::Failed(bro_tools::fleet_worktree::PhaseResult {
-            phase: bro_tools::fleet_worktree::CloseoutPhase::Preflight,
+        ToolOutcome::Failed(bro_worktree::PhaseResult {
+            phase: bro_worktree::CloseoutPhase::Preflight,
             repo_cwd: std::path::PathBuf::new(),
             ok: false,
-            error_class: bro_tools::fleet_worktree::CloseoutErrorClass::None,
+            error_class: bro_worktree::CloseoutErrorClass::None,
             content: serde_json::json!({
                 "error": format!("closeout driver task failed: {join_err}"),
             }),
@@ -213,7 +213,7 @@ pub(crate) async fn control_closeout_handler(
         ToolOutcome::Success { phases }
             if phases.iter().any(|phase| {
                 phase.ok
-                    && phase.phase == bro_tools::fleet_worktree::CloseoutPhase::Remove
+                    && phase.phase == bro_worktree::CloseoutPhase::Remove
             })
     );
     if let Some(checkout_id) = teardown_checkout_id {
@@ -258,7 +258,7 @@ pub(crate) async fn control_closeout_handler(
         }
     }
 
-    // Translate bro_tools::CloseoutOutcome into the bro_protocol wire shape.
+    // Translate bro_worktree::CloseoutOutcome into the bro_protocol wire shape.
     // The two type families are intentionally distinct (bro_protocol is
     // contract-bottom; bro_tools stays free of it). Each field maps 1:1;
     // the daemon does the conversion. PathBuf serializes to a string under
@@ -278,15 +278,15 @@ pub(crate) async fn control_closeout_handler(
     (status, axum::Json(json!(wire_outcome))).into_response()
 }
 
-/// Map `bro_tools::fleet_worktree::CloseoutPhase` →
+/// Map `bro_worktree::CloseoutPhase` →
 /// `bro_protocol::CloseoutPhase` by name (both are `Copy` + `Serialize` +
 /// `Deserialize` and use the same `snake_case` rename, so the numeric
 /// discriminants line up - but the type families are independent and the
 /// daemon bridges them, per the design).
-fn to_wire_phase(r: &bro_tools::fleet_worktree::PhaseResult) -> bro_protocol::PhaseResult {
+fn to_wire_phase(r: &bro_worktree::PhaseResult) -> bro_protocol::PhaseResult {
     use bro_protocol::CloseoutErrorClass as WireErr;
     use bro_protocol::CloseoutPhase as WirePhase;
-    use bro_tools::fleet_worktree::{CloseoutErrorClass as ToolErr, CloseoutPhase as ToolPhase};
+    use bro_worktree::{CloseoutErrorClass as ToolErr, CloseoutPhase as ToolPhase};
     let phase = match r.phase {
         ToolPhase::Preflight => WirePhase::Preflight,
         ToolPhase::StageCommit => WirePhase::StageCommit,
@@ -324,10 +324,8 @@ fn to_wire_phase(r: &bro_tools::fleet_worktree::PhaseResult) -> bro_protocol::Ph
 /// Translate the resolved wire `CloseoutHooksWire` into the `bro_tools` local
 /// `CloseoutHooks` the phased driver consumes. The daemon bridges the two type
 /// families (bro_protocol is contract-bottom; bro_tools stays free of it).
-fn to_driver_hooks(
-    w: &bro_protocol::CloseoutHooksWire,
-) -> bro_tools::fleet_worktree::CloseoutHooks {
-    use bro_tools::fleet_worktree::{CloseoutHooks, HookOnFail};
+fn to_driver_hooks(w: &bro_protocol::CloseoutHooksWire) -> bro_worktree::CloseoutHooks {
+    use bro_worktree::{CloseoutHooks, HookOnFail};
     let on_fail = match w.on_fail.as_deref() {
         Some("block") => HookOnFail::Block,
         _ => HookOnFail::Warn,
@@ -512,7 +510,7 @@ mod tests {
     /// the keep/preflight/discard/publish/merge/adopt set returns 400 with a
     /// clear error body. This is the cheapest guard-level assertion - the
     /// other guards (unmanaged worktree, detached HEAD, branch prefix)
-    /// require git setup and are covered by the bro-tools unit tests.
+    /// require git setup and are covered by the bro-worktree unit tests.
     #[tokio::test]
     async fn control_closeout_rejects_unknown_disposition() {
         let tmp = tempfile::tempdir().unwrap();
@@ -734,7 +732,7 @@ mod tests {
                     orchestration::test_task(
                         "terminal",
                         orchestration::TaskStatus::Completed,
-                        Provider::Brodex,
+                        Provider::Codex,
                     ),
                 )
                 .expect("insert terminal");

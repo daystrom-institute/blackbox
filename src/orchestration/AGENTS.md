@@ -1,81 +1,18 @@
 # orchestration/ — providers, brofiles, dispatch/resume, atoms, supervision
 
 Domain home for the dispatch plane. Boundary contract:
-`design/bro-harness/harness-process-boundary.md`; RX-V1 trust model:
-`design/refactor-tools/rust/rust-isolate-surface.md` §2.4/§8.2.
+`design/orchestration/provider-lanes.md`.
 
-## Dispatch tool_defaults (operator-authority lane)
+## Native provider dispatch
 
-- **`tool_defaults` is the operator-authority delivery channel for harness
-  bindings** (RX-V1 `acknowledge_*` grants, gap-ead94671). Two lanes merge
-  over the ambient map at every dispatch/resume: the brofile's durable
-  `tool_defaults` (persona-bound, versioned) then per-dispatch
-  `ExecParams`/`ResumeParams.tool_defaults` (ad-hoc). Precedence is
-  ambient < brofile < per-dispatch; most specific wins on key conflict.
-- The merged map reaches the harness child verbatim via
-  `--additional-context` (harness ladder: explicit map > CLI JSON >
-  `BRO_HARNESS_TOOL_DEFAULTS` env). Bindings read it host-side via
-  `cx.tool_arg_defaults.lookup(tool, param)`; a cell-authored
-  `acknowledge_*` is a schema error by design.
-- **Resume restores the brofile from the session, not from the caller.**
-  `bro_resume` takes no brofile selector. The session's most recent task
-  that carries a `bro_label` names the brofile, and it re-resolves in that
-  task's working-directory scope. When it resolves to the same provider, the
-  resume gets its account, model, effort, persona, filters and tool defaults
-  again and the resumed task keeps the label. Code mode and service tier are
-  not re-sent: the harness saved them with the session, and only a per-resume
-  parameter overrides that. A session with an allocator
-  lease keeps the lease's lane and takes persona, filters and tool defaults
-  from the brofile. Any other outcome is one decision point
-  (`ResumeBrofile::unrestored`): the resume runs without the brofile's
-  policy and its result carries `brofile.notice`.
-- **Edit discipline is chosen at dispatch and owned by the session.**
-  `edit_discipline` (`free` or `structured`) resolves per-dispatch value,
-  then brofile value, then nothing, and reaches the harness as
-  `--edit-discipline` on a fresh dispatch only. Resume never passes it: the
-  harness saved it with the session, so a later brofile edit does not flip a
-  running session. The daemon refuses `structured` with a resolved
-  `code_mode: off` before spawning; enforcement of the discipline itself
-  lives in the harness. The harness binary must understand the flag before a
-  daemon that sends it is deployed.
-  A brofile's value is a default for callers that name none, not a boundary:
-  a per-dispatch `free` overrides it, as per-dispatch tool filters do. The
-  admin upsert route rewrites a brofile from a few fields. It carries the
-  existing tool filters and `edit_discipline` over and lists them under
-  `kept` in its response, because both are restrictions; the other fields it
-  does not name (tool defaults, surface, context, code mode) are still reset
-  by that route.
-- **A dispatch may name its own harness binary, and the session keeps it.**
-  `harness_bin` on `bro_exec` is accepted only on the `ops` surface and only
-  as an absolute path; it becomes the worker spec's `bin_override` ahead of
-  `BRO_HARNESS_BIN` and provider config, and is stored on the task
-  (`harnessBin` in status). Resume has no such parameter: it launches the
-  binary recorded on the newest task of the session that has one (a task
-  that failed before its worker started records none), from any surface. An
-  absolute path is run as given on the executing host, so a missing one
-  fails the task with `harness_bin_unavailable`; nothing falls back to the
-  configured binary while a task of the session still records the path.
-  The record lives in the task store (it survives a restart through the
-  persisted record); once every task of the session that recorded it has
-  been pruned, a resume launches the configured binary with no error. The surface check is on the pinned surface name, so the
-  surface table cannot widen it: configuration changes which tools `ops`
-  shows, never which sessions are `ops`. Like every ops-only tool, it is as
-  strong as the choice of surface: any client that can reach the daemon's
-  MCP endpoint can name `ops`.
-  Known gap: the allocator availability gate (`provider_binary_missing`)
-  probes the configured binary on the daemon host and does not know about a
-  named one, which lives on the executing host. A dispatch that goes through
-  the allocator on a host whose configured binary is missing finds no lane
-  even when `harness_bin` names a good binary; a dispatch that names its
-  provider and no allocation field does not consult the gate.
-- **Every new dispatch path must thread both lanes, not just the ambient
-  map.** The merge helper exists because the direct, workflow, agent, and
-  atom dispatch sites each grew the call separately; a new site that passes
-  only `ambient_ctx.tool_arg_defaults()` silently strips operator grants
-  (that is the hole that made every RX-V1 consumer refusal-only in live
-  dispatches until the channel landed).
-- `/control/exec` and `/control/resume` deserialize the same
-  `ExecParams`/`ResumeParams` as the MCP tools, including per-dispatch grants.
+Only the Claude CLI and Codex app-server lanes execute. Archived provider
+identities remain decodable but are refused by admission, re-adoption and both
+executors. Model tools, code cells, compaction and refactoring belong to the
+native provider. No daemon setting installs a custom model-turn runtime.
+
+Resume re-resolves the original brofile from the session's recorded label.
+Preserve its provider, account, model, effort, persona and tool restrictions.
+An unavailable or mismatched brofile produces an explicit notice.
 
 ## Task terminal state follows the worker
 
@@ -158,30 +95,14 @@ Domain home for the dispatch plane. Boundary contract:
   it, which clears the entry. Status shows `pending_steers` (count and the
   oldest one's age) while any remain. Subtyped user events never clear one.
 
-## Worker environment inheritance
+## Worker environment and binary ownership
 
-- A worker inherits the spawning process's environment minus the spec's
-  `env_unset`, then gets the spec env. `env_unset` is composed in one place
-  (`prepare_harness_child_launch`): the service variables plus
-  `WORKER_UNINHERITED_ENV_VARS`, the harness switches that must come only
-  from an explicit account or per-dispatch env
-  (`BRO_HARNESS_MCP_HTTP_LIFECYCLE`). Add a harness switch there when a
-  stray export in the daemon's or fleetd's environment must not change
-  every worker on the host.
-- A worker presents the daemon service bearer to its own MCP server when
-  the daemon has one (`daemon.service_token_file`): the header value is
-  `$env:BLACKBOX_MCP_BEARER` and the token rides the spec env, on the
-  scrub list like every spec key. External MCP servers get no such header.
+A worker inherits the spawning process environment minus the spec's explicit
+removals, then receives its scoped environment. Service credentials for daemon
+MCP travel in secret environment fields, never command-line arguments.
 
-## Allocator binary eligibility follows the executor boundary
-
-- Harness provider binaries are resolved on the host that actually spawns the
-  worker. `LocalExecutor` may use daemon-host PATH availability as allocator
-  eligibility; `FleetdExecutor` must not. Fleetd performs final login-shell
-  resolution against its own worker-host PATH, so a containerized daemon that
-  lacks `bro-harness` locally must still admit otherwise-eligible fleetd
-  lanes. The pseudo-provider `workflow` remains non-dispatchable in either
-  mode.
+The execution host resolves native provider binaries. Fleetd admission must not
+probe the daemon container's PATH as evidence of worker-host availability.
 
 ## HTTP control dispatches use the interactive MCP surface
 

@@ -58,8 +58,8 @@ impl TranscriptSource {
             // A dispatched Codex session log, distinct from the interactive
             // `codex` source the CLI's own session files belong to.
             Self::Harness(Provider::Codex) => "codex-dispatch",
-            Self::Harness(Provider::Brodex) => "brodex",
-            Self::Harness(Provider::VibeBh) => "vibebh",
+            Self::Harness(Provider::LegacyBrodex) => "brodex",
+            Self::Harness(Provider::LegacyVibeBh) => "vibebh",
             Self::Harness(Provider::Glm) => "glm",
             Self::Harness(Provider::Deepseek) => "deepseek",
             Self::Harness(Provider::Minimax) => "minimax",
@@ -99,9 +99,13 @@ impl<'de> Deserialize<'de> for TranscriptSource {
             "codex" => Ok(Self::Codex),
             "codex-dispatch" => Ok(Self::Harness(Provider::Codex)),
             "slack" => Ok(Self::Slack),
-            other => other.parse::<Provider>().map(Self::Harness).map_err(|_| {
-                serde::de::Error::custom(format!("unknown transcript source: {other}"))
-            }),
+            other => {
+                serde_json::from_value::<Provider>(serde_json::Value::String(other.to_string()))
+                    .map(Self::Harness)
+                    .map_err(|_| {
+                        serde::de::Error::custom(format!("unknown transcript source: {other}"))
+                    })
+            }
         }
     }
 }

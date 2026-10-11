@@ -1,18 +1,6 @@
-//! Typed dispatch-context payload: the `--dispatch-context <json>` boundary
-//! surface (design/bro-harness/dispatch-prompt-slots.md §4).
-//!
-//! The daemon owns CONTENT SELECTION: the persona resolved from the brofile
-//! and the pre-bound scope IDs. The harness owns COMPOSITION: where each
-//! ingredient lands per transport (system stable slot, marker-demarcated
-//! contextual user fragments, or the vibe-shaped leading system block). This
-//! DTO is the ingredients list that crosses that boundary: typed values,
-//! never composed prose.
-//!
-//! Parsing is deliberately strict (`deny_unknown_fields`, exact version
-//! match): the payload is daemon-authored, so garbage is a bug to surface,
-//! not input to tolerate. The allowances are the shapes older daemons and
-//! persisted harness side-state carry: a `pins` block and a `directives`
-//! array are accepted and dropped.
+//! Typed dispatch context containing persona and pre-bound scope IDs.
+//! Native provider adapters compose these ingredients into provider inputs.
+//! Version validation is strict; legacy pins and directives decode inertly.
 
 use serde::{Deserialize, Serialize};
 

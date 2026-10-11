@@ -27,7 +27,6 @@ use tokio::sync::{mpsc, oneshot};
 /// The default harness binary name, when neither the spec nor the environment
 /// names one. fleetd supervises harness workers only, so unlike the daemon's
 /// per-provider `Provider::bin()` there is no provider-keyed table here.
-pub const DEFAULT_HARNESS_BIN: &str = "bro-harness";
 
 /// Cap on the stderr snapshot returned with a terminal outcome. The daemon's
 /// `LocalExecutor` keeps the child's ENTIRE stderr because it hands it over an
@@ -128,12 +127,12 @@ pub fn dispatch_path_env() -> String {
 }
 
 /// The raw binary name for a spec, before path resolution: the spec's
-/// override, else `BRO_HARNESS_BIN`, else the default harness name.
+/// override, else the native provider binary selected by its lane.
 pub fn raw_bin_for(spec: &WorkerSpawnSpec) -> String {
     let (env, default) = match spec.provider.lane() {
         bro_core::ProviderLane::Codex => ("CODEX_BIN", "codex"),
         bro_core::ProviderLane::ClaudeCli => ("CLAUDE_BIN", "claude"),
-        _ => ("BRO_HARNESS_BIN", DEFAULT_HARNESS_BIN),
+        _ => return String::new(),
     };
     spec.bin_override
         .clone()
@@ -233,6 +232,11 @@ pub async fn ensure_absolute_bin_executable(bin: &str) -> anyhow::Result<()> {
 
 /// Spawn the worker described by `spec` and return its live lanes.
 pub async fn spawn_worker(spec: WorkerSpawnSpec) -> anyhow::Result<WorkerChild> {
+    anyhow::ensure!(
+        spec.provider.is_dispatchable(),
+        "provider {} is retired",
+        spec.provider.as_str()
+    );
     anyhow::ensure!(
         (spec.provider == bro_core::Provider::Codex) == spec.codex.is_some(),
         "Codex requires typed app-server settings"
@@ -531,29 +535,8 @@ mod tests {
     #[test]
     fn raw_bin_prefers_the_spec_override() {
         let mut spec = sample_spec();
-        spec.bin_override = Some("/opt/custom-harness".to_string());
-        assert_eq!(raw_bin_for(&spec), "/opt/custom-harness");
-    }
-
-    /// With no override or environment, use the provider lane executable.
-    #[test]
-    fn raw_bin_falls_back_to_the_default_name() {
-        let mut spec = sample_spec();
-        spec.bin_override = None;
-        for (provider, variable, expected) in [
-            (bro_core::Provider::Glm, "CLAUDE_BIN", "claude"),
-            (bro_core::Provider::Codex, "CODEX_BIN", "codex"),
-            (
-                bro_core::Provider::Brodex,
-                "BRO_HARNESS_BIN",
-                DEFAULT_HARNESS_BIN,
-            ),
-        ] {
-            spec.provider = provider;
-            if std::env::var(variable).is_err() {
-                assert_eq!(raw_bin_for(&spec), expected);
-            }
-        }
+        spec.bin_override = Some("/opt/custom-provider".to_string());
+        assert_eq!(raw_bin_for(&spec), "/opt/custom-provider");
     }
 
     async fn write_file(path: &std::path::Path, mode: u32) {
@@ -638,7 +621,7 @@ mod tests {
             .await
             .unwrap();
         // A bare name or relative path is resolved later, as before.
-        ensure_absolute_bin_executable("bro-harness").await.unwrap();
+        ensure_absolute_bin_executable("claude").await.unwrap();
         ensure_absolute_bin_executable("./relative/harness")
             .await
             .unwrap();
@@ -647,8 +630,8 @@ mod tests {
     #[test]
     fn resolve_bin_passes_through_explicit_paths() {
         assert_eq!(
-            resolve_bin("/opt/custom/bro-harness").as_deref(),
-            Some("/opt/custom/bro-harness")
+            resolve_bin("/opt/custom/claude").as_deref(),
+            Some("/opt/custom/claude")
         );
     }
 
@@ -668,7 +651,7 @@ mod tests {
     /// variable set by the spec reaches the child.
     #[tokio::test]
     async fn a_scrubbed_variable_reaches_the_child_only_through_the_spec_env() {
-        const VAR: &str = "BRO_HARNESS_MCP_HTTP_LIFECYCLE";
+        const VAR: &str = "BBOX_TEST_WORKER_SETTING";
         // SAFETY: nextest runs each test in its own process.
         unsafe { std::env::set_var(VAR, "inherited") };
         let seen_by_child = |env: std::collections::BTreeMap<String, String>| async move {
@@ -692,6 +675,27 @@ mod tests {
         );
         let explicit = [(VAR.to_string(), "auto".to_string())].into();
         assert_eq!(seen_by_child(explicit).await.as_deref(), Some("auto"));
+    }
+
+    #[tokio::test]
+    async fn retired_provider_cannot_launch_even_with_an_executable_override() {
+        let root = tempfile::tempdir().unwrap();
+        for provider in [
+            bro_core::Provider::LegacyBrodex,
+            bro_core::Provider::LegacyVibeBh,
+        ] {
+            let mut spec = sample_spec();
+            spec.provider = provider;
+            spec.bin_override = Some("/bin/sh".into());
+            spec.argv = vec!["-c".into(), "touch launched".into()];
+            spec.cwd = Some(root.path().to_string_lossy().into_owned());
+            let error = match spawn_worker(spec).await {
+                Err(error) => error,
+                Ok(_) => panic!("retired provider launched"),
+            };
+            assert!(error.to_string().contains("retired"));
+            assert!(!root.path().join("launched").exists());
+        }
     }
 
     fn sample_spec() -> WorkerSpawnSpec {

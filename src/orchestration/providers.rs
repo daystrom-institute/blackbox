@@ -6,9 +6,7 @@
 //! re-exports them and owns the *daemon-logic* surface: the `ProviderExec` /
 //! `ProviderEvents` / `ProviderMcp` / `ProviderSession` traits (impl'd for
 //! `Provider` in the submodules), whose bodies reach daemon-internal types.
-//! Bring them all into scope with one glob via [`dispatch_prelude`]. See
-//! `design/bro-harness/harness-process-boundary.md` (contract bottom +
-//! thin-client decoupling).
+//! Bring them all into scope with one glob via [`dispatch_prelude`].
 
 mod events;
 mod exec_args;
@@ -21,12 +19,11 @@ use bro_core::ProviderLane;
 pub use bro_core::{Capability, Provider};
 
 /// Whether the executor that owns the worker's stdout writes the session log.
-/// A vendor CLI lane's child keeps no log under `BRO_HOME`; the harness writes
-/// its own.
+/// Native CLI lanes rely on the supervisor; archived runtimes wrote their own.
 pub fn supervisor_writes_event_log(lane: ProviderLane) -> bool {
     match lane {
         ProviderLane::ClaudeCli | ProviderLane::Codex => true,
-        ProviderLane::Harness | ProviderLane::Workflow => false,
+        ProviderLane::Retired | ProviderLane::Workflow => false,
     }
 }
 
@@ -36,7 +33,7 @@ pub fn supervisor_writes_event_log(lane: ProviderLane) -> bool {
 pub fn closes_input_after_result(lane: ProviderLane) -> bool {
     match lane {
         ProviderLane::ClaudeCli | ProviderLane::Codex => true,
-        ProviderLane::Harness | ProviderLane::Workflow => false,
+        ProviderLane::Retired | ProviderLane::Workflow => false,
     }
 }
 
@@ -47,7 +44,7 @@ pub fn closes_input_after_result(lane: ProviderLane) -> bool {
 pub fn worker_assigns_session_id(lane: ProviderLane) -> bool {
     match lane {
         ProviderLane::Codex => true,
-        ProviderLane::ClaudeCli | ProviderLane::Harness | ProviderLane::Workflow => false,
+        ProviderLane::ClaudeCli | ProviderLane::Retired | ProviderLane::Workflow => false,
     }
 }
 

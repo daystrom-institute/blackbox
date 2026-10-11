@@ -64,7 +64,7 @@ try:
  providers=call('bro_providers',{'provider':'glm'}); models=providers['glm']['models']; assert any(m['id']=='glm-5.3-flash' for m in models); assert providers['glm']['defaultModel']=='glm-5.3'; assert isinstance(providers['glm']['peak_usage'],bool); print('Flash catalog and peak advisory PASS',flush=True)
  summaries=call('bro_providers',{})
  assert all(isinstance(summaries[p]['peak_usage'],bool) for p in ['glm','deepseek'])
- assert 'peak_usage' not in summaries['brodex']
+ assert 'peak_usage' not in summaries['codex']
  call('bro_dashboard',{})
  dispatch_args={'provider':'glm','prompt':'Synthetic peak advisory fixture','cwd':str(root),'request_key':'synthetic-peak-exec'}
  dispatched=call('bro_exec',dispatch_args)

@@ -4,7 +4,7 @@ Blackbox stores the evidence and execution state that agents need across
 sessions: indexed transcripts and project source, hybrid search, a typed graph,
 shared knowledge, work threads and bro execution across providers.
 
-Blackbox runs model turns through a standalone harness. Callers compose reviews,
+Blackbox supervises native Claude CLI and Codex app-server sessions. Callers compose reviews,
 gates, retries, schedules and integrations in their own code. The daemon keeps
 execution, resume, status, cancellation and waits.
 
@@ -15,9 +15,7 @@ execution, resume, status, cancellation and waits.
 | `blackboxd` | Long-lived HTTP MCP corpus and bro service, deployed as a container workload. |
 | `blackbox` | Offline administration and project-catalog tools. |
 | `bro` | Fleet terminal client and execution controls. |
-| `bro-harness` | Standalone model-turn runtime with native tools. |
-| `isolate` | Harness-native deterministic tools and code cells. |
-| `fleetd` | Per-machine fleet supervisor that owns harness workers. |
+| `fleetd` | Per-machine supervisor for native provider sessions. |
 | `bbox-code-collector` | Checkout-owner file publication. |
 | `bbox-transcript-collector` | Source-host native transcript publication. |
 | `bbox-file-collector` | Producer-host connector satellite for remote document stores. |
@@ -34,7 +32,7 @@ cargo nextest run --workspace
 
 The corpus daemon runs as one container workload built from the runtime image
 ([deploy/docker](deploy/docker/README.md)). Checkout hosts run only satellites:
-`fleetd`, `bro-harness`, `bro` and the source collectors, which stay on the
+`fleetd`, `bro` and the source collectors, which stay on the
 hosts that own files and transcripts. Install the offline administration CLI
 on maintenance hosts:
 
@@ -53,7 +51,7 @@ The build, verification and convergence contract is in
 The MCP endpoint is `/mcp`. Configure clients with the actual deployment URL and
 appropriate credentials. A supplied path identifies caller scope; it does not
 grant the remote daemon access to the caller's filesystem. Use collector-backed
-corpus refs for remote reads and native harness tools for file, shell and Git work.
+corpus refs for remote reads and native provider tools for file, shell and Git work.
 
 ## Using the surface
 
@@ -84,6 +82,6 @@ it is not a remaining session work budget or a reason to stop assigning work.
 [Bro runtime](docs/bro-runtime.md) covers execution primitives.
 [Artifact catalog](docs/artifact-catalog.md) describes installation and historical receipts.
 [MCP surfaces](docs/mcp-surfaces.md) covers agent-facing surfaces and operator tools.
-[Refactor tooling](docs/refactor.md) explains the harness boundary.
+[Source editing](docs/refactor.md) explains the provider boundary.
 [Retirement contract](design/orchestration/bro-execution-boundary-and-retirement.md)
 records the removal scope, verification and preserved ownership.

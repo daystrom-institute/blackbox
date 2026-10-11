@@ -29,7 +29,6 @@
 //! exactly one adapter indexes each file.
 
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 
 use serde_json::Value;
 
@@ -56,8 +55,8 @@ const HARNESS_PROVIDERS: &[Provider] = &[
     Provider::Minimax,
     Provider::Kimi,
     Provider::Codex,
-    Provider::Brodex,
-    Provider::VibeBh,
+    Provider::LegacyBrodex,
+    Provider::LegacyVibeBh,
 ];
 
 /// Resolve the harness sessions dir the way the harness itself does
@@ -136,13 +135,13 @@ impl SessionMeta {
     /// model inference, then the shared fallback.
     fn resolve_provider(&self) -> Provider {
         if let Some(p) = self.provider.as_deref()
-            && let Ok(provider) = Provider::from_str(p)
+            && let Ok(provider) = serde_json::from_value::<Provider>(Value::String(p.to_string()))
         {
             return provider;
         }
         match self.transport.as_deref() {
-            Some("openai-responses") => Provider::Brodex,
-            Some("openai-chat") => Provider::VibeBh,
+            Some("openai-responses") => Provider::LegacyBrodex,
+            Some("openai-chat") => Provider::LegacyVibeBh,
             _ => {
                 let model = self.model.as_deref().unwrap_or("").to_ascii_lowercase();
                 if model.starts_with("deepseek") {
@@ -512,7 +511,7 @@ mod tests {
         synthetic_session(&root, "sess-brodex", "brodex");
 
         let glm = HarnessSessionsAdapter::new(Provider::Glm, root.clone());
-        let brodex = HarnessSessionsAdapter::new(Provider::Brodex, root.clone());
+        let brodex = HarnessSessionsAdapter::new(Provider::LegacyBrodex, root.clone());
 
         let glm_locs = glm.scan_locations(TranscriptScanTarget::Sessions).unwrap();
         assert_eq!(glm_locs.len(), 1);
@@ -547,8 +546,11 @@ mod tests {
         // No provider stamp: transport decides for responses/chat; model
         // prefix decides on the anthropic transport.
         let cases = [
-            (json!({"transport": "openai-responses"}), Provider::Brodex),
-            (json!({"transport": "openai-chat"}), Provider::VibeBh),
+            (
+                json!({"transport": "openai-responses"}),
+                Provider::LegacyBrodex,
+            ),
+            (json!({"transport": "openai-chat"}), Provider::LegacyVibeBh),
             (
                 json!({"transport": "anthropic", "model": "deepseek-v4-pro"}),
                 Provider::Deepseek,

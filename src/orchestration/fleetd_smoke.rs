@@ -9,7 +9,7 @@
 /// like from fleetd's side. The second executor has to find the still-running
 /// child by itself.
 ///
-/// The child is a stub shell script, not `bro-harness`. What is under test is
+/// The child is a stub shell script, not a native provider CLI. What is under test is
 /// the socket contract, the supervision lifecycle, and the cursor; a stub
 /// emitting known envelope lines with known `seq` values makes every assertion
 /// exact instead of dependent on a provider round trip. It appends those same
@@ -30,7 +30,7 @@ mod smoke {
     use bro_protocol::{SecretEnv, WorkerSpawnSpec};
 
     use super::{FleetdConfig, FleetdExecutor};
-    use crate::orchestration::executor::HarnessExecutor;
+    use crate::orchestration::executor::WorkerExecutor;
 
     /// Every wait is bounded so a broken assumption fails the test instead of
     /// hanging the suite.
@@ -218,7 +218,7 @@ mod smoke {
         }
     }
 
-    /// A stub standing in for `bro-harness`: emit `lines` on stdout AND append them
+    /// A stub standing in for a native provider CLI: emit `lines` on stdout AND append them
     /// to the durable event log (which is what the real harness does and what
     /// fleetd replays from), then either exit or idle.
     fn write_stub(root: &Path, name: &str, lines: &[&str], log: &Path, then: &str) -> String {
@@ -968,11 +968,11 @@ mod smoke {
         );
     }
 
-    /// Keeps `Arc` in use for the `HarnessExecutor` object-safety assumption the
+    /// Keeps `Arc` in use for the `WorkerExecutor` object-safety assumption the
     /// daemon relies on: the installed executor is stored as `Arc<dyn ...>`.
     #[test]
     fn the_executor_is_object_safe() {
-        fn assert_object_safe(_: Arc<dyn HarnessExecutor>) {}
+        fn assert_object_safe(_: Arc<dyn WorkerExecutor>) {}
         let tmp = tempfile::tempdir().expect("tempdir");
         assert_object_safe(Arc::new(FleetdExecutor::new(FleetdConfig::in_state_dir(
             tmp.path(),

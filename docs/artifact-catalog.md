@@ -9,7 +9,7 @@ machine cannot be read by this remote tool.
 
 ```text
 bbox_artifact_list(kind="brofile")
-bbox_artifact_install(kind="brofile", artifact={"name":"reviewer","provider":"brodex","lens":"Review correctness and explain material findings."})
+bbox_artifact_install(kind="brofile", artifact={"name":"reviewer","provider":"codex","lens":"Review correctness and explain material findings."})
 ```
 
 List responses contain bounded summaries. Follow `next_offset`; request

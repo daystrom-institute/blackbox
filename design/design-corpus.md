@@ -23,9 +23,7 @@ describes behavior that matters for implementation, verify it against the code,
   navigation.
 - [Orchestration](orchestration/orchestration.md) - bro execution,
   supervision, phase decomposition, and runtime handoff.
-- [Bro-Harness](bro-harness/bro-harness.md) - the custom headless coding agent:
-  transports, tool surface, clipboard, tool chaining, hooks, diagnostics,
-  neuralyze. Daemon-independent by invariant.
+
 - [Task control plane](daemon-runtime/control-plane.md) - headless dispatch,
   task observation and managed-worktree closeout.
 - [Daemon Runtime](daemon-runtime/daemon-runtime.md) - blackboxd's execution

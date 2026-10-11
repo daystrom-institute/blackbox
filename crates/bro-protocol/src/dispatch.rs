@@ -13,7 +13,7 @@ pub const SERVICE_TIER_PRIORITY: &str = "priority";
 pub const SERVICE_TIER_DEFAULT: &str = "default";
 
 /// One of the discrete phases of the closeout sequence (mirrors
-/// `bro_tools::fleet_worktree::CloseoutPhase` — the daemon bridges).
+/// `bro_worktree::CloseoutPhase` - the daemon bridges).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CloseoutPhase {
@@ -40,7 +40,7 @@ pub enum CloseoutPhase {
 }
 
 /// Coarse classification of a phase failure. Mirrors
-/// `bro_tools::fleet_worktree::CloseoutErrorClass`.
+/// `bro_worktree::CloseoutErrorClass`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CloseoutErrorClass {

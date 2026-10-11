@@ -1,7 +1,7 @@
 # Blackbox project context
 
 Blackbox provides a corpus daemon, source collectors, and agent coordination CLIs.
-`blackboxd` and `bro-harness` are separate processes. Provider guidance is generated
+`blackboxd` delegates provider sessions to execution-host adapters. Provider guidance is generated
 from source knowledge; change the source and render it instead of editing generated
 instructions.
 

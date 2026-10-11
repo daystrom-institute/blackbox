@@ -1,6 +1,6 @@
 
 /// Acceptance tests for the dispatch plane: the tool handlers drive a real
-/// `fleetd` process, which spawns a stub child standing in for `bro-harness`.
+/// `fleetd` process, which spawns a stub child standing in for a native provider CLI.
 /// The stub records the argv and environment it was started with, so every
 /// assertion about routing is made on what the child actually received.
 #[cfg(test)]
@@ -14,7 +14,7 @@ mod acceptance {
 
     use super::smoke::{FleetdProcess, tool_text};
 
-    /// A stub standing in for `bro-harness`. It records what it was started
+    /// A stub standing in for a native provider CLI. It records what it was started
     /// with under `<root>/child-<pid>/` (argv, cwd, the provider it was told to
     /// be, the path it was run as, and environment variable names, never
     /// values), appends every stdin line it receives, and, when it was given
@@ -186,11 +186,7 @@ while True: time.sleep(1)
     }
 
     impl Plane {
-        async fn start() -> Self {
-            Self::start_with_executor(bbox_config::config::ExecutorKind::Fleetd).await
-        }
-
-        async fn start_with_executor(kind: bbox_config::config::ExecutorKind) -> Self {
+async fn start_with_executor(kind: bbox_config::config::ExecutorKind) -> Self {
             let tmp = tempfile::tempdir().expect("tempdir");
             let root = tmp.path().canonicalize().expect("canonical tempdir");
             let fleetd = FleetdProcess::start(&root.join("state")).await;
@@ -199,7 +195,6 @@ while True: time.sleep(1)
             let stub = write_recording_stub(&root);
             let mut env = crate::util::TestEnvGuard::new();
             env.remove("BLACKBOX_MCP_URL");
-            env.set("BRO_HARNESS_BIN", &stub);
             env.set("CLAUDE_BIN", &stub);
             let state = Arc::new(crate::server::state::SharedState::for_test(&store_dir));
             assert!(crate::orchestration::install_harness_executor_with_config(
@@ -234,6 +229,12 @@ while True: time.sleep(1)
                 _tmp: tmp,
             }
         }
+
+        async fn start() -> Self {
+            Self::start_with_executor(bbox_config::config::ExecutorKind::Fleetd).await
+        }
+
+
 
         fn cwd(&self) -> String {
             self.root.to_string_lossy().into_owned()
@@ -334,7 +335,7 @@ while True: time.sleep(1)
         let mut plane = Plane::start().await;
         let cwd = plane.cwd();
         let (task, session, child) = plane
-            .exec(json!({ "prompt": "first turn", "provider": "brodex", "cwd": cwd }))
+            .exec(json!({ "prompt": "first turn", "provider": "glm", "cwd": cwd }))
             .await;
         await_file(&child.join("stdin"), "first turn").await;
         assert_eq!(plane.status(&task)["status"], "running");
@@ -353,7 +354,7 @@ while True: time.sleep(1)
             .bro_resume(call(json!({
                 "prompt": "second turn",
                 "session_id": session,
-                "provider": "brodex",
+                "provider": "glm",
                 "cwd": cwd,
             })))
             .await;
@@ -538,71 +539,7 @@ while True: time.sleep(1)
         await_file(&second.join("signal"), "term").await;
     }
 
-    /// A turn that ends in an error result does not end the worker. The task
-    /// stays running, so the coordinator can steer it and cancel it, and the
-    /// cancelled session resumes as a new task on a new child.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_failed_turn_leaves_the_worker_steerable_cancellable_and_resumable() {
-        let mut plane = Plane::start().await;
-        let cwd = plane.cwd();
-        let (task, session, child) = plane
-            .exec(json!({ "prompt": "first turn", "provider": "brodex", "cwd": cwd }))
-            .await;
-        await_file(&child.join("stdin"), "first turn").await;
 
-        assert_eq!(plane.steer(&task, "TURN_FAIL")["status"], "steered");
-        let deadline = tokio::time::Instant::now() + super::smoke::DEADLINE;
-        loop {
-            let ingested = plane
-                .state
-                .task_store
-                .read()
-                .get(&task)
-                .expect("task")
-                .inner
-                .lock()
-                .stderr
-                .contains("stub turn failed");
-            if ingested {
-                break;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the failed turn never reached the task"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
-        assert_eq!(plane.status(&task)["status"], "running");
-
-        assert_eq!(plane.steer(&task, "after the failure")["status"], "steered");
-        await_file(&child.join("stdin"), "after the failure").await;
-
-        let cancelled = parsed(&plane.server.bro_cancel(call(json!({ "task_id": task }))));
-        assert_eq!(cancelled["status"], "cancelled", "{cancelled}");
-
-        let resumed = plane
-            .server
-            .bro_resume(call(json!({
-                "prompt": "continue",
-                "session_id": session,
-                "provider": "brodex",
-                "cwd": cwd,
-            })))
-            .await;
-        let resumed = parsed(&resumed);
-        let resumed_task = resumed["taskId"].as_str().expect("resume taskId").to_string();
-        assert_ne!(resumed_task, task);
-        await_file(&child.join("signal"), "term").await;
-        let second = plane.next_child().await;
-        await_file(&second.join("stdin"), "continue").await;
-        assert_eq!(
-            flag(&argv(&second), "--resume"),
-            Some(session.as_str()),
-            "the same session continues"
-        );
-        assert_eq!(plane.status(&resumed_task)["status"], "running");
-        assert_eq!(plane.status(&task)["status"], "cancelled");
-    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn control_routes_run_the_lifecycle_as_control_tasks() {
@@ -614,9 +551,9 @@ while True: time.sleep(1)
             axum::Json(
                 serde_json::from_value(json!({
                     "prompt": "control turn",
-                    "provider": "brodex",
+                    "provider": "glm",
                     "cwd": cwd,
-                    "tool_defaults": { "default:shell_run.timeout_ms": 30000 },
+
                 }))
                 .expect("exec body"),
             ),
@@ -628,11 +565,8 @@ while True: time.sleep(1)
         let child = plane.next_child().await;
         await_file(&child.join("stdin"), "control turn").await;
         assert_eq!(plane.origin(&task), bro_core::Origin::Control);
-        let context: Value = serde_json::from_str(
-            flag(&argv(&child), "--additional-context").expect("additional context"),
-        )
-        .expect("context json");
-        assert_eq!(context["default:shell_run.timeout_ms"], 30000);
+
+
 
         let waited = plane.finish(&task).await;
         assert_eq!(waited["status"], "completed", "{waited}");
@@ -643,7 +577,7 @@ while True: time.sleep(1)
                 serde_json::from_value(json!({
                     "prompt": "control follow-up",
                     "session_id": session,
-                    "provider": "brodex",
+                    "provider": "glm",
                     "cwd": cwd,
                 }))
                 .expect("resume body"),
@@ -664,11 +598,11 @@ while True: time.sleep(1)
         let mut plane = Plane::start().await;
         let cwd = plane.cwd();
         let (done, _, _) = plane
-            .exec(json!({ "prompt": "finishes", "provider": "brodex", "cwd": cwd }))
+            .exec(json!({ "prompt": "finishes", "provider": "glm", "cwd": cwd }))
             .await;
         assert_eq!(plane.finish(&done).await["status"], "completed");
         let (running, _, child) = plane
-            .exec(json!({ "prompt": "keeps running", "provider": "brodex", "cwd": cwd }))
+            .exec(json!({ "prompt": "keeps running", "provider": "glm", "cwd": cwd }))
             .await;
         await_file(&child.join("stdin"), "keeps running").await;
 
@@ -705,176 +639,9 @@ while True: time.sleep(1)
         assert_ne!(created.is_error, Some(true), "{}", tool_text(&created));
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn the_child_receives_its_routing_and_resume_keeps_the_brofile_lanes() {
-        let mut plane = Plane::start().await;
-        let cwd = plane.cwd();
-        create_brofile(
-            &plane,
-            json!({
-                "action": "set_account",
-                "name": "acceptance-account",
-                "env": { "ACCEPTANCE_ACCOUNT_MARKER": "synthetic" },
-            }),
-        )
-        .await;
-        create_brofile(
-            &plane,
-            json!({
-                "action": "create",
-                "name": "acceptance-bro",
-                "provider": "brodex",
-                "account": "acceptance-account",
-                "model": "glm-5.3-flash",
-                "effort": "high",
-                "code_mode": "only",
-                "edit_discipline": "structured",
-                "tool_defaults": {
-                    "default:file_read.max_lines": 111,
-                    "default:shell_run.timeout_ms": 1000,
-                },
-                "disallow_tools": ["glob"],
-            }),
-        )
-        .await;
 
-        let (task, session, child) = plane
-            .exec(json!({
-                "prompt": "routed turn",
-                "bro": "acceptance-bro",
-                "cwd": cwd,
-                "tool_defaults": {
-                    "default:shell_run.timeout_ms": 30000,
-                    "default:content_search.max_results": 7,
-                },
-                "disallow_tools": ["web_fetch"],
-            }))
-            .await;
-        await_file(&child.join("stdin"), "routed turn").await;
-        let first = argv(&child);
-        assert_eq!(flag(&first, "--cwd"), Some(cwd.as_str()), "{first:?}");
-        assert_eq!(read(&child, "cwd").trim(), cwd);
-        assert_eq!(flag(&first, "--model"), Some("glm-5.3-flash"), "{first:?}");
-        assert_eq!(flag(&first, "--effort"), Some("high"), "{first:?}");
-        assert_eq!(flag(&first, "--code-mode"), Some("only"), "{first:?}");
-        assert_eq!(flag(&first, "--edit-discipline"), Some("structured"), "{first:?}");
-        let context: Value =
-            serde_json::from_str(flag(&first, "--additional-context").expect("context"))
-                .expect("context json");
-        // ambient < brofile < per-dispatch, most specific wins on conflict.
-        assert_eq!(context["default:mcp.bbox_gap.project"], cwd, "{context}");
-        assert_eq!(context["default:file_read.max_lines"], 111, "{context}");
-        assert_eq!(context["default:shell_run.timeout_ms"], 30000, "{context}");
-        assert_eq!(context["default:content_search.max_results"], 7, "{context}");
-        let denied: Vec<&str> = flag(&first, "--deny-tools").expect("deny").split(',').collect();
-        assert!(denied.contains(&"glob"), "{denied:?}");
-        assert!(denied.contains(&"web_fetch"), "{denied:?}");
-        // The brofile's provider and account reach the child. Only the name
-        // of the account's variable is recorded, never its value.
-        assert_eq!(read(&child, "provider").trim(), "brodex");
-        assert!(
-            read(&child, "env-names")
-                .lines()
-                .any(|name| name == "ACCEPTANCE_ACCOUNT_MARKER")
-        );
-        assert_eq!(plane.finish(&task).await["status"], "completed");
 
-        // A raw provider dispatch names a different provider and carries no
-        // account environment.
-        let (plain, _, plain_child) = plane
-            .exec(json!({ "prompt": "plain turn", "provider": "vibebh", "cwd": cwd }))
-            .await;
-        await_file(&plain_child.join("stdin"), "plain turn").await;
-        assert_eq!(read(&plain_child, "provider").trim(), "vibebh");
-        assert!(
-            !read(&plain_child, "env-names")
-                .lines()
-                .any(|name| name == "ACCEPTANCE_ACCOUNT_MARKER")
-        );
-        assert_eq!(plane.finish(&plain).await["status"], "completed");
 
-        // Resume restores what the brofile owns. Per-dispatch defaults and
-        // filters applied to the first invocation only.
-        let resumed = plane
-            .server
-            .bro_resume(call(json!({
-                "prompt": "routed follow-up",
-                "session_id": session,
-                "provider": "brodex",
-                "cwd": cwd,
-            })))
-            .await;
-        let resumed = parsed(&resumed);
-        assert_eq!(
-            resumed["brofile"],
-            json!({ "name": "acceptance-bro", "restored": true }),
-            "{resumed}"
-        );
-        let resumed_task = resumed["taskId"].as_str().expect("resume taskId").to_string();
-        let second_child = plane.next_child().await;
-        await_file(&second_child.join("stdin"), "routed follow-up").await;
-        assert_brofile_lanes(&second_child, &session, &cwd);
-        let second = argv(&second_child);
-        let context: Value =
-            serde_json::from_str(flag(&second, "--additional-context").expect("context"))
-                .expect("context json");
-        assert_eq!(context["default:shell_run.timeout_ms"], 1000, "{context}");
-        assert!(context.get("default:content_search.max_results").is_none(), "{context}");
-        let denied: Vec<&str> = flag(&second, "--deny-tools").expect("deny").split(',').collect();
-        assert!(!denied.contains(&"web_fetch"), "{denied:?}");
-        assert_eq!(plane.finish(&resumed_task).await["status"], "completed");
-
-        // The resumed task names the brofile too, so a later resume of the
-        // same session restores it again.
-        let again = plane
-            .server
-            .bro_resume(call(json!({
-                "prompt": "third turn",
-                "session_id": session,
-                "provider": "brodex",
-                "cwd": cwd,
-            })))
-            .await;
-        let again = parsed(&again);
-        assert_eq!(again["brofile"]["restored"], true, "{again}");
-        let resumed_task = again["taskId"].as_str().expect("resume taskId").to_string();
-        let third_child = plane.next_child().await;
-        await_file(&third_child.join("stdin"), "third turn").await;
-        assert_brofile_lanes(&third_child, &session, &cwd);
-        assert_eq!(plane.finish(&resumed_task).await["status"], "completed");
-    }
-
-    /// A resumed child of the routed session carries everything the brofile
-    /// owns: model, effort, persona, deny filter, tool defaults and the
-    /// account environment.
-    fn assert_brofile_lanes(child: &Path, session: &str, cwd: &str) {
-        let argv = argv(child);
-        assert_eq!(flag(&argv, "--resume"), Some(session), "{argv:?}");
-        assert_eq!(flag(&argv, "--cwd"), Some(cwd), "{argv:?}");
-        assert_eq!(flag(&argv, "--model"), Some("glm-5.3-flash"), "{argv:?}");
-        assert_eq!(flag(&argv, "--effort"), Some("high"), "{argv:?}");
-        // Code mode and service tier stay with the session: the harness saved
-        // them, and passing either here would override that.
-        assert_eq!(flag(&argv, "--code-mode"), None, "{argv:?}");
-        assert_eq!(flag(&argv, "--service-tier"), None, "{argv:?}");
-        assert_eq!(flag(&argv, "--edit-discipline"), None, "{argv:?}");
-        let dispatch: Value =
-            serde_json::from_str(flag(&argv, "--dispatch-context").expect("dispatch context"))
-                .expect("dispatch context json");
-        assert_eq!(dispatch["scope"]["bro"], "acceptance-bro", "{dispatch}");
-        let context: Value =
-            serde_json::from_str(flag(&argv, "--additional-context").expect("context"))
-                .expect("context json");
-        assert_eq!(context["default:mcp.bbox_gap.project"], cwd, "{context}");
-        assert_eq!(context["default:file_read.max_lines"], 111, "{context}");
-        let denied: Vec<&str> = flag(&argv, "--deny-tools").expect("deny").split(',').collect();
-        assert!(denied.contains(&"glob"), "{denied:?}");
-        assert!(
-            read(child, "env-names")
-                .lines()
-                .any(|name| name == "ACCEPTANCE_ACCOUNT_MARKER")
-        );
-    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn resume_of_a_session_whose_brofile_is_gone_runs_bare_and_says_so() {
@@ -885,7 +652,7 @@ while True: time.sleep(1)
             json!({
                 "action": "create",
                 "name": "short-lived-bro",
-                "provider": "brodex",
+                "provider": "glm",
                 "model": "glm-5.3-flash",
                 "disallow_tools": ["glob"],
             }),
@@ -903,7 +670,7 @@ while True: time.sleep(1)
             .bro_resume(call(json!({
                 "prompt": "after the brofile was deleted",
                 "session_id": session,
-                "provider": "brodex",
+                "provider": "glm",
                 "cwd": cwd,
             })))
             .await;
@@ -918,13 +685,13 @@ while True: time.sleep(1)
         let second = plane.next_child().await;
         await_file(&second.join("stdin"), "after the brofile was deleted").await;
         let argv = argv(&second);
-        let denied: Vec<&str> = flag(&argv, "--deny-tools").expect("deny").split(',').collect();
+        let denied: Vec<&str> = flag(&argv, "--disallowedTools").expect("deny").split(',').collect();
         assert!(!denied.contains(&"glob"), "{denied:?}");
         assert_eq!(plane.finish(&resumed_task).await["status"], "completed");
 
         // A session that was never dispatched by name reports no brofile.
         let (plain, plain_session, plain_child) = plane
-            .exec(json!({ "prompt": "plain turn", "provider": "brodex", "cwd": cwd }))
+            .exec(json!({ "prompt": "plain turn", "provider": "glm", "cwd": cwd }))
             .await;
         await_file(&plain_child.join("stdin"), "plain turn").await;
         assert_eq!(plane.finish(&plain).await["status"], "completed");
@@ -933,7 +700,7 @@ while True: time.sleep(1)
             .bro_resume(call(json!({
                 "prompt": "plain follow-up",
                 "session_id": plain_session,
-                "provider": "brodex",
+                "provider": "glm",
                 "cwd": cwd,
             })))
             .await;
@@ -945,308 +712,11 @@ while True: time.sleep(1)
         assert_eq!(plane.finish(&resumed_task).await["status"], "completed");
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn an_absolute_harness_binary_that_is_missing_fails_the_dispatch_by_name() {
-        let plane = Plane::start().await;
-        let cwd = plane.cwd();
-        let missing = plane.root.join("no-such-harness");
-        // SAFETY: the plane holds the process-wide test environment guard for
-        // its whole lifetime, so no other test reads this variable meanwhile.
-        unsafe { std::env::set_var("BRO_HARNESS_BIN", &missing) };
 
-        let result = plane
-            .server
-            .bro_exec(call(json!({ "prompt": "never runs", "provider": "brodex", "cwd": cwd })))
-            .await;
-        let exec = parsed(&result);
-        let task = exec["taskId"].as_str().expect("taskId").to_string();
-        let waited = plane.wait(&task, 20.0).await;
-        assert_eq!(waited["status"], "failed", "{waited}");
-        let text = waited.to_string();
-        assert!(text.contains("harness_bin_unavailable"), "{text}");
-        assert!(text.contains("no-such-harness"), "{text}");
-        // Nothing ran in its place.
-        assert!(child_dirs(&plane.root).is_empty());
-    }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_shell_session_report_reaches_supervision_through_fleetd() {
-        let mut plane = Plane::start().await;
-        let cwd = plane.cwd();
-        let (task, _, child) = plane
-            .exec(json!({ "prompt": "first turn", "provider": "brodex", "cwd": cwd }))
-            .await;
-        await_file(&child.join("stdin"), "first turn").await;
-        // The stub answers with one report for its own session and one that
-        // names a different session.
-        plane.steer(&task, "REPORT_SHELLS");
-        let held = {
-            let deadline = tokio::time::Instant::now() + super::smoke::DEADLINE;
-            loop {
-                let observed = plane
-                    .state
-                    .task_store
-                    .read()
-                    .get(&task)
-                    .expect("task")
-                    .inner
-                    .lock()
-                    .supervision
-                    .shell_sessions
-                    .clone();
-                if let Some(observed) = observed {
-                    break observed;
-                }
-                assert!(
-                    tokio::time::Instant::now() < deadline,
-                    "the report never reached supervision"
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-            }
-        };
-        assert_eq!(held.seq, 5);
-        assert!(held.observed_this_run);
-        assert_eq!(held.sessions.len(), 1);
-        assert_eq!(held.sessions[0].command, "sleep 600");
-        assert!(held.sessions[0].running);
 
-        // The report naming another session is never observed: it carried a
-        // higher sequence and an empty set and would have replaced the real
-        // one. An envelope from a different session also fails the task, as
-        // any such envelope does.
-        let failed = plane.wait(&task, 20.0).await;
-        assert_eq!(failed["status"], "failed", "{failed}");
-        assert!(failed.to_string().contains("session fork detected"), "{failed}");
-        let after = plane
-            .state
-            .task_store
-            .read()
-            .get(&task)
-            .expect("task")
-            .inner
-            .lock()
-            .supervision
-            .shell_sessions
-            .clone()
-            .expect("observation kept");
-        assert_eq!((after.seq, after.sessions.len()), (5, 1));
-    }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn edit_discipline_reaches_a_fresh_child_and_is_refused_without_a_code_surface() {
-        let mut plane = Plane::start().await;
-        let cwd = plane.cwd();
-        create_brofile(
-            &plane,
-            json!({
-                "action": "create",
-                "name": "free-bro",
-                "provider": "brodex",
-                "edit_discipline": "free",
-            }),
-        )
-        .await;
 
-        // The per-dispatch value overrides the brofile's.
-        let (task, _, child) = plane
-            .exec(json!({
-                "prompt": "structured turn",
-                "bro": "free-bro",
-                "cwd": cwd,
-                "edit_discipline": "structured",
-            }))
-            .await;
-        await_file(&child.join("stdin"), "structured turn").await;
-        let overridden = argv(&child);
-        assert_eq!(
-            flag(&overridden, "--edit-discipline"),
-            Some("structured"),
-            "{overridden:?}"
-        );
-        assert_eq!(plane.finish(&task).await["status"], "completed");
 
-        // The brofile's value applies when the dispatch names none, and a raw
-        // provider dispatch that names none passes no flag at all.
-        let (task, _, child) = plane
-            .exec(json!({ "prompt": "brofile turn", "bro": "free-bro", "cwd": cwd }))
-            .await;
-        await_file(&child.join("stdin"), "brofile turn").await;
-        assert_eq!(flag(&argv(&child), "--edit-discipline"), Some("free"));
-        assert_eq!(plane.finish(&task).await["status"], "completed");
-        let (task, _, child) = plane
-            .exec(json!({ "prompt": "plain turn", "provider": "brodex", "cwd": cwd }))
-            .await;
-        await_file(&child.join("stdin"), "plain turn").await;
-        assert_eq!(flag(&argv(&child), "--edit-discipline"), None);
-        assert_eq!(plane.finish(&task).await["status"], "completed");
 
-        // A runtime-allocated lane rebuilds the dispatch options; the
-        // discipline is folded back on afterwards and still reaches the child.
-        let (task, _, child) = plane
-            .exec(json!({
-                "prompt": "allocated turn",
-                "pin_provider": "brodex",
-                "cwd": cwd,
-                "edit_discipline": "structured",
-            }))
-            .await;
-        await_file(&child.join("stdin"), "allocated turn").await;
-        let allocated = argv(&child);
-        assert_eq!(
-            flag(&allocated, "--edit-discipline"),
-            Some("structured"),
-            "{allocated:?}"
-        );
-        assert_eq!(plane.finish(&task).await["status"], "completed");
-
-        // Structured with a code mode that has no code surface spawns nothing.
-        let before = (plane.task_count(), child_dirs(&plane.root).len());
-        let refused = plane
-            .server
-            .bro_exec(call(json!({
-                "prompt": "must not start",
-                "provider": "brodex",
-                "cwd": cwd,
-                "edit_discipline": "structured",
-                "code_mode": "off",
-            })))
-            .await;
-        let text = tool_text(&refused);
-        assert_eq!(refused.is_error, Some(true), "{text}");
-        assert!(text.contains("edit_discipline 'structured'"), "{text}");
-        assert!(text.contains("code_mode 'off'"), "{text}");
-        assert_eq!((plane.task_count(), child_dirs(&plane.root).len()), before);
-
-        // A brofile cannot be saved in that combination either, and an unknown
-        // value is rejected at the tool boundary.
-        let invalid = plane
-            .server
-            .bro_brofile(call(json!({
-                "action": "create",
-                "name": "contradictory-bro",
-                "provider": "brodex",
-                "code_mode": "off",
-                "edit_discipline": "structured",
-            })))
-            .await;
-        assert_eq!(invalid.is_error, Some(true), "{}", tool_text(&invalid));
-        assert!(
-            serde_json::from_value::<crate::tools::bro_params::ExecParams>(json!({
-                "prompt": "x", "provider": "brodex", "edit_discipline": "strict",
-            }))
-            .is_err()
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_dispatch_selected_harness_binary_is_ops_only_and_kept_across_resume() {
-        let mut plane = Plane::start().await;
-        let cwd = plane.cwd();
-        let configured = plane.root.join("recording-harness.sh");
-        let selected = plane.root.join("selected-harness.sh");
-        std::fs::copy(&configured, &selected).expect("copy stub");
-        let ops = crate::server::BlackboxServer::new(plane.state.clone());
-        assert!(ops.surface.set(Arc::from("ops")).is_ok());
-
-        // Refused off the ops surface and as a relative path. Nothing is
-        // recorded or launched.
-        let refusals = [
-            (&plane.server, json!(selected), "only on the ops surface"),
-            (&ops, json!("selected-harness.sh"), "absolute path"),
-        ];
-        for (server, bin, expected) in refusals {
-            let result = server
-                .bro_exec(call(json!({
-                    "prompt": "never runs",
-                    "provider": "brodex",
-                    "cwd": cwd,
-                    "harness_bin": bin,
-                })))
-                .await;
-            let text = tool_text(&result);
-            assert_eq!(result.is_error, Some(true), "{text}");
-            assert!(text.contains(expected), "{text}");
-        }
-        // The control route runs on a handler that pinned no surface, so a
-        // request body naming a binary is refused there too.
-        let control = crate::server::control::control_exec_handler(
-            axum::extract::State(plane.state.clone()),
-            axum::Json(
-                serde_json::from_value(json!({
-                    "prompt": "never runs",
-                    "provider": "brodex",
-                    "cwd": cwd,
-                    "harness_bin": selected,
-                }))
-                .expect("exec body"),
-            ),
-        )
-        .await
-        .0;
-        let text = tool_text(&control);
-        assert_eq!(control.is_error, Some(true), "{text}");
-        assert!(text.contains("only on the ops surface"), "{text}");
-        assert_eq!(plane.task_count(), 0);
-        assert!(child_dirs(&plane.root).is_empty());
-
-        // On the ops surface the named binary runs instead of the configured
-        // one, and the task says which.
-        let result = ops
-            .bro_exec(call(json!({
-                "prompt": "first turn",
-                "provider": "brodex",
-                "cwd": cwd,
-                "harness_bin": selected,
-            })))
-            .await;
-        let exec = parsed(&result);
-        let task = exec["taskId"].as_str().expect("taskId").to_string();
-        let session = exec["sessionId"].as_str().expect("sessionId").to_string();
-        let child = plane.next_child().await;
-        await_file(&child.join("stdin"), "first turn").await;
-        let selected_text = selected.to_string_lossy().into_owned();
-        assert_eq!(read(&child, "bin").trim(), selected_text);
-        assert_eq!(plane.status(&task)["harnessBin"], json!(selected_text));
-        assert_eq!(plane.finish(&task).await["status"], "completed");
-
-        // A resume names no binary and comes from an ordinary surface; the
-        // session keeps the one it started with.
-        let resume = |prompt: &str| {
-            call(json!({
-                "prompt": prompt,
-                "session_id": session,
-                "provider": "brodex",
-                "cwd": cwd,
-            }))
-        };
-        let resumed = parsed(&plane.server.bro_resume(resume("second turn")).await);
-        let resumed_task = resumed["taskId"].as_str().expect("resume taskId").to_string();
-        let second = plane.next_child().await;
-        await_file(&second.join("stdin"), "second turn").await;
-        assert_eq!(read(&second, "bin").trim(), selected_text);
-        assert_eq!(plane.status(&resumed_task)["harnessBin"], json!(selected_text));
-        assert_eq!(plane.finish(&resumed_task).await["status"], "completed");
-
-        // Once the binary is gone the resume fails by name; the configured
-        // binary is never substituted, on that resume or the one after it.
-        std::fs::remove_file(&selected).expect("remove selected binary");
-        for prompt in ["third turn", "fourth turn"] {
-            let gone = parsed(&plane.server.bro_resume(resume(prompt)).await);
-            let gone_task = gone["taskId"].as_str().expect("resume taskId").to_string();
-            let waited = plane.wait(&gone_task, 20.0).await;
-            assert_eq!(waited["status"], "failed", "{waited}");
-            let text = waited.to_string();
-            assert!(text.contains("harness_bin_unavailable"), "{text}");
-            assert!(text.contains("selected-harness.sh"), "{text}");
-        }
-        assert_eq!(child_dirs(&plane.root).len(), 2);
-
-        // A dispatch that names no binary still runs the configured one.
-        let (task, _, child) = plane
-            .exec(json!({ "prompt": "plain turn", "provider": "brodex", "cwd": cwd }))
-            .await;
-        assert_eq!(read(&child, "bin").trim(), configured.to_string_lossy());
-        assert!(plane.status(&task).get("harnessBin").is_none());
-        assert_eq!(plane.finish(&task).await["status"], "completed");
-    }
 }

@@ -407,7 +407,7 @@ mod tests {
             workspace_id: Some(WorkspaceId::parse("0123456789abcdef0123456789abcdef").unwrap()),
             workspace_scope: Some(WorkerWorkspaceScope::try_new("repo-1", "services/api").unwrap()),
             provider: Provider::Glm,
-            bin_override: Some("bro-harness".to_string()),
+            bin_override: Some("claude".to_string()),
             argv: vec![
                 "--input-format".to_string(),
                 "stream-json".to_string(),

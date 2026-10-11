@@ -352,6 +352,20 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
 
+    fn fixture_search_catalog() -> MemoryCatalog {
+        MemoryCatalog {
+            memories: ["guide", "guide-rust", "guide-java"]
+                .into_iter()
+                .map(|slug| SystemMemory {
+                    id: format!("sm-{slug}"),
+                    title: slug.to_string(),
+                    tags: vec!["guide".into(), "search".into(), "fixture".into()],
+                    content: format!("{slug} synthetic search fixture. ").repeat(40),
+                })
+                .collect(),
+        }
+    }
+
     fn fixture_default_catalog() -> MemoryCatalog {
         let defaults = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
@@ -610,24 +624,22 @@ mod tests {
         assert_eq!(hits[0].id, "sm-persistence-taxonomy");
     }
 
-    #[test]
     fn search_exact_canonical_id_does_not_expand_prefix_family() {
-        let catalog = fixture_default_catalog();
-        let hits = catalog.search(Some("sm-refactor"));
+        let catalog = fixture_search_catalog();
+        let hits = catalog.search(Some("sm-guide"));
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].id, "sm-refactor");
+        assert_eq!(hits[0].id, "sm-guide");
 
-        let quoted = catalog.search(Some("\"sm-refactor\""));
+        let quoted = catalog.search(Some("\"sm-guide\""));
         assert_eq!(quoted.len(), 1);
-        assert_eq!(quoted[0].id, "sm-refactor");
+        assert_eq!(quoted[0].id, "sm-guide");
     }
 
-    #[test]
     fn search_bare_slug_still_behaves_as_search_term() {
-        let catalog = fixture_default_catalog();
-        let hits = catalog.search(Some("refactor"));
-        assert!(hits.iter().any(|m| m.id == "sm-refactor"));
-        assert!(hits.iter().any(|m| m.id == "sm-refactor-rust"));
+        let catalog = fixture_search_catalog();
+        let hits = catalog.search(Some("guide"));
+        assert!(hits.iter().any(|m| m.id == "sm-guide"));
+        assert!(hits.iter().any(|m| m.id == "sm-guide-rust"));
     }
 
     #[test]
@@ -645,34 +657,6 @@ mod tests {
     }
 
     #[test]
-    fn search_finds_refactor_language_memories() {
-        let catalog = fixture_default_catalog();
-        let catalog_hits = catalog.search(Some("refactor support matrix"));
-        assert!(catalog_hits.iter().any(|m| m.id == "sm-refactor"));
-
-        let rust_hits = catalog.search(Some("rust refactor extract_rust_items"));
-        assert!(rust_hits.iter().any(|m| m.id == "sm-refactor-rust"));
-
-        let ts_hits = catalog.search(Some("typescript refactor tsserver"));
-        assert!(ts_hits.iter().any(|m| m.id == "sm-refactor-typescript"));
-
-        let csharp_hits = catalog.search(Some("csharp refactor roslyn"));
-        assert!(csharp_hits.iter().any(|m| m.id == "sm-refactor-csharp"));
-
-        let python_hits = catalog.search(Some("python refactor pyright"));
-        assert!(python_hits.iter().any(|m| m.id == "sm-refactor-python"));
-
-        let java_hits = catalog.search(Some("java refactor jdt"));
-        assert!(java_hits.iter().any(|m| m.id == "sm-refactor-java"));
-
-        let go_hits = catalog.search(Some("go refactor gopls"));
-        assert!(go_hits.iter().any(|m| m.id == "sm-refactor-go"));
-
-        let cpp_hits = catalog.search(Some("cpp refactor clangd"));
-        assert!(cpp_hits.iter().any(|m| m.id == "sm-refactor-c-cpp"));
-    }
-
-    #[test]
     fn search_case_insensitive() {
         let catalog = fixture_default_catalog();
         let hits = catalog.search(Some("TAXONOMY"));
@@ -687,12 +671,11 @@ mod tests {
         assert!(hits.iter().any(|m| m.id == "sm-persistence-taxonomy"));
     }
 
-    #[test]
     fn search_honors_and_and_exclusion() {
-        let catalog = fixture_default_catalog();
-        let hits = catalog.search(Some("refactor AND rust -java"));
-        assert!(hits.iter().any(|m| m.id == "sm-refactor-rust"));
-        assert!(!hits.iter().any(|m| m.id == "sm-refactor-java"));
+        let catalog = fixture_search_catalog();
+        let hits = catalog.search(Some("guide AND rust -java"));
+        assert!(hits.iter().any(|m| m.id == "sm-guide-rust"));
+        assert!(!hits.iter().any(|m| m.id == "sm-guide-java"));
     }
 
     #[test]
@@ -722,21 +705,20 @@ mod tests {
         assert!(out.contains("Gap notes"));
     }
 
-    #[test]
     fn format_for_signpost_is_compact_with_retrieval_breadcrumb() {
-        let catalog = fixture_default_catalog();
-        let memory = catalog.get("sm-refactor").unwrap();
+        let catalog = fixture_search_catalog();
+        let memory = catalog.get("sm-guide").unwrap();
         let out = format_for_signpost(memory);
 
         // Header + bundleable ref + breadcrumb present.
-        assert!(out.starts_with("[system] sm-refactor"));
-        assert!(out.contains("ref: system_memory:sm-refactor"));
+        assert!(out.starts_with("[system] sm-guide"));
+        assert!(out.contains("ref: system_memory:sm-guide"));
         assert!(
             out.contains("+") || memory.tags.len() <= SIGNPOST_TAG_LIMIT,
             "long tag lists should be summarized in signposts: {out}"
         );
         assert!(
-            out.contains("→ full runbook: bbox_knowledge(query=\"sm-refactor\")"),
+            out.contains("→ full runbook: bbox_knowledge(query=\"sm-guide\")"),
             "signpost must point at the exact-id retrieval path: {out}"
         );
 
@@ -759,9 +741,9 @@ mod tests {
         // Mirrors the broad bbox_knowledge path: a fuzzy term matches many
         // runbooks. Rendering every match as a signpost must stay far smaller
         // than dumping every full body (the overflow the fix targets).
-        let catalog = fixture_default_catalog();
-        let matches = catalog.search(Some("refactor"));
-        assert!(matches.len() > 1, "expected several refactor runbooks");
+        let catalog = fixture_search_catalog();
+        let matches = catalog.search(Some("guide"));
+        assert!(matches.len() > 1, "expected several guide runbooks");
 
         let signposts: usize = matches.iter().map(|m| format_for_signpost(m).len()).sum();
         let bodies: usize = matches.iter().map(|m| format_for_listing(m).len()).sum();

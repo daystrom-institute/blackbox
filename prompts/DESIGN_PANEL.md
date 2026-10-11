@@ -47,14 +47,7 @@ The shape choice above assumes you can rank the pool ex ante (the
 prototype regime: one clearly dominant author). When you cannot, use the
 casting option below instead.
 
-Provider profile observed across runs (revisit as models move): brodex
-(gpt-5.6-sol, xhigh) is the strongest author, slowest and costliest,
-differentially right on hard design forks; deepseek (deepseek-v4-pro,
-xhigh) is fast and cheap, weak on verification as an author but sharp as
-a critic when forced to quote lines; glm (glm-5.2, xhigh) is the best
-balance and a reliable repair/consolidation executor. Kimi (k3 via the
-`claudew` review path) is the independent review bookend, never a
-participant. In the panel shape, pick the consolidation author per round
+In the panel shape, pick the consolidation author per round
 on merit (whose final position matched the adjudication and whose
 corrections held), never by habit.
 

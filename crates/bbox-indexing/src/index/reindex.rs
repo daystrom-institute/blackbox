@@ -1170,7 +1170,9 @@ mod tests {
             tool_call: None,
         };
         let raw = RawTranscriptRef::jsonl(
-            bbox_corpus_index::transcripts::types::TranscriptSource::Harness(Provider::Brodex),
+            bbox_corpus_index::transcripts::types::TranscriptSource::Harness(
+                Provider::LegacyBrodex,
+            ),
             TranscriptStorage::JsonlFile,
             "/tmp/session.jsonl",
             0,
@@ -1178,7 +1180,9 @@ mod tests {
             0,
         );
         let normalized = NormalizedTranscriptEvent::from_parsed_event(
-            bbox_corpus_index::transcripts::types::TranscriptSource::Harness(Provider::Brodex),
+            bbox_corpus_index::transcripts::types::TranscriptSource::Harness(
+                Provider::LegacyBrodex,
+            ),
             parsed,
             raw,
         );

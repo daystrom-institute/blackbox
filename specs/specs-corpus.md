@@ -55,15 +55,6 @@ and the vendor API as its sources.
 A **domain** is a coherent specification area. Its hub note doubles as the domain
 charter (the contracts in scope + the spec-author contract).
 
-- [Bro-Harness](bro-harness/bro-harness-spec.md) — the core headless agent: the
-  agent loop and the API transports (Anthropic Messages, OpenAI Responses,
-  openai-chat) plus the common stream-json output envelope. **First seeded
-  domain** — the canonicalization work already underway in
-  `design/bro-harness/` is the proof-of-concept this corpus formalizes.
-
-Candidate future domains (not yet seeded): mcp-surface (tool admission, deferred
-tiering), knowledge-render (memory lanes + render invariants), orchestration
-(dispatch, recursion guard, allocation).
 
 ## Conventions (corpus-wide)
 

@@ -20,7 +20,7 @@ pub mod git_transport_cutover;
 pub mod identity;
 pub mod json_store;
 pub mod language;
-pub mod lsp_config;
+
 pub mod project_catalog;
 pub mod project_catalog_snapshot;
 pub mod project_record;

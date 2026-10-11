@@ -26,8 +26,8 @@ pub struct Brofile {
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
-    /// Durable persona-bound tool argument defaults. Dispatch merges these
-    /// after ambient defaults and before the per-dispatch overrides.
+    /// Historical custom-runtime defaults retained for stored brofile decoding.
+    /// Native provider dispatch does not consume them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_defaults: Option<BTreeMap<String, serde_json::Value>>,
     /// Persona-bound tool filter overlay. Merges between project mcp.json
@@ -41,8 +41,7 @@ pub struct Brofile {
     /// head uses for `?surface=<id>` callers) into the dispatch filter plane,
     /// so a child session is surface-governed exactly like a wire caller. An
     /// unknown surface denies every tool. Unset → no surface fold
-    /// (recursion-guard + `filters` still apply). See
-    /// design/bro-harness/harness-process-boundary.md §3.
+    /// (recursion-guard + `filters` still apply).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub surface: Option<String>,
     /// Legacy stored flag, accepted for decoding but no longer injects instructions.
@@ -59,20 +58,8 @@ pub struct Brofile {
     /// context-producer fields are not part of v1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<BrofileContext>,
-    /// Optional code-mode selector (harness-backed providers). Sets the
-    /// authorial tool surface for sessions this brofile dispatches:
-    /// `off`/`optional`/`only`. Unset → harness default (`optional`). A
-    /// per-dispatch `ExecParams.code_mode` overrides this. See
-    /// `crate::orchestration::brofile::CodeMode`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub code_mode: Option<CodeMode>,
-    /// Optional edit discipline for sessions this brofile dispatches:
-    /// `free` or `structured`. Unset → `free`. A per-dispatch
-    /// `ExecParams.edit_discipline` overrides this, and a started session
-    /// keeps the value it was dispatched with.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub edit_discipline: Option<EditDiscipline>,
-    /// Optional provider service tier. For Brodex/OpenAI Responses, `priority`
+
+    /// Optional provider service tier. For Codex, `priority`
     /// is Codex `/fast`; `default` clears back to the backend default. A
     /// per-dispatch service-tier override wins over this brofile value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -156,82 +143,14 @@ impl ProviderDefaultsMode {
     }
 }
 
-/// Code-mode selector carried to the harness as `--code-mode`. Mirrors the
-/// harness-side `CodeMode` (Codex's `ToolMode`): `off` (flat tools only),
-/// `optional` (flat tools + `exec`/`wait`), `only` (`exec`/`wait` authorial
-/// surface, flat builtins hidden). When unset the harness applies its default
-/// (`optional`). Only harness-backed providers honor it.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum CodeMode {
-    Off,
-    #[default]
-    Optional,
-    Only,
-}
-
-/// Edit discipline carried to the harness as `--edit-discipline`. `free`
-/// leaves the session's tool surface as it is. `structured` refuses the raw
-/// edit tools (`file_edit`, `file_write`, `apply_patch`) everywhere a model
-/// can reach them and points at `edits.*`. Enforcement lives in the harness;
-/// the daemon only carries the choice and rejects it with a code mode that
-/// has no code surface.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum EditDiscipline {
-    #[default]
-    Free,
-    Structured,
-}
-
-impl EditDiscipline {
-    /// The `--edit-discipline` token / serde value.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            EditDiscipline::Free => "free",
-            EditDiscipline::Structured => "structured",
-        }
-    }
-
-    /// `structured` edits are made inside `exec` cells, so a session with no
-    /// code surface cannot hold it. `code_mode` is the resolved value when the
-    /// daemon knows one; the harness checks again against the session.
-    pub fn check_code_mode(self, code_mode: Option<CodeMode>) -> Result<(), String> {
-        if self == EditDiscipline::Structured && code_mode == Some(CodeMode::Off) {
-            return Err(
-                "edit_discipline 'structured' cannot be combined with code_mode 'off': \
-                 structured edits are made inside exec cells, which that code mode removes"
-                    .to_string(),
-            );
-        }
-        Ok(())
-    }
-}
-
-impl CodeMode {
-    /// The `--code-mode` token / serde value.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            CodeMode::Off => "off",
-            CodeMode::Optional => "optional",
-            CodeMode::Only => "only",
-        }
-    }
-}
-
 /// Whether `provider` can honor a non-`Default` `ProviderDefaultsMode`
-/// in v1. Only surviving harness providers advertise this; removed CLI-backed
-/// providers fail closed before environment or arg construction.
+/// through its native CLI. Retired providers fail closed before dispatch.
 pub fn provider_supports_defaults_suppression(provider: Provider) -> bool {
-    // The claude CLI honors `--system-prompt ""`; the harness honors the same
-    // flag on every transport. The codex app-server has no equivalent that
+    // The Claude CLI honors `--system-prompt ""`. The Codex app-server has no equivalent that
     // leaves its own tool instructions intact.
     match provider.lane() {
-        bro_core::ProviderLane::ClaudeCli | bro_core::ProviderLane::Harness => true,
+        bro_core::ProviderLane::ClaudeCli => true,
+        bro_core::ProviderLane::Retired => false,
         bro_core::ProviderLane::Codex | bro_core::ProviderLane::Workflow => false,
     }
 }
@@ -243,6 +162,9 @@ pub fn enforce_provider_defaults(
     provider: Provider,
     context: Option<&BrofileContext>,
 ) -> Result<(), String> {
+    if !provider.is_dispatchable() {
+        return Err(format!("provider {} is retired", provider.as_str()));
+    }
     let mode = context
         .and_then(|c| c.provider_defaults)
         .unwrap_or_default();
@@ -696,52 +618,6 @@ pub fn effective_account(
         .or_else(|| provider_default_account(provider, store_dir))
 }
 
-fn skipped_codex_home_entry(name: &std::ffi::OsStr) -> bool {
-    name == "AGENTS.md" || name == "AGENTS.override.md"
-}
-
-#[cfg(unix)]
-fn symlink_codex_home_entry(source: &Path, link: &Path) -> std::io::Result<()> {
-    std::os::unix::fs::symlink(source, link)
-}
-
-#[cfg(not(unix))]
-fn symlink_codex_home_entry(source: &Path, link: &Path) -> std::io::Result<()> {
-    if source.is_file() {
-        fs::copy(source, link).map(|_| ())
-    } else {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "Codex suppressed home overlays require symlink support for directories",
-        ))
-    }
-}
-
-fn prepare_codex_suppressed_home(base_home: &Path, store_dir: &Path) -> std::io::Result<PathBuf> {
-    let overlay = store_dir.join("generated").join(format!(
-        "codex-home-suppressed-{}",
-        uuid::Uuid::new_v4().simple()
-    ));
-    fs::create_dir_all(&overlay)?;
-
-    let entries = match fs::read_dir(base_home) {
-        Ok(entries) => entries,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(overlay),
-        Err(err) => return Err(err),
-    };
-
-    for entry in entries {
-        let entry = entry?;
-        let name = entry.file_name();
-        if skipped_codex_home_entry(&name) {
-            continue;
-        }
-        symlink_codex_home_entry(&entry.path(), &overlay.join(name))?;
-    }
-
-    Ok(overlay)
-}
-
 /// Child env for the claude-lane providers that ride a dedicated config dir
 /// (GLM, DeepSeek, MiniMax, Kimi). The `claude` CLI reads the endpoint,
 /// credentials and model slots from that dir's own `settings.json`, exactly as
@@ -754,70 +630,6 @@ fn claude_config_dir_env(provider: Provider, home_dir: &Path) -> Option<HashMap<
         "CLAUDE_CONFIG_DIR".to_string(),
         home_dir.join(rel_path).to_string_lossy().into_owned(),
     )]))
-}
-
-/// Harness env for the vibe-bh provider — Mistral on the OpenAI
-/// **chat-completions** transport. The base URL is fixed to the Mistral API and
-/// the reasoning profile selects the Mistral effort/thinking shaping; the key is
-/// lifted from `MISTRAL_API_KEY` in the process env, falling back to the
-/// operator's `~/.vibe/.env` (where the vibe CLI stores it). The chat-transport
-/// analogue of `default_claude_compatible_env`, and the credential-wiring
-/// template for future OpenAI-compatible chat endpoints.
-fn default_vibe_harness_env(
-    home_dir: &Path,
-    materialize_on_worker: bool,
-) -> HashMap<String, String> {
-    let mut env = HashMap::from([
-        (
-            "BRO_HARNESS_TRANSPORT".to_string(),
-            "openai-chat".to_string(),
-        ),
-        (
-            "BRO_HARNESS_CHAT_REASONING".to_string(),
-            "mistral".to_string(),
-        ),
-        (
-            "OPENAI_BASE_URL".to_string(),
-            "https://api.mistral.ai/v1".to_string(),
-        ),
-    ]);
-
-    if materialize_on_worker {
-        env.insert(
-            "BRO_HARNESS_LOCAL_DOTENV_FILE".to_string(),
-            home_dir.join(".vibe/.env").to_string_lossy().into_owned(),
-        );
-        return env;
-    }
-
-    if let Some(key) = std::env::var("MISTRAL_API_KEY")
-        .ok()
-        .filter(|k| !k.is_empty())
-        .or_else(|| read_vibe_env_key(home_dir, "MISTRAL_API_KEY"))
-    {
-        env.insert("OPENAI_API_KEY".to_string(), key);
-    }
-    env
-}
-
-/// Read a single `KEY=value` entry from `~/.vibe/.env` (the vibe CLI's dotenv).
-/// Tolerant of an `export ` prefix and surrounding quotes; returns None if the
-/// file or key is absent.
-fn read_vibe_env_key(home_dir: &Path, key: &str) -> Option<String> {
-    let body = std::fs::read_to_string(home_dir.join(".vibe").join(".env")).ok()?;
-    for raw in body.lines() {
-        let line = raw.trim();
-        let line = line.strip_prefix("export ").unwrap_or(line);
-        if let Some(rest) = line.strip_prefix(key)
-            && let Some(val) = rest.trim_start().strip_prefix('=')
-        {
-            let val = val.trim().trim_matches('"').trim_matches('\'');
-            if !val.is_empty() {
-                return Some(val.to_string());
-            }
-        }
-    }
-    None
 }
 
 fn normalized_account_suffix(name: &str) -> Option<String> {
@@ -862,7 +674,7 @@ fn synthesized_account_env_for_home(
     let (env_key, rel_path) = match provider {
         // The codex app-server and the harness's Responses transport both
         // read their ChatGPT login from `CODEX_HOME`.
-        Provider::Codex | Provider::Brodex => ("CODEX_HOME", format!(".codex{suffix}")),
+        Provider::Codex => ("CODEX_HOME", format!(".codex{suffix}")),
         // GLM/DeepSeek/MiniMax/Kimi inherit credentials from fixed
         // Claude-compatible config dirs; vibe-bh authenticates via
         // MISTRAL_API_KEY, not accounts.
@@ -870,7 +682,8 @@ fn synthesized_account_env_for_home(
         | Provider::Deepseek
         | Provider::Minimax
         | Provider::Kimi
-        | Provider::VibeBh
+        | Provider::LegacyBrodex
+        | Provider::LegacyVibeBh
         | Provider::Workflow => return None,
     };
 
@@ -913,18 +726,13 @@ fn resolve_provider_env_for_locality(
     account_name: Option<&str>,
     _model: Option<&str>,
     store_dir: &Path,
-    brofile_context: Option<&BrofileContext>,
+    _brofile_context: Option<&BrofileContext>,
     worker_locality: Option<&super::executor::WorkerLocality>,
 ) -> Option<HashMap<String, String>> {
     if !provider.is_dispatchable() {
         return None;
     }
     let account_name = effective_account(provider, account_name, store_dir);
-    let suppress_instructions = brofile_context
-        .and_then(|c| c.provider_defaults)
-        .map(ProviderDefaultsMode::suppresses)
-        .unwrap_or(false);
-    let materialize_on_worker = worker_locality.is_some();
     let execution_home = worker_locality
         .map(|locality| locality.home.clone())
         .or_else(dirs::home_dir);
@@ -938,20 +746,11 @@ fn resolve_provider_env_for_locality(
         // The codex lane needs no transport env: `CODEX_HOME` (or the
         // app-server's default `~/.codex`) carries credentials and config.
         Provider::Codex => HashMap::new(),
-        // Brodex rides the harness on the OpenAI Responses transport against
-        // the Codex/ChatGPT backend; CODEX_HOME (for OAuth) is supplied by the
-        // account-env synthesis below, defaulting to ~/.codex in the harness.
-        Provider::Brodex => HashMap::from([(
-            "BRO_HARNESS_TRANSPORT".to_string(),
-            "openai-responses".to_string(),
-        )]),
+        // Archived identities have no execution environment.
+        Provider::LegacyBrodex | Provider::LegacyVibeBh => HashMap::new(),
         // vibe-bh rides the harness on the OpenAI chat-completions transport
         // against the Mistral API; base URL + reasoning profile are fixed and
         // the key comes from MISTRAL_API_KEY (env / ~/.vibe/.env).
-        Provider::VibeBh => execution_home
-            .as_deref()
-            .map(|home| default_vibe_harness_env(home, materialize_on_worker))
-            .unwrap_or_default(),
         Provider::Workflow => HashMap::new(),
     };
 
@@ -962,7 +761,7 @@ fn resolve_provider_env_for_locality(
                 | Provider::Deepseek
                 | Provider::Minimax
                 | Provider::Kimi
-                | Provider::VibeBh
+                | Provider::LegacyVibeBh
         ) {
             if let Some(account_env) = execution_home
                 .as_deref()
@@ -976,41 +775,6 @@ fn resolve_provider_env_for_locality(
     if let Some(account_name) = account_name.as_deref() {
         if let Some(overrides) = load_account(account_name, store_dir).and_then(|a| a.env) {
             env.extend(overrides);
-        }
-    }
-
-    if provider == Provider::Brodex && suppress_instructions {
-        let base_home = env
-            .get("CODEX_HOME")
-            .map(PathBuf::from)
-            .or_else(|| execution_home.map(|home| home.join(".codex")));
-        if let Some(base_home) = base_home {
-            if materialize_on_worker {
-                env.insert(
-                    "CODEX_HOME".to_string(),
-                    base_home.to_string_lossy().into_owned(),
-                );
-                env.insert(
-                    "BRO_HARNESS_SUPPRESS_CODEX_INSTRUCTIONS".to_string(),
-                    "1".to_string(),
-                );
-            } else {
-                match prepare_codex_suppressed_home(&base_home, store_dir) {
-                    Ok(overlay) => {
-                        env.insert(
-                            "CODEX_HOME".to_string(),
-                            overlay.to_string_lossy().into_owned(),
-                        );
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            base_home = %base_home.display(),
-                            error = %err,
-                            "failed to prepare Codex suppressed home overlay"
-                        );
-                    }
-                }
-            }
         }
     }
 
@@ -1042,7 +806,7 @@ mod tests {
                             .insert(format!("synthetic-{i}"), Account::default());
                         if i == 0 {
                             config.provider_defaults.insert(
-                                Provider::Brodex,
+                                Provider::Codex,
                                 ProviderDefault {
                                     account: "synthetic-0".into(),
                                 },
@@ -1056,7 +820,7 @@ mod tests {
         let config = load_config(&root);
         assert_eq!(config.accounts.len(), 8);
         assert_eq!(
-            config.provider_defaults[&Provider::Brodex].account,
+            config.provider_defaults[&Provider::Codex].account,
             "synthetic-0"
         );
     }
@@ -1075,8 +839,8 @@ mod tests {
             }))
             .unwrap()
         };
-        let rows = vec![make("c", "brodex"), make("b", "glm"), make("a", "brodex")];
-        let first = list_summary_page(rows.clone(), Some(Provider::Brodex), None, 0, 1).unwrap();
+        let rows = vec![make("c", "codex"), make("b", "glm"), make("a", "codex")];
+        let first = list_summary_page(rows.clone(), Some(Provider::Codex), None, 0, 1).unwrap();
         assert_eq!(first["total"], 2);
         assert_eq!(first["brofiles"][0]["name"], "a");
         assert_eq!(first["next_offset"], 1);
@@ -1084,7 +848,7 @@ mod tests {
         for field in ["lens", "filters", "tool_defaults"] {
             assert!(first["brofiles"][0].get(field).is_none());
         }
-        let second = list_summary_page(rows.clone(), Some(Provider::Brodex), None, 1, 1).unwrap();
+        let second = list_summary_page(rows.clone(), Some(Provider::Codex), None, 1, 1).unwrap();
         assert_eq!(second["brofiles"][0]["name"], "c");
         assert!(second["next_offset"].is_null());
         let beyond = list_summary_page(rows.clone(), None, None, usize::MAX, 0).unwrap();
@@ -1129,8 +893,7 @@ mod tests {
             coerce_workspace: None,
             runtime: None,
             context: None,
-            code_mode: None,
-            edit_discipline: None,
+
             service_tier: None,
         };
         save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
@@ -1152,7 +915,7 @@ mod tests {
         let dir = temp_store();
         let bf = Brofile {
             name: "post-install-verification".into(),
-            provider: Provider::Brodex,
+            provider: Provider::Codex,
             account: None,
             lens: Some("test".into()),
             model: Some("gpt-5.5".into()),
@@ -1163,8 +926,7 @@ mod tests {
             coerce_workspace: None,
             runtime: None,
             context: None,
-            code_mode: None,
-            edit_discipline: None,
+
             service_tier: Some("priority".into()),
         };
         let written = save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
@@ -1196,15 +958,14 @@ mod tests {
             coerce_workspace: None,
             runtime: None,
             context: None,
-            code_mode: None,
-            edit_discipline: None,
+
             service_tier: None,
         };
         save_brofile(&global_bf, "global", store.path(), None).expect("brofile save");
 
         let project_bf = Brofile {
             name: "worker".into(),
-            provider: Provider::Brodex,
+            provider: Provider::Codex,
             account: None,
             lens: Some("project lens".into()),
             model: None,
@@ -1215,8 +976,7 @@ mod tests {
             coerce_workspace: None,
             runtime: None,
             context: None,
-            code_mode: None,
-            edit_discipline: None,
+
             service_tier: None,
         };
         save_brofile(
@@ -1233,7 +993,7 @@ mod tests {
             Some(project.path().to_str().unwrap()),
         );
         assert!(resolved.is_some());
-        assert_eq!(resolved.unwrap().provider, Provider::Brodex);
+        assert_eq!(resolved.unwrap().provider, Provider::Codex);
     }
 
     #[test]
@@ -1253,8 +1013,7 @@ mod tests {
                 coerce_workspace: None,
                 runtime: None,
                 context: None,
-                code_mode: None,
-                edit_discipline: None,
+
                 service_tier: None,
             };
             save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
@@ -1281,8 +1040,7 @@ mod tests {
             coerce_workspace: None,
             runtime: None,
             context: None,
-            code_mode: None,
-            edit_discipline: None,
+
             service_tier: None,
         };
         save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
@@ -1335,8 +1093,7 @@ mod tests {
             coerce_workspace: None,
             runtime: None,
             context: None,
-            code_mode: None,
-            edit_discipline: None,
+
             service_tier: None,
         };
         save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
@@ -1363,79 +1120,12 @@ mod tests {
             coerce_workspace: None,
             runtime: None,
             context: None,
-            code_mode: None,
-            edit_discipline: None,
+
             service_tier: None,
         };
         save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
         let loaded = resolve_brofile("readonly-persona", dir.path(), None).unwrap();
         assert_eq!(loaded.surface.as_deref(), Some("readonly"));
-    }
-
-    #[test]
-    fn java_refactor_persona_matches_design_spec() {
-        let src =
-            include_str!("../../system-defaults/brofiles/refactor/java-refactor-persona.json");
-        let bf: Brofile = serde_json::from_str(src).expect("java-refactor-persona parses");
-        assert_eq!(bf.name, "java-refactor-persona");
-        assert_eq!(bf.provider, Provider::Brodex);
-        assert_eq!(bf.model.as_deref(), Some("gpt-5.5"));
-        assert_eq!(bf.effort.as_deref(), Some("medium"));
-        assert_eq!(
-            bf.context.as_ref().and_then(|c| c.provider_defaults),
-            Some(ProviderDefaultsMode::SuppressWhenSupported)
-        );
-        let lens = bf.lens.as_deref().unwrap_or("");
-        assert!(lens.contains("in-box refactor bindings"));
-        assert!(
-            lens.contains("Lombok") || lens.contains("annotation"),
-            "Java lens should reference Java-specific caveats (Lombok / annotation processors)"
-        );
-
-        let f = bf.filters.expect("filters present");
-
-        let expected_allow: Vec<&str> = vec![
-            "mcp__blackbox__bbox_thread",
-            "mcp__blackbox__bbox_inspect_entity",
-            "mcp__blackbox__bbox_hybrid_search",
-            "Read",
-            "Grep",
-            "Glob",
-            "exec",
-            "wait",
-            "code.*",
-            "edits.*",
-            "java.*",
-            "analysis.*",
-            "lsp.*",
-        ];
-        let expected_disallow: Vec<&str> = vec![
-            "mcp__blackbox__bbox_forget",
-            "mcp__blackbox__bbox_learn",
-            "mcp__blackbox__bbox_render",
-            "mcp__blackbox__bro_*",
-            "Bash",
-            "Write",
-            "Edit",
-        ];
-
-        let allow_set: std::collections::BTreeSet<&str> =
-            f.allow.iter().map(String::as_str).collect();
-        let expected_allow_set: std::collections::BTreeSet<&str> =
-            expected_allow.iter().copied().collect();
-        assert_eq!(
-            allow_set, expected_allow_set,
-            "java-refactor-persona allow list drifted from design spec"
-        );
-
-        let disallow_set: std::collections::BTreeSet<&str> =
-            f.disallow.iter().map(String::as_str).collect();
-        let expected_disallow_set: std::collections::BTreeSet<&str> =
-            expected_disallow.iter().copied().collect();
-        assert_eq!(
-            disallow_set, expected_disallow_set,
-            "java-refactor-persona disallow list drifted from design spec"
-        );
     }
 
     #[test]
@@ -1506,27 +1196,11 @@ mod tests {
     }
 
     #[test]
-    fn refactor_atom_brofiles_suppress_provider_defaults() {
-        for (name, src) in [(
-            "java-refactor-persona",
-            include_str!("../../system-defaults/brofiles/refactor/java-refactor-persona.json"),
-        )] {
-            let bf: Brofile = serde_json::from_str(src)
-                .unwrap_or_else(|e| panic!("{name} brofile should parse: {e}"));
-            assert_eq!(
-                bf.context.as_ref().and_then(|c| c.provider_defaults),
-                Some(ProviderDefaultsMode::SuppressWhenSupported),
-                "{name} should suppress provider defaults for profile-backed atoms"
-            );
-        }
-    }
-
-    #[test]
     fn test_brofile_with_model_effort() {
         let dir = temp_store();
         let bf = Brofile {
             name: "fast".into(),
-            provider: Provider::Brodex,
+            provider: Provider::Codex,
             account: None,
             lens: None,
             model: Some("gpt-5.4-mini".into()),
@@ -1537,53 +1211,13 @@ mod tests {
             coerce_workspace: None,
             runtime: None,
             context: None,
-            code_mode: None,
-            edit_discipline: None,
+
             service_tier: None,
         };
         save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
         let loaded = resolve_brofile("fast", dir.path(), None).unwrap();
         assert_eq!(loaded.model.as_deref(), Some("gpt-5.4-mini"));
         assert_eq!(loaded.effort.as_deref(), Some("low"));
-    }
-
-    #[test]
-    fn test_brofile_code_mode_round_trip() {
-        let dir = temp_store();
-        let bf = Brofile {
-            name: "coder".into(),
-            provider: Provider::Glm,
-            account: None,
-            lens: None,
-            model: None,
-            effort: None,
-            tool_defaults: None,
-            filters: None,
-            surface: None,
-            coerce_workspace: None,
-            runtime: None,
-            context: None,
-            code_mode: Some(CodeMode::Only),
-            edit_discipline: None,
-            service_tier: Some("priority".into()),
-        };
-        save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
-        let loaded = resolve_brofile("coder", dir.path(), None).unwrap();
-        assert_eq!(loaded.code_mode, Some(CodeMode::Only));
-        assert_eq!(loaded.service_tier.as_deref(), Some("priority"));
-
-        // Absent in JSON ⇒ None (serde default), and the token is snake_case.
-        let json = r#"{"name":"plain","provider":"glm"}"#;
-        let plain: Brofile = serde_json::from_str(json).unwrap();
-        assert_eq!(plain.code_mode, None);
-        assert_eq!(plain.service_tier, None);
-        assert_eq!(CodeMode::Only.as_str(), "only");
-        let parsed: Brofile = serde_json::from_str(
-            r#"{"name":"x","provider":"glm","code_mode":"optional","service_tier":"priority"}"#,
-        )
-        .unwrap();
-        assert_eq!(parsed.code_mode, Some(CodeMode::Optional));
-        assert_eq!(parsed.service_tier.as_deref(), Some("priority"));
     }
 
     #[test]
@@ -1606,8 +1240,7 @@ mod tests {
             coerce_workspace: None,
             runtime: None,
             context: None,
-            code_mode: None,
-            edit_discipline: None,
+
             service_tier: None,
         };
         save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
@@ -1631,8 +1264,7 @@ mod tests {
             coerce_workspace: Some(true),
             runtime: None,
             context: None,
-            code_mode: None,
-            edit_discipline: None,
+
             service_tier: None,
         };
         save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
@@ -1652,8 +1284,7 @@ mod tests {
             coerce_workspace: None,
             runtime: None,
             context: None,
-            code_mode: None,
-            edit_discipline: None,
+
             service_tier: None,
         };
         save_brofile(&bf_off, "global", dir.path(), None).expect("brofile save");
@@ -1692,7 +1323,7 @@ mod tests {
     #[test]
     fn test_synthesized_account_env_for_codex_account_name() {
         let env = synthesized_account_env_for_home(
-            Provider::Brodex,
+            Provider::Codex,
             "account3",
             Path::new("/tmp/fake-home"),
         )
@@ -1823,24 +1454,6 @@ mod tests {
                 .get("CLAUDE_CONFIG_DIR")
                 .is_some_and(|path| path.ends_with("/.claude-zai"))
         );
-    }
-
-    #[test]
-    fn test_resolve_provider_env_defaults_glm_claude_config() {
-        let store = temp_store();
-        let home = temp_store();
-
-        let resolved = with_fake_home(home.path(), || {
-            resolve_provider_env(Provider::Glm, None, None, store.path(), None).unwrap()
-        });
-        // GLM rides the claude CLI against its own config dir; the daemon
-        // names the dir and lifts nothing out of it.
-        assert_eq!(
-            resolved.get("CLAUDE_CONFIG_DIR").map(String::as_str),
-            Some(home.path().join(".claude-zai").to_string_lossy().as_ref())
-        );
-        assert!(!resolved.contains_key("BRO_HARNESS_TRANSPORT"));
-        assert!(!resolved.contains_key("ANTHROPIC_AUTH_TOKEN"));
     }
 
     #[test]
@@ -1981,10 +1594,10 @@ mod tests {
         let ctx = BrofileContext {
             provider_defaults: Some(ProviderDefaultsMode::StrictSuppress),
         };
-        let err = enforce_provider_defaults(Provider::Workflow, Some(&ctx))
-            .expect_err("strict_suppress on workflow should fail closed");
+        let err = enforce_provider_defaults(Provider::Codex, Some(&ctx))
+            .expect_err("strict_suppress on Codex should fail closed");
         assert!(err.contains("error.provider_defaults_unsupported"));
-        assert!(err.contains("workflow"));
+        assert!(err.contains("codex"));
     }
 
     #[test]
@@ -1992,44 +1605,15 @@ mod tests {
         let ctx = BrofileContext {
             provider_defaults: Some(ProviderDefaultsMode::StrictSuppress),
         };
-        enforce_provider_defaults(Provider::Glm, Some(&ctx))
-            .expect("strict_suppress on Inception is honored");
-        enforce_provider_defaults(Provider::Glm, Some(&ctx))
-            .expect("strict_suppress on Claude is honored via --system-prompt override");
-        enforce_provider_defaults(Provider::Brodex, Some(&ctx))
-            .expect("strict_suppress on Codex is honored via config overrides");
-        enforce_provider_defaults(Provider::Minimax, Some(&ctx))
-            .expect("strict_suppress on MiniMax is honored via --system-prompt override");
-    }
-
-    #[test]
-    fn test_resolve_provider_env_codex_suppression_overlays_home_without_agents() {
-        let store = temp_store();
-        let home = temp_store();
-        let codex_home = home.path().join(".codex");
-        fs::create_dir_all(&codex_home).unwrap();
-        fs::write(codex_home.join("AGENTS.md"), "global instructions").unwrap();
-        fs::write(
-            codex_home.join("AGENTS.override.md"),
-            "override instructions",
-        )
-        .unwrap();
-        fs::write(codex_home.join("config.toml"), "model = \"gpt-5.4\"\n").unwrap();
-        fs::write(codex_home.join("auth.json"), "{}\n").unwrap();
-
-        let ctx = BrofileContext {
-            provider_defaults: Some(ProviderDefaultsMode::StrictSuppress),
-        };
-        let env = with_fake_home(home.path(), || {
-            resolve_provider_env(Provider::Brodex, None, None, store.path(), Some(&ctx)).unwrap()
-        });
-        let overlay = PathBuf::from(env.get("CODEX_HOME").unwrap());
-
-        assert_ne!(overlay, codex_home);
-        assert!(overlay.join("config.toml").exists());
-        assert!(overlay.join("auth.json").exists());
-        assert!(!overlay.join("AGENTS.md").exists());
-        assert!(!overlay.join("AGENTS.override.md").exists());
+        for provider in [
+            Provider::Glm,
+            Provider::Deepseek,
+            Provider::Minimax,
+            Provider::Kimi,
+        ] {
+            enforce_provider_defaults(provider, Some(&ctx))
+                .expect("native Claude CLI supports the system-prompt override");
+        }
     }
 
     #[test]
@@ -2039,138 +1623,5 @@ mod tests {
         };
         enforce_provider_defaults(Provider::Glm, Some(&ctx))
             .expect("suppress_when_supported is best-effort and never fails closed");
-    }
-
-    #[test]
-    fn test_resolve_provider_env_defaults_deepseek_claude_config() {
-        let store = temp_store();
-        let home = temp_store();
-
-        let resolved = with_fake_home(home.path(), || {
-            resolve_provider_env(Provider::Deepseek, None, None, store.path(), None).unwrap()
-        });
-        assert_eq!(
-            resolved.get("CLAUDE_CONFIG_DIR").map(String::as_str),
-            Some(home.path().join(".claude-ds").to_string_lossy().as_ref())
-        );
-        assert!(!resolved.contains_key("BRO_HARNESS_TRANSPORT"));
-    }
-
-    #[test]
-    fn test_resolve_provider_env_brodex_selects_responses_transport() {
-        let store = temp_store();
-        let home = temp_store();
-        let resolved = with_fake_home(home.path(), || {
-            resolve_provider_env(Provider::Brodex, None, None, store.path(), None).unwrap()
-        });
-        assert_eq!(
-            resolved.get("BRO_HARNESS_TRANSPORT").map(String::as_str),
-            Some("openai-responses")
-        );
-        // No OPENAI_API_KEY → harness uses Codex ChatGPT OAuth from CODEX_HOME.
-        assert!(!resolved.contains_key("OPENAI_API_KEY"));
-    }
-
-    #[test]
-    fn test_resolve_provider_env_vibebh_selects_chat_transport_and_mistral() {
-        let store = temp_store();
-        let home = temp_store();
-        let resolved = with_fake_home(home.path(), || {
-            // Isolate from any real MISTRAL_API_KEY in the process env so the
-            // ~/.vibe/.env fallback path is exercised deterministically.
-            let prior_key = std::env::var_os("MISTRAL_API_KEY");
-            unsafe {
-                std::env::remove_var("MISTRAL_API_KEY");
-            }
-            let vibe_dir = home.path().join(".vibe");
-            fs::create_dir_all(&vibe_dir).unwrap();
-            fs::write(
-                vibe_dir.join(".env"),
-                "MISTRAL_API_KEY=\"test-mistral-key\"\n",
-            )
-            .unwrap();
-
-            let resolved =
-                resolve_provider_env(Provider::VibeBh, None, None, store.path(), None).unwrap();
-
-            if let Some(value) = prior_key {
-                unsafe { std::env::set_var("MISTRAL_API_KEY", value) }
-            }
-            resolved
-        });
-        assert_eq!(
-            resolved.get("BRO_HARNESS_TRANSPORT").map(String::as_str),
-            Some("openai-chat")
-        );
-        assert_eq!(
-            resolved
-                .get("BRO_HARNESS_CHAT_REASONING")
-                .map(String::as_str),
-            Some("mistral")
-        );
-        assert_eq!(
-            resolved.get("OPENAI_BASE_URL").map(String::as_str),
-            Some("https://api.mistral.ai/v1")
-        );
-        // Key lifted from ~/.vibe/.env (quotes stripped).
-        assert_eq!(
-            resolved.get("OPENAI_API_KEY").map(String::as_str),
-            Some("test-mistral-key")
-        );
-    }
-
-    #[test]
-    fn remote_provider_state_is_materialized_from_worker_paths() {
-        let store = temp_store();
-        let worker = temp_store();
-        let worker_home = worker.path().canonicalize().unwrap();
-        let locality = super::super::executor::WorkerLocality {
-            home: worker_home.clone(),
-            bro_home: worker_home.join("state/bro"),
-        };
-
-        let glm = resolve_provider_env_for_locality(
-            Provider::Glm,
-            None,
-            None,
-            store.path(),
-            None,
-            Some(&locality),
-        )
-        .unwrap();
-        // The claude lane names the worker-local config dir; the CLI reads
-        // credentials from it, so nothing is lifted out of it.
-        assert_eq!(
-            glm.get("CLAUDE_CONFIG_DIR").map(String::as_str),
-            Some(worker_home.join(".claude-zai").to_string_lossy().as_ref())
-        );
-        assert!(!glm.contains_key("ANTHROPIC_AUTH_TOKEN"));
-        assert!(!glm.contains_key("BRO_HARNESS_TRANSPORT"));
-
-        let brodex = resolve_provider_env_for_locality(
-            Provider::Brodex,
-            None,
-            None,
-            store.path(),
-            Some(&BrofileContext {
-                provider_defaults: Some(ProviderDefaultsMode::SuppressWhenSupported),
-            }),
-            Some(&locality),
-        )
-        .unwrap();
-        assert_eq!(
-            brodex.get("CODEX_HOME").map(String::as_str),
-            Some(worker_home.join(".codex").to_string_lossy().as_ref())
-        );
-        assert_eq!(
-            brodex
-                .get("BRO_HARNESS_SUPPRESS_CODEX_INSTRUCTIONS")
-                .map(String::as_str),
-            Some("1")
-        );
-        assert!(
-            !store.path().join("generated").exists(),
-            "the off-host daemon must not build a symlink overlay from its own HOME"
-        );
     }
 }

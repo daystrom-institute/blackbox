@@ -318,7 +318,7 @@ mod tests {
             workspace_id: Some(WorkspaceId::parse("0123456789abcdef0123456789abcdef").unwrap()),
             workspace_scope: Some(WorkerWorkspaceScope::try_new("repo-1", ".").unwrap()),
             provider: bro_core::Provider::Glm,
-            bin_override: Some("bro-harness".to_string()),
+            bin_override: Some("claude".to_string()),
             argv: vec!["--daemon-worker".to_string()],
             cwd: Some("/repo/x".to_string()),
             env: Default::default(),
