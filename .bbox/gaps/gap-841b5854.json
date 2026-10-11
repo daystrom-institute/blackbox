@@ -15,10 +15,10 @@
   "blocking_level": "workaround_available",
   "dedupe_key": "refactor_primitive/isolate-analysis/structural-survey-shape-count",
   "notes": "Tier 1 per the toolbox gap map (§5). Fits the facts-vs-analysis two-tier philosophy exactly: a structural question answered as a Rust-side reduction. Entry activity for the entire campaign portfolio (dozens of concerns), so leverage is breadth, not depth on one concern.",
-  "resolution": "acknowledged",
+  "resolution": "addressed",
   "project_id": "89bd722f",
   "created_at": "2026-07-02T16:56:36Z",
-  "updated_at": "2026-09-23T22:33:23Z",
-  "resolved_at": "2026-09-23T22:33:23Z",
-  "resolution_note": "issue: https://github.com/daystrom-institute/blackbox/issues/21"
+  "updated_at": "2026-10-11T19:45:52Z",
+  "resolved_at": "2026-10-11T19:45:52Z",
+  "resolution_note": "Transferred to https://github.com/daystrom-institute/blackbox/issues/21, now the canonical implementation work item. Structural predicate counts with bounded exemplars remain unimplemented; existing reference counts and per-file query captures do not supply the requested reduction. Verified against accepted beta 93c2d391a8d6b8d2d760b88b1acdadbafc7a3ea4. Gap triage is complete; the GitHub issue remains open and this transfer does not claim the capability is implemented."
 }

@@ -14,11 +14,11 @@
   "blocking_level": "workaround_available",
   "dedupe_key": "refactor_primitive/java-refactor/discontiguous-region-extract-method",
   "notes": "Generic finding from a private UI-builder probe. The logical concern was spread across several non-adjacent blocks, while the current primitive accepts one contiguous block.",
-  "resolution": "acknowledged",
+  "resolution": "addressed",
   "project_id": "89bd722f",
   "thread_id": "thread-8d968b2d",
   "created_at": "2026-06-14T01:13:44Z",
-  "updated_at": "2026-09-23T23:33:35Z",
-  "resolved_at": "2026-09-23T23:33:35Z",
-  "resolution_note": "issue: https://github.com/daystrom-institute/blackbox/issues/25"
+  "updated_at": "2026-10-11T19:45:52Z",
+  "resolved_at": "2026-10-11T19:45:52Z",
+  "resolution_note": "Transferred to https://github.com/daystrom-institute/blackbox/issues/25, now the canonical implementation work item. Java extraction still accepts one contiguous oldText rather than multiple ordered ranges. The issue's dependency on statement-alignment and replacement-span work is now recorded as satisfied by #24 via #103, commit 66c476ee. Verified against accepted beta 93c2d391a8d6b8d2d760b88b1acdadbafc7a3ea4. Gap triage is complete; the GitHub issue remains open and this transfer does not claim the capability is implemented."
 }

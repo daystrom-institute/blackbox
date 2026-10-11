@@ -17,14 +17,14 @@
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/bro-harness/code-mode-only-file-edit-denial",
   "notes": "Generic finding from a private Java extraction reprobe. The prompt explicitly required all edits through edits.apply, but the bro still used direct file_edit to patch a helper signature after a compile failure.",
-  "resolution": "acknowledged",
+  "resolution": "addressed",
   "project_id": "89bd722f",
   "task_id": "703b8a8b-d38d-4eff-97aa-1e14551f2a05",
   "session_id": "9ac4e4b9-79bc-40ff-948e-c9b9e7f40e07",
   "provider": "deepseek",
   "thread_id": "thread-8d968b2d",
   "created_at": "2026-06-14T05:42:29Z",
-  "updated_at": "2026-09-24T00:04:29Z",
-  "resolved_at": "2026-09-24T00:04:29Z",
-  "resolution_note": "issue: https://github.com/daystrom-institute/blackbox/issues/31"
+  "updated_at": "2026-10-11T19:45:52Z",
+  "resolved_at": "2026-10-11T19:45:52Z",
+  "resolution_note": "Addressed by the opt-in structured edit discipline in commits f20275e2, bb663182, d3a32a4f, 85a60712, and acafba70, present in accepted beta 93c2d391a8d6b8d2d760b88b1acdadbafc7a3ea4. Raw edit builtins are refused across flat and cell paths, the discipline persists across resume, and dispatch/brofile/Fleet paths carry it. Existing regression coverage and the issue's recorded live dispatch/resume check support closure. code_mode=only remains a discovery setting and does not itself impose this opt-in policy. Tracking issue https://github.com/daystrom-institute/blackbox/issues/31 is closed as completed."
 }
