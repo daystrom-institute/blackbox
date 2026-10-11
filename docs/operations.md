@@ -361,7 +361,8 @@ project id, operator alias or registered path and must resolve, or the whole
 call is refused. Each row names a thread id and its `expected_project`, the
 `project_selector` value read from the list. A row is stamped only when it has
 no project id and its raw selector equals `expected_project`; the raw selector
-is kept, and a row that already carries a project id is never overwritten.
+and the row's last activity are kept, and a row that already carries a project
+id is never overwritten.
 `dry_run` defaults to true and writes nothing; the applied call persists the
 store and reindexes each stamped row. Every call requires an `audit_reason`.
 

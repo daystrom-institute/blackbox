@@ -615,8 +615,9 @@ impl Threads {
     /// Stamp `project_id` on the named rows that carry none. A row is stamped
     /// only when its `project_id` is absent and its raw `project` equals the
     /// row's `expected_project`; a row that already carries an id keeps it.
-    /// The raw `project` is left as stored, and `last_activity` moves as for
-    /// every other metadata mutation. A dry run reports the same outcomes and
+    /// The raw `project` and `last_activity` are left as stored: a re-key
+    /// repairs identity and is not thread activity, so it never reorders the
+    /// list or resets idle age. A dry run reports the same outcomes and
     /// changes nothing. Duplicate ids in one request are refused.
     pub fn rekey_project_ids(
         &mut self,
@@ -634,7 +635,6 @@ impl Threads {
                 anyhow::bail!("duplicate thread id in request: {}", row.id);
             }
         }
-        let now = Self::now_iso();
         let mut outcomes = Vec::with_capacity(rows.len());
         let mut changed = Vec::new();
         for row in rows {
@@ -658,7 +658,6 @@ impl Threads {
                     None if dry_run => ThreadRekeyOutcome::WouldRekey,
                     None => {
                         thread.project_id = Some(project_id.to_owned());
-                        thread.last_activity = now.clone();
                         enqueue_thread_embed(thread);
                         changed.push(thread.clone());
                         ThreadRekeyOutcome::Rekeyed
@@ -2879,7 +2878,10 @@ mod tests {
         let row = threads.thread_by_id(&stale).unwrap();
         assert_eq!(row.project_id.as_deref(), Some("p_alpha"));
         assert_eq!(row.project, "/work/alpha-gone", "raw project is kept");
-        assert_ne!(row.last_activity, "2026-01-01T00:00:00Z");
+        assert_eq!(
+            row.last_activity, "2026-01-01T00:00:00Z",
+            "a re-key is not thread activity"
+        );
         let original = before.iter().find(|t| t.id == stale).unwrap();
         assert_eq!(row.topic, original.topic);
         assert_eq!(row.status, original.status);
@@ -2986,6 +2988,12 @@ mod tests {
         };
         assert!(!list_ids(&threads.read(), &id_only).contains(&stale));
 
+        let activity = threads
+            .read()
+            .thread_by_id(&stale)
+            .unwrap()
+            .last_activity
+            .clone();
         let report = threads
             .write()
             .rekey_project_ids("p_alpha", &[rekey_row(&stale, "/work/alpha-gone")], false)
@@ -2997,6 +3005,10 @@ mod tests {
         let row = reopened.thread_by_id(&stale).unwrap();
         assert_eq!(row.project_id.as_deref(), Some("p_alpha"));
         assert_eq!(row.project, "/work/alpha-gone");
+        assert_eq!(
+            row.last_activity, activity,
+            "a re-key is not thread activity"
+        );
         // The id arm decides: the row matches a query whose path no longer
         // names its raw key, and a different id excludes it even though the
         // path would match.

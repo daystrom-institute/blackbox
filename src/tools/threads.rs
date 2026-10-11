@@ -1082,6 +1082,14 @@ mod tests {
             {"id": "thread-00000000", "expected_project": "/work/alpha-wt"},
         ]);
         assert!(!listed_ids(&server, &alpha).contains(&id));
+        let activity = server
+            .state
+            .threads
+            .read()
+            .thread_by_id(&id)
+            .unwrap()
+            .last_activity
+            .clone();
 
         let dry = server
             .bbox_thread_rekey(Parameters(rekey_params(
@@ -1132,6 +1140,10 @@ mod tests {
             .clone();
         assert_eq!(row.project_id.as_deref(), Some(project_id.as_str()));
         assert_eq!(row.project, "/work/alpha-wt");
+        assert_eq!(
+            row.last_activity, activity,
+            "a re-key is not thread activity"
+        );
         // The durable file agrees with the in-memory store.
         let reopened = crate::threads::Threads::open(&store_path).unwrap();
         assert_eq!(
