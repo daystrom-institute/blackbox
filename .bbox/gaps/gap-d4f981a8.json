@@ -18,10 +18,10 @@
   "impact": "high",
   "blocking_level": "workaround_available",
   "dedupe_key": "docs_runbook/git-transport-cutover/stale-covered-row-no-exit",
-  "resolution": "acknowledged",
+  "resolution": "addressed",
   "project_id": "89bd722f",
   "created_at": "2026-08-23T06:06:44Z",
-  "updated_at": "2026-09-23T22:04:30Z",
-  "resolved_at": "2026-09-23T22:04:30Z",
-  "resolution_note": "issue: https://github.com/daystrom-institute/blackbox/issues/18"
+  "updated_at": "2026-10-11T19:14:59Z",
+  "resolved_at": "2026-10-11T19:14:59Z",
+  "resolution_note": "Obviated by removal of the Git transport cutover and its coverage marker in commit da0d5bca. The stale covered-row state and its recovery cycle no longer exist. Existing tracking: https://github.com/daystrom-institute/blackbox/issues/18. Verified against accepted beta commit 93c2d391a8d6b8d2d760b88b1acdadbafc7a3ea4."
 }

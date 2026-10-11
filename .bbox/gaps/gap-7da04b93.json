@@ -18,11 +18,11 @@
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/edge-index/publish-tears-down-prior-view-no-stale-serving",
   "notes": "Sibling of gap-71db0a11 (deferral branch leaves the fence down). This one covers the admitted-rebuild branch: the fence is down for the whole rebuild plus any retry because the prior index was discarded at publish time.",
-  "resolution": "acknowledged",
+  "resolution": "addressed",
   "project_id": "89bd722f",
   "thread_id": "thread-f51d2132",
   "created_at": "2026-09-20T03:02:31Z",
-  "updated_at": "2026-09-24T02:04:27Z",
-  "resolved_at": "2026-09-24T02:04:27Z",
-  "resolution_note": "issue: https://github.com/daystrom-institute/blackbox/issues/44"
+  "updated_at": "2026-10-11T19:14:59Z",
+  "resolved_at": "2026-10-11T19:14:59Z",
+  "resolution_note": "Obviated by removal of the daemon's in-memory edge graph in commit 39475a94. The graph readiness fence, empty placeholder, and rebuild outage path no longer exist. Existing tracking: https://github.com/daystrom-institute/blackbox/issues/44. This resolution relies on removal of the affected mechanism, not on the parent issue's child-issue closure as proof of full stale-view delivery. Verified against accepted beta commit 93c2d391a8d6b8d2d760b88b1acdadbafc7a3ea4."
 }
