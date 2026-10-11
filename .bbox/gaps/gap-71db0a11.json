@@ -16,10 +16,10 @@
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/edge-index/nudge-deferral-leaves-readiness-fence-down",
   "notes": "Triage trace: the described mechanism does not reproduce from current code. Every fence-lowering publish (code_source.rs republish_code_read_view and activation sites, file_source_activation.rs) installs an empty EdgeIndex placeholder, so the watcher reads published_edge_count=0 and admits the nudged rebuild; the manifest change also flips sidecars_changed. The deferral branch only runs with the fence already up. The observed edge_index_warming stall is real but its root cause is unconfirmed. Covered together with gap-7da04b93 by one issue on readiness-fence semantics: consumers must recover after every publish within one rebuild.",
-  "resolution": "acknowledged",
+  "resolution": "addressed",
   "project_id": "89bd722f",
   "created_at": "2026-09-03T22:52:14Z",
-  "updated_at": "2026-09-24T02:04:28Z",
-  "resolved_at": "2026-09-24T02:04:28Z",
-  "resolution_note": "issue: https://github.com/daystrom-institute/blackbox/issues/44"
+  "updated_at": "2026-10-11T21:23:24Z",
+  "resolved_at": "2026-10-11T21:23:24Z",
+  "resolution_note": "Obsolete: deployed ancestor 39475a94 removed the daemon EdgeIndex, nudge-driven watcher and edge_index_ready fence. Current deployed code at 237007630ef5700a610550e0d3dabc610ad6f550 has no complete_code_read_view or edge_index_warming path. The permanent fence-down failure and its nudge edge limit no longer exist. GitHub issue #44 is closed; this resolution records retirement rather than claiming the original stale-view design shipped."
 }

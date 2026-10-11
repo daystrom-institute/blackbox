@@ -18,10 +18,10 @@
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/git-source-transport/upload-resume-mid-state-wedge",
   "notes": "Triage correction: terminal upload staging dirs are already reclaimed by expire_stale_uploads after 24h idle (added in 75bb4ac0), so the GC half of the original record does not hold. The multi-day wedge came from this loop combined with gap-a0acbe33 (every fresh upload failed finalize again). Paired with gap-a0acbe33 in one issue.",
-  "resolution": "acknowledged",
+  "resolution": "addressed",
   "project_id": "89bd722f",
   "created_at": "2026-08-23T06:14:17Z",
-  "updated_at": "2026-09-23T22:04:29Z",
-  "resolved_at": "2026-09-23T22:04:29Z",
-  "resolution_note": "issue: https://github.com/daystrom-institute/blackbox/issues/17"
+  "updated_at": "2026-10-11T21:23:24Z",
+  "resolved_at": "2026-10-11T21:23:24Z",
+  "resolution_note": "Addressed by GitHub issue #17 / PR #93, merged as 31e3df4b and included in deployed commit 237007630ef5700a610550e0d3dabc610ad6f550. BeginGitHistoryUploadResponseV1 carries persisted state. The collector skips manifest replay for MissingRecords and safely replays digest-checked pages for ReceivingManifest. Store and collector resume regressions cover both states and convergence."
 }

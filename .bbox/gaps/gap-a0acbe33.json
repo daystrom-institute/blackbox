@@ -17,10 +17,10 @@
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/git-source-transport/immutable-install-serialization-drift",
   "notes": "Triage correction: the original diagnosis (pretty vs compact serialization breaking a byte compare) does not match the code; install_immutable_json has compared deserialized values since it was added. The failing field is the per-install timestamp and lifecycle state in source.json. Paired with gap-9c91a9c0 in one issue.",
-  "resolution": "acknowledged",
+  "resolution": "addressed",
   "project_id": "89bd722f",
   "created_at": "2026-08-23T06:49:44Z",
-  "updated_at": "2026-09-23T22:04:29Z",
-  "resolved_at": "2026-09-23T22:04:29Z",
-  "resolution_note": "issue: https://github.com/daystrom-institute/blackbox/issues/17"
+  "updated_at": "2026-10-11T21:23:24Z",
+  "resolved_at": "2026-10-11T21:23:24Z",
+  "resolution_note": "Addressed by GitHub issue #17 / PR #93, merged as 31e3df4b and included in deployed commit 237007630ef5700a610550e0d3dabc610ad6f550. finalize_history_upload compares immutable generation identity, descriptor and manifest while preserving an existing source record across lifecycle states. refinalize_reuses_existing_generation_in_every_lifecycle_state and refinalize_refuses_immutable_conflicts cover reuse and conflict refusal."
 }
