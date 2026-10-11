@@ -15,10 +15,10 @@
   "impact": "medium",
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/checkout-mutations/delivered-writes-left-uncommitted",
-  "resolution": "acknowledged",
+  "resolution": "addressed",
   "project_id": "89bd722f",
   "created_at": "2026-09-23T21:06:21Z",
-  "updated_at": "2026-09-24T05:03:08Z",
-  "resolved_at": "2026-09-24T05:03:08Z",
-  "resolution_note": "issue: https://github.com/daystrom-institute/blackbox/issues/59"
+  "updated_at": "2026-10-11T19:33:25Z",
+  "resolved_at": "2026-10-11T19:33:25Z",
+  "resolution_note": "Transferred to https://github.com/daystrom-institute/blackbox/issues/59 as the canonical implementation work item. Delivered checkout writes still require a separate commit/push; opt-in automatic publication remains unimplemented. Gap triage is complete and the GitHub issue remains open."
 }
