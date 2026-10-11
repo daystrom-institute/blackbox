@@ -14,11 +14,11 @@
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/corpus-index/symbol-entities-unsearchable",
   "notes": "Narrowed 2026-08-18 after Batch C verification at HEAD 075a0077: partial fix (edge-projection resolution) confirmed landed; remainder restated above. Original broader text claimed symbols wholly invisible to inspect_entity, which is no longer true.",
-  "resolution": "acknowledged",
+  "resolution": "addressed",
   "project_id": "89bd722f",
   "thread_id": "thread-098387b3",
   "created_at": "2026-06-12T23:43:18Z",
-  "updated_at": "2026-09-24T01:04:09Z",
-  "resolved_at": "2026-09-24T01:04:09Z",
-  "resolution_note": "issue: https://github.com/daystrom-institute/blackbox/issues/42"
+  "updated_at": "2026-10-11T19:19:07Z",
+  "resolved_at": "2026-10-11T19:19:07Z",
+  "resolution_note": "Obviated by removal of the daemon edge graph in commit 39475a94 and removal of unbacked symbol resolution in e59ce1d6. The affected symbol entity retrieval design no longer has a live entity source. Existing tracking: https://github.com/daystrom-institute/blackbox/issues/42."
 }

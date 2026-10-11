@@ -15,12 +15,12 @@
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/edits/batch-create-files",
   "notes": "This probe only created one file, so it was not painful here; the resumed probe flagged it as a scaling issue for sweeps.",
-  "resolution": "acknowledged",
+  "resolution": "addressed",
   "project_id": "89bd722f",
   "session_id": "cb377cca-dc09-4487-91a1-1701cd691812",
   "thread_id": "thread-370679a5",
   "created_at": "2026-06-13T18:04:47Z",
-  "updated_at": "2026-09-24T00:33:20Z",
-  "resolved_at": "2026-09-24T00:33:20Z",
-  "resolution_note": "issue: https://github.com/daystrom-institute/blackbox/issues/36"
+  "updated_at": "2026-10-11T19:19:07Z",
+  "resolved_at": "2026-10-11T19:19:07Z",
+  "resolution_note": "Addressed by https://github.com/daystrom-institute/blackbox/issues/36 via PR #94, delivered in commit 7608d2bc. edits.createFiles queues a batch atomically with collision checks and bounded inputs. Regression coverage includes whole-batch refusal and concurrent overlapping batches."
 }

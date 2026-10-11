@@ -15,10 +15,10 @@
   "blocking_level": "workaround_available",
   "dedupe_key": "refactor_primitive/java-refactor/extract-method-preview-exact-replacement-span",
   "notes": "Generic finding from a private Java result-record probe. The transform eventually succeeded, but lack of an explicit pre-apply span/text preview caused avoidable oldText/apply retry cells.",
-  "resolution": "acknowledged",
+  "resolution": "addressed",
   "project_id": "89bd722f",
   "created_at": "2026-06-14T04:08:48Z",
-  "updated_at": "2026-09-23T23:33:34Z",
-  "resolved_at": "2026-09-23T23:33:34Z",
-  "resolution_note": "issue: https://github.com/daystrom-institute/blackbox/issues/24"
+  "updated_at": "2026-10-11T19:19:07Z",
+  "resolved_at": "2026-10-11T19:19:07Z",
+  "resolution_note": "Addressed by https://github.com/daystrom-institute/blackbox/issues/24 via PR #103, delivered in commit 66c476ee. Java extraction exposes its exact call-site replacement span in preview and normal results and refuses selections that are not statement-aligned. Regression coverage compares preview and applied replacement metadata."
 }
