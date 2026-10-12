@@ -541,7 +541,7 @@ mod harness {
          bridge parity tests under nextest, which isolates per process."
         );
         assert!(
-            crate::system_memory::get("sm-agentic-opening-sequence").is_none(),
+            crate::system_memory::get("sm-create-etiquette").is_none(),
             "the REAL system-memory catalog is live in this process, so the \
          published views would capture repo memories instead of the pinned \
          fixture pair."

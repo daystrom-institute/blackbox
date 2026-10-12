@@ -1,6 +1,6 @@
 # System defaults
 
-Blackbox ships optional brofiles and deferred system memories. Built-in
+Blackbox ships optional brofiles, agent skills and deferred system memories. Built-in
 MCP surfaces live in daemon configuration
 (`crates/bbox-config/src/default_surfaces.toml`, see
 [MCP surfaces](../docs/mcp-surfaces.md)). The daemon does not install this
@@ -16,7 +16,8 @@ rejected.
 | Path | Purpose |
 | --- | --- |
 | `brofiles/`, `agentic-corpus/brofiles/` | Role prompts for explicitly dispatched workers. |
-| `memories/` | Deferred runbooks, loaded by the daemon. |
+| `skills/` | Global agent skills, installed into provider homes by `scripts/sync-skills.sh`. See [agent skills](../docs/agent-skills.md). |
+| `memories/` | Deferred `sm-*` references, loaded by the daemon. |
 
 Bro orchestration keeps execution, resume, status and waits. The caller composes
 reviews, gates, schedules and external integrations. See [artifact catalog](../docs/artifact-catalog.md).

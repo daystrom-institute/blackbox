@@ -398,8 +398,8 @@ impl GapNote {
 pub struct GapFileParams {
     /// One-line summary of the missing capability.
     pub title: String,
-    /// One of: packet_ast, tooling, agent, workflow, refactor_primitive,
-    /// mcp_surface, ontology, eval_coverage, docs_runbook.
+    /// One of: tooling, agent, workflow, refactor_primitive, mcp_surface,
+    /// ontology, eval_coverage, docs_runbook.
     pub gap_kind: String,
     /// Subsystem / domain tag (free text), e.g. `review-policy`.
     pub domain: String,

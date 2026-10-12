@@ -8,6 +8,21 @@ out explicitly under `Changed` or `Removed`.
 
 ## Unreleased
 
+- Blackbox procedures ship as agent skills. Six global skills under
+  `system-defaults/skills/` (`bbox-onboard-project`, `bbox-bro-dispatch`,
+  `bbox-gap`, `bbox-health`, `bbox-recall`, `bbox-persist`) are installed into
+  Claude Code and Codex homes by `scripts/sync-skills.sh`; three project skills
+  under `.agents/skills/` (`bbox-install`, `bbox-dev-lanes`, `bbox-retro`) are
+  read from the checkout. See `docs/agent-skills.md`.
+
+  Removed: the system memories those skills replace
+  (`sm-agentic-opening-sequence`, `sm-transcript-retrieval`,
+  `sm-bro-dispatch-patterns`, `sm-brofile-context`, `sm-gap-notes`,
+  `sm-persistence-taxonomy`, `sm-render-lifecycle`), the
+  `prompts/RETRO_INTERACTIVE.md` prompt and the `examples/skills/` prompts.
+  Tool guidance names the skill where it named a runbook id. Run
+  `scripts/sync-skills.sh` on each agent host after upgrading.
+
 - The `/mcp` and `/control/*` planes can admit OAuth access tokens beside the
   service bearer. `[daemon.mcp_oauth]` (`issuer`, `audience`,
   `required_group`, optional `jwks_uri`; `BBOX_MCP_OAUTH_ISSUER`,

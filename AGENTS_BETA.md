@@ -33,8 +33,8 @@ Use this sequence before codebase, design, history, or coordination claims:
    `bbox_inspect_entity` to confirm properties and provenance before making
    provenance-sensitive claims. Pass returned entity refs directly; do not
    reconstruct them from memory. Use `property_mode="summary"` when inspecting
-   broad tool/knowledge refs or other long entities. The detailed question-shape runbook is
-   `sm-agentic-opening-sequence`; pull it only when the injected tool guidance is
+   broad tool/knowledge refs or other long entities. The detailed question-shape procedure is
+   the `bbox-recall` skill; use it when the injected tool guidance is
    insufficient for the question shape. For fresh probe/retro evidence, if
    hybrid search returns only generic seeds, no results, or a degraded
    BM25-only/vector-warming notice, pivot to `bbox_gaps` with exact

@@ -33,6 +33,7 @@ The main operator binaries are:
 | [Refactor Tools](refactor.md) | Harness-native structural refactor tooling |
 | [Bro Runtime](bro-runtime.md) | Direct dispatch, resume, wait, brofiles, and provider runtime controls |
 | [Knowledge Store](knowledge-store.md) | Learn, forget, render, and thread notes |
+| [Agent Skills](agent-skills.md) | The `bbox-*` procedure skills, where they live, and how to install them |
 | [Design Graph](design-graph.md) | Operate this repo's `design` project graph: verbs, authority, reads, state blocks |
 | [Transcript Retrieval](transcript-retrieval.md) | Search, context, sessions, messages, and freshness checks |
 | [Projects And Code Indexing](projects-code-indexing.md) | Project registration, `.bbox`, code navigation, reindex, and reembed |

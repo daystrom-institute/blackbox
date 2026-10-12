@@ -5,7 +5,7 @@
 //!
 //! On startup, `sync_into_knowledge` publishes a compact inline bootstrap and
 //! topic-scoped satellite entries. `TOOL_DOCS` is the source for both detailed
-//! guidance and tool discovery. Deep runbooks remain available through memory.
+//! guidance and tool discovery. Multi-step procedures live in the `bbox-*` skills.
 //!
 //! Adding or changing a tool = one edit here. No hand-curated drift.
 
@@ -75,13 +75,13 @@ impl ToolCategory {
                 "Track non-dispatchable work that spans sessions (investigations, QC walks, debugging, refinement loops). Lighter than the full dispatch pipeline, heavier than memory. Use `kind=work_item` for orchestrator-led propose→execute→review→refine loops."
             }
             Self::Gaps => {
-                "First-class substrate gap-note store. File a gap when the blocker is in the blackbox substrate or shared agent workflow — a missing tool primitive, MCP surface, refactor atom, workflow shape, ontology edge, or runbook that agents in other projects could plausibly hit too — not in the current product codebase. Project-scoped gaps are repo-owned (committed under `<project>/.bbox/gaps/`, travel with the checkout); cross-project substrate gaps go to the central host store with `scope=\"global\"`. `bbox_gap` files (typed, validated, deduped by `dedupe_key`), `bbox_gaps` filters by typed fields, `bbox_gap_resolve` closes out (with structured supersession), `bbox_gap_update` edits in place. See `sm-gap-notes` via `bbox_knowledge` for the full envelope, vocabularies, and lifecycle."
+                "First-class substrate gap-note store. File a gap when the blocker is in the blackbox substrate or shared agent workflow (a missing tool primitive, MCP surface, refactor atom, workflow shape, ontology edge, or runbook that agents in other projects could plausibly hit too), not in the current product codebase. Project-scoped gaps are repo-owned (committed under `<project>/.bbox/gaps/`, travel with the checkout); cross-project substrate gaps go to the central host store with `scope=\"global\"`. `bbox_gap` files (typed, validated, deduped by `dedupe_key`), `bbox_gaps` filters by typed fields, `bbox_gap_resolve` closes out (with structured supersession), `bbox_gap_update` edits in place. The `bbox-gap` skill carries the filing procedure, vocabularies, and lifecycle."
             }
             Self::Artifacts => {
                 "Versioned catalog for brofiles. Supply artifact JSON inline or by HTTP(S) URL. Explicit retired-kind filters retrieve historical receipts. Operator tools, served on the `ops` surface: `bro mcp call <tool> '<json>' --surface ops`."
             }
             Self::Orchestration => {
-                "Dispatch agents across the providers listed by bro_providers. Prefer named `bro` targeting (a brofile name resolves provider, account, lens and context) over raw provider. Core pattern: `bro_exec` to launch, `bro_wait` or `bro_when_all` to block, `bro_resume` for follow-ups (never `bro_exec` again: it starts fresh with no memory). For ensembles: several `bro_exec` calls + `bro_when_all` (blind deliberation) or `bro_when_any` (race). For provider-default suppression and minimal probe context, pull `sm-brofile-context` via `bbox_knowledge`."
+                "Dispatch agents across the providers listed by bro_providers. Prefer named `bro` targeting (a brofile name resolves provider, account, lens and context) over raw provider. Core pattern: `bro_exec` to launch, `bro_wait` or `bro_when_all` to block, `bro_resume` for follow-ups (never `bro_exec` again: it starts fresh with no memory). For ensembles: several `bro_exec` calls + `bro_when_all` (blind deliberation) or `bro_when_any` (race). The `bbox-bro-dispatch` skill carries the dispatch procedure, including provider-default suppression and minimal probe context."
             }
             Self::StorageHealth => {
                 "Read-only storage inventory for edge sidecar hygiene. Operator tools, served on the `ops` surface: `bro mcp call <tool> '<json>' --surface ops`."
@@ -93,11 +93,13 @@ impl ToolCategory {
     }
 }
 
-fn deferred_system_memory(category: ToolCategory) -> Option<&'static str> {
+/// The skill that carries a category's procedure. A category named here is
+/// deferred in the hot render: its pointer replaces its tool stanzas.
+fn deferred_skill(category: ToolCategory) -> Option<&'static str> {
     match category {
-        ToolCategory::Gaps => Some("sm-gap-notes"),
-        ToolCategory::Orchestration => Some("sm-bro-dispatch-patterns"),
-        ToolCategory::ProjectGraphs => Some("sm-agentic-opening-sequence"),
+        ToolCategory::Gaps => Some("bbox-gap"),
+        ToolCategory::Orchestration => Some("bbox-bro-dispatch"),
+        ToolCategory::ProjectGraphs => Some("bbox-recall"),
         _ => None,
     }
 }
@@ -127,7 +129,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_hybrid_search",
         category: ToolCategory::Graph,
         summary: "Search the corpus (transcripts, code, docs, commits, knowledge, threads, graph vertices) with BM25 and vectors. Filter conversations by role, account, source, author or channel; mode=fulltext takes raw Tantivy/Lucene syntax. Conversation hits carry read coordinates for bbox_context and bbox_messages. Use debug for ranking diagnostics.",
-        when_to_use: "Step 2 of the agentic opening sequence (`sm-agentic-opening-sequence`). Use as the default search for any topical question, including prior conversations. Pass `project=$cwd` (or a registered project_id) when querying about your local repo to avoid cross-project keyword pollution. Trust topical hits: top seed is canonical for the query even when wording doesn't exactly match (vector lane catches paraphrases). The query language: adjacent terms broaden recall, quoted phrases stay exact, `-term` excludes; `mode=\"fulltext\"` takes raw Tantivy/Lucene boolean syntax with conjunction semantics. For conversations, narrow with `doc_type=\"transcript\"`, `role` (`user` finds who established a rule), `account`, `include_subagents=false`, and `exclude_self=true` for current-turn searches; once narrowed to conversations, `project` scopes them by recorded working directory. `source` filters the lane a document came from (`glm`, `claude`, `codex`, `slack`, ...): comma-separated for several, and a `-` prefix excludes one, so `source=\"slack\"` searches only ingested Slack conversations and `source=\"-slack\"` everything else. For \"what's in a channel\" questions use `channel=` (a name, leading `#` accepted, or an id; names resolve through the current roster so a renamed channel matches its whole history); plain queries match channel names too. `author` filters conversation documents by provider user id. Filters apply to every lane before ranking. Conversation hits carry `conversation` coordinates (`session_id`, `file_path`, `byte_offset`, timestamp, account, channel, permalink, and an `exact_read` page reader when available) that feed bbox_context, bbox_messages and bbox_session unchanged. Model rerank (hosted cross-encoder, [embed.rerank], default rerank-2.5-lite) is the DEFAULT and degrades to the heuristic path on API failure (degraded.rerank_unavailable); pass rerank=\"heuristic\" to skip the cross-encoder call when latency matters more than precision, or rerank=\"none\" for raw fusion order. Project graph vertices participate like any typed entity: `project` also scopes them by their stamped project id; repeatable `graph_source` picks planes (`published`, `connector`; unset = all; only `published` has indexed documents, so `connector` is accepted but returns no graph hits) and `graph_ids` names graphs within the resolved project, both applied before ranking so excluded vertices never consume rank positions. Vertex hits carry `graph_id`, `graph_source`, `graph_vertex_type`, `graph_generation`, and `graph_logical_ref`.",
+        when_to_use: "The corpus search step of the `bbox-recall` skill. Use as the default search for any topical question, including prior conversations. Pass `project=$cwd` (or a registered project_id) when querying about your local repo to avoid cross-project keyword pollution. Trust topical hits: top seed is canonical for the query even when wording doesn't exactly match (vector lane catches paraphrases). The query language: adjacent terms broaden recall, quoted phrases stay exact, `-term` excludes; `mode=\"fulltext\"` takes raw Tantivy/Lucene boolean syntax with conjunction semantics. For conversations, narrow with `doc_type=\"transcript\"`, `role` (`user` finds who established a rule), `account`, `include_subagents=false`, and `exclude_self=true` for current-turn searches; once narrowed to conversations, `project` scopes them by recorded working directory. `source` filters the lane a document came from (`glm`, `claude`, `codex`, `slack`, ...): comma-separated for several, and a `-` prefix excludes one, so `source=\"slack\"` searches only ingested Slack conversations and `source=\"-slack\"` everything else. For \"what's in a channel\" questions use `channel=` (a name, leading `#` accepted, or an id; names resolve through the current roster so a renamed channel matches its whole history); plain queries match channel names too. `author` filters conversation documents by provider user id. Filters apply to every lane before ranking. Conversation hits carry `conversation` coordinates (`session_id`, `file_path`, `byte_offset`, timestamp, account, channel, permalink, and an `exact_read` page reader when available) that feed bbox_context, bbox_messages and bbox_session unchanged. Model rerank (hosted cross-encoder, [embed.rerank], default rerank-2.5-lite) is the DEFAULT and degrades to the heuristic path on API failure (degraded.rerank_unavailable); pass rerank=\"heuristic\" to skip the cross-encoder call when latency matters more than precision, or rerank=\"none\" for raw fusion order. Project graph vertices participate like any typed entity: `project` also scopes them by their stamped project id; repeatable `graph_source` picks planes (`published`, `connector`; unset = all; only `published` has indexed documents, so `connector` is accepted but returns no graph hits) and `graph_ids` names graphs within the resolved project, both applied before ranking so excluded vertices never consume rank positions. Vertex hits carry `graph_id`, `graph_source`, `graph_vertex_type`, `graph_generation`, and `graph_logical_ref`.",
         example: Some(
             r#"bbox_hybrid_search(query="triad implementation", limit=10, project="/home/me/repos/erlang-test")"#,
         ),
@@ -187,7 +189,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_sessions_list",
         category: ToolCategory::Transcripts,
         summary: "Browse retained indexed sessions by latest indexed activity. Filter by source, exact account, or registered project identity/recorded path text. Pages default to 30 sessions, maximum 100, with next_offset and byte limits. Source freshness is not assessed. Session-name filters are unavailable because names are not indexed.",
-        when_to_use: "Use when you need to find a retained session by recency, project, source, or account without a concrete text query. See `sm-transcript-retrieval` via `bbox_knowledge` for retrieval ladders.",
+        when_to_use: "Use when you need to find a retained session by recency, project, source, or account without a concrete text query. The `bbox-recall` skill carries the retrieval ladders.",
         example: None,
     },
     ToolDoc {
@@ -373,7 +375,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_learn",
         category: ToolCategory::Knowledge,
         summary: "Persist an operator-approved rule or convention that should bind future sessions; rendered into provider markdown files. Pass render=false for an indexed-only recall entry that search finds but no rendered file carries. Use for narrative rules (\"we always X\", \"never Y\") only after the operator has approved the exact content and scope.",
-        when_to_use: "Use only after the operator has approved the exact text and scope for a standing user rule that must outlive the current edit AND would still be correct a year from now with all current arcs complete. Anti-trigger: content naming a specific migration, phase, active arc, current initiative, or \"finish X before Y\" sequencing is arc-bound; it belongs in the dispatch brief or the work-item thread. Not for one-off task constraints, not for facts you discovered yourself (those belong in a thread note or your final report). Query `bbox_knowledge` first to avoid duplicate entries. On a transport-governed estate, project-scoped writes ride the checkout-owner backchannel: the daemon enqueues the committed `.bbox/knowledge/` bytes and the collector applies them within one cycle; commit the file to publish. See `sm-persistence-taxonomy` via `bbox_knowledge` for the deeper split.",
+        when_to_use: "Use only after the operator has approved the exact text and scope for a standing user rule that must outlive the current edit AND would still be correct a year from now with all current arcs complete. Anti-trigger: content naming a specific migration, phase, active arc, current initiative, or \"finish X before Y\" sequencing is arc-bound; it belongs in the dispatch brief or the work-item thread. Not for one-off task constraints, not for facts you discovered yourself (those belong in a thread note or your final report). Query `bbox_knowledge` first to avoid duplicate entries. On a transport-governed estate, project-scoped writes ride the checkout-owner backchannel: the daemon enqueues the committed `.bbox/knowledge/` bytes and the collector applies them within one cycle; commit the file to publish. The `bbox-persist` skill carries the lane and scope procedure.",
         example: Some(
             r#"bbox_learn(content="use rustls, not openssl", category="convention", scope="project", project="/repo/x")"#,
         ),
@@ -396,7 +398,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_render",
         category: ToolCategory::Knowledge,
         summary: "Render entries into CLAUDE.md / AGENTS.md.",
-        when_to_use: "Use to publish standing approved knowledge into managed files. `global` patches the DAEMON HOST's memory files; when the daemon is remote (cage) or its store is isolated it refuses with `error.global_render_authority` instead of writing files nobody reads. To refresh an operator host's global files from a remote daemon, run `bro render global` ON THAT HOST (`--check` previews): it requests `bbox_render(scope=\"global\", global_plan={host_common_target})` and applies the returned managed bodies locally with backups. `project` renders the project's provider files (CLAUDE.md / AGENTS.md, which include PROJECT.md by reference) plus `.bbox/guidance` satellites IN THE CHECKOUT THAT OWNS IT: the code collector whose producer grant covers the project's published scope applies a daemon-built plan and returns a path-free receipt (`status`, per-output `dispositions`, `current`). The plan carries published knowledge only. Hand-authored provider files are preserved (`refused`); generated ones are replaced. If the owner has not answered within the wait, the response is `render_pending` with an `operation` id: call `bbox_render(project, operation)` to retrieve that operation's recorded receipt (it never re-applies; a newer render makes it historical). Refusals name the fix: `error.render_owner_*` for an owner that is stale, lacks the render lane, or does not hold the checkout, and `error.render_locality_required` when no owner covers the project (enroll the checkout with `bbox-code-collector add <path>` on its host). Do not use render as a way to keep active-work guidance hot across turns; that belongs in the dispatch brief or the work-item thread. See `sm-render-lifecycle` via `bbox_knowledge` for the full lifecycle.",
+        when_to_use: "Use to publish standing approved knowledge into managed files. `global` patches the DAEMON HOST's memory files; when the daemon is remote (cage) or its store is isolated it refuses with `error.global_render_authority` instead of writing files nobody reads. To refresh an operator host's global files from a remote daemon, run `bro render global` ON THAT HOST (`--check` previews): it requests `bbox_render(scope=\"global\", global_plan={host_common_target})` and applies the returned managed bodies locally with backups. `project` renders the project's provider files (CLAUDE.md / AGENTS.md, which include PROJECT.md by reference) plus `.bbox/guidance` satellites IN THE CHECKOUT THAT OWNS IT: the code collector whose producer grant covers the project's published scope applies a daemon-built plan and returns a path-free receipt (`status`, per-output `dispositions`, `current`). The plan carries published knowledge only. Hand-authored provider files are preserved (`refused`); generated ones are replaced. If the owner has not answered within the wait, the response is `render_pending` with an `operation` id: call `bbox_render(project, operation)` to retrieve that operation's recorded receipt (it never re-applies; a newer render makes it historical). Refusals name the fix: `error.render_owner_*` for an owner that is stale, lacks the render lane, or does not hold the checkout, and `error.render_locality_required` when no owner covers the project (enroll the checkout with `bbox-code-collector add <path>` on its host). Do not use render as a way to keep active-work guidance hot across turns; that belongs in the dispatch brief or the work-item thread. The `bbox-persist` skill carries the full lifecycle.",
         example: Some(r#"bbox_render(scope="project", project="/repo/x")"#),
     },
     // ── Threads ──────────────────────────────────────────────────────
@@ -419,7 +421,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_gap",
         category: ToolCategory::Gaps,
         summary: "File a first-class substrate gap note into the repo-owned gap store.",
-        when_to_use: "When the blocker is in the blackbox substrate or shared agent workflow: a missing tool primitive, MCP surface, refactor atom, workflow shape, ontology edge, or runbook that agents in other projects could plausibly hit too, NOT an ordinary TODO in the current product codebase and NOT a user-stated rule (those go to bbox_learn). Dedupe first with `bbox_gaps` and reuse the same `dedupe_key` (`<gap_kind>/<domain>/<slug>`); an open gap with that key dedupes by default (pass `allow_recurrence=true` to tally a recurrence). Project-scoped by default (committed in-repo under `.bbox/gaps/`); pass `scope=\"global\"` for cross-project substrate gaps. On a transport-governed estate the daemon holds no checkout authority: the call still works, but the daemon enqueues the committed-file bytes and the checkout-owner collector writes them into the checkout within one collector cycle (the response says where; commit the file to publish). See `sm-gap-notes` via `bbox_knowledge`.",
+        when_to_use: "When the blocker is in the blackbox substrate or shared agent workflow: a missing tool primitive, MCP surface, refactor atom, workflow shape, ontology edge, or runbook that agents in other projects could plausibly hit too, NOT an ordinary TODO in the current product codebase and NOT a user-stated rule (those go to bbox_learn). Dedupe first with `bbox_gaps` and reuse the same `dedupe_key` (`<gap_kind>/<domain>/<slug>`); an open gap with that key dedupes by default (pass `allow_recurrence=true` to tally a recurrence). Project-scoped by default (committed in-repo under `.bbox/gaps/`); pass `scope=\"global\"` for cross-project substrate gaps. On a transport-governed estate the daemon holds no checkout authority: the call still works, but the daemon enqueues the committed-file bytes and the checkout-owner collector writes them into the checkout within one collector cycle (the response says where; commit the file to publish). Follow the `bbox-gap` skill.",
         example: Some(
             r#"bbox_gap(title="No primitive classifies entities by rate within a time window", gap_kind="tooling", domain="review-policy", wanted_capability="Classify entities by count/rate within a time window.", dedupe_key="tooling/review-policy/rate-window-predicate", impact="medium")"#,
         ),
@@ -496,7 +498,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bro_resume",
         category: ToolCategory::Orchestration,
         summary: "Continue an existing session with a follow-up; single-flight per provider session. Optional request_key prevents duplicate continuation after a lost reply.",
-        when_to_use: "Use for follow-ups on an existing bro session. peak_usage has the bro_exec advisory contract, evaluated at the continuation attempt start. request_key has the same durable retry contract as bro_exec; use a new key for each intentional turn. Workflow/atom-owned sessions refuse ordinary resume. Do not use `bro_exec` again when you need continuity. Pass the `session_id` and `provider` returned by the original dispatch. The working-directory override is `cwd` (canonical; `project_dir` accepted as a deprecated alias), usually unnecessary because resume auto-resolves the session's recorded cwd. For Codex, pass `service_tier=\"priority\"` to force fast routing for the continuation or `service_tier=\"default\"` to persist standard routing. `pin_model` / `pin_effort` override the model and reasoning effort for the resumed turns (absent ⇒ brofile/session default). Never call `bro_resume` on a session while its previous task is still running: first `bro_wait(task_id=...)`, or `bro_cancel(task_id=...)` if you are abandoning that turn. If a prior turn failed but the session is still useful, resume it with recovery context before starting a fresh `bro_exec`. See `sm-bro-dispatch-patterns` via `bbox_knowledge` for workflow shapes.",
+        when_to_use: "Use for follow-ups on an existing bro session. peak_usage has the bro_exec advisory contract, evaluated at the continuation attempt start. request_key has the same durable retry contract as bro_exec; use a new key for each intentional turn. Workflow/atom-owned sessions refuse ordinary resume. Do not use `bro_exec` again when you need continuity. Pass the `session_id` and `provider` returned by the original dispatch. The working-directory override is `cwd` (canonical; `project_dir` accepted as a deprecated alias), usually unnecessary because resume auto-resolves the session's recorded cwd. For Codex, pass `service_tier=\"priority\"` to force fast routing for the continuation or `service_tier=\"default\"` to persist standard routing. `pin_model` / `pin_effort` override the model and reasoning effort for the resumed turns (absent ⇒ brofile/session default). Never call `bro_resume` on a session while its previous task is still running: first `bro_wait(task_id=...)`, or `bro_cancel(task_id=...)` if you are abandoning that turn. If a prior turn failed but the session is still useful, resume it with recovery context before starting a fresh `bro_exec`. The `bbox-bro-dispatch` skill carries the workflow shapes.",
         example: Some(
             r#"bro_resume(session_id="<sessionId>", provider="codex", prompt="add tests for the edge case we discussed")"#,
         ),
@@ -593,7 +595,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bro_brofile",
         category: ToolCategory::Orchestration,
         summary: "Manage brofiles and accounts. list/list_accounts return bounded summary pages; get/get_account return exact redaction-safe JSON body pages.",
-        when_to_use: "Create, inspect, and manage reusable bro blueprints. `action=list` returns sorted summaries (default limit=20, max=100) with total and next_offset; provider and name filter before pagination. scope selects one store exactly: global (default) or project (requires project_dir; global rejects it); unknown scopes are refused before any store access. `action=get` returns the exact stored brofile as bounded JSON body pages: concatenate body.text using cursor=body.next_cursor, then parse; cursors bind scope, selected store identity, name, and content. `context.provider_defaults` controls provider-default suppression; see `sm-brofile-context` via `bbox_knowledge` before composing minimal probes or strict suppression brofiles. Accounts live only in the daemon-owned global store: `list_accounts` returns bounded rows (counts plus a truncated environment-key preview) and `get_account` pages the exact redacted key/policy projection; set_account replies are compact summaries. Credential values are never returned. Before `action=create`, call `action=list` first to avoid duplicates. See `sm-create-etiquette` via `bbox_knowledge` for dedupe hygiene. Account and brofile reads distinguish corrupt/unreadable stores from empty or not-found. get_provider_default/list_provider_defaults support exact body_limit/cursor pages. Catalog-owned project configuration refuses without an owner transport; global and compatibility bridge lanes remain available.",
+        when_to_use: "Create, inspect, and manage reusable bro blueprints. `action=list` returns sorted summaries (default limit=20, max=100) with total and next_offset; provider and name filter before pagination. scope selects one store exactly: global (default) or project (requires project_dir; global rejects it); unknown scopes are refused before any store access. `action=get` returns the exact stored brofile as bounded JSON body pages: concatenate body.text using cursor=body.next_cursor, then parse; cursors bind scope, selected store identity, name, and content. `context.provider_defaults` controls provider-default suppression; read the `bbox-bro-dispatch` skill before composing minimal probes or strict suppression brofiles. Accounts live only in the daemon-owned global store: `list_accounts` returns bounded rows (counts plus a truncated environment-key preview) and `get_account` pages the exact redacted key/policy projection; set_account replies are compact summaries. Credential values are never returned. Before `action=create`, call `action=list` first to avoid duplicates. See `sm-create-etiquette` via `bbox_knowledge` for dedupe hygiene. Account and brofile reads distinguish corrupt/unreadable stores from empty or not-found. get_provider_default/list_provider_defaults support exact body_limit/cursor pages. Catalog-owned project configuration refuses without an owner transport; global and compatibility bridge lanes remain available.",
         example: Some(r#"bro_brofile(action="list")"#),
     },
     ToolDoc {
@@ -650,9 +652,13 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
 pub const WORKFLOW_NOTES: &str = "\
 ## Retrieval cues
 
-If a tool stanza says `See: sm-...`, fetch that runbook on demand with \
-`bbox_knowledge(query=\"sm-...\")`. Keep primitive semantics hot; pull deep \
-workflow guidance only when you need it.
+Multi-step Blackbox procedures are skills. Use the matching one before the \
+operation: `bbox-recall` (answer from stored evidence), `bbox-persist` \
+(propose durable knowledge), `bbox-gap` (report a substrate gap), \
+`bbox-bro-dispatch` (dispatch and supervise agents), `bbox-health` (triage \
+and maintenance), `bbox-onboard-project` (register a project). A tool stanza \
+that says `See: sm-...` names a cold reference: fetch it with \
+`bbox_knowledge(query=\"sm-...\")`.
 
 ## Query semantics
 
@@ -767,10 +773,8 @@ pub fn render_markdown() -> String {
     for cat in HOT_RENDER_CATEGORIES {
         out.push_str(&format!("## {}\n\n", cat.heading()));
 
-        if let Some(memory_id) = deferred_system_memory(*cat) {
-            out.push_str(&format!(
-                "On-demand runbook: `{memory_id}` via `bbox_knowledge(query=\"{memory_id}\")`.\n\n"
-            ));
+        if let Some(skill) = deferred_skill(*cat) {
+            out.push_str(&format!("On-demand procedure: the `{skill}` skill.\n\n"));
             continue;
         } else {
             out.push_str(cat.intro());
@@ -800,7 +804,7 @@ fn render_retrieval_workflow(out: &mut String) {
     out.push_str("## Retrieval workflow\n\n");
     out.push_str("Use Blackbox retrieval when stored decisions, conversation history, or indexed code evidence can change the answer. A direct local edit or an already-authoritative live result does not require a graph walk.\n\n");
     out.push_str("Use a short phrase from the task, not a single generic keyword. Query `bbox_knowledge` for durable rules and decisions, and `bbox_hybrid_search` for conversation history, indexed code or mixed evidence. Inspect relevant hits before relying on them.\n\n");
-    out.push_str("Use tool-returned canonical entity refs and suggested fixes. Retrieve `sm-agentic-opening-sequence` when the question needs its answer protocol or recipes.\n\n");
+    out.push_str("Use tool-returned canonical entity refs and suggested fixes. Use the `bbox-recall` skill when the question needs its answer protocol or recipes.\n\n");
 }
 
 fn render_persistence_workflow(out: &mut String) {
@@ -884,10 +888,8 @@ pub fn render_satellite(topic: GuidanceTopic) -> String {
             continue;
         }
         out.push_str(&format!("## {}\n\n{}\n\n", cat.heading(), cat.intro()));
-        if let Some(memory) = deferred_system_memory(cat) {
-            out.push_str(&format!(
-                "Detailed runbook: `bbox_knowledge(query=\"{memory}\")`.\n\n"
-            ));
+        if let Some(skill) = deferred_skill(cat) {
+            out.push_str(&format!("Procedure: the `{skill}` skill.\n\n"));
         }
         for doc in TOOL_DOCS.iter().filter(|doc| doc.category == cat) {
             out.push_str(&format!("- `{}`: {}\n", doc.name, doc.summary));
@@ -1051,7 +1053,7 @@ mod tests {
         assert!(!retrieval.contains("run this five-step sequence"));
         let operations = render_satellite(GuidanceTopic::Operations);
         assert!(operations.contains("bbox_gap"));
-        assert!(operations.contains("sm-gap-notes"));
+        assert!(operations.contains("the `bbox-gap` skill"));
         let persistence = render_satellite(GuidanceTopic::Persistence);
         assert!(persistence.contains("operator-approved persistence"));
     }
@@ -1063,7 +1065,7 @@ mod tests {
             if !HOT_RENDER_CATEGORIES.contains(&doc.category) {
                 continue;
             }
-            if deferred_system_memory(doc.category).is_some() {
+            if deferred_skill(doc.category).is_some() {
                 continue;
             }
             assert!(
@@ -1075,13 +1077,11 @@ mod tests {
     }
 
     #[test]
-    fn render_defers_deep_tool_categories_to_system_memories() {
+    fn render_defers_deep_tool_categories_to_skills() {
         let md = render_markdown();
-        for (cat, memory_id) in [(ToolCategory::Orchestration, "sm-bro-dispatch-patterns")] {
+        for (cat, skill) in [(ToolCategory::Orchestration, "bbox-bro-dispatch")] {
             assert!(md.contains(&format!("## {}", cat.heading())));
-            assert!(md.contains(&format!(
-                "`{memory_id}` via `bbox_knowledge(query=\"{memory_id}\")`"
-            )));
+            assert!(md.contains(&format!("On-demand procedure: the `{skill}` skill.")));
             for doc in TOOL_DOCS.iter().filter(|d| d.category == cat) {
                 assert!(
                     !md.contains(&format!("- **`{}`**", doc.name)),
@@ -1125,8 +1125,8 @@ mod tests {
     #[test]
     fn render_includes_system_memory_hint() {
         let md = render_markdown();
-        assert!(md.contains("sm-bro-dispatch-patterns"));
-        assert!(md.contains("bbox_knowledge(query=\"sm-bro-dispatch-patterns\")"));
+        assert!(md.contains("sm-create-etiquette"));
+        assert!(md.contains("bbox_knowledge(query=\"sm-create-etiquette\")"));
         assert!(!md.contains("bro_orchestrate_run"));
         assert!(!md.contains("## Whiteboards"));
     }

@@ -10,6 +10,20 @@ pub(crate) const ONBOARDING_SKILL_DESCRIPTION: &str =
     "Register, onboard, or add a project to Blackbox from a local or remote checkout host.";
 pub(crate) const ONBOARDING_SKILL_URI: &str = "blackbox://skills/onboard-project/SKILL.md";
 
+/// The onboarding procedure is the installed `bbox-onboard-project` skill's
+/// body, compiled in so the served resource and the skill cannot drift. The
+/// resource keeps its own name and appends this deployment's live state.
+const ONBOARDING_PROCEDURE: &str =
+    include_str!("../../system-defaults/skills/bbox-onboard-project/SKILL.md");
+
+/// The skill body without its front matter.
+fn procedure_body() -> &'static str {
+    ONBOARDING_PROCEDURE
+        .strip_prefix("---\n")
+        .and_then(|rest| rest.split_once("\n---\n"))
+        .map_or(ONBOARDING_PROCEDURE, |(_, body)| body)
+}
+
 pub(crate) fn render(state: &SharedState) -> String {
     let config = state.config.read();
     let policies = config
@@ -21,13 +35,8 @@ pub(crate) fn render(state: &SharedState) -> String {
     let presences = state.producer_commands.fresh_presences();
 
     let mut body = format!(
-        "---\nname: {ONBOARDING_SKILL_NAME}\ndescription: {ONBOARDING_SKILL_DESCRIPTION}\n---\n\n\
-         # Onboard a project\n\n\
-         Registration is an operator operation served on the `ops` MCP surface. Run these commands from a shell with `bro`, or ask the operator to run them.\n\n\
-         1. `bro mcp call bbox_project_register '{{\"path\":\"<absolute path on the checkout host>\"}}' --surface ops`. Add `\"producer\":\"<producer id>\"` only when the call returns `error.project_onboarding_ambiguous`.\n\
-         2. If the receipt has `identity_committed: false`, commit exactly the returned `commit_paths` on `published_ref` in that checkout. Do not push unless the user asks. The collector reads the local ref.\n\
-         3. Verify the project with `bro mcp call bbox_project_catalog_list '{{\"query\":\"<project name>\"}}' --surface ops` and `bro mcp call bbox_project_publisher_status '{{\"project_id\":\"<project_id>\"}}' --surface ops`. Publication starts on the collector's next pass after the identity commit: the daemon accepts the first valid candidate from the owning producer, and every later candidate on the same ref.\n\n\
-         ## Checkout hosts\n\n"
+        "---\nname: {ONBOARDING_SKILL_NAME}\ndescription: {ONBOARDING_SKILL_DESCRIPTION}\n---\n{}\n\n## Checkout hosts\n\n",
+        procedure_body().trim_end()
     );
 
     if presences.is_empty() {
@@ -224,6 +233,8 @@ mod tests {
 
         let text = render(&state);
         assert!(text.starts_with("---\nname: onboard-project\ndescription:"));
+        assert_eq!(text.matches("\n---\n").count(), 1, "one front matter block");
+        assert!(text.contains("bbox_project_register"));
         assert!(text.contains("https://blackbox.example.test"));
         assert!(text.contains("collector-b.service"));
         assert!(text.contains("`producer-b`: claims unclaimed scopes: yes."));

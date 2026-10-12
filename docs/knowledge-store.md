@@ -111,10 +111,11 @@ Use `bbox_knowledge` early when prior commitments or rules could change the answ
 
 ```text
 bbox_knowledge(query="retry policy", project="/repo/x")
-bbox_knowledge(query="sm-persistence-taxonomy")
+bbox_knowledge(query="sm-create-etiquette")
 ```
 
-It also surfaces system memories (`sm-*`). For active threads and their notes,
+It also surfaces system memories (`sm-*`). The procedure for proposing and
+saving knowledge is the `bbox-persist` [agent skill](agent-skills.md). For active threads and their notes,
 use `bbox_thread_list` and `bbox_thread`.
 
 ## Render

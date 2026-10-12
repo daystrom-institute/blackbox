@@ -33,7 +33,7 @@ mod tests {
     fn sample_refs() -> Vec<&'static str> {
         vec![
             "knowledge:abc12345",
-            "system_memory:sm-agentic-opening-sequence",
+            "system_memory:sm-create-etiquette",
             "file:README.md",
             "project_file:proj1234:relhash:chunkhash:0",
             "transcript:claude:session123:42:0",

@@ -243,16 +243,11 @@ Claude CLI. See
 [Provider & Agent Surfaces](../PROJECT.md#provider--agent-surfaces)
 rather than re-inventorying providers here.
 
-## System memories
+## Agent skills
 
-The detailed agent runbooks are runtime-loaded system memories fetched on
-demand:
-
-```text
-bbox_knowledge(query="sm-agentic-opening-sequence")
-bbox_knowledge(query="sm-transcript-retrieval")
-bbox_knowledge(query="sm-persistence-taxonomy")
-```
+The detailed agent procedures are [agent skills](agent-skills.md) loaded on
+demand: `bbox-recall` for retrieval and its transcript ladder, `bbox-persist`
+for knowledge and rendering.
 
 They stay out of provider files until needed, which keeps hot context
 smaller.

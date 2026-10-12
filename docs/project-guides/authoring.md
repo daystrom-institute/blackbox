@@ -1,8 +1,9 @@
 ## Knowledge & Render Invariants
 
-System memories are invariants and runbooks, not release ledgers or artifact
-inventories. Deep or role-specific docs belong in system memories, scoped docs,
-or code-owned catalogs rather than always-rendered provider memory.
+Agent skills carry procedures, one canonical copy each (`docs/agent-skills.md`).
+System memories are invariants and cold reference, not procedures, release
+ledgers or artifact inventories. Deep or role-specific docs belong in skills,
+scoped docs, or code-owned catalogs rather than always-rendered provider memory.
 
 `bbox_render` surfaces:
 

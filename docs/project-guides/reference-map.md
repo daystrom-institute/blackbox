@@ -1,7 +1,7 @@
 ## Docs Map
 
 Use `PROJECT.md` as the map and guardrail layer. Put detailed procedures in docs
-or system memories and link/pointer from here.
+or agent skills and link/pointer from here.
 
 - `README.md` - user-facing overview and setup.
 - `docs/index.md` - human documentation map.
@@ -9,7 +9,10 @@ or system memories and link/pointer from here.
   tutorial examples and installable default artifacts.
 - `prompts/README.md` - map of checked-in prose prompts (operator-pointed
   interactive prompts and dispatched-agent lenses). Distinct from
-  `system-defaults/` artifacts and `.claude` skills.
+  `system-defaults/` artifacts and agent skills.
+- `docs/agent-skills.md` - the `bbox-*` agent skills: global ones under
+  `system-defaults/skills/` installed by `scripts/sync-skills.sh`, project ones
+  under `.agents/skills/`.
 - `docs/getting-started.md`, `docs/operating-blackbox.md`,
   `docs/operations.md` - operational setup and day-2 runbooks.
 - `docs/operations-isolated-dev-daemon.md` - running a lightweight throwaway
@@ -19,7 +22,7 @@ or system memories and link/pointer from here.
 - `docs/transcript-retrieval.md`, `docs/knowledge-store.md`,
   `docs/projects-code-indexing.md` - core corpus surfaces.
 - `system-defaults/memories/system-memory-catalog.md` - Obsidian navigation
-  map for system memory runbooks; not loaded as a runtime memory.
+  map for system memories; not loaded as a runtime memory.
 - `docs/refactor.md` - source editing through native provider tools.
 
 - `design/design-corpus.md` - Obsidian-friendly map for the design corpus.

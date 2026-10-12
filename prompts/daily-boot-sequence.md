@@ -6,7 +6,7 @@ audience: interactive
 topic:
   - prompts
   - boot
-brief: "The daily operating rhythm: clean → survey residuals & net-news → process gaps → refine & process the TODO list → closeout. Orchestrates the dedicated daily prompts (daily-cleaning, gap-processing, RETRO_INTERACTIVE, CLOSEOUT) and owns the TODO-refinement loop + closeout that have no other home. Assumes CLAUDE.md / PROJECT.md are already loaded — it does NOT restate ambient/system facts or corpus layout; it captures only the daily flow and the tooling that isn't documented there."
+brief: "The daily operating rhythm: clean → survey residuals & net-news → process gaps → refine & process the TODO list → closeout. Orchestrates the dedicated daily prompts (daily-cleaning, gap-processing, CLOSEOUT) and the bbox-retro skill, and owns the TODO-refinement loop + closeout that have no other home. Assumes CLAUDE.md / PROJECT.md are already loaded: it does NOT restate ambient/system facts or corpus layout; it captures only the daily flow and the tooling that isn't documented there."
 ---
 
 # Daily Boot Sequence
@@ -61,7 +61,7 @@ order:
 ## Closeout
 
 1. **Debrief** — each item's deliverable and its handle (thread ids, new files).
-2. **Run the interactive retro if warranted** → `prompts/RETRO_INTERACTIVE.md`.
+2. **Run the session retro if warranted** → the `bbox-retro` skill.
    File real substrate gaps (`bbox_gap`, dedupe first) and record non-gap
    follow-ups as thread notes (`bbox_thread`, open or continue).
 3. **Persist durable lessons — operator-gated.** Surface candidate memories

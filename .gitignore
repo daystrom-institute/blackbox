@@ -2,6 +2,7 @@
 /site/
 /.claude/*
 !/.claude/agents/
+!/.claude/skills/
 /.dev-agent/
 /.dev-agent-links
 /.direnv/

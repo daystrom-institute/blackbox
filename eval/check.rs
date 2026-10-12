@@ -31,10 +31,6 @@ pub const MANIFEST_SOURCES: &[(&str, &str)] = &[
         include_str!("queries/decision-deep-docs-system-memory.json"),
     ),
     (
-        "decision-render-pipeline-unidirectional",
-        include_str!("queries/decision-render-pipeline-unidirectional.json"),
-    ),
-    (
         "transcript-nextest-workspace-adoption",
         include_str!("queries/transcript-nextest-workspace-adoption.json"),
     ),
@@ -167,7 +163,7 @@ mod tests {
     #[test]
     fn all_manifests_parse_and_round_trip() {
         let manifests = load_manifests().expect("all eval manifests parse");
-        assert_eq!(manifests.len(), 14);
+        assert_eq!(manifests.len(), 13);
 
         let mut ids = BTreeSet::new();
         let mut class_counts = BTreeMap::<QueryClass, usize>::new();
@@ -207,7 +203,7 @@ mod tests {
 
         for (class, count) in [
             (QueryClass::ConceptualDesignDoc, 4),
-            (QueryClass::StaleDecisionLookup, 2),
+            (QueryClass::StaleDecisionLookup, 1),
             (QueryClass::TranscriptProvenance, 6),
             (QueryClass::CrossModalCodeProse, 2),
         ] {

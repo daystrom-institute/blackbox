@@ -2135,7 +2135,7 @@ mod tests {
                 property: Some("id".into()),
                 property_cursor: None,
                 property_limit: None,
-                entity_ref: "system_memory:sm-agentic-opening-sequence".into(),
+                entity_ref: "system_memory:sm-create-etiquette".into(),
                 edge_types: None,
                 direction: None,
                 per_type_limit: Some(0),
@@ -2146,7 +2146,7 @@ mod tests {
         assert_ne!(result.is_error, Some(true), "{}", extract_text(&result));
         let value: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
         assert_eq!(value["status"], "ok", "{value}");
-        assert_eq!(value["body"]["text"], "sm-agentic-opening-sequence");
+        assert_eq!(value["body"]["text"], "sm-create-etiquette");
     }
 }
 

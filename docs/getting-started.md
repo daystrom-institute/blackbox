@@ -75,7 +75,8 @@ credentials that deployment requires.
 }
 ```
 
-**Codex CLI** - add to `~/.codex/config.toml`:
+**Codex CLI** - add to each profile's `$CODEX_HOME/config.toml` (default
+`~/.codex/config.toml`):
 
 ```toml
 [mcp_servers.blackbox]
@@ -97,11 +98,19 @@ url = "https://<daemon-origin>/mcp?surface=interactive"
 
 **Copilot** - `copilot mcp add blackbox https://<daemon-origin>/mcp?surface=interactive`
 
+Then install the global [agent skills](agent-skills.md) on the host, so every
+Claude Code and Codex account gets the Blackbox procedures:
+
+```bash
+scripts/sync-skills.sh
+```
+
 ## 4. Enroll a project from its owning checkout
 
-MCP clients can read the instance-specific onboarding instructions from
-`blackbox://skills/onboard-project/SKILL.md`, use the `onboard-project` prompt,
-or discover the same skill through `skills/list`.
+The `bbox-onboard-project` skill carries the procedure. MCP clients can also
+read it, with this deployment's checkout hosts and producer policy appended,
+from `blackbox://skills/onboard-project/SKILL.md`, through the
+`onboard-project` prompt, or through `skills/list`.
 
 Check `bbox_project_list()` before adding a project. Configure one producer
 with `claim_scopes = "unclaimed"` and configure the
@@ -129,12 +138,16 @@ not collect Claude/Codex session files.
 
 ## 5. Render approved knowledge on the target host
 
-For project files, call this from a managed provider session bound to the
-owning checkout, where the locality client applies the daemon's render plan:
+For project files, call:
 
 ```text
 bbox_render(scope="project", project="<project-selector>")
 ```
+
+A session bound to the owning checkout applies the daemon's render plan there
+through its locality client. A call without that binding is applied by the
+checkout-owner collector that covers the project, and returns a receipt, or
+`render_pending` with an `operation` id to read the receipt later.
 
 For global provider files, run on the operator host that should receive them:
 

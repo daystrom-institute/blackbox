@@ -92,7 +92,8 @@ install -m 755 target/release/{bbox-code-collector,bbox-transcript-collector} ~/
 
 Blackbox uses Voyage AI for embeddings. The daemon needs the key in its
 environment - not in a config file, not hardcoded. The env var name is
-`DAYSTROM_VOYAGE_API_KEY` (primary) or `VOYAGE_API_KEY` (fallback). A
+`VOYAGE_API_KEY` by default, with `DAYSTROM_VOYAGE_API_KEY` as the fallback;
+an `api_key_env` override in `embed.toml` names a different variable. A
 container deployment supplies it from a Secret in the workload environment;
 a throwaway local daemon takes it from the launching shell. Restart the
 daemon after changing it.

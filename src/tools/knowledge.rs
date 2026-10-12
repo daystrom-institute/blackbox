@@ -1845,13 +1845,13 @@ mod tests {
     fn exact_system_memory_response_returns_only_exact_memory() {
         init_system_memory();
         let out = exact_system_memory_response(&KnowledgeListParams {
-            query: Some("sm-gap-notes".into()),
+            query: Some("sm-create-etiquette".into()),
             ..Default::default()
         })
         .expect("exact canonical system memory query should short-circuit");
 
-        assert!(out.contains("[system] sm-gap-notes"));
-        assert!(!out.contains("[system] sm-transcript-retrieval"));
+        assert!(out.contains("[system] sm-create-etiquette"));
+        assert!(!out.contains("[system] sm-atoms"));
         assert!(!out.contains("[bb-tool-reference]"));
         assert!(!out.contains("No entries found."));
     }
@@ -1861,7 +1861,7 @@ mod tests {
         init_system_memory();
         let out = exact_system_memory_response(&KnowledgeListParams {
             scope: Some("project".into()),
-            query: Some("sm-gap-notes".into()),
+            query: Some("sm-create-etiquette".into()),
             ..Default::default()
         });
 
@@ -1981,13 +1981,13 @@ mod tests {
         init_system_memory();
         let out = exact_system_memory_response(&KnowledgeListParams {
             category: Some("system_memory".into()),
-            query: Some("taxonomy".into()),
+            query: Some("etiquette".into()),
             ..Default::default()
         })
         .expect("system_memory + query should return filtered catalog");
 
-        assert!(out.contains("[system] sm-persistence-taxonomy"));
-        assert!(!out.contains("[system] sm-transcript-retrieval"));
+        assert!(out.contains("[system] sm-create-etiquette"));
+        assert!(!out.contains("[system] sm-atoms"));
     }
 
     #[test]
@@ -1995,7 +1995,7 @@ mod tests {
         init_system_memory();
         let out = exact_system_memory_response(&KnowledgeListParams {
             category: Some("memory".into()),
-            query: Some("sm-gap-notes".into()),
+            query: Some("sm-create-etiquette".into()),
             ..Default::default()
         });
         assert!(out.is_none());

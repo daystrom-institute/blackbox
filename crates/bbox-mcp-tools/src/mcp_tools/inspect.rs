@@ -1288,7 +1288,7 @@ mod tests {
             property: None,
             property_cursor: None,
             property_limit: None,
-            entity_ref: "system_memory:sm-agentic-opening-sequence".into(),
+            entity_ref: "system_memory:sm-create-etiquette".into(),
             edge_types: None,
             direction: None,
             per_type_limit: Some(0),
@@ -1309,11 +1309,8 @@ mod tests {
                 .any(|key| key == "content")
         );
         assert!(value["property_projection"]["expand_hint"].is_string());
-        assert_eq!(
-            value["entity_ref"],
-            "system_memory:sm-agentic-opening-sequence"
-        );
-        assert_eq!(value["properties"]["id"], "sm-agentic-opening-sequence");
+        assert_eq!(value["entity_ref"], "system_memory:sm-create-etiquette");
+        assert_eq!(value["properties"]["id"], "sm-create-etiquette");
         assert!(value["properties"].get("content").is_none());
     }
 
@@ -1330,7 +1327,7 @@ mod tests {
             property: None,
             property_cursor: None,
             property_limit: None,
-            entity_ref: "system_memory:sm-agentic-opening-sequence".into(),
+            entity_ref: "system_memory:sm-create-etiquette".into(),
             edge_types: None,
             direction: None,
             per_type_limit: None,

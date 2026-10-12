@@ -15,8 +15,9 @@ You are working in an EDIT-ONLY checkout: a git worktree or fresh clone
 whose build cache is cold. On this estate the dev machine is the control
 plane, not the compute tier. A cold cargo invocation here is a 20+ minute
 full-dependency compile plus per-binary macOS assessment, stolen from every
-sibling lane, and the repo blocks it mechanically
-(`scripts/rustc-cold-guard.sh`).
+sibling lane. The repo blocks the common case mechanically
+(`scripts/rustc-cold-guard.sh` refuses a cold linked worktree on macOS); the
+rule holds for any cold checkout, guarded or not.
 
 ## What you do
 

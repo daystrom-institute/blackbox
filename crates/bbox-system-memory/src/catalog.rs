@@ -392,8 +392,8 @@ mod tests {
             })
             .count();
         assert_eq!(catalog.memories.len(), on_disk);
-        assert_eq!(catalog.memories[0].id, "sm-agentic-opening-sequence");
-        assert_eq!(catalog.memories[1].id, "sm-atoms");
+        assert_eq!(catalog.memories[0].id, "sm-atoms");
+        assert_eq!(catalog.memories[1].id, "sm-workflow-orchestration");
     }
 
     #[test]
@@ -612,16 +612,16 @@ mod tests {
     #[test]
     fn search_finds_by_tag_query() {
         let catalog = fixture_default_catalog();
-        let hits = catalog.search(Some("taxonomy"));
-        assert!(hits.iter().any(|m| m.id == "sm-persistence-taxonomy"));
+        let hits = catalog.search(Some("retirement"));
+        assert!(hits.iter().any(|m| m.id == "sm-atoms"));
     }
 
     #[test]
     fn search_finds_by_id_query() {
         let catalog = fixture_default_catalog();
-        let hits = catalog.search(Some("sm-persistence-taxonomy"));
+        let hits = catalog.search(Some("sm-create-etiquette"));
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].id, "sm-persistence-taxonomy");
+        assert_eq!(hits[0].id, "sm-create-etiquette");
     }
 
     fn search_exact_canonical_id_does_not_expand_prefix_family() {
@@ -659,16 +659,16 @@ mod tests {
     #[test]
     fn search_case_insensitive() {
         let catalog = fixture_default_catalog();
-        let hits = catalog.search(Some("TAXONOMY"));
-        assert!(hits.iter().any(|m| m.id == "sm-persistence-taxonomy"));
+        let hits = catalog.search(Some("RETIREMENT"));
+        assert!(hits.iter().any(|m| m.id == "sm-atoms"));
     }
 
     #[test]
     fn search_defaults_adjacent_terms_to_or() {
         let catalog = fixture_default_catalog();
-        let hits = catalog.search(Some("etiquette taxonomy"));
+        let hits = catalog.search(Some("etiquette retirement"));
         assert!(hits.iter().any(|m| m.id == "sm-create-etiquette"));
-        assert!(hits.iter().any(|m| m.id == "sm-persistence-taxonomy"));
+        assert!(hits.iter().any(|m| m.id == "sm-atoms"));
     }
 
     fn search_honors_and_and_exclusion() {
@@ -690,19 +690,19 @@ mod tests {
     #[test]
     fn get_accepts_canonical_and_bare() {
         let catalog = fixture_default_catalog();
-        assert!(catalog.get("sm-gap-notes").is_some());
-        assert!(catalog.get("gap-notes").is_some());
+        assert!(catalog.get("sm-create-etiquette").is_some());
+        assert!(catalog.get("create-etiquette").is_some());
         assert!(catalog.get("nonexistent").is_none());
     }
 
     #[test]
     fn format_for_listing_has_system_prefix() {
         let catalog = fixture_default_catalog();
-        let memory = catalog.get("sm-gap-notes").unwrap();
+        let memory = catalog.get("sm-create-etiquette").unwrap();
         let out = format_for_listing(memory);
-        assert!(out.starts_with("[system] sm-gap-notes"));
-        assert!(out.contains("ref: system_memory:sm-gap-notes"));
-        assert!(out.contains("Gap notes"));
+        assert!(out.starts_with("[system] sm-create-etiquette"));
+        assert!(out.contains("ref: system_memory:sm-create-etiquette"));
+        assert!(out.contains("Create etiquette"));
     }
 
     fn format_for_signpost_is_compact_with_retrieval_breadcrumb() {
@@ -796,33 +796,5 @@ mod tests {
         for memory in &catalog.memories {
             assert!(memory.id.starts_with("sm-"));
         }
-    }
-
-    #[test]
-    fn gap_notes_memory_loaded_and_teaches_bbox_gap() {
-        let catalog = fixture_default_catalog();
-        let memory = catalog
-            .get("sm-gap-notes")
-            .expect("sm-gap-notes must exist");
-        assert!(memory.content.len() > 500);
-        // First-class surface: filing is via `bbox_gap`, dedupe via `bbox_gaps`.
-        assert!(memory.content.contains("bbox_gap("));
-        assert!(memory.content.contains("bbox_gaps"));
-        // The envelope tag remains searchable for handoff to a caller with bbox_gap.
-        assert!(memory.content.contains("blackbox.gap_note.v1"));
-    }
-
-    #[test]
-    fn search_finds_gap_notes_by_subject_vocabulary() {
-        let catalog = fixture_default_catalog();
-        let hits = catalog.search(Some("substrate gap"));
-        assert!(hits.iter().any(|m| m.id == "sm-gap-notes"));
-
-        let envelope_hits = catalog.search(Some("blackbox.gap_note.v1"));
-        assert!(envelope_hits.iter().any(|m| m.id == "sm-gap-notes"));
-
-        let id_hits = catalog.search(Some("sm-gap-notes"));
-        assert_eq!(id_hits.len(), 1);
-        assert_eq!(id_hits[0].id, "sm-gap-notes");
     }
 }

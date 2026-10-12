@@ -447,7 +447,7 @@ bbox_embed_status()
 `queue_depth` should trend down. A non-zero queue is normal during a
 large reindex; a queue that never drains is an operations issue.
 
-Voyage needs `DAYSTROM_VOYAGE_API_KEY` or `VOYAGE_API_KEY` in the daemon's
+Voyage needs `VOYAGE_API_KEY` (or the `DAYSTROM_VOYAGE_API_KEY` fallback) in the daemon's
 environment (see [Operations](operations.md#api-keys)). Restart the daemon
 after changing it.
 
@@ -566,7 +566,7 @@ host with `bro render global`.
 | `~/.local/bin/bbox-code-collector` | Checkout-source collector |
 | `~/.local/bin/bbox-transcript-collector` | Native transcript collector |
 | `~/.local/share/blackbox/index/` | Rebuildable Tantivy index |
-| `~/.local/share/blackbox/memories/` | Shipped system memories and runbooks |
+| `~/.local/share/blackbox/memories/` | Shipped system memories |
 | `~/.local/state/blackbox/vectors/` | Rebuildable vector partitions |
 | `~/.local/state/blackbox/edges/` | Edge sidecars: snapshot manifest, snapshots and overlays |
 | `~/.local/state/blackbox/git_meta/` | Rebuildable git fingerprints |

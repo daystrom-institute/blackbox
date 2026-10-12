@@ -11,11 +11,15 @@ cargo nextest run --workspace   # mid-cycle gate; quarantines slow tests (.confi
 cargo clippy
 ```
 
-**These gates assume a WARM checkout** (the base repo or a lane). In a
-cold checkout (any manual `git worktree add` or agent-created worktree) do
-not run them locally: cold cargo fails loud by design
-(`scripts/rustc-cold-guard.sh`, wired via `.cargo/config.toml`;
-`BBOX_ALLOW_COLD_BUILD=1` is a deliberate operator override). Done-criteria
+**These gates assume a WARM checkout** (a checkout with a populated build
+cache, typically the base repo or a lane). In a cold checkout (any manual
+`git worktree add`, agent-created worktree, or fresh clone) do not run them
+locally. The repository enforces one case mechanically:
+`scripts/rustc-cold-guard.sh`, wired via `.cargo/config.toml`, refuses to
+compile in a linked worktree on macOS that has no cached `.rlib` files
+(`BBOX_ALLOW_COLD_BUILD=1` is a deliberate operator override). The policy is
+broader than the guard: a checkout the guard lets through is not thereby
+cheap to build. Done-criteria
 for dispatched edit-only work is committed changes with tests WRITTEN, not
 locally-run gates; the orchestrator runs all gates lane-side against the
 ref (see "Where Heavy Work Runs" and `prompts/agents/edit-only-worktree.md`).
@@ -79,10 +83,12 @@ DEFAULT; the operator-local overlay repo `~/repos/bbox-cage` owns it (its
     triage with `~/repos/bbox-cage/build/verify-triage.sh <workflow-name>`
     first - never hand-roll log pipelines per incident.
   - A red at a sha whose lane gates are green is not presumptively code:
-    resubmit the same sha (red-green = flaky test; deterministic red-red =
-    environmental), and check whether a base regen landed between the last
-    green and first red - the cluster's warm-base rotation can mint bad
-    artifacts that every subsequent clone inherits. The remedy table in
+    resubmit the same sha to test reproducibility, read the failing test's
+    evidence, and check whether a base regen landed between the last green
+    and first red - the cluster's warm-base rotation can mint bad artifacts
+    that every subsequent clone inherits. A repeat failure alone does not
+    establish an environmental cause, and a pass on retry does not establish
+    which test is flaky. The remedy table in
     `~/repos/bbox-cage/build/README.md` covers both cases.
 - **linux/amd64 images** build on the cluster:
   `~/repos/bbox-cage/build/submit-bbox-build.sh --ref <ref>` (native amd64

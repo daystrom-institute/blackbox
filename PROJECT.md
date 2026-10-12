@@ -18,6 +18,8 @@ Skip guides unrelated to the task; do not load the whole documentation map by de
   `docs/project-guides/authoring.md`.
 - Locating additional domain documentation:
   `docs/project-guides/reference-map.md`.
+- Writing or changing an agent skill, or installing the global ones:
+  `docs/agent-skills.md`.
 
 Crate and subtree `AGENTS.md` files carry local invariants. Read the applicable
 file when entering that area. Shared-service mutations require explicit operator

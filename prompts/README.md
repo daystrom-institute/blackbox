@@ -4,7 +4,7 @@ kind: prompt-hub
 corpus: blackbox-prompts
 topic:
   - prompts
-brief: "Map of checked-in interactive and dispatched-agent prompts: prose an operator points an agent at, or a brofile points a dispatched bro at. Distinct from system-defaults/ (installable artifacts) and .claude skills (harness-native commands)."
+brief: "Map of checked-in interactive and dispatched-agent prompts: prose an operator points an agent at, or a brofile points a dispatched bro at. Distinct from system-defaults/ (installable artifacts) and agent skills (procedures a provider loads on its own)."
 ---
 
 # Prompts
@@ -21,9 +21,11 @@ human reader. Two species live here:
   brofile that references it.
 
 This is **not** [`system-defaults/`](../system-defaults/system-defaults.md)
-(installable JSON artifacts: brofiles) and it is
-**not** a `.claude` skill (harness-native slash commands). It is plain Markdown
-an agent is told to read.
+(installable artifacts: brofiles and global skills) and it is **not** an
+[agent skill](../docs/agent-skills.md), which a provider lists and loads on its
+own when the task matches. A prompt here is plain Markdown an agent is told to
+read. A recurring procedure that agents should reach without being pointed at
+it belongs in a skill; the session retro is the `bbox-retro` skill.
 
 ## Operator-Pointed Prompts
 
@@ -37,7 +39,6 @@ an agent is told to read.
 | [CLOSEOUT.md](CLOSEOUT.md) | Fold a worktree back into `main`: commit, ff-only merge, push, clean up. |
 | [CLOSEOUT-beta.md](CLOSEOUT-beta.md) | Beta-line sibling of CLOSEOUT.md: fold a worktree into `beta/blackbox-v2` instead of `main`. |
 | [DESIGN_PANEL.md](DESIGN_PANEL.md) | Produce a reviewed implementation plan for **one phase or slice**: author-critic default, three-author panel escalation, adjudicated repair loop, independent review bookend to exact PASS. Prototype-stage orchestration runbook; fan-out is operator-directed via child orchestrators. |
-| [RETRO_INTERACTIVE.md](RETRO_INTERACTIVE.md) | End-of-session retro for a **live interactive** agent (tools, MCP, instructions, operator steering). Files gaps + follow-up thread notes. |
 | [REFRESH_ALL_CLIS.md](REFRESH_ALL_CLIS.md) | Refresh the harness research corpus: fan the `MINE_CLI` lens over all CLI subjects at their latest versions, integrate, validate, commit. Dispatches bros pointed at [`agents/MINE_CLI.md`](agents/MINE_CLI.md). |
 
 ## Dispatched-Agent Lenses
