@@ -16,8 +16,10 @@
   "blocking_level": "workaround_available",
   "dedupe_key": "mcp_surface/mcp-resources/read-result-cache-fields",
   "notes": "Observed after the daemon restarted under a live Claude Code session, so the session reconnected without a new process. Not verified whether a freshly started Claude Code session, which performs its own handshake, fails the same way. The bbox-onboard-project skill still works without the resource: its procedure is self-contained and the resource only adds the live checkout-host table.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "project_id": "89bd722f",
   "created_at": "2026-10-12T20:25:08Z",
-  "updated_at": "2026-10-12T20:25:08Z"
+  "updated_at": "2026-10-12T20:47:09Z",
+  "resolved_at": "2026-10-12T20:47:09Z",
+  "resolution_note": "Obsolete as of commit 07490da7: the daemon no longer serves MCP resources, prompts or skills/list, so there is no resources/read result for a client to reject. The onboarding procedure is the bbox-onboard-project agent skill, and the live producer facts the resource carried come back in the bbox_project_register no-producer refusal (unclaimed_scope_producers, daemon_url). Verified on the converged daemon: capabilities list tools only."
 }
