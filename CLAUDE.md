@@ -39,10 +39,10 @@ For project architecture, implementation, or operational work, read `PROJECT.md`
 
 Read the matching guide before that operation. Skip unrelated guides. Read a guide once unless its contents change or are no longer available in context.
 
-- Changing subsystem boundaries, protocols, or public tool surfaces: `.bbox/guidance/b849be1c5dd17b5df33420a15d98b0ffe53bff386b06074bcc078c23b41d0689/claude-architecture.md`
-- Writing project documentation, prompts, research, specifications, or system memories: `.bbox/guidance/b849be1c5dd17b5df33420a15d98b0ffe53bff386b06074bcc078c23b41d0689/claude-authoring.md`
-- Building, formatting, or testing this project: `.bbox/guidance/b849be1c5dd17b5df33420a15d98b0ffe53bff386b06074bcc078c23b41d0689/claude-build.md`
-- Operating or troubleshooting Blackbox infrastructure, configuration, or substrate gaps: `.bbox/guidance/b849be1c5dd17b5df33420a15d98b0ffe53bff386b06074bcc078c23b41d0689/claude-operations.md`
-- Dispatching, supervising, or validating agents and Fleet: `.bbox/guidance/b849be1c5dd17b5df33420a15d98b0ffe53bff386b06074bcc078c23b41d0689/claude-orchestration.md`
-- Creating, changing, or retiring durable memory: `.bbox/guidance/b849be1c5dd17b5df33420a15d98b0ffe53bff386b06074bcc078c23b41d0689/claude-persistence.md`
-- Changing or executing structural refactor tooling: `.bbox/guidance/b849be1c5dd17b5df33420a15d98b0ffe53bff386b06074bcc078c23b41d0689/claude-refactoring.md`
+- Changing subsystem boundaries, protocols, or public tool surfaces: `.bbox/guidance/8f0efdf6174fa2582c5a16a1fa3b7c3a57dea3412874f8a0f9b8bfc05216a2b6/claude-architecture.md`
+- Writing project documentation, prompts, research, specifications, or system memories: `.bbox/guidance/8f0efdf6174fa2582c5a16a1fa3b7c3a57dea3412874f8a0f9b8bfc05216a2b6/claude-authoring.md`
+- Building, formatting, or testing this project: `.bbox/guidance/8f0efdf6174fa2582c5a16a1fa3b7c3a57dea3412874f8a0f9b8bfc05216a2b6/claude-build.md`
+- Operating or troubleshooting Blackbox infrastructure, configuration, or substrate gaps: `.bbox/guidance/8f0efdf6174fa2582c5a16a1fa3b7c3a57dea3412874f8a0f9b8bfc05216a2b6/claude-operations.md`
+- Dispatching, supervising, or validating agents and Fleet: `.bbox/guidance/8f0efdf6174fa2582c5a16a1fa3b7c3a57dea3412874f8a0f9b8bfc05216a2b6/claude-orchestration.md`
+- Creating, changing, or retiring durable memory: `.bbox/guidance/8f0efdf6174fa2582c5a16a1fa3b7c3a57dea3412874f8a0f9b8bfc05216a2b6/claude-persistence.md`
+- Changing or executing structural refactor tooling: `.bbox/guidance/8f0efdf6174fa2582c5a16a1fa3b7c3a57dea3412874f8a0f9b8bfc05216a2b6/claude-refactoring.md`

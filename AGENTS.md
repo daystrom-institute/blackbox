@@ -39,10 +39,10 @@ For project architecture, implementation, or operational work, read `PROJECT.md`
 
 Read the matching guide before that operation. Skip unrelated guides. Read a guide once unless its contents change or are no longer available in context.
 
-- Changing subsystem boundaries, protocols, or public tool surfaces: `.bbox/guidance/28a1c81347297992a7092b20abacb287d8d8f3d2afb271c9d7c4234cdcdb17b6/agents-architecture.md`
-- Writing project documentation, prompts, research, specifications, or system memories: `.bbox/guidance/28a1c81347297992a7092b20abacb287d8d8f3d2afb271c9d7c4234cdcdb17b6/agents-authoring.md`
-- Building, formatting, or testing this project: `.bbox/guidance/28a1c81347297992a7092b20abacb287d8d8f3d2afb271c9d7c4234cdcdb17b6/agents-build.md`
-- Operating or troubleshooting Blackbox infrastructure, configuration, or substrate gaps: `.bbox/guidance/28a1c81347297992a7092b20abacb287d8d8f3d2afb271c9d7c4234cdcdb17b6/agents-operations.md`
-- Dispatching, supervising, or validating agents and Fleet: `.bbox/guidance/28a1c81347297992a7092b20abacb287d8d8f3d2afb271c9d7c4234cdcdb17b6/agents-orchestration.md`
-- Creating, changing, or retiring durable memory: `.bbox/guidance/28a1c81347297992a7092b20abacb287d8d8f3d2afb271c9d7c4234cdcdb17b6/agents-persistence.md`
-- Changing or executing structural refactor tooling: `.bbox/guidance/28a1c81347297992a7092b20abacb287d8d8f3d2afb271c9d7c4234cdcdb17b6/agents-refactoring.md`
+- Changing subsystem boundaries, protocols, or public tool surfaces: `.bbox/guidance/77826f2bae044178e95dfea27b8a9ee625657b0a992cffd03a590734594f7f02/agents-architecture.md`
+- Writing project documentation, prompts, research, specifications, or system memories: `.bbox/guidance/77826f2bae044178e95dfea27b8a9ee625657b0a992cffd03a590734594f7f02/agents-authoring.md`
+- Building, formatting, or testing this project: `.bbox/guidance/77826f2bae044178e95dfea27b8a9ee625657b0a992cffd03a590734594f7f02/agents-build.md`
+- Operating or troubleshooting Blackbox infrastructure, configuration, or substrate gaps: `.bbox/guidance/77826f2bae044178e95dfea27b8a9ee625657b0a992cffd03a590734594f7f02/agents-operations.md`
+- Dispatching, supervising, or validating agents and Fleet: `.bbox/guidance/77826f2bae044178e95dfea27b8a9ee625657b0a992cffd03a590734594f7f02/agents-orchestration.md`
+- Creating, changing, or retiring durable memory: `.bbox/guidance/77826f2bae044178e95dfea27b8a9ee625657b0a992cffd03a590734594f7f02/agents-persistence.md`
+- Changing or executing structural refactor tooling: `.bbox/guidance/77826f2bae044178e95dfea27b8a9ee625657b0a992cffd03a590734594f7f02/agents-refactoring.md`
