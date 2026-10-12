@@ -56,9 +56,9 @@ and reports anything else at a target path as a conflict.
 Install a skill name in exactly one place. Providers do not merge same-name
 skills from two scanned directories, so a second copy shows up as a duplicate.
 
-The daemon also serves the onboarding procedure as the MCP resource
-`blackbox://skills/onboard-project/SKILL.md`, built from the same skill body
-with the deployment's current checkout hosts and producer policy appended.
+The daemon serves no skills, resources or prompts over MCP: its MCP surface is
+tools only. Deployment state a procedure needs comes back from the tool it
+calls, as `bbox_project_register` does for checkout hosts and producer policy.
 
 ## Writing a skill
 

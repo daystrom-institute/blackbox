@@ -491,13 +491,6 @@ mod tests {
         for (method, params, headers) in [
             ("server/discover", serde_json::json!({}), vec![]),
             ("tools/list", serde_json::json!({}), vec![]),
-            ("resources/list", serde_json::json!({}), vec![]),
-            ("prompts/list", serde_json::json!({}), vec![]),
-            (
-                "resources/read",
-                serde_json::json!({ "uri": "blackbox://skills/onboard-project/SKILL.md" }),
-                vec![("mcp-name", "blackbox://skills/onboard-project/SKILL.md")],
-            ),
             (
                 "tools/call",
                 serde_json::json!({ "name": "bbox_thread_list", "arguments": {} }),

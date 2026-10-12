@@ -11,11 +11,14 @@
   handler is served by a fresh instance bound to that request's own scope
   (`scoped_for`); it never falls back to `default` when the request names
   something else, and the shared handler stays unpinned.
-- Every MCP method resolves or checks request scope, including the ones
-  whose answer does not vary by surface (resources, prompts, `skills/list`):
+- The MCP surface is tools only. The daemon advertises no resources, prompts
+  or skills extension and implements none of their methods; procedures are
+  agent skills installed on the client host, and deployment state a
+  procedure needs is returned by the tool it calls.
+- Every MCP method the daemon implements resolves or checks request scope:
   a request naming an unknown surface or an unauthenticated binding is
   refused on all of them, never served a partial catalog.
-- Catalog listings (tools, resources, prompts) are stable in order and carry
+- The tool listing is stable in order and carries
   `ttlMs` and `cacheScope: private` only for a request that reached an
   uninitialized handler on a revision without a handshake. A handler that
   initialized never adds them, whatever version a request's `_meta` claims.

@@ -23,6 +23,12 @@ out explicitly under `Changed` or `Removed`.
   Tool guidance names the skill where it named a runbook id. Run
   `scripts/sync-skills.sh` on each agent host after upgrading.
 
+  Removed: the daemon's MCP resource, prompt and `skills/list` surface, which
+  served only the onboarding skill. The MCP surface is tools only. The
+  `bbox_project_register` no-producer refusal now carries
+  `unclaimed_scope_producers` and `daemon_url`, and onboarding refusals name
+  the `bbox-onboard-project` skill in `skill` where they carried `skill_uri`.
+
 - The `/mcp` and `/control/*` planes can admit OAuth access tokens beside the
   service bearer. `[daemon.mcp_oauth]` (`issuer`, `audience`,
   `required_group`, optional `jwks_uri`; `BBOX_MCP_OAUTH_ISSUER`,

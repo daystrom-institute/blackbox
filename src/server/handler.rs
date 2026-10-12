@@ -1,32 +1,18 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::server::{self, BlackboxServer};
 
 use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::model::{
-    CacheScope, CallToolRequestParams, CallToolResponse, CustomRequest, CustomResult,
-    DiscoverResult, ErrorCode, GetPromptRequestParams, GetPromptResponse, GetPromptResult,
-    InitializeRequestParams, InitializeResult, ListPromptsResult, ListResourcesResult,
-    ListToolsResult, PaginatedRequestParams, Prompt, PromptArgument, PromptMessage,
-    ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
-    ResourceContents, Role, ServerCapabilities, ServerConfig,
+    CacheScope, CallToolRequestParams, CallToolResponse, DiscoverResult, ErrorCode,
+    InitializeRequestParams, InitializeResult, ListToolsResult, PaginatedRequestParams,
+    ProtocolVersion, ServerCapabilities, ServerConfig,
 };
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, ServerHandler, tool_handler};
-use serde::Deserialize;
-use serde_json::json;
 
-use super::onboarding_skill::{
-    self, ONBOARDING_SKILL_DESCRIPTION, ONBOARDING_SKILL_NAME, ONBOARDING_SKILL_URI,
-};
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SkillsListParams {
-    #[allow(dead_code)]
-    cursor: Option<String>,
-}
+use super::render_owner::ONBOARDING_SKILL;
 
 // ---------------------------------------------------------------------------
 // ServerHandler impl
@@ -427,23 +413,13 @@ static MODERN_LIFECYCLE_VERSIONS: [ProtocolVersion; 4] = [
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for BlackboxServer {
     fn get_info(&self) -> ServerConfig {
-        let mut extensions = BTreeMap::new();
-        extensions.insert(
-            "io.modelcontextprotocol/skills".to_string(),
-            serde_json::Map::new(),
-        );
-        ServerConfig::new(
-            ServerCapabilities::builder()
-                .enable_extensions_with(extensions)
-                .enable_prompts()
-                .enable_resources()
-                .enable_tools()
-                .build(),
-        )
-        .with_protocol_version(LEGACY_PROTOCOL_VERSION)
-        .with_instructions(format!(
-            "Blackbox provides unified transcript search, knowledge management, and multi-provider agent orchestration. Project onboarding is described by resource {ONBOARDING_SKILL_URI}."
-        ))
+        // Tools are the whole MCP surface. Procedures are agent skills
+        // installed on the client host, not resources or prompts served here.
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+            .with_protocol_version(LEGACY_PROTOCOL_VERSION)
+            .with_instructions(format!(
+                "Blackbox provides unified transcript search, knowledge management, and multi-provider agent orchestration. Project onboarding is the `{ONBOARDING_SKILL}` agent skill."
+            ))
     }
 
     fn supported_protocol_versions(&self) -> std::borrow::Cow<'static, [ProtocolVersion]> {
@@ -535,127 +511,6 @@ impl ServerHandler for BlackboxServer {
         })
     }
 
-    async fn list_resources(
-        &self,
-        _request: Option<PaginatedRequestParams>,
-        context: RequestContext<RoleServer>,
-    ) -> Result<ListResourcesResult, ErrorData> {
-        self.refuse_unservable_scope(&context).await?;
-        let (ttl_ms, cache_scope) =
-            catalog_cache_hints(self.scope_pinned(), context.protocol_version().as_ref());
-        Ok(ListResourcesResult {
-            resources: vec![
-                Resource::new(ONBOARDING_SKILL_URI, "onboard-project/SKILL.md")
-                    .with_description(ONBOARDING_SKILL_DESCRIPTION)
-                    .with_mime_type("text/markdown"),
-            ],
-            ttl_ms,
-            cache_scope,
-            ..Default::default()
-        })
-    }
-
-    async fn read_resource(
-        &self,
-        request: ReadResourceRequestParams,
-        context: RequestContext<RoleServer>,
-    ) -> Result<ReadResourceResponse, ErrorData> {
-        self.refuse_unservable_scope(&context).await?;
-        if request.uri != ONBOARDING_SKILL_URI {
-            return Err(ErrorData::resource_not_found(
-                format!("resource not found: {}", request.uri),
-                None,
-            ));
-        }
-        Ok(ReadResourceResult::new(vec![
-            ResourceContents::text(onboarding_skill::render(&self.state), ONBOARDING_SKILL_URI)
-                .with_mime_type("text/markdown"),
-        ])
-        .into())
-    }
-
-    async fn list_prompts(
-        &self,
-        _request: Option<PaginatedRequestParams>,
-        context: RequestContext<RoleServer>,
-    ) -> Result<ListPromptsResult, ErrorData> {
-        self.refuse_unservable_scope(&context).await?;
-        let (ttl_ms, cache_scope) =
-            catalog_cache_hints(self.scope_pinned(), context.protocol_version().as_ref());
-        Ok(ListPromptsResult {
-            prompts: vec![Prompt::new(
-                ONBOARDING_SKILL_NAME,
-                Some(ONBOARDING_SKILL_DESCRIPTION),
-                Some(vec![
-                    PromptArgument::new("path")
-                        .with_description("Absolute path on the checkout host")
-                        .with_required(false),
-                ]),
-            )],
-            ttl_ms,
-            cache_scope,
-            ..Default::default()
-        })
-    }
-
-    async fn get_prompt(
-        &self,
-        request: GetPromptRequestParams,
-        context: RequestContext<RoleServer>,
-    ) -> Result<GetPromptResponse, ErrorData> {
-        self.refuse_unservable_scope(&context).await?;
-        if request.name != ONBOARDING_SKILL_NAME {
-            return Err(ErrorData::invalid_params(
-                format!("unknown prompt: {}", request.name),
-                None,
-            ));
-        }
-        let path = request
-            .arguments
-            .as_ref()
-            .and_then(|arguments| arguments.get("path"))
-            .and_then(serde_json::Value::as_str);
-        let target = path
-            .map(|path| format!("Please onboard the project at `{path}`."))
-            .unwrap_or_else(|| "Please onboard the current project.".to_string());
-        let message = format!("{}\n\n{target}\n", onboarding_skill::render(&self.state));
-        Ok(
-            GetPromptResult::new(vec![PromptMessage::new_text(Role::User, message)])
-                .with_description(ONBOARDING_SKILL_DESCRIPTION)
-                .into(),
-        )
-    }
-
-    async fn on_custom_request(
-        &self,
-        request: CustomRequest,
-        context: RequestContext<RoleServer>,
-    ) -> Result<CustomResult, ErrorData> {
-        self.refuse_unservable_scope(&context).await?;
-        if request.method != "skills/list" {
-            return Err(ErrorData::new(
-                ErrorCode::METHOD_NOT_FOUND,
-                request.method,
-                None,
-            ));
-        }
-        request
-            .params_as::<SkillsListParams>()
-            .map_err(|error| ErrorData::invalid_params(error.to_string(), None))?;
-        let text = onboarding_skill::render(&self.state);
-        let value = json!({
-            "skills": [{
-                "frontmatter": {
-                    "name": ONBOARDING_SKILL_NAME,
-                    "description": ONBOARDING_SKILL_DESCRIPTION,
-                },
-                "uri": ONBOARDING_SKILL_URI,
-                "digest": onboarding_skill::digest(&text),
-            }]
-        });
-        Ok(CustomResult::new(value))
-    }
-
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
@@ -700,18 +555,8 @@ impl ServerHandler for BlackboxServer {
 mod tests {
     use std::sync::Arc;
 
-    use rmcp::model::{
-        ClientRequest, GetPromptRequestParams, ReadResourceRequestParams, ResourceContents,
-        ServerResult,
-    };
-    use rmcp::{ClientHandler, ServiceExt};
-    use serde_json::{Value, json};
-
     use super::*;
     use crate::server::SharedState;
-
-    struct TestClient;
-    impl ClientHandler for TestClient {}
 
     fn test_server() -> (tempfile::TempDir, BlackboxServer) {
         let dir = tempfile::tempdir().unwrap();
@@ -722,8 +567,7 @@ mod tests {
 
     // The handler methods take a `RequestContext`, which needs a live peer and
     // cannot be built here, so scope handling is tested through `scoped_for`
-    // and the hint decision through `catalog_cache_hints`; the call sites in
-    // the resource, prompt and custom-request methods have no direct test.
+    // and the hint decision through `catalog_cache_hints`.
     fn request_parts(uri: &str, headers: &[(&str, &str)]) -> http::request::Parts {
         let mut request = http::Request::builder().uri(uri);
         for (name, value) in headers {
@@ -954,124 +798,18 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_advertise_tools_resources_prompts_and_skills() {
+    fn capabilities_advertise_tools_only() {
         let (_dir, server) = test_server();
         let info = server.get_info();
         assert!(info.capabilities.tools.is_some());
-        assert!(info.capabilities.resources.is_some());
-        assert!(info.capabilities.prompts.is_some());
-        assert_eq!(
-            info.capabilities
-                .extensions
-                .as_ref()
-                .and_then(|extensions| extensions.get("io.modelcontextprotocol/skills")),
-            Some(&serde_json::Map::new())
-        );
+        assert!(info.capabilities.resources.is_none());
+        assert!(info.capabilities.prompts.is_none());
+        assert!(info.capabilities.extensions.is_none());
         assert!(
             info.instructions
                 .as_deref()
                 .unwrap()
-                .contains(ONBOARDING_SKILL_URI)
+                .contains(ONBOARDING_SKILL)
         );
-    }
-
-    #[tokio::test]
-    async fn skill_resource_and_prompts_round_trip_over_mcp_transport() {
-        let (_dir, server) = test_server();
-        let (server_io, client_io) = tokio::io::duplex(64 * 1024);
-        let serving = tokio::spawn(async move {
-            server
-                .serve(server_io)
-                .await
-                .unwrap()
-                .waiting()
-                .await
-                .unwrap();
-        });
-        let client = TestClient.serve(client_io).await.unwrap();
-
-        let result = client
-            .send_request(ClientRequest::CustomRequest(CustomRequest::new(
-                "skills/list",
-                Some(json!({})),
-            )))
-            .await
-            .unwrap();
-        let ServerResult::CustomResult(skills) = result else {
-            panic!("unexpected custom result");
-        };
-        let skills: Value = skills.0;
-        assert_eq!(
-            skills["skills"][0]["frontmatter"]["name"],
-            ONBOARDING_SKILL_NAME
-        );
-        assert_eq!(skills["skills"][0]["uri"], ONBOARDING_SKILL_URI);
-
-        let resources = client.list_resources(None).await.unwrap();
-        assert_eq!(resources.resources.len(), 1);
-        assert_eq!(resources.resources[0].uri, ONBOARDING_SKILL_URI);
-        let read = client
-            .read_resource(ReadResourceRequestParams::new(ONBOARDING_SKILL_URI))
-            .await
-            .unwrap();
-        let ResourceContents::TextResourceContents {
-            text, mime_type, ..
-        } = &read.contents[0]
-        else {
-            panic!("skill resource must be text");
-        };
-        assert_eq!(mime_type.as_deref(), Some("text/markdown"));
-        assert!(text.starts_with("---\nname: onboard-project\ndescription:"));
-        assert_eq!(
-            skills["skills"][0]["digest"],
-            onboarding_skill::digest(text)
-        );
-
-        let prompts = client.list_prompts(None).await.unwrap();
-        assert_eq!(prompts.prompts[0].name, ONBOARDING_SKILL_NAME);
-        let without_path = client
-            .get_prompt(GetPromptRequestParams::new(ONBOARDING_SKILL_NAME))
-            .await
-            .unwrap();
-        assert!(
-            serde_json::to_string(&without_path)
-                .unwrap()
-                .contains("current project")
-        );
-        let with_path = client
-            .get_prompt(
-                GetPromptRequestParams::new(ONBOARDING_SKILL_NAME).with_arguments(
-                    json!({"path":"/srv/checkouts/demo"})
-                        .as_object()
-                        .unwrap()
-                        .clone(),
-                ),
-            )
-            .await
-            .unwrap();
-        assert!(
-            serde_json::to_string(&with_path)
-                .unwrap()
-                .contains("/srv/checkouts/demo")
-        );
-
-        assert!(
-            client
-                .read_resource(ReadResourceRequestParams::new("blackbox://unknown"))
-                .await
-                .is_err()
-        );
-        assert!(
-            client
-                .send_request(ClientRequest::CustomRequest(CustomRequest::new(
-                    "skills/unknown",
-                    None,
-                )))
-                .await
-                .is_err()
-        );
-
-        client.cancel().await.unwrap();
-        serving.await.unwrap();
     }
 }

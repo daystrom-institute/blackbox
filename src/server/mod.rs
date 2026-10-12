@@ -33,7 +33,6 @@ pub(crate) mod control;
 pub(crate) mod drain;
 pub(crate) mod knowledge_view;
 mod mcp;
-pub(crate) mod onboarding_skill;
 mod open;
 pub(crate) mod producer_auth;
 pub(crate) mod producer_commands;

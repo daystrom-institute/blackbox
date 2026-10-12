@@ -81,7 +81,7 @@ plan.
 | App-level cancellation (`bro_cancel` = SIGTERM + store transition) | `src/tools/dispatch.rs` | No protocol cancellation for tools today; tasks extension adds `tasks/cancel` in Phase 2 |
 | Client: harness child -> daemon, `StreamableHttpClientTransport` | `crates/bro-harness/src/mcp.rs` | Same; the one client pair we own end to end (proving ground) |
 | 80KB response budget; oversize is an in-band `response_too_large` tool error | `src/server/response.rs` | Orthogonal: nothing is written to daemon disk, so the budget holds unchanged for a remote daemon |
-| Capabilities: tools, plus resources, prompts and the `io.modelcontextprotocol/skills` extension serving the one onboarding skill; no subscriptions | `src/server/handler.rs` (`get_info`) | Phase 4 resource projection extends the existing `list_resources` / `read_resource` |
+| Capabilities: tools only; no resources, prompts, skills extension or subscriptions | `src/server/handler.rs` (`get_info`) | Phase 4 resource projection would add `list_resources` / `read_resource` |
 | `StreamableHttpService<S, M>` bound | `src/server/mcp.rs` | Now requires `S: ServerHandler` (was `Service<RoleServer>`); we already impl `ServerHandler` |
 | Zero auth (loopback trust) | transport layer, implicitly | Fine until the corpus daemon leaves the machine; Q8 picks the auth story (bearer + TLS minimum) before locality-first slice 6 |
 

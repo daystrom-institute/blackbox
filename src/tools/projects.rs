@@ -486,11 +486,28 @@ impl BlackboxServer {
                     "message": "multiple checkout-host producers have equally specific enroll roots for this path",
                     "path": params.path,
                     "candidates": producer_ids,
-                    "skill_uri": crate::server::onboarding_skill::ONBOARDING_SKILL_URI,
+                    "skill": crate::server::render_owner::ONBOARDING_SKILL,
                     "next_step": "Call bbox_project_register again with the producer parameter set to one candidate id."
                 }));
             }
             Err(ProducerSelectionError::NoProducer { known }) => {
+                // The refusal carries what the operator needs to cover the
+                // path: which producers may claim a new scope, and the URL a
+                // new collector would be pointed at.
+                let (unclaimed_scope_producers, daemon_url) = {
+                    let config = self.state.config.read();
+                    let producers = config
+                        .code_collection
+                        .producers
+                        .iter()
+                        .filter(|producer| {
+                            producer.claim_scopes
+                                == bbox_config::config::ProducerScopeClaimPolicy::Unclaimed
+                        })
+                        .map(|producer| producer.producer_id.clone())
+                        .collect::<Vec<_>>();
+                    (producers, config.daemon.advertise_url.clone())
+                };
                 let known = known
                     .into_iter()
                     .map(|producer| {
@@ -514,7 +531,10 @@ impl BlackboxServer {
                     "message": "no fresh checkout-host producer covers this path",
                     "path": params.path,
                     "known_producers": known,
-                    "skill_uri": crate::server::onboarding_skill::ONBOARDING_SKILL_URI,
+                    "unclaimed_scope_producers": unclaimed_scope_producers,
+                    "daemon_url": daemon_url,
+                    "skill": crate::server::render_owner::ONBOARDING_SKILL,
+                    "next_step": "Ask the operator to cover this path: a code collector on the checkout host needs an enroll root that contains it and an operator-minted token. When unclaimed_scope_producers is empty, the operator must also grant a producer the new scope in the daemon's producer config.",
                 }));
             }
         };
@@ -723,7 +743,7 @@ impl BlackboxServer {
                             p.path
                         ),
                         "path": p.path,
-                        "skill_uri": crate::server::onboarding_skill::ONBOARDING_SKILL_URI,
+                        "skill": crate::server::render_owner::ONBOARDING_SKILL,
                     })
                 );
             }
@@ -1473,7 +1493,12 @@ mod tests {
             result_text(&result)
         );
         assert!(
-            result_text(&result).contains(crate::server::onboarding_skill::ONBOARDING_SKILL_URI),
+            result_text(&result).contains("unclaimed_scope_producers"),
+            "{}",
+            result_text(&result)
+        );
+        assert!(
+            result_text(&result).contains(crate::server::render_owner::ONBOARDING_SKILL),
             "{}",
             result_text(&result)
         );
@@ -1500,8 +1525,8 @@ mod tests {
             .unwrap_err();
         assert_eq!(error["code"], "error.project_onboarding_ambiguous");
         assert_eq!(
-            error["skill_uri"],
-            crate::server::onboarding_skill::ONBOARDING_SKILL_URI
+            error["skill"],
+            crate::server::render_owner::ONBOARDING_SKILL
         );
     }
 
@@ -1518,7 +1543,7 @@ mod tests {
             .await;
         assert_eq!(result.is_error, Some(true));
         assert!(
-            result_text(&result).contains(crate::server::onboarding_skill::ONBOARDING_SKILL_URI),
+            result_text(&result).contains(crate::server::render_owner::ONBOARDING_SKILL),
             "{}",
             result_text(&result)
         );

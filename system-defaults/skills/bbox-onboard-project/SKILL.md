@@ -30,7 +30,7 @@ Add `"producer":"<producer id>"` only to resolve `error.project_onboarding_ambig
 
 A receipt that reports enrollment as pending is not a completed enrollment. Read what the receipt says happened.
 
-If you do not know which host or producer applies, read the MCP resource `blackbox://skills/onboard-project/SKILL.md` when your client can read resources. The daemon renders its current checkout hosts, enroll roots and producer policy there.
+You do not need to know the hosts or producers in advance. When registration cannot route, the refusal carries the live picture (see the last section).
 
 ## 3. Commit the identity files
 
@@ -59,10 +59,16 @@ Report the project identity, the identity commit, and which stage the project ha
 
 ## When registration cannot proceed
 
-These need the operator. State the specific missing piece and ask; do not guess credentials or edit daemon policy.
+`error.project_onboarding_no_producer` means no fresh collector covers the path. Read what it returns before asking for anything:
 
-- No fresh collector covers the path: a collector must be installed on that host with an `enroll_roots` entry containing the project, and its token minted.
-- No producer may claim the scope: the operator grants it in the daemon's producer config.
-- A collector exists but routing failed: the operator can enroll directly on that host with `bbox-code-collector --config <collector config path> add <path>`.
+- `known_producers`: each known collector's host label, enroll roots, config path and freshness, with a ready `host_shell_fallback` command that enrolls this path directly on that host.
+- `unclaimed_scope_producers`: the producers allowed to claim a new scope. Empty means none can, and the operator must grant one in the daemon's producer config.
+- `daemon_url`: the URL a new collector would be pointed at, when the daemon advertises one.
+
+These need the operator. State the specific missing piece from that refusal and ask; do not guess credentials or edit daemon policy.
+
+- No collector on the host that owns the path: one must be installed there with an `enroll_roots` entry containing the project, and its token minted.
+- A collector is listed but stale, or its roots do not contain the path: the operator fixes that collector, or runs its `host_shell_fallback` on that host.
+- `unclaimed_scope_producers` is empty: the operator grants a producer the scope.
 
 Enrollment is live-reloaded, so none of this needs a service restart. If a restart of a shared service does become necessary, name the service and get approval for it first.

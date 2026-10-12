@@ -7,7 +7,7 @@ topic:
   - daemon-runtime
   - project-catalog
 tags: [locality, onboarding, collector, catalog, transport, skills]
-brief: "New-project onboarding with zero daemon checkout access and no per-project operator config: a producer may claim unclaimed scopes on first onboard, the checkout-owner collector enrolls projects into a live-reloaded sidecar, bbox_project_register routes a remote path to the collector that covers it, and the daemon serves an instance-rendered onboarding skill over MCP."
+brief: "New-project onboarding with zero daemon checkout access and no per-project operator config: a producer may claim unclaimed scopes on first onboard, the checkout-owner collector enrolls projects into a live-reloaded sidecar, bbox_project_register routes a remote path to the collector that covers it, and its refusals carry the live producer and policy facts the onboarding skill needs."
 ---
 
 # Remote project onboarding through the collector backchannel
@@ -43,9 +43,10 @@ Four cooperating pieces:
    it is willing to enroll under. `bbox_project_register` on a path the daemon
    cannot see routes an enroll command to the covering collector over the
    producer channel and returns the onboard receipt.
-4. **Onboarding skill (MCP).** The daemon serves an onboarding skill whose
-   body is rendered from live instance facts: known producers, their hosts,
-   enroll roots, config paths, claim policy, and the daemon's advertised URL.
+4. **Onboarding skill.** The procedure is an agent skill installed on the
+   client host. The registration refusals carry the live instance facts it
+   needs: known producers, their hosts, enroll roots, config paths, claim
+   policy, and the daemon's advertised URL.
 
 ## 2. Scope claims
 
@@ -204,41 +205,21 @@ currently checked-out branch does not select or constrain the published ref.
 Producer, ref, and scope changes and rollback are operator moves
 ([publisher-auto-advance.md](publisher-auto-advance.md)).
 
-## 6. Onboarding skill over MCP
+## 6. Onboarding procedure
 
-The daemon declares MCP resources, prompts, and the
-`io.modelcontextprotocol/skills` extension, and serves one onboarding skill
-three ways:
+The procedure is the `bbox-onboard-project` agent skill, installed on the
+client host. The daemon serves no skill, resource or prompt for it.
 
-- `skills/list`, for clients that consume the skills extension;
-- `resources/list` and `resources/read` on the skill's `SKILL.md` URI, for
-  clients that read MCP resources;
-- a prompt, for clients that expose MCP prompts as commands.
+Deployment state reaches the agent through the registration tool's own
+refusals, at the point it is needed:
 
-Wire shape consumed by Claude Code's skills-extension client:
+- `error.project_onboarding_ambiguous` lists the candidate producer ids.
+- `error.project_onboarding_no_producer` lists every known producer (host
+  label, enroll roots, config path, freshness, and a host-shell fallback
+  command), the producers allowed to claim an unclaimed scope, and the
+  advertised daemon URL.
 
-- The server capabilities carry both `resources` and
-  `extensions["io.modelcontextprotocol/skills"]` (an object; `directoryRead`
-  is optional and unused here).
-- `skills/list` takes `{cursor?}` and returns `{skills: [{frontmatter:
-  {name, description}, uri, digest}], nextCursor?}`.
-- `resources/read` on `uri` returns the complete `SKILL.md` (YAML
-  frontmatter plus body) as the first text content. `digest` is
-  `sha256:<hex>` of exactly that text; the client caches by digest.
-- The client names the skill `<server>:<name>` and ignores hooks and
-  allowed-tools declared by MCP-sourced skills.
-
-Because the client caches by digest, the rendered body carries no
-per-read volatile values (clock times, ages); it changes only when the
-instance facts it states change.
-
-The skill body is rendered at read time from instance facts: fresh producer
-presence (host label, enroll roots, config path, service label), claim
-policy, and the daemon's `advertise_url` when configured. It
-states the register call, the commit step, the host-shell `add` fallback,
-the verification reads, and for a host with no collector the collector
-config to write, with `server_url` set from `advertise_url`. The
-remote-path errors from section 4.2 name the skill's resource URI.
+Each refusal names the skill.
 
 ## 7. Trust model
 
@@ -299,8 +280,8 @@ operator runs the relevant cutover ceremony for it; nothing fails open.
   presence; idempotent re-register; timeout pending result.
 - publication defaults: the first valid candidate from the owning producer
   establishes the pointer; later candidates on its ref advance it.
-- skill: served through skills/list, resources, and prompts; body reflects
-  presence and policy; digest matches the served body.
+- refusals: the no-producer refusal reflects presence, claim policy and the
+  advertised URL; each onboarding refusal names the skill.
 - end to end on the estate: register a throwaway repository from an MCP
   call, commit its identity, observe catalog attachment, first collection,
   search visibility, and published knowledge.

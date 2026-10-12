@@ -107,10 +107,9 @@ scripts/sync-skills.sh
 
 ## 4. Enroll a project from its owning checkout
 
-The `bbox-onboard-project` skill carries the procedure. MCP clients can also
-read it, with this deployment's checkout hosts and producer policy appended,
-from `blackbox://skills/onboard-project/SKILL.md`, through the
-`onboard-project` prompt, or through `skills/list`.
+The `bbox-onboard-project` skill carries the procedure. When registration
+cannot route, the `bbox_project_register` refusal lists the known collectors,
+the producers allowed to claim a new scope, and the daemon URL.
 
 Check `bbox_project_list()` before adding a project. Configure one producer
 with `claim_scopes = "unclaimed"` and configure the

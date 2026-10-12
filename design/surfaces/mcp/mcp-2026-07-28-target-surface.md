@@ -360,12 +360,10 @@ blackbox://artifact/{kind}/{name}                   (installation receipt)
 blackbox://task/{id}                                (live task state)
 blackbox://project/{project_id}                     (catalog project)
 blackbox://project/{project_id}/graph/{graph_id}    (published project graph)
-blackbox://skills/onboard-project/SKILL.md
 ```
 
-`blackbox://skills/onboard-project/SKILL.md` is served today through
-resources, prompts and the `io.modelcontextprotocol/skills` extension; it is
-the only resource the daemon lists. Brofiles are the only installable
+The daemon lists no resources today: its MCP surface is tools only, and
+procedures are agent skills installed on the client host. Brofiles are the only installable
 artifact kind: the other kinds are retired, their receipts stay readable
 with an explicit kind, and they get no catalog of their own.
 
