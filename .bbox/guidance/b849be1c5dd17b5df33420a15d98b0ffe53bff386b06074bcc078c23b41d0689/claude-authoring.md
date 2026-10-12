@@ -22,7 +22,7 @@ The `research/` corpus (sibling of `design/`, mapped by `research/research-corpu
 
 **Deep docs belong in system memories**
 
-In transcript-search/blackbox, deep tool and workflow documentation must stay out of always-rendered provider memory. Use scoped/deferred surfaces and code-owned system memories for role-specific or cold docs. When adding a new tool category, do not trim unrelated hot docs or raise the prompt-size budget to compensate; put the tool behind the appropriate surface/deferred memory boundary unless it is genuinely hot-path guidance.
+In transcript-search/blackbox, deep tool and workflow documentation must stay out of always-rendered provider memory. Use scoped/deferred surfaces and agent skills for role-specific or cold docs. When adding a new tool category, do not trim unrelated hot docs or raise the prompt-size budget to compensate; put the tool behind the appropriate surface/deferred memory boundary unless it is genuinely hot-path guidance.
 
 
 ### System Memory
