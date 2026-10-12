@@ -1,0 +1,23 @@
+{
+  "id": "gap-59a5749e",
+  "title": "Claude Code rejects the daemon's resources/read result, so MCP resources are unreadable from that client",
+  "gap_kind": "mcp_surface",
+  "domain": "mcp-resources",
+  "wanted_capability": "Read a Blackbox MCP resource (for example blackbox://skills/onboard-project/SKILL.md) from a Claude Code session. The client validates the resources/read result and requires a numeric ttlMs and a cacheScope of public or private; the daemon's result carries only contents, so the read fails client-side even though the daemon answered.",
+  "missing_primitive": "ttlMs and cacheScope on the resources/read result for the protocol revision this client speaks",
+  "fallback_used": "Opened a raw MCP session with curl on protocol 2025-06-18 using the service bearer and read the resource there; that read succeeded and returned result keys [contents] only.",
+  "evidence": [
+    "src/server/handler.rs: list handlers set ttl_ms and cache_scope, read_resource does not",
+    "client error: Invalid result for resources/read: ttlMs expected number received undefined; cacheScope expected public|private",
+    "system-defaults/skills/bbox-onboard-project/SKILL.md directs agents to this resource for live checkout hosts",
+    "resources/list from the same session succeeded"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "mcp_surface/mcp-resources/read-result-cache-fields",
+  "notes": "Observed after the daemon restarted under a live Claude Code session, so the session reconnected without a new process. Not verified whether a freshly started Claude Code session, which performs its own handshake, fails the same way. The bbox-onboard-project skill still works without the resource: its procedure is self-contained and the resource only adds the live checkout-host table.",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "created_at": "2026-10-12T20:25:08Z",
+  "updated_at": "2026-10-12T20:25:08Z"
+}
