@@ -1877,7 +1877,7 @@ mod tests {
             crate::server::state::SharedState::for_test(&root),
         ));
         assert!(
-            system_memory::search(None).len() > 3,
+            system_memory::search(None).len() > 2,
             "fixture must span pages"
         );
         for query in [None, Some("refactor")] {
@@ -1890,7 +1890,7 @@ mod tests {
                     .bbox_knowledge(Parameters(KnowledgeListParams {
                         category: Some("system_memory".into()),
                         query: query.map(str::to_owned),
-                        limit: Some(3),
+                        limit: Some(2),
                         offset: Some(offset),
                         ..Default::default()
                     }))
@@ -1909,7 +1909,7 @@ mod tests {
                             .and_then(|line| line.split_once(':').map(|(id, _)| id.to_owned()))
                     })
                     .collect();
-                assert!(!ids.is_empty() && ids.len() <= 3, "{out}");
+                assert!(!ids.is_empty() && ids.len() <= 2, "{out}");
                 for id in &ids {
                     assert!(out.contains(&format!("ref: system_memory:{id}")), "{out}");
                     assert!(
