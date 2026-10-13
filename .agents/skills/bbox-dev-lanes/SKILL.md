@@ -1,6 +1,6 @@
 ---
 name: bbox-dev-lanes
-description: Choose where to build, test and verify changes to this repository, including cold worktrees, warm cluster lanes and the local contributor fallback. Use before running cargo build, check, nextest or clippy in a checkout you have not built in, when starting work in a new worktree, when cargo fails with the cold-checkout guard, when dispatching an agent to write code here, and when asked to verify or build a ref.
+description: Choose where to build, test and verify changes to this repository, including cold worktrees, warm cluster lanes and the local contributor fallback. Use before running cargo build, check, nextest or clippy in a checkout you have not built in, when starting work in a new worktree, when cargo fails with the cold-checkout guard, when dispatching an agent to write code here, when claiming or releasing a warm lane, and when asked to verify or build a ref.
 ---
 
 # Where blackbox work runs
@@ -56,7 +56,7 @@ scripts/fmt.sh --check
 
 ## Dispatching another agent to write code here
 
-- For heavy work, give it a warm lane as its working directory and one line telling it to read the lane contract first (see [estate-lanes.md](estate-lanes.md)).
+- For heavy work, give it a warm lane as its working directory and one line naming the lane contract documents to read first, by absolute path (see [estate-lanes.md](estate-lanes.md)).
 - For edit-only work in a cold worktree, point it at `prompts/agents/edit-only-worktree.md`. Its done-criteria is the handed-over change, never locally run gates.
 - You run the gates against its ref and send corrections back to the same session, which still holds the context.
 
