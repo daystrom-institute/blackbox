@@ -31,15 +31,13 @@ for the marker rather than compiling into a half-provisioned lane.
 To run a gate against a pushed ref in a lane you hold:
 
 ```sh
-~/repos/bbox-cage/build/lanes/lane-run.sh <name> --ref <sha or origin/branch> -- <command>
+~/repos/bbox-cage/build/lanes/lane-run.sh <name> --ref <ref> -- <command>
 ```
 
-It fetches, resets the lane checkout to that ref, refusing a checkout with
-tracked modifications, and runs the command there, so bare cargo names route
-into the pod. Name the handed-over commit by its SHA or as `origin/<branch>`:
-a bare branch name resolves to the lane's local branch, which the fetch does
-not move. Confirm the commit it reports before trusting the result. This is
-how a dispatcher gates a worker's handed-over ref.
+It fetches, resets the lane checkout to that ref as pushed, refusing a
+checkout with tracked modifications, and runs the command there, so bare cargo
+names route into the pod. It prints the commit it ran against. This is how a
+dispatcher gates a worker's handed-over ref.
 
 For verification of an already-pushed ref:
 
