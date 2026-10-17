@@ -19,6 +19,9 @@ pub struct CodexSessionConfig {
     pub allowed_tools: Vec<String>,
     #[serde(default)]
     pub disallowed_tools: Vec<String>,
+    /// Skill names the app-server hides from dispatched threads.
+    #[serde(default)]
+    pub disabled_skills: Vec<String>,
     /// Composition errors are refused before a process is spawned.
     #[serde(default)]
     pub errors: Vec<String>,

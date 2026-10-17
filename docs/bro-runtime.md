@@ -131,6 +131,20 @@ bro_providers()
 
 Provider binaries can be overridden with env vars such as `CLAUDE_BIN`,
 
+## Codex Skills
+
+The daemon config's `[providers] codex_disabled_skills` names skills hidden from
+every dispatched Codex thread, on fresh dispatch and resume. It travels as
+session config, so it applies after the execution host's own `skills.config`
+rules. Use it for host skills that assume an interactive session. A dispatched
+thread is unloaded when its turn ends, so a `codex queue` completion callback
+waits until the next `bro_resume` instead of continuing the task.
+
+```toml
+[providers]
+codex_disabled_skills = ["codex-queue"]
+```
+
 ## MCP Servers And Filters
 
 `bro_mcp`, on the `ops` surface, manages MCP servers and dispatch-time tool

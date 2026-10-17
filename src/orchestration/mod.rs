@@ -3504,6 +3504,10 @@ fn prepare_harness_child_launch(
                 worker_mcp_bearer().is_some(),
             );
             config.mcp_servers = servers.into_iter().collect();
+            // Operator skill exclusions ride every fresh dispatch and resume.
+            if let Ok(cfg) = blackbox::config::load() {
+                config.disabled_skills = cfg.providers.codex_disabled_skills;
+            }
             bro_worker::codex::validate(config)?;
             anyhow::ensure!(
                 args.is_empty(),
@@ -6075,8 +6079,40 @@ mod tests {
         assert_eq!(spec.argv, ["app-server"]);
         assert_eq!(spec.bin_override.as_deref(), Some("/opt/bin/codex"));
         assert_eq!(spec.initial_messages[0]["command"]["text"], "initial turn");
-        assert!(spec.codex.unwrap().model.is_some());
+        let codex = spec.codex.unwrap();
+        assert!(codex.model.is_some());
+        assert!(codex.disabled_skills.is_empty());
         assert!(spec.supervisor_writes_event_log);
+    }
+
+    #[test]
+    fn codex_launch_carries_configured_skill_exclusions() {
+        let mut env = crate::util::TestEnvGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let config = root.join("config.toml");
+        std::fs::write(
+            &config,
+            "[providers]\ncodex_disabled_skills = [\"codex-queue\"]\n",
+        )
+        .unwrap();
+        env.set("BLACKBOX_CONFIG", config.to_str().unwrap());
+        let launch = Provider::Codex.build_exec_args("initial turn", None, "pending", None, None);
+        let spec = prepare_harness_child_launch(
+            "task-codex".into(),
+            "pending".into(),
+            Provider::Codex,
+            launch,
+            root.to_str(),
+            None,
+            None,
+            &root,
+            Some("http://example.test/mcp"),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(spec.codex.unwrap().disabled_skills, ["codex-queue"]);
     }
 
     #[test]

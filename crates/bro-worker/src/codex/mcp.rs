@@ -1,4 +1,5 @@
-//! Convert dispatch MCP definitions to native app-server configuration.
+//! Convert dispatch MCP definitions and skill exclusions to native
+//! app-server configuration.
 use anyhow::{Context, ensure};
 use bro_protocol::CodexSessionConfig;
 use serde_json::{Value, json};
@@ -124,10 +125,24 @@ pub fn overrides(config: &CodexSessionConfig) -> anyhow::Result<BTreeMap<String,
                 .push(json!(tool_name));
         }
     }
-    Ok(servers
+    let mut overrides: BTreeMap<String, Value> = servers
         .into_iter()
         .map(|(name, table)| (format!("mcp_servers.{name}"), Value::Object(table)))
-        .collect())
+        .collect();
+    // Session-flag skill rules apply after the user's own `skills.config`
+    // rules, so a name listed here is hidden whatever the host enables.
+    if !config.disabled_skills.is_empty() {
+        let mut rules = Vec::new();
+        for name in &config.disabled_skills {
+            ensure!(
+                !name.trim().is_empty() && name.trim() == name,
+                "invalid disabled skill name {name:?}"
+            );
+            rules.push(json!({"name": name, "enabled": false}));
+        }
+        overrides.insert("skills.config".into(), Value::Array(rules));
+    }
+    Ok(overrides)
 }
 fn reference(value: &str) -> Option<&str> {
     value
@@ -196,5 +211,32 @@ mod tests {
             tables["mcp_servers.box"]["disabled_tools"],
             json!(["write"])
         );
+    }
+
+    #[test]
+    fn disabled_skills_become_session_skill_rules() {
+        assert!(
+            !overrides(&CodexSessionConfig::default())
+                .unwrap()
+                .contains_key("skills.config")
+        );
+        let config = CodexSessionConfig {
+            disabled_skills: vec!["codex-queue".into(), "other".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            overrides(&config).unwrap()["skills.config"],
+            json!([
+                {"name": "codex-queue", "enabled": false},
+                {"name": "other", "enabled": false},
+            ])
+        );
+        for name in ["", " padded "] {
+            let config = CodexSessionConfig {
+                disabled_skills: vec![name.into()],
+                ..Default::default()
+            };
+            assert!(overrides(&config).is_err());
+        }
     }
 }

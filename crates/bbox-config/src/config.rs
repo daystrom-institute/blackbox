@@ -79,6 +79,7 @@ pub struct ProviderOverrides {
     pub vibe_bin: Option<Option<String>>,
     pub vibe_session_dir: Option<Option<PathBuf>>,
     pub extra_path: Option<Vec<PathBuf>>,
+    pub codex_disabled_skills: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -569,6 +570,8 @@ struct RawProviderConfig {
     pub vibe_session_dir: Option<PathBuf>,
     #[serde(default)]
     pub extra_path: Vec<PathBuf>,
+    #[serde(default)]
+    pub codex_disabled_skills: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1113,6 +1116,8 @@ pub struct ProviderConfig {
     pub vibe_bin: Option<String>,
     pub vibe_session_dir: Option<PathBuf>,
     pub extra_path: Vec<PathBuf>,
+    /// Skill names hidden from every dispatched Codex thread.
+    pub codex_disabled_skills: Vec<String>,
 }
 
 /// Transcript configuration
@@ -1229,6 +1234,7 @@ impl Config {
                 vibe_bin: None,
                 vibe_session_dir: None,
                 extra_path: Vec::new(),
+                codex_disabled_skills: Vec::new(),
             },
 
             transcripts: RawTranscriptConfig {
@@ -1655,6 +1661,7 @@ pub fn load_with(options: LoadOptions) -> Result<Config> {
             vibe_bin: raw.providers.vibe_bin,
             vibe_session_dir: raw.providers.vibe_session_dir,
             extra_path: raw.providers.extra_path,
+            codex_disabled_skills: raw.providers.codex_disabled_skills,
         },
 
         transcripts: TranscriptConfig {
@@ -1988,6 +1995,9 @@ fn apply_flag_overrides(mut raw: RawConfig, overrides: ConfigOverrides) -> RawCo
     }
     if let Some(extra_path) = overrides.providers.extra_path {
         raw.providers.extra_path = extra_path;
+    }
+    if let Some(codex_disabled_skills) = overrides.providers.codex_disabled_skills {
+        raw.providers.codex_disabled_skills = codex_disabled_skills;
     }
 
     // Apply LSP overrides

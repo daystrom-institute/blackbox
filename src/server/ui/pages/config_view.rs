@@ -417,6 +417,7 @@ fn provider_rows(rows: &mut Rows, providers: &ProviderConfig) {
         vibe_bin,
         vibe_session_dir,
         extra_path,
+        codex_disabled_skills,
     } = providers;
     rows.optional("claude_bin", claude_bin.as_ref());
     rows.optional("codex_bin", codex_bin.as_ref());
@@ -424,6 +425,7 @@ fn provider_rows(rows: &mut Rows, providers: &ProviderConfig) {
     rows.optional("vibe_bin", vibe_bin.as_ref());
     rows.optional_path("vibe_session_dir", vibe_session_dir.as_ref());
     rows.list("extra_path", extra_path.iter().map(|path| path.display()));
+    rows.list("codex_disabled_skills", codex_disabled_skills.iter());
 }
 
 fn transcript_rows(rows: &mut Rows, transcripts: &TranscriptConfig) {
@@ -589,6 +591,7 @@ pub(crate) mod tests {
         providers.vibe_bin = Some("/usr/local/bin/vibe".into());
         providers.vibe_session_dir = Some("/srv/vibe".into());
         providers.extra_path = vec!["/opt/bin".into()];
+        providers.codex_disabled_skills = vec!["queue-callbacks".into()];
 
         config.transcripts.roots = Some("/srv/transcripts".into());
         config.transcripts.codex_root = Some("/srv/codex".into());
