@@ -6,6 +6,7 @@ Usage: mcp_fixture.py <logfile> <port> <mode>
          modern-drop   same, but close the FIRST listen stream after the notifications (no terminal result)
          modern-bad-ack same, but send an acknowledgement with an unmatched subscription id
          modern-url-elicitation return a URL input request on the first tools/call
+         modern-no-result-fields omit resultType, ttlMs and cacheScope from JSON results
          legacy        reject server/discover with -32601, answer initialize at 2025-11-25 with legacy tasks,
                        echo Mcp-Session-Id, hold the GET stream open
 Every request is appended to <logfile> as one JSON line.
@@ -45,6 +46,12 @@ class H(BaseHTTPRequestHandler):
             h["authorization"] = "<present>"
         return h
     def _json(self, obj, extra=None, status=200):
+        if MODE == "modern-no-result-fields" and isinstance(obj.get("result"), dict):
+            result = obj["result"]
+            for key in ("resultType", "ttlMs", "cacheScope"):
+                result.pop(key, None)
+            log({"event": "result_fields_omitted", "request_id": obj.get("id"),
+                 "result_keys": sorted(result)})
         data = json.dumps(obj).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")

@@ -99,6 +99,17 @@ try:
             require(first.get("arguments") == retry.get("arguments") and first.get("name") == retry.get("name"), "MRTR retry changed original tool invocation")
             require(any(e.get("event") == "tool-results" and "URL flow cancel" in json.dumps(e.get("results", [])) for e in events), "cancelled flow result did not reach the model")
             require(not any(e.get("path") == "/audit-flow" for e in events), "headless probe unexpectedly opened the URL")
+        if mode == "modern-no-result-fields":
+            tool_calls = calls("tools/call")
+            require(len(tool_calls) == 1, "compatibility probe did not call the tool exactly once")
+            omitted = {e["request_id"]: e for e in events if e.get("event") == "result_fields_omitted"}
+            for e in requests:
+                if "id" not in e["body"] or e["body"]["method"] == "subscriptions/listen":
+                    continue
+                stripped = omitted.get(e["body"]["id"])
+                require(stripped is not None, "missing result omission evidence")
+                require(not set(stripped["result_keys"]) & {"resultType", "ttlMs", "cacheScope"}, "result fields were not omitted")
+            require(any(e.get("event") == "tool-results" and "echo: url-audit" in json.dumps(e.get("results", [])) for e in events), "tool result without modern fields did not reach the model")
     print(f"PASS {name}: lifecycle={'legacy' if legacy else 'modern'}, capabilities={json.dumps(capabilities, sort_keys=True)}")
 except (OSError, ValueError, KeyError, TypeError) as error:
     print(f"FAIL {name}: {error}", file=sys.stderr)
@@ -120,7 +131,7 @@ run_case() {
   python3 "$HERE/claude-mcp-fixture.py" "$log" $mp "$mode" & local fx=$!
   local tool_call=0
   local -a extra_args=()
-  if [[ $mode == modern-url-elicitation ]]; then
+  if [[ $mode == modern-url-elicitation || $mode == modern-no-result-fields ]]; then
     tool_call=1
     extra_args=(--allowedTools mcp__fixture__fixture_echo)
   fi
@@ -157,6 +168,7 @@ run_case explicit-v1 modern MCP_SDK_GENERATION=v1
 run_case explicit-legacy modern MCP_PROTOCOL_NEGOTIATION=legacy
 run_case v2-auto-listen-unmatched-ack modern-bad-ack MCP_SDK_GENERATION=v2 MCP_PROTOCOL_NEGOTIATION=auto
 run_case v2-auto-url-elicitation modern-url-elicitation MCP_SDK_GENERATION=v2 MCP_PROTOCOL_NEGOTIATION=auto
+run_case v2-auto-omitted-result-fields modern-no-result-fields MCP_SDK_GENERATION=v2 MCP_PROTOCOL_NEGOTIATION=auto
 echo "wire logs under $OUT"
 if (( FAILURES > 0 )); then
   echo "$FAILURES audit case(s) failed" >&2

@@ -44,9 +44,9 @@ is the largest protocol break since Streamable HTTP:
 
 ### Current client compatibility
 
-The checked-in [Claude audit](claude-2.1.284-mcp-audit.json) and
-[Codex audit](codex-0.158.0-mcp-audit.json) pin binary hashes, release
-versions, source snapshots, selectors, ordered wire observations and limits.
+The checked-in [Claude audit](claude-2.1.302-mcp-audit.json) and
+[Codex audit](codex-0.163.0-mcp-audit.json) record release versions, source
+snapshots, selectors, ordered wire observations and limits.
 Both matrices use isolated loopback MCP servers and deterministic local
 model responses. Wire findings are direct evidence; decoded Claude gates
 and inspected Codex/rmcp source are separate evidence layers.
@@ -58,22 +58,32 @@ and inspected Codex/rmcp source are separate evidence layers.
 | Discover rejected | Default and explicit Auto fall back to initialize at 2025-11-25 | Explicit Auto falls back to initialize at 2025-06-18 | Keep discover rejection and legacy fallback well-defined |
 | Standard listen | Opens automatically for catalog `listChanged`; filter contains tools, prompts and resources list changes | No consumer in inspected source; no listen request despite advertised tools list changes | Catalog-change push has a Claude consumer |
 | Notification effect | Tools refetched after notification; dropped listen reopened with synthesized reconciliation and further refetch | Not applicable | Reconcile on reconnect; do not rely on replay |
-| Tasks | No tasks capability or tasks extension declared, even when advertised by the fixture; embedded gate is false | No declaration or consumer; modern tool driver accepts complete/input-required responses | Keep plain tool JSON unless the tasks extension is explicitly declared |
+| Tasks | No tasks capability or tasks extension declared, even when advertised by the fixture; rollout gate defaults off | No declaration or consumer; modern tool driver accepts complete/input-required responses | Keep plain tool JSON unless the tasks extension is explicitly declared |
 | Tool execution | A modern URL-elicitation tool call retries with cancellation and consumes the final result in headless mode | Both default legacy and explicit modern modes reach tools/call and consume the echo result | Stateless tool calls have direct evidence from both clients |
 
 Claude's isolated direct-HTTP default uses the v2 SDK and automatic
 negotiation. Account-specific rollout flags and server denylists still
 apply; this fixture does not inspect an account's remote configuration.
-The task gate remains literally false, despite bundled task UI, extension
-keys and legacy methods. Neither the vocabulary nor catalog listen proves
-task wake-on-done.
+The `tengu_glowing_lark` task gate defaults false. The bundled modern
+task loop polls `tasks/get`, sends input responses through `tasks/update`,
+and supports `tasks/cancel`; the isolated matrix does not declare the
+tasks extension or exercise this loop. Catalog listen does not establish
+task wake-on-done. Static selectors also default stdio and the
+`claudeai-proxy` / `ccr-proxy` transports to automatic negotiation; the
+live matrix covers direct HTTP only.
 
-Claude advertises `elicitation: {form: {}, url: {}}` on modern requests.
+Claude advertises `elicitation: {form: {}, url: {}}` on modern requests
+and legacy initialization, including Auto fallback and both explicit
+legacy opt-outs.
 The URL-elicitation probe returns `input_required` without a legacy
 `elicitationId`; headless Claude retries the tool with an `inputResponses`
 cancellation and the exact `requestState`, then consumes the completed
 result. This proves the cancellation continuation, not browser interaction,
 acceptance, form elicitation or asynchronous completion notifications.
+Complete JSON discovery, catalog and tool-call results also work without
+`resultType`, `ttlMs` or `cacheScope`; the compatibility case observes
+the tool result reaching the model. It does not cover omitted fields in
+SSE listen acknowledgements or task/MRTR result variants.
 
 The listen acknowledgement must be the first SSE frame on a chunked
 response and carry `_meta["io.modelcontextprotocol/subscriptionId"]`
@@ -85,7 +95,7 @@ catalogs do not establish their notification-driven refetch behavior, and
 per-URI subscriptions remain outside the matrix. Claude's model-facing
 resource catalog filters Apps UI resources identified by `ui://` or HTML
 with the `mcp-app` profile; direct URI reads remain available. With
-`CLAUDE_CODE_MCP_APPS_HOST` set, the legacy capability builder also
+`CLAUDE_CODE_MCP_APPS_HOST` set, the base capability builder also
 declares the `io.modelcontextprotocol/ui` extension for that MIME type;
 no matrix case declares it. The audit records both as static evidence.
 
@@ -94,7 +104,10 @@ remain default false in the inspected source. Modern stdio additionally
 requires server-config env `CODEX_MCP_PROTOCOL_VERSION=2026-07-28`.
 Those stdio and hosted-Apps paths are source findings, not live matrix
 results. Codex's proprietary `events/list` / `events/stream` transport is
-not a standard listen consumer.
+not a standard listen consumer. Upstream main also has a separate
+`mcp_tool_list_changed` flag, default false, which handles received tool
+list-change notifications and refreshes catalogs. That receive path does
+not open standard listen, and it is absent from the audited release.
 
 Codex's modern MRTR driver accepts complete/input-required responses,
 returns `inputResponses` with `requestState`, bounds continuation rounds,
@@ -110,16 +123,21 @@ keys appear in both modern and legacy tool-call captures. Conditional
 `tracestate`) are present in release source. Neither path is exercised by
 the matrix. Scope remains URL-owned, never inferred from client identifiers.
 
-Codex still pins rmcp 3.2.0; the published migration candidate is rmcp
-3.5.0. Source inspection of 3.5.0 confirms no task subscription filter and
-explicit rejection of task notifications by the server sink and client
-subscription. From 3.5.0 `ProtocolVersion::LATEST` is 2026-07-28 and
+Codex release and upstream main pin distinct rust-sdk git revisions
+both declaring rmcp 3.5.1. The published migration candidate is also
+3.5.1, whose source still has no task subscription filter and rejects task
+notifications in the server sink and client subscription. The published
+patch fills missing cache hints on complete cacheable modern results,
+keeps discovery before initialization neutral between lifecycles, and
+returns handler-generated `INVALID_PARAMS` as HTTP 200 JSON-RPC errors.
+
+From 3.5.0 `ProtocolVersion::LATEST` is 2026-07-28 and
 `LATEST_WITH_INITIALIZE` names the newest handshake version (2025-11-25);
 SDK defaults no longer imply the legacy version, so the version gate is
 the server's `supported_protocol_versions()` override and the client's
-lifecycle mode. The standalone runtime exemplar runs on rmcp 3.5.0 with
-every mechanic and SDK limit unchanged. Exact source anchors and package
-provenance are in the Codex audit record.
+lifecycle mode. Runtime exemplar findings remain scoped to its rmcp 3.5.0
+pin; the 3.5.1 patch assessment is source-only. Exact source anchors and
+package versions are in the Codex audit record.
 
 ### Convergence with locality-first decomposition
 

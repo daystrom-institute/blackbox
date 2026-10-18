@@ -1,0 +1,603 @@
+{
+  "audit_date": "2026-10-17",
+  "audit_timezone": "America/Edmonton",
+  "binary": {
+    "version": "2.1.302",
+    "platform": "macos-arm64",
+    "path": "~/.local/share/claude/versions/2.1.302",
+    "size_bytes": 267956720,
+    "embedded_build_time": "2026-10-16T15:52:41Z",
+    "embedded_git_sha": "2ef144e6f98c1c99d082b735e4b38f50e3391e55"
+  },
+  "release": {
+    "latest_stable_verified": true,
+    "registry_source": "https://registry.npmjs.org/@anthropic-ai/claude-code/latest",
+    "source": "https://api.github.com/repos/anthropics/claude-code/releases/latest",
+    "url": "https://github.com/anthropics/claude-code/releases/tag/v2.1.302",
+    "published_at": "2026-10-16T20:53:06Z",
+    "prerelease": false
+  },
+  "previous_audit": {
+    "version": "2.1.284",
+    "record": "claude-2.1.284-mcp-audit.json"
+  },
+  "delta": {
+    "direct_http_default": "UNCHANGED: isolated default and v2-only negotiate 2026-07-28 with discover and catalog listen.",
+    "listen": "UNCHANGED: notification refetch, dropped-stream reopen/reconciliation and unmatched-ack cancellation pass.",
+    "modern_url_elicitation": "UNCHANGED: headless URL input_required retries tools/call with action cancel and echoes requestState.",
+    "legacy_elicitation": "CHANGED: explicit v1, explicit legacy and Auto fallback all initialize with form and url elicitation capabilities.",
+    "modern_result_compatibility": "NEW LIVE COVERAGE: discover, catalog results and tools/call remain usable when resultType, ttlMs and cacheScope are absent.",
+    "default_negotiation_transports": "CHANGED STATIC/VENDOR: stdio, claudeai-proxy and ccr-proxy now default to Auto alongside HTTP. These transports were not live-tested.",
+    "tasks": "CHANGED STATIC: modern SEP-2663 task handling now includes tasks/get polling, tasks/update inputResponses and tasks/cancel. Capability admission uses tengu_glowing_lark with false fallback, replacing a literal false gate. UNCHANGED LIVE: no legacy tasks or tasks extension declared in any isolated case; task execution was not exercised.",
+    "task_notifications": "No bare notifications/tasks literal was found; legacy notifications/tasks/status remains present. Catalog listen is not evidence of task wake-on-done."
+  },
+  "methodology": {
+    "static": "Bounded inspection of readable embedded JavaScript in the installed native binary. Literal vocabulary presence is not proof of reachable behavior.",
+    "live": "Unmodified installed binary, --bare -p, empty built-in tool set and setting sources, strict explicit loopback MCP configuration, fresh temporary cwd and CLAUDE_CONFIG_DIR under env -i with HOME preserved. Dummy API key and local deterministic Messages stub; no real model inference. Standard ten-case matrix plus one omitted-result-fields compatibility case.",
+    "fixtures": [
+      "fixtures/claude-audit-matrix.sh",
+      "fixtures/claude-mcp-fixture.py",
+      "fixtures/claude-messages-stub.py"
+    ],
+    "raw_evidence_directory": "/tmp/claude-mcp-2.1.302.6oXzVE/final",
+    "limits": [
+      "Account-specific remote rollout flags were not inspected or forced; isolated defaults are not a universal rollout verdict.",
+      "No task result was sent to a client that did not declare support; task execution and task notifications were not live-tested.",
+      "Only direct HTTP was tested. Stdio and hosted connector default changes are embedded-source and vendor-release findings.",
+      "Prompt/resource catalogs were empty; only tool refetches were observed after list_changed.",
+      "No per-URI resource subscription, interactive URL acceptance, browser completion, form elicitation, prolonged reconnect, cache expiry or cache sharing was tested.",
+      "Omitted-result-fields coverage excludes SSE listen terminal results and task/MRTR result variants.",
+      "MCP Apps UI-resource filtering, direct URI read retention and host UI extension declaration were inspected statically only."
+    ],
+    "capture_validation": "All eleven cases passed with EXPECT_TASKS=absent, followed by AUDIT_VERIFY_ONLY replay. Python syntax parsing, bash -n and git diff --check passed. Negative replays removing the final tool result or restoring resultType each failed as expected."
+  },
+  "static_findings": {
+    "task_gate": {
+      "byte_offset": 220825291,
+      "symbol": "Ik",
+      "flag": "tengu_glowing_lark",
+      "fallback": false,
+      "effect": "Conditional v2 extension declaration and modern tool-task driver admission."
+    },
+    "modern_tasks": {
+      "capability": "extensions.io.modelcontextprotocol/tasks = {}",
+      "methods": [
+        "tasks/get",
+        "tasks/update",
+        "tasks/cancel"
+      ],
+      "task_result_type": "task",
+      "input_response_field": "inputResponses",
+      "poll_interval_field": "pollIntervalMs",
+      "ttl_field": "ttlMs",
+      "background_and_restore_paths_present": true,
+      "driver_byte_offset": 256043162,
+      "live_exercised": false
+    },
+    "tasks_update_present": true,
+    "bare_tasks_notification_present": false,
+    "legacy_task_status_notification_present": true,
+    "runtime_selector": {
+      "env": "MCP_SDK_GENERATION",
+      "values": [
+        "v1",
+        "v2"
+      ],
+      "rollout_flag": "tengu_brindle_causeway",
+      "fallback": "v2"
+    },
+    "negotiation_selector": {
+      "env": "MCP_PROTOCOL_NEGOTIATION",
+      "values": [
+        "legacy",
+        "auto"
+      ],
+      "default_auto_transports": [
+        "http",
+        "stdio",
+        "claudeai-proxy",
+        "ccr-proxy"
+      ],
+      "default_legacy_transports": [
+        "sse",
+        "ws",
+        "ide",
+        "ccr-toolport",
+        "in-process",
+        "sdk-control"
+      ],
+      "rollout_flags": [
+        "tengu_mcp_protocol_negotiation_http",
+        "tengu_mcp_protocol_negotiation_stdio",
+        "tengu_mcp_protocol_negotiation_claudeai",
+        "tengu_mcp_protocol_negotiation_ccr"
+      ],
+      "auto_rollout_fallback": true,
+      "byte_offset": 251413823
+    },
+    "legacy_url_elicitation": {
+      "flag": "tengu_mcp_legacy_url_elicitation",
+      "fallback": true,
+      "bare_capability_override": "bareElicitationCapability"
+    },
+    "mcp_apps_resource_filter": {
+      "predicate_byte_offset": 219819973,
+      "list_filter_byte_offset": 229298158,
+      "mention_filter_byte_offset": 243673096,
+      "excluded_from_model_lists": "Case-insensitive ui:// URI, or text/html MIME type with a case-insensitive profile=mcp-app parameter.",
+      "scope": "Model resource listing and resource/template mention suggestions.",
+      "direct_uri_reads_retained": true,
+      "modern_read_path_byte_offset": 251518706,
+      "live_exercised": false
+    },
+    "mcp_apps_host_extension": {
+      "builder_byte_offset": 223558578,
+      "selector": "CLAUDE_CODE_MCP_APPS_HOST",
+      "extension": "io.modelcontextprotocol/ui",
+      "mimeTypes": [
+        "text/html;profile=mcp-app"
+      ],
+      "scope": "Base capability builder conditionally adds the extension; v2 capabilities derive from that builder.",
+      "observed_in_matrix": false
+    }
+  },
+  "vendor_release_findings": [
+    {
+      "version": "2.1.292",
+      "url": "https://github.com/anthropics/claude-code/releases/tag/v2.1.292",
+      "finding": "Local stdio defaults to 2026-07-28 negotiation, including Bedrock, Vertex and Foundry."
+    },
+    {
+      "version": "2.1.295",
+      "url": "https://github.com/anthropics/claude-code/releases/tag/v2.1.295",
+      "finding": "claude.ai connectors default to 2026-07-28 negotiation when no flags are fetched."
+    },
+    {
+      "version": "2.1.299",
+      "url": "https://github.com/anthropics/claude-code/releases/tag/v2.1.299",
+      "finding": "Cloud and Remote Control connectors default to 2026-07-28 negotiation when no flags are fetched."
+    },
+    {
+      "version": "2.1.302",
+      "url": "https://github.com/anthropics/claude-code/releases/tag/v2.1.302",
+      "finding": "Modern servers can omit resultType and cache hints without losing tools or tool-call results."
+    }
+  ],
+  "cases": [
+    {
+      "name": "isolated-default",
+      "exit_code": 0,
+      "client_capability_variants": [
+        {
+          "roots": {
+            "listChanged": true
+          },
+          "elicitation": {
+            "form": {},
+            "url": {}
+          }
+        }
+      ],
+      "observed_protocol_headers": [
+        "2026-07-28"
+      ],
+      "session_id_echoed": false,
+      "methods": [
+        "server/discover",
+        "subscriptions/listen",
+        "prompts/list",
+        "resources/list",
+        "tools/list",
+        "tools/list"
+      ],
+      "listen_requests": [
+        {
+          "id": "listen:0",
+          "notifications": {
+            "toolsListChanged": true,
+            "promptsListChanged": true,
+            "resourcesListChanged": true
+          }
+        }
+      ],
+      "tools_list_count": 2,
+      "tool_call_count": 0
+    },
+    {
+      "name": "v2-only",
+      "exit_code": 0,
+      "client_capability_variants": [
+        {
+          "roots": {
+            "listChanged": true
+          },
+          "elicitation": {
+            "form": {},
+            "url": {}
+          }
+        }
+      ],
+      "observed_protocol_headers": [
+        "2026-07-28"
+      ],
+      "session_id_echoed": false,
+      "methods": [
+        "server/discover",
+        "subscriptions/listen",
+        "prompts/list",
+        "resources/list",
+        "tools/list",
+        "tools/list"
+      ],
+      "listen_requests": [
+        {
+          "id": "listen:0",
+          "notifications": {
+            "toolsListChanged": true,
+            "promptsListChanged": true,
+            "resourcesListChanged": true
+          }
+        }
+      ],
+      "tools_list_count": 2,
+      "tool_call_count": 0
+    },
+    {
+      "name": "v2-auto-discover-success",
+      "exit_code": 0,
+      "client_capability_variants": [
+        {
+          "roots": {
+            "listChanged": true
+          },
+          "elicitation": {
+            "form": {},
+            "url": {}
+          }
+        }
+      ],
+      "observed_protocol_headers": [
+        "2026-07-28"
+      ],
+      "session_id_echoed": false,
+      "methods": [
+        "server/discover",
+        "subscriptions/listen",
+        "prompts/list",
+        "tools/list",
+        "resources/list",
+        "tools/list"
+      ],
+      "listen_requests": [
+        {
+          "id": "listen:0",
+          "notifications": {
+            "toolsListChanged": true,
+            "promptsListChanged": true,
+            "resourcesListChanged": true
+          }
+        }
+      ],
+      "tools_list_count": 2,
+      "tool_call_count": 0
+    },
+    {
+      "name": "v2-auto-discover-rejected",
+      "exit_code": 0,
+      "client_capability_variants": [
+        {
+          "roots": {
+            "listChanged": true
+          },
+          "elicitation": {
+            "form": {},
+            "url": {}
+          }
+        }
+      ],
+      "observed_protocol_headers": [
+        "2025-11-25",
+        "2026-07-28"
+      ],
+      "session_id_echoed": true,
+      "methods": [
+        "server/discover",
+        "initialize",
+        "notifications/initialized",
+        "tools/list",
+        "prompts/list",
+        "resources/list"
+      ],
+      "listen_requests": [],
+      "tools_list_count": 1,
+      "tool_call_count": 0
+    },
+    {
+      "name": "v2-auto-listen-stream-dropped",
+      "exit_code": 0,
+      "client_capability_variants": [
+        {
+          "roots": {
+            "listChanged": true
+          },
+          "elicitation": {
+            "form": {},
+            "url": {}
+          }
+        }
+      ],
+      "observed_protocol_headers": [
+        "2026-07-28"
+      ],
+      "session_id_echoed": false,
+      "methods": [
+        "server/discover",
+        "subscriptions/listen",
+        "prompts/list",
+        "resources/list",
+        "tools/list",
+        "tools/list",
+        "subscriptions/listen",
+        "tools/list",
+        "tools/list"
+      ],
+      "listen_requests": [
+        {
+          "id": "listen:0",
+          "notifications": {
+            "toolsListChanged": true,
+            "promptsListChanged": true,
+            "resourcesListChanged": true
+          }
+        },
+        {
+          "id": "listen:1",
+          "notifications": {
+            "toolsListChanged": true,
+            "promptsListChanged": true,
+            "resourcesListChanged": true
+          }
+        }
+      ],
+      "tools_list_count": 4,
+      "tool_call_count": 0
+    },
+    {
+      "name": "isolated-default-discover-rejected",
+      "exit_code": 0,
+      "client_capability_variants": [
+        {
+          "roots": {
+            "listChanged": true
+          },
+          "elicitation": {
+            "form": {},
+            "url": {}
+          }
+        }
+      ],
+      "observed_protocol_headers": [
+        "2025-11-25",
+        "2026-07-28"
+      ],
+      "session_id_echoed": true,
+      "methods": [
+        "server/discover",
+        "initialize",
+        "notifications/initialized",
+        "tools/list",
+        "prompts/list",
+        "resources/list"
+      ],
+      "listen_requests": [],
+      "tools_list_count": 1,
+      "tool_call_count": 0
+    },
+    {
+      "name": "explicit-v1",
+      "exit_code": 0,
+      "client_capability_variants": [
+        {
+          "roots": {
+            "listChanged": true
+          },
+          "elicitation": {
+            "form": {},
+            "url": {}
+          }
+        }
+      ],
+      "observed_protocol_headers": [
+        "2025-11-25"
+      ],
+      "session_id_echoed": false,
+      "methods": [
+        "initialize",
+        "notifications/initialized",
+        "tools/list",
+        "prompts/list",
+        "resources/list"
+      ],
+      "listen_requests": [],
+      "tools_list_count": 1,
+      "tool_call_count": 0
+    },
+    {
+      "name": "explicit-legacy",
+      "exit_code": 0,
+      "client_capability_variants": [
+        {
+          "roots": {
+            "listChanged": true
+          },
+          "elicitation": {
+            "form": {},
+            "url": {}
+          }
+        }
+      ],
+      "observed_protocol_headers": [
+        "2025-11-25"
+      ],
+      "session_id_echoed": false,
+      "methods": [
+        "initialize",
+        "notifications/initialized",
+        "tools/list",
+        "prompts/list",
+        "resources/list"
+      ],
+      "listen_requests": [],
+      "tools_list_count": 1,
+      "tool_call_count": 0
+    },
+    {
+      "name": "v2-auto-listen-unmatched-ack",
+      "exit_code": 0,
+      "client_capability_variants": [
+        {
+          "roots": {
+            "listChanged": true
+          },
+          "elicitation": {
+            "form": {},
+            "url": {}
+          }
+        }
+      ],
+      "observed_protocol_headers": [
+        "2026-07-28"
+      ],
+      "session_id_echoed": false,
+      "methods": [
+        "server/discover",
+        "subscriptions/listen",
+        "notifications/cancelled",
+        "tools/list",
+        "resources/list",
+        "prompts/list",
+        "subscriptions/listen",
+        "tools/list"
+      ],
+      "listen_requests": [
+        {
+          "id": "listen:0",
+          "notifications": {
+            "toolsListChanged": true,
+            "promptsListChanged": true,
+            "resourcesListChanged": true
+          }
+        },
+        {
+          "id": "listen:1",
+          "notifications": {
+            "toolsListChanged": true,
+            "promptsListChanged": true,
+            "resourcesListChanged": true
+          }
+        }
+      ],
+      "tools_list_count": 2,
+      "tool_call_count": 0
+    },
+    {
+      "name": "v2-auto-url-elicitation",
+      "exit_code": 0,
+      "client_capability_variants": [
+        {
+          "roots": {
+            "listChanged": true
+          },
+          "elicitation": {
+            "form": {},
+            "url": {}
+          }
+        }
+      ],
+      "observed_protocol_headers": [
+        "2026-07-28"
+      ],
+      "session_id_echoed": false,
+      "methods": [
+        "server/discover",
+        "subscriptions/listen",
+        "prompts/list",
+        "resources/list",
+        "tools/list",
+        "tools/list",
+        "tools/call",
+        "tools/call"
+      ],
+      "listen_requests": [
+        {
+          "id": "listen:0",
+          "notifications": {
+            "toolsListChanged": true,
+            "promptsListChanged": true,
+            "resourcesListChanged": true
+          }
+        }
+      ],
+      "tools_list_count": 2,
+      "tool_call_count": 2,
+      "mrtr_retry": {
+        "name": "fixture_echo",
+        "arguments": {
+          "text": "url-audit"
+        },
+        "inputResponses": {
+          "url-flow": {
+            "action": "cancel"
+          }
+        },
+        "requestState": "fixture-url-state"
+      }
+    },
+    {
+      "name": "v2-auto-omitted-result-fields",
+      "exit_code": 0,
+      "client_capability_variants": [
+        {
+          "roots": {
+            "listChanged": true
+          },
+          "elicitation": {
+            "form": {},
+            "url": {}
+          }
+        }
+      ],
+      "observed_protocol_headers": [
+        "2026-07-28"
+      ],
+      "session_id_echoed": false,
+      "methods": [
+        "server/discover",
+        "subscriptions/listen",
+        "prompts/list",
+        "tools/list",
+        "resources/list",
+        "tools/list",
+        "tools/call"
+      ],
+      "listen_requests": [
+        {
+          "id": "listen:0",
+          "notifications": {
+            "toolsListChanged": true,
+            "promptsListChanged": true,
+            "resourcesListChanged": true
+          }
+        }
+      ],
+      "tools_list_count": 2,
+      "tool_call_count": 1,
+      "omitted_result_fields": [
+        "resultType",
+        "ttlMs",
+        "cacheScope"
+      ],
+      "result_omission_count": 6
+    }
+  ]
+}

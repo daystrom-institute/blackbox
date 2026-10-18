@@ -27,9 +27,10 @@ plan.
   `bro-harness`).
 - To: rmcp 3.x implementing MCP 2026-07-28. The title names the 3.0
   breaking-change migration, not an upper bound on the minor version.
-  Evaluate 3.5.0 as the concrete candidate: it is the latest published
-  version in the [SDK source audit](codex-0.158.0-mcp-audit.json), while
-  Codex release and upstream main still pin `=3.2.0`.
+  Evaluate 3.5.1 as the concrete candidate: it is the latest published
+  version in the [SDK source audit](codex-0.163.0-mcp-audit.json), while
+  Codex release and upstream main pin distinct git revisions declaring
+  `=3.5.1`, rather than the published crate.
   Relevant to this plan: 3.3.0 adds
   `ServerHandler::negotiate_initialize` (#1247, reuse the SDK's version
   negotiation from an `initialize` override) and enterprise refresh-token
@@ -59,8 +60,13 @@ plan.
   and is deprecated, #1270), tolerates an empty `cacheScope` (#1281) and
   preserves an explicit `null` `structuredContent` (#1295). The task
   subscription filter and notification rejection paths remain unchanged
-  through 3.5.0; MSRV stays 1.88. The exemplar runs on 3.5.0 with its
-  findings unchanged; rerun it against any later version before treating
+  through 3.5.1; MSRV stays 1.88. Version 3.5.1 supplies missing cache
+  hints on complete cacheable modern results (`ttlMs: 0`,
+  `cacheScope: private`), keeps discovery before initialization in
+  bootstrap so it can be followed by either lifecycle, and leaves
+  handler-generated `INVALID_PARAMS` as HTTP 200 JSON-RPC errors while
+  missing request metadata still produces HTTP 400. The exemplar runs on
+  3.5.0 with its findings unchanged; rerun it against any later version before treating
   an SDK limitation as fixed or unchanged.
 - We skip the entire 2.x line. Most 2.x deprecations are removals in 3.0,
   and we already use the modern names (`CallToolRequestParams`, `ErrorData`,
@@ -294,9 +300,10 @@ Claude Code is a verified catalog consumer: its default direct HTTP path
 negotiates modern discovery and opens listen for advertised tools/prompts/
 resources list changes. The isolated matrix validates tool catalog refetch
 on notification and after stream reopening, plus explicit legacy opt-outs
-and discover fallback. Tasks remain disabled; Codex still has no standard
-listen consumer. See the [Claude audit](claude-2.1.284-mcp-audit.json) and
-[Codex audit](codex-0.158.0-mcp-audit.json). This validates a catalog-change
+and discover fallback. Tasks are not declared by the isolated clients;
+Claude gates its polling/input loop on a default-off rollout flag. Codex
+still has no standard listen consumer. See the [Claude audit](claude-2.1.302-mcp-audit.json) and
+[Codex audit](codex-0.163.0-mcp-audit.json). This validates a catalog-change
 slice independently of Phase 2, not task notifications.
 
 - `ServerHandler::listen` + `SubscriptionSink`; emit
@@ -306,8 +313,8 @@ slice independently of Phase 2, not task notifications.
 - `resourcesListChanged` if Phase 4 has landed.
 - Harness children switch from bro_wait polling to listen + task handles;
   bro_wait remains the Tier 0 floor for all other clients.
-- SDK gap confirmed by the runtime spike and source inspection, both on
-  rmcp 3.5.0: `SubscriptionFilter` has no
+- SDK gap confirmed by the runtime spike on rmcp 3.5.0 and source
+  inspection through 3.5.1: `SubscriptionFilter` has no
   task category, `SubscriptionSink::send` rejects `notifications/tasks`,
   and the client `Subscription` rejects them too. Options: (a) custom glue
   sending task notifications on the active listen response stream, which
@@ -372,8 +379,8 @@ This plan interlocks at two points:
 
 Before flipping the prod version gate (Q2) or relying on any modern shape
 from Claude Code, re-probe the installed binary. Current evidence is in the
-[Claude audit](claude-2.1.284-mcp-audit.json) and
-[Codex audit](codex-0.158.0-mcp-audit.json); the entries below are prior
+[Claude audit](claude-2.1.302-mcp-audit.json) and
+[Codex audit](codex-0.163.0-mcp-audit.json); the entries below are prior
 snapshots, not the current compatibility verdict. The probe is structural,
 not single-literal: it enumerates vocabulary classes rather than grepping
 one string each, because (a) a constructed/concatenated key literal would
@@ -696,11 +703,12 @@ Probe history:
 ### Claude live tripwire
 
 Run `fixtures/claude-audit-matrix.sh` under bash with `CLAUDE_BIN`
-pointing at the exact binary. It drives ten cases against the MCP fixture
+pointing at the exact binary. It drives eleven cases against the MCP fixture
 and deterministic Messages stub: default, SDK-only, explicit modern,
 explicit/default fallback, dropped stream, each legacy opt-out,
-mismatched acknowledgement, and a headless URL-elicitation cancellation
-round. The cancellation case verifies `inputResponses`, exact
+mismatched acknowledgement, a headless URL-elicitation cancellation
+round, and complete JSON responses omitting `resultType`, `ttlMs` and
+`cacheScope`. The cancellation case verifies `inputResponses`, exact
 `requestState` echo and final tool-result consumption. It prints per-case
 wire timelines and checks capture completeness and lifecycle behavior.
 
