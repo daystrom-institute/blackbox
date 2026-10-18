@@ -34,6 +34,7 @@ use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 use super::super::shell::{Section, empty_state, error_fragment, layout};
 use super::super::{Principal, UiState, html_response};
 use super::display::{age, encode_component, from_millis, preview, sse_html};
+use super::gaps::{Related, related_panel};
 use crate::orchestration::{self, TaskStatus, tail::TailEvent};
 use crate::server::BlackboxServer;
 use crate::tools::roster::{dashboard_elapsed, dashboard_order};
@@ -661,6 +662,14 @@ fn render_task(task: &TaskDetail, now: DateTime<Utc>) -> Markup {
     }
 }
 
+/// The panel of gaps this task filed, read on the blocking pool.
+async fn task_gaps(ui: &Arc<UiState>, task_id: String) -> Markup {
+    let reader_ui = ui.clone();
+    tokio::task::spawn_blocking(move || related_panel(&reader_ui, Related::Task(&task_id)))
+        .await
+        .unwrap_or_else(|error| error_fragment("bbox_gaps", &error.to_string()))
+}
+
 /// `GET /bros/{task}`
 pub(crate) async fn task_page(
     State(ui): State<Arc<UiState>>,
@@ -668,11 +677,14 @@ pub(crate) async fn task_page(
     Path(task_id): Path<String>,
 ) -> Response {
     let (status, title, content) = match task_detail(&ui, task_id.clone()).await {
-        Ok(Some(task)) => (
-            StatusCode::OK,
-            format!("Task {}", task.id),
-            render_task(&task, Utc::now()),
-        ),
+        Ok(Some(task)) => {
+            let gaps = task_gaps(&ui, task.id.clone()).await;
+            (
+                StatusCode::OK,
+                format!("Task {}", task.id),
+                html! { (render_task(&task, Utc::now())) (gaps) },
+            )
+        }
         Ok(None) => (
             StatusCode::NOT_FOUND,
             "Task not found".to_string(),

@@ -1,5 +1,6 @@
 use crate::gaps::{GapFileParams, GapListParams, GapResolveParams, GapUpdateParams};
 use crate::server::BlackboxServer;
+use crate::server::gap_view::SessionGapView;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
@@ -29,7 +30,7 @@ fn carrier_matches_filter(
     })
 }
 
-fn gap_diagnostic_preview(diagnostics: &[String], debug: bool) -> Vec<String> {
+pub(crate) fn gap_diagnostic_preview(diagnostics: &[String], debug: bool) -> Vec<String> {
     let preview = |text: &str| {
         let mut value: String = text.chars().take(256).collect();
         if text.chars().count() > 256 {
@@ -73,6 +74,71 @@ fn gap_diagnostic_preview(diagnostics: &[String], debug: bool) -> Vec<String> {
 }
 
 impl BlackboxServer {
+    /// The gap view and the resolved selection for one gap list read, as
+    /// `bbox_gaps` reads it: a `project` filter arms the identity and
+    /// ledger predicates, and the returned diagnostics name filter misses
+    /// and project overlays the reload skipped. The operator UI reads
+    /// through this too.
+    pub(crate) fn resolve_gap_list(
+        &self,
+        mut p: GapListParams,
+    ) -> anyhow::Result<(SessionGapView, GapListParams, Vec<String>)> {
+        let requested_project = p.project.clone();
+        let view = self.session_gap_view(requested_project.as_deref())?;
+        let mut filter_diagnostics = Vec::new();
+        if let Some(raw) = requested_project.as_deref() {
+            // Catalog-mode ledger arm (plan §8.2): path-only gaps still
+            // keyed under one of this project's historical paths stay
+            // visible after relocation. Empty in bridge mode.
+            p.project_ledger_paths = self.filter_ledger_paths(raw);
+            // Identity arm (gap-40ab1102): a filter that resolves also
+            // arms the dual-read id predicate, so rows stamped with a
+            // project_id match whatever path key they carry. A
+            // published row on a path-free daemon carries none, and
+            // without this arm every filtered query returned zero rows
+            // over a store that plainly held them. An unresolvable
+            // value keeps the literal substring lane and says so.
+            // A blank value narrows nothing and reports nothing: it is
+            // the documented unscoped escape hatch, not a miss.
+            if p.project_id.is_none() && !raw.trim().is_empty() {
+                match self.project_filter_identity(raw) {
+                    Ok(project_id) => p.project_id = Some(project_id),
+                    Err(diagnostic) => filter_diagnostics.push(diagnostic),
+                }
+            }
+            if let Some(base) = self.rescope_project_filter_value(raw) {
+                p.project = Some(base);
+            }
+        } else if let Some(raw_id) = p.project_id.clone() {
+            // A caller-supplied id is a selector, not an assertion: it
+            // resolves through the engine to the canonical id (and the
+            // ledger arm), and an unknown id simply matches nothing.
+            if let Some(resolved) = self
+                .resolve_project_filter(&raw_id)
+                .and_then(|resolution| resolution.project_id().map(str::to_owned))
+            {
+                p.project_ledger_paths = self.ledger_historical_paths(&resolved);
+                p.project_id = Some(resolved);
+            }
+        }
+        // The mutation store's reload tolerates unreadable carriers by
+        // skipping them; tell the caller which projects that hid.
+        for (project, error) in self.state.gaps.read().degraded_carriers() {
+            if !self.carrier_affects_project_filter(
+                project,
+                p.project.as_deref(),
+                p.project_id.as_deref(),
+                &p.project_ledger_paths,
+            ) {
+                continue;
+            }
+            filter_diagnostics.push(format!(
+                "gap store overlay skipped for project {project}: {error}"
+            ));
+        }
+        Ok((view, p, filter_diagnostics))
+    }
+
     /// A skipped carrier is relevant only if its rows could match this read.
     /// Resolve carrier identity before the path fallback, just as row filters do.
     pub(crate) fn carrier_affects_project_filter(
@@ -957,60 +1023,7 @@ impl BlackboxServer {
     )]
     pub(crate) fn bbox_gaps(&self, Parameters(p): Parameters<GapListParams>) -> CallToolResult {
         Self::run_with_structured("bbox_gaps", || {
-            let mut p = p;
-            let requested_project = p.project.clone();
-            let mut view = self.session_gap_view(requested_project.as_deref())?;
-            let mut filter_diagnostics = Vec::new();
-            if let Some(raw) = requested_project.as_deref() {
-                // Catalog-mode ledger arm (plan §8.2): path-only gaps still
-                // keyed under one of this project's historical paths stay
-                // visible after relocation. Empty in bridge mode.
-                p.project_ledger_paths = self.filter_ledger_paths(raw);
-                // Identity arm (gap-40ab1102): a filter that resolves also
-                // arms the dual-read id predicate, so rows stamped with a
-                // project_id match whatever path key they carry. A
-                // published row on a path-free daemon carries none, and
-                // without this arm every filtered query returned zero rows
-                // over a store that plainly held them. An unresolvable
-                // value keeps the literal substring lane and says so.
-                // A blank value narrows nothing and reports nothing: it is
-                // the documented unscoped escape hatch, not a miss.
-                if p.project_id.is_none() && !raw.trim().is_empty() {
-                    match self.project_filter_identity(raw) {
-                        Ok(project_id) => p.project_id = Some(project_id),
-                        Err(diagnostic) => filter_diagnostics.push(diagnostic),
-                    }
-                }
-                if let Some(base) = self.rescope_project_filter_value(raw) {
-                    p.project = Some(base);
-                }
-            } else if let Some(raw_id) = p.project_id.clone() {
-                // A caller-supplied id is a selector, not an assertion: it
-                // resolves through the engine to the canonical id (and the
-                // ledger arm), and an unknown id simply matches nothing.
-                if let Some(resolved) = self
-                    .resolve_project_filter(&raw_id)
-                    .and_then(|resolution| resolution.project_id().map(str::to_owned))
-                {
-                    p.project_ledger_paths = self.ledger_historical_paths(&resolved);
-                    p.project_id = Some(resolved);
-                }
-            }
-            // The mutation store's reload tolerates unreadable carriers by
-            // skipping them; tell the caller which projects that hid.
-            for (project, error) in self.state.gaps.read().degraded_carriers() {
-                if !self.carrier_affects_project_filter(
-                    project,
-                    p.project.as_deref(),
-                    p.project_id.as_deref(),
-                    &p.project_ledger_paths,
-                ) {
-                    continue;
-                }
-                filter_diagnostics.push(format!(
-                    "gap store overlay skipped for project {project}: {error}"
-                ));
-            }
+            let (mut view, p, filter_diagnostics) = self.resolve_gap_list(p)?;
             let mut record_params = p.clone();
             if p.diagnostics_detail {
                 anyhow::ensure!(

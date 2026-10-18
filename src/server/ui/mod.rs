@@ -174,6 +174,10 @@ pub(crate) fn build_ui_router(state: UiState) -> Router {
         )
         .route("/streams/bros", get(pages::bros::roster_stream))
         .route("/streams/bros/{task}/tail", get(pages::bros::task_stream))
+        .route("/gaps", get(pages::gaps::list_page))
+        .route("/gaps/{id}", get(pages::gaps::detail_page))
+        .route("/fragments/gaps/table", get(pages::gaps::table_fragment))
+        .route("/fragments/gaps/{id}", get(pages::gaps::detail_fragment))
         .route("/projects", get(pages::projects::page))
         .route("/system", get(pages::system::page))
         .route("/config", get(pages::configuration::page))
@@ -412,6 +416,7 @@ mod tests {
             "Overview",
             "Threads",
             "Bros",
+            "Gaps",
             "Projects",
             "System",
             "Configuration",

@@ -424,6 +424,8 @@ struct DetailData {
     knowledge_transport: bool,
     history_transport: Result<bool, String>,
     graphs: Result<Vec<GraphRow>, String>,
+    /// The panel of this project's open gaps.
+    gaps: Markup,
 }
 
 /// The outcome of resolving a project id for the detail view.
@@ -523,6 +525,7 @@ impl Detail {
                 crate::server::history_activation::state_transport_owns_project_history(shared, id)
                     .map_err(|error| format!("{error:#}")),
             graphs,
+            gaps: super::gaps::related_panel(ui, super::gaps::Related::Project(id)),
         }))
     }
 }
@@ -652,6 +655,7 @@ fn render_detail(data: &DetailData) -> Markup {
                 h2 #project-graphs { "Graphs" }
                 (graphs_table(&data.graphs))
             }
+            (data.gaps)
         }
     }
 }

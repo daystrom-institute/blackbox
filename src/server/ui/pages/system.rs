@@ -565,6 +565,7 @@ fn gaps_body(ui: &UiState) -> Markup {
                     tr { td { (state_label("stale", "acknowledged")) } td.num { (acknowledged) } }
                 }
             }
+            p { a href="/gaps" { "All open gaps" } }
             (source("bbox_gaps"))
         }
     }

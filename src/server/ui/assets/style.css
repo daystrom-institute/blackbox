@@ -408,6 +408,8 @@ tfoot td {
 }
 
 .thread-detail .panel,
+.gap-detail .panel,
+.gap-related,
 .task-live > .panel,
 #task-summary > .panel,
 .task-panels {
@@ -499,6 +501,42 @@ tfoot td {
 
 .tail-empty:not(:only-child) {
   display: none;
+/* Gaps */
+
+.gaps-table td .quiet {
+  font-size: 0.85em;
+}
+
+.gap-impacts {
+  margin: 0 0 0.5rem;
+  color: var(--text-muted);
+}
+
+.gap-impact-table {
+  margin-top: 0.75rem;
+}
+
+.gap-evidence,
+.gap-siblings {
+  margin: 0;
+  padding-left: 1.25rem;
+}
+
+.gap-evidence li,
+.gap-siblings li {
+  padding: 0.2rem 0;
+}
+
+.gap-diagnostics {
+  margin: 0.75rem 0 0;
+  color: var(--text-muted);
+}
+
+.gap-diagnostics ul {
+  margin: 0.4rem 0 0;
+  padding-left: 1.25rem;
+}
+
 /* Projects */
 
 .region {

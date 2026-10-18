@@ -22,16 +22,18 @@ pub(crate) enum Section {
     Overview,
     Threads,
     Bros,
+    Gaps,
     Projects,
     System,
     Configuration,
 }
 
 impl Section {
-    const ALL: [Section; 6] = [
+    const ALL: [Section; 7] = [
         Section::Overview,
         Section::Threads,
         Section::Bros,
+        Section::Gaps,
         Section::Projects,
         Section::System,
         Section::Configuration,
@@ -42,6 +44,7 @@ impl Section {
             Section::Overview => "Overview",
             Section::Threads => "Threads",
             Section::Bros => "Bros",
+            Section::Gaps => "Gaps",
             Section::Projects => "Projects",
             Section::System => "System",
             Section::Configuration => "Configuration",
@@ -53,6 +56,7 @@ impl Section {
             Section::Overview => "/",
             Section::Threads => "/threads",
             Section::Bros => "/bros",
+            Section::Gaps => "/gaps",
             Section::Projects => "/projects",
             Section::System => "/system",
             Section::Configuration => "/config",
@@ -69,6 +73,7 @@ impl Section {
             Section::Bros => {
                 r#"<circle cx="9" cy="8" r="3"/><circle cx="17" cy="9" r="2.5"/><path d="M3 20c0-3.5 2.7-6 6-6s6 2.5 6 6"/><path d="M15 14.5c3 0 6 2 6 5.5"/>"#
             }
+            Section::Gaps => r#"<path d="M12 3l9 17H3z"/><path d="M12 10v4M12 17v.5"/>"#,
             Section::Projects => r#"<path d="M3 6h7l2 2h9v11H3z"/>"#,
             Section::System => {
                 r#"<rect x="3" y="4" width="18" height="12" rx="1"/><path d="M8 20h8M12 16v4"/>"#

@@ -6,7 +6,7 @@ corpus: blackbox-design
 topic:
   - surfaces
   - web-ui
-brief: "A read-only operator web UI rendered by blackboxd itself on a loopback-only listener behind an identity proxy: threads, bros, projects, system state, and redacted configuration, with live roster and tail over SSE."
+brief: "A read-only operator web UI rendered by blackboxd itself on a loopback-only listener behind an identity proxy: threads, bros, gaps, projects, system state, and redacted configuration, with live roster and tail over SSE."
 ---
 
 # Operator Web UI
@@ -15,7 +15,7 @@ The daemon renders a browser surface for the operator from the state it
 already holds. The surface is read-only, server-rendered, and reachable only
 through an identity-aware reverse proxy that is mechanically the only route
 in. It replaces the retired terminal cockpits as the human view of threads,
-bros, projects, and daemon health.
+bros, gaps, projects, and daemon health.
 
 ## Invariants
 
@@ -80,26 +80,34 @@ principal rule.
 
 ## Page map
 
-Every page shares the shell: left navigation (Overview, Threads, Bros,
+Every page shares the shell: left navigation (Overview, Threads, Bros, Gaps,
 Projects, System, Configuration), a header with the daemon's hostname,
 version, uptime, and the signed-in principal, and a footer with the
 daemon's build identity.
 
 | Route | Content | Source |
 | --- | --- | --- |
-| `/` | Overview: counts (threads by status, bros by state bucket, registered projects), index health, last activation, open gaps | the same readers as `bbox_stats`, `bro_dashboard`, `bbox_project_list`, `bbox_gaps` |
+| `/` | Overview: counts (threads by status, bros by state bucket, registered projects), index health, last activation, open gaps by resolution and by impact | the same readers as `bbox_stats`, `bro_dashboard`, `bbox_project_list`, `bbox_gaps` |
 | `/threads` | Thread list with status and project filters; title, status, project, message count, updated | `bbox_thread_list` reader |
-| `/threads/{id}` | Thread detail: messages in order, participants, linked entities | `bbox_thread` reader |
+| `/threads/{id}` | Thread detail: messages in order, participants, linked entities, gaps filed from the thread | `bbox_thread`, `bbox_gaps` readers |
 | `/bros` | Roster table: state bucket, task id, label or brofile, provider, model, elapsed, last event; live through the roster delta stream | `bro_dashboard` projection, `roster_tx` |
-| `/bros/{task}` | Task detail: status, dispatch parameters (secrets redacted), report when present, event tail streamed while running | `bro_status` reader, `tail_tx` |
+| `/bros/{task}` | Task detail: status, dispatch parameters (secrets redacted), report when present, event tail streamed while running, gaps the task filed | `bro_status`, `bbox_gaps` readers, `tail_tx` |
+| `/gaps` | Gap list with resolution (default unresolved and acknowledged), kind, impact, blocking, domain, project and text filters; per-impact counts; title, kind, domain, impact, blocking, resolution, linked issue, project, created; source diagnostics; the table re-fetches on an interval | `bbox_gaps` selection (`resolve_gap_list`) |
+| `/gaps/{id}` | Gap detail: summary, provenance (published ref and commit, or legacy), origin linked to its task and thread, need, evidence, notes, resolution with linked issues, supersession and same-dedupe-key gaps | `bbox_gaps` exact read |
 | `/projects` | Catalog: project id, scope, attachments, publisher state, last activation | `bbox_project_list`, `bbox_project_catalog_list` readers |
-| `/projects/{id}` | Project detail: attachments, graph summary, transport ownership, publisher status | `bbox_project_catalog_get`, `bbox_project_graph_describe` readers |
+| `/projects/{id}` | Project detail: attachments, graph summary, transport ownership, publisher status, open gaps | `bbox_project_catalog_get`, `bbox_project_graph_describe`, `bbox_gaps` readers |
 | `/system` | Index stats, doctor findings, storage health and GC schedule, embed routes and queue, providers and allocator status, runtime metrics | `bbox_doctor`, `bbox_storage_health`, `bbox_embed_status`, `bro_providers`, `bro_allocator_status` readers, the runtime metrics collector |
 | `/config` | Effective daemon config (redacted), the surface table with each surface's visible tools, brofiles, managed MCP server configs | the loaded config, the surface resolver, `bro_brofile` and `bro_mcp` readers |
 
 Fragments (`/fragments/...`) return the table bodies and detail panes that
 htmx swaps; each fragment is also a full page's building block, so there is
 one renderer per view.
+
+Gap pages select through the same resolution `bbox_gaps` makes: the project
+filter arms the identity and ledger predicates, and the diagnostics the tool
+returns (filter misses, skipped project overlays, legacy rows) render under
+the table. Issue links come from the URLs in a gap's resolution note. No gap
+broadcast exists, so the gap table refreshes by interval rather than SSE.
 
 ## Visual design
 

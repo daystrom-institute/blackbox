@@ -4,6 +4,7 @@ pub(super) mod bros;
 pub(super) mod config_view;
 pub(super) mod configuration;
 pub(super) mod display;
+pub(super) mod gaps;
 pub(super) mod overview;
 pub(super) mod placeholder;
 pub(super) mod projects;

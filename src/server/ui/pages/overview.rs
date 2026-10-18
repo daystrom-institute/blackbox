@@ -32,8 +32,9 @@ struct OverviewData {
     projects: Vec<Count>,
     /// `bbox_stats` reader: the index statistics.
     index: Result<Vec<(String, String)>, String>,
-    /// `bbox_gaps` reader: the session gap view, open records only.
-    gaps: Result<Vec<Count>, String>,
+    /// `bbox_gaps` reader: the session gap view, open records only, by
+    /// resolution and by impact.
+    gaps: Result<(Vec<Count>, Vec<(&'static str, usize)>), String>,
 }
 
 impl OverviewData {
@@ -110,7 +111,7 @@ impl OverviewData {
             .session_gap_view(None)
             .map(|view| {
                 let all = view.gaps.all();
-                [
+                let resolutions: Vec<Count> = [
                     (GapResolution::Unresolved, "unresolved", "waiting"),
                     (GapResolution::Acknowledged, "acknowledged", "stale"),
                 ]
@@ -123,7 +124,8 @@ impl OverviewData {
                         .filter(|gap| gap.resolution == resolution)
                         .count(),
                 })
-                .collect()
+                .collect();
+                (resolutions, super::gaps::open_impacts(all))
             })
             .map_err(|error| format!("{error:#}"));
 
@@ -194,9 +196,30 @@ fn render(data: &OverviewData) -> Markup {
                 }
             }
             section.panel aria-labelledby="overview-gaps" {
-                h2 id="overview-gaps" { "Open gaps" }
+                h2 id="overview-gaps" { a href="/gaps" { "Open gaps" } }
                 @match &data.gaps {
-                    Ok(counts) => { (count_table("Resolution", counts, "No gaps are open.", "bbox_gaps")) }
+                    Ok((counts, impacts)) => {
+                        (count_table("Resolution", counts, "No gaps are open.", "bbox_gaps"))
+                        @if impacts.iter().any(|(_, count)| *count > 0) {
+                            table.gap-impact-table {
+                                thead { tr { th scope="col" { "Impact" } th.num scope="col" { "Open" } } }
+                                tbody {
+                                    @for (impact, count) in impacts {
+                                        tr {
+                                            td {
+                                                @if *count > 0 {
+                                                    a href=(format!("/gaps?impact={impact}")) { (impact) }
+                                                } @else {
+                                                    span.quiet { (impact) }
+                                                }
+                                            }
+                                            td.num { (count) }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     Err(error) => { (error_fragment("bbox_gaps", error)) }
                 }
             }

@@ -32,6 +32,7 @@ use serde::Deserialize;
 use super::super::shell::{Section, empty_state, error_fragment, layout};
 use super::super::{Principal, UiState, html_response};
 use super::display::{age, encode_component, parse_rfc3339, preview};
+use super::gaps::{Related, related_panel};
 use super::projects::project_names;
 
 /// Rows per list page.
@@ -152,21 +153,21 @@ fn thread_project(thread: &Thread) -> Option<&str> {
 /// One choice on the project filter: the stored keys that name one project,
 /// or one selector no project claims.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ProjectChoice {
+pub(super) struct ProjectChoice {
     /// The query value: the project id, else the selector itself.
-    value: String,
+    pub(super) value: String,
     /// The option text: the project's name, else its id, else the selector.
-    label: String,
+    pub(super) label: String,
     /// The project behind the choice; absent for an unclaimed selector.
-    project_id: Option<String>,
+    pub(super) project_id: Option<String>,
     /// Every stored key that selects this choice.
-    keys: BTreeSet<String>,
+    pub(super) keys: BTreeSet<String>,
 }
 
 impl ProjectChoice {
     /// How a row names its project: the choice's label and value, with the
     /// stored key kept for the hover text.
-    fn reference(&self, key: &str) -> ProjectRef {
+    pub(super) fn reference(&self, key: &str) -> ProjectRef {
         ProjectRef {
             value: self.value.clone(),
             label: self.label.clone(),
@@ -178,11 +179,11 @@ impl ProjectChoice {
 
 /// A thread's project as a page names it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ProjectRef {
-    value: String,
-    label: String,
-    project_id: Option<String>,
-    key: String,
+pub(super) struct ProjectRef {
+    pub(super) value: String,
+    pub(super) label: String,
+    pub(super) project_id: Option<String>,
+    pub(super) key: String,
 }
 
 /// The project filter choices for `keys`, plus the resolution of every key
@@ -190,7 +191,7 @@ struct ProjectRef {
 /// resolver maps to one project fold into that project's choice, the rest
 /// stand alone. Resolution runs over one catalog snapshot; when the
 /// resolver is unavailable every key stands alone.
-fn project_choices(
+pub(super) fn project_choices(
     ui: &UiState,
     keys: &BTreeSet<String>,
     extra: Option<&str>,
@@ -249,7 +250,7 @@ fn project_choices(
 
 /// The choice a filter value selects: by value, then by the project the
 /// value resolves to, then by stored key.
-fn select_choice<'c>(
+pub(super) fn select_choice<'c>(
     choices: &'c [ProjectChoice],
     resolved: &BTreeMap<String, Option<String>>,
     wanted: &str,
@@ -535,11 +536,11 @@ fn project_cell(project: Option<&ProjectRef>) -> Markup {
 }
 
 /// `bbox_thread` reader: the stored record for this id, with its project
-/// named the way the list names it.
+/// named the way the list names it, and the panel of gaps filed from it.
 async fn read_thread(
     ui: &Arc<UiState>,
     id: String,
-) -> Result<Option<(Thread, Option<ProjectRef>)>, String> {
+) -> Result<Option<(Thread, Option<ProjectRef>, Markup)>, String> {
     let reader_ui = ui.clone();
     tokio::task::spawn_blocking(move || {
         let thread = reader_ui.shared.threads.read().thread_by_id(&id).cloned()?;
@@ -557,7 +558,8 @@ async fn read_thread(
                     key: key.to_string(),
                 })
         });
-        Some((thread, project))
+        let gaps = related_panel(&reader_ui, Related::Thread(&thread.id));
+        Some((thread, project, gaps))
     })
     .await
     .map_err(|error| error.to_string())
@@ -570,10 +572,10 @@ pub(crate) async fn detail_page(
     Path(id): Path<String>,
 ) -> Response {
     let (status, title, content) = match read_thread(&ui, id.clone()).await {
-        Ok(Some((thread, project))) => (
+        Ok(Some((thread, project, gaps))) => (
             StatusCode::OK,
             thread_title(&thread),
-            thread_detail(&thread, project.as_ref(), Utc::now()),
+            thread_detail(&thread, project.as_ref(), gaps, Utc::now()),
         ),
         Ok(None) => (
             StatusCode::NOT_FOUND,
@@ -603,9 +605,9 @@ pub(crate) async fn detail_fragment(
     Path(id): Path<String>,
 ) -> Response {
     match read_thread(&ui, id.clone()).await {
-        Ok(Some((thread, project))) => html_response(
+        Ok(Some((thread, project, gaps))) => html_response(
             StatusCode::OK,
-            thread_detail(&thread, project.as_ref(), Utc::now()),
+            thread_detail(&thread, project.as_ref(), gaps, Utc::now()),
         ),
         Ok(None) => html_response(StatusCode::NOT_FOUND, missing_thread(&id)),
         Err(error) => html_response(StatusCode::OK, error_fragment("bbox_thread", &error)),
@@ -619,7 +621,12 @@ fn missing_thread(id: &str) -> Markup {
     }
 }
 
-fn thread_detail(thread: &Thread, project: Option<&ProjectRef>, now: DateTime<Utc>) -> Markup {
+fn thread_detail(
+    thread: &Thread,
+    project: Option<&ProjectRef>,
+    gaps: Markup,
+    now: DateTime<Utc>,
+) -> Markup {
     html! {
         div.thread-detail {
             section.panel aria-labelledby="thread-summary" {
@@ -760,6 +767,8 @@ fn thread_detail(thread: &Thread, project: Option<&ProjectRef>, now: DateTime<Ut
                     }
                 }
             }
+
+            (gaps)
 
             @if let Some(doc) = thread.handoff_doc.as_deref().filter(|doc| !doc.trim().is_empty()) {
                 section.panel aria-labelledby="thread-handoff" {

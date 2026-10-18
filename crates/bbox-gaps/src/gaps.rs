@@ -2169,6 +2169,14 @@ impl GapStore {
         out
     }
 
+    /// Every gap the filters select, unpaged, newest first. Validates the
+    /// enum filters first, as [`Self::list_page`] does, so an invalid value
+    /// never broadens the selection.
+    pub fn select(&self, p: &GapListParams) -> Result<Vec<GapNote>> {
+        self.validate_list_filters(p)?;
+        Ok(self.matching(p))
+    }
+
     pub fn query(&self, p: &GapListParams) -> Vec<GapNote> {
         self.matching(p)
             .into_iter()
@@ -2181,8 +2189,7 @@ impl GapStore {
     /// stay unchanged; response metadata is attached only to these read rows.
     pub fn list_page(&self, p: &GapListParams) -> Result<Value> {
         // Validate before selecting: an invalid enum must never broaden a query.
-        self.validate_list_filters(p)?;
-        let matched = self.matching(p);
+        let matched = self.select(p)?;
         if p.body_cursor.is_some() || p.body_limit.is_some() {
             anyhow::ensure!(
                 p.id.is_some(),
