@@ -16,7 +16,7 @@ rejected.
 | Path | Purpose |
 | --- | --- |
 | `brofiles/`, `agentic-corpus/brofiles/` | Role prompts for explicitly dispatched workers. |
-| `skills/` | Global agent skills, installed into provider homes by `scripts/sync-skills.sh`. See [agent skills](../docs/agent-skills.md). |
+| `skills/` | Global agent skills, registered with the host's Agent Service Desk by `scripts/sync-skills.sh`, which links them into provider homes. See [agent skills](../docs/agent-skills.md). |
 | `memories/` | Deferred `sm-*` references, loaded by the daemon. |
 
 Bro orchestration keeps execution, resume, status and waits. The caller composes

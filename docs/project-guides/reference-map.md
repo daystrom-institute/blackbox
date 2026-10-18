@@ -11,7 +11,7 @@ or agent skills and link/pointer from here.
   interactive prompts and dispatched-agent lenses). Distinct from
   `system-defaults/` artifacts and agent skills.
 - `docs/agent-skills.md` - the `bbox-*` agent skills: global ones under
-  `system-defaults/skills/` installed by `scripts/sync-skills.sh`, project ones
+  `system-defaults/skills/` registered by `scripts/sync-skills.sh`, project ones
   under `.agents/skills/`.
 - `docs/getting-started.md`, `docs/operating-blackbox.md`,
   `docs/operations.md` - operational setup and day-2 runbooks.

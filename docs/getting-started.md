@@ -99,7 +99,8 @@ url = "https://<daemon-origin>/mcp?surface=interactive"
 **Copilot** - `copilot mcp add blackbox https://<daemon-origin>/mcp?surface=interactive`
 
 Then install the global [agent skills](agent-skills.md) on the host, so every
-Claude Code and Codex account gets the Blackbox procedures:
+Claude Code and Codex account gets the Blackbox procedures. The script
+registers them with the host's Agent Service Desk, which must be running:
 
 ```bash
 scripts/sync-skills.sh

@@ -41,17 +41,40 @@ checkout:
 
 ## Installing the global skills
 
-Run on every host where agents work, and again after the skills change:
+The host's Agent Service Desk (ASD) daemon installs global skills. Run on every
+host where agents work, and again after the skills change:
 
 ```bash
 scripts/sync-skills.sh --check    # report pending changes, write nothing
 scripts/sync-skills.sh
 ```
 
-The script copies each global skill once into `~/.agents/skills`, which Codex
-reads whatever `CODEX_HOME` is, and links that copy into every Claude Code home
-(`~/.claude` and `~/.claude-*`). It replaces or removes only what it installed
-and reports anything else at a target path as a conflict.
+The script registers the six skills with ASD as publisher `blackbox`, each
+pointing at its directory in this checkout, together with the skill roots to
+reach: `~/.agents/skills`, which Codex reads whatever `CODEX_HOME` is, and the
+`skills` directory of every Claude Code home (`~/.claude` and `~/.claude-*`).
+ASD links each skill directory into every root and keeps the links current.
+`BBOX_SKILLS_DIR` and `--claude-home` choose other roots; `ASD_URL` names the
+daemon, which must run on the same host.
+
+The links point at the source, so run the script from the checkout that keeps
+the skills (or name it with `BBOX_SKILLS_SOURCE`), not from a session worktree
+that will be removed. A skill that leaves the source is unregistered on the next
+run, and ASD removes only the links it created. Other publishers' registrations
+and anything ASD did not install are left alone; content in the way of a link is
+reported as a conflict for the operator to resolve. Skill roots are shared: a
+root this script adds also receives other publishers' skills that ASD installs
+everywhere.
+
+Copies made by the earlier copy-based installer carry a `.bbox-skill` marker.
+ASD adopts them: each copy is moved under its data directory and replaced by
+the link, and Claude links that pointed at a copy are replaced too.
+
+When ASD is not running the script stops with exit status 3 and installs
+nothing. `--check` asks ASD to inspect the links on disk without changing them.
+`scripts/sync-skills-test.sh` tests the script against a stub; with
+`ASD_CHECKOUT` naming a whalesong checkout it also runs a throwaway ASD daemon
+on a temporary home.
 
 Install a skill name in exactly one place. Providers do not merge same-name
 skills from two scanned directories, so a second copy shows up as a duplicate.

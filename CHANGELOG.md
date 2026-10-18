@@ -8,6 +8,13 @@ out explicitly under `Changed` or `Removed`.
 
 ## Unreleased
 
+- `scripts/sync-skills.sh` registers the global skills with the host's Agent
+  Service Desk as publisher `blackbox` instead of copying them. ASD links each
+  skill directory into `~/.agents/skills` and every Claude Code home, adopts
+  the `.bbox-skill` copies made by the earlier installer and reports conflicts
+  without touching them. The daemon must be running; `--check` reports pending
+  changes from the links on disk. `scripts/sync-skills-test.sh` covers the
+  script.
 - Blackbox procedures ship as agent skills. Six global skills under
   `system-defaults/skills/` (`bbox-onboard-project`, `bbox-bro-dispatch`,
   `bbox-gap`, `bbox-health`, `bbox-recall`, `bbox-persist`) are installed into
