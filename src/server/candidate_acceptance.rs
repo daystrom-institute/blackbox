@@ -34,7 +34,7 @@ use bbox_indexing::accepted_publication_runtime::{
     PublisherPublishMode,
 };
 use bbox_indexing::project_catalog_admin;
-use bbox_indexing::project_catalog_store::ProjectCatalogStore;
+use bbox_indexing::project_catalog_store::{ProjectCatalogState, ProjectCatalogStore};
 use bbox_knowledge_source_store::KnowledgeSourceStore;
 
 use super::producer_auth::ProducerAuthRuntime;
@@ -245,6 +245,35 @@ pub(crate) fn publish_from_ready_candidate(
 /// candidate, and only the caller's convergence path may react to that.
 fn stale_epoch_race(error: &PublishError) -> bool {
     error.code() == "error.project_catalog_stale_epoch" && !error.may_have_swapped()
+}
+
+/// Establish admission: the project is published at a scope and an
+/// attached repo-knowledge capable attachment is validated at that scope.
+/// The first attempt checks it before the publish, and every stale-epoch
+/// retry rechecks it against the refreshed snapshot: the publish path
+/// validates the candidate's scope but never attachment admission, so a
+/// detach landing between the check and the commit must refuse rather
+/// than establish a pointer with no admitted checkout.
+fn has_eligible_establish_attachment(
+    snapshot: &ProjectCatalogState,
+    project_id: &ProjectId,
+) -> bool {
+    let Some(project) = snapshot.catalog().projects.get(project_id) else {
+        return false;
+    };
+    let ProjectScope::Published(catalog_scope) = &project.scope else {
+        return false;
+    };
+    snapshot
+        .attachments()
+        .attachments
+        .values()
+        .any(|attachment| {
+            attachment.project_id == *project_id
+                && attachment.status == AttachmentStatus::Attached
+                && attachment.capabilities.repo_knowledge
+                && attachment.validated_scope.as_ref() == Some(catalog_scope)
+        })
 }
 
 /// Why an acceptance attempt did not move the pointer, or that it did.
@@ -619,7 +648,11 @@ impl super::BlackboxServer {
     /// whole publish path, repinning the candidate, re-proving the grant,
     /// and re-parsing the configuration, because an epoch change may alter
     /// scope-relevant state, and [`MAX_STALE_EPOCH_RETRIES`] bounds the
-    /// cost.
+    /// cost. An Establish retry also revalidates attachment admission
+    /// against the refreshed snapshot, because the publish path checks the
+    /// candidate's scope but never admission; an Advance retry rechecks
+    /// nothing, because its compare-and-swap tokens still decide whether
+    /// this attempt may swap.
     ///
     /// Every other refusal is final. The mode's compare-and-swap tokens
     /// stay from their first read, so a concurrent acceptance that swapped
@@ -659,6 +692,18 @@ impl super::BlackboxServer {
                     retries += 1;
                     match store.snapshot() {
                         Ok(snapshot) => {
+                            // Establish admission is snapshot state, not
+                            // publish state: a detach that landed between
+                            // the first check and the commit refuses the
+                            // retry instead of establishing a pointer with
+                            // no admitted checkout. Advance rechecks
+                            // nothing: its CAS tokens still decide whether
+                            // this attempt may swap.
+                            if matches!(mode, PublisherPublishMode::Establish)
+                                && !has_eligible_establish_attachment(&snapshot, project_id)
+                            {
+                                return Err(AcceptanceOutcome::NoAttachedCheckout);
+                            }
                             epoch = self.state.candidate_publish_epoch(snapshot.epoch());
                         }
                         Err(error) => {
@@ -896,18 +941,7 @@ impl super::BlackboxServer {
                     AcceptanceOutcome::RefNotBranch,
                 );
             }
-            let has_eligible_attachment =
-                snapshot
-                    .attachments()
-                    .attachments
-                    .values()
-                    .any(|attachment| {
-                        attachment.project_id == *project_id
-                            && attachment.status == AttachmentStatus::Attached
-                            && attachment.capabilities.repo_knowledge
-                            && attachment.validated_scope.as_ref() == Some(catalog_scope)
-                    });
-            if !has_eligible_attachment {
+            if !has_eligible_establish_attachment(&snapshot, project_id) {
                 return (
                     candidate.producer_id.clone(),
                     AcceptanceOutcome::NoAttachedCheckout,

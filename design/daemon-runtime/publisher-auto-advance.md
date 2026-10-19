@@ -117,9 +117,13 @@ daemon was already accepting.
   collector is the next attempt. The one non-verdict refusal, a lost race
   against the catalog-global epoch (any project's catalog write bumps it),
   is retried inline within the one claimed attempt: at most
-  `MAX_STALE_EPOCH_RETRIES` times, each retry re-reading only the epoch and
+  `MAX_STALE_EPOCH_RETRIES` times, each retry re-reading the epoch and
   keeping the pointer CAS tokens from the first read, so a persistently
-  contended catalog still stops and refuses. A refusal that may have
+  contended catalog still stops and refuses. An establish retry also
+  revalidates attachment admission against the refreshed snapshot: the
+  publish path checks the candidate's scope but never admission, so a
+  detach landing between the first check and the commit refuses the
+  retry. A refusal that may have
   reached the swap never retries: the pointer may already name the
   candidate, and only convergence reacts to that.
 - **The prior accepted generation keeps serving, unless the refusal reached

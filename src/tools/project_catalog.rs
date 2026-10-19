@@ -6064,6 +6064,53 @@ mod tests {
         assert_eq!(unbound["last_candidate"]["served_by_pointer"], false);
     }
 
+    /// An unreadable catalog pair does not hide a lagging pointer: doctor
+    /// reports the catalog fault, that the pointer still verifies and
+    /// serves independently of it, and the Ready candidate it lags.
+    #[tokio::test]
+    async fn doctor_reports_a_lagging_pointer_through_an_unreadable_catalog() {
+        use crate::server::state::catalog_fixture::{COMMIT_ONE, COMMIT_TWO};
+
+        crate::init_system_memory_for_tests();
+        let fixture = AcceptanceFixture::new("p_accept_lag_poison");
+        let first = fixture.stage_candidate("knowledge-a", "first", COMMIT_ONE);
+        assert!(fixture.accept(&first).accepted());
+        let second = fixture.stage_candidate("knowledge-a", "second", COMMIT_TWO);
+
+        let store = fixture
+            .server
+            .state
+            .project_authority
+            .catalog_store()
+            .cloned()
+            .expect("catalog authority");
+        let restore = store
+            .poison_for_test("doctor: catalog pair unreadable")
+            .expect("the store is readable before poisoning");
+        let report = crate::doctor::run(&fixture.server).unwrap();
+        store.unpoison_for_test(restore);
+
+        let text = serde_json::to_string(
+            report
+                .sections
+                .iter()
+                .find(|section| section.section == "accepted_publication")
+                .expect("the accepted-publication section"),
+        )
+        .unwrap();
+        assert!(
+            text.contains("could not be read from the catalog pair"),
+            "{text}"
+        );
+        assert!(
+            text.contains("verified independently of the catalog"),
+            "{text}"
+        );
+        assert!(text.contains("is not served"), "{text}");
+        assert!(text.contains(&second), "{text}");
+        assert!(!text.contains("could not be evaluated further"), "{text}");
+    }
+
     #[tokio::test]
     async fn establish_ignores_the_checked_out_attachment_branch() {
         use crate::server::state::catalog_fixture::COMMIT_ONE;
@@ -6678,6 +6725,75 @@ mod tests {
             after["acceptance"]["last_attempt"]["code"],
             "error.project_catalog_stale_epoch"
         );
+    }
+
+    /// An Establish stale-epoch retry revalidates admission: when the last
+    /// eligible attachment detaches between the admission check and the
+    /// publish commit, the retry refuses instead of establishing a pointer
+    /// with no admitted checkout. The detach rides the epoch hook through
+    /// the daemon's own store handle, the store the acceptance path reads.
+    #[tokio::test]
+    async fn an_establish_retry_refuses_when_the_last_eligible_attachment_detaches() {
+        use crate::server::state::catalog_fixture::COMMIT_ONE;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let fixture = AcceptanceFixture::new("p_accept_detach_race");
+        let first = fixture.stage_candidate("knowledge-a", "first", COMMIT_ONE);
+        let store = fixture
+            .server
+            .state
+            .project_authority
+            .catalog_store()
+            .cloned()
+            .expect("catalog authority");
+        // The first epoch read detaches the only eligible attachment and
+        // returns a stale epoch: the first publish loses the epoch race,
+        // and the retry faces the refreshed admission.
+        let reads = std::sync::Arc::new(AtomicUsize::new(0));
+        let seen = std::sync::Arc::clone(&reads);
+        fixture
+            .server
+            .state
+            .install_candidate_acceptance_epoch_hook_for_test(Box::new(move |epoch| {
+                if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                    let current = store.snapshot().unwrap().epoch();
+                    store
+                        .transact(current, |_catalog, attachments| {
+                            let row = attachments
+                                .attachments
+                                .get_mut(
+                                    &bbox_corpus_core::project_catalog::AttachmentId::parse(
+                                        "att_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                                    )
+                                    .unwrap(),
+                                )
+                                .unwrap();
+                            row.status =
+                                bbox_corpus_core::project_catalog::AttachmentStatus::Detached;
+                            row.detached_at = Some("2026-10-18T00:00:00Z".into());
+                            row.capabilities = Default::default();
+                            Ok(())
+                        })
+                        .unwrap();
+                    epoch - 1
+                } else {
+                    epoch
+                }
+            }));
+
+        assert_eq!(
+            fixture.accept(&first),
+            AcceptanceOutcome::NoAttachedCheckout,
+            "the retry revalidates admission against the refreshed snapshot"
+        );
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            1,
+            "the admission refusal precedes the second epoch read"
+        );
+        let status = fixture.status().await;
+        assert_eq!(status["accepted_state"], "missing");
+        assert!(status["generation_id"].is_null(), "{status}");
     }
 
     /// Convergence after a publish: the published knowledge reaches the
