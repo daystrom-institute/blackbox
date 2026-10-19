@@ -14,10 +14,10 @@
 //!   every in-flight merge, so a per-batch writer turns each small commit
 //!   into a wasted rewrite of the pending merge set and never compacts
 //!   deletions; the long-lived writer lets those merges land in the
-//!   background. Any failed commit scope drops the stored writer so the next
-//!   op rebuilds from a clean one, and a full reindex pass settles its merge
-//!   threads (`wait_merging_threads`, which consumes the writer) before
-//!   leaving the slot empty for the next op to refill.
+//!   background. Any failed op or failed commit drops the stored writer so
+//!   the next op rebuilds from a clean one, and a full reindex pass settles
+//!   its merge threads (`wait_merging_threads`, which consumes the writer)
+//!   before leaving the slot empty for the next op to refill.
 //! - Small ops are fire-and-forget (`enqueue`): callers already treated index
 //!   sync as best-effort (warn-and-continue), and the durable stores +
 //!   periodic reindex reconcile any op lost to a writer error. Tests needing
@@ -245,7 +245,8 @@ pub enum IndexWriteOp {
     /// lifetime), so fixtures that used to seed a transcript index directly
     /// enqueue through here instead. Carries raw documents precisely because
     /// it asserts nothing about them: it exists to reproduce legacy shapes no
-    /// production op can express.
+    /// production op can express, and to commit an exact document grouping
+    /// as one segment regardless of how the queue coalesces.
     #[cfg(any(test, feature = "test-support"))]
     SeedDocuments(Vec<TantivyDocument>),
 }
@@ -2839,8 +2840,9 @@ fn run_selector_retirement(ctx: &ActorCtx, selector: &str) -> Result<u64> {
 }
 
 /// Apply a batch of small ops under one commit of the actor's long-lived
-/// writer. A failed commit drops the writer (the slot keeps nothing back), so
-/// the next batch rebuilds one instead of reusing a possibly-poisoned arena.
+/// writer. Any failed op or failed commit drops the writer (the slot keeps
+/// nothing back), so the next batch rebuilds one instead of reusing a
+/// possibly-poisoned arena.
 fn process_batch(ctx: &ActorCtx, batch: Vec<IndexWriteOp>) {
     let mut flush_acks: Vec<mpsc::SyncSender<()>> = Vec::new();
     let mut ops: Vec<IndexWriteOp> = Vec::new();
@@ -2855,12 +2857,25 @@ fn process_batch(ctx: &ActorCtx, batch: Vec<IndexWriteOp>) {
         match take_writer(ctx) {
             Ok(mut writer) => {
                 writer.set_merge_policy(Box::new(conservative_log_merge_policy()));
+                let mut apply_failed = false;
                 for op in ops {
-                    apply_small_op(ctx, &mut writer, op);
+                    if let Err(err) = apply_small_op(ctx, &mut writer, op) {
+                        apply_failed = true;
+                        tracing::warn!(
+                            error = %err,
+                            "index writer actor: op failed; discarding the writer after this batch (reindex pass will reconcile)"
+                        );
+                    }
                 }
                 match writer.commit() {
                     Ok(_) => {
-                        keep_writer(ctx, writer);
+                        // The commit still lands the ops that did apply; only
+                        // a fully healthy batch returns the writer to the
+                        // slot, because an op that failed mid-batch leaves
+                        // the writer's staged state suspect.
+                        if !apply_failed {
+                            keep_writer(ctx, writer);
+                        }
                         post_commit(ctx);
                     }
                     Err(err) => tracing::error!(
@@ -2904,6 +2919,10 @@ fn run_pass(
         writer.set_merge_policy(Box::new(conservative_log_merge_policy()));
     }
     let mut pending_flushes: Vec<mpsc::SyncSender<()>> = Vec::new();
+    // A drained op that fails its apply leaves this writer just as suspect
+    // as a failed batch op would; the flag keeps it out of the slot after
+    // the pass so the next op rebuilds from a clean one.
+    let mut drained_op_failed = false;
     let outcome = {
         let mut drain = |writer: &mut IndexWriter| {
             while let Ok(op) = rx.try_recv() {
@@ -2944,7 +2963,15 @@ fn run_pass(
                         )));
                     }
                     IndexWriteOp::Flush(ack) => pending_flushes.push(ack),
-                    small => apply_small_op(ctx, writer, small),
+                    small => {
+                        if let Err(err) = apply_small_op(ctx, writer, small) {
+                            drained_op_failed = true;
+                            tracing::warn!(
+                                error = %err,
+                                "index writer actor: drained op failed inside pass; the writer will be discarded after the pass"
+                            );
+                        }
+                    }
                 }
             }
         };
@@ -2968,12 +2995,13 @@ fn run_pass(
         // owned-writer path did this between commit and meta save; doing it
         // post-commit here preserves the settled-segments property).
         // wait_merging_threads consumes the writer, so the slot stays empty
-        // and the next scope recreates one; an incremental pass keeps it.
+        // and the next scope recreates one; an incremental pass keeps it,
+        // unless a drained op failed inside it.
         if full {
             if let Err(err) = writer.wait_merging_threads() {
                 tracing::warn!(error = %err, "index writer actor: wait_merging_threads failed");
             }
-        } else {
+        } else if !drained_op_failed {
             keep_writer(ctx, writer);
         }
         post_commit(ctx);
@@ -3004,7 +3032,7 @@ fn rollback_enqueued_graph_generation(
 
 // executes inside the IndexWriterActor pass (sanctioned single-writer).
 #[allow(clippy::disallowed_methods)]
-fn apply_small_op(ctx: &ActorCtx, writer: &mut IndexWriter, op: IndexWriteOp) {
+fn apply_small_op(ctx: &ActorCtx, writer: &mut IndexWriter, op: IndexWriteOp) -> Result<()> {
     let (kind, result): (&str, Result<()>) = match op {
         IndexWriteOp::UpsertKnowledge(entry) => (
             "upsert_knowledge",
@@ -3130,12 +3158,10 @@ fn apply_small_op(ctx: &ActorCtx, writer: &mut IndexWriter, op: IndexWriteOp) {
         | IndexWriteOp::RetireCodeSelector { .. }
         | IndexWriteOp::Flush(_) => {
             debug_assert!(false, "control ops are routed before apply_small_op");
-            return;
+            return Ok(());
         }
     };
-    if let Err(err) = result {
-        tracing::warn!(error = %err, op = kind, "index writer actor: op failed; reindex pass will reconcile");
-    }
+    result.context(format!("index writer actor: {kind} op failed"))
 }
 
 fn knowledge_path(config: &ReindexConfig) -> &Path {
@@ -3238,9 +3264,9 @@ fn take_writer(ctx: &ActorCtx) -> Result<IndexWriter> {
     }
 }
 
-/// Return an unpoisoned writer to the slot after a successful commit scope.
-/// Its background merges keep running and land on their own; nothing waits
-/// for them outside a full reindex pass.
+/// Return the writer to the slot only after a fully healthy batch or pass:
+/// no failed op, no failed commit. Its background merges keep running and
+/// land on their own; nothing waits for them outside a full reindex pass.
 fn keep_writer(ctx: &ActorCtx, writer: IndexWriter) {
     *ctx.writer.borrow_mut() = Some(writer);
 }
@@ -5043,25 +5069,48 @@ mod tests {
     }
 
     /// Deletions only ever leave tombstones unless a merge swallows the
-    /// tombstoned segments; an orphaned-merge writer compacts nothing. The
-    /// summed deleted-doc count must reach zero once background merges land.
+    /// tombstoned segments; an orphaned-merge writer compacts nothing. Each
+    /// of the five segments carries four documents and loses two (a 0.5
+    /// delete ratio, above the conservative policy's 0.3 floor), so the
+    /// compacting merge is triggered by the deletes themselves rather than
+    /// by segment count: the summed deleted-doc count must reach zero while
+    /// the survivors stay searchable.
     #[test]
     fn batch_deletes_are_compacted_once_merges_complete() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let index = test_index(&root);
         let actor = IndexWriterActor::spawn_for(&index);
-        for i in 0..10 {
-            actor.enqueue(IndexWriteOp::UpsertKnowledge(Box::new(test_entry(
-                &format!("compact{i:02}delete"),
-                &format!("delete compaction sentinel {i}"),
-            ))));
-            actor.flush_blocking().unwrap();
+        // Five four-document segments. Seeded as one op per group so each
+        // group commits as a single segment no matter how the queue
+        // coalesces (a split group could land fully-deleted or under the
+        // ratio and make the pass vacuous). The docs are byte-identical to
+        // what UpsertKnowledge stages, so DeleteKnowledge tombstones hit
+        // them by the same entity id. The conservative policy stays under
+        // its 20-segment floor with no deletions, so nothing merges yet.
+        let fields = index.field_handles();
+        let kb_path = root.join("kb.json");
+        for batch in 0..5 {
+            let documents = (0..4)
+                .map(|doc| {
+                    let marker = if doc < 2 { "vanishing" } else { "surviving" };
+                    let entry = test_entry(
+                        &format!("compact{batch:02}x{doc}"),
+                        &format!("compaction sentinel {marker} {batch}-{doc}"),
+                    );
+                    super::super::knowledge_docs::build_knowledge_doc(&entry, &kb_path, fields)
+                })
+                .collect();
+            actor.seed_documents_for_test(documents).unwrap();
         }
-        for i in 0..4 {
-            actor.enqueue(IndexWriteOp::DeleteKnowledge(format!(
-                "compact{i:02}delete"
-            )));
+        // Two tombstones per segment: every segment lands above the delete
+        // ratio, which is what makes the whole level a merge candidate.
+        for batch in 0..5 {
+            for doc in 0..2 {
+                actor.enqueue(IndexWriteOp::DeleteKnowledge(format!(
+                    "compact{batch:02}x{doc}"
+                )));
+            }
         }
         actor.flush_blocking().unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -5075,36 +5124,129 @@ mod tests {
         }
         assert_eq!(
             live_doc_total(&index),
-            6,
+            10,
             "compaction must remove tombstoned documents, not live ones"
+        );
+        assert!(
+            search(&index, "surviving").contains("surviving"),
+            "survivors must remain searchable after compaction"
+        );
+        assert!(
+            !search(&index, "vanishing").contains("vanishing"),
+            "tombstoned entries must not surface after compaction"
         );
     }
 
-    /// A full reindex pass runs the tantivy default policy (8-segment merge
-    /// floor) and must return only after settling its merge threads, even
-    /// though the writer now comes from the actor's long-lived slot and
-    /// carries the small-op conservative policy on arrival.
+    /// A full reindex pass runs under the tantivy default policy and must
+    /// return only after settling its merge threads, even though the writer
+    /// now comes from the actor's long-lived slot. The rebuild inputs are
+    /// durable (kb store entries), so the delete-all + rebuild is observable:
+    /// exactly the store-backed docs survive, an index-only entry is gone,
+    /// and the writer the pass consumed leaves the slot empty for the next
+    /// small-op batch to refill.
+    ///
+    /// A full pass cannot be made to end with more segments than its own
+    /// rebuild commit produces: delete_all_documents clears the segment
+    /// inventory and the rebuild lands in exactly one commit, so the
+    /// post-pass count is small by construction. The immediate count
+    /// assertion pins that the pass returned settled (with the pre-pass
+    /// batches' pending merges drained) rather than with a writer whose
+    /// merges were orphaned mid-flight.
     #[test]
     fn full_reindex_pass_still_settles_merge_threads() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let index = test_index(&root);
         let actor = IndexWriterActor::spawn_for(&index);
-        for i in 0..30 {
-            actor.enqueue(IndexWriteOp::UpsertKnowledge(Box::new(test_entry(
-                &format!("settle{i:02}full"),
-                &format!("full pass settle sentinel {i}"),
-            ))));
+        let durable: Vec<_> = (0..30)
+            .map(|i| {
+                test_entry(
+                    &format!("settle{i:02}durable"),
+                    &format!("durablekeep sentinel {i}"),
+                )
+            })
+            .collect();
+        persist_kb_entries(&root.join("kb.json"), &durable);
+        // Index-only entry: never store-backed, so a real full rebuild must
+        // drop it. This is what makes the rebuild non-vacuous.
+        actor.enqueue(IndexWriteOp::UpsertKnowledge(Box::new(test_entry(
+            "settle99indexonly",
+            "rebuiltdrop sentinel",
+        ))));
+        actor.flush_blocking().unwrap();
+        // Thirty one-document commits push the tiny level over the
+        // conservative floor, leaving scheduled (possibly in-flight) merges
+        // for the pass's settle to drain.
+        for entry in &durable {
+            actor.enqueue(IndexWriteOp::UpsertKnowledge(Box::new(entry.clone())));
             actor.flush_blocking().unwrap();
         }
-        // No assertion on the pre-pass segment count: background merges may
-        // already have compacted some of the 30 single-doc batches, and the
-        // invariant under test is only what the pass itself guarantees.
         actor.run_reindex_pass(true, true).unwrap();
         assert!(
             segment_total(&index) <= 8,
             "full pass must return with merge threads settled: {}",
             segment_total(&index)
+        );
+        assert_eq!(
+            live_doc_total(&index),
+            30,
+            "the rebuild must re-add exactly the store-backed entries"
+        );
+        assert!(
+            search(&index, "durablekeep").contains("durablekeep"),
+            "store-backed entries must survive the full rebuild"
+        );
+        assert!(
+            !search(&index, "rebuiltdrop").contains("rebuiltdrop"),
+            "index-only entries must not survive a full rebuild"
+        );
+        // The pass consumed the writer (wait_merging_threads), so the slot
+        // must be empty: the next small op lands on a freshly created one.
+        actor.enqueue(IndexWriteOp::UpsertKnowledge(Box::new(test_entry(
+            "settle98afterpass",
+            "freshwriter sentinel",
+        ))));
+        actor.flush_blocking().unwrap();
+        assert!(
+            search(&index, "freshwriter").contains("freshwriter"),
+            "the op after a full pass must land on the refilled slot"
+        );
+    }
+
+    /// A failed apply must not return the writer to the slot even when the
+    /// batch's own commit succeeds: the staged state of a writer that saw an
+    /// op fail mid-batch is suspect, so the next op rebuilds a fresh writer
+    /// and must land on it. An empty ReplaceProjectGraphLane is the concrete
+    /// failing apply (it bails before staging anything). The discard itself
+    /// is not externally observable through the handle; the recovery is.
+    #[test]
+    fn failed_apply_discards_the_stored_writer_and_the_next_op_lands() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let index = test_index(&root);
+        let actor = IndexWriterActor::spawn_for(&index);
+        actor.enqueue(IndexWriteOp::UpsertKnowledge(Box::new(test_entry(
+            "recover00before",
+            "recoverybaseline sentinel",
+        ))));
+        actor.flush_blocking().unwrap();
+        actor.enqueue(IndexWriteOp::ReplaceProjectGraphLane {
+            documents: Vec::new(),
+        });
+        actor.flush_blocking().unwrap();
+        actor.enqueue(IndexWriteOp::UpsertKnowledge(Box::new(test_entry(
+            "recover01after",
+            "recoverylanded sentinel",
+        ))));
+        actor.flush_blocking().unwrap();
+        assert_eq!(
+            live_doc_total(&index),
+            2,
+            "the healthy op after a failed apply must commit on a fresh writer"
+        );
+        assert!(
+            search(&index, "recoverylanded").contains("recoverylanded"),
+            "the healthy op after a failed apply must be searchable"
         );
     }
 

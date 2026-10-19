@@ -31,9 +31,9 @@ brief: "Holistic concurrency architecture for blackboxd: current as-built map, t
 > op with retry-on-busy rather than at spawn. Dropping a tantivy writer kills
 > its segment updater and orphans every in-flight merge, so a per-batch writer
 > wastes the pending merge set on every commit and never compacts deletions;
-> failed commit scopes drop the stored writer and the next op rebuilds it,
-> and full reindex passes settle merge threads before returning (the queue,
-> not writer recreation, provides serialization).
+> failed ops and failed commits drop the stored writer and the next op
+> rebuilds it, and full reindex passes settle merge threads before returning
+> (the queue, not writer recreation, provides serialization).
 > Measured: idle mean poll 1791µs → ~236µs across the campaign; under-load
 > samples confounded by host rustc storms (see thread note 22). The daemon
 > keeps no in-memory edge graph, so no edge rebuild holds store guards or runs
