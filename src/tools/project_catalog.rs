@@ -1623,7 +1623,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_project_scope_migrate",
-        description = "Local administrator operation requiring verified daemon checkout authority for every active attachment. Transport-owned projects return error.project_admin_locality_required before probes; no remote attached-migration lane is implemented. Attachment-proved scope migration for a published catalog project: kind=relpath-move for a monorepo relocation, kind=repo-authority-change for a recorded-authority change. The daemon probes every active attachment at HEAD (and, for a relpath move, the relocated directory, which must exist) and the pair transaction rewrites the catalog scope, relocates the attachments, appends host-local path bindings, and writes the migration record with its proof. A repo-authority change requires acknowledge_repo_authority_change, which agents pass through from operator input and never default or infer. dry_run validates the complete mutation and commits nothing. Requires expected_catalog_epoch and a bounded audit_reason. Returns error.project_catalog_inactive while the version-1 registry is the runtime authority."
+        description = "Local administrator operation requiring verified daemon checkout authority for every active attachment. Transport-owned projects return error.project_admin_locality_required before probes; no remote attached-migration lane is implemented. Attachment-proved scope migration for a published catalog project: kind=relpath-move for a monorepo relocation, kind=repo-authority-change for a recorded-authority change. The daemon probes every active attachment at HEAD (and, for a relpath move, the relocated directory, which must exist) and the pair transaction rewrites the catalog scope, relocates the attachments, appends host-local path bindings, and writes the migration record with its proof. A repo-authority change requires acknowledge_repo_authority_change, which agents pass through from operator input and never default or infer. dry_run validates the complete mutation and commits nothing. Requires expected_catalog_epoch and a bounded audit_reason. A committed migration also rewrites the project's checkout-registry census rows to the new scope (best-effort after the commit, reported per checkout under checkout_registry) and reports publication_bridge.needs_scope_move while the accepted pointer still names the old scope; the scope_move advance itself stays with bbox_project_publisher_advance. Returns error.project_catalog_inactive while the version-1 registry is the runtime authority."
     )]
     pub(crate) async fn bbox_project_scope_migrate(
         &self,
@@ -1659,7 +1659,7 @@ impl BlackboxServer {
                 probe_migration_attachments(&store, &project_id, &kind, &new_scope)?;
             let request = project_catalog_admin::ScopeMigrationRequest {
                 project_id: project_id.clone(),
-                expected_old_scope,
+                expected_old_scope: expected_old_scope.clone(),
                 new_scope: new_scope.clone(),
                 kind,
                 designated_attachment,
@@ -1688,6 +1688,31 @@ impl BlackboxServer {
                 p.dry_run,
             )
             .map_err(|error| anyhow::anyhow!("{error}"))?;
+            // Post-commit convergence, reported and never fatal: the
+            // transaction is the authority. The census rows of the
+            // project's attachments follow the committed scope, and the
+            // publication bridge tells the operator a `scope_move` advance
+            // is still needed. A dry run touches neither.
+            let attachment_checkout_ids = leases
+                .iter()
+                .map(|lease| lease.checkout_id().to_owned())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            let checkout_registry = if receipt.is_some() {
+                server.rewrite_migrated_census_rows(
+                    &attachment_checkout_ids,
+                    &expected_old_scope,
+                    &new_scope,
+                )
+            } else {
+                json!({"moved": 0, "outcomes": []})
+            };
+            let publication_bridge = server.scope_migrate_publication_bridge(
+                &project_id,
+                &new_scope,
+                request.publication_bridge_generation.clone(),
+            );
             Ok(serde_json::to_string_pretty(&json!({
                 "status": "ok",
                 "project_id": project_id.as_str(),
@@ -1706,6 +1731,8 @@ impl BlackboxServer {
                 "attachments_sha256": receipt
                     .as_ref()
                     .map(|receipt| receipt.commit.attachments_sha256.clone()),
+                "checkout_registry": checkout_registry,
+                "publication_bridge": publication_bridge,
             }))?)
         })
         .await
@@ -2504,6 +2531,90 @@ impl BlackboxServer {
             }
         }
         DetachCleanup::from_results(census, watcher)
+    }
+
+    /// Rewrite the census rows of a just-migrated project's active
+    /// attachments from the old scope to the new one, after the catalog
+    /// pair transaction has committed. Best-effort by design: a committed
+    /// migration is never failed by census cleanup, whose failure is warned
+    /// and left to reconciliation's catalog-confirmed stale drop.
+    fn rewrite_migrated_census_rows(
+        &self,
+        checkout_ids: &[String],
+        old: &PublishedScope,
+        new: &PublishedScope,
+    ) -> serde_json::Value {
+        let mut moved = 0;
+        let outcomes = checkout_ids
+            .iter()
+            .map(|checkout_id| {
+                // The load-bearing census mutation lock order, one row at a
+                // time: lifecycle mutation guard, then the registry write
+                // lock, then the registry's internal store lock. The catalog
+                // transaction is already committed and never nested here.
+                let outcome = (|| -> anyhow::Result<bool> {
+                    let _lifecycle = self
+                        .state
+                        .checkout_access
+                        .lifecycle_mutation_guard()
+                        .map_err(anyhow::Error::new)?;
+                    self.state
+                        .checkout_registry
+                        .write()
+                        .rewrite_scope(checkout_id, old, new)
+                })();
+                if let Err(error) = &outcome {
+                    tracing::warn!(
+                        checkout_id = %checkout_id,
+                        error = %error,
+                        "scope migration committed but checkout registry rewrite failed"
+                    );
+                }
+                let outcome_label = match &outcome {
+                    Ok(true) => {
+                        moved += 1;
+                        "moved"
+                    }
+                    Ok(false) => "not_registered",
+                    Err(_) => "failed",
+                };
+                json!({"checkout_id": checkout_id, "outcome": outcome_label})
+            })
+            .collect::<Vec<_>>();
+        json!({"moved": moved, "outcomes": outcomes})
+    }
+
+    /// The publication-bridge report for a scope migration: whether the
+    /// accepted pointer still names a scope the catalog is leaving behind,
+    /// so the operator's `scope_move` advance is the remaining step. The
+    /// migration never performs the move itself. Read-only.
+    fn scope_migrate_publication_bridge(
+        &self,
+        project_id: &ProjectId,
+        new_scope: &PublishedScope,
+        probed_bridge_generation: Option<String>,
+    ) -> serde_json::Value {
+        let installed = self
+            .state
+            .accepted_publications
+            .as_ref()
+            .and_then(|runtime| runtime.installed_pointer(project_id).ok().flatten());
+        match installed {
+            Some(pointer) => json!({
+                "needs_scope_move": pointer.accepted_scope != *new_scope,
+                "accepted_scope": {
+                    "repo_id": pointer.accepted_scope.repo_id(),
+                    "bbox_root_relpath": pointer.accepted_scope.bbox_root_relpath(),
+                },
+            }),
+            // No readable pointer facts. The catalog is leaving the old
+            // scope in this very operation, so any installed pointer
+            // predates the move and needs the operator's scope_move.
+            None => json!({
+                "needs_scope_move": probed_bridge_generation.is_some(),
+                "accepted_scope": serde_json::Value::Null,
+            }),
+        }
     }
 }
 
@@ -6598,6 +6709,125 @@ mod tests {
             &moved_scope,
         );
         assert!(fixture.accept(&third).accepted());
+    }
+
+    /// A committed attached migration converges the host-local census in
+    /// the same operation: the old-scope registry row moves to the new
+    /// scope, and the response reports the publication bridge the operator
+    /// still has to clear with `scope_move`. A dry run touches neither the
+    /// census nor the pointer.
+    #[tokio::test]
+    async fn scope_migrate_moves_checkout_registry_rows_and_reports_pointer_bridge() {
+        use crate::server::state::catalog_fixture::{COMMIT_ONE, CatalogFixture, knowledge_entry};
+
+        let fixture = CatalogFixture::new();
+        let old = CatalogFixture::scope(".");
+        let new = CatalogFixture::scope("services/api");
+        let project = "p_census_migrate";
+        let checkout_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaa0138";
+        let attachment = "att_00000000000000000000000000000138";
+        // The checkout already carries the relocated project root at HEAD,
+        // which is what every attachment probe of the migration resolves.
+        let checkout = fixture.root().join("estate");
+        std::fs::create_dir_all(checkout.join("services/api/.bbox/knowledge")).unwrap();
+        git(&checkout, &["init", "-b", "main"]);
+        git(
+            &checkout,
+            &["config", "user.email", "probe@example.invalid"],
+        );
+        git(&checkout, &["config", "user.name", "probe"]);
+        std::fs::write(
+            checkout.join("services/api/.bbox/config.toml"),
+            "[project]\nrepo_id = \"repo_example\"\n",
+        )
+        .unwrap();
+        git(&checkout, &["add", "-A"]);
+        git(&checkout, &["commit", "-m", "relocated project root"]);
+
+        fixture.add_published_project(project, &old);
+        fixture.install_publication(
+            project,
+            &old,
+            COMMIT_ONE,
+            &[knowledge_entry("knowledge-a", "published at the old scope")],
+            &[],
+        );
+        fixture.attach_overlay_checkout(project, &old, &checkout, attachment, checkout_id, true);
+        let server = fixture.server_with_checkout_authority();
+        // The census row discovery left behind at the old scope, which used
+        // to survive the migration and fail reconciliation forever.
+        server
+            .state
+            .checkout_registry
+            .write()
+            .register(bbox_indexing::checkout_registry::CheckoutRow {
+                project_id: Some(project.into()),
+                checkout_id: checkout_id.into(),
+                checkout_dir: checkout.to_string_lossy().into_owned(),
+                repo_id: Some(old.repo_id().to_string()),
+                bbox_root_relpath: Some(old.bbox_root_relpath().to_string()),
+                branch_ref: Some("refs/heads/main".into()),
+            })
+            .unwrap();
+        let epoch = server.catalog_store().unwrap().snapshot().unwrap().epoch();
+        let migrate = |dry_run: bool| {
+            server.bbox_project_scope_migrate(Parameters(ProjectScopeMigrateParams {
+                project_id: project.into(),
+                attachment_id: attachment.into(),
+                expected_old_repo_id: old.repo_id().into(),
+                expected_old_relpath: old.bbox_root_relpath().into(),
+                new_repo_id: new.repo_id().into(),
+                new_relpath: new.bbox_root_relpath().into(),
+                kind: "relpath-move".into(),
+                acknowledge_repo_authority_change: false,
+                dry_run,
+                expected_catalog_epoch: epoch,
+                audit_reason: "fixture census convergence".into(),
+            }))
+        };
+
+        let rehearsed = migrate(true).await;
+        assert_ne!(rehearsed.is_error, Some(true), "{}", error_text(&rehearsed));
+        let rehearsed: serde_json::Value = serde_json::from_str(&error_text(&rehearsed)).unwrap();
+        assert_eq!(rehearsed["dry_run"], true);
+        assert_eq!(rehearsed["checkout_registry"]["moved"], 0);
+        {
+            let registry = server.state.checkout_registry.read();
+            assert!(
+                registry.get(checkout_id, &old).is_some(),
+                "a dry run moves no census row"
+            );
+            assert!(registry.get(checkout_id, &new).is_none());
+        }
+
+        let applied = migrate(false).await;
+        assert_ne!(applied.is_error, Some(true), "{}", error_text(&applied));
+        let applied: serde_json::Value = serde_json::from_str(&error_text(&applied)).unwrap();
+        assert_eq!(applied["checkout_registry"]["moved"], 1);
+        assert_eq!(
+            applied["checkout_registry"]["outcomes"][0]["checkout_id"],
+            checkout_id
+        );
+        assert_eq!(
+            applied["checkout_registry"]["outcomes"][0]["outcome"],
+            "moved"
+        );
+        {
+            let registry = server.state.checkout_registry.read();
+            assert!(
+                registry.get(checkout_id, &old).is_none(),
+                "the migration artifact row is gone"
+            );
+            assert!(
+                registry.get(checkout_id, &new).is_some(),
+                "the census follows the committed scope"
+            );
+        }
+        assert_eq!(applied["publication_bridge"]["needs_scope_move"], true);
+        assert_eq!(
+            applied["publication_bridge"]["accepted_scope"]["bbox_root_relpath"],
+            old.bbox_root_relpath()
+        );
     }
 
     /// A candidate the ACCEPTANCE PATH itself refuses is reported with the
