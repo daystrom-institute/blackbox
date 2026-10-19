@@ -5432,14 +5432,18 @@ mod tests {
             "a healthy batch must leave the writer in the slot"
         );
         // The failing op is enqueued from inside a drain boundary, before
-        // the try_recv loop that must consume it; the flag makes the enqueue
-        // once-only across the pass's several boundaries.
+        // the try_recv loop that must consume it. The handle rides in a
+        // take()-once slot: after the boundary fires, nothing the observer
+        // holds references the actor, so the capture cannot keep the
+        // actor's receive loop (and with it the recovered writer and the
+        // index lock) alive past the test.
         let drain_enqueued = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let drain_flag = drain_enqueued.clone();
-        let actor_from_drain = actor.clone();
+        let drain_handle = Arc::new(parking_lot::Mutex::new(Some(actor.clone())));
         actor.install_pass_drain_observer_for_test(move || {
-            if !drain_flag.swap(true, Ordering::SeqCst) {
-                actor_from_drain.enqueue(IndexWriteOp::ReplaceProjectGraphLane {
+            if let Some(actor) = drain_handle.lock().take() {
+                drain_flag.store(true, Ordering::SeqCst);
+                actor.enqueue(IndexWriteOp::ReplaceProjectGraphLane {
                     documents: Vec::new(),
                 });
             }
