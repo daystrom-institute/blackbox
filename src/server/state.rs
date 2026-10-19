@@ -986,12 +986,17 @@ mod clause_one_exit_proof {
     const ATTACHED_PROJECT: &str = "p_clause_one_attached";
 
     /// A populated server and its recordless twin over the same durable
-    /// bytes, so any difference is the blanked field and nothing else.
+    /// catalog bytes, so any difference is the blanked field and nothing
+    /// else. Each twin runs in its own runtime directory: the writer actor
+    /// holds its index directory's writer for its lifetime, so two live
+    /// runtimes cannot share one index directory.
     fn twin(fixture: &CatalogFixture) -> (BlackboxServer, BlackboxServer) {
-        let populated = fixture.server();
-        let recordless = fixture.server_with_records_provider(|inner| {
-            Arc::new(RecordlessProjectRecordsProvider::new(inner))
-        });
+        let root = fixture.root();
+        let populated = fixture.server_in_runtime_dir(&root.join("clause-one-runtime-populated"));
+        let recordless = fixture.server_with_records_provider_in_runtime_dir(
+            &root.join("clause-one-runtime-recordless"),
+            |inner| Arc::new(RecordlessProjectRecordsProvider::new(inner)),
+        );
         (populated, recordless)
     }
 
@@ -1270,21 +1275,6 @@ mod clause_one_exit_proof {
                 .records
                 .is_empty()
         );
-        // The actor holds the directory's writer for its lifetime, so this
-        // fixture's two live runtimes cannot both write the same index: the
-        // recordless twin's auto-index would take LockBusy against the
-        // populated twin's actor. Settle the directory before the walk: one
-        // full pass through the populated twin's actor builds the index,
-        // consumes its writer (wait_merging_threads) and leaves the slot
-        // empty, so that actor holds no directory lock while the recordless
-        // twin's actor runs its own auto-index. The populated arm never
-        // re-opens one mid-proof: the pass reloads its reader, so its index
-        // reads non-empty from here on.
-        populated
-            .state
-            .index_writer
-            .run_reindex_pass(true, true)
-            .expect("settle the shared index directory before the proof walk");
         let mut executed: Vec<&str> = Vec::new();
 
         macro_rules! compare {
@@ -2996,20 +2986,39 @@ pub(crate) mod catalog_fixture {
             BlackboxServer::new(Arc::new(state))
         }
 
-        /// A server whose records provider is wrapped, over the same
-        /// durable bytes as `server()`.
+        /// A fresh server over the same durable catalog bytes with its own
+        /// runtime directory (index, kb, threads, vectors).
         ///
-        /// Added for the clause 1 exit proof, which needs two servers that
-        /// differ ONLY in the attached-row view. Wrapping happens before
-        /// the state is shared, so no cached projection straddles the swap.
-        pub(crate) fn server_with_records_provider(
+        /// The clause 1 exit proof drives two live runtimes at once, and
+        /// the writer actor holds its index directory's writer for its
+        /// lifetime, so the second runtime needs its own index directory
+        /// rather than a second writer on one shared directory. The
+        /// compared surface (catalog, publications) stays shared.
+        pub(crate) fn server_in_runtime_dir(
             &self,
+            runtime_dir: &std::path::Path,
+        ) -> BlackboxServer {
+            std::fs::create_dir_all(runtime_dir).unwrap();
+            BlackboxServer::new(Arc::new(SharedState::for_test_catalog(
+                runtime_dir,
+                &self.catalog_projects_path,
+            )))
+        }
+
+        /// The recordless-twin companion to [`Self::server_in_runtime_dir`]:
+        /// a wrapped records provider (before the state is shared, so no
+        /// cached projection straddles the swap), in its own runtime
+        /// directory.
+        pub(crate) fn server_with_records_provider_in_runtime_dir(
+            &self,
+            runtime_dir: &std::path::Path,
             wrap: impl FnOnce(
                 Arc<dyn bbox_corpus_core::project_record::ProjectRecordsProvider>,
             )
                 -> Arc<dyn bbox_corpus_core::project_record::ProjectRecordsProvider>,
         ) -> BlackboxServer {
-            let mut state = SharedState::for_test_catalog(&self.root, &self.catalog_projects_path);
+            std::fs::create_dir_all(runtime_dir).unwrap();
+            let mut state = SharedState::for_test_catalog(runtime_dir, &self.catalog_projects_path);
             state.records_provider = wrap(state.records_provider.clone());
             BlackboxServer::new(Arc::new(state))
         }
