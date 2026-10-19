@@ -51,6 +51,13 @@ const CANDIDATE_REQUIRED: &str = "error.accepted_publication_candidate_required"
 /// daemon grows without bound.
 const MAX_LEDGER_PROJECTS: usize = 512;
 
+/// Stale-epoch races one claimed acceptance attempt retries inline. The
+/// catalog epoch is global, so any other project's catalog write bumps it
+/// between this path's epoch read and its publish commit; the budget
+/// bounds a persistently contended catalog instead of retrying without
+/// end.
+pub(crate) const MAX_STALE_EPOCH_RETRIES: u32 = 3;
+
 /// Attempted candidates remembered per project. "At most one attempt per
 /// uploaded candidate" needs memory of which candidates were attempted;
 /// bounding it is what keeps a chatty producer from turning that memory
@@ -231,6 +238,15 @@ pub(crate) fn publish_from_ready_candidate(
     )
 }
 
+/// Whether a publish refusal is a lost race against the catalog-global
+/// epoch rather than a verdict on the candidate: the catalog's own
+/// stale-epoch code, raised before the pointer swap. A refusal that may
+/// have reached the swap never retries: the pointer may already name the
+/// candidate, and only the caller's convergence path may react to that.
+fn stale_epoch_race(error: &PublishError) -> bool {
+    error.code() == "error.project_catalog_stale_epoch" && !error.may_have_swapped()
+}
+
 /// Why an acceptance attempt did not move the pointer, or that it did.
 ///
 /// Every non-accepting outcome is a REASON, never silence. A candidate
@@ -271,11 +287,13 @@ pub(crate) enum AcceptanceOutcome {
     /// This candidate was already attempted in this daemon lifetime. At
     /// most one attempt per uploaded candidate, always.
     AlreadyAttempted,
-    /// The acceptance path refused. There is no retry. The prior accepted
-    /// generation keeps serving UNLESS the refusal was raised at or after
-    /// the pointer swap, which `may_have_swapped` reports: the same signal
-    /// `bbox_project_publisher_advance` uses to decide whether it still has
-    /// to reconverge after a failure.
+    /// The acceptance path refused, after any inline stale-epoch retries.
+    /// Verdict refusals are final: only a lost race against the
+    /// catalog-global epoch is retried, inside the one claimed attempt.
+    /// The prior accepted generation keeps serving UNLESS the refusal was
+    /// raised at or after the pointer swap, which `may_have_swapped`
+    /// reports: the same signal `bbox_project_publisher_advance` uses to
+    /// decide whether it still has to reconverge after a failure.
     Refused {
         code: String,
         detail: String,
@@ -482,12 +500,15 @@ fn now_unix_secs() -> u64 {
 impl super::BlackboxServer {
     /// One acceptance attempt for one freshly Ready publication candidate.
     ///
-    /// Blocking, at most once per candidate, and never retried. Every exit
-    /// records a reason in the ledger, so `bbox_project_publisher_status`
-    /// can answer "why is my Ready candidate not serving" without a log
-    /// dive. On any refusal the prior accepted generation keeps serving:
-    /// this function only ever calls the ordinary acceptance path, which
-    /// swaps a pointer or refuses.
+    /// Blocking, at most once per candidate. A refusal that is a verdict
+    /// on the candidate is never retried; the one non-verdict refusal, a
+    /// lost race against the catalog-global epoch, is retried inline
+    /// within this single claimed attempt. Every exit records a reason in
+    /// the ledger, so `bbox_project_publisher_status` can answer "why is
+    /// my Ready candidate not serving" without a log dive. On any refusal
+    /// the prior accepted generation keeps serving: this function only
+    /// ever calls the ordinary acceptance path, which swaps a pointer or
+    /// refuses.
     pub(crate) fn accept_ready_candidate(
         &self,
         project_id: &str,
@@ -549,11 +570,13 @@ impl super::BlackboxServer {
                 detail,
                 may_have_swapped,
             } => {
-                // Loud, once, and then done. A retry loop here would turn
-                // one bad candidate into a storm against the publication
-                // lock. `may_have_swapped` says which generation is serving
-                // after this refusal, so the log answers that without a
-                // pointer read.
+                // Loud, once, and then done. This is the verdict path: a
+                // retry loop here would turn one bad candidate into a
+                // storm against the publication lock. A stale-epoch race
+                // never reaches this log; it was retried inline within the
+                // one claimed attempt. `may_have_swapped` says which
+                // generation is serving after this refusal, so the log
+                // answers that without a pointer read.
                 tracing::warn!(
                     project_id,
                     source_generation_id,
@@ -584,6 +607,68 @@ impl super::BlackboxServer {
             }
         }
         outcome
+    }
+
+    /// One candidate publish, retrying a lost race against the
+    /// catalog-global epoch.
+    ///
+    /// `error.project_catalog_stale_epoch` without swap uncertainty means
+    /// any project's catalog transaction bumped the global epoch between
+    /// this path's read and the publish commit: a lost race, not a verdict
+    /// on the candidate. Each retry re-reads the epoch and re-runs the
+    /// whole publish path, repinning the candidate, re-proving the grant,
+    /// and re-parsing the configuration, because an epoch change may alter
+    /// scope-relevant state, and [`MAX_STALE_EPOCH_RETRIES`] bounds the
+    /// cost.
+    ///
+    /// Every other refusal is final. The mode's compare-and-swap tokens
+    /// stay from their first read, so a concurrent acceptance that swapped
+    /// the pointer between attempts fails the retry as a pointer conflict
+    /// rather than overwriting it. `AlreadyAccepted` is not rechecked
+    /// inside the loop for the same reason: the tokens, not a fresh
+    /// pointer read, decide whether this attempt may still swap, and a
+    /// conflict refusal is the honest report for a candidate the pointer
+    /// may already serve.
+    fn publish_candidate_with_stale_epoch_retry(
+        &self,
+        store: &ProjectCatalogStore,
+        runtime: &AcceptedPublicationRuntime,
+        producer_auth: &ProducerAuthRuntime,
+        knowledge_sources: &KnowledgeSourceStore,
+        project_id: &ProjectId,
+        source_generation_id: &str,
+        mode: PublisherPublishMode,
+        first_epoch: u64,
+    ) -> Result<PublishReceipt, AcceptanceOutcome> {
+        let mut epoch = self.state.candidate_publish_epoch(first_epoch);
+        let mut retries = 0u32;
+        loop {
+            match publish_from_ready_candidate(
+                store,
+                runtime,
+                producer_auth,
+                knowledge_sources,
+                project_id,
+                source_generation_id,
+                mode.clone(),
+                epoch,
+                false,
+            ) {
+                Ok(receipt) => return Ok(receipt),
+                Err(error) if stale_epoch_race(&error) && retries < MAX_STALE_EPOCH_RETRIES => {
+                    retries += 1;
+                    match store.snapshot() {
+                        Ok(snapshot) => {
+                            epoch = self.state.candidate_publish_epoch(snapshot.epoch());
+                        }
+                        Err(error) => {
+                            return Err(AcceptanceOutcome::refused(&anyhow::anyhow!("{error}")));
+                        }
+                    }
+                }
+                Err(error) => return Err(AcceptanceOutcome::from_publish_error(&error)),
+            }
+        }
     }
 
     /// The decision half, split out so the ledger write and the logging
@@ -712,7 +797,7 @@ impl super::BlackboxServer {
             }
         };
         let producer_auth = self.state.code_sources.producer_auth();
-        let outcome = publish_from_ready_candidate(
+        let outcome = match self.publish_candidate_with_stale_epoch_retry(
             &store,
             runtime.as_ref(),
             producer_auth.as_ref(),
@@ -721,28 +806,20 @@ impl super::BlackboxServer {
             source_generation_id,
             // The tokens of the pointer the checks above read: a concurrent
             // move between that read and the swap refuses as a pointer
-            // conflict instead of being overwritten.
+            // conflict instead of being overwritten. The retries keep them
+            // for the same reason.
             PublisherPublishMode::Advance {
                 expected_generation_id: installed.expected_generation_id.clone(),
                 expected_pointer_sha256: installed.expected_pointer_sha256.clone(),
             },
             epoch,
-            false,
-        );
-        match outcome {
-            Ok(receipt) => (
-                bound_producer,
-                AcceptanceKind::Advance,
-                AcceptanceOutcome::Accepted {
-                    generation_id: receipt.generation_id().to_string(),
-                },
-            ),
-            Err(error) => (
-                bound_producer,
-                AcceptanceKind::Advance,
-                AcceptanceOutcome::from_publish_error(&error),
-            ),
-        }
+        ) {
+            Ok(receipt) => AcceptanceOutcome::Accepted {
+                generation_id: receipt.generation_id().to_string(),
+            },
+            Err(outcome) => outcome,
+        };
+        (bound_producer, AcceptanceKind::Advance, outcome)
     }
 
     /// Establish the first pointer from the first valid candidate: the
@@ -839,7 +916,7 @@ impl super::BlackboxServer {
         }
         drop(pinned);
 
-        let outcome = publish_from_ready_candidate(
+        let outcome = self.publish_candidate_with_stale_epoch_retry(
             store,
             runtime,
             producer_auth.as_ref(),
@@ -848,7 +925,6 @@ impl super::BlackboxServer {
             source_generation_id,
             PublisherPublishMode::Establish,
             snapshot.epoch(),
-            false,
         );
         match outcome {
             Ok(receipt) => (
@@ -857,10 +933,7 @@ impl super::BlackboxServer {
                     generation_id: receipt.generation_id().to_string(),
                 },
             ),
-            Err(error) => (
-                owning_producer,
-                AcceptanceOutcome::from_publish_error(&error),
-            ),
+            Err(outcome) => (owning_producer, outcome),
         }
     }
 }
@@ -970,6 +1043,26 @@ mod tests {
         );
         assert!(!AcceptanceOutcome::RefChanged.requires_convergence());
         assert!(!AcceptanceOutcome::AlreadyAttempted.requires_convergence());
+    }
+
+    /// The stale-epoch retry predicate: only the catalog's stale-epoch
+    /// code raised before the pointer swap is a race to retry. Swap
+    /// uncertainty and every verdict code, candidate staleness included,
+    /// are final.
+    #[test]
+    fn stale_epoch_races_are_the_only_retried_refusals() {
+        let race = PublishError::refusal(
+            "error.project_catalog_stale_epoch",
+            "expected epoch does not match the current catalog epoch",
+        );
+        assert!(stale_epoch_race(&race));
+        assert!(!stale_epoch_race(
+            &race.with_swap_uncertainty_for_test(true)
+        ));
+        assert!(!stale_epoch_race(&PublishError::refusal(
+            "error.accepted_publication_candidate_stale",
+            "the pinned publication candidate changed before commit"
+        )));
     }
 
     #[test]

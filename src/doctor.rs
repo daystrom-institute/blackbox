@@ -477,6 +477,14 @@ fn accepted_publication_section(
         }
         let project = &status.project_id;
         findings.extend(unserved);
+        // A lagging pointer's report is the unserved-candidate finding
+        // above; a second state line would only repeat it. A scope bridge
+        // still adds its own action below.
+        if status.accepted.state == "lagging"
+            && status.accepted.scope_agreement != "refresh_required"
+        {
+            continue;
+        }
         findings.push(match status.accepted.state {
             // Serving old accepted truth under its old scope until a
             // scope move at the new scope clears the bridge (plan 4.9).

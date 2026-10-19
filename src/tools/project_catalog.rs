@@ -2259,7 +2259,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_project_publisher_status",
-        description = "Read one catalog project's accepted-publication status: state, scope/ref/commit identity, typed source binding, advance availability, the generation_id and pointer_sha256 identities, and the latest candidate acceptance attempt. pointer_written_unix_secs is the pointer file's modification time: the last pointer write (accept, bind or rollback), not strictly the last accept, and a restored store carries the restore time. last_candidate is the newest candidate stored for the project (status stored, none or unavailable; source generation, producer, ref, commit, state, creation time, diagnostic) with served_by_pointer saying whether the accepted pointer serves it; it is read from durable state and survives a daemon restart. Default health and connector sections are compact bounded summaries that keep stale, unavailable, queued, and partial signals visible with total, status, and omission counts; recorded rows are observations, not live filesystem authority. Oversized summary strings become explicit size-and-truncation markers (diagnostics keep a bounded prefix) whose exact bytes live only in detail pages. detail=health returns the complete runtime view, detail=connector the complete connector view, detail=acceptance the latest candidate acceptance attempt, and detail=checkout_mutations the project's queued checkout edits that are pending, applied but not yet published, failed, conflicted, or blocked (ids, paths, digests and state counts, never file content; detail_path and detail_states narrow the rows, counts stay whole) as exact bounded body pages; replay detail.body.next_cursor while the body is unchanged. Connector detail requires a connector-scoped project and checkout_mutations detail a published one. Observational, path-free, and takes no checkout lease; see design/daemon-runtime/publisher-auto-advance.md for deep mechanics. Returns error.project_catalog_inactive while the version-1 registry is the runtime authority."
+        description = "Read one catalog project's accepted-publication status: accepted_state (current, lagging while a Ready candidate from the bound producer, scope and ref is stored but not served by the pointer, prior, missing, corrupt), scope/ref/commit identity, typed source binding, advance availability, the generation_id and pointer_sha256 identities, and the latest candidate acceptance attempt. pointer_written_unix_secs is the pointer file's modification time: the last pointer write (accept, bind or rollback), not strictly the last accept, and a restored store carries the restore time. last_candidate is the newest candidate stored for the project (status stored, none or unavailable; source generation, producer, ref, commit, state, creation time, diagnostic) with served_by_pointer saying whether the accepted pointer serves it; it is read from durable state and survives a daemon restart. Default health and connector sections are compact bounded summaries that keep stale, unavailable, queued, and partial signals visible with total, status, and omission counts; recorded rows are observations, not live filesystem authority. Oversized summary strings become explicit size-and-truncation markers (diagnostics keep a bounded prefix) whose exact bytes live only in detail pages. detail=health returns the complete runtime view, detail=connector the complete connector view, detail=acceptance the latest candidate acceptance attempt, and detail=checkout_mutations the project's queued checkout edits that are pending, applied but not yet published, failed, conflicted, or blocked (ids, paths, digests and state counts, never file content; detail_path and detail_states narrow the rows, counts stay whole) as exact bounded body pages; replay detail.body.next_cursor while the body is unchanged. Connector detail requires a connector-scoped project and checkout_mutations detail a published one. Observational, path-free, and takes no checkout lease; see design/daemon-runtime/publisher-auto-advance.md for deep mechanics. Returns error.project_catalog_inactive while the version-1 registry is the runtime authority."
     )]
     pub(crate) async fn bbox_project_publisher_status(
         &self,
@@ -2418,7 +2418,14 @@ impl BlackboxServer {
                 "project_id": project_id.as_str(),
                 "scope": scope_json(&project.scope),
                 "connector": connector_summary,
-                "accepted_state": accepted_state_label(status.state()),
+                // The health view's label is authoritative: it qualifies a
+                // verified pointer with the stored-candidate check, so a
+                // pointer current but behind a Ready bound candidate
+                // reports "lagging" instead of "current".
+                "accepted_state": runtime_health
+                    .as_ref()
+                    .map(|health| health.accepted.state)
+                    .unwrap_or_else(|| accepted_state_label(status.state())),
                 "published_available": status.published_available(),
                 "advance_available": status.advance_available(),
                 "scope_agreement": scope_agreement_label(status.scope_agreement()),
@@ -6008,7 +6015,7 @@ mod tests {
         // Stored, never accepted: the pointer stays on the first commit.
         let second = fixture.stage_candidate("knowledge-a", "second", COMMIT_TWO);
         let lagging = fixture.status().await;
-        assert_eq!(lagging["accepted_state"], "current");
+        assert_eq!(lagging["accepted_state"], "lagging");
         assert_eq!(lagging["accepted_commit"], COMMIT_ONE);
         assert_eq!(
             lagging["pointer_written_unix_secs"],
@@ -6035,9 +6042,26 @@ mod tests {
         // Accepting it clears both.
         assert!(fixture.accept(&second).accepted());
         let caught_up = fixture.status().await;
+        assert_eq!(caught_up["accepted_state"], "current");
         assert_eq!(caught_up["last_candidate"]["served_by_pointer"], true);
         let report = serde_json::to_string(&accepted_section(&fixture.server)).unwrap();
         assert!(!report.contains("is not served"), "{report}");
+
+        // A Ready candidate from a different producer is an operator
+        // rebind, not a lag the daemon owes: the label stays current even
+        // though the pointer does not serve it.
+        let foreign = fixture.stage_candidate_as_at(
+            "producer-b",
+            "knowledge-b",
+            "foreign",
+            "3333333333333333333333333333333333333333",
+            "refs/heads/main",
+            &fixture.scope,
+        );
+        let unbound = fixture.status().await;
+        assert_eq!(unbound["accepted_state"], "current");
+        assert_eq!(unbound["last_candidate"]["source_generation_id"], foreign);
+        assert_eq!(unbound["last_candidate"]["served_by_pointer"], false);
     }
 
     #[tokio::test]
@@ -6554,6 +6578,105 @@ mod tests {
         assert_eq!(
             after["acceptance"]["last_attempt"]["code"],
             "error.accepted_publication_candidate_required"
+        );
+    }
+
+    /// A Ready candidate the acceptance path refuses only because its epoch
+    /// read lost a race against the catalog-global epoch is retried against
+    /// the fresh epoch inside the one claimed attempt: it accepts, and the
+    /// repeated attempt is AlreadyAttempted, so the ledger claim stays
+    /// exactly-once despite the internal retry.
+    #[tokio::test]
+    async fn a_candidate_refused_for_a_stale_catalog_epoch_is_retried_against_the_fresh_epoch() {
+        use crate::server::state::catalog_fixture::{COMMIT_ONE, COMMIT_TWO};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let fixture = AcceptanceFixture::new("p_accept_epoch_race");
+        let first = fixture.stage_candidate("knowledge-a", "first", COMMIT_ONE);
+        assert!(fixture.accept(&first).accepted());
+
+        let second = fixture.stage_candidate("knowledge-a", "second", COMMIT_TWO);
+        // The first epoch read loses the race; every later read is fresh.
+        let reads = std::sync::Arc::new(AtomicUsize::new(0));
+        let seen = std::sync::Arc::clone(&reads);
+        fixture
+            .server
+            .state
+            .install_candidate_acceptance_epoch_hook_for_test(Box::new(move |epoch| {
+                if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                    epoch - 1
+                } else {
+                    epoch
+                }
+            }));
+
+        assert!(
+            fixture.accept(&second).accepted(),
+            "the stale first read is retried against the fresh epoch"
+        );
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            2,
+            "the doctored read plus the retry's fresh read"
+        );
+        let status = fixture.status().await;
+        assert_eq!(status["accepted_commit"], COMMIT_TWO);
+        assert_eq!(status["acceptance"]["last_attempt"]["outcome"], "accepted");
+        assert_eq!(
+            fixture.accept(&second),
+            AcceptanceOutcome::AlreadyAttempted,
+            "one ledger claim despite the internal retry"
+        );
+    }
+
+    /// A stale-epoch storm is bounded: when every epoch read loses the
+    /// race, the one claimed attempt refuses with the stale-epoch code
+    /// after MAX_STALE_EPOCH_RETRIES retries, and the prior generation
+    /// keeps serving.
+    #[tokio::test]
+    async fn a_stale_epoch_storm_is_bounded_and_the_prior_generation_keeps_serving() {
+        use crate::server::candidate_acceptance::MAX_STALE_EPOCH_RETRIES;
+        use crate::server::state::catalog_fixture::{COMMIT_ONE, COMMIT_TWO};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let fixture = AcceptanceFixture::new("p_accept_epoch_storm");
+        let first = fixture.stage_candidate("knowledge-a", "first", COMMIT_ONE);
+        assert!(fixture.accept(&first).accepted());
+        let before = fixture.status().await;
+
+        let second = fixture.stage_candidate("knowledge-a", "second", COMMIT_TWO);
+        let reads = std::sync::Arc::new(AtomicUsize::new(0));
+        let seen = std::sync::Arc::clone(&reads);
+        fixture
+            .server
+            .state
+            .install_candidate_acceptance_epoch_hook_for_test(Box::new(move |epoch| {
+                seen.fetch_add(1, Ordering::SeqCst);
+                epoch - 1
+            }));
+
+        let AcceptanceOutcome::Refused {
+            code,
+            may_have_swapped,
+            ..
+        } = fixture.accept(&second)
+        else {
+            unreachable!("every epoch read is stale: the attempt must refuse");
+        };
+        assert_eq!(code, "error.project_catalog_stale_epoch");
+        assert!(!may_have_swapped);
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            1 + MAX_STALE_EPOCH_RETRIES as usize,
+            "one first read plus one read per retry, then the budget stops the loop"
+        );
+
+        let after = fixture.status().await;
+        assert_eq!(after["generation_id"], before["generation_id"]);
+        assert_eq!(after["accepted_commit"], COMMIT_ONE);
+        assert_eq!(
+            after["acceptance"]["last_attempt"]["code"],
+            "error.project_catalog_stale_epoch"
         );
     }
 

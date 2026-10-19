@@ -938,6 +938,8 @@ pub(super) fn open_shared_state(
             vectors::VectorStore::open_unloaded(cfg.paths.vectors_path.clone())
                 .expect("default vector store placeholder should open"),
         ),
+        #[cfg(test)]
+        candidate_acceptance_epoch_hook: Default::default(),
     });
     shared.install_code_read_view_commit_hook();
 
