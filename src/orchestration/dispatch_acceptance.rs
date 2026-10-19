@@ -187,13 +187,31 @@ while True: time.sleep(1)
 
     impl Plane {
 async fn start_with_executor(kind: bbox_config::config::ExecutorKind) -> Self {
+            Self::start_with_config(kind, false).await
+        }
+
+        /// A plane whose daemon and fleetd run with HOME and BRO_HOME inside
+        /// the fixture, so the runner's global blackbox config (its global
+        /// mcp.json filters among it) cannot reach dispatch resolution.
+        async fn start_isolated() -> Self {
+            Self::start_with_config(bbox_config::config::ExecutorKind::Fleetd, true).await
+        }
+
+        async fn start_with_config(
+            kind: bbox_config::config::ExecutorKind,
+            isolate_home: bool,
+        ) -> Self {
             let tmp = tempfile::tempdir().expect("tempdir");
             let root = tmp.path().canonicalize().expect("canonical tempdir");
+            let mut env = crate::util::TestEnvGuard::new();
+            if isolate_home {
+                env.set("HOME", &root.join("home"));
+                env.set("BRO_HOME", &root.join("bro-home"));
+            }
             let fleetd = FleetdProcess::start(&root.join("state")).await;
             let store_dir = root.join("bro");
             std::fs::create_dir_all(&store_dir).expect("store dir");
             let stub = write_recording_stub(&root);
-            let mut env = crate::util::TestEnvGuard::new();
             env.remove("BLACKBOX_MCP_URL");
             env.set("CLAUDE_BIN", &stub);
             let state = Arc::new(crate::server::state::SharedState::for_test(&store_dir));
@@ -641,7 +659,7 @@ async fn start_with_executor(kind: bbox_config::config::ExecutorKind) -> Self {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn resume_of_a_named_session_restores_the_brofile_lanes_and_relabels() {
-        let mut plane = Plane::start().await;
+        let mut plane = Plane::start_isolated().await;
         let cwd = plane.cwd();
         create_brofile(
             &plane,
