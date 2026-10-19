@@ -3280,7 +3280,7 @@ fn rewrite_cli_census_rows(
     let mut registry = match open_checkout_registry(state_dir) {
         Ok(registry) => registry,
         Err(error) => {
-            eprintln!("blackbox: {error.message}");
+            eprintln!("blackbox: {}", error.message);
             return serde_json::json!({ "moved": 0, "failed": 0, "unreadable": true });
         }
     };
