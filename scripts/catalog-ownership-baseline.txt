@@ -98,6 +98,7 @@ checkout_root_path	crates/bbox-providers/src/providers/file.rs	fn read_with_leas
 checkout_root_path	crates/bbox-providers/src/providers/file.rs	fn resolve_absolute	1	collapse into the lease confined readers
 checkout_root_path	crates/bbox-providers/src/providers/file.rs	fn resolve_catalog_file	1	collapse into the lease confined readers
 checkout_root_path	src/bin/blackbox.rs	fn capture_retirement_evidence	1	collapse into the lease confined readers
+checkout_root_path	src/bin/blackbox.rs	fn execute_checkout_registry	1	collapse into the lease confined readers
 checkout_root_path	src/bin/blackbox.rs	fn execute_get	1	collapse into the lease confined readers
 checkout_root_path	src/bin/blackbox.rs	fn probe_retire_evidence	1	collapse into the lease confined readers
 checkout_root_path	src/server/checkout_access.rs	fn project_root	1	collapse into the lease confined readers

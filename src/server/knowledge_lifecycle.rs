@@ -1834,35 +1834,55 @@ mod tests {
         );
     }
 
-    /// Authority disagreement keeps the row: the attachment moved but the
-    /// catalog did not, so nothing proves the row is a migration artifact
-    /// and the mismatch stays an operator-visible error.
+    /// Authority disagreement keeps the row: the census row claims a
+    /// published scope the catalog never confirmed (the project stayed
+    /// LegacyLocal and its attachment carries no validated scope), so
+    /// nothing proves the row is a migration artifact and the mismatch
+    /// stays an operator-visible error.
     #[test]
     fn reconcile_preserves_a_scope_mismatched_row_when_catalog_did_not_migrate() {
         use crate::server::state::catalog_fixture::CatalogFixture;
+        use bbox_corpus_core::project_catalog::{ProjectId, ProjectScope};
 
         let fixture = CatalogFixture::new();
-        let old = CatalogFixture::scope(".");
-        let new = CatalogFixture::scope("services/api");
+        let claimed = CatalogFixture::scope("services/api");
         let project = "p_row_disagreed";
         let checkout_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaa0238";
         let checkout = estate_checkout(fixture.root());
-        fixture.add_published_project(project, &old);
+        fixture.add_published_project(project, &claimed);
         fixture.attach_overlay_checkout_at(
             project,
-            &new,
+            &claimed,
             &checkout,
             &checkout.join("services/api"),
             "att_00000000000000000000000000000238",
             checkout_id,
             true,
         );
+        // The disagreement is built with a raw transaction because the
+        // strict pair validates scope agreement: the project and its
+        // attachment have to leave the published world together, and a
+        // LegacyLocal project validating no attachment scope is the one
+        // contract-legal shape whose census-row resolution scope-mismatches
+        // with no published catalog scope that could agree the row stale.
+        let epoch = fixture.epoch();
+        fixture
+            .store()
+            .transact(epoch, |catalog, attachments| {
+                let project_id = ProjectId::parse(project).unwrap();
+                catalog.projects.get_mut(&project_id).unwrap().scope = ProjectScope::LegacyLocal;
+                for attachment in attachments.attachments.values_mut() {
+                    attachment.validated_scope = None;
+                }
+                Ok(())
+            })
+            .unwrap();
         let server = fixture.server_with_checkout_authority();
         server
             .state
             .checkout_registry
             .write()
-            .register(census_row(checkout_id, &old, Some(project), &checkout))
+            .register(census_row(checkout_id, &claimed, Some(project), &checkout))
             .unwrap();
 
         let report = server.reconcile_dark_knowledge_checkouts().unwrap();
@@ -1872,7 +1892,7 @@ mod tests {
                 .state
                 .checkout_registry
                 .read()
-                .get(checkout_id, &old)
+                .get(checkout_id, &claimed)
                 .is_some(),
             "only agreeing authority drops a mismatched row"
         );
