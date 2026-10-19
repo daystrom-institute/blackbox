@@ -2585,17 +2585,24 @@ mod tests {
         )
         .unwrap();
 
-        let store = ProjectCatalogStore::initialize_empty(&projects_path).unwrap();
         let old_scope = PublishedScope::try_new("bridgefamily", ".").unwrap();
-        let (project_id, _) = project_catalog_admin::catalog_add(
-            &store,
-            current_epoch(&store),
-            &project_catalog_admin::CatalogAddKind::Published(old_scope.clone()),
-            "remote service",
-            &[],
-            "2026-10-18T00:00:00Z",
-        )
-        .unwrap();
+        // The fixture store holds the migration lifetime lock for as long as
+        // the handle lives, and the CLI's administration claim is exclusive
+        // first, so the catalog-building handle is dropped before any
+        // migration call runs.
+        let project_id = {
+            let store = ProjectCatalogStore::initialize_empty(&projects_path).unwrap();
+            let (project_id, _) = project_catalog_admin::catalog_add(
+                &store,
+                current_epoch(&store).unwrap(),
+                &project_catalog_admin::CatalogAddKind::Published(old_scope.clone()),
+                "remote service",
+                &[],
+                "2026-10-18T00:00:00Z",
+            )
+            .unwrap();
+            project_id
+        };
         bbox_indexing::accepted_publication_test_support::install_accepted_publication_for_test(
             &projects_path,
             &project_id,
