@@ -2073,18 +2073,21 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let server = test_server(&tmp);
         {
-            let idx = server.state.idx.write();
-            let fields = idx.field_handles();
-            let mut writer = idx.index_handle().writer(50_000_000).unwrap();
+            // The actor holds the tantivy writer lock for its lifetime, so
+            // the doc is seeded through the actor's own single-writer lane
+            // rather than a second writer on the live index.
+            let fields = server.state.idx.read().field_handles();
             let mut transcript = tantivy::TantivyDocument::new();
             transcript.add_text(fields.doc_type, "transcript");
             transcript.add_text(fields.account, "claude");
             transcript.add_text(fields.session_id, "sess-1");
             transcript.add_u64(fields.byte_offset, 42);
             transcript.add_text(fields.role, "assistant");
-            writer.add_document(transcript).unwrap();
-            writer.commit().unwrap();
-            idx.reader_reload_for_test();
+            server
+                .state
+                .index_writer
+                .seed_documents_for_test(vec![transcript])
+                .unwrap();
         }
 
         let inspect = |entity_ref: String| {

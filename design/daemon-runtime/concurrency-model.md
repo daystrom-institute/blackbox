@@ -27,9 +27,13 @@ brief: "Holistic concurrency architecture for blackboxd: current as-built map, t
 > through one actor thread; the reindex pass executes inside the actor with
 > phase-boundary drains; bbox_reindex unified onto the same pass; the
 > LockBusy/silent-skip class is structurally gone. §4.3 delta as built: the
-> actor creates its writer per batch/pass with retry-on-busy instead of
-> holding it for the daemon lifetime (keeps boot initial build + cross-process
-> guard semantics; the queue, not the held lock, provides serialization).
+> actor holds one writer for its lifetime, created lazily on the first write
+> op with retry-on-busy rather than at spawn. Dropping a tantivy writer kills
+> its segment updater and orphans every in-flight merge, so a per-batch writer
+> wastes the pending merge set on every commit and never compacts deletions;
+> failed ops and failed commits drop the stored writer and the next op
+> rebuilds it, and full reindex passes settle merge threads before returning
+> (the queue, not writer recreation, provides serialization).
 > Measured: idle mean poll 1791µs → ~236µs across the campaign; under-load
 > samples confounded by host rustc storms (see thread note 22). The daemon
 > keeps no in-memory edge graph, so no edge rebuild holds store guards or runs
