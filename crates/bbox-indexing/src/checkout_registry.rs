@@ -413,6 +413,41 @@ impl CheckoutRegistry {
         })
     }
 
+    /// Move one `(checkout_id, published_scope)` row to a new scope, keeping
+    /// every other recorded field. A row already present at the new scope
+    /// satisfies the move, so the old row is dropped without duplicating it.
+    /// Returns whether a row moved. Persists when it moves.
+    pub fn rewrite_scope(
+        &mut self,
+        checkout_id: &str,
+        old: &PublishedScope,
+        new: &PublishedScope,
+    ) -> Result<bool> {
+        self.mutate_store(|next| {
+            let mut carried = None;
+            let mut moved = false;
+            next.checkouts.retain(|row| {
+                if !row.matches(checkout_id, old) {
+                    return true;
+                }
+                moved = true;
+                carried = Some(row.clone());
+                false
+            });
+            if let Some(mut row) = carried
+                && !next
+                    .checkouts
+                    .iter()
+                    .any(|row| row.matches(checkout_id, new))
+            {
+                row.repo_id = Some(new.repo_id().to_string());
+                row.bbox_root_relpath = Some(new.bbox_root_relpath().to_string());
+                next.checkouts.push(row);
+            }
+            Ok((moved, moved))
+        })
+    }
+
     /// Explicit teardown deregistration by checkout id. Returns whether a row
     /// was removed. Persists when it removes.
     pub fn deregister(&mut self, checkout_id: &str) -> Result<bool> {
@@ -679,6 +714,122 @@ mod tests {
         assert!(reg.deregister("c1").unwrap());
         assert!(!reg.deregister("c1").unwrap()); // already gone
         assert!(reg.rows().is_empty());
+    }
+
+    #[test]
+    fn rewrite_scope_moves_row_preserving_fields_and_persists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("checkouts.json");
+        let dir = tempfile::tempdir().unwrap();
+        let checkout = dir.path().canonicalize().unwrap();
+        let mut owned = row("c1", &checkout);
+        owned.project_id = Some("p_000000000000000000000000000000a1".into());
+        let mut registry = CheckoutRegistry::open(&path).unwrap();
+        registry.register(owned).unwrap();
+
+        let new = PublishedScope::try_new("repofam", "services/api").unwrap();
+        assert!(registry.rewrite_scope("c1", &root_scope(), &new).unwrap());
+        assert!(registry.get("c1", &root_scope()).is_none());
+        let moved = registry.get("c1", &new).unwrap();
+        assert_eq!(moved.checkout_dir, checkout.to_str().unwrap());
+        assert_eq!(moved.branch_ref.as_deref(), Some("feature/x"));
+        assert_eq!(
+            moved.project_id.as_deref(),
+            Some("p_000000000000000000000000000000a1")
+        );
+        assert_eq!(registry.rows().len(), 1);
+
+        drop(registry);
+        let reopened = CheckoutRegistry::open(&path).unwrap();
+        assert!(reopened.get("c1", &root_scope()).is_none());
+        assert_eq!(
+            reopened.get("c1", &new).unwrap().checkout_dir,
+            checkout.to_str().unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rewrite_scope_without_a_row_writes_nothing() {
+        use std::os::unix::fs::MetadataExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("checkouts.json");
+        let dir = tempfile::tempdir().unwrap();
+        let checkout = dir.path().canonicalize().unwrap();
+        let mut registry = CheckoutRegistry::open(&path).unwrap();
+        registry.register(row("c1", &checkout)).unwrap();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+
+        let new = PublishedScope::try_new("repofam", "services/api").unwrap();
+        assert!(
+            !registry
+                .rewrite_scope("other", &root_scope(), &new)
+                .unwrap()
+        );
+        assert!(!registry.rewrite_scope("c1", &new, &root_scope()).unwrap());
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+    }
+
+    #[test]
+    fn rewrite_scope_collapses_onto_an_existing_new_scope_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("checkouts.json");
+        let dir = tempfile::tempdir().unwrap();
+        let checkout = dir.path().canonicalize().unwrap();
+        let mut registry = CheckoutRegistry::open(&path).unwrap();
+        registry.register(row("c1", &checkout)).unwrap();
+        let mut nested = row("c1", &checkout);
+        nested.bbox_root_relpath = Some("services/api".into());
+        registry.register(nested).unwrap();
+
+        let new = PublishedScope::try_new("repofam", "services/api").unwrap();
+        assert!(registry.rewrite_scope("c1", &root_scope(), &new).unwrap());
+        assert_eq!(registry.rows_for_checkout("c1").count(), 1);
+        assert!(registry.get("c1", &new).is_some());
+        assert!(registry.get("c1", &root_scope()).is_none());
+    }
+
+    #[test]
+    fn rewrite_scope_upgrades_a_legacy_v1_store_on_the_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("checkouts.json");
+        let dir = tempfile::tempdir().unwrap();
+        let checkout = dir.path().canonicalize().unwrap();
+        let legacy = CheckoutRegistryStore {
+            version: 1,
+            checkouts: vec![row("c1", &checkout)],
+        };
+        std::fs::write(&path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+
+        let mut registry = CheckoutRegistry::open(&path).unwrap();
+        let new = PublishedScope::try_new("repofam", "services/api").unwrap();
+        assert!(registry.rewrite_scope("c1", &root_scope(), &new).unwrap());
+        let persisted: CheckoutRegistryStore =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(persisted.version, 2);
+        assert_eq!(persisted.checkouts.len(), 1);
+        assert_eq!(
+            persisted.checkouts[0].bbox_root_relpath.as_deref(),
+            Some("services/api")
+        );
+    }
+
+    #[test]
+    fn reconcile_still_drops_a_rewritten_row_whose_checkout_is_gone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("checkouts.json");
+        let gone = tempfile::tempdir().unwrap();
+        let checkout = gone.path().canonicalize().unwrap();
+        let mut registry = CheckoutRegistry::open(&path).unwrap();
+        registry.register(row("c1", &checkout)).unwrap();
+        let new = PublishedScope::try_new("repofam", "services/api").unwrap();
+        assert!(registry.rewrite_scope("c1", &root_scope(), &new).unwrap());
+        drop(gone);
+
+        let dropped = registry.reconcile(|_| true).unwrap();
+        assert_eq!(dropped.len(), 1);
+        assert!(registry.rows().is_empty());
     }
 
     #[test]

@@ -164,6 +164,8 @@ enum ProjectCatalogCommand {
     ScopeMigrate(ScopeMigrateArgs),
     /// Clear a stale or broken code bridge on a scope-migrated project.
     ScopeBridgeClear(ScopeBridgeClearArgs),
+    /// Inspect or remove host-local checkout census rows.
+    CheckoutRegistry(CheckoutRegistryArgs),
     /// Inventory and optionally remove one fully discharged project.
     Retire(RetireArgs),
     /// Resume or inspect a forward-only retirement journal (section 11).
@@ -329,6 +331,44 @@ struct ScopeBridgeClearArgs {
     #[arg(long)]
     double_migration_repair: bool,
     /// Load the same configuration file used by blackboxd.
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct CheckoutRegistryArgs {
+    #[command(subcommand)]
+    command: CheckoutRegistryCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum CheckoutRegistryCommand {
+    /// List every host-local checkout census row.
+    List(CheckoutRegistryListArgs),
+    /// Remove exactly one stale (checkout, scope) census row. Sibling
+    /// scopes of the same checkout keep their rows.
+    Remove(CheckoutRegistryRemoveArgs),
+}
+
+#[derive(Debug, Args)]
+struct CheckoutRegistryListArgs {
+    /// Load the same configuration file used by blackboxd. The census is
+    /// read from the state root it resolves.
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct CheckoutRegistryRemoveArgs {
+    #[arg(long, value_name = "ID")]
+    checkout_id: String,
+    #[arg(long, value_name = "REPO_ID")]
+    repo_id: String,
+    /// Repo-relative path of the row's `.bbox` root (`.` at the root).
+    #[arg(long, value_name = "RELPATH")]
+    relpath: String,
+    /// Load the same configuration file used by blackboxd. The census is
+    /// read from the state root it resolves.
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
 }
@@ -700,6 +740,18 @@ fn command_name(cli: &Cli) -> &'static str {
             command: ProjectCatalogCommand::ScopeBridgeClear(_),
         }) => "project_catalog_scope_bridge_clear",
         TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
+            command:
+                ProjectCatalogCommand::CheckoutRegistry(CheckoutRegistryArgs {
+                    command: CheckoutRegistryCommand::List(_),
+                }),
+        }) => "project_catalog_checkout_registry_list",
+        TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
+            command:
+                ProjectCatalogCommand::CheckoutRegistry(CheckoutRegistryArgs {
+                    command: CheckoutRegistryCommand::Remove(_),
+                }),
+        }) => "project_catalog_checkout_registry_remove",
+        TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
             command: ProjectCatalogCommand::Retire(_),
         }) => "project_catalog_retire",
         TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
@@ -757,6 +809,9 @@ fn execute(cli: Cli) -> Result<serde_json::Value, CommandFailure> {
         TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
             command: ProjectCatalogCommand::ScopeBridgeClear(args),
         }) => execute_scope_bridge_clear(args),
+        TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
+            command: ProjectCatalogCommand::CheckoutRegistry(args),
+        }) => execute_checkout_registry(args),
         TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
             command: ProjectCatalogCommand::Retire(args),
         }) => execute_retire(args),
@@ -2932,9 +2987,11 @@ fn execute_scope_migrate(args: ScopeMigrateArgs) -> Result<serde_json::Value, Co
     // generation or an accepted publication pointer must survive the scope
     // change as evidence, and a channel that leaves them unset would write a
     // record that cannot be told apart from a project holding neither.
+    let expected_old_scope = parse_scope(&args.expected_old_repo, &args.expected_old_relpath)?;
+    let new_scope = parse_scope(&args.new_repo, &args.new_relpath)?;
     let request = project_catalog_admin::ScopeMigrationRequest {
-        expected_old_scope: parse_scope(&args.expected_old_repo, &args.expected_old_relpath)?,
-        new_scope: parse_scope(&args.new_repo, &args.new_relpath)?,
+        expected_old_scope: expected_old_scope.clone(),
+        new_scope,
         kind,
         designated_attachment: bbox_corpus_core::project_catalog::AttachmentId::mint(),
         acknowledge_repo_authority_change: args.acknowledge_repo_authority_change,
@@ -2957,14 +3014,28 @@ fn execute_scope_migrate(args: ScopeMigrateArgs) -> Result<serde_json::Value, Co
         args.acknowledge_unattached_scope_migration,
         args.dry_run,
     )?;
-    Ok(serde_json::json!({
+    let mut response = serde_json::json!({
         "status": if receipt.is_some() { "applied" } else { "dry_run" },
         "dry_run": args.dry_run,
         "scope_migration_id": receipt
             .as_ref()
             .map(|receipt| receipt.scope_migration_id.as_str()),
         "epoch": receipt.as_ref().map(|receipt| receipt.commit.epoch),
-    }))
+    });
+    // Post-commit convergence, reported and never fatal: the attested
+    // channel has no attachment leases to enumerate, but census rows are
+    // scope-keyed, so every old-scope row of this project (or of no
+    // recorded project) follows the committed scope. A dry run touches
+    // nothing.
+    if receipt.is_some() {
+        response["checkout_registry"] = rewrite_cli_census_rows(
+            &config.paths.state_dir,
+            &expected_old_scope,
+            &request.new_scope,
+            &request.project_id,
+        );
+    }
+    Ok(response)
 }
 
 fn execute_scope_bridge_clear(
@@ -3009,6 +3080,121 @@ fn execute_scope_bridge_clear(
         },
         "epoch": commit.epoch,
     }))
+}
+
+/// Host-local checkout census administration. The offline CLI takes no
+/// instance or lifecycle locks by design; the registry's own store lock
+/// serializes it with a running daemon, whose every mutation re-reads disk
+/// under the same lock.
+fn execute_checkout_registry(
+    args: CheckoutRegistryArgs,
+) -> Result<serde_json::Value, CommandFailure> {
+    match args.command {
+        CheckoutRegistryCommand::List(args) => {
+            let config = load_config(args.config)?;
+            let registry = open_checkout_registry(&config.paths.state_dir)?;
+            let rows = registry
+                .rows()
+                .iter()
+                .map(|row| {
+                    serde_json::json!({
+                        "project_id": row.project_id,
+                        "checkout_id": row.checkout_id,
+                        "checkout_dir": row.checkout_dir,
+                        "repo_id": row.repo_id,
+                        "bbox_root_relpath": row.bbox_root_relpath,
+                        "branch_ref": row.branch_ref,
+                    })
+                })
+                .collect::<Vec<_>>();
+            Ok(serde_json::json!({ "rows": rows }))
+        }
+        CheckoutRegistryCommand::Remove(args) => {
+            let config = load_config(args.config)?;
+            let scope = parse_scope(&args.repo_id, &args.relpath)?;
+            let mut registry = open_checkout_registry(&config.paths.state_dir)?;
+            let removed = registry
+                .deregister_scope(&args.checkout_id, &scope)
+                .map_err(|error| {
+                    CommandFailure::new(
+                        "error.project_catalog_cli_checkout_registry",
+                        format!("removing the census row failed: {error}"),
+                    )
+                })?;
+            Ok(serde_json::json!({
+                "checkout_id": args.checkout_id,
+                "scope": {
+                    "repo_id": scope.repo_id(),
+                    "bbox_root_relpath": scope.bbox_root_relpath(),
+                },
+                "removed": removed,
+            }))
+        }
+    }
+}
+
+fn open_checkout_registry(
+    state_dir: &Path,
+) -> Result<bbox_indexing::checkout_registry::CheckoutRegistry, CommandFailure> {
+    bbox_indexing::checkout_registry::CheckoutRegistry::open(
+        &state_dir.join("checkout-registry.json"),
+    )
+    .map_err(|error| {
+        CommandFailure::new(
+            "error.project_catalog_cli_checkout_registry",
+            format!(
+                "host-local checkout registry under {} is unreadable: {error}",
+                state_dir.display()
+            ),
+        )
+    })
+}
+
+/// Rewrite the host-local census rows a committed attested scope migration
+/// leaves behind. The attested channel has no attachments to enumerate and
+/// census rows are scope-keyed, so every row at the old scope that names
+/// this project (or no project) moves to the new one. Post-commit and
+/// best-effort: the migration is authoritative, cleanup failure is
+/// reported, not fatal.
+fn rewrite_cli_census_rows(
+    state_dir: &Path,
+    old: &PublishedScope,
+    new: &PublishedScope,
+    project_id: &ProjectId,
+) -> serde_json::Value {
+    let mut registry = match open_checkout_registry(state_dir) {
+        Ok(registry) => registry,
+        Err(error) => {
+            eprintln!("blackbox: {error.message}");
+            return serde_json::json!({ "moved": 0, "failed": 0, "unreadable": true });
+        }
+    };
+    let checkout_ids = registry
+        .rows()
+        .iter()
+        .filter(|row| row.published_scope().as_ref() == Some(old))
+        .filter(|row| {
+            row.project_id
+                .as_deref()
+                .is_none_or(|recorded| recorded == project_id.as_str())
+        })
+        .map(|row| row.checkout_id.clone())
+        .collect::<Vec<_>>();
+    let mut moved = 0;
+    let mut failed = 0;
+    for checkout_id in &checkout_ids {
+        match registry.rewrite_scope(checkout_id, old, new) {
+            Ok(true) => moved += 1,
+            Ok(false) => {}
+            Err(error) => {
+                failed += 1;
+                eprintln!(
+                    "blackbox: census row {checkout_id} did not move to the new scope: {error}"
+                );
+            }
+        }
+    }
+    serde_json::json!({ "moved": moved, "failed": failed })
 }
 
 fn execute_retire(args: RetireArgs) -> Result<serde_json::Value, CommandFailure> {
