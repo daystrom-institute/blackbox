@@ -246,7 +246,10 @@ pub enum IndexWriteOp {
     /// enqueue through here instead. Carries raw documents precisely because
     /// it asserts nothing about them: it exists to reproduce legacy shapes no
     /// production op can express, and to commit an exact document grouping
-    /// as one segment regardless of how the queue coalesces.
+    /// as one segment. The handler applies the group through
+    /// `IndexWriter::run`, whose single AddBatch flushes the whole group into
+    /// one segment no matter how the queue coalesces or how tantivy would
+    /// spread independent add_document calls across its indexing workers.
     #[cfg(any(test, feature = "test-support"))]
     SeedDocuments(Vec<TantivyDocument>),
 }
@@ -259,6 +262,10 @@ pub struct IndexWriterActor {
     reader: IndexReader,
     fields: FieldHandles,
     post_commit_hook: Arc<parking_lot::RwLock<Option<PostCommitHook>>>,
+    /// Test-support observer around a full pass's consuming merge wait.
+    /// Production never installs one.
+    #[cfg(any(test, feature = "test-support"))]
+    merge_wait_observer: Arc<parking_lot::RwLock<Option<MergeWaitObserver>>>,
     checkout_access: Arc<CheckoutAccessBroker>,
     records_provider: Arc<dyn ProjectRecordsProvider>,
     assignments: Arc<parking_lot::RwLock<Option<Arc<dyn ProducerAssignmentSource>>>>,
@@ -268,6 +275,11 @@ pub struct IndexWriterActor {
     /// authority on supersession: an A -> B -> A activation sequence must not
     /// skip the final A just because B has been queued but not committed.
     enqueued_graph_generations: Arc<parking_lot::Mutex<BTreeMap<(String, String, String), String>>>,
+    /// The actor's writer slot, shared with `ActorCtx` so the test-support
+    /// occupancy probe can inspect it. Production never touches the handle's
+    /// clone.
+    #[cfg(any(test, feature = "test-support"))]
+    writer_slot: Arc<parking_lot::Mutex<Option<IndexWriter>>>,
     config: ReindexConfig,
 }
 
@@ -317,6 +329,19 @@ pub struct HistoryLanePublicationV1 {
 }
 
 type PostCommitHook = Arc<dyn Fn(tantivy::Searcher) + Send + Sync>;
+
+/// Phase of a full pass's merge settle, delivered from the actor thread
+/// around the consuming `wait_merging_threads` call. Test support: seeing
+/// both phases recorded before a pass answers its ack proves the settle ran
+/// and completed, which no segment-count assertion can (a rebuild commit can
+/// carry several segments whether the wait happened or not).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MergeWaitPhase {
+    Started,
+    Finished,
+}
+
+type MergeWaitObserver = Arc<dyn Fn(MergeWaitPhase) + Send + Sync>;
 
 pub struct StagedIndexGeneration {
     result: super::project_files::CollectedIndexResult,
@@ -397,6 +422,7 @@ struct ActorCtx {
     reader: IndexReader,
     stats_cache: StatsCache,
     post_commit_hook: Arc<parking_lot::RwLock<Option<PostCommitHook>>>,
+    merge_wait_observer: Arc<parking_lot::RwLock<Option<MergeWaitObserver>>>,
     checkout_access: Arc<CheckoutAccessBroker>,
     records_provider: Arc<dyn ProjectRecordsProvider>,
     assignments: Arc<parking_lot::RwLock<Option<Arc<dyn ProducerAssignmentSource>>>>,
@@ -405,9 +431,11 @@ struct ActorCtx {
     /// The actor's long-lived writer: created lazily on the first write op,
     /// held across batches and passes so merges scheduled by a commit survive
     /// it, and emptied while a scope owns it (any failed scope simply never
-    /// puts it back, so the next op rebuilds from a clean writer). The ctx is
-    /// thread-confined to the actor, so `RefCell` access is single-threaded.
-    writer: std::cell::RefCell<Option<IndexWriter>>,
+    /// puts it back, so the next op rebuilds from a clean writer). Only the
+    /// actor thread writes it, but the cell is shared (an Arc Mutex, not a
+    /// thread-confined RefCell) so the handle's test-support slot probe can
+    /// observe occupancy from the test thread.
+    writer: Arc<parking_lot::Mutex<Option<IndexWriter>>>,
 }
 
 const PUBLICATION_IDLE: u8 = 0;
@@ -1080,10 +1108,12 @@ impl IndexWriterActor {
     ) -> Self {
         let (tx, rx) = mpsc::channel::<IndexWriteOp>();
         let post_commit_hook = Arc::new(parking_lot::RwLock::new(None));
+        let merge_wait_observer = Arc::new(parking_lot::RwLock::new(None));
         let assignments: Arc<parking_lot::RwLock<Option<Arc<dyn ProducerAssignmentSource>>>> =
             Arc::new(parking_lot::RwLock::new(None));
         let publication_activity = Arc::new(AtomicU8::new(PUBLICATION_IDLE));
         let enqueued_graph_generations = Arc::new(parking_lot::Mutex::new(BTreeMap::new()));
+        let writer_slot = Arc::new(parking_lot::Mutex::new(None));
         let ctx = ActorCtx {
             index,
             fields,
@@ -1091,12 +1121,13 @@ impl IndexWriterActor {
             reader: reader.clone(),
             stats_cache,
             post_commit_hook: post_commit_hook.clone(),
+            merge_wait_observer: merge_wait_observer.clone(),
             checkout_access: checkout_access.clone(),
             records_provider: records_provider.clone(),
             assignments: assignments.clone(),
             publication_activity: publication_activity.clone(),
             enqueued_graph_generations: enqueued_graph_generations.clone(),
-            writer: std::cell::RefCell::new(None),
+            writer: writer_slot.clone(),
         };
         if let Err(err) = std::thread::Builder::new()
             .name("blackbox-index-writer".into())
@@ -1113,10 +1144,14 @@ impl IndexWriterActor {
             reader,
             fields,
             post_commit_hook,
+            #[cfg(any(test, feature = "test-support"))]
+            merge_wait_observer,
             checkout_access,
             records_provider,
             assignments,
             enqueued_graph_generations,
+            #[cfg(any(test, feature = "test-support"))]
+            writer_slot,
             config,
         }
     }
@@ -1142,6 +1177,33 @@ impl IndexWriterActor {
         let mut installed = self.post_commit_hook.write();
         *installed = Some(hook.clone());
         hook(self.reader.searcher());
+    }
+
+    /// Observe a full pass's merge settle. Test support: the actor invokes
+    /// the observer when `wait_merging_threads` starts and again once it has
+    /// returned, both from the actor thread before the pass's ack fires, so
+    /// a test can pin that the consuming wait completed before the pass
+    /// answered.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn install_merge_wait_observer_for_test(
+        &self,
+        observer: impl Fn(MergeWaitPhase) + Send + Sync + 'static,
+    ) {
+        *self.merge_wait_observer.write() = Some(Arc::new(observer));
+    }
+
+    /// Whether the actor's writer slot currently holds a writer. Test
+    /// support: the discard after a failed scope is otherwise invisible from
+    /// outside the actor, and recovery alone cannot distinguish a rebuilt
+    /// writer from a retained suspect one. Meaningful once an ack
+    /// (`flush_blocking`, a pass return) says the actor is idle: the actor
+    /// holds the slot's lock only while placing or taking a writer, never
+    /// across a commit.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn writer_slot_occupied_for_test(&self) -> bool {
+        self.writer_slot.lock().is_some()
     }
 
     /// Queue a mutation, fire-and-forget. A send failure (actor thread dead)
@@ -2998,9 +3060,11 @@ fn run_pass(
         // and the next scope recreates one; an incremental pass keeps it,
         // unless a drained op failed inside it.
         if full {
+            notify_merge_wait(ctx, MergeWaitPhase::Started);
             if let Err(err) = writer.wait_merging_threads() {
                 tracing::warn!(error = %err, "index writer actor: wait_merging_threads failed");
             }
+            notify_merge_wait(ctx, MergeWaitPhase::Finished);
         } else if !drained_op_failed {
             keep_writer(ctx, writer);
         }
@@ -3139,15 +3203,17 @@ fn apply_small_op(ctx: &ActorCtx, writer: &mut IndexWriter, op: IndexWriteOp) ->
             ),
         ),
         #[cfg(any(test, feature = "test-support"))]
-        IndexWriteOp::SeedDocuments(documents) => {
-            let mut seeded: Result<()> = Ok(());
-            for document in documents {
-                if let Err(err) = writer.add_document(document) {
-                    seeded = Err(err.into());
-                }
-            }
-            ("seed_documents", seeded)
-        }
+        IndexWriteOp::SeedDocuments(documents) => (
+            "seed_documents",
+            writer
+                .run(
+                    documents
+                        .into_iter()
+                        .map(|document| tantivy::indexer::UserOperation::Add(document)),
+                )
+                .map(|_| ())
+                .map_err(anyhow::Error::new),
+        ),
         IndexWriteOp::ReindexPass { .. }
         | IndexWriteOp::StageCollectedGeneration { .. }
         | IndexWriteOp::StageConnectorGeneration { .. }
@@ -3225,6 +3291,16 @@ fn post_commit(ctx: &ActorCtx) {
     *ctx.stats_cache.lock() = None;
 }
 
+/// Fire the merge-settle observer, when installed. The full-pass arm calls
+/// this around its consuming wait so tests can pin that the settle completed
+/// before the pass returned; with no observer installed this is a lock read
+/// on an empty slot.
+fn notify_merge_wait(ctx: &ActorCtx, phase: MergeWaitPhase) {
+    if let Some(observer) = ctx.merge_wait_observer.read().clone() {
+        observer(phase);
+    }
+}
+
 /// Create a writer, retrying briefly when the cross-process lock is busy
 /// (e.g. a previous daemon instance still winding down at boot). In-process
 /// contention cannot occur — this actor is the only in-process writer.
@@ -3258,7 +3334,7 @@ fn create_writer(index: &Index) -> Result<IndexWriter> {
 /// poison reset the per-call writers this module once used provided
 /// implicitly.
 fn take_writer(ctx: &ActorCtx) -> Result<IndexWriter> {
-    match ctx.writer.borrow_mut().take() {
+    match ctx.writer.lock().take() {
         Some(writer) => Ok(writer),
         None => create_writer(&ctx.index),
     }
@@ -3268,7 +3344,7 @@ fn take_writer(ctx: &ActorCtx) -> Result<IndexWriter> {
 /// no failed op, no failed commit. Its background merges keep running and
 /// land on their own; nothing waits for them outside a full reindex pass.
 fn keep_writer(ctx: &ActorCtx, writer: IndexWriter) {
-    *ctx.writer.borrow_mut() = Some(writer);
+    *ctx.writer.lock() = Some(writer);
 }
 
 /// Run one committing scope against the actor's long-lived writer: the slot
@@ -5081,10 +5157,11 @@ mod tests {
         let root = dir.path().canonicalize().unwrap();
         let index = test_index(&root);
         let actor = IndexWriterActor::spawn_for(&index);
-        // Five four-document segments. Seeded as one op per group so each
-        // group commits as a single segment no matter how the queue
-        // coalesces (a split group could land fully-deleted or under the
-        // ratio and make the pass vacuous). The docs are byte-identical to
+        // Five four-document segments. Each SeedDocuments op applies as one
+        // `run` group, which tantivy flushes into a single segment;
+        // independent add_document calls would be spread across the indexing
+        // workers and could split a group, letting the deletes below vanish
+        // whole segments without any merge. The docs are byte-identical to
         // what UpsertKnowledge stages, so DeleteKnowledge tombstones hit
         // them by the same entity id. The conservative policy stays under
         // its 20-segment floor with no deletions, so nothing merges yet.
@@ -5103,6 +5180,20 @@ mod tests {
                 .collect();
             actor.seed_documents_for_test(documents).unwrap();
         }
+        // The fixture's premise, verified before any tombstone is staged:
+        // exactly five committed segments, four live documents each.
+        index.reader_reload_for_test();
+        let per_segment_docs: Vec<u32> = index
+            .searcher()
+            .segment_readers()
+            .iter()
+            .map(|segment| segment.num_docs())
+            .collect();
+        assert_eq!(
+            per_segment_docs,
+            vec![4, 4, 4, 4, 4],
+            "each SeedDocuments run group must land as one four-document segment"
+        );
         // Two tombstones per segment: every segment lands above the delete
         // ratio, which is what makes the whole level a merge candidate.
         for batch in 0..5 {
@@ -5145,19 +5236,25 @@ mod tests {
     /// and the writer the pass consumed leaves the slot empty for the next
     /// small-op batch to refill.
     ///
-    /// A full pass cannot be made to end with more segments than its own
-    /// rebuild commit produces: delete_all_documents clears the segment
-    /// inventory and the rebuild lands in exactly one commit, so the
-    /// post-pass count is small by construction. The immediate count
-    /// assertion pins that the pass returned settled (with the pre-pass
-    /// batches' pending merges drained) rather than with a writer whose
-    /// merges were orphaned mid-flight.
+    /// Segment counts alone cannot prove the settle: delete_all_documents
+    /// clears the segment inventory and the rebuild lands in the pass's
+    /// single commit, which can still carry several segments (each indexing
+    /// worker flushes its budget as its own segment) but stays small either
+    /// way. The wait observer pins the settle itself: both of its phases
+    /// must fire before run_reindex_pass answers its ack, so removing the
+    /// consuming wait (a plain drop leaves the rebuild equally countable)
+    /// cannot pass.
     #[test]
     fn full_reindex_pass_still_settles_merge_threads() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let index = test_index(&root);
         let actor = IndexWriterActor::spawn_for(&index);
+        let wait_events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let recorded = wait_events.clone();
+        actor.install_merge_wait_observer_for_test(move |phase| {
+            recorded.lock().push(phase);
+        });
         let durable: Vec<_> = (0..30)
             .map(|i| {
                 test_entry(
@@ -5182,6 +5279,11 @@ mod tests {
             actor.flush_blocking().unwrap();
         }
         actor.run_reindex_pass(true, true).unwrap();
+        assert_eq!(
+            *wait_events.lock(),
+            vec![MergeWaitPhase::Started, MergeWaitPhase::Finished],
+            "the full pass must run wait_merging_threads to completion before answering its ack"
+        );
         assert!(
             segment_total(&index) <= 8,
             "full pass must return with merge threads settled: {}",
@@ -5217,8 +5319,9 @@ mod tests {
     /// batch's own commit succeeds: the staged state of a writer that saw an
     /// op fail mid-batch is suspect, so the next op rebuilds a fresh writer
     /// and must land on it. An empty ReplaceProjectGraphLane is the concrete
-    /// failing apply (it bails before staging anything). The discard itself
-    /// is not externally observable through the handle; the recovery is.
+    /// failing apply (it bails before staging anything). The slot probe
+    /// makes the discard itself observable: the slot must be empty
+    /// immediately after the failed batch, before any healthy op runs.
     #[test]
     fn failed_apply_discards_the_stored_writer_and_the_next_op_lands() {
         let dir = tempfile::tempdir().unwrap();
@@ -5230,15 +5333,27 @@ mod tests {
             "recoverybaseline sentinel",
         ))));
         actor.flush_blocking().unwrap();
+        assert!(
+            actor.writer_slot_occupied_for_test(),
+            "a healthy batch must leave the writer in the slot"
+        );
         actor.enqueue(IndexWriteOp::ReplaceProjectGraphLane {
             documents: Vec::new(),
         });
         actor.flush_blocking().unwrap();
+        assert!(
+            !actor.writer_slot_occupied_for_test(),
+            "a failed apply must empty the slot even though the batch's own commit succeeded"
+        );
         actor.enqueue(IndexWriteOp::UpsertKnowledge(Box::new(test_entry(
             "recover01after",
             "recoverylanded sentinel",
         ))));
         actor.flush_blocking().unwrap();
+        assert!(
+            actor.writer_slot_occupied_for_test(),
+            "the healthy batch after the failure must have refilled the slot"
+        );
         assert_eq!(
             live_doc_total(&index),
             2,
@@ -5247,6 +5362,71 @@ mod tests {
         assert!(
             search(&index, "recoverylanded").contains("recoverylanded"),
             "the healthy op after a failed apply must be searchable"
+        );
+    }
+
+    /// The batch path is not the only way a failed apply touches the stored
+    /// writer: an op drained into an incremental pass fails inside the
+    /// pass's own scope, and the drained-op failure flag must keep that
+    /// writer out of the slot too. The failing op is enqueued immediately
+    /// behind the pass request: whether the pass drains it into its commit
+    /// or it lands as a post-pass batch, both paths discard, so once the
+    /// queue settles the slot must be empty and the next healthy op must
+    /// land on a fresh writer.
+    #[test]
+    fn a_failing_op_around_an_incremental_pass_empties_the_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let index = test_index(&root);
+        let actor = IndexWriterActor::spawn_for(&index);
+        actor.enqueue(IndexWriteOp::UpsertKnowledge(Box::new(test_entry(
+            "drain00before",
+            "drainbaseline sentinel",
+        ))));
+        actor.flush_blocking().unwrap();
+        assert!(
+            actor.writer_slot_occupied_for_test(),
+            "a healthy batch must leave the writer in the slot"
+        );
+        // Dispatch the pass through a hand-built op so the failing op can be
+        // enqueued while the pass is in flight: run_reindex_pass cannot
+        // interleave an enqueue from this thread.
+        let (ack_tx, ack_rx) = mpsc::sync_channel(1);
+        actor.enqueue(IndexWriteOp::ReindexPass {
+            full: false,
+            dirty: true,
+            cause: FullRebuildCause::Ordinary,
+            accept_empty_projects: Vec::new(),
+            ack: Some(ack_tx),
+        });
+        actor.enqueue(IndexWriteOp::ReplaceProjectGraphLane {
+            documents: Vec::new(),
+        });
+        ack_rx.recv().unwrap().unwrap();
+        // The Flush barrier also processes the failing op when the pass did
+        // not drain it, so the slot state is settled either way here.
+        actor.flush_blocking().unwrap();
+        assert!(
+            !actor.writer_slot_occupied_for_test(),
+            "a drained or post-pass failed apply must keep the slot empty after the pass"
+        );
+        actor.enqueue(IndexWriteOp::UpsertKnowledge(Box::new(test_entry(
+            "drain01after",
+            "drainrecovered sentinel",
+        ))));
+        actor.flush_blocking().unwrap();
+        assert_eq!(
+            live_doc_total(&index),
+            2,
+            "the healthy op after the failed one must commit on a fresh writer"
+        );
+        assert!(
+            search(&index, "drainrecovered").contains("drainrecovered"),
+            "the healthy op after the failed one must be searchable"
+        );
+        assert!(
+            actor.writer_slot_occupied_for_test(),
+            "the healthy batch after the failure must have refilled the slot"
         );
     }
 
