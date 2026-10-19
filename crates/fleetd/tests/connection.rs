@@ -22,7 +22,10 @@ use bro_protocol::{
     WORKSPACE_BINDING_ENV, WORKSPACE_SCOPE_ENV, WorkerSpawnSpec, WorkerWorkspaceScope,
     WorkspaceInspectionOutcome, WorkspaceInspectionRequest,
 };
-use bro_rpc::{BuildIdentity, Envelope, HandshakeOptions, NegotiatedIo, ServiceToken};
+use bro_rpc::{
+    BuildIdentity, Envelope, FramedIo, HandshakeMessage, HandshakeOptions, Hello, NegotiatedIo,
+    ServiceToken,
+};
 use fleetd::server::{
     DEFAULT_PRE_AUTHENTICATION_TIMEOUT, Fleetd, TcpBindBackoff, bind_listener, bind_tcp_listener,
     build_identity, resolve_tcp_listen_addresses, serve, serve_tcp, serve_tcp_retrying,
@@ -36,6 +39,11 @@ const TEST_TOKEN: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 /// Every wait in this file is bounded, so a broken assumption fails as a test
 /// failure rather than hanging the suite.
 const DEADLINE: Duration = Duration::from_secs(20);
+/// Outer bound for observing a drop when the configured deadline is a few
+/// hundred milliseconds: generous scheduler tolerance, yet far below
+/// bro_rpc's internal 10s handshake timeout, so passing proves the
+/// CONFIGURED deadline fired rather than an independent internal bound.
+const DROP_WINDOW: Duration = Duration::from_secs(3);
 
 // ---------------------------------------------------------------- fake daemon
 
@@ -232,6 +240,40 @@ async fn start_fleetd_tls_with_timeout(pre_authentication_timeout: Duration) -> 
         address,
         state,
         identity,
+    }
+}
+
+/// One fleetd state serving both listeners at once, as the real binary
+/// does: the Unix socket and the TCP address share the registry, the token,
+/// the owner slot and the pre-authentication deadline.
+struct DualHarness {
+    _directory: tempfile::TempDir,
+    socket: PathBuf,
+    address: std::net::SocketAddr,
+    state: Arc<Fleetd>,
+}
+
+async fn start_fleetd_dual_with_timeout(pre_authentication_timeout: Duration) -> DualHarness {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let root = directory.path().canonicalize().expect("canonicalize");
+    let socket = root.join("fleetd.sock");
+    let unix_listener = bind_listener(&socket).await.expect("bind Unix");
+    let tcp_listener = bind_tcp_listener("127.0.0.1:0".parse().unwrap(), false)
+        .await
+        .expect("bind TCP");
+    let address = tcp_listener.local_addr().expect("TCP address");
+    let state = Fleetd::with_pre_authentication_timeout(
+        ServiceToken::parse(TEST_TOKEN).expect("token"),
+        build_identity(),
+        pre_authentication_timeout,
+    );
+    tokio::spawn(serve(state.clone(), unix_listener));
+    tokio::spawn(serve_tcp(state.clone(), tcp_listener, None));
+    DualHarness {
+        _directory: directory,
+        socket,
+        address,
+        state,
     }
 }
 
@@ -452,6 +494,17 @@ fn write_event_log(path: &Path, seqs: &[u64]) {
         body.push('\n');
     }
     std::fs::write(path, body).expect("write event log");
+}
+
+/// One length-prefixed handshake frame exactly as `FramedIo` writes it:
+/// big-endian u32 length, then the JSON payload. Tests that spend part of
+/// the pre-authentication budget mid-frame trickle byte ranges of it.
+fn handshake_frame(message: &HandshakeMessage) -> Vec<u8> {
+    let payload = serde_json::to_vec(message).expect("serialize handshake message");
+    let mut frame = Vec::with_capacity(payload.len() + 4);
+    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&payload);
+    frame
 }
 
 // --------------------------------------------------------------- handshake
@@ -699,20 +752,28 @@ async fn an_incompatible_build_is_rejected_at_handshake() {
 #[tokio::test]
 async fn a_peer_that_handshakes_then_goes_silent_before_authenticating_is_dropped() {
     let harness = start_fleetd_tcp_with_timeout(Duration::from_millis(200)).await;
+    let started = std::time::Instant::now();
     let daemon = FakeDaemon::connect_tcp(harness.address)
         .await
         .expect("the protocol handshake completes; nothing more is sent");
     // Reclaim the raw stream: fleetd writes no error envelope on the
     // timeout path, so the drop is observable only as the read resolving:
-    // EOF, or a reset if the close races unread bytes.
+    // EOF, or a reset if the close races unread bytes. The window is far
+    // below the internal 10s handshake timeout, so resolving inside it
+    // proves the configured 200ms deadline fired.
     let mut stream = daemon.io.into_framed().into_inner();
     let mut byte = [0u8; 1];
-    let read = tokio::time::timeout(DEADLINE, stream.read(&mut byte))
+    let read = tokio::time::timeout(DROP_WINDOW, stream.read(&mut byte))
         .await
         .expect("fleetd must drop the silent peer at the deadline");
     assert!(
         matches!(read, Ok(0) | Err(_)),
         "fleetd closed the socket without writing, got {read:?}"
+    );
+    assert!(
+        started.elapsed() < DROP_WINDOW,
+        "the drop took {:?}, which is an internal bound, not the configured deadline",
+        started.elapsed()
     );
     assert!(!harness.state.has_owner());
 
@@ -728,14 +789,14 @@ async fn a_peer_that_handshakes_then_goes_silent_before_authenticating_is_droppe
 }
 
 /// A plaintext peer that connects and sends nothing: pre-fix the drop
-/// waited on bro_rpc's internal 10s handshake timeout, well past this 5s
-/// window.
+/// waited on bro_rpc's internal 10s handshake timeout, well past the
+/// drop window.
 #[tokio::test]
 async fn a_silent_plaintext_tcp_peer_is_dropped_at_the_pre_authentication_deadline() {
     let harness = start_fleetd_tcp_with_timeout(Duration::from_millis(200)).await;
     let mut peer = TcpStream::connect(harness.address).await.expect("dial");
     let mut byte = [0u8; 1];
-    let read = tokio::time::timeout(Duration::from_secs(5), peer.read(&mut byte))
+    let read = tokio::time::timeout(DROP_WINDOW, peer.read(&mut byte))
         .await
         .expect("a silent plaintext peer is dropped well inside the window");
     assert!(
@@ -754,7 +815,7 @@ async fn a_silent_tls_peer_is_dropped_at_the_pre_authentication_deadline() {
 
     let mut silent = TcpStream::connect(harness.address).await.expect("dial");
     let mut byte = [0u8; 1];
-    let read = tokio::time::timeout(Duration::from_secs(5), silent.read(&mut byte))
+    let read = tokio::time::timeout(DROP_WINDOW, silent.read(&mut byte))
         .await
         .expect("a silent TLS peer is dropped at the deadline");
     assert!(
@@ -769,9 +830,160 @@ async fn a_silent_tls_peer_is_dropped_at_the_pre_authentication_deadline() {
         .write_all(&[0x16, 0x03, 0x01])
         .await
         .expect("write a TLS record prefix");
-    let read = tokio::time::timeout(Duration::from_secs(5), partial.read(&mut byte))
+    let read = tokio::time::timeout(DROP_WINDOW, partial.read(&mut byte))
         .await
         .expect("a peer stalled mid-TLS-record is dropped at the deadline");
+    assert!(
+        matches!(read, Ok(0) | Err(_)),
+        "fleetd closed the socket without writing, got {read:?}"
+    );
+
+    assert!(!harness.state.has_owner());
+}
+
+/// ONE budget for the whole phase: a peer that trickles part of the
+/// protocol handshake, finishes it, then stalls before Authenticate is
+/// dropped at the deadline counted from accept. 600ms of the 1s budget is
+/// spent mid-Hello, so a stage that reset the deadline would land the drop
+/// a full second later, at ~1.6s.
+#[tokio::test]
+async fn a_staged_peer_consumes_one_shared_pre_authentication_budget() {
+    let deadline = Duration::from_secs(1);
+    let harness = start_fleetd_tcp_with_timeout(deadline).await;
+    let hello = handshake_frame(&HandshakeMessage::Hello(Hello {
+        protocol_versions: vec![FLEETD_PROTOCOL_VERSION],
+        build: build_identity(),
+    }));
+    let started = std::time::Instant::now();
+    let mut stream = TcpStream::connect(harness.address).await.expect("dial");
+    stream
+        .write_all(&hello[..2])
+        .await
+        .expect("trickle the first bytes of the length prefix");
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    stream
+        .write_all(&hello[2..])
+        .await
+        .expect("finish the hello");
+
+    // The handshake completes on what is left of the budget: fleetd answers
+    // Welcome, and from here the peer sends nothing.
+    {
+        let mut framed = FramedIo::new(&mut stream);
+        match framed
+            .read_json::<HandshakeMessage>()
+            .await
+            .expect("welcome")
+        {
+            HandshakeMessage::Welcome(_) => {}
+            other => panic!("expected welcome, got {other:?}"),
+        }
+    }
+    let mut byte = [0u8; 1];
+    let read = tokio::time::timeout(DROP_WINDOW, stream.read(&mut byte))
+        .await
+        .expect("the staged peer is dropped at the shared deadline");
+    let elapsed = started.elapsed();
+    assert!(
+        matches!(read, Ok(0) | Err(_)),
+        "fleetd closed the socket without writing, got {read:?}"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(850),
+        "the drop at {elapsed:?} fired before the configured deadline"
+    );
+    assert!(
+        elapsed < deadline + Duration::from_millis(300),
+        "the drop at {elapsed:?} landed a full deadline after the trickle, so a stage reset the budget"
+    );
+    assert!(!harness.state.has_owner());
+}
+
+/// Partial protocol negotiation, not just silence: a Hello truncated at
+/// its length prefix or mid-payload parks fleetd mid-read, and the deadline
+/// drops it having written nothing.
+#[tokio::test]
+async fn a_peer_with_a_truncated_protocol_hello_is_dropped_at_the_deadline() {
+    let harness = start_fleetd_tcp_with_timeout(Duration::from_millis(200)).await;
+    let mut byte = [0u8; 1];
+
+    // Half a length prefix: fleetd waits for the remaining header bytes.
+    let mut prefix = TcpStream::connect(harness.address).await.expect("dial");
+    prefix
+        .write_all(&[0x00, 0x00])
+        .await
+        .expect("write half a length prefix");
+    let read = tokio::time::timeout(DROP_WINDOW, prefix.read(&mut byte))
+        .await
+        .expect("a half-written length prefix is dropped at the deadline");
+    assert!(
+        matches!(read, Ok(0) | Err(_)),
+        "fleetd closed the socket without writing, got {read:?}"
+    );
+
+    // A full length prefix promising a payload that never completes. The
+    // payload bytes are never parsed, so any well-formed prefix will do.
+    let mut payload = TcpStream::connect(harness.address).await.expect("dial");
+    payload
+        .write_all(&64u32.to_be_bytes())
+        .await
+        .expect("write a full length prefix");
+    payload
+        .write_all(b"{\"type\":\"hel")
+        .await
+        .expect("start a JSON payload");
+    let read = tokio::time::timeout(DROP_WINDOW, payload.read(&mut byte))
+        .await
+        .expect("a truncated hello payload is dropped at the deadline");
+    assert!(
+        matches!(read, Ok(0) | Err(_)),
+        "fleetd closed the socket without writing, got {read:?}"
+    );
+
+    assert!(!harness.state.has_owner());
+}
+
+/// The first-envelope leg has the same partial coverage: after a complete
+/// handshake, an Authenticate frame truncated at its length prefix or
+/// mid-payload is dropped at the deadline with no error envelope in reply.
+#[tokio::test]
+async fn a_peer_with_a_truncated_first_envelope_is_dropped_at_the_deadline() {
+    let harness = start_fleetd_tcp_with_timeout(Duration::from_millis(200)).await;
+    let mut byte = [0u8; 1];
+
+    // Half the envelope's length prefix.
+    let daemon = FakeDaemon::connect_tcp(harness.address)
+        .await
+        .expect("handshake completes");
+    let mut prefix = daemon.io.into_framed().into_inner();
+    prefix
+        .write_all(&[0x00, 0x00])
+        .await
+        .expect("write half a length prefix");
+    let read = tokio::time::timeout(DROP_WINDOW, prefix.read(&mut byte))
+        .await
+        .expect("a half-written envelope prefix is dropped at the deadline");
+    assert!(
+        matches!(read, Ok(0) | Err(_)),
+        "fleetd closed the socket without writing, got {read:?}"
+    );
+
+    // A full prefix whose declared payload never completes.
+    let daemon = FakeDaemon::connect_tcp(harness.address)
+        .await
+        .expect("handshake completes");
+    let mut payload = daemon.io.into_framed().into_inner();
+    payload
+        .write_all(&64u32.to_be_bytes())
+        .await
+        .expect("write a full length prefix");
+    payload
+        .write_all(b"{\"type\":\"aut")
+        .await
+        .expect("start a JSON payload");
+    let read = tokio::time::timeout(DROP_WINDOW, payload.read(&mut byte))
+        .await
+        .expect("a truncated envelope payload is dropped at the deadline");
     assert!(
         matches!(read, Ok(0) | Err(_)),
         "fleetd closed the socket without writing, got {read:?}"
@@ -833,6 +1045,73 @@ async fn an_authenticated_connection_outlives_the_pre_authentication_deadline() 
         FleetdToDaemon::Sessions { sessions } => assert!(sessions.is_empty()),
         other => panic!("expected sessions, got {other:?}"),
     }
+    assert!(harness.state.has_owner());
+}
+
+/// Expiry is cleanup, not disruption: while stalled unauthenticated peers
+/// time out on the Unix and TCP listeners of ONE shared state, the
+/// authenticated owner keeps exchanging commands, and both listeners keep
+/// serving afterwards. The stalled Unix peer also pins the newly bounded
+/// Unix path: pre-fix it would sit on bro_rpc's internal 10s handshake
+/// timeout, past the drop window.
+#[tokio::test]
+async fn stalled_peers_expire_while_the_owner_and_both_listeners_stay_usable() {
+    let harness = start_fleetd_dual_with_timeout(Duration::from_millis(300)).await;
+
+    let mut owner = FakeDaemon::connect_tcp(harness.address)
+        .await
+        .expect("owner connects");
+    owner.authenticate().await;
+    owner.send(DaemonToFleetd::ListSessions).await;
+    assert!(matches!(
+        owner.expect().await,
+        FleetdToDaemon::Sessions { .. }
+    ));
+
+    // One stalled peer per transport, started after the owner is installed.
+    let mut stalled_unix = UnixStream::connect(&harness.socket)
+        .await
+        .expect("dial Unix");
+    let mut stalled_tcp = TcpStream::connect(harness.address).await.expect("dial TCP");
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let mut byte = [0u8; 1];
+    let read = tokio::time::timeout(DROP_WINDOW, stalled_unix.read(&mut byte))
+        .await
+        .expect("a stalled Unix peer is dropped at the deadline");
+    assert!(
+        matches!(read, Ok(0) | Err(_)),
+        "fleetd closed the Unix socket without writing, got {read:?}"
+    );
+    let read = tokio::time::timeout(DROP_WINDOW, stalled_tcp.read(&mut byte))
+        .await
+        .expect("a stalled TCP peer is dropped at the deadline");
+    assert!(
+        matches!(read, Ok(0) | Err(_)),
+        "fleetd closed the TCP socket without writing, got {read:?}"
+    );
+    assert!(harness.state.has_owner(), "the owner survived the expiries");
+
+    // The owner still exchanges commands across the expiries.
+    owner.send(DaemonToFleetd::ListSessions).await;
+    assert!(matches!(
+        owner.expect().await,
+        FleetdToDaemon::Sessions { .. }
+    ));
+
+    // Both listeners still serve: a fresh protocol handshake completes on
+    // each. Neither peer authenticates, so each is dropped at its own
+    // deadline without disturbing the owner.
+    FakeDaemon::connect(&harness.socket)
+        .await
+        .expect("the Unix listener still serves");
+    FakeDaemon::connect_tcp(harness.address)
+        .await
+        .expect("the TCP listener still serves");
+    owner.send(DaemonToFleetd::ListSessions).await;
+    assert!(matches!(
+        owner.expect().await,
+        FleetdToDaemon::Sessions { .. }
+    ));
     assert!(harness.state.has_owner());
 }
 
