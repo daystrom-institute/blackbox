@@ -265,6 +265,15 @@ pub(crate) struct SharedState {
     // kept: SharedState vector store handle; consumed by embed/queue path through alternate state plumbing, retained here for direct access
     #[allow(dead_code)]
     pub(crate) vector_store: std::sync::Arc<crate::vectors::VectorStore>,
+
+    /// Test-only seam for the candidate-acceptance path: applied to every
+    /// catalog epoch the path pins a publish against, so a lost race
+    /// against the catalog-global epoch and its bounded retry can be
+    /// reproduced deterministically without driving a real concurrent
+    /// catalog write.
+    #[cfg(test)]
+    pub(crate) candidate_acceptance_epoch_hook:
+        parking_lot::Mutex<Option<Box<dyn FnMut(u64) -> u64 + Send>>>,
 }
 
 pub(crate) struct CodeReadView {
@@ -395,6 +404,29 @@ impl SharedState {
                     state.publish_code_read_searcher(searcher);
                 }
             });
+    }
+
+    /// Install the test-only candidate-acceptance epoch hook. Every catalog
+    /// epoch the acceptance path reads passes through it, so a test can
+    /// replay a lost race against the catalog-global epoch and its bounded
+    /// retry deterministically.
+    #[cfg(test)]
+    pub(crate) fn install_candidate_acceptance_epoch_hook_for_test(
+        &self,
+        hook: Box<dyn FnMut(u64) -> u64 + Send>,
+    ) {
+        *self.candidate_acceptance_epoch_hook.lock() = Some(hook);
+    }
+
+    /// The epoch a candidate-acceptance publish pins against, after the
+    /// test-only epoch hook. Production passes the snapshot's own epoch
+    /// through unchanged.
+    pub(crate) fn candidate_publish_epoch(&self, epoch: u64) -> u64 {
+        #[cfg(test)]
+        if let Some(hook) = self.candidate_acceptance_epoch_hook.lock().as_mut() {
+            return hook(epoch);
+        }
+        epoch
     }
 
     /// Replace only the searcher component of the immutable read view. Holding
@@ -724,6 +756,8 @@ impl SharedState {
                 crate::vectors::VectorStore::open(store_dir.join("vectors"))
                     .expect("test vector store should open"),
             ),
+            #[cfg(test)]
+            candidate_acceptance_epoch_hook: Default::default(),
         }
     }
 
@@ -1813,8 +1847,10 @@ impl PublishedScopeView {
 /// Accepted-publication state and content identity.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct AcceptedRuntimeView {
-    /// `current`, `prior`, `missing`, `corrupt`, or `unavailable` when the
-    /// runtime itself could not be consulted.
+    /// `current`, `lagging` while a Ready candidate from the bound
+    /// producer, scope, and ref is stored but unserved, `prior`, `missing`,
+    /// `corrupt`, or `unavailable` when the runtime itself could not be
+    /// consulted.
     pub(crate) state: &'static str,
     pub(crate) serves_published_content: bool,
     pub(crate) advance_available: bool,
@@ -2012,6 +2048,8 @@ impl SharedState {
             .accepted_publications
             .as_ref()
             .and_then(|runtime| runtime.status(project_id, None).ok());
+        let (last_candidate, unserved_bound_candidate) =
+            self.last_candidate_view(project_id, accepted_status.as_ref());
         ProjectRuntimeStatus {
             project_id: project_id.as_str().to_string(),
             catalog_authority: "unavailable",
@@ -2019,8 +2057,9 @@ impl SharedState {
             accepted: AcceptedRuntimeView::project(
                 accepted_status.as_ref(),
                 self.pointer_written_unix_secs(project_id),
+                unserved_bound_candidate,
             ),
-            last_candidate: self.last_candidate_view(project_id, accepted_status.as_ref()),
+            last_candidate,
             binding: BindingRuntimeView {
                 // The pointer's own bytes are readable; whether the
                 // attachment it names is still attached is a CATALOG
@@ -2100,11 +2139,13 @@ impl SharedState {
             .accepted_publications
             .as_ref()
             .and_then(|runtime| runtime.status(&parsed, catalog_scope.as_ref()).ok());
+        let (last_candidate, unserved_bound_candidate) =
+            self.last_candidate_view(&parsed, accepted_status.as_ref());
         let accepted = AcceptedRuntimeView::project(
             accepted_status.as_ref(),
             self.pointer_written_unix_secs(&parsed),
+            unserved_bound_candidate,
         );
-        let last_candidate = self.last_candidate_view(&parsed, accepted_status.as_ref());
 
         let rows = snapshot
             .attachments()
@@ -2198,16 +2239,19 @@ impl SharedState {
             .and_then(|runtime| runtime.pointer_written_unix_secs(project_id))
     }
 
-    /// The newest stored candidate for the project and whether the accepted
-    /// pointer serves it. The knowledge-source store is its own durable
-    /// store, so this is read whether or not the catalog pair is readable.
+    /// The newest stored candidate for the project, whether the accepted
+    /// pointer serves it, and whether it is a Ready candidate from the
+    /// bound producer, scope, and ref that the pointer does not serve,
+    /// the fact that relabels a verified pointer's state from `current`
+    /// to `lagging`. The knowledge-source store is its own durable store,
+    /// so this is read whether or not the catalog pair is readable.
     fn last_candidate_view(
         &self,
         project_id: &bbox_corpus_core::project_catalog::ProjectId,
         accepted_status: Option<
             &bbox_indexing::accepted_publication_runtime::AcceptedPublicationStatus,
         >,
-    ) -> LastCandidateRuntimeView {
+    ) -> (LastCandidateRuntimeView, bool) {
         use bbox_knowledge_source::SourceGenerationStateV1 as State;
 
         let latest = match self
@@ -2216,12 +2260,14 @@ impl SharedState {
             .latest_publication_candidate(project_id.as_str())
         {
             Ok(latest) => latest,
-            Err(_) => return LastCandidateRuntimeView::absent("unavailable"),
+            Err(_) => return (LastCandidateRuntimeView::absent("unavailable"), false),
         };
         let unreadable = latest.unreadable_index_entries;
         let Some(candidate) = latest.candidate else {
-            return LastCandidateRuntimeView::absent("none")
-                .with_unreadable_index_entries(unreadable);
+            return (
+                LastCandidateRuntimeView::absent("none").with_unreadable_index_entries(unreadable),
+                false,
+            );
         };
         let bound_generation = accepted_status
             .and_then(|status| status.binding_stamp())
@@ -2235,28 +2281,47 @@ impl SharedState {
                         && stamp.accepted_commit() == candidate.descriptor.publisher_commit
                 }),
         };
-        LastCandidateRuntimeView {
-            status: "stored",
-            source_generation_id: Some(candidate.source_generation_id),
-            producer_id: Some(candidate.producer_id),
-            full_ref: Some(candidate.descriptor.full_ref),
-            publisher_commit: Some(candidate.descriptor.publisher_commit),
-            state: Some(match candidate.state {
-                State::ReceivingManifest => "receiving_manifest",
-                State::MissingBlobs => "missing_blobs",
-                State::Ready => "ready",
-                State::Superseded => "superseded",
-                State::Retired => "retired",
-                State::Expired => "expired",
-                State::Failed => "failed",
-            }),
-            created_unix_secs: Some(candidate.created_unix_secs),
-            diagnostic: candidate.diagnostic,
-            served_by_pointer: Some(served_by_pointer),
-            unreadable_index_entry_count: 0,
-            unreadable_index_entries: Vec::new(),
-        }
-        .with_unreadable_index_entries(unreadable)
+        // A Ready candidate the pointer does not serve counts as lag only
+        // when automatic acceptance would take it: the same producer,
+        // scope, and ref the pointer is bound to. Anything else is an
+        // operator move, and the pointer is not behind; it is waiting.
+        let unserved_bound_candidate = candidate.state == State::Ready
+            && !served_by_pointer
+            && accepted_status
+                .and_then(|status| status.binding_stamp())
+                .and_then(|stamp| stamp.source().producer_id())
+                == Some(candidate.producer_id.as_str())
+            && accepted_status
+                .and_then(|status| status.content_stamp())
+                .is_some_and(|stamp| {
+                    stamp.accepted_scope() == &candidate.descriptor.scope
+                        && stamp.full_ref() == candidate.descriptor.full_ref
+                });
+        (
+            LastCandidateRuntimeView {
+                status: "stored",
+                source_generation_id: Some(candidate.source_generation_id),
+                producer_id: Some(candidate.producer_id),
+                full_ref: Some(candidate.descriptor.full_ref),
+                publisher_commit: Some(candidate.descriptor.publisher_commit),
+                state: Some(match candidate.state {
+                    State::ReceivingManifest => "receiving_manifest",
+                    State::MissingBlobs => "missing_blobs",
+                    State::Ready => "ready",
+                    State::Superseded => "superseded",
+                    State::Retired => "retired",
+                    State::Expired => "expired",
+                    State::Failed => "failed",
+                }),
+                created_unix_secs: Some(candidate.created_unix_secs),
+                diagnostic: candidate.diagnostic,
+                served_by_pointer: Some(served_by_pointer),
+                unreadable_index_entry_count: 0,
+                unreadable_index_entries: Vec::new(),
+            }
+            .with_unreadable_index_entries(unreadable),
+            unserved_bound_candidate,
+        )
     }
 
     fn watcher_runtime_view(
@@ -2313,6 +2378,7 @@ impl AcceptedRuntimeView {
     fn project(
         status: Option<&bbox_indexing::accepted_publication_runtime::AcceptedPublicationStatus>,
         pointer_written_unix_secs: Option<u64>,
+        unserved_bound_candidate: bool,
     ) -> Self {
         use bbox_indexing::accepted_publication_runtime::{
             AcceptedPublicationScopeAgreement as Agreement, AcceptedPublicationState as State,
@@ -2339,6 +2405,7 @@ impl AcceptedRuntimeView {
         let stamp = status.content_stamp();
         Self {
             state: match status.state() {
+                State::Current if unserved_bound_candidate => "lagging",
                 State::Current => "current",
                 State::Prior => "prior",
                 State::Missing => "missing",

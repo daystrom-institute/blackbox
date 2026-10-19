@@ -427,6 +427,19 @@ fn accepted_publication_section(
                 ),
                 ops_call("bbox_doctor", "{}"),
             ));
+            // A lagging pointer reports both facts, not the generic arm:
+            // the explanation below says it still verifies and serves, and
+            // the unserved-candidate finding is the actionable half the
+            // generic wording would hide behind the unreadable catalog.
+            if status.accepted.state == "lagging" {
+                findings.push(Finding::info(format!(
+                    "project {project} accepted publication is verified independently \
+                         of the catalog and still serves its current generation while \
+                         the catalog pair is unreadable"
+                )));
+                findings.extend(unserved_candidate_finding(status));
+                continue;
+            }
             findings.push(match status.accepted.state {
                 "current" if status.accepted.serves_published_content => Finding::info(format!(
                     "project {project} accepted publication is verified independently \
@@ -477,6 +490,14 @@ fn accepted_publication_section(
         }
         let project = &status.project_id;
         findings.extend(unserved);
+        // A lagging pointer's report is the unserved-candidate finding
+        // above; a second state line would only repeat it. A scope bridge
+        // still adds its own action below.
+        if status.accepted.state == "lagging"
+            && status.accepted.scope_agreement != "refresh_required"
+        {
+            continue;
+        }
         findings.push(match status.accepted.state {
             // Serving old accepted truth under its old scope until a
             // scope move at the new scope clears the bridge (plan 4.9).
@@ -2976,6 +2997,61 @@ mod catalog_health_tests {
         // The projects' own candidates were read: nothing says they went
         // unchecked, and the index finding is the section's only one.
         assert_eq!(section.findings.len(), 1, "{:?}", section.findings);
+    }
+
+    /// An unreadable catalog pair does not hide a lagging pointer: the
+    /// verified-serving explanation and the unserved candidate are both
+    /// reported, not collapsed into the generic warning.
+    #[test]
+    fn an_unreadable_catalog_still_reports_a_lagging_pointer_and_its_candidate() {
+        use crate::server::state::LastCandidateRuntimeView;
+
+        crate::init_system_memory_for_tests();
+        let fixture = CatalogFixture::new();
+        let scope = CatalogFixture::scope(".");
+        fixture.add_published_project(PROJECT, &scope);
+        fixture.install_publication(
+            PROJECT,
+            &scope,
+            COMMIT_ONE,
+            &[knowledge_entry("k1", "a")],
+            &[],
+        );
+        let server = fixture.server();
+        let mut status = status(&server);
+        assert_eq!(status.accepted.state, "current");
+        // The unreadable-catalog projection of the same host: the pointer
+        // still verifies, and a bound Ready candidate is stored unserved.
+        status.catalog_authority = "unavailable";
+        status.accepted.state = "lagging";
+        status.last_candidate = LastCandidateRuntimeView {
+            status: "stored",
+            source_generation_id: Some(format!("kps_{}", "2".repeat(64))),
+            producer_id: Some("producer-a".into()),
+            full_ref: Some("refs/heads/main".into()),
+            publisher_commit: Some(COMMIT_TWO.into()),
+            state: Some("ready"),
+            created_unix_secs: Some(1_700_000_000),
+            diagnostic: None,
+            served_by_pointer: Some(false),
+            unreadable_index_entry_count: 0,
+            unreadable_index_entries: Vec::new(),
+        };
+
+        let section = accepted_publication_section(&[status]);
+        let text = serde_json::to_string(&section).unwrap();
+        assert!(
+            text.contains("could not be read from the catalog pair"),
+            "{text}"
+        );
+        assert!(
+            text.contains("verified independently of the catalog"),
+            "{text}"
+        );
+        assert!(text.contains("is not served"), "{text}");
+        assert!(!text.contains("could not be evaluated further"), "{text}");
+        assert_eq!(section.findings.len(), 3, "{:?}", section.findings);
+        assert_eq!(section.worst(), FindingLevel::Action);
     }
 
     /// Accepted Current, and the section says so without inventing findings.

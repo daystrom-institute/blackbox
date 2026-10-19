@@ -256,6 +256,7 @@ fn project_cell(project_id: &str, label: Option<&str>) -> Markup {
 fn publisher_label(state: &str) -> Markup {
     let class = match state {
         "current" => "running",
+        "lagging" => "waiting",
         "prior" => "waiting",
         "missing" => "finished",
         "corrupt" => "failed",

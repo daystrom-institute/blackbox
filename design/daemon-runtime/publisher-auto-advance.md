@@ -112,8 +112,20 @@ daemon was already accepting.
 
 - **At most one attempt per uploaded candidate**, claimed in a bounded
   in-process ledger BEFORE the attempt, so a failure consumes the claim too.
-- **No retry, ever.** A refusal logs once at warn and stops. The next
-  candidate from the collector is the next attempt.
+- **Verdict refusals never retry.** A refusal that is a verdict on the
+  candidate logs once at warn and stops. The next candidate from the
+  collector is the next attempt. The one non-verdict refusal, a lost race
+  against the catalog-global epoch (any project's catalog write bumps it),
+  is retried inline within the one claimed attempt: at most
+  `MAX_STALE_EPOCH_RETRIES` times, each retry re-reading the epoch and
+  keeping the pointer CAS tokens from the first read, so a persistently
+  contended catalog still stops and refuses. An establish retry also
+  revalidates attachment admission against the refreshed snapshot: the
+  publish path checks the candidate's scope but never admission, so a
+  detach landing between the first check and the commit refuses the
+  retry. A refusal that may have
+  reached the swap never retries: the pointer may already name the
+  candidate, and only convergence reacts to that.
 - **The prior accepted generation keeps serving, unless the refusal reached
   the swap.** A failure raised at or after the atomic pointer replacement
   leaves the new pointer installed while reporting an error, which is what
@@ -217,6 +229,13 @@ and after a restart:
   whose source generation it names; a pointer bound to an attachment serves a
   candidate with the same ref and commit.
 
+The same facts qualify the status tool's `accepted_state`: a pointer current
+on the catalog reports `lagging` while a Ready candidate from the bound
+producer, scope, and ref is stored but not served by the pointer, and
+`current` once the pointer serves it. A Ready candidate from any other
+producer or ref is an operator move the daemon does not owe, so the state
+stays `current` while the pointer waits for it.
+
 `bbox_doctor` reports a project whose newest stored candidate is not served
 by the pointer, whatever the pointer's own state: an action for a Ready
 candidate (acceptance refused it or never ran, and an operator move can serve
@@ -241,6 +260,7 @@ operation, and the operator's `audit_reason`.
   what the configured ref holds and cannot choose the ref, the scope, or the
   pointer.
 - No automatic producer, scope, or ref change; those are operator moves.
-- No retry, backoff, or queue for refused candidates.
+- No retry, backoff, or queue for refused candidates; the bounded inline
+  stale-epoch retry inside the one claimed attempt is the single exception.
 - No durable per-attempt history; the ledger is bounded and in-process.
 - No change to accepted content, its normalization, or its hashes.
