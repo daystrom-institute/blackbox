@@ -187,13 +187,31 @@ while True: time.sleep(1)
 
     impl Plane {
 async fn start_with_executor(kind: bbox_config::config::ExecutorKind) -> Self {
+            Self::start_with_config(kind, false).await
+        }
+
+        /// A plane whose daemon and fleetd run with HOME and BRO_HOME inside
+        /// the fixture, so the runner's global blackbox config (its global
+        /// mcp.json filters among it) cannot reach dispatch resolution.
+        async fn start_isolated() -> Self {
+            Self::start_with_config(bbox_config::config::ExecutorKind::Fleetd, true).await
+        }
+
+        async fn start_with_config(
+            kind: bbox_config::config::ExecutorKind,
+            isolate_home: bool,
+        ) -> Self {
             let tmp = tempfile::tempdir().expect("tempdir");
             let root = tmp.path().canonicalize().expect("canonical tempdir");
+            let mut env = crate::util::TestEnvGuard::new();
+            if isolate_home {
+                env.set("HOME", &root.join("home"));
+                env.set("BRO_HOME", &root.join("bro-home"));
+            }
             let fleetd = FleetdProcess::start(&root.join("state")).await;
             let store_dir = root.join("bro");
             std::fs::create_dir_all(&store_dir).expect("store dir");
             let stub = write_recording_stub(&root);
-            let mut env = crate::util::TestEnvGuard::new();
             env.remove("BLACKBOX_MCP_URL");
             env.set("CLAUDE_BIN", &stub);
             let state = Arc::new(crate::server::state::SharedState::for_test(&store_dir));
@@ -639,9 +657,125 @@ async fn start_with_executor(kind: bbox_config::config::ExecutorKind) -> Self {
         assert_ne!(created.is_error, Some(true), "{}", tool_text(&created));
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resume_of_a_named_session_restores_the_brofile_lanes_and_relabels() {
+        let mut plane = Plane::start_isolated().await;
+        let cwd = plane.cwd();
+        create_brofile(
+            &plane,
+            json!({
+                "action": "set_account",
+                "name": "acceptance-account",
+                "env": { "ACCEPTANCE_ACCOUNT_MARKER": "synthetic" },
+            }),
+        )
+        .await;
+        create_brofile(
+            &plane,
+            json!({
+                "action": "create",
+                "name": "acceptance-bro",
+                "provider": "glm",
+                "account": "acceptance-account",
+                "model": "glm-5.3-flash",
+                "effort": "high",
+                "lens": "acceptance persona",
+                "disallow_tools": ["glob"],
+            }),
+        )
+        .await;
+        let (task, session, child) = plane
+            .exec(json!({ "prompt": "named first turn", "bro": "acceptance-bro", "cwd": cwd }))
+            .await;
+        await_file(&child.join("stdin"), "named first turn").await;
+        assert_eq!(plane.finish(&task).await["status"], "completed");
 
+        // A resume of the named session restores the brofile in full and
+        // says so.
+        let resumed = plane
+            .server
+            .bro_resume(call(json!({
+                "prompt": "named second turn",
+                "session_id": session,
+                "provider": "glm",
+                "cwd": cwd,
+            })))
+            .await;
+        let resumed = parsed(&resumed);
+        assert_eq!(
+            resumed["brofile"],
+            json!({ "name": "acceptance-bro", "restored": true }),
+            "{resumed}"
+        );
+        let resumed_task = resumed["taskId"].as_str().expect("resume taskId").to_string();
+        let second = plane.next_child().await;
+        await_file(&second.join("stdin"), "named second turn").await;
+        assert_brofile_lanes(&second, &session);
+        let waited = plane.finish(&resumed_task).await;
+        assert_eq!(waited["status"], "completed", "{waited}");
+        // The resumed task still names the brofile, so waits and roster rows
+        // report it.
+        assert_eq!(waited["bro"], "acceptance-bro", "{waited}");
+        let roster = {
+            let store = plane.state.task_store.read();
+            let task = store.get(&resumed_task).expect("resumed task");
+            crate::orchestration::roster_summary_from_task(&task)
+        };
+        assert_eq!(roster.label.as_deref(), Some("acceptance-bro"));
+        assert_eq!(roster.name.as_deref(), Some("acceptance-bro"));
 
+        // The first resume restamped the label, so a second resume of the
+        // same session restores the brofile again.
+        let again = plane
+            .server
+            .bro_resume(call(json!({
+                "prompt": "named third turn",
+                "session_id": session,
+                "provider": "glm",
+                "cwd": cwd,
+            })))
+            .await;
+        let again = parsed(&again);
+        assert_eq!(
+            again["brofile"],
+            json!({ "name": "acceptance-bro", "restored": true }),
+            "{again}"
+        );
+        let again_task = again["taskId"].as_str().expect("resume taskId").to_string();
+        let third = plane.next_child().await;
+        await_file(&third.join("stdin"), "named third turn").await;
+        assert_brofile_lanes(&third, &session);
+        assert_eq!(plane.finish(&again_task).await["bro"], "acceptance-bro");
+    }
 
+    /// A resumed child of a named session carries everything the brofile
+    /// owns: the account environment, model, effort, persona with the scope
+    /// block, and the deny filter.
+    fn assert_brofile_lanes(child: &Path, session: &str) {
+        let argv = argv(child);
+        assert_eq!(flag(&argv, "--resume"), Some(session), "{argv:?}");
+        assert_eq!(flag(&argv, "--model"), Some("glm-5.3-flash"), "{argv:?}");
+        assert_eq!(flag(&argv, "--effort"), Some("high"), "{argv:?}");
+        // Persona and scope share --append-system-prompt: the persona leads,
+        // and the scope block below it names the brofile.
+        assert_eq!(
+            flag(&argv, "--append-system-prompt"),
+            Some("acceptance persona"),
+            "{argv:?}"
+        );
+        let raw = read(child, "argv");
+        assert!(raw.contains("bro: acceptance-bro"), "{raw}");
+        let denied: Vec<&str> = flag(&argv, "--disallowedTools")
+            .expect("deny")
+            .split(',')
+            .collect();
+        assert!(denied.contains(&"glob"), "{denied:?}");
+        assert!(
+            read(child, "env-names")
+                .lines()
+                .any(|name| name == "ACCEPTANCE_ACCOUNT_MARKER")
+        );
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn resume_of_a_session_whose_brofile_is_gone_runs_bare_and_says_so() {
