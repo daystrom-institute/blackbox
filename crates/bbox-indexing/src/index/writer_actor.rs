@@ -266,6 +266,10 @@ pub struct IndexWriterActor {
     /// Production never installs one.
     #[cfg(any(test, feature = "test-support"))]
     merge_wait_observer: Arc<parking_lot::RwLock<Option<MergeWaitObserver>>>,
+    /// Test-support observer fired at a pass's drain boundaries.
+    /// Production never installs one.
+    #[cfg(any(test, feature = "test-support"))]
+    pass_drain_observer: Arc<parking_lot::RwLock<Option<PassDrainObserver>>>,
     checkout_access: Arc<CheckoutAccessBroker>,
     records_provider: Arc<dyn ProjectRecordsProvider>,
     assignments: Arc<parking_lot::RwLock<Option<Arc<dyn ProducerAssignmentSource>>>>,
@@ -342,6 +346,13 @@ pub enum MergeWaitPhase {
 }
 
 type MergeWaitObserver = Arc<dyn Fn(MergeWaitPhase) + Send + Sync>;
+
+/// Test-support observer fired on the actor thread at the top of a pass's
+/// drain boundary: an op enqueued from inside the observer is guaranteed to
+/// be consumed by the try_recv loop that runs right after it, making the
+/// drained-into-the-pass path (as opposed to a post-pass batch) reachable
+/// deterministically.
+type PassDrainObserver = Arc<dyn Fn() + Send + Sync>;
 
 pub struct StagedIndexGeneration {
     result: super::project_files::CollectedIndexResult,
@@ -423,6 +434,7 @@ struct ActorCtx {
     stats_cache: StatsCache,
     post_commit_hook: Arc<parking_lot::RwLock<Option<PostCommitHook>>>,
     merge_wait_observer: Arc<parking_lot::RwLock<Option<MergeWaitObserver>>>,
+    pass_drain_observer: Arc<parking_lot::RwLock<Option<PassDrainObserver>>>,
     checkout_access: Arc<CheckoutAccessBroker>,
     records_provider: Arc<dyn ProjectRecordsProvider>,
     assignments: Arc<parking_lot::RwLock<Option<Arc<dyn ProducerAssignmentSource>>>>,
@@ -1109,6 +1121,7 @@ impl IndexWriterActor {
         let (tx, rx) = mpsc::channel::<IndexWriteOp>();
         let post_commit_hook = Arc::new(parking_lot::RwLock::new(None));
         let merge_wait_observer = Arc::new(parking_lot::RwLock::new(None));
+        let pass_drain_observer = Arc::new(parking_lot::RwLock::new(None));
         let assignments: Arc<parking_lot::RwLock<Option<Arc<dyn ProducerAssignmentSource>>>> =
             Arc::new(parking_lot::RwLock::new(None));
         let publication_activity = Arc::new(AtomicU8::new(PUBLICATION_IDLE));
@@ -1122,6 +1135,7 @@ impl IndexWriterActor {
             stats_cache,
             post_commit_hook: post_commit_hook.clone(),
             merge_wait_observer: merge_wait_observer.clone(),
+            pass_drain_observer: pass_drain_observer.clone(),
             checkout_access: checkout_access.clone(),
             records_provider: records_provider.clone(),
             assignments: assignments.clone(),
@@ -1146,6 +1160,8 @@ impl IndexWriterActor {
             post_commit_hook,
             #[cfg(any(test, feature = "test-support"))]
             merge_wait_observer,
+            #[cfg(any(test, feature = "test-support"))]
+            pass_drain_observer,
             checkout_access,
             records_provider,
             assignments,
@@ -1191,6 +1207,20 @@ impl IndexWriterActor {
         observer: impl Fn(MergeWaitPhase) + Send + Sync + 'static,
     ) {
         *self.merge_wait_observer.write() = Some(Arc::new(observer));
+    }
+
+    /// Observe a pass's drain boundaries. Test support: the actor invokes
+    /// the observer on its own thread at the top of every in-pass drain,
+    /// before the try_recv loop runs, so an op enqueued from inside the
+    /// observer is guaranteed to be drained into that pass rather than
+    /// landing as a post-pass batch.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn install_pass_drain_observer_for_test(
+        &self,
+        observer: impl Fn() + Send + Sync + 'static,
+    ) {
+        *self.pass_drain_observer.write() = Some(Arc::new(observer));
     }
 
     /// Whether the actor's writer slot currently holds a writer. Test
@@ -2987,6 +3017,7 @@ fn run_pass(
     let mut drained_op_failed = false;
     let outcome = {
         let mut drain = |writer: &mut IndexWriter| {
+            notify_pass_drain(ctx);
             while let Ok(op) = rx.try_recv() {
                 match op {
                     IndexWriteOp::ReindexPass { ack, .. } => {
@@ -3298,6 +3329,15 @@ fn post_commit(ctx: &ActorCtx) {
 fn notify_merge_wait(ctx: &ActorCtx, phase: MergeWaitPhase) {
     if let Some(observer) = ctx.merge_wait_observer.read().clone() {
         observer(phase);
+    }
+}
+
+/// Fire the pass-drain observer, when installed, at the top of a pass's
+/// drain boundary. Test support; with no observer installed this is a lock
+/// read on an empty slot.
+fn notify_pass_drain(ctx: &ActorCtx) {
+    if let Some(observer) = ctx.pass_drain_observer.read().clone() {
+        observer();
     }
 }
 
@@ -5368,29 +5408,42 @@ mod tests {
     /// The batch path is not the only way a failed apply touches the stored
     /// writer: an op drained into an incremental pass fails inside the
     /// pass's own scope, and the drained-op failure flag must keep that
-    /// writer out of the slot too. The failing op is enqueued immediately
-    /// behind the pass request: whether the pass drains it into its commit
-    /// or it lands as a post-pass batch, both paths discard, so once the
-    /// queue settles the slot must be empty and the next healthy op must
-    /// land on a fresh writer.
+    /// writer out of the slot too. The pass-drain observer enqueues the
+    /// failing op on the actor thread at a drain boundary, so the pass is
+    /// guaranteed to drain it rather than run it as a post-pass batch; the
+    /// slot is asserted empty straight after the pass ack, before any other
+    /// op is processed, and the healthy op after it proves recovery on a
+    /// fresh writer. The baseline entry is store-backed because incremental
+    /// reconciliation term-deletes the whole published knowledge lane and
+    /// rebuilds it from the KB store: an index-only baseline would be
+    /// deleted by the pass itself.
     #[test]
-    fn a_failing_op_around_an_incremental_pass_empties_the_slot() {
+    fn a_failing_drained_op_empties_the_slot_after_an_incremental_pass() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let index = test_index(&root);
         let actor = IndexWriterActor::spawn_for(&index);
-        actor.enqueue(IndexWriteOp::UpsertKnowledge(Box::new(test_entry(
-            "drain00before",
-            "drainbaseline sentinel",
-        ))));
+        let baseline = test_entry("drain00before", "drainbaseline sentinel");
+        persist_kb_entries(&root.join("kb.json"), &[baseline.clone()]);
+        actor.enqueue(IndexWriteOp::UpsertKnowledge(Box::new(baseline)));
         actor.flush_blocking().unwrap();
         assert!(
             actor.writer_slot_occupied_for_test(),
             "a healthy batch must leave the writer in the slot"
         );
-        // Dispatch the pass through a hand-built op so the failing op can be
-        // enqueued while the pass is in flight: run_reindex_pass cannot
-        // interleave an enqueue from this thread.
+        // The failing op is enqueued from inside a drain boundary, before
+        // the try_recv loop that must consume it; the flag makes the enqueue
+        // once-only across the pass's several boundaries.
+        let drain_enqueued = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let drain_flag = drain_enqueued.clone();
+        let actor_from_drain = actor.clone();
+        actor.install_pass_drain_observer_for_test(move || {
+            if !drain_flag.swap(true, Ordering::SeqCst) {
+                actor_from_drain.enqueue(IndexWriteOp::ReplaceProjectGraphLane {
+                    documents: Vec::new(),
+                });
+            }
+        });
         let (ack_tx, ack_rx) = mpsc::sync_channel(1);
         actor.enqueue(IndexWriteOp::ReindexPass {
             full: false,
@@ -5399,16 +5452,14 @@ mod tests {
             accept_empty_projects: Vec::new(),
             ack: Some(ack_tx),
         });
-        actor.enqueue(IndexWriteOp::ReplaceProjectGraphLane {
-            documents: Vec::new(),
-        });
         ack_rx.recv().unwrap().unwrap();
-        // The Flush barrier also processes the failing op when the pass did
-        // not drain it, so the slot state is settled either way here.
-        actor.flush_blocking().unwrap();
+        assert!(
+            drain_enqueued.load(Ordering::SeqCst),
+            "the pass must reach a drain boundary so the failing op is drained, not batched"
+        );
         assert!(
             !actor.writer_slot_occupied_for_test(),
-            "a drained or post-pass failed apply must keep the slot empty after the pass"
+            "a failed apply drained into the pass must keep the slot empty after it"
         );
         actor.enqueue(IndexWriteOp::UpsertKnowledge(Box::new(test_entry(
             "drain01after",
@@ -5418,7 +5469,7 @@ mod tests {
         assert_eq!(
             live_doc_total(&index),
             2,
-            "the healthy op after the failed one must commit on a fresh writer"
+            "store-backed baseline (restored by the pass) plus the recovery op"
         );
         assert!(
             search(&index, "drainrecovered").contains("drainrecovered"),
