@@ -1270,6 +1270,21 @@ mod clause_one_exit_proof {
                 .records
                 .is_empty()
         );
+        // The actor holds the directory's writer for its lifetime, so this
+        // fixture's two live runtimes cannot both write the same index: the
+        // recordless twin's auto-index would take LockBusy against the
+        // populated twin's actor. Settle the directory before the walk: one
+        // full pass through the populated twin's actor builds the index,
+        // consumes its writer (wait_merging_threads) and leaves the slot
+        // empty, so that actor holds no directory lock while the recordless
+        // twin's actor runs its own auto-index. The populated arm never
+        // re-opens one mid-proof: the pass reloads its reader, so its index
+        // reads non-empty from here on.
+        populated
+            .state
+            .index_writer
+            .run_reindex_pass(true, true)
+            .expect("settle the shared index directory before the proof walk");
         let mut executed: Vec<&str> = Vec::new();
 
         macro_rules! compare {

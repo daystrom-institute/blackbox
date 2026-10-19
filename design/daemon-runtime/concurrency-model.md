@@ -32,8 +32,11 @@ brief: "Holistic concurrency architecture for blackboxd: current as-built map, t
 > its segment updater and orphans every in-flight merge, so a per-batch writer
 > wastes the pending merge set on every commit and never compacts deletions;
 > failed ops and failed commits drop the stored writer and the next op
-> rebuilds it, and full reindex passes settle merge threads before returning
-> (the queue, not writer recreation, provides serialization).
+> rebuilds it. A full reindex pass never runs on the stored writer:
+> delete_all_documents rewinds the opstamp stamper, which is safe only on a
+> writer that has committed nothing, so the pass retires the stored writer,
+> opens a fresh one, settles merge threads before returning, and leaves the
+> slot empty (the queue, not writer recreation, provides serialization).
 > Measured: idle mean poll 1791µs → ~236µs across the campaign; under-load
 > samples confounded by host rustc storms (see thread note 22). The daemon
 > keeps no in-memory edge graph, so no edge rebuild holds store guards or runs
