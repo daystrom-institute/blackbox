@@ -982,7 +982,7 @@ async fn a_staged_tls_peer_consumes_the_budget_before_tls_completes() {
     let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
     let server_name = rustls::pki_types::ServerName::try_from("127.0.0.1".to_string())
         .expect("the listener address is an IP server name");
-    let tls_stream = connector
+    let mut tls_stream = connector
         .connect(server_name, HeldWrites::new(tcp, hold))
         .await
         .expect("TLS completes on the remaining budget");
@@ -1209,8 +1209,8 @@ async fn stalled_peers_expire_while_the_owner_and_both_listeners_stay_usable() {
     ));
 
     // Both listeners still serve: a fresh protocol handshake completes on
-    // each. Neither peer authenticates, so each is dropped at its own
-    // deadline without disturbing the owner.
+    // each. The throwaway clients drop right here, unauthenticated, without
+    // disturbing the owner.
     FakeDaemon::connect(&harness.socket)
         .await
         .expect("the Unix listener still serves");
