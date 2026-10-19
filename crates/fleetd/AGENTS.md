@@ -51,7 +51,11 @@ into a binary that changes a few times a year is the fix.
   protocol.
 - **Auth is a gate, not a suggestion.** The first post-handshake envelope must
   be `Authenticate` with a valid bearer token. A well-formed `Spawn` sent
-  first is refused, not executed. Unix accepts also run `verify_peer_uid` as a
+  first is refused, not executed. The combined pre-authentication phase
+  (TLS accept, protocol negotiation, first `Authenticate` envelope) is bounded
+  by one shared deadline (`DEFAULT_PRE_AUTHENTICATION_TIMEOUT`); a peer that
+  exceeds it is dropped with no reply bytes, and the deadline never applies
+  once authentication succeeds. Unix accepts also run `verify_peer_uid` as a
   second independent check: it proves the peer runs as our uid, never which
   service it is. TCP has no Unix uid claim and is disabled by default. Its
   network identity boundary is one of two things: the TLS identity in
