@@ -8,11 +8,16 @@
 //! `state.idx` write guard — which stalled searches too).
 //!
 //! Design deltas from §4.3 as written:
-//! - The actor creates its writer **per batch / per pass** (with retry on a
-//!   busy cross-process lock) instead of holding it for the daemon lifetime.
-//!   Serialization through the queue is what eliminates in-process LockBusy;
-//!   releasing between batches keeps the boot-time initial index build and
-//!   test helpers working, and frees the writer's arena + threads when idle.
+//! - The actor keeps ONE writer for its lifetime, created lazily on the
+//!   first write op (with retry on a busy cross-process lock) rather than at
+//!   spawn. Dropping a tantivy writer kills its segment updater and orphans
+//!   every in-flight merge, so a per-batch writer turns each small commit
+//!   into a wasted rewrite of the pending merge set and never compacts
+//!   deletions; the long-lived writer lets those merges land in the
+//!   background. Any failed commit scope drops the stored writer so the next
+//!   op rebuilds from a clean one, and a full reindex pass settles its merge
+//!   threads (`wait_merging_threads`, which consumes the writer) before
+//!   leaving the slot empty for the next op to refill.
 //! - Small ops are fire-and-forget (`enqueue`): callers already treated index
 //!   sync as best-effort (warn-and-continue), and the durable stores +
 //!   periodic reindex reconcile any op lost to a writer error. Tests needing
@@ -31,7 +36,7 @@ use anyhow::{Context, Result, anyhow};
 use tantivy::collector::{Count, TopDocs};
 use tantivy::query::TermQuery;
 use tantivy::schema::{IndexRecordOption, Term};
-use tantivy::{Index, IndexReader, IndexWriter};
+use tantivy::{Index, IndexReader, IndexWriter, TantivyDocument};
 
 use bbox_corpus_core::code_project_identity::{CodeProjectIdentity, IdentityOrigin};
 use bbox_corpus_core::project_catalog::ProjectScope;
@@ -234,6 +239,15 @@ pub enum IndexWriteOp {
     /// Barrier: acked once every previously-enqueued op has been applied and
     /// committed. Drained-queue semantics, not durability.
     Flush(mpsc::SyncSender<()>),
+    /// Test support: write prebuilt documents through the actor's own
+    /// single-writer lane. Tests must not open a second writer on an index
+    /// with a live actor (the actor's writer holds the tantivy lock for its
+    /// lifetime), so fixtures that used to seed a transcript index directly
+    /// enqueue through here instead. Carries raw documents precisely because
+    /// it asserts nothing about them: it exists to reproduce legacy shapes no
+    /// production op can express.
+    #[cfg(any(test, feature = "test-support"))]
+    SeedDocuments(Vec<TantivyDocument>),
 }
 
 /// Cloneable handle to the writer actor. Lives in `SharedState`.
@@ -387,6 +401,12 @@ struct ActorCtx {
     assignments: Arc<parking_lot::RwLock<Option<Arc<dyn ProducerAssignmentSource>>>>,
     publication_activity: Arc<AtomicU8>,
     enqueued_graph_generations: Arc<parking_lot::Mutex<BTreeMap<(String, String, String), String>>>,
+    /// The actor's long-lived writer: created lazily on the first write op,
+    /// held across batches and passes so merges scheduled by a commit survive
+    /// it, and emptied while a scope owns it (any failed scope simply never
+    /// puts it back, so the next op rebuilds from a clean writer). The ctx is
+    /// thread-confined to the actor, so `RefCell` access is single-threaded.
+    writer: std::cell::RefCell<Option<IndexWriter>>,
 }
 
 const PUBLICATION_IDLE: u8 = 0;
@@ -988,7 +1008,9 @@ const STAGE_HOLD_PUBLISHING: u8 = 1;
 const STAGE_HOLD_EXPIRED: u8 = 2;
 const STAGE_HOLD_RELEASED: u8 = 3;
 
-const WRITER_HEAP_SMALL_OPS: usize = 50_000_000;
+/// Heap for the actor's single long-lived writer. One size serves small-op
+/// batches and reindex passes alike: the writer is no longer rebuilt per
+/// batch, so the old small-ops/reindex split bought nothing.
 const WRITER_HEAP_REINDEX: usize = 100_000_000;
 
 impl IndexWriterActor {
@@ -1073,6 +1095,7 @@ impl IndexWriterActor {
             assignments: assignments.clone(),
             publication_activity: publication_activity.clone(),
             enqueued_graph_generations: enqueued_graph_generations.clone(),
+            writer: std::cell::RefCell::new(None),
         };
         if let Err(err) = std::thread::Builder::new()
             .name("blackbox-index-writer".into())
@@ -1577,6 +1600,17 @@ impl IndexWriterActor {
             .recv()
             .map_err(|_| anyhow!("index writer actor dropped the flush ack"))
     }
+
+    /// Seed prebuilt documents through the actor's single-writer lane and
+    /// block until they are committed. Test support only: an actor holds the
+    /// tantivy writer lock for its lifetime, so a test cannot open a second
+    /// writer on a live actor's index.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn seed_documents_for_test(&self, documents: Vec<TantivyDocument>) -> Result<()> {
+        self.enqueue(IndexWriteOp::SeedDocuments(documents));
+        self.flush_blocking()
+    }
 }
 
 fn run_actor(rx: mpsc::Receiver<IndexWriteOp>, ctx: ActorCtx) {
@@ -1904,40 +1938,45 @@ fn run_collected_stage(
     let compat = compat_record(ctx, identity.project_id.as_str());
     let edges_dir =
         bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(&ctx.config.projects_path);
-    let mut writer = create_writer(&ctx.index, WRITER_HEAP_REINDEX)?;
-    writer.set_merge_policy(Box::new(conservative_log_merge_policy()));
-    let mut publication = super::project_files::ProjectIndexPublicationBundle::default();
-    let result = super::project_files::stage_collected_project_generation(
-        identity,
-        super::project_files::ProjectFileCompatFields {
-            repo_id: compat.as_ref().and_then(|record| record.repo_id.as_deref()),
-        },
-        descriptor,
-        generation_id,
-        entries,
-        ctx.fields,
-        &mut writer,
-        &edges_dir,
-        &mut publication,
-        |entry| {
-            let mut file = store.verified_blob_file(entry.content_sha256, entry.size)?;
-            let mut bytes = Vec::with_capacity(entry.size as usize);
-            std::io::Read::read_to_end(&mut file, &mut bytes)?;
-            Ok(bytes)
-        },
-    )?;
-    // No checkout lease contributed to this bundle, so there is no
-    // publication guard to hold: the broker's guard exists to pin checkout
-    // lifecycle across publish, and this transaction touched no checkout.
-    let (publication_result, commit_payload) =
-        commit_snapshot_publications(&ctx.index, &mut writer, &edges_dir, publication.publish()?)?;
-    publication_result.finalize_publications()?;
-    bbox_edge_sidecar::snapshot::prune_receipt_closeouts_after_commit(
-        &edges_dir,
-        (!commit_payload.is_empty()).then_some(commit_payload.as_str()),
-    )?;
-    post_commit(ctx);
-    Ok(result)
+    with_actor_writer(ctx, |writer| {
+        writer.set_merge_policy(Box::new(conservative_log_merge_policy()));
+        let mut publication = super::project_files::ProjectIndexPublicationBundle::default();
+        let result = super::project_files::stage_collected_project_generation(
+            identity,
+            super::project_files::ProjectFileCompatFields {
+                repo_id: compat.as_ref().and_then(|record| record.repo_id.as_deref()),
+            },
+            descriptor,
+            generation_id,
+            entries,
+            ctx.fields,
+            &mut *writer,
+            &edges_dir,
+            &mut publication,
+            |entry| {
+                let mut file = store.verified_blob_file(entry.content_sha256, entry.size)?;
+                let mut bytes = Vec::with_capacity(entry.size as usize);
+                std::io::Read::read_to_end(&mut file, &mut bytes)?;
+                Ok(bytes)
+            },
+        )?;
+        // No checkout lease contributed to this bundle, so there is no
+        // publication guard to hold: the broker's guard exists to pin checkout
+        // lifecycle across publish, and this transaction touched no checkout.
+        let (publication_result, commit_payload) = commit_snapshot_publications(
+            &ctx.index,
+            &mut *writer,
+            &edges_dir,
+            publication.publish()?,
+        )?;
+        publication_result.finalize_publications()?;
+        bbox_edge_sidecar::snapshot::prune_receipt_closeouts_after_commit(
+            &edges_dir,
+            (!commit_payload.is_empty()).then_some(commit_payload.as_str()),
+        )?;
+        post_commit(ctx);
+        Ok(result)
+    })
 }
 
 /// Stage a connector generation. A NARROWING of [`run_collected_stage`].
@@ -1982,33 +2021,38 @@ fn run_connector_stage(
             size: entry.size,
         })
         .collect();
-    let mut writer = create_writer(&ctx.index, WRITER_HEAP_REINDEX)?;
-    writer.set_merge_policy(Box::new(conservative_log_merge_policy()));
-    let mut publication = super::project_files::ProjectIndexPublicationBundle::default();
-    let result = super::project_files::stage_connector_file_generation(
-        identity,
-        super::project_files::ProjectFileCompatFields {
-            repo_id: compat.as_ref().and_then(|record| record.repo_id.as_deref()),
-        },
-        generation_id,
-        &staging,
-        ctx.fields,
-        &mut writer,
-        &edges_dir,
-        &mut publication,
-        |entry| store.verified_blob(entry.content_sha256, entry.size),
-    )?;
-    // No checkout lease contributed to this bundle and no connector source can
-    // ever produce one, so there is no publication guard to hold.
-    let (publication_result, commit_payload) =
-        commit_snapshot_publications(&ctx.index, &mut writer, &edges_dir, publication.publish()?)?;
-    publication_result.finalize_publications()?;
-    bbox_edge_sidecar::snapshot::prune_receipt_closeouts_after_commit(
-        &edges_dir,
-        (!commit_payload.is_empty()).then_some(commit_payload.as_str()),
-    )?;
-    post_commit(ctx);
-    Ok(result)
+    with_actor_writer(ctx, |writer| {
+        writer.set_merge_policy(Box::new(conservative_log_merge_policy()));
+        let mut publication = super::project_files::ProjectIndexPublicationBundle::default();
+        let result = super::project_files::stage_connector_file_generation(
+            identity,
+            super::project_files::ProjectFileCompatFields {
+                repo_id: compat.as_ref().and_then(|record| record.repo_id.as_deref()),
+            },
+            generation_id,
+            &staging,
+            ctx.fields,
+            &mut *writer,
+            &edges_dir,
+            &mut publication,
+            |entry| store.verified_blob(entry.content_sha256, entry.size),
+        )?;
+        // No checkout lease contributed to this bundle and no connector source
+        // can ever produce one, so there is no publication guard to hold.
+        let (publication_result, commit_payload) = commit_snapshot_publications(
+            &ctx.index,
+            &mut *writer,
+            &edges_dir,
+            publication.publish()?,
+        )?;
+        publication_result.finalize_publications()?;
+        bbox_edge_sidecar::snapshot::prune_receipt_closeouts_after_commit(
+            &edges_dir,
+            (!commit_payload.is_empty()).then_some(commit_payload.as_str()),
+        )?;
+        post_commit(ctx);
+        Ok(result)
+    })
 }
 
 fn run_local_stage(
@@ -2041,51 +2085,56 @@ fn run_local_stage(
     // code cutback cannot manufacture a GitHistory observation after strict
     // transport cutover.
     let compat = compat_record(ctx, project_id);
-    let mut writer = create_writer(&ctx.index, WRITER_HEAP_REINDEX)?;
-    writer.set_merge_policy(Box::new(conservative_log_merge_policy()));
     let edges_dir =
         bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(&ctx.config.projects_path);
-    let mut publication = super::project_files::ProjectIndexPublicationBundle::default();
-    let result = super::project_files::stage_local_project_generation(
-        identity,
-        super::project_files::ProjectFileCompatFields {
-            repo_id: compat.as_ref().and_then(|record| record.repo_id.as_deref()),
-        },
-        scope,
-        local_lease.project_root(),
-        local_lease.checkout_root(),
-        ctx.fields,
-        &mut writer,
-        &edges_dir,
-        &mut publication,
-    )?;
-    // P3-F completes the P3-B deferral: local staging no longer walks Git
-    // inside its own transaction. It stages the EMPTY current-file member and
-    // lets the post-activation overlay step own the walk, exactly as the
-    // collected lane does.
-    //
-    // The parity consequence is enumerated in plan section 6 item 3 as
-    // amended: after a local cutback, `git-current.jsonl` is empty and the
-    // manifest entry is overlay-managed with no selector, so the loader gates
-    // the member off until the overlay lands. That is strictly better than
-    // the alternative it replaces - a Git error mid-walk previously failed
-    // the whole cutback, which is the F5 class on the local side.
-    //
-    // `stage_snapshot_git_current` with `include_managed_git: false` is what
-    // writes the empty member: the member must EXIST (the snapshot's file set
-    // is fixed at write time) while carrying no edges.
-    let _ = compat.as_ref();
-    publication.stage_snapshot_git_current(&edges_dir, project_id, &result.snapshot_id, false);
-    let _publication_guard = ctx.checkout_access.publication_guard(&local_lease)?;
-    let (publication_result, commit_payload) =
-        commit_snapshot_publications(&ctx.index, &mut writer, &edges_dir, publication.publish()?)?;
-    publication_result.finalize_publications()?;
-    bbox_edge_sidecar::snapshot::prune_receipt_closeouts_after_commit(
-        &edges_dir,
-        (!commit_payload.is_empty()).then_some(commit_payload.as_str()),
-    )?;
-    post_commit(ctx);
-    Ok(result)
+    with_actor_writer(ctx, |writer| {
+        writer.set_merge_policy(Box::new(conservative_log_merge_policy()));
+        let mut publication = super::project_files::ProjectIndexPublicationBundle::default();
+        let result = super::project_files::stage_local_project_generation(
+            identity,
+            super::project_files::ProjectFileCompatFields {
+                repo_id: compat.as_ref().and_then(|record| record.repo_id.as_deref()),
+            },
+            scope,
+            local_lease.project_root(),
+            local_lease.checkout_root(),
+            ctx.fields,
+            &mut *writer,
+            &edges_dir,
+            &mut publication,
+        )?;
+        // P3-F completes the P3-B deferral: local staging no longer walks Git
+        // inside its own transaction. It stages the EMPTY current-file member
+        // and lets the post-activation overlay step own the walk, exactly as
+        // the collected lane does.
+        //
+        // The parity consequence is enumerated in plan section 6 item 3 as
+        // amended: after a local cutback, `git-current.jsonl` is empty and the
+        // manifest entry is overlay-managed with no selector, so the loader
+        // gates the member off until the overlay lands. That is strictly
+        // better than the alternative it replaces - a Git error mid-walk
+        // previously failed the whole cutback, which is the F5 class on the
+        // local side.
+        //
+        // `stage_snapshot_git_current` with `include_managed_git: false` is
+        // what writes the empty member: the member must EXIST (the snapshot's
+        // file set is fixed at write time) while carrying no edges.
+        publication.stage_snapshot_git_current(&edges_dir, project_id, &result.snapshot_id, false);
+        let _publication_guard = ctx.checkout_access.publication_guard(&local_lease)?;
+        let (publication_result, commit_payload) = commit_snapshot_publications(
+            &ctx.index,
+            &mut *writer,
+            &edges_dir,
+            publication.publish()?,
+        )?;
+        publication_result.finalize_publications()?;
+        bbox_edge_sidecar::snapshot::prune_receipt_closeouts_after_commit(
+            &edges_dir,
+            (!commit_payload.is_empty()).then_some(commit_payload.as_str()),
+        )?;
+        post_commit(ctx);
+        Ok(result)
+    })
 }
 
 /// Walk Git for an already-active generation and publish its current-file
@@ -2106,38 +2155,43 @@ fn run_git_current_overlay(
         bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(&ctx.config.projects_path);
     let git_meta_dir =
         super::git_history::git_meta_dir_from_projects_path(&ctx.config.projects_path);
-    let mut writer = create_writer(&ctx.index, WRITER_HEAP_REINDEX)?;
-    writer.set_merge_policy(Box::new(conservative_log_merge_policy()));
-    let mut publication = super::project_files::ProjectIndexPublicationBundle::default();
-    let mut meta = HashMap::new();
-    let mut git_ctx = super::git_history::GitIndexContext {
-        f: ctx.fields,
-        writer: &mut writer,
-        meta: &mut meta,
-        edges_dir: &edges_dir,
-        git_meta_dir: &git_meta_dir,
-        force_full: true,
-        publication: &mut publication,
-        project_display,
-    };
-    super::git_history::index_git_history_for_project(
-        project,
-        lease.checkout_root(),
-        current_chunk_targets,
-        &mut git_ctx,
-    )?;
-    drop(git_ctx);
-    publication.stage_snapshot_git_current(&edges_dir, &project.project_id, snapshot_id, true);
-    let _publication_guard = ctx.checkout_access.publication_guard(lease)?;
-    let (publication_result, commit_payload) =
-        commit_snapshot_publications(&ctx.index, &mut writer, &edges_dir, publication.publish()?)?;
-    publication_result.finalize_publications()?;
-    bbox_edge_sidecar::snapshot::prune_receipt_closeouts_after_commit(
-        &edges_dir,
-        (!commit_payload.is_empty()).then_some(commit_payload.as_str()),
-    )?;
-    post_commit(ctx);
-    Ok(())
+    with_actor_writer(ctx, |writer| {
+        writer.set_merge_policy(Box::new(conservative_log_merge_policy()));
+        let mut publication = super::project_files::ProjectIndexPublicationBundle::default();
+        let mut meta = HashMap::new();
+        let mut git_ctx = super::git_history::GitIndexContext {
+            f: ctx.fields,
+            writer: &mut *writer,
+            meta: &mut meta,
+            edges_dir: &edges_dir,
+            git_meta_dir: &git_meta_dir,
+            force_full: true,
+            publication: &mut publication,
+            project_display,
+        };
+        super::git_history::index_git_history_for_project(
+            project,
+            lease.checkout_root(),
+            current_chunk_targets,
+            &mut git_ctx,
+        )?;
+        drop(git_ctx);
+        publication.stage_snapshot_git_current(&edges_dir, &project.project_id, snapshot_id, true);
+        let _publication_guard = ctx.checkout_access.publication_guard(lease)?;
+        let (publication_result, commit_payload) = commit_snapshot_publications(
+            &ctx.index,
+            &mut *writer,
+            &edges_dir,
+            publication.publish()?,
+        )?;
+        publication_result.finalize_publications()?;
+        bbox_edge_sidecar::snapshot::prune_receipt_closeouts_after_commit(
+            &edges_dir,
+            (!commit_payload.is_empty()).then_some(commit_payload.as_str()),
+        )?;
+        post_commit(ctx);
+        Ok(())
+    })
 }
 
 /// Write one consolidated repo-history walk: commit documents under the
@@ -2160,90 +2214,56 @@ fn run_consolidated_history(
 ) -> Result<u64> {
     let edges_dir =
         bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(&ctx.config.projects_path);
-    let mut writer = create_writer(&ctx.index, WRITER_HEAP_REINDEX)?;
-    writer.set_merge_policy(Box::new(conservative_log_merge_policy()));
-    let mut written = 0_u64;
-    for commit in commits {
-        let entity_id = super::git_history::commit_entity_id(commit_namespace, &commit.sha);
-        writer.delete_term(Term::from_field_text(ctx.fields.entity_id, &entity_id));
-        writer.add_document(super::git_history::build_commit_doc(
-            commit,
-            commit_namespace,
-            // The per-project source key this document's `file_path` carries
-            // is the delete term of the LEGACY per-project purge arm. A
-            // consolidated document belongs to no single project, so it is
-            // keyed by the namespace instead; the purge arm that used the
-            // project key never applied to it.
-            commit_namespace,
-            project_display,
-            ctx.fields,
-        ))?;
-        super::embed_hook::emit_git_message(
-            &entity_id,
-            &super::git_history::commit_message_hash(&commit.message),
-            &commit.message,
-        );
-        written += 1;
-    }
-    let mut publications: Vec<super::project_files::PublicationResult> = Vec::new();
-    let staging_attempt = (|| -> Result<()> {
-        for (project_id, edges) in edges_by_project {
-            // Replace, not merge: a consolidated walk that produced no edge for a
-            // project is asserting that project currently has none, and merging
-            // would keep a retired snapshot's edges alive forever.
-            bbox_edge_sidecar::edge_sidecar::replace_materialized_edges(
-                &edges_dir, "git", project_id, edges,
-            )?;
-            if let Some(snapshot_id) = snapshot_by_project.get(project_id) {
-                let mut publication =
-                    super::project_files::ProjectIndexPublicationBundle::default();
-                publication.stage_snapshot_git_current(&edges_dir, project_id, snapshot_id, true);
-                publications.push(publication.publish()?);
+    with_actor_writer(ctx, |writer| {
+        writer.set_merge_policy(Box::new(conservative_log_merge_policy()));
+        let mut written = 0_u64;
+        for commit in commits {
+            let entity_id = super::git_history::commit_entity_id(commit_namespace, &commit.sha);
+            writer.delete_term(Term::from_field_text(ctx.fields.entity_id, &entity_id));
+            writer.add_document(super::git_history::build_commit_doc(
+                commit,
+                commit_namespace,
+                // The per-project source key this document's `file_path` carries
+                // is the delete term of the LEGACY per-project purge arm. A
+                // consolidated document belongs to no single project, so it is
+                // keyed by the namespace instead; the purge arm that used the
+                // project key never applied to it.
+                commit_namespace,
+                project_display,
+                ctx.fields,
+            ))?;
+            super::embed_hook::emit_git_message(
+                &entity_id,
+                &super::git_history::commit_message_hash(&commit.message),
+                &commit.message,
+            );
+            written += 1;
+        }
+        let mut publications: Vec<super::project_files::PublicationResult> = Vec::new();
+        let staging_attempt = (|| -> Result<()> {
+            for (project_id, edges) in edges_by_project {
+                // Replace, not merge: a consolidated walk that produced no edge
+                // for a project is asserting that project currently has none,
+                // and merging would keep a retired snapshot's edges alive
+                // forever.
+                bbox_edge_sidecar::edge_sidecar::replace_materialized_edges(
+                    &edges_dir, "git", project_id, edges,
+                )?;
+                if let Some(snapshot_id) = snapshot_by_project.get(project_id) {
+                    let mut publication =
+                        super::project_files::ProjectIndexPublicationBundle::default();
+                    publication.stage_snapshot_git_current(
+                        &edges_dir,
+                        project_id,
+                        snapshot_id,
+                        true,
+                    );
+                    publications.push(publication.publish()?);
+                }
             }
-        }
-        Ok(())
-    })();
-    if let Err(error) = staging_attempt {
-        let mut cleanup_failures = Vec::new();
-        for publication in &mut publications {
-            if let Err(cleanup) = publication.rollback_pending() {
-                cleanup_failures.push(format!("{cleanup:#}"));
-            }
-        }
-        if !cleanup_failures.is_empty() {
-            return Err(error).context(format!(
-                "consolidated snapshot staging failed and rollback left unresolved state: {}",
-                cleanup_failures.join("; ")
-            ));
-        }
-        return Err(error);
-    }
-    let commit_attempt = (|| -> Result<String> {
-        let prior_payload = ctx
-            .index
-            .load_metas()
-            .context("loading prior index payload before snapshot commit")?
-            .payload;
-        let current: Vec<String> = publications
-            .iter()
-            .flat_map(|publication| publication.pending_commitments())
-            .collect();
-        let commitments = bbox_edge_sidecar::snapshot::carry_forward_commitments(
-            &edges_dir,
-            prior_payload.as_deref(),
-            &current,
-        )?;
-        let mut prepared = writer.prepare_commit()?;
-        let payload = commitments.join(",");
-        if !payload.is_empty() {
-            prepared.set_payload(&payload);
-        }
-        prepared.commit()?;
-        Ok(payload)
-    })();
-    let commit_payload = match commit_attempt {
-        Ok(payload) => payload,
-        Err(error) => {
+            Ok(())
+        })();
+        if let Err(error) = staging_attempt {
             let mut cleanup_failures = Vec::new();
             for publication in &mut publications {
                 if let Err(cleanup) = publication.rollback_pending() {
@@ -2252,37 +2272,78 @@ fn run_consolidated_history(
             }
             if !cleanup_failures.is_empty() {
                 return Err(error).context(format!(
-                    "snapshot commit failed and rollback left unresolved state: {}",
+                    "consolidated snapshot staging failed and rollback left unresolved state: {}",
                     cleanup_failures.join("; ")
                 ));
             }
             return Err(error);
         }
-    };
-    let mut all_handles = Vec::new();
-    for publication in &mut publications {
-        publication.mark_commit_succeeded();
-        all_handles.extend(publication.take_pending_snapshot_finalizations());
-    }
-    // R20F4: fail closed if any finalization fails.
-    for handle in &all_handles {
-        if let Err(error) = bbox_edge_sidecar::snapshot::finalize_snapshot_publication(handle) {
-            tracing::error!(
-                project_id = %handle.project_id,
-                snapshot_id = %handle.snapshot_id,
-                txn_token = %handle.txn_token,
-                error = %error,
-                "failed to finalize snapshot publication after consolidated index commit"
-            );
-            return Err(error);
+        let commit_attempt = (|| -> Result<String> {
+            let prior_payload = ctx
+                .index
+                .load_metas()
+                .context("loading prior index payload before snapshot commit")?
+                .payload;
+            let current: Vec<String> = publications
+                .iter()
+                .flat_map(|publication| publication.pending_commitments())
+                .collect();
+            let commitments = bbox_edge_sidecar::snapshot::carry_forward_commitments(
+                &edges_dir,
+                prior_payload.as_deref(),
+                &current,
+            )?;
+            let mut prepared = writer.prepare_commit()?;
+            let payload = commitments.join(",");
+            if !payload.is_empty() {
+                prepared.set_payload(&payload);
+            }
+            prepared.commit()?;
+            Ok(payload)
+        })();
+        let commit_payload = match commit_attempt {
+            Ok(payload) => payload,
+            Err(error) => {
+                let mut cleanup_failures = Vec::new();
+                for publication in &mut publications {
+                    if let Err(cleanup) = publication.rollback_pending() {
+                        cleanup_failures.push(format!("{cleanup:#}"));
+                    }
+                }
+                if !cleanup_failures.is_empty() {
+                    return Err(error).context(format!(
+                        "snapshot commit failed and rollback left unresolved state: {}",
+                        cleanup_failures.join("; ")
+                    ));
+                }
+                return Err(error);
+            }
+        };
+        let mut all_handles = Vec::new();
+        for publication in &mut publications {
+            publication.mark_commit_succeeded();
+            all_handles.extend(publication.take_pending_snapshot_finalizations());
         }
-    }
-    bbox_edge_sidecar::snapshot::prune_receipt_closeouts_after_commit(
-        &edges_dir,
-        (!commit_payload.is_empty()).then_some(commit_payload.as_str()),
-    )?;
-    post_commit(ctx);
-    Ok(written)
+        // R20F4: fail closed if any finalization fails.
+        for handle in &all_handles {
+            if let Err(error) = bbox_edge_sidecar::snapshot::finalize_snapshot_publication(handle) {
+                tracing::error!(
+                    project_id = %handle.project_id,
+                    snapshot_id = %handle.snapshot_id,
+                    txn_token = %handle.txn_token,
+                    error = %error,
+                    "failed to finalize snapshot publication after consolidated index commit"
+                );
+                return Err(error);
+            }
+        }
+        bbox_edge_sidecar::snapshot::prune_receipt_closeouts_after_commit(
+            &edges_dir,
+            (!commit_payload.is_empty()).then_some(commit_payload.as_str()),
+        )?;
+        post_commit(ctx);
+        Ok(written)
+    })
 }
 
 /// Publish the exact rows already verified in one immutable P3 generation.
@@ -2331,68 +2392,31 @@ fn run_history_generation_publication(
             HistoryLanePlan::full(&generation.commit_documents, 0)
         }
     };
-    let mut writer = create_writer(&ctx.index, WRITER_HEAP_REINDEX)?;
-    writer.set_merge_policy(Box::new(conservative_log_merge_policy()));
-    apply_history_lane_plan(&writer, ctx.fields, generation, owner, &plan)?;
+    with_actor_writer(ctx, |writer| {
+        writer.set_merge_policy(Box::new(conservative_log_merge_policy()));
+        apply_history_lane_plan(writer, ctx.fields, generation, owner, &plan)?;
 
-    let mut publications: Vec<(String, super::project_files::PublicationResult)> = Vec::new();
-    let staging_attempt = (|| -> Result<()> {
-        for (project_id, edges) in edges_by_project {
-            bbox_edge_sidecar::edge_sidecar::replace_materialized_edges(
-                &edges_dir, "git", project_id, edges,
-            )?;
-            if let Some(snapshot_id) = snapshot_by_project.get(project_id) {
-                let mut publication =
-                    super::project_files::ProjectIndexPublicationBundle::default();
-                publication.stage_snapshot_git_current(&edges_dir, project_id, snapshot_id, true);
-                publications.push((project_id.clone(), publication.publish()?));
+        let mut publications: Vec<(String, super::project_files::PublicationResult)> = Vec::new();
+        let staging_attempt = (|| -> Result<()> {
+            for (project_id, edges) in edges_by_project {
+                bbox_edge_sidecar::edge_sidecar::replace_materialized_edges(
+                    &edges_dir, "git", project_id, edges,
+                )?;
+                if let Some(snapshot_id) = snapshot_by_project.get(project_id) {
+                    let mut publication =
+                        super::project_files::ProjectIndexPublicationBundle::default();
+                    publication.stage_snapshot_git_current(
+                        &edges_dir,
+                        project_id,
+                        snapshot_id,
+                        true,
+                    );
+                    publications.push((project_id.clone(), publication.publish()?));
+                }
             }
-        }
-        Ok(())
-    })();
-    if let Err(error) = staging_attempt {
-        let mut cleanup_failures = Vec::new();
-        for (_, publication) in &mut publications {
-            if let Err(cleanup) = publication.rollback_pending() {
-                cleanup_failures.push(format!("{cleanup:#}"));
-            }
-        }
-        if !cleanup_failures.is_empty() {
-            return Err(error).context(format!(
-                "history snapshot staging failed and rollback left unresolved state: {}",
-                cleanup_failures.join("; ")
-            ));
-        }
-        return Err(error);
-    }
-    for (_, publication) in &publications {
-        if publication.pending_commitments().len() != 1 {
-            anyhow::bail!("history overlay publication did not stage exactly one receipt");
-        }
-    }
-    let commit_attempt = (|| -> Result<String> {
-        let prior_payload = ctx
-            .index
-            .load_metas()
-            .context("loading prior index payload before history commit")?
-            .payload;
-        let current = publications
-            .iter()
-            .flat_map(|(_, publication)| publication.pending_commitments())
-            .collect::<Vec<_>>();
-        let commitments = bbox_edge_sidecar::snapshot::carry_forward_commitments(
-            &edges_dir,
-            prior_payload.as_deref(),
-            &current,
-        )?;
-        inject_history_publication_failure(namespace, "before-commit")?;
-        let payload = commitments.join(",");
-        commit_with_payload(&mut writer, &payload)?;
-        Ok(payload)
-    })();
-    let commit_payload = match commit_attempt {
-        Ok(payload) => payload,
-        Err(error) => {
+            Ok(())
+        })();
+        if let Err(error) = staging_attempt {
             let mut cleanup_failures = Vec::new();
             for (_, publication) in &mut publications {
                 if let Err(cleanup) = publication.rollback_pending() {
@@ -2401,102 +2425,148 @@ fn run_history_generation_publication(
             }
             if !cleanup_failures.is_empty() {
                 return Err(error).context(format!(
-                    "history snapshot commit failed and rollback left unresolved state: {}",
+                    "history snapshot staging failed and rollback left unresolved state: {}",
                     cleanup_failures.join("; ")
                 ));
             }
             return Err(error);
         }
-    };
-    let mut handles = Vec::new();
-    for (_, publication) in &mut publications {
-        publication.mark_commit_succeeded();
-        handles.extend(publication.take_pending_snapshot_finalizations());
-    }
-    for handle in &handles {
-        bbox_edge_sidecar::snapshot::finalize_snapshot_publication(handle)?;
-    }
-    // The whole committed lane, owner fields included, must equal the
-    // generation before anything is exposed. A diff that did not converge is
-    // replaced whole under the same receipt payload; a full replacement that
-    // still disagrees fails the publication.
-    let verify_lane = || -> Result<()> {
-        super::history_transport::verify_history_commit_lane(
-            &latest_committed_searcher(&ctx.index)?,
-            ctx.fields,
-            generation,
-            owner,
-        )
-        .map_err(|error| anyhow!("{error}"))
-    };
-    let mut lane = plan.accounting();
-    if let Err(error) = verify_lane() {
-        if plan.mode == HistoryLanePublicationModeV1::Full {
-            return Err(error.context("history lane replacement did not verify"));
-        }
-        tracing::warn!(
-            namespace,
-            error = %error,
-            "history lane diff did not verify; replacing the lane whole"
-        );
-        let full = HistoryLanePlan::full(&generation.commit_documents, plan.prior_total);
-        apply_history_lane_plan(&writer, ctx.fields, generation, owner, &full)?;
-        commit_with_payload(&mut writer, &commit_payload)?;
-        verify_lane().context("history lane replacement did not verify")?;
-        lane = HistoryLanePublicationV1 {
-            mode: HistoryLanePublicationModeV1::Full,
-            ..full.accounting()
-        };
-    }
-    // Vector work follows the diff, never the whole generation: an unchanged
-    // row is neither probed nor enqueued. A new or rewritten row is enqueued
-    // only when no active vector already covers its exact content.
-    for input in &generation.vector_inputs {
-        if !plan.upserted_ids.contains(input.entity_id.as_str()) {
-            continue;
-        }
-        match super::embed_hook::git_message_vector_is_active(&input.entity_id, &input.content_hash)
-        {
-            Some(true) => lane.vectors_verified += 1,
-            Some(false) | None => {
-                super::embed_hook::emit_git_message(
-                    &input.entity_id,
-                    &input.content_hash,
-                    &input.message,
-                );
-                lane.vectors_enqueued += 1;
+        for (_, publication) in &publications {
+            if publication.pending_commitments().len() != 1 {
+                anyhow::bail!("history overlay publication did not stage exactly one receipt");
             }
         }
-    }
-    let overlay_file_commitments = publications
-        .iter()
-        .map(|(project_id, _)| {
-            let snapshot_id = snapshot_by_project
-                .get(project_id)
-                .ok_or_else(|| anyhow!("history overlay publication lost its snapshot id"))?;
-            let commitment = bbox_edge_sidecar::snapshot::snapshot_publication_commitment(
+        let commit_attempt = (|| -> Result<String> {
+            let prior_payload = ctx
+                .index
+                .load_metas()
+                .context("loading prior index payload before history commit")?
+                .payload;
+            let current = publications
+                .iter()
+                .flat_map(|(_, publication)| publication.pending_commitments())
+                .collect::<Vec<_>>();
+            let commitments = bbox_edge_sidecar::snapshot::carry_forward_commitments(
                 &edges_dir,
-                project_id,
-                snapshot_id,
-            )?
-            .ok_or_else(|| anyhow!("history overlay publication has no durable receipt"))?;
-            Ok((project_id.clone(), commitment))
+                prior_payload.as_deref(),
+                &current,
+            )?;
+            inject_history_publication_failure(namespace, "before-commit")?;
+            let payload = commitments.join(",");
+            commit_with_payload(&mut *writer, &payload)?;
+            Ok(payload)
+        })();
+        let commit_payload = match commit_attempt {
+            Ok(payload) => payload,
+            Err(error) => {
+                let mut cleanup_failures = Vec::new();
+                for (_, publication) in &mut publications {
+                    if let Err(cleanup) = publication.rollback_pending() {
+                        cleanup_failures.push(format!("{cleanup:#}"));
+                    }
+                }
+                if !cleanup_failures.is_empty() {
+                    return Err(error).context(format!(
+                        "history snapshot commit failed and rollback left unresolved state: {}",
+                        cleanup_failures.join("; ")
+                    ));
+                }
+                return Err(error);
+            }
+        };
+        let mut handles = Vec::new();
+        for (_, publication) in &mut publications {
+            publication.mark_commit_succeeded();
+            handles.extend(publication.take_pending_snapshot_finalizations());
+        }
+        for handle in &handles {
+            bbox_edge_sidecar::snapshot::finalize_snapshot_publication(handle)?;
+        }
+        // The whole committed lane, owner fields included, must equal the
+        // generation before anything is exposed. A diff that did not converge
+        // is replaced whole under the same receipt payload; a full replacement
+        // that still disagrees fails the publication.
+        let verify_lane = || -> Result<()> {
+            super::history_transport::verify_history_commit_lane(
+                &latest_committed_searcher(&ctx.index)?,
+                ctx.fields,
+                generation,
+                owner,
+            )
+            .map_err(|error| anyhow!("{error}"))
+        };
+        let mut lane = plan.accounting();
+        if let Err(error) = verify_lane() {
+            if plan.mode == HistoryLanePublicationModeV1::Full {
+                return Err(error.context("history lane replacement did not verify"));
+            }
+            tracing::warn!(
+                namespace,
+                error = %error,
+                "history lane diff did not verify; replacing the lane whole"
+            );
+            let full = HistoryLanePlan::full(&generation.commit_documents, plan.prior_total);
+            apply_history_lane_plan(writer, ctx.fields, generation, owner, &full)?;
+            commit_with_payload(&mut *writer, &commit_payload)?;
+            verify_lane().context("history lane replacement did not verify")?;
+            lane = HistoryLanePublicationV1 {
+                mode: HistoryLanePublicationModeV1::Full,
+                ..full.accounting()
+            };
+        }
+        // Vector work follows the diff, never the whole generation: an
+        // unchanged row is neither probed nor enqueued. A new or rewritten row
+        // is enqueued only when no active vector already covers its exact
+        // content.
+        for input in &generation.vector_inputs {
+            if !plan.upserted_ids.contains(input.entity_id.as_str()) {
+                continue;
+            }
+            match super::embed_hook::git_message_vector_is_active(
+                &input.entity_id,
+                &input.content_hash,
+            ) {
+                Some(true) => lane.vectors_verified += 1,
+                Some(false) | None => {
+                    super::embed_hook::emit_git_message(
+                        &input.entity_id,
+                        &input.content_hash,
+                        &input.message,
+                    );
+                    lane.vectors_enqueued += 1;
+                }
+            }
+        }
+        let overlay_file_commitments = publications
+            .iter()
+            .map(|(project_id, _)| {
+                let snapshot_id = snapshot_by_project
+                    .get(project_id)
+                    .ok_or_else(|| anyhow!("history overlay publication lost its snapshot id"))?;
+                let commitment = bbox_edge_sidecar::snapshot::snapshot_publication_commitment(
+                    &edges_dir,
+                    project_id,
+                    snapshot_id,
+                )?
+                .ok_or_else(|| anyhow!("history overlay publication has no durable receipt"))?;
+                Ok((project_id.clone(), commitment))
+            })
+            .collect::<Result<std::collections::BTreeMap<_, _>>>()?;
+        bbox_edge_sidecar::snapshot::prune_receipt_closeouts_after_commit(
+            &edges_dir,
+            (!commit_payload.is_empty()).then_some(commit_payload.as_str()),
+        )?;
+        post_commit(ctx);
+        Ok(HistoryPublicationResultV1 {
+            commit_document_count: generation.commit_documents.len() as u64,
+            commit_view_commitment: generation
+                .manifest
+                .body
+                .commit_document_commitment_sha256
+                .clone(),
+            overlay_file_commitments,
+            lane,
         })
-        .collect::<Result<std::collections::BTreeMap<_, _>>>()?;
-    bbox_edge_sidecar::snapshot::prune_receipt_closeouts_after_commit(
-        &edges_dir,
-        (!commit_payload.is_empty()).then_some(commit_payload.as_str()),
-    )?;
-    post_commit(ctx);
-    Ok(HistoryPublicationResultV1 {
-        commit_document_count: generation.commit_documents.len() as u64,
-        commit_view_commitment: generation
-            .manifest
-            .body
-            .commit_document_commitment_sha256
-            .clone(),
-        overlay_file_commitments,
-        lane,
     })
 }
 
@@ -2752,18 +2822,25 @@ fn run_selector_retirement(ctx: &ActorCtx, selector: &str) -> Result<u64> {
                 .sum::<usize>(),
             "selector-retirement vector batch completed"
         );
-        let mut writer = create_writer(&ctx.index, WRITER_HEAP_REINDEX)?;
-        writer.delete_term(Term::from_field_text(
-            ctx.fields.code_source_selector,
-            selector,
-        ));
-        writer.commit()?;
-        post_commit(ctx);
-        Ok(count as u64)
+        with_actor_writer(ctx, |writer| {
+            // The writer may arrive carrying whatever policy the previous
+            // scope set; retirement is a small-op-sized delete, so it sets the
+            // small-op policy explicitly.
+            writer.set_merge_policy(Box::new(conservative_log_merge_policy()));
+            writer.delete_term(Term::from_field_text(
+                ctx.fields.code_source_selector,
+                selector,
+            ));
+            writer.commit()?;
+            post_commit(ctx);
+            Ok(count as u64)
+        })
     })
 }
 
-/// Apply a batch of small ops under one writer and one commit.
+/// Apply a batch of small ops under one commit of the actor's long-lived
+/// writer. A failed commit drops the writer (the slot keeps nothing back), so
+/// the next batch rebuilds one instead of reusing a possibly-poisoned arena.
 fn process_batch(ctx: &ActorCtx, batch: Vec<IndexWriteOp>) {
     let mut flush_acks: Vec<mpsc::SyncSender<()>> = Vec::new();
     let mut ops: Vec<IndexWriteOp> = Vec::new();
@@ -2775,14 +2852,17 @@ fn process_batch(ctx: &ActorCtx, batch: Vec<IndexWriteOp>) {
     }
 
     if !ops.is_empty() {
-        match create_writer(&ctx.index, WRITER_HEAP_SMALL_OPS) {
+        match take_writer(ctx) {
             Ok(mut writer) => {
                 writer.set_merge_policy(Box::new(conservative_log_merge_policy()));
                 for op in ops {
                     apply_small_op(ctx, &mut writer, op);
                 }
                 match writer.commit() {
-                    Ok(_) => post_commit(ctx),
+                    Ok(_) => {
+                        keep_writer(ctx, writer);
+                        post_commit(ctx);
+                    }
                     Err(err) => tracing::error!(
                         error = %err,
                         "index writer actor: batch commit failed; reindex pass will reconcile"
@@ -2814,8 +2894,13 @@ fn run_pass(
     cause: FullRebuildCause,
     accept_empty_projects: &[String],
 ) -> Result<String> {
-    let mut writer = create_writer(&ctx.index, WRITER_HEAP_REINDEX)?;
-    if !full {
+    let mut writer = take_writer(ctx)?;
+    if full {
+        // A full rebuild merges aggressively under the tantivy default policy
+        // and settles before returning; the slot may hand over a writer still
+        // carrying the small-op conservative policy, so both arms set theirs.
+        writer.set_merge_policy(Box::new(tantivy::merge_policy::LogMergePolicy::default()));
+    } else {
         writer.set_merge_policy(Box::new(conservative_log_merge_policy()));
     }
     let mut pending_flushes: Vec<mpsc::SyncSender<()>> = Vec::new();
@@ -2882,10 +2967,14 @@ fn run_pass(
         // Full rebuilds settle merge threads before publishing (the old
         // owned-writer path did this between commit and meta save; doing it
         // post-commit here preserves the settled-segments property).
+        // wait_merging_threads consumes the writer, so the slot stays empty
+        // and the next scope recreates one; an incremental pass keeps it.
         if full {
             if let Err(err) = writer.wait_merging_threads() {
                 tracing::warn!(error = %err, "index writer actor: wait_merging_threads failed");
             }
+        } else {
+            keep_writer(ctx, writer);
         }
         post_commit(ctx);
     }
@@ -2913,6 +3002,8 @@ fn rollback_enqueued_graph_generation(
     }
 }
 
+// executes inside the IndexWriterActor pass (sanctioned single-writer).
+#[allow(clippy::disallowed_methods)]
 fn apply_small_op(ctx: &ActorCtx, writer: &mut IndexWriter, op: IndexWriteOp) {
     let (kind, result): (&str, Result<()>) = match op {
         IndexWriteOp::UpsertKnowledge(entry) => (
@@ -3019,6 +3110,16 @@ fn apply_small_op(ctx: &ActorCtx, writer: &mut IndexWriter, op: IndexWriteOp) {
                 &threads,
             ),
         ),
+        #[cfg(any(test, feature = "test-support"))]
+        IndexWriteOp::SeedDocuments(documents) => {
+            let mut seeded: Result<()> = Ok(());
+            for document in documents {
+                if let Err(err) = writer.add_document(document) {
+                    seeded = Err(err.into());
+                }
+            }
+            ("seed_documents", seeded)
+        }
         IndexWriteOp::ReindexPass { .. }
         | IndexWriteOp::StageCollectedGeneration { .. }
         | IndexWriteOp::StageConnectorGeneration { .. }
@@ -3101,11 +3202,11 @@ fn post_commit(ctx: &ActorCtx) {
 /// Create a writer, retrying briefly when the cross-process lock is busy
 /// (e.g. a previous daemon instance still winding down at boot). In-process
 /// contention cannot occur — this actor is the only in-process writer.
-fn create_writer(index: &Index, heap: usize) -> Result<IndexWriter> {
+fn create_writer(index: &Index) -> Result<IndexWriter> {
     let mut delay = Duration::from_millis(100);
     let attempts = 5;
     for attempt in 1..=attempts {
-        match index.writer(heap) {
+        match index.writer(WRITER_HEAP_REINDEX) {
             Ok(w) => return Ok(w),
             Err(tantivy::TantivyError::LockFailure(e, hint)) => {
                 if attempt == attempts {
@@ -3122,6 +3223,44 @@ fn create_writer(index: &Index, heap: usize) -> Result<IndexWriter> {
         }
     }
     unreachable!("retry loop returns on success or final attempt")
+}
+
+/// Take the actor's long-lived writer out of its slot, creating it on first
+/// use. The slot is empty for the whole scope that owns the writer: a scope
+/// that fails simply never puts it back, so its uncommitted staged operations
+/// are discarded with it and the next op rebuilds from a clean writer: the
+/// poison reset the per-call writers this module once used provided
+/// implicitly.
+fn take_writer(ctx: &ActorCtx) -> Result<IndexWriter> {
+    match ctx.writer.borrow_mut().take() {
+        Some(writer) => Ok(writer),
+        None => create_writer(&ctx.index),
+    }
+}
+
+/// Return an unpoisoned writer to the slot after a successful commit scope.
+/// Its background merges keep running and land on their own; nothing waits
+/// for them outside a full reindex pass.
+fn keep_writer(ctx: &ActorCtx, writer: IndexWriter) {
+    *ctx.writer.borrow_mut() = Some(writer);
+}
+
+/// Run one committing scope against the actor's long-lived writer: the slot
+/// is emptied for the scope's duration and receives the writer back only when
+/// the scope succeeds. Every scope sets its own merge policy: `set_merge_policy`
+/// is cheap and the writer may arrive carrying the previous scope's.
+fn with_actor_writer<T>(
+    ctx: &ActorCtx,
+    scope: impl FnOnce(&mut IndexWriter) -> Result<T>,
+) -> Result<T> {
+    let mut writer = take_writer(ctx)?;
+    match scope(&mut writer) {
+        Ok(value) => {
+            keep_writer(ctx, writer);
+            Ok(value)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(test)]
@@ -3588,20 +3727,21 @@ mod tests {
         {
             // Legacy consolidated rows: `file_path` is the namespace and no
             // `project_id` is stored, so every row differs from the plan.
-            let index = fixture.transcript.index_handle();
-            let mut writer = index.writer(15_000_000).unwrap();
-            for commit in [&one, &two] {
-                writer
-                    .add_document(super::super::git_history::build_commit_doc(
+            // Seeded through the actor: a live actor holds the tantivy writer
+            // lock for its lifetime, so no second writer may open the index.
+            let documents = [&one, &two]
+                .into_iter()
+                .map(|commit| {
+                    super::super::git_history::build_commit_doc(
                         commit,
                         fixture.namespace.as_str(),
                         fixture.namespace.as_str(),
                         "legacy",
                         fields,
-                    ))
-                    .unwrap();
-            }
-            writer.commit().unwrap();
+                    )
+                })
+                .collect();
+            fixture.actor.seed_documents_for_test(documents).unwrap();
         }
         let g0 = fixture.generation(&[one.clone(), two.clone()]);
         assert!(fixture.verify(&g0, &owner).is_err());
@@ -3612,14 +3752,11 @@ mod tests {
         // A lane row without an entity id cannot be removed by a row delete,
         // so the lane is replaced whole.
         {
-            let index = fixture.transcript.index_handle();
-            let mut writer = index.writer(15_000_000).unwrap();
             let mut orphan = tantivy::TantivyDocument::default();
             orphan.add_text(fields.doc_type, "commit");
             orphan.add_text(fields.repo_id, fixture.namespace.as_str());
             orphan.add_text(fields.content, "orphaned lane row");
-            writer.add_document(orphan).unwrap();
-            writer.commit().unwrap();
+            fixture.actor.seed_documents_for_test(vec![orphan]).unwrap();
         }
         assert!(fixture.verify(&g0, &owner).is_err());
         let replaced = fixture.publish(&g0, &owner).unwrap();
@@ -4848,6 +4985,129 @@ mod tests {
         );
     }
 
+    fn segment_total(index: &TranscriptIndex) -> usize {
+        bbox_corpus_index::index::passes::segment_count(&index.index_handle())
+    }
+
+    fn deleted_doc_total(index: &TranscriptIndex) -> u32 {
+        index.reader_reload_for_test();
+        index
+            .searcher()
+            .segment_readers()
+            .iter()
+            .map(|segment| segment.num_deleted_docs())
+            .sum()
+    }
+
+    fn live_doc_total(index: &TranscriptIndex) -> u32 {
+        index.reader_reload_for_test();
+        index
+            .searcher()
+            .segment_readers()
+            .iter()
+            .map(|segment| segment.num_docs())
+            .sum()
+    }
+
+    /// A writer dropped without waiting for its merge threads orphans every
+    /// merge its commit scheduled, so 40 single-doc batches leave 40 segments
+    /// forever. The actor's long-lived writer must let those merges finish in
+    /// the background and land in meta.json.
+    #[test]
+    fn small_op_batches_let_merges_finish_so_segments_converge() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let index = test_index(&root);
+        let actor = IndexWriterActor::spawn_for(&index);
+        for i in 0..40 {
+            actor.enqueue(IndexWriteOp::UpsertKnowledge(Box::new(test_entry(
+                &format!("merge{i:02}converge"),
+                &format!("merge convergence sentinel {i}"),
+            ))));
+            actor.flush_blocking().unwrap();
+        }
+        assert_eq!(
+            live_doc_total(&index),
+            40,
+            "every upsert must be committed and searchable"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while segment_total(&index) > 25 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "segments never converged below 25: {}",
+                segment_total(&index)
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    /// Deletions only ever leave tombstones unless a merge swallows the
+    /// tombstoned segments; an orphaned-merge writer compacts nothing. The
+    /// summed deleted-doc count must reach zero once background merges land.
+    #[test]
+    fn batch_deletes_are_compacted_once_merges_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let index = test_index(&root);
+        let actor = IndexWriterActor::spawn_for(&index);
+        for i in 0..10 {
+            actor.enqueue(IndexWriteOp::UpsertKnowledge(Box::new(test_entry(
+                &format!("compact{i:02}delete"),
+                &format!("delete compaction sentinel {i}"),
+            ))));
+            actor.flush_blocking().unwrap();
+        }
+        for i in 0..4 {
+            actor.enqueue(IndexWriteOp::DeleteKnowledge(format!(
+                "compact{i:02}delete"
+            )));
+        }
+        actor.flush_blocking().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while deleted_doc_total(&index) != 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "deleted docs were never compacted: {}",
+                deleted_doc_total(&index)
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert_eq!(
+            live_doc_total(&index),
+            6,
+            "compaction must remove tombstoned documents, not live ones"
+        );
+    }
+
+    /// A full reindex pass runs the tantivy default policy (8-segment merge
+    /// floor) and must return only after settling its merge threads, even
+    /// though the writer now comes from the actor's long-lived slot and
+    /// carries the small-op conservative policy on arrival.
+    #[test]
+    fn full_reindex_pass_still_settles_merge_threads() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let index = test_index(&root);
+        let actor = IndexWriterActor::spawn_for(&index);
+        for i in 0..30 {
+            actor.enqueue(IndexWriteOp::UpsertKnowledge(Box::new(test_entry(
+                &format!("settle{i:02}full"),
+                &format!("full pass settle sentinel {i}"),
+            ))));
+            actor.flush_blocking().unwrap();
+        }
+        // No assertion on the pre-pass segment count: background merges may
+        // already have compacted some of the 30 single-doc batches, and the
+        // invariant under test is only what the pass itself guarantees.
+        actor.run_reindex_pass(true, true).unwrap();
+        assert!(
+            segment_total(&index) <= 8,
+            "full pass must return with merge threads settled: {}",
+            segment_total(&index)
+        );
+    }
+
     /// A knowledge document an older daemon wrote under the retired
     /// provisional visibility.
     fn write_legacy_provisional_document(index: &TranscriptIndex, entry_id: &str, content: &str) {
@@ -5997,7 +6257,7 @@ mod source_planning_tests {
         let fields = index.field_handles();
         {
             let handle = index.index_handle();
-            let mut writer: IndexWriter = handle.writer(WRITER_HEAP_SMALL_OPS).unwrap();
+            let mut writer: IndexWriter = handle.writer(15_000_000).unwrap();
             let mut document = tantivy::TantivyDocument::new();
             document.add_text(fields.doc_type, "project_file");
             document.add_text(fields.project_id, REMOTE);
