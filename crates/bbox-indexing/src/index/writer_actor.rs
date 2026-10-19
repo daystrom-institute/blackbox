@@ -3001,11 +3001,28 @@ fn run_pass(
     cause: FullRebuildCause,
     accept_empty_projects: &[String],
 ) -> Result<String> {
-    let mut writer = take_writer(ctx)?;
+    // A full rebuild never runs on the slot's writer. It clears the index
+    // with delete_all_documents, which rewinds tantivy's opstamp stamper to
+    // the writer's creation-time committed opstamp. On a writer that has
+    // committed since (every slotted writer has), the rewound opstamps
+    // collide with delete-queue entries from those commits, and commit-time
+    // delete application, which assumes opstamps rise with queue order,
+    // then drops freshly re-added documents. Dropping the slotted writer
+    // first also frees the directory lock for the recreate; its in-flight
+    // merges are irrelevant to a rebuild that clears every segment. The
+    // full arm consumes its writer in wait_merging_threads below, so the
+    // slot ends empty either way.
+    let mut writer = if full {
+        let retired = ctx.writer.lock().take();
+        drop(retired);
+        create_writer(&ctx.index)?
+    } else {
+        take_writer(ctx)?
+    };
+    // A full rebuild merges aggressively under the tantivy default policy
+    // and settles before returning; the incremental cadence keeps the
+    // conservative policy so steady-state commits do not thrash merges.
     if full {
-        // A full rebuild merges aggressively under the tantivy default policy
-        // and settles before returning; the slot may hand over a writer still
-        // carrying the small-op conservative policy, so both arms set theirs.
         writer.set_merge_policy(Box::new(tantivy::merge_policy::LogMergePolicy::default()));
     } else {
         writer.set_merge_policy(Box::new(conservative_log_merge_policy()));
