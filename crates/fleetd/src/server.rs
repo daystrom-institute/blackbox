@@ -16,6 +16,19 @@
 //! This is what lets a restarted daemon reclaim fleetd without a separate
 //! liveness protocol: dial, authenticate, and the old connection is gone.
 //!
+//! ## The pre-authentication phase is deadline-bounded
+//!
+//! Every accepted peer, on every transport, runs under ONE shared deadline
+//! for the whole pre-authentication phase: the TLS handshake where the
+//! listener serves TLS, protocol negotiation, and the first `Authenticate`
+//! envelope. A peer that connects and then stalls anywhere in that window
+//! is dropped when the deadline passes, so silent peers cannot hold a
+//! connection task and a socket open indefinitely. Nothing is written to a
+//! timed-out peer on the way out: writing to a wedged peer is itself an
+//! unbounded await, so the drop is the diagnostic. The deadline covers
+//! exactly the gate. Once the token verifies it is never consulted again,
+//! and an authenticated owner session has no timeout.
+//!
 //! ## Disconnect is not session death
 //!
 //! Losing the owner connection does NOT kill children. Relaying pauses, the
@@ -79,21 +92,42 @@ pub struct Fleetd {
     build: BuildIdentity,
     generation: AtomicU64,
     owner: Mutex<Option<Owner>>,
+    pre_authentication_timeout: Duration,
 }
 
 impl Fleetd {
     pub fn new(token: ServiceToken, build: BuildIdentity) -> Arc<Self> {
+        Self::with_pre_authentication_timeout(token, build, DEFAULT_PRE_AUTHENTICATION_TIMEOUT)
+    }
+
+    /// [`Fleetd::new`] with an explicit deadline for the combined
+    /// pre-authentication phase. Production takes
+    /// [`DEFAULT_PRE_AUTHENTICATION_TIMEOUT`]; tests shrink it to pin the
+    /// drop behavior. A zero deadline drops every peer before it can speak
+    /// and must not be passed.
+    pub fn with_pre_authentication_timeout(
+        token: ServiceToken,
+        build: BuildIdentity,
+        pre_authentication_timeout: Duration,
+    ) -> Arc<Self> {
         Arc::new(Self {
             registry: Arc::new(Registry::new()),
             token,
             build,
             generation: AtomicU64::new(0),
             owner: Mutex::new(None),
+            pre_authentication_timeout,
         })
     }
 
     pub fn registry(&self) -> &Arc<Registry> {
         &self.registry
+    }
+
+    /// The shared deadline every accepted peer's pre-authentication phase
+    /// runs under. Plain state, set before the `Arc` is published.
+    fn pre_authentication_timeout(&self) -> Duration {
+        self.pre_authentication_timeout
     }
 
     /// Allocate the next connection generation. Monotonic and never reused,
@@ -288,6 +322,14 @@ impl Default for TcpBindBackoff {
     }
 }
 
+/// How long an accepted peer has to finish the entire pre-authentication
+/// phase: the TLS handshake where the listener serves TLS, protocol
+/// negotiation, and the first `Authenticate` envelope. It matches the
+/// protocol handshake timeout and sits inside the daemon's remote dial
+/// budget, so fleetd never drops a peer its own client is still waiting
+/// for.
+pub const DEFAULT_PRE_AUTHENTICATION_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Serve the TCP owner listener on an already validated address, binding it
 /// whenever the address is available. A bind failure is an environment
 /// condition (the interface that carries the address is down, or the port is
@@ -389,11 +431,19 @@ pub async fn serve_tls_connection(
     acceptor: tokio_rustls::TlsAcceptor,
 ) -> anyhow::Result<()> {
     stream.set_nodelay(true)?;
-    let stream = acceptor
-        .accept(stream)
+    // The deadline starts BEFORE the TLS accept, so the handshake consumes
+    // the same pre-authentication budget as the protocol handshake and the
+    // first envelope below.
+    let deadline = tokio::time::Instant::now() + state.pre_authentication_timeout();
+    let stream = tokio::time::timeout_at(deadline, acceptor.accept(stream))
         .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "peer did not complete the TLS handshake within the pre-authentication deadline"
+            )
+        })?
         .map_err(|error| anyhow::anyhow!("TLS handshake failed: {error}"))?;
-    serve_authenticated_connection(state, stream, "tls").await
+    serve_authenticated_connection(state, stream, "tls", deadline).await
 }
 
 /// Handshake, authenticate, then run one owner connection to completion.
@@ -402,7 +452,8 @@ pub async fn serve_connection(state: Arc<Fleetd>, stream: UnixStream) -> anyhow:
     // it: it proves the peer runs as our uid, never which service it is.
     verify_peer_uid(&stream)?;
 
-    serve_authenticated_connection(state, stream, "unix").await
+    let deadline = tokio::time::Instant::now() + state.pre_authentication_timeout();
+    serve_authenticated_connection(state, stream, "unix", deadline).await
 }
 
 /// TCP counterpart to [`serve_connection`]. There is deliberately no peer-uid
@@ -410,26 +461,39 @@ pub async fn serve_connection(state: Arc<Fleetd>, stream: UnixStream) -> anyhow:
 /// grant, and the first protocol envelope still has to pass bearer auth.
 pub async fn serve_tcp_connection(state: Arc<Fleetd>, stream: TcpStream) -> anyhow::Result<()> {
     stream.set_nodelay(true)?;
-    serve_authenticated_connection(state, stream, "tcp").await
+    let deadline = tokio::time::Instant::now() + state.pre_authentication_timeout();
+    serve_authenticated_connection(state, stream, "tcp", deadline).await
 }
 
 async fn serve_authenticated_connection<S>(
     state: Arc<Fleetd>,
     stream: S,
     transport: &'static str,
+    deadline: tokio::time::Instant,
 ) -> anyhow::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let generation = state.next_generation();
-    let (negotiated, _hello, _welcome) = bro_rpc::accept(
-        stream,
-        state.build.clone(),
-        vec![FLEETD_PROTOCOL_VERSION],
-        generation,
-        HandshakeOptions::default(),
+    // The shared pre-authentication deadline bounds this handshake and the
+    // first envelope below; bro_rpc's own handshake timeout stays as an
+    // inner, per-leg bound.
+    let (negotiated, _hello, _welcome) = tokio::time::timeout_at(
+        deadline,
+        bro_rpc::accept(
+            stream,
+            state.build.clone(),
+            vec![FLEETD_PROTOCOL_VERSION],
+            generation,
+            HandshakeOptions::default(),
+        ),
     )
-    .await?;
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "peer did not complete the protocol handshake within the pre-authentication deadline"
+        )
+    })??;
     let binding = negotiated.binding();
 
     // See the module note on why the connection is split.
@@ -438,8 +502,14 @@ where
 
     // Auth gate: the FIRST envelope must be a valid Authenticate. Anything
     // else, including a well-formed Spawn, is refused and the connection is
-    // dropped.
-    let first = read_body(&mut reader).await?;
+    // dropped. The same deadline applies to a peer that never sends it: no
+    // error envelope is written on the timeout path, because writing to a
+    // wedged peer is itself an unbounded await. The drop is the diagnostic.
+    let first = tokio::time::timeout_at(deadline, read_body(&mut reader))
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("peer did not authenticate within the pre-authentication deadline")
+        })??;
     let DaemonToFleetd::Authenticate { token } = first else {
         write_body(
             &mut writer,
