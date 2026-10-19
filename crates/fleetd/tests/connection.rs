@@ -899,6 +899,116 @@ async fn a_staged_peer_consumes_one_shared_pre_authentication_budget() {
     assert!(!harness.state.has_owner());
 }
 
+/// An IO wrapper that holds every write back until a fixed delay elapses,
+/// then passes bytes through: a TLS client connected through it spends that
+/// much of fleetd's pre-authentication budget INSIDE the TLS handshake,
+/// because the ClientHello only flows once the hold lapses.
+struct HeldWrites<T> {
+    inner: T,
+    hold: std::pin::Pin<Box<tokio::time::Sleep>>,
+}
+
+impl<T> HeldWrites<T> {
+    fn new(inner: T, hold: Duration) -> Self {
+        Self {
+            inner,
+            hold: Box::pin(tokio::time::sleep(hold)),
+        }
+    }
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for HeldWrites<T> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for HeldWrites<T> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<Result<usize, std::io::Error>> {
+        if std::future::Future::poll(self.hold.as_mut(), cx).is_pending() {
+            return std::task::Poll::Pending;
+        }
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// The TLS boundary gets the same staged-budget proof as the protocol
+/// handshake: a peer whose ClientHello is held for 600ms of the 1s budget,
+/// completes the TLS handshake on what is left, then stalls before the
+/// protocol handshake. The drop must land against the deadline counted
+/// from TCP accept: an implementation that recomputed the deadline after a
+/// successful TLS accept would land it a full second later, at ~1.6s.
+#[tokio::test]
+async fn a_staged_tls_peer_consumes_the_budget_before_tls_completes() {
+    let deadline = Duration::from_secs(1);
+    let harness = start_fleetd_tls_with_timeout(deadline).await;
+    let hold = Duration::from_millis(600);
+
+    let started = std::time::Instant::now();
+    let tcp = TcpStream::connect(harness.address).await.expect("dial");
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(harness.identity.certificate().clone())
+        .expect("trust the generated identity");
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("protocol versions")
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+    let server_name = rustls::pki_types::ServerName::try_from("127.0.0.1".to_string())
+        .expect("the listener address is an IP server name");
+    let tls_stream = connector
+        .connect(server_name, HeldWrites::new(tcp, hold))
+        .await
+        .expect("TLS completes on the remaining budget");
+
+    // Nothing is sent after the TLS handshake; fleetd's protocol handshake
+    // wait inherits only the unspent remainder of the budget.
+    let mut byte = [0u8; 1];
+    let read = tokio::time::timeout(DROP_WINDOW, tls_stream.read(&mut byte))
+        .await
+        .expect("the staged TLS peer is dropped at the shared deadline");
+    let elapsed = started.elapsed();
+    assert!(
+        matches!(read, Ok(0) | Err(_)),
+        "fleetd closed the socket without writing, got {read:?}"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(850),
+        "the drop at {elapsed:?} fired before the configured deadline"
+    );
+    assert!(
+        elapsed < deadline + Duration::from_millis(300),
+        "the drop at {elapsed:?} landed a full deadline after the TLS accept, so the deadline was restarted after TLS"
+    );
+    assert!(!harness.state.has_owner());
+}
+
 /// Partial protocol negotiation, not just silence: a Hello truncated at
 /// its length prefix or mid-payload parks fleetd mid-read, and the deadline
 /// drops it having written nothing.
