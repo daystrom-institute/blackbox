@@ -2563,6 +2563,104 @@ mod tests {
         .expect_err("a malformed id must be refused before any store access");
         assert_eq!(failure.code, "error.git_history_cli_arguments");
     }
+
+    /// A scope migration an operator attests through the CLI still has to
+    /// surface the publication bridge: the accepted pointer names the old
+    /// scope, the report says so on both the dry run and the applied run,
+    /// and the pointer bytes are left exactly as they were because the
+    /// `scope_move` advance belongs to the publisher channel.
+    #[test]
+    fn scope_migrate_reports_the_publication_bridge_and_leaves_the_pointer_alone() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let catalog_dir = root.join("catalog");
+        std::fs::create_dir_all(&catalog_dir).unwrap();
+        let projects_path = catalog_dir.join("projects.json");
+        let state_dir = root.join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let config_path = root.join("blackbox.toml");
+        std::fs::write(
+            &config_path,
+            format!("[paths]\nstate_dir = \"{}\"\n", state_dir.display()),
+        )
+        .unwrap();
+
+        let store = ProjectCatalogStore::initialize_empty(&projects_path).unwrap();
+        let old_scope = PublishedScope::try_new("bridgefamily", ".").unwrap();
+        let (project_id, _) = project_catalog_admin::catalog_add(
+            &store,
+            current_epoch(&store),
+            &project_catalog_admin::CatalogAddKind::Published(old_scope.clone()),
+            "remote service",
+            &[],
+            "2026-10-18T00:00:00Z",
+        )
+        .unwrap();
+        bbox_indexing::accepted_publication_test_support::install_accepted_publication_for_test(
+            &projects_path,
+            &project_id,
+            &AttachmentId::mint(),
+            &old_scope,
+            "refs/heads/main",
+            "1111111111111111111111111111111111111111",
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        let pointer_path = catalog_dir
+            .join("accepted-publications")
+            .join("pointers")
+            .join(format!("{project_id}.json"));
+        let before = std::fs::read(&pointer_path).unwrap();
+
+        let migrate = |dry_run| {
+            execute_scope_migrate(ScopeMigrateArgs {
+                store: StoreArgs {
+                    projects_path: projects_path.clone(),
+                },
+                operator_attested: true,
+                dry_run,
+                project: project_id.as_str().to_string(),
+                expected_old_repo: "bridgefamily".into(),
+                expected_old_relpath: ".".into(),
+                new_repo: "bridgefamily".into(),
+                new_relpath: "svc/api".into(),
+                kind: "relpath-move".into(),
+                acknowledge_unattached_scope_migration: true,
+                acknowledge_repo_authority_change: false,
+                reason: "relocated the remote-only service root".into(),
+                migrated_at: "2026-10-18T00:00:01Z".into(),
+                config: Some(config_path.clone()),
+            })
+            .unwrap()
+        };
+
+        let dry_run = migrate(true);
+        assert_eq!(dry_run["status"], "dry_run");
+        assert_eq!(dry_run["publication_bridge"]["needs_scope_move"], true);
+        assert_eq!(
+            dry_run["publication_bridge"]["accepted_scope"]["bbox_root_relpath"],
+            "."
+        );
+        assert_eq!(std::fs::read(&pointer_path).unwrap(), before);
+
+        let applied = migrate(false);
+        assert_eq!(applied["status"], "applied");
+        assert_eq!(applied["publication_bridge"]["needs_scope_move"], true);
+        assert_eq!(
+            applied["publication_bridge"]["accepted_scope"]["repo_id"],
+            "bridgefamily"
+        );
+        assert_eq!(
+            applied["publication_bridge"]["accepted_scope"]["bbox_root_relpath"],
+            "."
+        );
+        assert_eq!(
+            std::fs::read(&pointer_path).unwrap(),
+            before,
+            "the migration must not rewrite the accepted pointer"
+        );
+    }
 }
 
 /// Take the offline-administration lifetime claim on one projects path
@@ -3035,6 +3133,16 @@ fn execute_scope_migrate(args: ScopeMigrateArgs) -> Result<serde_json::Value, Co
             &request.project_id,
         );
     }
+    // The publication bridge report rides along for parity with the daemon
+    // tool's response: an accepted pointer still naming the old scope is
+    // the operator's remaining `scope_move` advance, and this channel
+    // never performs the move itself.
+    response["publication_bridge"] = scope_migrate_publication_bridge(
+        &args.store.projects_path,
+        &request.project_id,
+        &request.new_scope,
+        request.publication_bridge_generation.as_deref(),
+    );
     Ok(response)
 }
 
@@ -5498,4 +5606,49 @@ fn publication_bridge_generation(
         return Ok(None);
     };
     read_json_field(&pointer, "accepted_generation")
+}
+
+/// The publication-bridge report for a CLI scope migration, the same shape
+/// the daemon tool returns: whether the accepted pointer still names a
+/// scope the catalog is leaving behind, so the operator's `scope_move`
+/// advance is the remaining step. Read-only and never fatal: a pointer
+/// whose scope cannot be read degrades to the probe-keyed fallback.
+fn scope_migrate_publication_bridge(
+    projects_path: &Path,
+    project_id: &ProjectId,
+    new_scope: &PublishedScope,
+    probed_bridge_generation: Option<&str>,
+) -> serde_json::Value {
+    let installed = accepted_publication_pointer(projects_path, project_id)
+        .and_then(|pointer| installed_accepted_scope(&pointer));
+    match installed {
+        Some((repo_id, bbox_root_relpath)) => serde_json::json!({
+            "needs_scope_move": repo_id != new_scope.repo_id()
+                || bbox_root_relpath != new_scope.bbox_root_relpath(),
+            "accepted_scope": {
+                "repo_id": repo_id,
+                "bbox_root_relpath": bbox_root_relpath,
+            },
+        }),
+        // No readable pointer facts. The catalog is leaving the old scope
+        // in this very operation, so any installed pointer predates the
+        // move and needs the operator's scope_move.
+        None => serde_json::json!({
+            "needs_scope_move": probed_bridge_generation.is_some(),
+            "accepted_scope": serde_json::Value::Null,
+        }),
+    }
+}
+
+/// The accepted scope one installed pointer records, read without locks
+/// exactly like the bridge-generation probe reads the same file. `None`
+/// when the pointer is absent or carries no complete scope.
+fn installed_accepted_scope(pointer: &Path) -> Option<(String, String)> {
+    let bytes = read_regular_nofollow(pointer).ok()??;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let scope = value.get("accepted_scope")?;
+    Some((
+        scope.get("repo_id")?.as_str()?.to_string(),
+        scope.get("bbox_root_relpath")?.as_str()?.to_string(),
+    ))
 }

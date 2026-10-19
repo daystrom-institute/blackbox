@@ -1592,6 +1592,30 @@ mod tests {
         );
     }
 
+    /// A real git checkout whose committed project root sits at
+    /// `services/api` below the checkout root, the on-disk shape a
+    /// non-"." published scope has. The committed config records the
+    /// repo family the catalog fixture publishes under, so the v2
+    /// authority resolves a checkout a producer would actually work in.
+    fn estate_checkout(root: &Path) -> PathBuf {
+        let checkout = root.join("estate");
+        std::fs::create_dir_all(checkout.join("services/api/.bbox")).unwrap();
+        git(&checkout, &["init", "-q"]);
+        git(&checkout, &["config", "user.email", "estate@example.com"]);
+        git(&checkout, &["config", "user.name", "estate"]);
+        std::fs::write(
+            checkout.join("services/api/.bbox/config.toml"),
+            "[project]\nrepo_id = \"repo_example\"\n",
+        )
+        .unwrap();
+        git(&checkout, &["add", "services/api/.bbox/config.toml"]);
+        git(
+            &checkout,
+            &["commit", "-q", "-m", "seed the relocated service root"],
+        );
+        checkout
+    }
+
     fn fixture() -> (
         tempfile::TempDir,
         BlackboxServer,
@@ -1729,11 +1753,32 @@ mod tests {
         }
     }
 
+    /// Denied checkout acquisitions the census lane recorded, the observable
+    /// a recovery pass leaves behind when it probes a row whose resolution
+    /// fails. A converged registry records none.
+    fn census_lane_denials(server: &BlackboxServer) -> u64 {
+        use bbox_indexing::checkout_access::{CheckoutAccessOutcome, CheckoutAccessSourceLane};
+
+        server
+            .state
+            .checkout_access
+            .health()
+            .counters
+            .into_iter()
+            .filter(|counter| {
+                counter.source_lane == CheckoutAccessSourceLane::LegacyCheckoutRegistry
+                    && counter.outcome == CheckoutAccessOutcome::Denied
+            })
+            .map(|counter| counter.count)
+            .sum()
+    }
+
     /// The migration artifact row: the catalog moved to a new scope, the
     /// checkout's attachment proves the new scope, and only the census row
     /// still names the old one. Agreement between catalog authority and the
     /// attachment is what proves the row stale, so reconcile drops it
-    /// instead of preserving a ScopeMismatch refusal forever.
+    /// instead of preserving a ScopeMismatch refusal forever, and the
+    /// transaction-recovery pass stops probing the removed row.
     #[test]
     fn reconcile_drops_registry_row_whose_scope_migrated_with_catalog_authority() {
         use crate::server::state::catalog_fixture::CatalogFixture;
@@ -1743,8 +1788,7 @@ mod tests {
         let new = CatalogFixture::scope("services/api");
         let project = "p_row_migrated";
         let checkout_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaa0138";
-        let checkout = fixture.root().join("estate");
-        std::fs::create_dir_all(checkout.join("services/api/.bbox/local")).unwrap();
+        let checkout = estate_checkout(fixture.root());
         fixture.add_published_project(project, &new);
         fixture.attach_overlay_checkout_at(
             project,
@@ -1775,6 +1819,19 @@ mod tests {
         );
         let repeat = server.reconcile_dark_knowledge_checkouts().unwrap();
         assert_eq!(repeat.dropped, 0, "the row no longer fails every pass");
+
+        // The abandoned-transaction recovery pass iterates census rows; the
+        // removed old-scope row must contribute nothing to it. A probe that
+        // resolved through the stale scope would record a denied
+        // acquisition on the census lane, which is the every-pass failure
+        // the issue reported.
+        let denials = census_lane_denials(&server);
+        assert_eq!(server.recover_abandoned_dark_knowledge_transactions(), 0);
+        assert_eq!(
+            census_lane_denials(&server),
+            denials,
+            "recovery no longer probes the removed old-scope row"
+        );
     }
 
     /// Authority disagreement keeps the row: the attachment moved but the
@@ -1789,8 +1846,7 @@ mod tests {
         let new = CatalogFixture::scope("services/api");
         let project = "p_row_disagreed";
         let checkout_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaa0238";
-        let checkout = fixture.root().join("estate");
-        std::fs::create_dir_all(checkout.join("services/api/.bbox/local")).unwrap();
+        let checkout = estate_checkout(fixture.root());
         fixture.add_published_project(project, &old);
         fixture.attach_overlay_checkout_at(
             project,
@@ -1834,8 +1890,7 @@ mod tests {
         let new = CatalogFixture::scope("services/api");
         let project = "p_row_orphaned";
         let checkout_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaa0338";
-        let checkout = fixture.root().join("estate");
-        std::fs::create_dir_all(checkout.join("services/api/.bbox/local")).unwrap();
+        let checkout = estate_checkout(fixture.root());
         fixture.add_published_project(project, &new);
         fixture.attach_overlay_checkout_at(
             project,
@@ -1874,6 +1929,51 @@ mod tests {
         let other = PublishedScope::try_new("repo-family-lifecycle", "services/api").unwrap();
         assert!(!server.catalog_authority_superseded_registry_row("c1", "p_any", &scope));
         assert!(!server.catalog_authority_superseded_registry_row("c1", "p_any", &other));
+    }
+
+    /// The reconcile-level bridge pin: a census row whose scope disagrees
+    /// with the checkout's committed root is PRESERVED when no catalog
+    /// authority exists to prove it a migration artifact. The registry is
+    /// the bridge lane's own authority, so the row resolves and stays; the
+    /// equivalent row dies only through catalog agreement (the fixture
+    /// tests above).
+    #[test]
+    fn reconcile_preserves_a_scope_shifted_row_in_bridge_mode() {
+        let (_temp, server, base, _worktree, scope) = fixture();
+        let shifted = PublishedScope::try_new("repo-family-lifecycle", "services/api").unwrap();
+        let checkout_id = bbox_corpus_core::identity::ensure_checkout_id(&base).unwrap();
+        std::fs::create_dir_all(base.join("services/api")).unwrap();
+        let project_id = server
+            .state
+            .records_provider
+            .records_snapshot()
+            .records
+            .iter()
+            .find(|project| project.canonical_path == base.to_string_lossy())
+            .unwrap()
+            .project_id
+            .clone();
+        server
+            .state
+            .checkout_registry
+            .write()
+            .register(census_row(&checkout_id, &shifted, Some(&project_id), &base))
+            .unwrap();
+
+        let report = server.reconcile_dark_knowledge_checkouts().unwrap();
+        assert_eq!(
+            report.dropped, 0,
+            "bridge mode has no authority to drop a scope-shifted row"
+        );
+        let registry = server.state.checkout_registry.read();
+        assert!(
+            registry.get(&checkout_id, &shifted).is_some(),
+            "the mismatched row survives reconcile without catalog authority"
+        );
+        assert!(
+            registry.get(&checkout_id, &scope).is_some(),
+            "discovery still registers the committed root scope"
+        );
     }
 
     #[test]
