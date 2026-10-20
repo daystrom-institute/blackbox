@@ -368,6 +368,7 @@ mod blocking_scope_tests {
     }
 
     #[tokio::test]
+    #[cfg(debug_assertions)]
     #[should_panic(expected = "BlockingScope entered on a tokio runtime thread")]
     async fn enter_on_runtime_thread_panics_in_debug() {
         let _scope = BlockingScope::enter();
