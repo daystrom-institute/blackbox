@@ -339,6 +339,10 @@ out explicitly under `Changed` or `Removed`.
 - `git_commit` validates literal files, refuses unrelated staged work, and commits
   only the selected paths, including explicit deletions.
 
+- Kimi's catalog adds K3.1 Pro (`k3.1-pro`, the new default) and
+  `k3.1-pro-highspeed`, plus the canonical `k3-256k` and `kimi-for-coding*`
+  model ids. K3.1/K3 default to high effort and K2.8 to max. Built-in Kimi
+  tiers use K3.1 Pro/Highspeed; older model ids remain selectable.
 - DeepSeek V4.1 Flash is selectable as `deepseek-flash` and is the default
   DeepSeek model across built-in allocator tiers, with native low/high/max
   efforts and a 1M harness context window. Legacy V4 Flash model names remain

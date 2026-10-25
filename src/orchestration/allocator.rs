@@ -474,7 +474,7 @@ pub fn built_in_config() -> AllocatorConfig {
             (Glm, Some("glm-4.5-air"), Some("low"), None),
             (Deepseek, Some("deepseek-flash"), Some("low"), None),
             (Minimax, Some("MiniMax-M3"), Some("low"), None),
-            (Kimi, Some("kimi-k2.7-code-highspeed"), Some("low"), None),
+            (Kimi, Some("k3.1-pro-highspeed"), Some("low"), None),
         ],
     );
     tier(
@@ -484,7 +484,7 @@ pub fn built_in_config() -> AllocatorConfig {
             (Glm, Some("glm-5-turbo"), Some("medium"), None),
             (Deepseek, Some("deepseek-flash"), Some("high"), None),
             (Minimax, Some("MiniMax-M3"), Some("medium"), None),
-            (Kimi, Some("k3"), Some("medium"), None),
+            (Kimi, Some("k3.1-pro"), Some("medium"), None),
         ],
     );
     tier(
@@ -494,7 +494,7 @@ pub fn built_in_config() -> AllocatorConfig {
             (Glm, Some("glm-5.2"), Some("high"), None),
             (Deepseek, Some("deepseek-flash"), Some("high"), None),
             (Minimax, Some("MiniMax-M3"), Some("high"), None),
-            (Kimi, Some("k3"), Some("high"), None),
+            (Kimi, Some("k3.1-pro"), Some("high"), None),
         ],
     );
     tier(
@@ -503,7 +503,7 @@ pub fn built_in_config() -> AllocatorConfig {
             (Codex, Some("gpt-5.5"), Some("xhigh"), None),
             (Deepseek, Some("deepseek-flash"), Some("max"), None),
             (Minimax, Some("MiniMax-M3"), Some("max"), None),
-            (Kimi, Some("k3"), Some("max"), None),
+            (Kimi, Some("k3.1-pro"), Some("max"), None),
         ],
     );
     tier(
@@ -513,12 +513,7 @@ pub fn built_in_config() -> AllocatorConfig {
             (Glm, Some("glm-4.5-air"), Some("low"), Some(0.8)),
             (Deepseek, Some("deepseek-flash"), Some("low"), Some(0.8)),
             (Minimax, Some("MiniMax-M3"), Some("low"), Some(0.8)),
-            (
-                Kimi,
-                Some("kimi-k2.7-code-highspeed"),
-                Some("low"),
-                Some(0.8),
-            ),
+            (Kimi, Some("k3.1-pro-highspeed"), Some("low"), Some(0.8)),
         ],
     );
 
@@ -1946,6 +1941,22 @@ mod tests {
                     "{tier}.{provider} maps effort `{effort}` unsupported by model {model:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn kimi_builtin_tiers_use_k31_models() {
+        let cfg = built_in_config();
+        for (tier, model, effort) in [
+            ("economy", "k3.1-pro-highspeed", "low"),
+            ("standard", "k3.1-pro", "medium"),
+            ("premium", "k3.1-pro", "high"),
+            ("deepthink", "k3.1-pro", "max"),
+            ("super-el-cheapo-drones", "k3.1-pro-highspeed", "low"),
+        ] {
+            let entry = &cfg.tiers[tier][&Provider::Kimi];
+            assert_eq!(entry.model.as_deref(), Some(model), "{tier}");
+            assert_eq!(entry.effort.as_deref(), Some(effort), "{tier}");
         }
     }
 

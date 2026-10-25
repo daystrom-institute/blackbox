@@ -56,6 +56,36 @@ fn deepseek_flash_exec_resume_and_default_use_canonical_model() {
 }
 
 #[test]
+fn kimi_k31_exec_resume_and_default_use_canonical_models() {
+    let provider = Provider::Kimi;
+    for (model, canonical) in [
+        ("k3.1-pro-highspeed", "k3.1-pro-highspeed"),
+        ("kimi/k3.1-pro", "k3.1-pro"),
+    ] {
+        let opts = ExecOpts {
+            model: Some(model.into()),
+            effort: Some("high".into()),
+            ..Default::default()
+        };
+        for args in [
+            provider.build_exec_args("hello", None, "sid", None, Some(&opts)),
+            provider.build_resume_args("sid", "continue", None, Some(&opts)),
+        ] {
+            assert!(
+                args.windows(2).any(|pair| pair == ["--model", canonical]),
+                "{model} did not normalize to {canonical}"
+            );
+        }
+    }
+    for args in [
+        provider.build_exec_args("hello", None, "sid", None, None),
+        provider.build_resume_args("sid", "continue", None, None),
+    ] {
+        assert!(args.windows(2).any(|pair| pair == ["--model", "k3.1-pro"]));
+    }
+}
+
+#[test]
 fn providers_default_model_when_none_supplied() {
     for provider in Provider::ALL {
         let args = provider.build_exec_args("hi", None, "", None, None);

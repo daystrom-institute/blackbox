@@ -593,21 +593,53 @@ static MINIMAX_MODELS: &[ModelInfo] = &[ModelInfo {
     default_effort: None,
 }];
 
-// Kimi (Moonshot AI) model ids verified live against the Kimi-for-Coding
-// Anthropic endpoint (`https://api.kimi.com/coding`, 2026-07-19 probe): the
-// upstream K3 id is bare `k3` — the Claude Code slot ids `k3[1m]` /
-// `kimi-k3[1m]` are rejected with "set model id as `k3`" (the 1M window is
-// opened by the context-1m beta header, not the id suffix; see
-// exec_args::normalize_model_for_provider for the mapping). K3 always reasons
-// (usage carries output_tokens_details.thinking_tokens). The Moonshot
-// platform pay-as-you-go endpoint (`api.moonshot.ai/anthropic`) documents
-// `kimi-k3[1m]`; it is a separate credential lane from this provider's
-// ~/.claude-k source.
+// The 2026-07-19 wire probe against the Kimi-for-Coding Anthropic endpoint
+// established bare `k3` as the upstream id: Claude Code slot ids `k3[1m]` /
+// `kimi-k3[1m]` were rejected, with the 1M window opened by the context-1m beta
+// header (see exec_args::normalize_model_for_provider). The current release ids
+// and effort defaults below follow Kimi's official model configuration checked
+// on 2026-10-25. Older ids remain available for existing brofiles. The Moonshot
+// platform pay-as-you-go endpoint is a separate credential lane from ~/.claude-k.
 static KIMI_MODELS: &[ModelInfo] = &[
     ModelInfo {
-        id: "k3",
-        description: "Kimi K3 flagship, 1M context, always-reasoning, via Anthropic-compatible claude CLI transport",
+        id: "k3.1-pro",
+        description: "Kimi K3.1 Pro thinking-only flagship, up to 1M context via the claude CLI",
         default: true,
+        efforts: &[],
+        default_effort: Some("high"),
+    },
+    ModelInfo {
+        id: "k3.1-pro-highspeed",
+        description: "Kimi K3.1 Pro Highspeed thinking-only variant, up to 1M context via the claude CLI",
+        default: false,
+        efforts: &[],
+        default_effort: Some("high"),
+    },
+    ModelInfo {
+        id: "k3",
+        description: "Kimi K3 previous-generation flagship, up to 1M context via the claude CLI",
+        default: false,
+        efforts: &[],
+        default_effort: Some("high"),
+    },
+    ModelInfo {
+        id: "k3-256k",
+        description: "Kimi K3 with a 256K context window via the claude CLI",
+        default: false,
+        efforts: &[],
+        default_effort: Some("high"),
+    },
+    ModelInfo {
+        id: "kimi-for-coding",
+        description: "Kimi K2.8 Preview, up to 1M context via the claude CLI",
+        default: false,
+        efforts: &[],
+        default_effort: Some("max"),
+    },
+    ModelInfo {
+        id: "kimi-for-coding-highspeed",
+        description: "Kimi K2.7 Code Highspeed canonical model id, 256K via the claude CLI",
+        default: false,
         efforts: &[],
         default_effort: None,
     },
@@ -641,10 +673,9 @@ static KIMI_MODELS: &[ModelInfo] = &[
     },
 ];
 
-// Same effort ids as the other Anthropic-transport providers (verified
-// accepted on the wire: output_config.effort high/max both 200, 2026-07-19
-// probe), but defaulting to `max` per the vendor's Claude Code guidance
-// (CLAUDE_CODE_EFFORT_LEVEL=max for Kimi K3).
+// Claude CLI maps medium to high and xhigh to max. The provider-wide max
+// fallback preserves older entries; current models declare their documented
+// defaults individually.
 static KIMI_EFFORTS: &[EffortInfo] = &[
     EffortInfo {
         id: "low",
@@ -668,7 +699,7 @@ static KIMI_EFFORTS: &[EffortInfo] = &[
     },
     EffortInfo {
         id: "max",
-        description: "Maximum reasoning depth (vendor-recommended for Kimi K3)",
+        description: "Maximum reasoning depth",
         default: true,
     },
 ];
@@ -1017,16 +1048,37 @@ mod tests {
     }
 
     #[test]
-    fn kimi_catalog_defaults_to_k3_and_max_effort() {
+    fn kimi_catalog_defaults_to_k31_and_tracks_effort_defaults() {
         let p = Provider::Kimi;
+        assert_eq!(p.models().iter().filter(|m| m.default).count(), 1);
         let default_model = p.models().iter().find(|m| m.default).unwrap();
-        assert_eq!(default_model.id, "k3");
-        assert!(p.models().iter().any(|m| m.id == "kimi-k2.7-code"));
+        assert_eq!(default_model.id, "k3.1-pro");
+        for id in [
+            "k3.1-pro",
+            "k3.1-pro-highspeed",
+            "k3",
+            "k3-256k",
+            "kimi-for-coding",
+            "kimi-for-coding-highspeed",
+            "kimi-k2.7-code",
+            "kimi-k2.7-code-highspeed",
+            "kimi-k2.6",
+            "kimi-k2.5",
+        ] {
+            assert!(p.models().iter().any(|m| m.id == id), "missing {id}");
+        }
+        for id in ["k3.1-pro", "k3.1-pro-highspeed", "k3", "k3-256k"] {
+            assert_eq!(p.model_default_effort(id), Some("high"), "{id}");
+        }
+        assert_eq!(p.model_default_effort("kimi-for-coding"), Some("max"));
+        assert_eq!(
+            p.model_efforts("k3.1-pro"),
+            ["low", "medium", "high", "xhigh", "max"]
+        );
         assert_eq!(
             p.prompt_cache(),
             PromptCacheCapability::AnthropicCacheControl
         );
-        assert_eq!(p.model_default_effort("k3"), Some("max"));
         assert!(p.supports_resume());
         assert!(Provider::ALL.contains(&Provider::Kimi));
     }

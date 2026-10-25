@@ -564,6 +564,10 @@ mod tests {
                 Provider::Kimi,
             ),
             (
+                json!({"transport": "anthropic", "model": "k3.1-pro-highspeed"}),
+                Provider::Kimi,
+            ),
+            (
                 json!({"transport": "anthropic", "model": "kimi-k2.7-code"}),
                 Provider::Kimi,
             ),
