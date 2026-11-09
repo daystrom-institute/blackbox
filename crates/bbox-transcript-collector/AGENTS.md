@@ -17,6 +17,10 @@
   redirects so a credential cannot cross authorities.
 - Capture failures, deferred incomplete files, and unchanged/published streams
   have separate counts. One failed stream must not prevent backfill of others.
+- The exception is the daemon's storage refusal (`507`, code
+  `storage_exhausted`) on any stream request: abort the cycle, walk no further
+  stream, post no completion contact, and return one contextual error naming
+  the refusal and stream. Any other status or code stays a per-stream failure.
 
 - Begin and complete each scan with authenticated contact evidence. Recording
   scan completion can fail after snapshots were admitted; report that partial

@@ -148,6 +148,19 @@ impl std::fmt::Display for TransportError {
     }
 }
 impl std::error::Error for TransportError {}
+impl TransportError {
+    /// The daemon's storage admission refusal (`507 Insufficient Storage`).
+    pub fn is_storage_exhausted(&self) -> bool {
+        self.status == 507 && self.code == "storage_exhausted"
+    }
+}
+fn storage_exhausted(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<TransportError>()
+            .is_some_and(TransportError::is_storage_exhausted)
+    })
+}
 
 async fn decode<R: serde::de::DeserializeOwned>(mut response: reqwest::Response) -> Result<R> {
     let status = response.status();
@@ -332,6 +345,10 @@ pub fn error_diagnostic(error: &anyhow::Error) -> String {
 pub type CycleReport = ScanSummary;
 /// No mtime checkpoint or local cursor can suppress server reconciliation:
 /// every discovered stream compares with the durable server generation.
+///
+/// A daemon storage refusal aborts the cycle: no further stream is walked and
+/// no completion contact is posted, because a completion records a finished
+/// walk. The next cycle's scan-start contact replaces the in-progress scan.
 pub async fn publish_cycle(config: &Config, client: &Client) -> Result<CycleReport> {
     let scan_id =
         sha256(format!("{}:{:?}", std::process::id(), std::time::SystemTime::now()).as_bytes());
@@ -388,6 +405,13 @@ pub async fn publish_cycle(config: &Config, client: &Client) -> Result<CycleRepo
                 Ok((true, bytes)) => {
                     report.published += 1;
                     report.uploaded_bytes += bytes;
+                }
+                Err(error) if storage_exhausted(&error) => {
+                    return Err(error.context(format!(
+                        "daemon refused native transcript storage (storage_exhausted) on stream \
+                         {} ({:?}/{}); cycle aborted without recording scan completion",
+                        captured.snapshot.stream_id, root.source, root.account
+                    )));
                 }
                 Err(error) => {
                     report.failed += 1;
@@ -572,5 +596,267 @@ mod diagnostic_tests {
             4096 + " [diagnostic truncated]".len()
         );
         assert!(diagnostic.ends_with(" [diagnostic truncated]"));
+    }
+}
+
+#[cfg(test)]
+mod cycle_tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Write};
+    use std::sync::{Arc, Mutex};
+
+    const ROUTE_PREFIX: &str = "/internal/transcript-source/v1/";
+
+    /// Answer the `nth` (1-based) request to `route` with `status`/`code`.
+    #[derive(Clone, Copy)]
+    struct Refusal {
+        route: &'static str,
+        nth: usize,
+        status: u16,
+        code: &'static str,
+    }
+    #[derive(Default)]
+    struct Recorded {
+        /// Every request as (route, stream id), in arrival order.
+        requests: Vec<(String, String)>,
+        contacts: Vec<ContactRequest>,
+    }
+
+    /// Loopback stub of the daemon's transcript source routes. Every stream
+    /// is new and asks for all of its chunks, so each stream exercises
+    /// status, missing, chunk upload and publish.
+    fn stub_daemon(refusal: Option<Refusal>) -> (String, Arc<Mutex<Recorded>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let recorded = Arc::new(Mutex::new(Recorded::default()));
+        let sink = recorded.clone();
+        std::thread::spawn(move || {
+            for connection in listener.incoming() {
+                let mut connection = connection.unwrap();
+                let mut reader = BufReader::new(connection.try_clone().unwrap());
+                let mut request_line = String::new();
+                reader.read_line(&mut request_line).unwrap();
+                let target = request_line.split(' ').nth(1).unwrap().to_owned();
+                let mut length = 0;
+                loop {
+                    let mut header = String::new();
+                    reader.read_line(&mut header).unwrap();
+                    let header = header.trim_end();
+                    if header.is_empty() {
+                        break;
+                    }
+                    if let Some((name, value)) = header.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        length = value.trim().parse().unwrap();
+                    }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                let path = target.strip_prefix(ROUTE_PREFIX).unwrap();
+                let route = path.split('/').next().unwrap().to_owned();
+                let mut recorded = sink.lock().unwrap();
+                let (stream_id, response) = match route.as_str() {
+                    "contact" => {
+                        let contact: ContactRequest = serde_json::from_slice(&body).unwrap();
+                        let response = serde_json::to_value(SourceContact {
+                            last_contact_at: "2026-01-01T00:00:00Z".into(),
+                            scan_id: contact.scan_id.clone(),
+                            scan_started_at: "2026-01-01T00:00:00Z".into(),
+                            scan_in_progress: contact.completed.is_none(),
+                            last_completed_scan_at: None,
+                            last_completed_scan: contact.completed.clone(),
+                        })
+                        .unwrap();
+                        recorded.contacts.push(contact);
+                        (String::new(), response)
+                    }
+                    "status" => {
+                        let query: StreamQuery = serde_json::from_slice(&body).unwrap();
+                        let response = serde_json::to_value(StreamStatus {
+                            stream_id: query.stream_id.clone(),
+                            generation: None,
+                            byte_length: 0,
+                            published_at: None,
+                        })
+                        .unwrap();
+                        (query.stream_id, response)
+                    }
+                    "missing" => {
+                        let snapshot: StreamSnapshot = serde_json::from_slice(&body).unwrap();
+                        let hashes: Vec<_> =
+                            snapshot.chunks.iter().map(|chunk| &chunk.sha256).collect();
+                        (snapshot.stream_id.clone(), serde_json::json!(hashes))
+                    }
+                    "chunks" => (
+                        path.split('/').nth(2).unwrap().to_owned(),
+                        serde_json::Value::Null,
+                    ),
+                    "publish" => {
+                        let request: PublishRequest = serde_json::from_slice(&body).unwrap();
+                        let response = serde_json::to_value(PublishReceipt {
+                            generation: request.snapshot.generation().unwrap(),
+                            locator: "fixture".into(),
+                            byte_length: request.snapshot.byte_length,
+                            durable: true,
+                        })
+                        .unwrap();
+                        (request.snapshot.stream_id, response)
+                    }
+                    other => panic!("unexpected collector route {other}"),
+                };
+                recorded.requests.push((route.clone(), stream_id));
+                let seen = recorded
+                    .requests
+                    .iter()
+                    .filter(|(seen, _)| *seen == route)
+                    .count();
+                drop(recorded);
+                let (status, response) = match refusal {
+                    Some(refusal) if refusal.route == route && refusal.nth == seen => (
+                        refusal.status,
+                        serde_json::json!({"code": refusal.code, "message": "refused"}),
+                    ),
+                    _ => (200, response),
+                };
+                let response = response.to_string();
+                write!(
+                    connection,
+                    "HTTP/1.1 {status} Fixture\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{response}",
+                    response.len()
+                )
+                .unwrap();
+            }
+        });
+        (url, recorded)
+    }
+
+    /// Three Claude streams walked in file-name order, under a canonicalized
+    /// per-test root. The token file lives in the same tempdir, never HOME.
+    fn fixture(url: String) -> (tempfile::TempDir, Config) {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let root = base.join("root");
+        std::fs::create_dir(&root).unwrap();
+        for name in ["a", "b", "c"] {
+            std::fs::write(
+                root.join(format!("{name}.jsonl")),
+                serde_json::json!({"sessionId": format!("session-{name}")}).to_string() + "\n",
+            )
+            .unwrap();
+        }
+        let token_file = base.join("token");
+        std::fs::write(&token_file, "7".repeat(64)).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let config = Config {
+            corpus_url: url,
+            token_file,
+            scope: ConnectorScope::try_new("csrc_0123456789abcdef", "native_transcript").unwrap(),
+            remote_authority: "fixture-host".into(),
+            display_name: "fixture".into(),
+            roots: vec![RootConfig {
+                source: NativeSource::Claude,
+                account: "fixture".into(),
+                path: root,
+            }],
+        };
+        (dir, config)
+    }
+
+    fn streams_requested(recorded: &Recorded, route: &str) -> Vec<String> {
+        recorded
+            .requests
+            .iter()
+            .filter(|(seen, _)| seen == route)
+            .map(|(_, stream)| stream.clone())
+            .collect()
+    }
+
+    async fn assert_storage_refusal_aborts_cycle(route: &'static str) {
+        let (url, recorded) = stub_daemon(Some(Refusal {
+            route,
+            nth: 2,
+            status: 507,
+            code: "storage_exhausted",
+        }));
+        let (_dir, config) = fixture(url);
+        let client = Client::new(&config).unwrap();
+        let error = publish_cycle(&config, &client).await.unwrap_err();
+        let diagnostic = error_diagnostic(&error);
+        {
+            let recorded = recorded.lock().unwrap();
+            let statuses = streams_requested(&recorded, "status");
+            assert_eq!(
+                statuses.len(),
+                2,
+                "no stream after the refused one: {route}"
+            );
+            let refused = &statuses[1];
+            assert_eq!(
+                recorded.requests.last().unwrap(),
+                &(route.to_owned(), refused.clone()),
+                "the refused request is the cycle's last"
+            );
+            assert_eq!(recorded.contacts.len(), 1, "only the scan-start contact");
+            assert!(recorded.contacts[0].completed.is_none());
+            assert!(diagnostic.contains("storage_exhausted"), "{diagnostic}");
+            assert!(diagnostic.contains("HTTP 507"), "{diagnostic}");
+            assert!(diagnostic.contains(refused.as_str()), "{diagnostic}");
+            assert!(diagnostic.contains("without recording scan completion"));
+        }
+
+        // The next cycle starts a new scan normally once storage admits ingest.
+        let error_count = recorded.lock().unwrap().requests.len();
+        let report = publish_cycle(&config, &client).await.unwrap();
+        assert_eq!(report.published, 3);
+        assert_eq!(report.failed, 0);
+        let recorded = recorded.lock().unwrap();
+        assert!(recorded.requests.len() > error_count);
+        assert_eq!(recorded.contacts.len(), 3);
+        assert!(recorded.contacts[1].completed.is_none());
+        assert_ne!(recorded.contacts[1].scan_id, recorded.contacts[0].scan_id);
+        assert_eq!(recorded.contacts[2].scan_id, recorded.contacts[1].scan_id);
+        assert_eq!(recorded.contacts[2].completed.as_ref(), Some(&report));
+    }
+
+    #[tokio::test]
+    async fn storage_refusal_on_publish_aborts_cycle_without_completion() {
+        assert_storage_refusal_aborts_cycle("publish").await;
+    }
+
+    #[tokio::test]
+    async fn storage_refusal_on_any_stream_request_aborts_cycle_without_completion() {
+        for route in ["status", "missing", "chunks"] {
+            assert_storage_refusal_aborts_cycle(route).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn other_stream_failures_continue_and_record_completion() {
+        for (status, code) in [(500, "internal_error"), (507, "unclassified_storage")] {
+            let (url, recorded) = stub_daemon(Some(Refusal {
+                route: "publish",
+                nth: 2,
+                status,
+                code,
+            }));
+            let (_dir, config) = fixture(url);
+            let client = Client::new(&config).unwrap();
+            let report = publish_cycle(&config, &client).await.unwrap();
+            assert_eq!(report.discovered, 3);
+            assert_eq!(report.published, 2);
+            assert_eq!(report.failed, 1);
+            let recorded = recorded.lock().unwrap();
+            assert_eq!(streams_requested(&recorded, "status").len(), 3);
+            assert_eq!(streams_requested(&recorded, "publish").len(), 3);
+            assert_eq!(recorded.contacts.len(), 2);
+            assert!(recorded.contacts[0].completed.is_none());
+            assert_eq!(recorded.contacts[1].completed.as_ref(), Some(&report));
+        }
     }
 }
