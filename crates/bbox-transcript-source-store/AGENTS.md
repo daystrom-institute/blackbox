@@ -71,9 +71,11 @@
   `contact.lock`, the lock those writes take. `contact.json`,
   `contact.lock`, `readers.lock` and `health.json` are never removed.
 - Each run caches a per-source measurement in `health.json` and returns it in
-  the run report; the daemon keeps the latest run's measurements (every
-  source directory, granted or not) with a headroom sample, and diagnostics
-  read that observation instead of walking the store or probing live. A run that cannot measure keeps
+  the run report; the daemon publishes the latest run's measurements (every
+  source directory, granted or not) as soon as the run completes, and
+  diagnostics read them instead of walking the store. Filesystem headroom is
+  sampled separately with at most one probe in flight, so a hung mount never
+  holds back reclamation. A run that cannot measure keeps
   the previous measurement and records the failed attempt.
 
 ## Storage exhaustion and admission

@@ -154,19 +154,26 @@ configuration reload that changes `state_dir` does not move it until restart.
 The reserve is a soft guarantee. Other writers on the same filesystem (indexes,
 vectors, contact and lease files) do not reserve against it. Live content still
 grows with source history, because retention is unchanged. `bbox_doctor`'s
-`storage` section (catalog-authority daemons) reports what the reaper's latest
-run sampled: each store filesystem's size and free space, with a warning below
-15% free and an action on the filesystem holding the transcript store when free
-space is below the reserve, and for each native source its live, stored, staged
-and non-current bytes, the stored-to-live ratio and the measurement time. It
-warns when stored exceeds live by more than 25% after a completed generation
-phase or when the measurement is older than three reaper intervals. Sources
+`storage` section (catalog-authority daemons) reports two cached observations,
+each with its absolute time. A headroom sample of each store filesystem's size
+and free space is taken at start and then every five minutes (or every reaper
+interval, if shorter) by a sampler separate from the reaper, so a hung mount
+delays only its own sample; it warns below 15% free and raises an action on the
+filesystem holding the transcript store when free space is below the reserve.
+The reaper's latest measurement of each native source reports its live,
+stored, staged and non-current bytes and the stored-to-live ratio, and warns
+when stored exceeds live by more than 25% after a completed generation phase.
+Either observation warns once it is older than three reaper intervals. Sources
 whose grant was removed stay listed while their bytes remain; a newly granted
-source shows as unavailable until its first measurement. Because the numbers
-change only when the reaper runs, they lag live free space by up to one reaper
-interval; admission itself always reads live free space. Unadmitted staging
-younger than the expiry is legitimately retained, so treat the ratio as a
-diagnostic.
+source shows as unavailable until its first measurement.
+
+How far doctor's free space lags the filesystem depends on sampling
+succeeding: normally by up to one sampling period, longer if a probe stalls,
+which the staleness warning then reports. Doctor does not promise a warning
+before every refusal. Admission reads live free space on every chunk and
+publish, so ingest can be refused before a sample shows the shortfall.
+Unadmitted staging younger than the expiry is legitimately retained, so treat
+the ratio as a diagnostic.
 
 Removing or disabling a grant rejects subsequent producer requests. A daemon
 configuration restart updates index enrollment, and its next reindex removes

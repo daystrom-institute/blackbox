@@ -434,6 +434,7 @@ mod tests {
             opened
         );
         state.transcript_source.run_once().unwrap();
+        state.transcript_source.sample_headroom_now();
         let server = super::super::BlackboxServer::new(state.clone());
         let report = crate::doctor::run_section(&server, "storage").unwrap();
         let storage = report.storage.unwrap();

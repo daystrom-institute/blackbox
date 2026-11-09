@@ -3532,6 +3532,7 @@ mod catalog_health_tests {
             )
             .unwrap();
         server.state.transcript_source.run_once().unwrap();
+        server.state.transcript_source.sample_headroom_now();
         (fixture, server, [scope, unmeasured], bytes.len() as u64)
     }
 
@@ -3574,7 +3575,7 @@ mod catalog_health_tests {
         assert!(
             report
                 .render_summary()
-                .contains("storage: worst filesystem")
+                .contains("storage: headroom sampled at ")
         );
         let full = run(&server).unwrap();
         assert!(

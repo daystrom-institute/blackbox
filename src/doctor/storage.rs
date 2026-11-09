@@ -1,12 +1,13 @@
 //! Doctor `storage` section: free space on every filesystem holding a store
 //! root the daemon opens, and the native transcript source store's
-//! accounting. Both come from the transcript source reaper's latest
-//! observation in daemon state, so doctor never probes or walks a store and
-//! its body stays byte-stable until the reaper runs again. Times are
-//! absolute; nothing serialized depends on when the report was rendered.
+//! accounting. Both come from cached daemon state (the headroom sampler's
+//! latest sample and the reaper's latest measurements), so doctor never
+//! probes or walks a store and its body stays byte-stable until one of them
+//! is replaced. Times are absolute; nothing serialized depends on when the
+//! report was rendered. Each observation is judged stale on its own clock.
 use super::{Finding, SectionReport};
 use crate::server::transcript_source_reaper::{
-    FsProbe, ProbedRoot, StorageObservation, StorageRoot,
+    FsProbe, HeadroomSample, ProbedRoot, StorageObservation, StorageRoot,
 };
 use bbox_transcript_source_store::{
     GenerationPhase, ReservePolicy, SourceStorageHealth, StorageAccounting,
@@ -21,7 +22,8 @@ const LOW_HEADROOM_FRACTION: f64 = 0.15;
 /// Stored bytes above live bytes by more than this ratio warn once a
 /// generation phase completed.
 const AMPLIFICATION_RATIO: f64 = 1.25;
-/// A measurement older than this many reaper intervals warns.
+/// A headroom sample or source measurement older than this many reaper
+/// intervals warns.
 const STALE_INTERVALS: u32 = 3;
 
 #[derive(Debug, Clone, Serialize)]
@@ -67,18 +69,23 @@ pub(crate) struct TranscriptSourceStorage {
 /// The section's numbers at every severity, including `ok`.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct StorageSnapshot {
-    /// When the reaper sampled this observation; `None` before its first run.
+    /// When filesystem headroom was last sampled; `None` before the first
+    /// sample completes.
     pub(crate) sampled_at_unix: Option<u64>,
+    /// When the reaper last published source measurements.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) sources_measured_at_unix: Option<u64>,
     pub(crate) filesystems: Vec<FilesystemHeadroom>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) unprobed_roots: Vec<UnprobedRoot>,
     pub(crate) transcript_sources: Vec<TranscriptSourceStorage>,
-    /// One line: the worst filesystem and the worst source ratio.
+    /// One line: the sample time, the worst filesystem and the worst source
+    /// ratio.
     pub(crate) summary: String,
 }
 
 pub(crate) struct StorageInputs {
-    pub(crate) observation: Option<StorageObservation>,
+    pub(crate) observation: StorageObservation,
     /// Native transcript sources enrolled by current producer grants.
     pub(crate) configured_sources: Vec<String>,
     pub(crate) reserve: ReservePolicy,
@@ -160,7 +167,7 @@ fn phase_name(phase: Option<GenerationPhase>) -> &'static str {
 }
 
 fn filesystem_findings(
-    observation: &StorageObservation,
+    observation: &HeadroomSample,
     reserve_policy: ReservePolicy,
     findings: &mut Vec<Finding>,
 ) -> (Vec<FilesystemHeadroom>, Vec<UnprobedRoot>) {
@@ -331,12 +338,26 @@ fn source_row(
 /// sources. Pure, so tests can supply filesystems a test host cannot mount.
 pub(crate) fn build(inputs: StorageInputs) -> (SectionReport, StorageSnapshot) {
     let mut findings = Vec::new();
-    let (filesystems, unprobed) = match &inputs.observation {
-        Some(observation) => filesystem_findings(observation, inputs.reserve, &mut findings),
+    let stale_after = inputs.reaper_interval.as_secs() * u64::from(STALE_INTERVALS);
+    let headroom = inputs.observation.headroom.as_ref();
+    let (filesystems, unprobed) = match headroom {
+        Some(sample) => {
+            // Judged on its own clock, so a daemon with no sources still
+            // learns that its headroom numbers stopped refreshing.
+            if inputs.now_unix.saturating_sub(sample.sampled_at_unix) > stale_after {
+                findings.push(Finding::warn(format!(
+                    "filesystem headroom was last sampled at {}, older than three reaper \
+                     intervals; the free space below may be outdated (transcript ingest \
+                     admission still reads live free space)",
+                    timestamp(sample.sampled_at_unix)
+                )));
+            }
+            filesystem_findings(sample, inputs.reserve, &mut findings)
+        }
         None => {
             findings.push(Finding::info(
-                "storage not sampled yet: the transcript source reaper samples headroom and \
-                 measures sources on each run, the first at daemon start",
+                "filesystem headroom not sampled yet: the daemon samples every store \
+                 filesystem shortly after start and then periodically",
             ));
             (Vec::new(), Vec::new())
         }
@@ -349,21 +370,18 @@ pub(crate) fn build(inputs: StorageInputs) -> (SectionReport, StorageSnapshot) {
         .iter()
         .cloned()
         .collect::<BTreeSet<_>>();
+    let measured = inputs.observation.sources.as_ref();
     let mut ids = configured.clone();
-    if let Some(observation) = &inputs.observation {
-        ids.extend(observation.sources.keys().cloned());
+    if let Some(measured) = measured {
+        ids.extend(measured.sources.keys().cloned());
     }
-    let stale_after = inputs.reaper_interval.as_secs() * u64::from(STALE_INTERVALS);
     let sources = ids
         .iter()
         .map(|id| {
             source_row(
                 id,
                 configured.contains(id),
-                inputs
-                    .observation
-                    .as_ref()
-                    .and_then(|observation| observation.sources.get(id)),
+                measured.and_then(|measured| measured.sources.get(id)),
                 stale_after,
                 inputs.now_unix,
                 &mut findings,
@@ -393,18 +411,21 @@ pub(crate) fn build(inputs: StorageInputs) -> (SectionReport, StorageSnapshot) {
             "no measured source with live bytes".to_owned(),
             |(row, ratio)| format!("{} at {ratio:.2}", row.connector_source_id),
         );
-    let summary =
-        format!("worst filesystem {worst_filesystem}; worst transcript source ratio {worst_ratio}");
+    let sampled = headroom.map_or("headroom not sampled".to_owned(), |sample| {
+        format!("headroom sampled at {}", timestamp(sample.sampled_at_unix))
+    });
+    let summary = format!(
+        "{sampled}; worst filesystem {worst_filesystem}; worst transcript source ratio \
+         {worst_ratio}"
+    );
     (
         SectionReport {
             section: SECTION,
             findings,
         },
         StorageSnapshot {
-            sampled_at_unix: inputs
-                .observation
-                .as_ref()
-                .map(|observation| observation.sampled_at_unix),
+            sampled_at_unix: headroom.map(|sample| sample.sampled_at_unix),
+            sources_measured_at_unix: measured.map(|measured| measured.measured_at_unix),
             filesystems,
             unprobed_roots: unprobed,
             transcript_sources: sources,
@@ -502,16 +523,23 @@ mod tests {
         .collect::<Vec<_>>();
         roots.push(transcript.clone());
         StorageObservation {
-            sampled_at_unix: 90_000,
-            roots,
-            transcript_root: transcript,
-            sources,
+            headroom: Some(HeadroomSample {
+                sampled_at_unix: 99_000,
+                roots,
+                transcript_root: transcript,
+            }),
+            sources: (!sources.is_empty()).then(|| {
+                crate::server::transcript_source_reaper::SourceMeasurements {
+                    measured_at_unix: 99_000,
+                    sources,
+                }
+            }),
         }
     }
 
     fn inputs(observation: Option<StorageObservation>, configured: &[&str]) -> StorageInputs {
         StorageInputs {
-            observation,
+            observation: observation.unwrap_or_default(),
             configured_sources: configured.iter().map(|id| id.to_string()).collect(),
             reserve: ReservePolicy::Default,
             reaper_interval: Duration::from_secs(1800),
@@ -523,7 +551,7 @@ mod tests {
     fn probes_deduplicate_by_filesystem_and_attribute_the_reserve_to_the_transcript_mount() {
         let (section, snapshot) =
             build(inputs(Some(observation(&[], false, BTreeMap::new())), &[]));
-        assert_eq!(snapshot.sampled_at_unix, Some(90_000));
+        assert_eq!(snapshot.sampled_at_unix, Some(99_000));
         assert_eq!(snapshot.filesystems.len(), 2);
         let shared = &snapshot.filesystems[0];
         assert_eq!(
@@ -697,6 +725,44 @@ mod tests {
             snapshot
                 .summary
                 .contains("worst transcript source ratio csrc_000000000000000b at 2.00")
+        );
+    }
+
+    #[test]
+    fn an_old_headroom_sample_warns_even_with_no_sources_and_dates_the_summary() {
+        let mut old = observation(&[], false, BTreeMap::new());
+        let sample = old.headroom.as_mut().unwrap();
+        // Now is 100_000; three intervals of 1800s is 5400s; this is 7200s old.
+        sample.sampled_at_unix = 100_000 - 7200;
+        let (section, snapshot) = build(inputs(Some(old), &[]));
+        assert!(snapshot.transcript_sources.is_empty());
+        let stale = section
+            .findings
+            .iter()
+            .filter(|finding| {
+                finding.level == FindingLevel::Warn
+                    && finding
+                        .message
+                        .contains("older than three reaper intervals")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(stale.len(), 1, "{:?}", section.findings);
+        assert!(stale[0].message.contains("1970-01-02T01:46:40Z"));
+        assert!(
+            snapshot
+                .summary
+                .starts_with("headroom sampled at 1970-01-02T01:46:40Z;"),
+            "{}",
+            snapshot.summary
+        );
+
+        // A fresh sample does not warn on age.
+        let (fresh, _) = build(inputs(Some(observation(&[], false, BTreeMap::new())), &[]));
+        assert!(
+            fresh
+                .findings
+                .iter()
+                .all(|finding| !finding.message.contains("older than three"))
         );
     }
 }

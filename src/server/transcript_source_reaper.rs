@@ -12,11 +12,17 @@
 //! here rather than on a handle. The reaper runs at task start, on a
 //! periodic timer, and after every native index pass (nudged by the index
 //! writer once the pass's reader leases dropped). Runs are serialized by this
-//! one task and execute on the blocking pool. Each run also samples
-//! filesystem headroom, so doctor reports one consistent observation that
-//! changes only when the reaper runs.
+//! one task and execute on the blocking pool, and each run publishes its
+//! source accounting as soon as it completes.
+//!
+//! Filesystem headroom is sampled by a separate task with at most one probe
+//! worker in flight: a stalled probe of an unrelated mount skips later
+//! samples instead of piling up, and never delays reclamation. Doctor
+//! reports both cached observations with their own timestamps, so its body
+//! changes only when one of them is replaced.
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -67,15 +73,31 @@ pub(crate) struct ProbedRoot {
     pub(crate) probe: Result<FsProbe, String>,
 }
 
-/// One reaper run's view of storage: filesystem headroom sampled with the
-/// run, and every source directory the run measured, granted or not.
+/// One completed headroom sample of every probed store root.
 #[derive(Debug, Clone)]
-pub(crate) struct StorageObservation {
+pub(crate) struct HeadroomSample {
     pub(crate) sampled_at_unix: u64,
     pub(crate) roots: Vec<ProbedRoot>,
     pub(crate) transcript_root: ProbedRoot,
+}
+
+/// Every source directory the latest completed reaper run measured, granted
+/// or not.
+#[derive(Debug, Clone)]
+pub(crate) struct SourceMeasurements {
+    pub(crate) measured_at_unix: u64,
     pub(crate) sources: BTreeMap<String, SourceStorageHealth>,
 }
+
+/// What doctor reads: the two cached observations, each `None` until its
+/// first completion.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct StorageObservation {
+    pub(crate) headroom: Option<HeadroomSample>,
+    pub(crate) sources: Option<SourceMeasurements>,
+}
+
+pub(crate) type HeadroomProbe = Arc<dyn Fn(&Path) -> std::io::Result<FsProbe> + Send + Sync>;
 
 pub(crate) fn probe_filesystem(path: &Path) -> std::io::Result<FsProbe> {
     let space = bbox_transcript_source_store::probe_filesystem(path)?;
@@ -99,10 +121,23 @@ pub(crate) fn probe_filesystem(path: &Path) -> std::io::Result<FsProbe> {
     })
 }
 
-fn probed(root: &StorageRoot) -> ProbedRoot {
+fn probed(probe: &HeadroomProbe, root: &StorageRoot) -> ProbedRoot {
     ProbedRoot {
         root: root.clone(),
-        probe: probe_filesystem(&root.probe_dir).map_err(|error| error.to_string()),
+        probe: probe(&root.probe_dir).map_err(|error| error.to_string()),
+    }
+}
+
+/// Upper bound on the headroom sampling period; shorter when the reaper
+/// interval is.
+const MAX_HEADROOM_SAMPLE_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+/// Clears the in-flight flag when a sampling worker ends, however it ends.
+struct SamplingSlot(Arc<AtomicBool>);
+
+impl Drop for SamplingSlot {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
     }
 }
 
@@ -121,7 +156,10 @@ pub(crate) struct TranscriptSourceRuntime {
     /// Instance-lock roots whose filesystems doctor reports, beside the
     /// transcript store root itself.
     probe_roots: Vec<StorageRoot>,
-    observation: Mutex<Option<StorageObservation>>,
+    probe: HeadroomProbe,
+    sampling: Arc<AtomicBool>,
+    headroom: Mutex<Option<HeadroomSample>>,
+    sources: Mutex<Option<SourceMeasurements>>,
 }
 
 impl TranscriptSourceRuntime {
@@ -155,8 +193,22 @@ impl TranscriptSourceRuntime {
             interval: Duration::from_secs(config.reaper_interval_secs),
             nudge: Arc::new(tokio::sync::Notify::new()),
             probe_roots,
-            observation: Mutex::new(None),
+            probe: Arc::new(probe_filesystem),
+            sampling: Arc::new(AtomicBool::new(false)),
+            headroom: Mutex::new(None),
+            sources: Mutex::new(None),
         }
+    }
+
+    /// Replace the filesystem probe, so tests can stall or fake a mount.
+    #[cfg(test)]
+    pub(crate) fn with_probe(mut self, probe: HeadroomProbe) -> Self {
+        self.probe = probe;
+        self
+    }
+
+    fn headroom_sample_interval(&self) -> Duration {
+        self.interval.min(MAX_HEADROOM_SAMPLE_INTERVAL)
     }
 
     /// The store root every transcript surface uses, fixed at open.
@@ -194,50 +246,84 @@ impl TranscriptSourceRuntime {
         Arc::new(move || nudge.notify_one())
     }
 
-    /// The latest reaper run's storage observation; `None` before the first.
-    pub(crate) fn observation(&self) -> Option<StorageObservation> {
-        self.observation
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+    /// The cached headroom sample and source measurements.
+    pub(crate) fn observation(&self) -> StorageObservation {
+        StorageObservation {
+            headroom: self
+                .headroom
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+            sources: self
+                .sources
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+        }
     }
 
-    /// One reaper run, then a headroom sample, recorded together. Blocking
-    /// filesystem work: call it on the blocking pool.
+    /// One reaper run, publishing its source accounting when it completes.
+    /// Blocking filesystem work on the transcript store only: call it on the
+    /// blocking pool.
     pub(crate) fn run_once(&self) -> anyhow::Result<ReapReport> {
         let result =
             TranscriptSourceStore::for_read(&self.root).reap(&self.policy, SystemTime::now());
-        let transcript_root = probed(&StorageRoot::new(
-            "transcript source store",
-            self.root.clone(),
-            true,
-        ));
-        let mut roots = self.probe_roots.iter().map(probed).collect::<Vec<_>>();
-        roots.push(transcript_root.clone());
-        let mut observation = self
-            .observation
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // A run that could not enumerate the store keeps the sources it last
-        // measured; headroom is always the fresh sample.
-        let sources = match &result {
-            Ok(report) => report
-                .scopes
-                .iter()
-                .map(|scope| (scope.connector_source_id.clone(), scope.health.clone()))
-                .collect(),
-            Err(_) => observation
-                .as_ref()
-                .map(|previous| previous.sources.clone())
-                .unwrap_or_default(),
-        };
-        *observation = Some(StorageObservation {
+        // measured.
+        if let Ok(report) = &result {
+            *self
+                .sources
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(SourceMeasurements {
+                measured_at_unix: unix_now(),
+                sources: report
+                    .scopes
+                    .iter()
+                    .map(|scope| (scope.connector_source_id.clone(), scope.health.clone()))
+                    .collect(),
+            });
+        }
+        result
+    }
+
+    /// Probe every store root and publish the sample. Blocking, and can stall
+    /// on an unresponsive mount: the scheduler only reaches it through
+    /// [`Self::request_headroom_sample`].
+    pub(crate) fn sample_headroom_now(&self) {
+        let transcript_root = probed(
+            &self.probe,
+            &StorageRoot::new("transcript source store", self.root.clone(), true),
+        );
+        let mut roots = self
+            .probe_roots
+            .iter()
+            .map(|root| probed(&self.probe, root))
+            .collect::<Vec<_>>();
+        roots.push(transcript_root.clone());
+        *self
+            .headroom
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(HeadroomSample {
             sampled_at_unix: unix_now(),
             roots,
             transcript_root,
-            sources,
         });
-        result
+    }
+
+    /// Start one sampling worker on the blocking pool unless one is still in
+    /// flight. Never waits; returns whether a worker started.
+    pub(crate) fn request_headroom_sample(self: &Arc<Self>) -> bool {
+        if self.sampling.swap(true, Ordering::SeqCst) {
+            tracing::debug!("filesystem headroom sample still in flight; skipping");
+            return false;
+        }
+        let slot = SamplingSlot(self.sampling.clone());
+        let runtime = self.clone();
+        drop(tokio::task::spawn_blocking(move || {
+            let _slot = slot;
+            runtime.sample_headroom_now();
+        }));
+        true
     }
 }
 
@@ -276,8 +362,16 @@ fn log_run(report: &ReapReport, elapsed: Duration) {
     );
 }
 
-/// Spawn the reaper task. Its first run starts immediately (daemon start).
+/// Spawn the reaper task and the independent headroom sampler. Both start
+/// immediately (daemon start).
 pub(crate) fn spawn(runtime: Arc<TranscriptSourceRuntime>) {
+    let sampler = runtime.clone();
+    tokio::spawn(async move {
+        loop {
+            sampler.request_headroom_sample();
+            tokio::time::sleep(sampler.headroom_sample_interval()).await;
+        }
+    });
     tokio::spawn(async move {
         loop {
             let worker = runtime.clone();
@@ -340,5 +434,114 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(20)).await;
         (runtime.pass_hook())();
         wait_for(Some(first)).await;
+    }
+
+    async fn eventually(mut done: impl FnMut() -> bool, what: &str) {
+        for _ in 0..400 {
+            if done() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    /// An unrelated store mount whose probe hangs stalls only the headroom
+    /// sampler: sweeps keep running and publishing accounting, further
+    /// samples are skipped instead of queued, and the sample lands once the
+    /// probe returns.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stalled_headroom_probe_never_delays_reclamation_or_piles_up() {
+        use std::sync::atomic::AtomicUsize;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let store_root = root.join("transcript-sources");
+        std::fs::create_dir_all(store_root.join("csrc_0123456789abcdef")).unwrap();
+        let stalled = root.join("stalled-mount");
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let probe: HeadroomProbe = {
+            let stalled = stalled.clone();
+            let calls = calls.clone();
+            Arc::new(move |path: &Path| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                if path == stalled {
+                    release_rx.lock().unwrap().recv().unwrap();
+                    return Ok(FsProbe {
+                        device: 99,
+                        total: 100,
+                        available: 50,
+                    });
+                }
+                probe_filesystem(path)
+            })
+        };
+        let runtime = Arc::new(
+            TranscriptSourceRuntime::new(
+                store_root.clone(),
+                &TranscriptSourceConfig {
+                    reaper_interval_secs: 24 * 60 * 60,
+                    ..TranscriptSourceConfig::default()
+                },
+                vec![StorageRoot {
+                    label: "stalled mount".into(),
+                    path: stalled.clone(),
+                    probe_dir: stalled.clone(),
+                }],
+            )
+            .with_probe(probe),
+        );
+        spawn(runtime.clone());
+
+        eventually(
+            || runtime.observation().sources.is_some(),
+            "the start-up sweep to publish accounting",
+        )
+        .await;
+        eventually(|| calls.load(Ordering::SeqCst) >= 2, "the sampler to stall").await;
+        assert!(runtime.observation().headroom.is_none());
+        assert!(
+            !runtime.request_headroom_sample(),
+            "a second sample is skipped while one is in flight"
+        );
+
+        // A later sweep, nudged by an index pass, still runs and publishes.
+        std::fs::create_dir_all(store_root.join("csrc_fedcba9876543210")).unwrap();
+        (runtime.pass_hook())();
+        eventually(
+            || {
+                runtime
+                    .observation()
+                    .sources
+                    .is_some_and(|measured| measured.sources.contains_key("csrc_fedcba9876543210"))
+            },
+            "the nudged sweep to publish the new source",
+        )
+        .await;
+        assert!(runtime.observation().headroom.is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "no probe piled up");
+
+        release_tx.send(()).unwrap();
+        eventually(
+            || runtime.observation().headroom.is_some(),
+            "the released sample to publish",
+        )
+        .await;
+        let sample = runtime.observation().headroom.unwrap();
+        assert!(
+            sample
+                .roots
+                .iter()
+                .any(|probed| probed.root.path == stalled && probed.probe.is_ok())
+        );
+        // The slot is free again; the next sample's stalled probe returns too.
+        release_tx.send(()).unwrap();
+        eventually(|| runtime.request_headroom_sample(), "the slot to free").await;
+        eventually(
+            || calls.load(Ordering::SeqCst) == 4 && !runtime.sampling.load(Ordering::SeqCst),
+            "the follow-up sample to finish",
+        )
+        .await;
     }
 }

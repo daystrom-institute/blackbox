@@ -359,8 +359,9 @@ bbox_embed_status()                      # confirm no embedding errors
 ```
 
 `bbox_doctor(section="storage")` reports free space on every filesystem that
-holds a daemon store and the native transcript store's stored-to-live ratio, as
-the transcript source reaper last sampled them. An `action` there means transcript ingest
+holds a daemon store, as last sampled, and the native transcript store's
+stored-to-live ratio, as the reaper last measured it. Each carries its sample
+time and warns once it is older than three reaper intervals. An `action` there means transcript ingest
 admission is refusing or about to refuse.
 
 ### Re-keying threads to a project
