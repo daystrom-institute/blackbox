@@ -251,6 +251,18 @@ counter moves, and the daemon never attempts a checkout-backed fallback:
 Transcript attribution is unaffected: every collected project is attributed
 from its attachment path without reading the checkout.
 
+### Native transcript store storage
+
+The `[transcript_source]` block bounds the native transcript landing store
+(`<state_dir>/transcript-sources`): `min_free_bytes` (the ingest free-space
+reserve, default the larger of 2 GiB and 3% of the filesystem),
+`reaper_interval_secs` (default 1800), `staging_expiry_secs` (default 86400)
+and `staging_budget_bytes` (per source, default 2 GiB). Settings are read at
+startup. A zero interval or expiry is refused. What each bound governs, and the
+`507 storage_exhausted` refusal ingest returns when the reserve would be
+consumed, are in
+[Native transcript collection](native-transcript-collector.md#daemon-storage).
+
 ### Operator web UI
 
 The daemon serves a read-only operator web UI on a second listener, off by
@@ -345,6 +357,11 @@ bbox_doctor(format="summary")            # aggregate health + attention report
 bbox_thread_list(status="open")          # investigation continuity
 bbox_embed_status()                      # confirm no embedding errors
 ```
+
+`bbox_doctor(section="storage")` reports free space on every filesystem that
+holds a daemon store and the native transcript store's stored-to-live ratio as
+its reaper last measured it. An `action` there means transcript ingest
+admission is refusing or about to refuse.
 
 ### Re-keying threads to a project
 
