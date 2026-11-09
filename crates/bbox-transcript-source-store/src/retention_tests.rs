@@ -869,3 +869,64 @@ fn the_first_run_reclaims_a_legacy_store_with_oversized_and_orphaned_state() {
         .unwrap();
     assert!(store.source_storage_health(&scope()).unwrap().is_some());
 }
+
+#[test]
+fn lockless_stream_directories_left_by_a_crash_are_reclaimed_only_when_empty_and_expired() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let store = TranscriptSourceStore::open(&root).unwrap();
+    let scope_root = store.scope_root(&scope());
+
+    // Crash after creating the directory, before opening its lock.
+    let created = snapshot_in(&scope(), "crash-before-lock", b"{\"a\":1}\n");
+    fs::create_dir_all(stream_dir(&store, &created)).unwrap();
+
+    // Crash after a deleter unlinked lock, before its empty-only removal.
+    let unlinked_bytes = b"{\"b\":2}\n".to_vec();
+    let unlinked = snapshot_in(&scope(), "crash-after-unlink", &unlinked_bytes);
+    stage_all(&store, &unlinked, &unlinked_bytes);
+    let unlinked_dir = stream_dir(&store, &unlinked);
+    fs::remove_dir_all(unlinked_dir.join(CHUNKS_DIR)).unwrap();
+    fs::remove_file(unlinked_dir.join("lock")).unwrap();
+
+    // A lockless directory that still holds a file is never emptied.
+    let foreign = snapshot_in(&scope(), "lockless-with-content", b"{\"c\":3}\n");
+    let foreign_dir = stream_dir(&store, &foreign);
+    fs::create_dir_all(&foreign_dir).unwrap();
+    fs::write(foreign_dir.join("stray"), b"kept").unwrap();
+
+    for stream in [&created, &unlinked] {
+        assert!(stream_dir(&store, stream).is_dir());
+        assert!(!stream_dir(&store, stream).join("lock").exists());
+        // Non-creating acquisition finds nothing to lock.
+        assert_eq!(store.missing_chunks(stream).unwrap().len(), 1);
+    }
+
+    // Younger than the staging expiry: kept.
+    let young = store
+        .reap(&ReaperPolicy::default(), SystemTime::now())
+        .unwrap();
+    assert_eq!(young.totals().unpublished_streams.files, 0);
+    assert!(stream_dir(&store, &created).is_dir());
+
+    let expired = store.reap(&ReaperPolicy::default(), later(2)).unwrap();
+    assert_eq!(expired.totals().unpublished_streams.files, 2);
+    assert_eq!(expired.error_count(), 0, "{expired:?}");
+    assert!(!stream_dir(&store, &created).exists());
+    assert!(!unlinked_dir.exists());
+    assert!(foreign_dir.join("stray").is_file());
+    assert_eq!(
+        expired.scopes[0]
+            .health
+            .accounting
+            .as_ref()
+            .unwrap()
+            .unpublished_streams,
+        1
+    );
+    assert!(scope_root.join(HEALTH_NAME).is_file());
+
+    // A producer can still create the stream afterwards.
+    stage_all(&store, &created, b"{\"a\":1}\n");
+    assert!(store.missing_chunks(&created).unwrap().is_empty());
+}

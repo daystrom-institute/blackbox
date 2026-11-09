@@ -142,6 +142,8 @@ pub struct ScopeReapReport {
     pub generation_phase: Option<GenerationPhase>,
     pub errors: Vec<String>,
     pub error_count: u64,
+    /// The health record this run cached for the source.
+    pub health: SourceStorageHealth,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -355,6 +357,7 @@ impl TranscriptSourceStore {
             generation_phase,
             errors: sweep.errors,
             error_count: sweep.error_count,
+            health,
         }
     }
 
@@ -366,6 +369,7 @@ impl TranscriptSourceStore {
     /// Staging phase for one stream, under its verified lock.
     fn sweep_stream_staging(&self, stream: &Path, sweep: &mut ScopeSweep<'_>) -> Result<()> {
         let Some(lock) = self.acquire(stream, Acquire::Existing)? else {
+            remove_expired_lockless(stream, sweep);
             return Ok(());
         };
         let published = has_pointer(stream);
@@ -526,6 +530,26 @@ impl TranscriptSourceStore {
         }
         drop(readers);
         Ok(GenerationPhase::Ran)
+    }
+}
+
+/// A crash between creating a stream directory and its `lock`, or between
+/// unlinking `lock` and removing the directory, leaves a directory no lock
+/// can be verified for. Nothing can hold it, so the only safe step is an
+/// empty-only removal once the directory itself is older than the staging
+/// expiry. A producer re-creating it races benignly: either its `lock` makes
+/// the directory non-empty, or its open fails and it re-creates the
+/// directory. Contents are never removed without a verified lock.
+fn remove_expired_lockless(stream: &Path, sweep: &mut ScopeSweep<'_>) {
+    let Ok(metadata) = fs::symlink_metadata(stream) else {
+        return;
+    };
+    if metadata.is_dir()
+        && !has_pointer(stream)
+        && sweep.expired(metadata.modified().unwrap_or(sweep.now))
+        && fs::remove_dir(stream).is_ok()
+    {
+        sweep.counters.unpublished_streams.files += 1;
     }
 }
 
