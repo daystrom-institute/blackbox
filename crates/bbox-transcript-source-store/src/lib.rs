@@ -6,6 +6,12 @@
 //! chunks or from verified ranges of the current materialization and then
 //! drops the staged chunks it absorbed, so settled content is stored once.
 //! The reaper ([`TranscriptSourceStore::reap`]) bounds what remains.
+//
+// Every operation here is blocking filesystem work by design. Callers run it
+// on the blocking pool (ingest routes, the reaper task, doctor) or on the
+// index writer thread, never on an async worker, so the workspace's
+// blocking-I/O lint does not apply inside this crate.
+#![allow(clippy::disallowed_methods)]
 use anyhow::{Result, anyhow, ensure};
 use bbox_corpus_core::project_catalog::ConnectorScope;
 use bbox_transcript_source::*;

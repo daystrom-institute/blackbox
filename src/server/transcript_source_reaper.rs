@@ -40,10 +40,6 @@ impl TranscriptSourceRuntime {
         }
     }
 
-    pub(crate) fn root(&self) -> &Path {
-        &self.root
-    }
-
     /// The shared reservation ledger every ingest store handle admits through.
     pub(crate) fn admission(&self) -> Arc<StorageAdmission> {
         self.admission.clone()
