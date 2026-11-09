@@ -1249,6 +1249,7 @@ mod tests {
             conversation_source_root: None,
             native_source_root: None,
             native_sources: Vec::new(),
+            native_source_pass_hook: None,
             conversation_sources: Vec::new(),
         };
 
@@ -1347,6 +1348,7 @@ mod tests {
             conversation_source_root: None,
             native_source_root: None,
             native_sources: Vec::new(),
+            native_source_pass_hook: None,
             conversation_sources: Vec::new(),
         };
 

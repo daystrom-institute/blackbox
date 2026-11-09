@@ -48,6 +48,7 @@ pub fn find_session_file(
         conversation_source_root: None,
         native_source_root: None,
         native_sources: Vec::new(),
+        native_source_pass_hook: None,
         conversation_sources: Vec::new(),
         roots: roots.to_vec(),
         codex_root: codex_root.map(Path::to_path_buf),

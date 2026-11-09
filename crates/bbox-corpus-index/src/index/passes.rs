@@ -361,6 +361,40 @@ pub fn index_transcripts_via_adapters(
     commit_progress: bool,
 ) -> Result<()> {
     let registry = TranscriptAdapterRegistry::from_reindex_config(config);
+    let result = index_registry_locations(
+        &registry,
+        fields,
+        writer,
+        meta,
+        indexed_files,
+        indexed_docs,
+        skipped,
+        tool_edges,
+        commit_progress,
+    );
+    // Native adapters hold their source reader leases until the registry
+    // drops. Reclamation is scheduled only after that, whatever the outcome.
+    drop(registry);
+    if config.native_source_root.is_some()
+        && let Some(hook) = &config.native_source_pass_hook
+    {
+        hook();
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn index_registry_locations(
+    registry: &TranscriptAdapterRegistry,
+    fields: FieldHandles,
+    writer: &mut IndexWriter,
+    meta: &mut HashMap<String, FileMeta>,
+    indexed_files: &mut u64,
+    indexed_docs: &mut u64,
+    skipped: &mut u64,
+    tool_edges: &ToolEdgeContext,
+    commit_progress: bool,
+) -> Result<()> {
     for adapter in registry.adapters() {
         let sessions = adapter
             .scan_locations(TranscriptScanTarget::Sessions)
@@ -502,4 +536,105 @@ pub fn index_adapter_location(
         writer.commit()?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod native_pass_hook_tests {
+    use crate::index::TranscriptIndex;
+    use bbox_corpus_core::project_catalog::ConnectorScope;
+    use bbox_transcript_source::*;
+    use bbox_transcript_source_store::TranscriptSourceStore;
+    use std::sync::{Arc, Mutex};
+
+    fn scope() -> ConnectorScope {
+        ConnectorScope::try_new("csrc_0123456789abcdef", "native_transcript").unwrap()
+    }
+
+    /// Every call records whether the source reader lease was free, which
+    /// proves the pass's leases were released before the hook ran.
+    fn recording_hook(
+        store_root: std::path::PathBuf,
+    ) -> (crate::index::NativeSourcePassHook, Arc<Mutex<Vec<bool>>>) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let recorded = calls.clone();
+        let hook: crate::index::NativeSourcePassHook = Arc::new(move || {
+            // The generation phase runs only with the exclusive reader lease.
+            let lease_free = TranscriptSourceStore::for_read(&store_root)
+                .reap(
+                    &bbox_transcript_source_store::ReaperPolicy::default(),
+                    std::time::SystemTime::now(),
+                )
+                .map_or(true, |report| {
+                    report.scopes.iter().all(|scope| {
+                        scope.generation_phase
+                            == Some(bbox_transcript_source_store::GenerationPhase::Ran)
+                    })
+                });
+            recorded.lock().unwrap().push(lease_free);
+        });
+        (hook, calls)
+    }
+
+    #[test]
+    fn the_native_pass_hook_runs_after_reader_leases_drop_on_success_and_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let store_root = root.join("transcript-sources");
+        let store = TranscriptSourceStore::open(&store_root).unwrap();
+        let bytes = b"{\"type\":\"user\",\"sessionId\":\"s\",\"message\":{\"content\":\"hook\"}}\n";
+        let snapshot = StreamSnapshot {
+            schema_version: SCHEMA_VERSION,
+            scope: scope(),
+            stream_id: sha256(b"claude/default/s"),
+            source: NativeSource::Claude,
+            account: "default".into(),
+            session_id: "s".into(),
+            is_subagent: false,
+            content_sha256: sha256(bytes),
+            byte_length: bytes.len() as u64,
+            chunks: vec![ChunkRef {
+                sha256: sha256(bytes),
+                size: bytes.len() as u64,
+            }],
+        };
+        store
+            .install_chunk(&scope(), &snapshot.stream_id, &sha256(bytes), bytes)
+            .unwrap();
+        store
+            .publish(
+                &PublishRequest {
+                    snapshot,
+                    expected_generation: None,
+                },
+                "now",
+            )
+            .unwrap();
+
+        let mut index = TranscriptIndex::open_or_create_with_records(
+            &root.join("idx"),
+            Vec::new(),
+            None,
+            root.join("projects.json"),
+            root.join("kb.json"),
+            root.join("threads.json"),
+            Arc::new(crate::index::StaticProjectRecordsProvider::empty()),
+        )
+        .unwrap();
+        // Without native sources the hook is never called.
+        let (hook, calls) = recording_hook(store_root.clone());
+        index.set_native_source_pass_hook(hook);
+        index.build_index_with_project_access(false, &[]).unwrap();
+        assert!(calls.lock().unwrap().is_empty());
+
+        index.set_native_sources(store_root.clone(), vec![scope()]);
+        index.build_index_with_project_access(false, &[]).unwrap();
+        assert_eq!(*calls.lock().unwrap(), vec![true]);
+
+        // A failing native scan still releases its leases and notifies.
+        let saved = root.join("saved-sources");
+        std::fs::rename(&store_root, &saved).unwrap();
+        std::fs::write(&store_root, b"not a directory").unwrap();
+        assert!(index.build_index_with_project_access(true, &[]).is_err());
+        assert_eq!(calls.lock().unwrap().len(), 2);
+    }
 }
