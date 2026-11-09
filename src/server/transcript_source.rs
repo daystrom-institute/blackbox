@@ -9,7 +9,9 @@ use axum::routing::{post, put};
 use axum::{Json, Router};
 use bbox_corpus_core::project_catalog::ConnectorScope;
 use bbox_transcript_source::*;
-use bbox_transcript_source_store::TranscriptSourceStore;
+use bbox_transcript_source_store::{
+    StorageExhausted, TranscriptSourceStore, normalize_storage_error,
+};
 use std::sync::Arc;
 
 pub(crate) fn router(state: Arc<SharedState>) -> Router<Arc<SharedState>> {
@@ -73,12 +75,20 @@ fn reply<T: serde::Serialize>(result: Result<T>) -> Response {
     match result {
         Ok(value) => Json(value).into_response(),
         Err(error) => {
+            // The store normalizes at its boundary; this also covers storage
+            // errors raised outside it (opening the store root).
+            let error = normalize_storage_error(error);
             tracing::warn!(error = %error, "native transcript source request failed");
             let text = error.to_string();
-            let (status, code) = if let Some(catalog_error) =
+            // Exhaustion is checked by type, ahead of the generic I/O branch,
+            // so producers can tell it from a transient failure.
+            let (status, code) = if error.downcast_ref::<StorageExhausted>().is_some() {
+                (StatusCode::INSUFFICIENT_STORAGE, "storage_exhausted")
+            } else if let Some(catalog_error) =
                 error
                     .downcast_ref::<bbox_indexing::project_catalog_store::ProjectCatalogStoreError>(
-                    ) {
+                    )
+            {
                 (StatusCode::CONFLICT, catalog_error.code())
             } else if text.contains("scope_forbidden") || text.contains("scope_wrong_lane") {
                 (StatusCode::FORBIDDEN, text.as_str())
@@ -184,9 +194,12 @@ async fn chunk(
         return reply::<()>(Err(error));
     }
     let root = store_root(&state);
+    let runtime = state.transcript_source.clone();
     reply(
         blocking(move || {
-            TranscriptSourceStore::open(root)?.install_chunk(&scope, &stream, &hash, &body)
+            runtime
+                .ingest_store(root)?
+                .install_chunk(&scope, &stream, &hash, &body)
         })
         .await,
     )
@@ -200,8 +213,11 @@ async fn publish(
         return reply::<()>(Err(error));
     }
     let root = store_root(&state);
+    let runtime = state.transcript_source.clone();
     let result = blocking(move || {
-        TranscriptSourceStore::open(root)?.publish(&request, &chrono::Utc::now().to_rfc3339())
+        runtime
+            .ingest_store(root)?
+            .publish(&request, &chrono::Utc::now().to_rfc3339())
     })
     .await;
     if result.is_ok() {
@@ -306,6 +322,50 @@ mod tests {
             .unwrap(),
         );
         (Arc::new(state), token_path)
+    }
+
+    async fn reply_parts(response: Response) -> (StatusCode, serde_json::Value) {
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    #[tokio::test]
+    async fn storage_exhaustion_maps_to_507_ahead_of_the_generic_io_branch() {
+        let typed = reply::<()>(Err(anyhow::Error::new(StorageExhausted::new(
+            "admission refused",
+        ))));
+        let (status, body) = reply_parts(typed).await;
+        assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE);
+        assert_eq!(body["code"], "storage_exhausted");
+        assert!(body["message"].is_string());
+
+        // An unnormalized ENOSPC still classifies by its chain, not as a
+        // transient source failure.
+        let raw = reply::<()>(Err(anyhow::Error::from(std::io::Error::from(
+            std::io::ErrorKind::StorageFull,
+        ))
+        .context("opening the transcript store")));
+        let (status, body) = reply_parts(raw).await;
+        assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE);
+        assert_eq!(body["code"], "storage_exhausted");
+
+        let transient = reply::<()>(Err(anyhow::Error::from(std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied,
+        ))));
+        let (status, body) = reply_parts(transient).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["code"], "transcript_source_unavailable");
+
+        let missing = reply::<()>(Err(anyhow!(
+            "missing transcript chunk {}: ask missing again and upload it",
+            sha256(b"x")
+        )));
+        let (status, body) = reply_parts(missing).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "invalid_transcript_snapshot");
     }
 
     #[tokio::test]

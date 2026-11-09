@@ -19,6 +19,7 @@ pub(super) async fn start_background_tasks(shared: Arc<SharedState>) -> anyhow::
     spawn_vector_warmup_thread(shared.clone())?;
     spawn_code_read_view_refresher(shared.clone(), std::time::Duration::from_secs(60));
     spawn_storage_gc(shared.clone());
+    super::transcript_source_reaper::spawn(shared.transcript_source.clone());
     spawn_runtime_metrics_sampler();
     // Off-runtime companion to the sampler above: the sampler is a
     // tokio::spawn and therefore goes blind exactly when the runtime stalls.
