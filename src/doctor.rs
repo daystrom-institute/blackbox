@@ -12,6 +12,8 @@
 
 use serde::Serialize;
 
+mod storage;
+
 /// Finding severity, ordered so `max()` yields the worst level for the
 /// report status line. `Ok < Info < Warn < Action < Blocked`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -138,6 +140,10 @@ pub(crate) struct DoctorReport {
     pub(crate) knowledge_transport: Option<
         bbox_indexing::knowledge_transport_observations::KnowledgeTransportObservationSnapshotV1,
     >,
+    /// Storage section numbers at every severity: filesystem headroom and
+    /// cached transcript source accounting.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) storage: Option<storage::StorageSnapshot>,
 }
 
 impl DoctorReport {
@@ -152,7 +158,21 @@ impl DoctorReport {
             sections,
             checkout_access: None,
             knowledge_transport: None,
+            storage: None,
         }
+    }
+
+    fn with_storage(mut self, snapshot: storage::StorageSnapshot) -> Self {
+        self.storage = Some(snapshot);
+        self
+    }
+
+    /// The storage section's one-line roll-up, shown even when every
+    /// storage finding is `ok`.
+    pub(crate) fn storage_summary(&self) -> Option<&str> {
+        self.storage
+            .as_ref()
+            .map(|storage| storage.summary.as_str())
     }
 
     fn with_checkout_access(
@@ -208,6 +228,9 @@ impl DoctorReport {
         if !ok_sections.is_empty() {
             out.push_str(&format!("\nok: {}\n", ok_sections.join(", ")));
         }
+        if let Some(storage) = self.storage_summary() {
+            out.push_str(&format!("storage: {storage}\n"));
+        }
         out
     }
 }
@@ -243,6 +266,17 @@ pub(crate) fn run(server: &crate::server::BlackboxServer) -> anyhow::Result<Doct
             observations,
         ));
     }
+    // Storage reads host filesystem statistics, which a frozen bridge
+    // response cannot carry; like the other catalog-era sections it is
+    // reported where the catalog is the authority.
+    let storage = state
+        .project_authority
+        .catalog_store()
+        .is_some()
+        .then(|| storage::collect(state));
+    if let Some((section, _)) = &storage {
+        sections.push(section.clone());
+    }
     // Catalog-only project health (plan section 8, P5-G). Each section is
     // observational: it reports what the catalog, the accepted pointer, and
     // the runtime's published observations already say, and never counts an
@@ -260,6 +294,9 @@ pub(crate) fn run(server: &crate::server::BlackboxServer) -> anyhow::Result<Doct
     let mut report = DoctorReport::from_sections(sections).with_checkout_access(checkout_access);
     if let Some(observations) = knowledge_transport {
         report = report.with_knowledge_transport(observations);
+    }
+    if let Some((_, snapshot)) = storage {
+        report = report.with_storage(snapshot);
     }
     Ok(report)
 }
@@ -280,6 +317,7 @@ pub(crate) fn section_names(state: &crate::server::state::SharedState) -> Vec<&'
     ];
     if catalog {
         names.push("knowledge_transport");
+        names.push(storage::SECTION);
     }
     if catalog {
         names.extend([
@@ -311,6 +349,10 @@ pub(crate) fn run_section(
         return Ok(
             DoctorReport::from_sections(vec![section_report]).with_checkout_access(checkout_access)
         );
+    }
+    if section == storage::SECTION {
+        let (section_report, snapshot) = storage::collect(state);
+        return Ok(DoctorReport::from_sections(vec![section_report]).with_storage(snapshot));
     }
     if section == "knowledge_transport" {
         let checkout_access = state.checkout_access_observations.health();
@@ -3410,6 +3452,131 @@ mod catalog_health_tests {
                 )],
             )));
         crate::server::BlackboxServer::new(std::sync::Arc::new(state))
+    }
+
+    /// The storage section is part of the catalog vocabulary, collects alone
+    /// when requested, carries its numbers at ok severity, and reads the
+    /// accounting a real reaper run cached for an enrolled native source. The
+    /// frozen bridge report does not gain it.
+    #[test]
+    fn storage_section_reports_cached_native_accounting_and_stays_out_of_bridge_reports() {
+        use bbox_transcript_source::*;
+        crate::init_system_memory_for_tests();
+        let fixture = CatalogFixture::new();
+        let server = fixture.server();
+        let state_dir = fixture.root().join("native-state");
+        let scope = bbox_corpus_core::project_catalog::ConnectorScope::try_new(
+            "csrc_0123456789abcdef",
+            "native_transcript",
+        )
+        .unwrap();
+        let unmeasured = bbox_corpus_core::project_catalog::ConnectorScope::try_new(
+            "csrc_fedcba9876543210",
+            "native_transcript",
+        )
+        .unwrap();
+        {
+            let mut cfg = server.state.config.write();
+            cfg.paths.state_dir = state_dir.clone();
+            cfg.source_connectors = crate::config::SourceConnectorsConfig {
+                retained_conversations: Vec::new(),
+                enabled: true,
+                producers: vec![crate::config::ConnectorProducerConfig {
+                    producer_id: "fixture-producer".into(),
+                    token_file: fixture.root().join("producer.token"),
+                    token_files: Vec::new(),
+                    scopes: [&scope, &unmeasured]
+                        .into_iter()
+                        .map(|scope| crate::config::ConnectorScopeGrant {
+                            connector_source_id: scope.connector_source_id().clone(),
+                            connector_kind: scope.connector_kind().clone(),
+                            remote_authority: "fixture-installation".into(),
+                            profile: crate::config::ConnectorProfile::Transcript,
+                        })
+                        .collect(),
+                }],
+            };
+        }
+        let store = bbox_transcript_source_store::TranscriptSourceStore::open(
+            state_dir.join("transcript-sources"),
+        )
+        .unwrap();
+        let bytes = b"{\"type\":\"user\"}\n";
+        let snapshot = StreamSnapshot {
+            schema_version: SCHEMA_VERSION,
+            scope: scope.clone(),
+            stream_id: sha256(b"claude/default/doctor"),
+            source: NativeSource::Claude,
+            account: "default".into(),
+            session_id: "doctor".into(),
+            is_subagent: false,
+            content_sha256: sha256(bytes),
+            byte_length: bytes.len() as u64,
+            chunks: vec![ChunkRef {
+                sha256: sha256(bytes),
+                size: bytes.len() as u64,
+            }],
+        };
+        store
+            .install_chunk(&scope, &snapshot.stream_id, &sha256(bytes), bytes)
+            .unwrap();
+        store
+            .publish(
+                &PublishRequest {
+                    snapshot,
+                    expected_generation: None,
+                },
+                "now",
+            )
+            .unwrap();
+        store
+            .reap(
+                &bbox_transcript_source_store::ReaperPolicy::default(),
+                std::time::SystemTime::now(),
+            )
+            .unwrap();
+
+        assert!(section_names(&server.state).contains(&"storage"));
+        let report = run_section(&server, "storage").unwrap();
+        assert_eq!(report.sections.len(), 1);
+        let storage = report.storage.as_ref().expect("storage numbers");
+        assert!(!storage.filesystems.is_empty());
+        assert!(storage.filesystems.iter().any(|fs| {
+            fs.holds_transcript_source_store
+                && fs
+                    .roots
+                    .iter()
+                    .any(|root| root.label == "transcript source store")
+        }));
+        let measured = &storage.transcript_sources[0];
+        assert_eq!(measured.state, "measured");
+        assert_eq!(
+            measured.accounting.as_ref().unwrap().live_bytes,
+            bytes.len() as u64
+        );
+        assert!(measured.measurement_age_secs.is_some());
+        assert_eq!(storage.transcript_sources[1].state, "unavailable");
+        assert!(
+            report
+                .render_summary()
+                .contains("storage: worst filesystem")
+        );
+        let full = run(&server).unwrap();
+        assert!(
+            full.sections
+                .iter()
+                .any(|section| section.section == "storage")
+        );
+        assert!(full.storage.is_some());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let bridge = crate::server::BlackboxServer::new(std::sync::Arc::new(
+            crate::server::state::SharedState::for_test(&tmp.path().canonicalize().unwrap()),
+        ));
+        assert!(!section_names(&bridge.state).contains(&"storage"));
+        let bridge_report = run(&bridge).unwrap();
+        assert!(bridge_report.storage.is_none());
+        assert!(run_section(&bridge, "storage").is_err());
     }
 
     /// The locality cutovers are retired: neither a catalog daemon (with

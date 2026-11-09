@@ -98,6 +98,9 @@ fn render_report(
         if section != "knowledge_transport" {
             report.knowledge_transport = None;
         }
+        if section != "storage" {
+            report.storage = None;
+        }
     }
     if p.detail.as_deref() == Some("full") {
         let selection = serde_json::to_string(&serde_json::json!([
@@ -160,10 +163,14 @@ fn render_report(
         rows.push(row);
     }
     let next_offset = (offset + rows.len() < total).then_some(offset + rows.len());
-    let value = serde_json::json!({"status": report.status, "detail": "summary",
+    let mut value = serde_json::json!({"status": report.status, "detail": "summary",
         "sections": sections, "findings": rows, "total_findings": total,
         "offset": offset, "next_offset": next_offset,
         "detail_hint": "Use detail=full and an exact section for server-owned diagnostic counters."});
+    // Storage numbers stay visible when every storage finding is ok.
+    if let Some(storage) = report.storage_summary() {
+        value["storage"] = serde_json::Value::String(storage.to_owned());
+    }
     if p.format.as_deref() == Some("json") {
         Ok(serde_json::to_string(&value)?)
     } else {
@@ -185,6 +192,9 @@ fn render_report(
             .map(|section| format!("{}={}", section.section, section.worst().as_str()))
             .collect::<Vec<_>>();
         out.push_str(&format!("sections: {}\n", names.join(", ")));
+        if let Some(storage) = report.storage_summary() {
+            out.push_str(&format!("storage: {storage}\n"));
+        }
         if let Some(offset) = next_offset {
             out.push_str(&format!("next_offset: {offset}\n"));
         }
