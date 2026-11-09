@@ -1,21 +1,116 @@
 //! Daemon ownership of the native transcript landing store's storage bounds:
-//! the single reservation ledger for its root, and the reaper schedule.
+//! the store root, the single reservation ledger for it, the reaper
+//! schedule, and the storage observation doctor reads.
+//!
+//! The root is fixed when the daemon opens. Every transcript route, the
+//! ledger, the reaper and doctor read it from here, never from live config,
+//! so a configuration reload cannot split ingest from its admission and
+//! reclamation; moving the store takes a restart.
 //!
 //! One daemon owns a store root (the instance lock covers the state root),
 //! while routes open a fresh store handle per request, so the ledger lives
 //! here rather than on a handle. The reaper runs at task start, on a
 //! periodic timer, and after every native index pass (nudged by the index
 //! writer once the pass's reader leases dropped). Runs are serialized by this
-//! one task and execute on the blocking pool.
+//! one task and execute on the blocking pool. Each run also samples
+//! filesystem headroom, so doctor reports one consistent observation that
+//! changes only when the reaper runs.
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bbox_config::config::TranscriptSourceConfig;
 use bbox_transcript_source_store::{
-    GenerationPhase, ReapReport, ReaperPolicy, ReservePolicy, StorageAdmission,
-    TranscriptSourceStore,
+    GenerationPhase, ReapReport, ReaperPolicy, ReservePolicy, SourceStorageHealth,
+    StorageAdmission, TranscriptSourceStore, nearest_existing_ancestor,
 };
+use serde::Serialize;
+
+/// What one filesystem probe reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FsProbe {
+    pub(crate) device: u64,
+    pub(crate) total: u64,
+    pub(crate) available: u64,
+}
+
+/// A store root whose filesystem headroom is sampled.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct StorageRoot {
+    pub(crate) label: String,
+    pub(crate) path: PathBuf,
+    /// The directory actually probed: the root itself, or its nearest
+    /// existing ancestor (the parent first, for a file root).
+    #[serde(skip)]
+    pub(crate) probe_dir: PathBuf,
+}
+
+impl StorageRoot {
+    pub(crate) fn new(label: impl Into<String>, path: PathBuf, directory: bool) -> Self {
+        let start = if directory {
+            path.as_path()
+        } else {
+            path.parent().unwrap_or(&path)
+        };
+        Self {
+            label: label.into(),
+            probe_dir: nearest_existing_ancestor(start),
+            path,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ProbedRoot {
+    pub(crate) root: StorageRoot,
+    pub(crate) probe: Result<FsProbe, String>,
+}
+
+/// One reaper run's view of storage: filesystem headroom sampled with the
+/// run, and every source directory the run measured, granted or not.
+#[derive(Debug, Clone)]
+pub(crate) struct StorageObservation {
+    pub(crate) sampled_at_unix: u64,
+    pub(crate) roots: Vec<ProbedRoot>,
+    pub(crate) transcript_root: ProbedRoot,
+    pub(crate) sources: BTreeMap<String, SourceStorageHealth>,
+}
+
+pub(crate) fn probe_filesystem(path: &Path) -> std::io::Result<FsProbe> {
+    let space = bbox_transcript_source_store::probe_filesystem(path)?;
+    #[cfg(unix)]
+    let device = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path)?.dev()
+    };
+    // Without device ids every probe is its own filesystem.
+    #[cfg(not(unix))]
+    let device = {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        path.hash(&mut hasher);
+        hasher.finish()
+    };
+    Ok(FsProbe {
+        device,
+        total: space.total,
+        available: space.available,
+    })
+}
+
+fn probed(root: &StorageRoot) -> ProbedRoot {
+    ProbedRoot {
+        root: root.clone(),
+        probe: probe_filesystem(&root.probe_dir).map_err(|error| error.to_string()),
+    }
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
+}
 
 pub(crate) struct TranscriptSourceRuntime {
     root: PathBuf,
@@ -23,10 +118,32 @@ pub(crate) struct TranscriptSourceRuntime {
     policy: ReaperPolicy,
     interval: Duration,
     nudge: Arc<tokio::sync::Notify>,
+    /// Instance-lock roots whose filesystems doctor reports, beside the
+    /// transcript store root itself.
+    probe_roots: Vec<StorageRoot>,
+    observation: Mutex<Option<StorageObservation>>,
 }
 
 impl TranscriptSourceRuntime {
-    pub(crate) fn new(root: PathBuf, config: &TranscriptSourceConfig) -> Self {
+    /// The daemon's runtime: the store under the opened state directory,
+    /// and every instance-lock root as a headroom probe.
+    pub(crate) fn from_config(cfg: &crate::config::Config) -> Self {
+        let probe_roots = super::instance_lock::instance_lock_roots(cfg)
+            .into_iter()
+            .map(|root| StorageRoot::new(root.label, root.path.clone(), root.is_directory()))
+            .collect();
+        Self::new(
+            cfg.paths.state_dir.join("transcript-sources"),
+            &cfg.transcript_source,
+            probe_roots,
+        )
+    }
+
+    pub(crate) fn new(
+        root: PathBuf,
+        config: &TranscriptSourceConfig,
+        probe_roots: Vec<StorageRoot>,
+    ) -> Self {
         let reserve = ReservePolicy::from_config(config.min_free_bytes);
         Self {
             admission: Arc::new(StorageAdmission::new(root.clone(), reserve)),
@@ -37,12 +154,14 @@ impl TranscriptSourceRuntime {
             },
             interval: Duration::from_secs(config.reaper_interval_secs),
             nudge: Arc::new(tokio::sync::Notify::new()),
+            probe_roots,
+            observation: Mutex::new(None),
         }
     }
 
-    /// The shared reservation ledger every ingest store handle admits through.
-    pub(crate) fn admission(&self) -> Arc<StorageAdmission> {
-        self.admission.clone()
+    /// The store root every transcript surface uses, fixed at open.
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
     }
 
     pub(crate) fn reserve_policy(&self) -> ReservePolicy {
@@ -53,12 +172,19 @@ impl TranscriptSourceRuntime {
         self.interval
     }
 
-    /// Ingest handle for `root`, admitting through the shared ledger.
-    pub(crate) fn ingest_store(
-        &self,
-        root: impl AsRef<Path>,
-    ) -> anyhow::Result<TranscriptSourceStore> {
-        Ok(TranscriptSourceStore::open(root)?.with_admission(self.admission()))
+    /// Ingest handle on the runtime root, admitting through the shared ledger.
+    pub(crate) fn ingest_store(&self) -> anyhow::Result<TranscriptSourceStore> {
+        Ok(TranscriptSourceStore::open(&self.root)?.with_admission(self.admission.clone()))
+    }
+
+    /// Control and read handle on the runtime root; never admits.
+    pub(crate) fn store(&self) -> anyhow::Result<TranscriptSourceStore> {
+        TranscriptSourceStore::open(&self.root)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn admission_root(&self) -> &Path {
+        self.admission.root()
     }
 
     /// Hook for the index writer: never blocks, coalesces into one pending
@@ -68,9 +194,50 @@ impl TranscriptSourceRuntime {
         Arc::new(move || nudge.notify_one())
     }
 
-    /// One reaper run. Blocking filesystem work: call it on the blocking pool.
+    /// The latest reaper run's storage observation; `None` before the first.
+    pub(crate) fn observation(&self) -> Option<StorageObservation> {
+        self.observation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// One reaper run, then a headroom sample, recorded together. Blocking
+    /// filesystem work: call it on the blocking pool.
     pub(crate) fn run_once(&self) -> anyhow::Result<ReapReport> {
-        TranscriptSourceStore::for_read(&self.root).reap(&self.policy, SystemTime::now())
+        let result =
+            TranscriptSourceStore::for_read(&self.root).reap(&self.policy, SystemTime::now());
+        let transcript_root = probed(&StorageRoot::new(
+            "transcript source store",
+            self.root.clone(),
+            true,
+        ));
+        let mut roots = self.probe_roots.iter().map(probed).collect::<Vec<_>>();
+        roots.push(transcript_root.clone());
+        let mut observation = self
+            .observation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A run that could not enumerate the store keeps the sources it last
+        // measured; headroom is always the fresh sample.
+        let sources = match &result {
+            Ok(report) => report
+                .scopes
+                .iter()
+                .map(|scope| (scope.connector_source_id.clone(), scope.health.clone()))
+                .collect(),
+            Err(_) => observation
+                .as_ref()
+                .map(|previous| previous.sources.clone())
+                .unwrap_or_default(),
+        };
+        *observation = Some(StorageObservation {
+            sampled_at_unix: unix_now(),
+            roots,
+            transcript_root,
+            sources,
+        });
+        result
     }
 }
 
@@ -149,6 +316,7 @@ mod tests {
                 reaper_interval_secs: 24 * 60 * 60,
                 ..TranscriptSourceConfig::default()
             },
+            Vec::new(),
         ));
         spawn(runtime.clone());
         let health = scope_root.join("health.json");

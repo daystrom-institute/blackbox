@@ -45,6 +45,11 @@
   directory removal. If that removal fails, a producer re-created the stream
   through a fresh lock and the attempt ends; never resume deleting contents
   without re-acquiring and verifying the current lock.
+- A crash between creating a stream directory and its `lock`, or between
+  unlinking `lock` and the final removal, leaves a directory with no lock to
+  verify. The reaper may only `rmdir` such a directory (empty-only) once it is
+  older than the staging expiry; it never removes the contents of a
+  directory it cannot lock.
 
 ## Reaper
 
@@ -65,8 +70,10 @@
 - Scope-level temporaries of contact and health writes are swept under
   `contact.lock`, the lock those writes take. `contact.json`,
   `contact.lock`, `readers.lock` and `health.json` are never removed.
-- Each run caches a per-source measurement in `health.json`, so diagnostics
-  read that record and never walk the store. A run that cannot measure keeps
+- Each run caches a per-source measurement in `health.json` and returns it in
+  the run report; the daemon keeps the latest run's measurements (every
+  source directory, granted or not) with a headroom sample, and diagnostics
+  read that observation instead of walking the store or probing live. A run that cannot measure keeps
   the previous measurement and records the failed attempt.
 
 ## Storage exhaustion and admission
@@ -76,7 +83,10 @@
   persist error, becomes `StorageExhausted`. Callers classify by that type,
   never by message text, and must check it before any generic I/O branch.
 - Admission is optional per handle and comes from one ledger per store root
-  owned by the daemon, because handles are per request. Check-and-reserve is
+  owned by the daemon, because handles are per request. The daemon fixes the
+  store root when it opens; routes, the ledger, the reaper and diagnostics
+  must all take it from that runtime, never from live config, or a reload
+  splits ingest from its admission and reclamation. Check-and-reserve is
   atomic under the ledger mutex; a reservation guard releases on every exit
   path. Chunk installs reserve the chunk plus metadata allowances for each
   directory and temporary they may create; publications reserve the full new

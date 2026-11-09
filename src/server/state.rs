@@ -675,6 +675,7 @@ impl SharedState {
                 super::transcript_source_reaper::TranscriptSourceRuntime::new(
                     store_dir.join("transcript-sources"),
                     &Default::default(),
+                    Vec::new(),
                 ),
             ),
             project_authority,

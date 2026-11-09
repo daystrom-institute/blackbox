@@ -110,7 +110,8 @@ A reaper bounds the rest. It runs when the daemon starts, every
 staging phase removes chunks already present in the current generation,
 staging and temporaries older than `staging_expiry_secs`, the oldest staged
 chunks of a source over `staging_budget_bytes`, and stream directories that
-never published and have been idle for the staging expiry. Its generation phase
+never published and have been idle for the staging expiry (including empty
+directories an interrupted create or delete left without a lock file). Its generation phase
 removes every generation file other than the current one, but only when no
 index pass holds the source's reader lease; otherwise the next run retries.
 Sources whose grant was removed are reclaimed the same way. Each run logs one
@@ -146,18 +147,26 @@ staging_expiry_secs = 86400       # default 24 hours
 staging_budget_bytes = 2147483648 # per source, default 2 GiB
 ```
 
+The store lives at `<state_dir>/transcript-sources` as resolved when the daemon
+opens. Ingest, admission, the reaper and doctor all use that root; a
+configuration reload that changes `state_dir` does not move it until restart.
+
 The reserve is a soft guarantee. Other writers on the same filesystem (indexes,
 vectors, contact and lease files) do not reserve against it. Live content still
 grows with source history, because retention is unchanged. `bbox_doctor`'s
-`storage` section (catalog-authority daemons) reports each store filesystem's
-size and free space, warns below 15% free, and raises an action on the
-filesystem holding the transcript store when free space is below the reserve.
-For each native source it reports live, stored, staged and non-current bytes,
-the stored-to-live ratio, and the age of the reaper's last measurement, and
+`storage` section (catalog-authority daemons) reports what the reaper's latest
+run sampled: each store filesystem's size and free space, with a warning below
+15% free and an action on the filesystem holding the transcript store when free
+space is below the reserve, and for each native source its live, stored, staged
+and non-current bytes, the stored-to-live ratio and the measurement time. It
 warns when stored exceeds live by more than 25% after a completed generation
-phase or when the measurement is older than three reaper intervals. Unadmitted
-staging younger than the expiry is legitimately retained, so treat the ratio
-as a diagnostic.
+phase or when the measurement is older than three reaper intervals. Sources
+whose grant was removed stay listed while their bytes remain; a newly granted
+source shows as unavailable until its first measurement. Because the numbers
+change only when the reaper runs, they lag live free space by up to one reaper
+interval; admission itself always reads live free space. Unadmitted staging
+younger than the expiry is legitimately retained, so treat the ratio as a
+diagnostic.
 
 Removing or disabling a grant rejects subsequent producer requests. A daemon
 configuration restart updates index enrollment, and its next reindex removes

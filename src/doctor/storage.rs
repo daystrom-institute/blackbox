@@ -1,14 +1,18 @@
 //! Doctor `storage` section: free space on every filesystem holding a store
 //! root the daemon opens, and the native transcript source store's
-//! accounting as its reaper cached it. Reads filesystem statistics and the
-//! per-source health records only; it never walks a store.
+//! accounting. Both come from the transcript source reaper's latest
+//! observation in daemon state, so doctor never probes or walks a store and
+//! its body stays byte-stable until the reaper runs again. Times are
+//! absolute; nothing serialized depends on when the report was rendered.
 use super::{Finding, SectionReport};
+use crate::server::transcript_source_reaper::{
+    FsProbe, ProbedRoot, StorageObservation, StorageRoot,
+};
 use bbox_transcript_source_store::{
-    GenerationPhase, ReservePolicy, SourceStorageHealth, StorageAccounting, TranscriptSourceStore,
-    nearest_existing_ancestor,
+    GenerationPhase, ReservePolicy, SourceStorageHealth, StorageAccounting,
 };
 use serde::Serialize;
-use std::path::{Path, PathBuf};
+use std::collections::BTreeSet;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub(crate) const SECTION: &str = "storage";
@@ -19,24 +23,6 @@ const LOW_HEADROOM_FRACTION: f64 = 0.15;
 const AMPLIFICATION_RATIO: f64 = 1.25;
 /// A measurement older than this many reaper intervals warns.
 const STALE_INTERVALS: u32 = 3;
-
-/// What one filesystem probe reports.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct FsProbe {
-    pub(crate) device: u64,
-    pub(crate) total: u64,
-    pub(crate) available: u64,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct StorageRoot {
-    pub(crate) label: String,
-    pub(crate) path: PathBuf,
-    /// The directory actually probed: the root itself, or its nearest
-    /// existing ancestor (the parent first, for a file root).
-    #[serde(skip)]
-    pub(crate) probe_dir: PathBuf,
-}
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct FilesystemHeadroom {
@@ -52,14 +38,17 @@ pub(crate) struct FilesystemHeadroom {
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct UnprobedRoot {
     pub(crate) label: String,
-    pub(crate) path: PathBuf,
+    pub(crate) path: std::path::PathBuf,
     pub(crate) error: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct TranscriptSourceStorage {
     pub(crate) connector_source_id: String,
-    /// `measured`, `unavailable` (never measured) or `unreadable`.
+    /// Whether a current producer grant enrolls the source. A source whose
+    /// grant was removed keeps its stored bytes and stays reported.
+    pub(crate) configured: bool,
+    /// `measured` or `unavailable` (never measured).
     pub(crate) state: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) accounting: Option<StorageAccounting>,
@@ -68,20 +57,18 @@ pub(crate) struct TranscriptSourceStorage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) measured_at_unix: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) measurement_age_secs: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) last_attempt_at_unix: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) generation_phase: Option<GenerationPhase>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) last_attempt_error: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) error: Option<String>,
 }
 
 /// The section's numbers at every severity, including `ok`.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct StorageSnapshot {
+    /// When the reaper sampled this observation; `None` before its first run.
+    pub(crate) sampled_at_unix: Option<u64>,
     pub(crate) filesystems: Vec<FilesystemHeadroom>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) unprobed_roots: Vec<UnprobedRoot>,
@@ -91,103 +78,44 @@ pub(crate) struct StorageSnapshot {
 }
 
 pub(crate) struct StorageInputs {
-    /// Probe set, the transcript source store root included.
-    pub(crate) roots: Vec<StorageRoot>,
-    pub(crate) transcript_root: StorageRoot,
+    pub(crate) observation: Option<StorageObservation>,
+    /// Native transcript sources enrolled by current producer grants.
+    pub(crate) configured_sources: Vec<String>,
     pub(crate) reserve: ReservePolicy,
     pub(crate) reaper_interval: Duration,
-    pub(crate) sources: Vec<(String, Result<Option<SourceStorageHealth>, String>)>,
     pub(crate) now_unix: u64,
-}
-
-fn probe_dir(path: &Path, directory: bool) -> PathBuf {
-    let start = if directory {
-        path
-    } else {
-        path.parent().unwrap_or(path)
-    };
-    nearest_existing_ancestor(start)
-}
-
-fn probe_filesystem(path: &Path) -> std::io::Result<FsProbe> {
-    let space = bbox_transcript_source_store::probe_filesystem(path)?;
-    #[cfg(unix)]
-    let device = {
-        use std::os::unix::fs::MetadataExt;
-        std::fs::metadata(path)?.dev()
-    };
-    // Without device ids every probe is its own filesystem.
-    #[cfg(not(unix))]
-    let device = {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        path.hash(&mut hasher);
-        hasher.finish()
-    };
-    Ok(FsProbe {
-        device,
-        total: space.total,
-        available: space.available,
-    })
 }
 
 /// Collect the section for the running daemon.
 pub(crate) fn collect(
     state: &crate::server::state::SharedState,
 ) -> (SectionReport, StorageSnapshot) {
-    let cfg = state.config.read().clone();
-    let transcript_path = cfg.paths.state_dir.join("transcript-sources");
-    let transcript_root = StorageRoot {
-        label: "transcript source store".into(),
-        probe_dir: probe_dir(&transcript_path, true),
-        path: transcript_path.clone(),
-    };
-    let mut roots = crate::server::instance_lock::instance_lock_roots(&cfg)
-        .into_iter()
-        .map(|root| StorageRoot {
-            label: root.label.into(),
-            probe_dir: probe_dir(&root.path, root.is_directory()),
-            path: root.path,
-        })
-        .collect::<Vec<_>>();
-    roots.push(transcript_root.clone());
-    let store = TranscriptSourceStore::for_read(&transcript_path);
-    let mut sources = Vec::new();
-    if cfg.source_connectors.enabled {
-        let mut seen = std::collections::BTreeSet::new();
-        for grant in cfg
-            .source_connectors
-            .producers
-            .iter()
-            .flat_map(|producer| producer.scopes.iter())
-            .filter(|grant| grant.profile == crate::config::ConnectorProfile::Transcript)
-        {
-            let scope = grant.scope();
-            let id = scope.connector_source_id().as_str().to_owned();
-            if seen.insert(id.clone()) {
-                sources.push((
-                    id,
-                    store
-                        .source_storage_health(&scope)
-                        .map_err(|error| format!("{error:#}")),
-                ));
+    let configured_sources = {
+        let cfg = state.config.read();
+        let mut ids = BTreeSet::new();
+        if cfg.source_connectors.enabled {
+            for grant in cfg
+                .source_connectors
+                .producers
+                .iter()
+                .flat_map(|producer| producer.scopes.iter())
+                .filter(|grant| grant.profile == crate::config::ConnectorProfile::Transcript)
+            {
+                ids.insert(grant.connector_source_id.as_str().to_owned());
             }
         }
-    }
+        ids.into_iter().collect()
+    };
     let now_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs());
-    build(
-        StorageInputs {
-            roots,
-            transcript_root,
-            reserve: state.transcript_source.reserve_policy(),
-            reaper_interval: state.transcript_source.interval(),
-            sources,
-            now_unix,
-        },
-        &probe_filesystem,
-    )
+    build(StorageInputs {
+        observation: state.transcript_source.observation(),
+        configured_sources,
+        reserve: state.transcript_source.reserve_policy(),
+        reaper_interval: state.transcript_source.interval(),
+        now_unix,
+    })
 }
 
 fn bytes(value: u64) -> String {
@@ -205,13 +133,14 @@ fn bytes(value: u64) -> String {
     }
 }
 
-fn age(secs: u64) -> String {
-    match secs {
-        0..60 => format!("{secs}s"),
-        60..3600 => format!("{}m", secs / 60),
-        3600..86_400 => format!("{}h", secs / 3600),
-        _ => format!("{}d", secs / 86_400),
-    }
+fn timestamp(unix: u64) -> String {
+    i64::try_from(unix)
+        .ok()
+        .and_then(|secs| chrono::DateTime::from_timestamp(secs, 0))
+        .map_or_else(
+            || format!("unix {unix}"),
+            |time| time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        )
 }
 
 fn root_names(roots: &[StorageRoot]) -> String {
@@ -230,41 +159,43 @@ fn phase_name(phase: Option<GenerationPhase>) -> &'static str {
     }
 }
 
-/// Build the section from probes and cached records. Pure, so tests can
-/// supply filesystems that a test host cannot mount.
-pub(crate) fn build(
-    inputs: StorageInputs,
-    probe: &dyn Fn(&Path) -> std::io::Result<FsProbe>,
-) -> (SectionReport, StorageSnapshot) {
-    let mut findings = Vec::new();
-    let mut groups: Vec<(FsProbe, Vec<StorageRoot>)> = Vec::new();
-    let mut unprobed = Vec::new();
-    let transcript_device = probe(&inputs.transcript_root.probe_dir)
+fn filesystem_findings(
+    observation: &StorageObservation,
+    reserve_policy: ReservePolicy,
+    findings: &mut Vec<Finding>,
+) -> (Vec<FilesystemHeadroom>, Vec<UnprobedRoot>) {
+    let sampled = timestamp(observation.sampled_at_unix);
+    let transcript_device = observation
+        .transcript_root
+        .probe
+        .as_ref()
         .ok()
         .map(|found| found.device);
-    for root in inputs.roots {
-        match probe(&root.probe_dir) {
+    let mut groups: Vec<(FsProbe, Vec<StorageRoot>)> = Vec::new();
+    let mut unprobed = Vec::new();
+    for ProbedRoot { root, probe } in &observation.roots {
+        match probe {
             Ok(found) => match groups
                 .iter_mut()
                 .find(|(group, _)| group.device == found.device)
             {
                 Some((_, roots)) => {
                     if !roots.iter().any(|known| known.path == root.path) {
-                        roots.push(root);
+                        roots.push(root.clone());
                     }
                 }
-                None => groups.push((found, vec![root])),
+                None => groups.push((*found, vec![root.clone()])),
             },
             Err(error) => {
                 findings.push(Finding::warn(format!(
-                    "could not read free space for {} ({}): {error}",
+                    "could not read free space for {} ({}) at {sampled}: {error}",
                     root.label,
                     root.path.display()
                 )));
                 unprobed.push(UnprobedRoot {
-                    label: root.label,
-                    path: root.path,
-                    error: error.to_string(),
+                    label: root.label.clone(),
+                    path: root.path.clone(),
+                    error: error.clone(),
                 });
             }
         }
@@ -277,9 +208,9 @@ pub(crate) fn build(
             found.available as f64 / found.total as f64
         };
         let holds_transcript = transcript_device == Some(found.device);
-        let reserve = holds_transcript.then(|| inputs.reserve.reserve_for(found.total));
+        let reserve = holds_transcript.then(|| reserve_policy.reserve_for(found.total));
         let headroom = format!(
-            "{:.1}% available ({} of {})",
+            "{:.1}% available ({} of {}) at {sampled}",
             fraction * 100.0,
             bytes(found.available),
             bytes(found.total)
@@ -309,107 +240,141 @@ pub(crate) fn build(
             transcript_reserve_bytes: reserve,
         });
     }
+    (filesystems, unprobed)
+}
 
-    let stale_after = inputs.reaper_interval.as_secs() * u64::from(STALE_INTERVALS);
-    let mut sources = Vec::new();
-    for (id, record) in inputs.sources {
-        let mut row = TranscriptSourceStorage {
-            connector_source_id: id.clone(),
-            state: "unavailable",
-            accounting: None,
-            stored_to_live_ratio: None,
-            measured_at_unix: None,
-            measurement_age_secs: None,
-            last_attempt_at_unix: None,
-            generation_phase: None,
-            last_attempt_error: None,
-            error: None,
-        };
-        let health = match record {
-            Err(error) => {
-                findings.push(Finding::warn(format!(
-                    "transcript source {id} storage record is unreadable: {error}"
-                )));
-                row.state = "unreadable";
-                row.error = Some(error);
-                sources.push(row);
-                continue;
-            }
-            Ok(health) => health,
-        };
-        row.last_attempt_at_unix = health.as_ref().map(|h| h.last_attempt_at_unix);
-        row.last_attempt_error = health.as_ref().and_then(|h| h.last_attempt_error.clone());
-        let measured = health.as_ref().and_then(|h| {
-            Some((
-                h.accounting.clone()?,
-                h.measured_at_unix?,
-                h.generation_phase,
-            ))
-        });
-        let Some((accounting, measured_at, phase)) = measured else {
-            findings.push(Finding::info(format!(
-                "transcript source {id} storage accounting unavailable: the reaper has not \
-                 measured it yet"
-            )));
-            sources.push(row);
-            continue;
-        };
-        let age_secs = inputs.now_unix.saturating_sub(measured_at);
-        let ratio = (accounting.live_bytes > 0)
-            .then(|| accounting.stored_bytes as f64 / accounting.live_bytes as f64);
-        let usage = match ratio {
-            Some(ratio) => format!(
-                "stores {} for {} live (ratio {ratio:.2})",
-                bytes(accounting.stored_bytes),
-                bytes(accounting.live_bytes)
-            ),
-            None => format!(
-                "stores {} with no live bytes",
-                bytes(accounting.stored_bytes)
-            ),
-        };
-        let detail = format!(
-            "{usage}; staged chunks {}, non-current generations {}; measured {} ago, \
-             generation phase {}",
-            bytes(accounting.staged_chunk_bytes),
-            bytes(accounting.non_current_generation_bytes),
-            age(age_secs),
-            phase_name(phase)
-        );
-        let mut flagged = false;
-        if age_secs > stale_after {
-            flagged = true;
-            findings.push(Finding::warn(format!(
-                "transcript source {id} storage measurement is {} old, older than three \
-                 reaper intervals; {detail}",
-                age(age_secs)
-            )));
-        }
-        if phase == Some(GenerationPhase::Ran)
-            && ratio.is_some_and(|ratio| ratio > AMPLIFICATION_RATIO)
-        {
-            flagged = true;
-            findings.push(Finding::warn(format!(
-                "transcript source {id} stores more than 1.25x its live bytes after a \
-                 completed generation phase; {detail}"
-            )));
-        }
-        if !flagged {
-            findings.push(Finding::ok(format!("transcript source {id} {detail}")));
-        }
-        row.state = "measured";
-        row.stored_to_live_ratio = ratio;
-        row.measured_at_unix = Some(measured_at);
-        row.measurement_age_secs = Some(age_secs);
-        row.generation_phase = phase;
-        row.accounting = Some(accounting);
-        sources.push(row);
+fn source_row(
+    id: &str,
+    configured: bool,
+    health: Option<&SourceStorageHealth>,
+    stale_after: u64,
+    now_unix: u64,
+    findings: &mut Vec<Finding>,
+) -> TranscriptSourceStorage {
+    let label = if configured {
+        format!("transcript source {id}")
+    } else {
+        format!("transcript source {id} (no current grant)")
+    };
+    let mut row = TranscriptSourceStorage {
+        connector_source_id: id.to_owned(),
+        configured,
+        state: "unavailable",
+        accounting: None,
+        stored_to_live_ratio: None,
+        measured_at_unix: None,
+        last_attempt_at_unix: health.map(|h| h.last_attempt_at_unix),
+        generation_phase: None,
+        last_attempt_error: health.and_then(|h| h.last_attempt_error.clone()),
+    };
+    let measured = health.and_then(|h| {
+        Some((
+            h.accounting.clone()?,
+            h.measured_at_unix?,
+            h.generation_phase,
+        ))
+    });
+    let Some((accounting, measured_at, phase)) = measured else {
+        findings.push(Finding::info(format!(
+            "{label} storage accounting unavailable: the reaper has not measured it yet"
+        )));
+        return row;
+    };
+    let ratio = (accounting.live_bytes > 0)
+        .then(|| accounting.stored_bytes as f64 / accounting.live_bytes as f64);
+    let usage = match ratio {
+        Some(ratio) => format!(
+            "stores {} for {} live (ratio {ratio:.2})",
+            bytes(accounting.stored_bytes),
+            bytes(accounting.live_bytes)
+        ),
+        None => format!(
+            "stores {} with no live bytes",
+            bytes(accounting.stored_bytes)
+        ),
+    };
+    let detail = format!(
+        "{usage}; staged chunks {}, non-current generations {}; measured at {}, \
+         generation phase {}",
+        bytes(accounting.staged_chunk_bytes),
+        bytes(accounting.non_current_generation_bytes),
+        timestamp(measured_at),
+        phase_name(phase)
+    );
+    let mut flagged = false;
+    if now_unix.saturating_sub(measured_at) > stale_after {
+        flagged = true;
+        findings.push(Finding::warn(format!(
+            "{label} storage measurement is older than three reaper intervals; {detail}"
+        )));
     }
+    if phase == Some(GenerationPhase::Ran) && ratio.is_some_and(|ratio| ratio > AMPLIFICATION_RATIO)
+    {
+        flagged = true;
+        findings.push(Finding::warn(format!(
+            "{label} stores more than 1.25x its live bytes after a completed generation \
+             phase; {detail}"
+        )));
+    }
+    if !flagged {
+        findings.push(Finding::ok(format!("{label} {detail}")));
+    }
+    row.state = "measured";
+    row.stored_to_live_ratio = ratio;
+    row.measured_at_unix = Some(measured_at);
+    row.generation_phase = phase;
+    row.accounting = Some(accounting);
+    row
+}
+
+/// Build the section from the reaper's observation and the configured
+/// sources. Pure, so tests can supply filesystems a test host cannot mount.
+pub(crate) fn build(inputs: StorageInputs) -> (SectionReport, StorageSnapshot) {
+    let mut findings = Vec::new();
+    let (filesystems, unprobed) = match &inputs.observation {
+        Some(observation) => filesystem_findings(observation, inputs.reserve, &mut findings),
+        None => {
+            findings.push(Finding::info(
+                "storage not sampled yet: the transcript source reaper samples headroom and \
+                 measures sources on each run, the first at daemon start",
+            ));
+            (Vec::new(), Vec::new())
+        }
+    };
+
+    // Configured sources, plus every source the reaper measured, including
+    // retained sources whose grant was removed.
+    let configured = inputs
+        .configured_sources
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut ids = configured.clone();
+    if let Some(observation) = &inputs.observation {
+        ids.extend(observation.sources.keys().cloned());
+    }
+    let stale_after = inputs.reaper_interval.as_secs() * u64::from(STALE_INTERVALS);
+    let sources = ids
+        .iter()
+        .map(|id| {
+            source_row(
+                id,
+                configured.contains(id),
+                inputs
+                    .observation
+                    .as_ref()
+                    .and_then(|observation| observation.sources.get(id)),
+                stale_after,
+                inputs.now_unix,
+                &mut findings,
+            )
+        })
+        .collect::<Vec<_>>();
 
     let worst_filesystem = filesystems
         .iter()
         .min_by(|a, b| a.available_fraction.total_cmp(&b.available_fraction))
-        .map_or("no filesystem probed".to_owned(), |fs| {
+        .map_or("not sampled".to_owned(), |fs| {
             format!(
                 "{} at {:.1}% available ({} of {})",
                 fs.roots
@@ -436,6 +401,10 @@ pub(crate) fn build(
             findings,
         },
         StorageSnapshot {
+            sampled_at_unix: inputs
+                .observation
+                .as_ref()
+                .map(|observation| observation.sampled_at_unix),
             filesystems,
             unprobed_roots: unprobed,
             transcript_sources: sources,
@@ -448,6 +417,8 @@ pub(crate) fn build(
 mod tests {
     use super::*;
     use crate::doctor::FindingLevel;
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
 
     const GIB: u64 = 1024 * 1024 * 1024;
 
@@ -482,7 +453,7 @@ mod tests {
 
     /// `/state` and `/index` share one filesystem; the transcript store is a
     /// separate mount under the state directory.
-    fn probe(path: &Path) -> std::io::Result<FsProbe> {
+    fn probe(path: &Path) -> Result<FsProbe, String> {
         if path.starts_with("/state/transcript-sources") {
             Ok(FsProbe {
                 device: 2,
@@ -496,32 +467,63 @@ mod tests {
                 available: 50 * GIB,
             })
         } else {
-            Err(std::io::Error::other("probe refused"))
+            Err("probe refused".into())
         }
     }
 
-    fn inputs(
-        sources: Vec<(String, Result<Option<SourceStorageHealth>, String>)>,
-    ) -> StorageInputs {
-        let transcript = root("transcript source store", "/state/transcript-sources");
-        StorageInputs {
-            roots: vec![
-                root("state root", "/state"),
-                root("transcript index", "/index"),
-                root("knowledge store", "/state/knowledge.json"),
-                transcript.clone(),
-            ],
+    fn observation(
+        extra: &[StorageRoot],
+        tighten: bool,
+        sources: BTreeMap<String, SourceStorageHealth>,
+    ) -> StorageObservation {
+        let sample = |root: &StorageRoot| ProbedRoot {
+            root: root.clone(),
+            probe: probe(&root.probe_dir).map(|found| FsProbe {
+                available: if tighten {
+                    found.total / 10
+                } else {
+                    found.available
+                },
+                ..found
+            }),
+        };
+        let transcript = sample(&root(
+            "transcript source store",
+            "/state/transcript-sources",
+        ));
+        let mut roots = [
+            root("state root", "/state"),
+            root("transcript index", "/index"),
+            root("knowledge store", "/state/knowledge.json"),
+        ]
+        .iter()
+        .chain(extra)
+        .map(sample)
+        .collect::<Vec<_>>();
+        roots.push(transcript.clone());
+        StorageObservation {
+            sampled_at_unix: 90_000,
+            roots,
             transcript_root: transcript,
+            sources,
+        }
+    }
+
+    fn inputs(observation: Option<StorageObservation>, configured: &[&str]) -> StorageInputs {
+        StorageInputs {
+            observation,
+            configured_sources: configured.iter().map(|id| id.to_string()).collect(),
             reserve: ReservePolicy::Default,
             reaper_interval: Duration::from_secs(1800),
-            sources,
             now_unix: 100_000,
         }
     }
 
     #[test]
     fn probes_deduplicate_by_filesystem_and_attribute_the_reserve_to_the_transcript_mount() {
-        let (section, snapshot) = build(inputs(Vec::new()), &probe);
+        let (section, snapshot) =
+            build(inputs(Some(observation(&[], false, BTreeMap::new())), &[]));
+        assert_eq!(snapshot.sampled_at_unix, Some(90_000));
         assert_eq!(snapshot.filesystems.len(), 2);
         let shared = &snapshot.filesystems[0];
         assert_eq!(
@@ -562,15 +564,14 @@ mod tests {
 
     #[test]
     fn low_headroom_warns_on_any_filesystem_and_unprobed_roots_are_named() {
-        let mut low = inputs(Vec::new());
-        low.roots.push(root("bro home", "/elsewhere"));
-        let tight = |path: &Path| {
-            probe(path).map(|found| FsProbe {
-                available: found.total / 10,
-                ..found
-            })
-        };
-        let (section, snapshot) = build(low, &tight);
+        let (section, snapshot) = build(inputs(
+            Some(observation(
+                &[root("bro home", "/elsewhere")],
+                true,
+                BTreeMap::new(),
+            )),
+            &[],
+        ));
         // 10% available: warn everywhere; the transcript mount's default
         // reserve (3 GiB) is below its 10 GiB available.
         assert_eq!(
@@ -586,54 +587,68 @@ mod tests {
     }
 
     #[test]
-    fn cached_accounting_reports_age_ratio_unavailable_and_zero_live_states() {
-        let now = 100_000;
-        let sources = vec![
-            (
-                "csrc_000000000000000a".into(),
-                Ok(Some(measured(1000, 1100, now - 60, GenerationPhase::Ran))),
-            ),
-            (
-                "csrc_000000000000000b".into(),
-                Ok(Some(measured(1000, 2000, now - 60, GenerationPhase::Ran))),
-            ),
-            (
-                "csrc_000000000000000c".into(),
-                Ok(Some(measured(
-                    1000,
-                    1900,
-                    now - 60,
-                    GenerationPhase::LeaseHeld,
-                ))),
-            ),
-            (
-                "csrc_000000000000000d".into(),
-                Ok(Some(measured(
-                    1000,
-                    1000,
-                    now - 4 * 1800,
-                    GenerationPhase::Ran,
-                ))),
-            ),
-            (
-                "csrc_000000000000000e".into(),
-                Ok(Some(measured(0, 500, now - 60, GenerationPhase::Ran))),
-            ),
-            ("csrc_000000000000000f".into(), Ok(None)),
-            ("csrc_0000000000000010".into(), Err("bad record".into())),
-        ];
-        let (section, snapshot) = build(inputs(sources), &probe);
-        let source_findings = section
-            .findings
-            .iter()
-            .filter(|finding| finding.message.starts_with("transcript source "))
-            .map(|finding| (finding.level, finding.message.clone()))
-            .collect::<Vec<_>>();
-        let level_of = |id: &str| {
-            source_findings
+    fn an_unsampled_daemon_reports_configured_sources_as_unavailable() {
+        let (section, snapshot) = build(inputs(None, &["csrc_000000000000000a"]));
+        assert_eq!(snapshot.sampled_at_unix, None);
+        assert!(snapshot.filesystems.is_empty());
+        assert_eq!(snapshot.transcript_sources.len(), 1);
+        assert_eq!(snapshot.transcript_sources[0].state, "unavailable");
+        assert!(
+            section
+                .findings
                 .iter()
-                .filter(|(_, message)| message.contains(id))
-                .map(|(level, _)| *level)
+                .all(|finding| finding.level == FindingLevel::Info)
+        );
+    }
+
+    #[test]
+    fn cached_accounting_reports_ratio_staleness_unavailable_retained_and_zero_live_states() {
+        let now = 100_000;
+        let sources = BTreeMap::from([
+            (
+                "csrc_000000000000000a".to_owned(),
+                measured(1000, 1100, now - 60, GenerationPhase::Ran),
+            ),
+            (
+                "csrc_000000000000000b".to_owned(),
+                measured(1000, 2000, now - 60, GenerationPhase::Ran),
+            ),
+            (
+                "csrc_000000000000000c".to_owned(),
+                measured(1000, 1900, now - 60, GenerationPhase::LeaseHeld),
+            ),
+            (
+                "csrc_000000000000000d".to_owned(),
+                measured(1000, 1000, now - 4 * 1800, GenerationPhase::Ran),
+            ),
+            (
+                "csrc_000000000000000e".to_owned(),
+                measured(0, 500, now - 60, GenerationPhase::Ran),
+            ),
+            (
+                "csrc_0000000000000010".to_owned(),
+                measured(700, 700, now - 60, GenerationPhase::Ran),
+            ),
+        ]);
+        let configured = [
+            "csrc_000000000000000a",
+            "csrc_000000000000000b",
+            "csrc_000000000000000c",
+            "csrc_000000000000000d",
+            "csrc_000000000000000e",
+            "csrc_000000000000000f",
+        ];
+        let (section, snapshot) =
+            build(inputs(Some(observation(&[], false, sources)), &configured));
+        let level_of = |id: &str| {
+            section
+                .findings
+                .iter()
+                .filter(|finding| {
+                    finding.message.starts_with("transcript source ")
+                        && finding.message.contains(id)
+                })
+                .map(|finding| finding.level)
                 .collect::<Vec<_>>()
         };
         assert_eq!(level_of("000a"), [FindingLevel::Ok]);
@@ -654,7 +669,7 @@ mod tests {
         );
         assert_eq!(level_of("000e"), [FindingLevel::Ok]);
         assert_eq!(level_of("000f"), [FindingLevel::Info]);
-        assert_eq!(level_of("0010"), [FindingLevel::Warn]);
+        assert_eq!(level_of("0010"), [FindingLevel::Ok]);
 
         let row = |id: &str| {
             snapshot
@@ -663,20 +678,21 @@ mod tests {
                 .find(|row| row.connector_source_id.ends_with(id))
                 .unwrap()
         };
+        assert_eq!(snapshot.transcript_sources.len(), 7);
         assert_eq!(row("000a").state, "measured");
-        assert_eq!(row("000a").measurement_age_secs, Some(60));
+        assert_eq!(row("000a").measured_at_unix, Some(now - 60));
         assert_eq!(row("000a").stored_to_live_ratio, Some(1.1));
-        assert_eq!(row("000d").measurement_age_secs, Some(4 * 1800));
         assert_eq!(row("000e").stored_to_live_ratio, None);
         assert_eq!(row("000e").accounting.as_ref().unwrap().stored_bytes, 500);
-        assert!(
-            level_of("000e").len() == 1
-                && source_findings
-                    .iter()
-                    .any(|(_, m)| m.contains("000e stores 500 B with no live bytes"))
-        );
+        assert!(section.findings.iter().any(|finding| {
+            finding
+                .message
+                .contains("000e stores 500 B with no live bytes")
+        }));
         assert_eq!(row("000f").state, "unavailable");
-        assert_eq!(row("0010").state, "unreadable");
+        assert!(row("000f").configured);
+        assert_eq!(row("0010").state, "measured");
+        assert!(!row("0010").configured, "a retained source stays visible");
         assert!(
             snapshot
                 .summary

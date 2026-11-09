@@ -9,9 +9,7 @@ use axum::routing::{post, put};
 use axum::{Json, Router};
 use bbox_corpus_core::project_catalog::ConnectorScope;
 use bbox_transcript_source::*;
-use bbox_transcript_source_store::{
-    StorageExhausted, TranscriptSourceStore, normalize_storage_error,
-};
+use bbox_transcript_source_store::{StorageExhausted, normalize_storage_error};
 use std::sync::Arc;
 
 pub(crate) fn router(state: Arc<SharedState>) -> Router<Arc<SharedState>> {
@@ -56,13 +54,10 @@ fn authorize(
     );
     Ok(())
 }
-fn store_root(state: &SharedState) -> std::path::PathBuf {
-    state
-        .config
-        .read()
-        .paths
-        .state_dir
-        .join("transcript-sources")
+/// The store root fixed when the daemon opened. Never derived from live
+/// config: ingest, admission, the reaper and doctor share this one root.
+pub(super) fn store_root(state: &SharedState) -> std::path::PathBuf {
+    state.transcript_source.root().to_path_buf()
 }
 async fn blocking<T: Send + 'static>(
     operation: impl FnOnce() -> Result<T> + Send + 'static,
@@ -136,10 +131,11 @@ async fn contact(
     if let Err(error) = authorize(&state, &grant, &request.scope, false) {
         return reply::<()>(Err(error));
     }
-    let root = store_root(&state);
+    let runtime = state.transcript_source.clone();
     reply(
         blocking(move || {
-            TranscriptSourceStore::open(root)?
+            runtime
+                .store()?
                 .record_contact(&request, &chrono::Utc::now().to_rfc3339())
         })
         .await,
@@ -153,13 +149,8 @@ async fn status(
     if let Err(error) = authorize(&state, &grant, &request.scope, false) {
         return reply::<()>(Err(error));
     }
-    let root = store_root(&state);
-    reply(
-        blocking(move || {
-            TranscriptSourceStore::open(root)?.status(&request.scope, &request.stream_id)
-        })
-        .await,
-    )
+    let runtime = state.transcript_source.clone();
+    reply(blocking(move || runtime.store()?.status(&request.scope, &request.stream_id)).await)
 }
 async fn missing(
     State(state): State<Arc<SharedState>>,
@@ -169,8 +160,8 @@ async fn missing(
     if let Err(error) = authorize(&state, &grant, &snapshot.scope, false) {
         return reply::<()>(Err(error));
     }
-    let root = store_root(&state);
-    reply(blocking(move || TranscriptSourceStore::open(root)?.missing_chunks(&snapshot)).await)
+    let runtime = state.transcript_source.clone();
+    reply(blocking(move || runtime.store()?.missing_chunks(&snapshot)).await)
 }
 async fn chunk(
     State(state): State<Arc<SharedState>>,
@@ -193,12 +184,11 @@ async fn chunk(
     if let Err(error) = authorize(&state, &grant, &scope, false) {
         return reply::<()>(Err(error));
     }
-    let root = store_root(&state);
     let runtime = state.transcript_source.clone();
     reply(
         blocking(move || {
             runtime
-                .ingest_store(root)?
+                .ingest_store()?
                 .install_chunk(&scope, &stream, &hash, &body)
         })
         .await,
@@ -212,11 +202,10 @@ async fn publish(
     if let Err(error) = authorize(&state, &grant, &request.snapshot.scope, false) {
         return reply::<()>(Err(error));
     }
-    let root = store_root(&state);
     let runtime = state.transcript_source.clone();
     let result = blocking(move || {
         runtime
-            .ingest_store(root)?
+            .ingest_store()?
             .publish(&request, &chrono::Utc::now().to_rfc3339())
     })
     .await;
@@ -276,6 +265,7 @@ async fn onboard(
 mod tests {
     use super::*;
     use bbox_corpus_core::project_catalog::{ConnectorKind, ConnectorSourceId};
+    use bbox_transcript_source_store::TranscriptSourceStore;
 
     fn scope() -> ConnectorScope {
         ConnectorScope::try_new("csrc_0123456789abcdef", "native_transcript").unwrap()

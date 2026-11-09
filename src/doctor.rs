@@ -3454,17 +3454,42 @@ mod catalog_health_tests {
         crate::server::BlackboxServer::new(std::sync::Arc::new(state))
     }
 
-    /// The storage section is part of the catalog vocabulary, collects alone
-    /// when requested, carries its numbers at ok severity, and reads the
-    /// accounting a real reaper run cached for an enrolled native source. The
-    /// frozen bridge report does not gain it.
-    #[test]
-    fn storage_section_reports_cached_native_accounting_and_stays_out_of_bridge_reports() {
+    fn native_grants(
+        fixture: &CatalogFixture,
+        scopes: &[&bbox_corpus_core::project_catalog::ConnectorScope],
+    ) -> crate::config::SourceConnectorsConfig {
+        crate::config::SourceConnectorsConfig {
+            retained_conversations: Vec::new(),
+            enabled: !scopes.is_empty(),
+            producers: vec![crate::config::ConnectorProducerConfig {
+                producer_id: "fixture-producer".into(),
+                token_file: fixture.root().join("producer.token"),
+                token_files: Vec::new(),
+                scopes: scopes
+                    .iter()
+                    .map(|scope| crate::config::ConnectorScopeGrant {
+                        connector_source_id: scope.connector_source_id().clone(),
+                        connector_kind: scope.connector_kind().clone(),
+                        remote_authority: "fixture-installation".into(),
+                        profile: crate::config::ConnectorProfile::Transcript,
+                    })
+                    .collect(),
+            }],
+        }
+    }
+
+    /// A catalog server with two granted native sources, one of them
+    /// published and measured by a real reaper run of the daemon runtime.
+    fn measured_native_server() -> (
+        CatalogFixture,
+        crate::server::BlackboxServer,
+        [bbox_corpus_core::project_catalog::ConnectorScope; 2],
+        u64,
+    ) {
         use bbox_transcript_source::*;
         crate::init_system_memory_for_tests();
         let fixture = CatalogFixture::new();
         let server = fixture.server();
-        let state_dir = fixture.root().join("native-state");
         let scope = bbox_corpus_core::project_catalog::ConnectorScope::try_new(
             "csrc_0123456789abcdef",
             "native_transcript",
@@ -3475,32 +3500,9 @@ mod catalog_health_tests {
             "native_transcript",
         )
         .unwrap();
-        {
-            let mut cfg = server.state.config.write();
-            cfg.paths.state_dir = state_dir.clone();
-            cfg.source_connectors = crate::config::SourceConnectorsConfig {
-                retained_conversations: Vec::new(),
-                enabled: true,
-                producers: vec![crate::config::ConnectorProducerConfig {
-                    producer_id: "fixture-producer".into(),
-                    token_file: fixture.root().join("producer.token"),
-                    token_files: Vec::new(),
-                    scopes: [&scope, &unmeasured]
-                        .into_iter()
-                        .map(|scope| crate::config::ConnectorScopeGrant {
-                            connector_source_id: scope.connector_source_id().clone(),
-                            connector_kind: scope.connector_kind().clone(),
-                            remote_authority: "fixture-installation".into(),
-                            profile: crate::config::ConnectorProfile::Transcript,
-                        })
-                        .collect(),
-                }],
-            };
-        }
-        let store = bbox_transcript_source_store::TranscriptSourceStore::open(
-            state_dir.join("transcript-sources"),
-        )
-        .unwrap();
+        server.state.config.write().source_connectors =
+            native_grants(&fixture, &[&scope, &unmeasured]);
+        let store = server.state.transcript_source.ingest_store().unwrap();
         let bytes = b"{\"type\":\"user\"}\n";
         let snapshot = StreamSnapshot {
             schema_version: SCHEMA_VERSION,
@@ -3529,17 +3531,23 @@ mod catalog_health_tests {
                 "now",
             )
             .unwrap();
-        store
-            .reap(
-                &bbox_transcript_source_store::ReaperPolicy::default(),
-                std::time::SystemTime::now(),
-            )
-            .unwrap();
+        server.state.transcript_source.run_once().unwrap();
+        (fixture, server, [scope, unmeasured], bytes.len() as u64)
+    }
 
+    /// The storage section is part of the catalog vocabulary, collects alone
+    /// when requested, carries its numbers at ok severity, and reports the
+    /// accounting the daemon's reaper run cached. A source whose grant is
+    /// removed keeps its stored bytes and stays visible. The frozen bridge
+    /// report does not gain the section.
+    #[test]
+    fn storage_section_reports_cached_native_accounting_and_stays_out_of_bridge_reports() {
+        let (fixture, server, [scope, unmeasured], live) = measured_native_server();
         assert!(section_names(&server.state).contains(&"storage"));
         let report = run_section(&server, "storage").unwrap();
         assert_eq!(report.sections.len(), 1);
         let storage = report.storage.as_ref().expect("storage numbers");
+        assert!(storage.sampled_at_unix.is_some());
         assert!(!storage.filesystems.is_empty());
         assert!(storage.filesystems.iter().any(|fs| {
             fs.holds_transcript_source_store
@@ -3549,13 +3557,20 @@ mod catalog_health_tests {
                     .any(|root| root.label == "transcript source store")
         }));
         let measured = &storage.transcript_sources[0];
-        assert_eq!(measured.state, "measured");
         assert_eq!(
-            measured.accounting.as_ref().unwrap().live_bytes,
-            bytes.len() as u64
+            measured.connector_source_id,
+            scope.connector_source_id().as_str()
         );
-        assert!(measured.measurement_age_secs.is_some());
-        assert_eq!(storage.transcript_sources[1].state, "unavailable");
+        assert_eq!(measured.state, "measured");
+        assert!(measured.configured);
+        assert_eq!(measured.accounting.as_ref().unwrap().live_bytes, live);
+        assert!(measured.measured_at_unix.is_some());
+        let never = &storage.transcript_sources[1];
+        assert_eq!(
+            never.connector_source_id,
+            unmeasured.connector_source_id().as_str()
+        );
+        assert_eq!(never.state, "unavailable");
         assert!(
             report
                 .render_summary()
@@ -3569,6 +3584,26 @@ mod catalog_health_tests {
         );
         assert!(full.storage.is_some());
 
+        // Removing every grant leaves the measured source reported from the
+        // cached observation; the never-measured one had nothing stored.
+        server.state.config.write().source_connectors = native_grants(&fixture, &[]);
+        let retained = run_section(&server, "storage").unwrap();
+        let rows = &retained.storage.as_ref().unwrap().transcript_sources;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(
+            rows[0].connector_source_id,
+            scope.connector_source_id().as_str()
+        );
+        assert!(!rows[0].configured);
+        assert_eq!(rows[0].state, "measured");
+        assert_eq!(rows[0].accounting.as_ref().unwrap().live_bytes, live);
+        assert!(
+            retained.sections[0]
+                .findings
+                .iter()
+                .any(|finding| finding.message.contains("(no current grant)"))
+        );
+
         let tmp = tempfile::tempdir().unwrap();
         let bridge = crate::server::BlackboxServer::new(std::sync::Arc::new(
             crate::server::state::SharedState::for_test(&tmp.path().canonicalize().unwrap()),
@@ -3577,6 +3612,74 @@ mod catalog_health_tests {
         let bridge_report = run(&bridge).unwrap();
         assert!(bridge_report.storage.is_none());
         assert!(run_section(&bridge, "storage").is_err());
+    }
+
+    /// Full-detail pages of the storage section reassemble across a clock
+    /// tick and a change in free space: the body carries absolute times and
+    /// the reaper's sampled headroom, never a value computed per render.
+    #[tokio::test]
+    async fn storage_full_detail_pages_survive_time_passing_between_continuations() {
+        use rmcp::handler::server::wrapper::Parameters;
+        let (fixture, server, _, _) = measured_native_server();
+        let call = |cursor: Option<String>| {
+            let server = server.clone();
+            async move {
+                let result = server
+                    .bbox_doctor(Parameters(crate::tools::doctor::DoctorParams {
+                        format: Some("json".into()),
+                        detail: Some("full".into()),
+                        section: Some("storage".into()),
+                        body_limit: Some(256),
+                        cursor,
+                        ..Default::default()
+                    }))
+                    .await;
+                assert!(!result.is_error.unwrap_or(false), "{result:?}");
+                let text = result
+                    .content
+                    .iter()
+                    .filter_map(|content| content.as_text().map(|text| text.text.clone()))
+                    .collect::<String>();
+                serde_json::from_str::<serde_json::Value>(&text).unwrap()
+            }
+        };
+        let first = call(None).await;
+        let mut text = first["body"]["text"].as_str().unwrap().to_owned();
+        let mut cursor = first["body"]["next_cursor"].as_str().map(str::to_owned);
+        assert!(cursor.is_some(), "the storage body spans several pages");
+        // A second passes and the filesystem's free space moves.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(fixture.root().join("free-space-churn"), vec![0u8; 1 << 20]).unwrap();
+        let mut pages = 1;
+        while let Some(next) = cursor {
+            let page = call(Some(next)).await;
+            text.push_str(page["body"]["text"].as_str().unwrap());
+            cursor = page["body"]["next_cursor"].as_str().map(str::to_owned);
+            pages += 1;
+            assert!(pages < 200, "paging terminates");
+        }
+        let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(body["storage"]["sampled_at_unix"].is_u64());
+        assert!(body["storage"]["transcript_sources"][0]["measured_at_unix"].is_u64());
+
+        // A reaper run is new evidence: an old cursor is then refused.
+        let stale = call(None).await["body"]["next_cursor"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        server.state.transcript_source.run_once().unwrap();
+        let refused = server
+            .bbox_doctor(Parameters(crate::tools::doctor::DoctorParams {
+                format: Some("json".into()),
+                detail: Some("full".into()),
+                section: Some("storage".into()),
+                body_limit: Some(256),
+                cursor: Some(stale),
+                ..Default::default()
+            }))
+            .await;
+        assert!(refused.is_error.unwrap_or(false), "{refused:?}");
     }
 
     /// The locality cutovers are retired: neither a catalog daemon (with

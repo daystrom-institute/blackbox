@@ -451,15 +451,11 @@ pub(super) fn open_shared_state(
     // touches no state; the reaper's first run starts with the background
     // tasks. The index writer nudges it after each native pass, so the hook
     // is installed before the writer clones the config below.
-    let transcript_source = Arc::new(
-        super::transcript_source_reaper::TranscriptSourceRuntime::new(
-            cfg.paths.state_dir.join("transcript-sources"),
-            &cfg.transcript_source,
-        ),
-    );
+    let transcript_source =
+        Arc::new(super::transcript_source_reaper::TranscriptSourceRuntime::from_config(&cfg));
     idx.set_native_source_pass_hook(transcript_source.pass_hook());
     idx.set_native_sources(
-        cfg.paths.state_dir.join("transcript-sources"),
+        transcript_source.root().to_path_buf(),
         if cfg.source_connectors.enabled {
             cfg.source_connectors
                 .producers
