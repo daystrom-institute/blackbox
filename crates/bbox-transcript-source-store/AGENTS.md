@@ -74,8 +74,10 @@
   the run report; the daemon publishes the latest run's measurements (every
   source directory, granted or not) as soon as the run completes, and
   diagnostics read them instead of walking the store. Filesystem headroom is
-  sampled separately with at most one probe in flight, so a hung mount never
-  holds back reclamation. A run that cannot measure keeps
+  sampled separately, on a detached thread with at most one probe in flight,
+  so a hung mount never holds back reclamation or daemon exit. A sample is
+  stamped before its first probe, so a slow batch never looks fresher than
+  its oldest reading. A run that cannot measure keeps
   the previous measurement and records the failed attempt.
 
 ## Storage exhaustion and admission

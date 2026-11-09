@@ -16,8 +16,9 @@
 //! source accounting as soon as it completes.
 //!
 //! Filesystem headroom is sampled by a separate task with at most one probe
-//! worker in flight: a stalled probe of an unrelated mount skips later
-//! samples instead of piling up, and never delays reclamation. Doctor
+//! worker in flight, on a detached thread: a stalled probe of an unrelated
+//! mount skips later samples instead of piling up, and never delays
+//! reclamation or runtime teardown at exit. Doctor
 //! reports both cached observations with their own timestamps, so its body
 //! changes only when one of them is replaced.
 use std::collections::BTreeMap;
@@ -290,6 +291,9 @@ impl TranscriptSourceRuntime {
     /// on an unresponsive mount: the scheduler only reaches it through
     /// [`Self::request_headroom_sample`].
     pub(crate) fn sample_headroom_now(&self) {
+        // Stamped before the first probe: a batch held up by a slow mount
+        // must not make its earlier readings look fresh.
+        let sampled_at_unix = unix_now();
         let transcript_root = probed(
             &self.probe,
             &StorageRoot::new("transcript source store", self.root.clone(), true),
@@ -304,14 +308,19 @@ impl TranscriptSourceRuntime {
             .headroom
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(HeadroomSample {
-            sampled_at_unix: unix_now(),
+            sampled_at_unix,
             roots,
             transcript_root,
         });
     }
 
-    /// Start one sampling worker on the blocking pool unless one is still in
-    /// flight. Never waits; returns whether a worker started.
+    /// Start one sampling worker unless one is still in flight. Never waits;
+    /// returns whether a worker started.
+    ///
+    /// The worker is a detached OS thread, not blocking-pool work: the async
+    /// runtime's teardown waits for blocking tasks it started, so a probe
+    /// stalled on a hung mount there would hold daemon exit past its grace.
+    /// The probes are read-only, so abandoning one at exit loses nothing.
     pub(crate) fn request_headroom_sample(self: &Arc<Self>) -> bool {
         if self.sampling.swap(true, Ordering::SeqCst) {
             tracing::debug!("filesystem headroom sample still in flight; skipping");
@@ -319,11 +328,21 @@ impl TranscriptSourceRuntime {
         }
         let slot = SamplingSlot(self.sampling.clone());
         let runtime = self.clone();
-        drop(tokio::task::spawn_blocking(move || {
-            let _slot = slot;
-            runtime.sample_headroom_now();
-        }));
-        true
+        let spawned = std::thread::Builder::new()
+            .name("bbox-storage-headroom".into())
+            .spawn(move || {
+                let _slot = slot;
+                runtime.sample_headroom_now();
+            });
+        match spawned {
+            Ok(_detached) => true,
+            Err(error) => {
+                // The closure, and the slot it owned, dropped with the failed
+                // spawn, so the next tick may try again.
+                tracing::warn!(%error, "could not start the filesystem headroom sampler thread");
+                false
+            }
+        }
     }
 }
 
@@ -543,5 +562,61 @@ mod tests {
             "the follow-up sample to finish",
         )
         .await;
+    }
+
+    /// Tearing down the async runtime, as daemon exit does, completes while
+    /// a headroom probe is still blocked on a hung mount.
+    #[test]
+    fn runtime_teardown_does_not_wait_for_a_blocked_headroom_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let hung = root.join("hung-mount");
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let entered_tx = Arc::new(Mutex::new(entered_tx));
+        let probe: HeadroomProbe = {
+            let hung = hung.clone();
+            Arc::new(move |path: &Path| {
+                if path == hung {
+                    entered_tx.lock().unwrap().send(()).unwrap();
+                    let _ = release_rx.lock().unwrap().recv();
+                }
+                probe_filesystem(path)
+            })
+        };
+        let runtime = Arc::new(
+            TranscriptSourceRuntime::new(
+                root.join("transcript-sources"),
+                &TranscriptSourceConfig::default(),
+                vec![StorageRoot {
+                    label: "hung mount".into(),
+                    path: hung.clone(),
+                    probe_dir: hung,
+                }],
+            )
+            .with_probe(probe),
+        );
+        let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        tokio_runtime.block_on(async {
+            assert!(runtime.request_headroom_sample());
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the probe reached the hung mount");
+
+        let (dropped_tx, dropped_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(tokio_runtime);
+            dropped_tx.send(()).unwrap();
+        });
+        let torn_down = dropped_rx.recv_timeout(Duration::from_secs(5));
+        assert!(runtime.sampling.load(Ordering::SeqCst), "still in flight");
+        release_tx.send(()).unwrap();
+        torn_down.expect("runtime teardown waited on the blocked probe");
     }
 }

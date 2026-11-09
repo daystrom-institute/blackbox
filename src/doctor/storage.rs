@@ -765,4 +765,92 @@ mod tests {
                 .all(|finding| !finding.message.contains("older than three"))
         );
     }
+
+    /// A batch held up by a slow mount keeps the time its first reading was
+    /// taken, so it is still judged stale once that is three intervals old.
+    #[test]
+    fn a_delayed_headroom_batch_keeps_its_start_time_and_is_still_stale() {
+        use crate::server::transcript_source_reaper::{
+            HeadroomProbe, TranscriptSourceRuntime, probe_filesystem,
+        };
+        use std::sync::{Arc, Mutex};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let slow = root.join("slow-mount");
+        let first_probe_at = Arc::new(Mutex::new(None));
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let probe: HeadroomProbe = {
+            let slow = slow.clone();
+            let first_probe_at = first_probe_at.clone();
+            Arc::new(move |path: &Path| {
+                first_probe_at.lock().unwrap().get_or_insert_with(|| {
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs()
+                });
+                if path == slow {
+                    let _ = release_rx.lock().unwrap().recv();
+                }
+                probe_filesystem(path)
+            })
+        };
+        // One-second interval: three intervals is three seconds.
+        let runtime = Arc::new(
+            TranscriptSourceRuntime::new(
+                root.join("transcript-sources"),
+                &bbox_config::config::TranscriptSourceConfig {
+                    reaper_interval_secs: 1,
+                    ..Default::default()
+                },
+                vec![StorageRoot {
+                    label: "slow mount".into(),
+                    path: slow.clone(),
+                    probe_dir: slow,
+                }],
+            )
+            .with_probe(probe),
+        );
+        assert!(runtime.request_headroom_sample());
+        // The slow mount holds the batch past three intervals, then returns.
+        std::thread::sleep(Duration::from_millis(4200));
+        release_tx.send(()).unwrap();
+        for _ in 0..400 {
+            if runtime.observation().headroom.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let observation = runtime.observation();
+        let sample = observation.headroom.as_ref().expect("the batch published");
+        let first = first_probe_at.lock().unwrap().unwrap();
+        assert!(
+            sample.sampled_at_unix <= first,
+            "stamped {} after the first probe at {first}",
+            sample.sampled_at_unix
+        );
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let (section, _) = build(StorageInputs {
+            observation,
+            configured_sources: Vec::new(),
+            reserve: ReservePolicy::Default,
+            reaper_interval: runtime.interval(),
+            now_unix: now,
+        });
+        assert!(
+            section
+                .findings
+                .iter()
+                .any(|finding| finding.level == FindingLevel::Warn
+                    && finding
+                        .message
+                        .contains("older than three reaper intervals")),
+            "{:?}",
+            section.findings
+        );
+    }
 }
