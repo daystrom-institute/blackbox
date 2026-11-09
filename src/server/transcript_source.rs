@@ -56,6 +56,8 @@ fn authorize(
 }
 /// The store root fixed when the daemon opened. Never derived from live
 /// config: ingest, admission, the reaper and doctor share this one root.
+/// Handlers reach it through the runtime; tests name it directly.
+#[cfg(test)]
 pub(super) fn store_root(state: &SharedState) -> std::path::PathBuf {
     state.transcript_source.root().to_path_buf()
 }
