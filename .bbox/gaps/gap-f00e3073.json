@@ -1,0 +1,25 @@
+{
+  "id": "gap-f00e3073",
+  "title": "Native transcript source store grows without bound and gives no warning before the daemon volume fills",
+  "gap_kind": "tooling",
+  "domain": "transcript-source",
+  "wanted_capability": "The daemon-side native transcript source store should stay near one copy of live content and surface storage pressure before writes fail. Today it never removes chunk files (every superseded tail chunk of a growing session and every abandoned upload stays forever), keeps live content twice (chunk set plus materialized generation), and skips generation cleanup entirely whenever a reader lease is held, retrying only on that stream's next publish. On a mature store this measured about 3.3x live content (46 GiB stored for 14 GiB live), filled the daemon state volume, and stalled every daemon write. ENOSPC surfaces as the generic 503 transcript_source_unavailable, the collector keeps staging chunks across the rest of each cycle, and bbox_doctor has no storage or headroom section, so the first signal was unrelated write failures.",
+  "missing_primitive": "Chunk GC and single-copy storage in bbox-transcript-source-store, a lease-aware periodic reaper, a distinct storage_exhausted refusal with ingest admission, and a doctor storage section (filesystem headroom plus stored-to-live ratio)",
+  "fallback_used": "Stopped the collector, then ran a one-off shell sweep inside the daemon pod holding an exclusive readers.lock. It deleted every non-current generation .jsonl and every chunk not referenced by the stream's current.json (about 17 GiB reclaimed, volume from 100% to 81%), then restarted the collector and confirmed a clean scan. Wrote a proposal reviewed in three adversarial rounds (verdict ratify with amendments, all applied).",
+  "evidence": [
+    "crates/bbox-transcript-source-store/src/lib.rs:145 (install_chunk; nothing deletes chunks/)",
+    "crates/bbox-transcript-source-store/src/lib.rs:186 (publish materializes full .jsonl beside chunks; cleanup skipped when readers.lock contended)",
+    "src/server/transcript_source.rs:91 (io errors including ENOSPC map to 503 transcript_source_unavailable)",
+    "crates/bbox-transcript-collector/src/lib.rs:350 (cycle continues per stream after refusals)",
+    "src/doctor.rs (no storage section)",
+    "design/daemon-runtime/transcript-source-storage-retention.md (proposed fix)"
+  ],
+  "impact": "high",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/transcript-source/unbounded-store-growth",
+  "suggested_owner": "blackbox",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "created_at": "2026-11-09T19:52:48Z",
+  "updated_at": "2026-11-09T19:52:48Z"
+}

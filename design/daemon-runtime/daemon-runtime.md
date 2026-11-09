@@ -37,6 +37,7 @@ all of that work.
 - [Slim v1 project catalog importer](slim-v1-importer.md)
 - [Typed Git-history transport implementation plan](git-history-provenance-transport-impl.md)
 - [Candidate acceptance: the configured ref is the only gate](publisher-auto-advance.md)
+- [Bounded storage for the native transcript source store](transcript-source-storage-retention.md)
 
 ## Archived
 
