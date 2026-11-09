@@ -94,10 +94,6 @@ fn names_same_file(file: &File, path: &Path) -> io::Result<bool> {
 }
 
 impl StreamLock {
-    pub(crate) fn dir(&self) -> &Path {
-        &self.dir
-    }
-
     /// Remove the whole stream directory: its contents, then `lock`, then
     /// the directory itself with an empty-only removal. A failure while
     /// removing contents leaves `lock` in place for a later sweep. After
