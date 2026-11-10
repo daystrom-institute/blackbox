@@ -18,8 +18,10 @@
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/transcript-source/unbounded-store-growth",
   "suggested_owner": "blackbox",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "project_id": "89bd722f",
   "created_at": "2026-11-09T19:52:48Z",
-  "updated_at": "2026-11-09T19:52:48Z"
+  "updated_at": "2026-11-10T15:41:06Z",
+  "resolved_at": "2026-11-10T15:41:06Z",
+  "resolution_note": "Shipped in beta/blackbox-v2 6c1db490 (merge of feat/transcript-store-retention implementing design/daemon-runtime/transcript-source-storage-retention.md) and deployed to the cage daemon as image 6c1db490514a, with the macOS transcript collector and blackbox CLI redeployed. Verified live: the first reaper run removed 17,752 absorbed chunks (15.2 GB) and 62 non-current generations with the generation phase run and 0 errors; the store went to 1.01x live content and the volume from 82% to 66% used; doctor's storage section reports headroom and the ratio; a collector scan on the new binaries published with tail-only uploads and left no absorbed chunks; transcript search still serves collected sessions. The 507 storage_exhausted path is covered by tests, not exercised live."
 }
