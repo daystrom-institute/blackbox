@@ -447,8 +447,15 @@ pub(super) fn open_shared_state(
     // snapshots) so harness sessions are searchable like any other provider
     // transcript. Each child receives this same root as BRO_HOME.
     idx.set_harness_sessions_dir(cfg.paths.bro_home.join("harness-sessions"));
+    // The native transcript store's ledger and reaper schedule. Building it
+    // touches no state; the reaper's first run starts with the background
+    // tasks. The index writer nudges it after each native pass, so the hook
+    // is installed before the writer clones the config below.
+    let transcript_source =
+        Arc::new(super::transcript_source_reaper::TranscriptSourceRuntime::from_config(&cfg));
+    idx.set_native_source_pass_hook(transcript_source.pass_hook());
     idx.set_native_sources(
-        cfg.paths.state_dir.join("transcript-sources"),
+        transcript_source.root().to_path_buf(),
         if cfg.source_connectors.enabled {
             cfg.source_connectors
                 .producers
@@ -874,6 +881,7 @@ pub(super) fn open_shared_state(
         producer_claim_lock: tokio::sync::Mutex::new(()),
         producer_commands: Arc::new(super::producer_commands::ProducerCommandRuntime::new()),
         producer_currency: Arc::new(super::producer_currency::ProducerCurrencyRuntime::new()),
+        transcript_source,
         render_operations,
         project_authority,
         accepted_publications,

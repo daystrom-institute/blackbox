@@ -97,6 +97,8 @@ struct RawConfig {
     pub code_collection: RawCodeCollectionConfig,
     #[serde(default)]
     pub source_connectors: RawSourceConnectorsConfig,
+    #[serde(default)]
+    pub transcript_source: RawTranscriptSourceConfig,
     pub provenance: RawProvenanceConfig,
     pub providers: RawProviderConfig,
 
@@ -163,6 +165,48 @@ struct RawSourceConnectorsConfig {
     /// These rows authorize no producer or ingest operation.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub retained_conversations: Vec<RetainedConversationSource>,
+}
+
+/// Raw `[transcript_source]` block: storage bounds of the daemon's native
+/// transcript landing store. Strict, so a misspelled bound is a refusal
+/// rather than a silently ignored limit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTranscriptSourceConfig {
+    /// Free-space reserve that transcript ingest admission keeps on the
+    /// store's filesystem. Absent means the larger of 2 GiB and 3% of the
+    /// filesystem.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_free_bytes: Option<u64>,
+    #[serde(default = "default_transcript_source_reaper_interval_secs")]
+    pub reaper_interval_secs: u64,
+    #[serde(default = "default_transcript_source_staging_expiry_secs")]
+    pub staging_expiry_secs: u64,
+    #[serde(default = "default_transcript_source_staging_budget_bytes")]
+    pub staging_budget_bytes: u64,
+}
+
+impl Default for RawTranscriptSourceConfig {
+    fn default() -> Self {
+        Self {
+            min_free_bytes: None,
+            reaper_interval_secs: default_transcript_source_reaper_interval_secs(),
+            staging_expiry_secs: default_transcript_source_staging_expiry_secs(),
+            staging_budget_bytes: default_transcript_source_staging_budget_bytes(),
+        }
+    }
+}
+
+fn default_transcript_source_reaper_interval_secs() -> u64 {
+    30 * 60
+}
+
+fn default_transcript_source_staging_expiry_secs() -> u64 {
+    24 * 60 * 60
+}
+
+fn default_transcript_source_staging_budget_bytes() -> u64 {
+    2 * 1024 * 1024 * 1024
 }
 
 impl Default for RawCodeCollectionConfig {
@@ -1120,6 +1164,35 @@ pub struct ProviderConfig {
     pub codex_disabled_skills: Vec<String>,
 }
 
+/// Storage bounds of the native transcript landing store
+/// (`<state_dir>/transcript-sources`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TranscriptSourceConfig {
+    /// Free bytes transcript ingest admission keeps on the store's
+    /// filesystem. `None` resolves per filesystem to the larger of 2 GiB and
+    /// 3% of its size.
+    pub min_free_bytes: Option<u64>,
+    /// Period of the store reaper; it also runs at daemon start and after
+    /// each native index pass.
+    pub reaper_interval_secs: u64,
+    /// Age after which unadmitted staging (chunks, temporaries, unpublished
+    /// stream directories) is reclaimed.
+    pub staging_expiry_secs: u64,
+    /// Per-source staged chunk bytes the reaper evicts down to, oldest first.
+    pub staging_budget_bytes: u64,
+}
+
+impl Default for TranscriptSourceConfig {
+    fn default() -> Self {
+        Self {
+            min_free_bytes: None,
+            reaper_interval_secs: default_transcript_source_reaper_interval_secs(),
+            staging_expiry_secs: default_transcript_source_staging_expiry_secs(),
+            staging_budget_bytes: default_transcript_source_staging_budget_bytes(),
+        }
+    }
+}
+
 /// Transcript configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranscriptConfig {
@@ -1167,6 +1240,20 @@ fn validate_surfaces(surfaces: &std::collections::BTreeMap<String, SurfaceConfig
     Ok(())
 }
 
+/// A zero reaper interval would spin, and a zero staging expiry would reclaim
+/// a producer's chunks between its upload and its publish.
+fn validate_transcript_source(raw: &RawTranscriptSourceConfig) -> Result<()> {
+    anyhow::ensure!(
+        raw.reaper_interval_secs > 0,
+        "transcript_source.reaper_interval_secs must be positive"
+    );
+    anyhow::ensure!(
+        raw.staging_expiry_secs > 0,
+        "transcript_source.staging_expiry_secs must be positive"
+    );
+    Ok(())
+}
+
 /// Main configuration structure with all resolved values
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -1174,6 +1261,7 @@ pub struct Config {
     pub index: IndexConfig,
     pub code_collection: CodeCollectionConfig,
     pub source_connectors: SourceConnectorsConfig,
+    pub transcript_source: TranscriptSourceConfig,
     pub provenance: ProvenanceConfig,
     pub providers: ProviderConfig,
 
@@ -1224,6 +1312,7 @@ impl Config {
             },
             code_collection: RawCodeCollectionConfig::default(),
             source_connectors: RawSourceConnectorsConfig::default(),
+            transcript_source: RawTranscriptSourceConfig::default(),
             provenance: RawProvenanceConfig {
                 git_notes_namespace: default_provenance_git_notes_namespace(),
             },
@@ -1578,6 +1667,7 @@ pub fn load_with(options: LoadOptions) -> Result<Config> {
     };
     validate_source_connectors(&source_connectors)?;
     validate_surfaces(&raw.surfaces)?;
+    validate_transcript_source(&raw.transcript_source)?;
 
     validate_cutback_retry_config(
         raw.code_collection.cutback_retry_base_secs,
@@ -1651,6 +1741,12 @@ pub fn load_with(options: LoadOptions) -> Result<Config> {
             producers: code_collection_producers,
         },
         source_connectors,
+        transcript_source: TranscriptSourceConfig {
+            min_free_bytes: raw.transcript_source.min_free_bytes,
+            reaper_interval_secs: raw.transcript_source.reaper_interval_secs,
+            staging_expiry_secs: raw.transcript_source.staging_expiry_secs,
+            staging_budget_bytes: raw.transcript_source.staging_budget_bytes,
+        },
         provenance: ProvenanceConfig {
             git_notes_namespace: raw.provenance.git_notes_namespace,
         },
@@ -2539,6 +2635,53 @@ bind = "0.0.0.0"
                 .is_err(),
                 "{invalid}"
             );
+        }
+    }
+
+    #[test]
+    fn transcript_source_bounds_default_parse_and_refuse_degenerate_values() {
+        let _guard = bbox_util::util::test_env_lock();
+        let dir = tempdir().unwrap();
+        let home = dir.path().canonicalize().unwrap();
+        unsafe {
+            env::set_var("HOME", &home);
+            env::set_var("XDG_CONFIG_HOME", home.join(".config"));
+            env::set_var("XDG_DATA_HOME", home.join(".local/share"));
+            env::set_var("XDG_STATE_HOME", home.join(".local/state"));
+            env::remove_var("BLACKBOX_CONFIG");
+        }
+        let load = |text: &str| {
+            let path = home.join("transcript-source.toml");
+            std::fs::write(&path, text).unwrap();
+            load_with(LoadOptions {
+                config_path: Some(path),
+                ..Default::default()
+            })
+        };
+        assert_eq!(
+            load("").unwrap().transcript_source,
+            TranscriptSourceConfig {
+                min_free_bytes: None,
+                reaper_interval_secs: 1800,
+                staging_expiry_secs: 86_400,
+                staging_budget_bytes: 2 * 1024 * 1024 * 1024,
+            }
+        );
+        let configured = load(
+            "[transcript_source]\nmin_free_bytes = 5000000000\nreaper_interval_secs = 600\nstaging_expiry_secs = 3600\nstaging_budget_bytes = 1048576\n",
+        )
+        .unwrap()
+        .transcript_source;
+        assert_eq!(configured.min_free_bytes, Some(5_000_000_000));
+        assert_eq!(configured.reaper_interval_secs, 600);
+        assert_eq!(configured.staging_expiry_secs, 3600);
+        assert_eq!(configured.staging_budget_bytes, 1_048_576);
+        for invalid in [
+            "[transcript_source]\nreaper_interval_secs = 0\n",
+            "[transcript_source]\nstaging_expiry_secs = 0\n",
+            "[transcript_source]\nmin_free_byte = 1\n",
+        ] {
+            assert!(load(invalid).is_err(), "{invalid}");
         }
     }
 

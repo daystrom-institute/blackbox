@@ -216,6 +216,10 @@ pub struct FieldHandles {
     pub graph_generation: Field,
 }
 
+/// Called after a native transcript pass released its reader leases. Must
+/// not block: the caller is the index writer.
+pub type NativeSourcePassHook = std::sync::Arc<dyn Fn() + Send + Sync>;
+
 /// Config needed by the background reindex thread.
 #[derive(Clone)]
 pub struct ReindexConfig {
@@ -244,6 +248,12 @@ pub struct ReindexConfig {
     pub conversation_source_root: Option<PathBuf>,
     pub native_source_root: Option<PathBuf>,
     pub native_sources: Vec<bbox_corpus_core::project_catalog::ConnectorScope>,
+    /// Notified once after every adapter-driven transcript pass that
+    /// enumerated native sources, after the adapter registry (and with it the
+    /// pass's source reader leases) dropped, on success and error alike. The
+    /// daemon uses it to schedule native source store reclamation; `None`
+    /// in hermetic indexes.
+    pub native_source_pass_hook: Option<NativeSourcePassHook>,
     /// Which conversation-lane connector scopes the corpus may project, with
     /// the vendor tenant each grant declares. Empty disables the adapter even
     /// when the root is set: enrollment is operator config, so retiring the
@@ -569,6 +579,7 @@ impl TranscriptIndex {
             conversation_source_root: None,
             native_source_root: None,
             native_sources: Vec::new(),
+            native_source_pass_hook: None,
             conversation_sources: Vec::new(),
         };
         let active_code_selectors = load_active_code_selectors(
@@ -879,6 +890,13 @@ impl TranscriptIndex {
     ) {
         self.config.native_source_root = Some(root);
         self.config.native_sources = scopes;
+    }
+
+    /// Notify `hook` after each native transcript pass releases its source
+    /// reader leases. Called by daemon startup before the index writer
+    /// clones this config.
+    pub fn set_native_source_pass_hook(&mut self, hook: NativeSourcePassHook) {
+        self.config.native_source_pass_hook = Some(hook);
     }
 
     pub fn set_conversation_sources(

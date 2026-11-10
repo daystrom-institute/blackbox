@@ -949,9 +949,11 @@ dependencies = [
  "bbox-corpus-core",
  "bbox-transcript-source",
  "fs2",
+ "serde",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
+ "tracing",
 ]
 
 [[package]]

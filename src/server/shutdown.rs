@@ -394,4 +394,58 @@ mod tests {
             "reload must revoke a producer overlay with no current journal before transitions are dispatched"
         );
     }
+
+    /// A reload that moves the state directory cannot split transcript
+    /// ingest from its admission ledger, reaper and doctor observation: all of
+    /// them keep the store root the daemon opened until restart.
+    #[tokio::test]
+    async fn config_reload_keeps_every_transcript_surface_on_the_opened_store_root() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let state_dir = root.join("state");
+        let catalog_path = root.join("catalog").join("projects.json");
+        fs::create_dir_all(&state_dir).unwrap();
+        fs::create_dir_all(catalog_path.parent().unwrap()).unwrap();
+        let mut env = crate::util::TestEnvGuard::new();
+        env.set("BLACKBOX_CONFIG", root.join("missing-config.toml"));
+        env.set("BLACKBOX_STATE_DIR", &state_dir);
+        bbox_indexing::project_catalog_store::ProjectCatalogStore::initialize_empty(&catalog_path)
+            .unwrap();
+        let state = Arc::new(SharedState::for_test_catalog(&state_dir, &catalog_path));
+        let opened = state.transcript_source.root().to_path_buf();
+        assert_eq!(super::super::transcript_source::store_root(&state), opened);
+
+        let moved_dir = root.join("moved-state");
+        let mut moved = state.config.read().clone();
+        moved.paths.state_dir = moved_dir.clone();
+        install_config_reload(&state, moved)
+            .await
+            .expect("the reload installs");
+        assert_eq!(
+            state.config.read().paths.state_dir,
+            moved_dir,
+            "the reload really moved the configured state directory"
+        );
+
+        assert_eq!(super::super::transcript_source::store_root(&state), opened);
+        assert_eq!(state.transcript_source.admission_root(), opened);
+        assert_eq!(
+            state.transcript_source.ingest_store().unwrap().root(),
+            opened
+        );
+        state.transcript_source.run_once().unwrap();
+        state.transcript_source.sample_headroom_now();
+        let server = super::super::BlackboxServer::new(state.clone());
+        let report = crate::doctor::run_section(&server, "storage").unwrap();
+        let storage = report.storage.unwrap();
+        assert!(
+            storage
+                .filesystems
+                .iter()
+                .flat_map(|filesystem| &filesystem.roots)
+                .any(|root| root.label == "transcript source store" && root.path == opened),
+            "{storage:?}"
+        );
+        assert!(!moved_dir.join("transcript-sources").exists());
+    }
 }

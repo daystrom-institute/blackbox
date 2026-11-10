@@ -26,6 +26,7 @@ pub(crate) mod knowledge_source;
 pub(crate) mod mcp_auth;
 pub(crate) mod mcp_oauth;
 pub(crate) mod transcript_source;
+pub(crate) mod transcript_source_reaper;
 // The published-view install gate lives here and is exercised from the
 // catalog tool's acceptance tests, which is why this module is crate
 // visible while its knowledge/gap siblings are not.

@@ -15,7 +15,7 @@ use bbox_config::config::{
     CodeCollectionConfig, CodeCollectionProducerConfig, Config, ConnectorProducerConfig,
     ConnectorProfile, ConnectorScopeGrant, DaemonConfig, ExecutorKind, IndexConfig, McpOAuthConfig,
     ProducerScopeClaimPolicy, ProvenanceConfig, ProviderConfig, ResolvedPathConfig,
-    RetainedConversationSource, SourceConnectorsConfig, TranscriptConfig,
+    RetainedConversationSource, SourceConnectorsConfig, TranscriptConfig, TranscriptSourceConfig,
 };
 
 /// The fixed text every redacted value renders as.
@@ -53,6 +53,7 @@ pub(crate) fn redacted_config(config: &Config) -> Vec<ConfigGroup> {
         index,
         code_collection,
         source_connectors,
+        transcript_source,
         provenance,
         providers,
         transcripts,
@@ -68,6 +69,9 @@ pub(crate) fn redacted_config(config: &Config) -> Vec<ConfigGroup> {
         }),
         group("source_connectors", |rows| {
             source_connector_rows(rows, source_connectors)
+        }),
+        group("transcript_source", |rows| {
+            transcript_source_rows(rows, transcript_source)
         }),
         group("provenance", |rows| provenance_rows(rows, provenance)),
         group("providers", |rows| provider_rows(rows, providers)),
@@ -428,6 +432,19 @@ fn provider_rows(rows: &mut Rows, providers: &ProviderConfig) {
     rows.list("codex_disabled_skills", codex_disabled_skills.iter());
 }
 
+fn transcript_source_rows(rows: &mut Rows, transcript_source: &TranscriptSourceConfig) {
+    let TranscriptSourceConfig {
+        min_free_bytes,
+        reaper_interval_secs,
+        staging_expiry_secs,
+        staging_budget_bytes,
+    } = transcript_source;
+    rows.optional("min_free_bytes", min_free_bytes.as_ref());
+    rows.text("reaper_interval_secs", reaper_interval_secs);
+    rows.text("staging_expiry_secs", staging_expiry_secs);
+    rows.text("staging_budget_bytes", staging_budget_bytes);
+}
+
 fn transcript_rows(rows: &mut Rows, transcripts: &TranscriptConfig) {
     let TranscriptConfig { roots, codex_root } = transcripts;
     rows.optional("roots", roots.as_ref());
@@ -630,6 +647,10 @@ pub(crate) mod tests {
             (
                 "source_connectors",
                 serde_json::to_value(&config.source_connectors).unwrap(),
+            ),
+            (
+                "transcript_source",
+                serde_json::to_value(&config.transcript_source).unwrap(),
             ),
             (
                 "provenance",

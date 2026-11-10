@@ -93,17 +93,94 @@ filesystem/git probing on the daemon.
 The initial source set is Claude Code and Codex JSONL sessions. Each stream is
 limited to 1GiB, uploaded in chunks of at most 1MiB. Capture, upload, and server
 publication operate with bounded chunk buffers. Root directories must be
-explicit and source/account pairs unique. Chunk materializations retain the
-current and immediately previous generation. Active index readers hold a source
-lease that defers cleanup across further publications; cleanup failures do not
-undo durable admission. Chunk blobs are retained, including
-interrupted uploads. Account for that storage when choosing retention outside
-the live collection path.
+explicit and source/account pairs unique.
+
+## Daemon storage
+
+At rest the daemon stores each stream's live content once: its current
+generation's materialized file. Uploaded chunks are staging. The daemon answers
+which chunks it already has from staged chunks and from verified ranges of the
+current generation, so an appended session still uploads only its changed
+tail. A publish assembles the new generation from those two sources and then
+deletes the staged chunks its snapshot absorbed. Damaged stored bytes are never
+reported present; they are re-requested and re-uploaded like a new chunk.
+
+A reaper bounds the rest. It runs when the daemon starts, every
+`reaper_interval_secs`, and after each index pass that read native sources. Its
+staging phase removes chunks already present in the current generation,
+staging and temporaries older than `staging_expiry_secs`, the oldest staged
+chunks of a source over `staging_budget_bytes`, and stream directories that
+never published and have been idle for the staging expiry (including empty
+directories an interrupted create or delete left without a lock file). Its generation phase
+removes every generation file other than the current one, but only when no
+index pass holds the source's reader lease; otherwise the next run retries.
+Sources whose grant was removed are reclaimed the same way. Each run logs one
+`native transcript source reaper run` line with per-category counts. On upgrade
+the first run with the lease free reclaims the chunks and generations earlier
+releases retained.
+
+A presence answer is not a reservation. If staging the producer relied on is
+reclaimed before its publish, the publish is refused before the current
+pointer moves and the collector's next cycle re-asks and uploads the missing
+chunk. No admitted snapshot is lost.
+
+Ingest is admitted against free space. A chunk upload reserves its size and a
+publish reserves the new generation's full length before writing; the
+operation is refused when the store's filesystem would keep less than the
+reserve after outstanding ingest reservations. A full filesystem or exhausted
+quota is refused the same way. Both answer `507` with code `storage_exhausted`,
+distinct from the transient `503 transcript_source_unavailable`. The collector
+aborts its cycle on `507 storage_exhausted`: it stops walking roots and posts no
+completion contact, so the scan stays in progress until the next cycle starts a
+new one, and the cycle reports the refusal once. Republishing a generation that
+is already current needs no headroom.
+
+The bounds live in the daemon config:
+
+```toml
+[transcript_source]
+# Free bytes ingest keeps on the store's filesystem. Omit for the larger of
+# 2 GiB and 3% of the filesystem.
+min_free_bytes = 5000000000
+reaper_interval_secs = 1800       # default 30 minutes
+staging_expiry_secs = 86400       # default 24 hours
+staging_budget_bytes = 2147483648 # per source, default 2 GiB
+```
+
+The store lives at `<state_dir>/transcript-sources` as resolved when the daemon
+opens. Ingest, admission, the reaper and doctor all use that root; a
+configuration reload that changes `state_dir` does not move it until restart.
+
+The reserve is a soft guarantee. Other writers on the same filesystem (indexes,
+vectors, contact and lease files) do not reserve against it. Live content still
+grows with source history, because retention is unchanged. `bbox_doctor`'s
+`storage` section (catalog-authority daemons) reports two cached observations,
+each with its absolute time. A headroom sample of each store filesystem's size
+and free space is taken at start and then every five minutes (or every reaper
+interval, if shorter) by a sampler separate from the reaper, so a hung mount
+delays only its own sample; it warns below 15% free and raises an action on the
+filesystem holding the transcript store when free space is below the reserve.
+The reaper's latest measurement of each native source reports its live,
+stored, staged and non-current bytes and the stored-to-live ratio, and warns
+when stored exceeds live by more than 25% after a completed generation phase.
+Either observation warns once it is older than three reaper intervals. Sources
+whose grant was removed stay listed while their bytes remain; a newly granted
+source shows as unavailable until its first measurement.
+
+How far doctor's free space lags the filesystem depends on sampling
+succeeding: normally by up to one sampling period, longer if a probe stalls,
+which the staleness warning then reports. Doctor does not promise a warning
+before every refusal. Admission reads live free space on every chunk and
+publish, so ingest can be refused before a sample shows the shortfall.
+Unadmitted staging younger than the expiry is legitimately retained, so treat
+the ratio as a diagnostic.
 
 Removing or disabling a grant rejects subsequent producer requests. A daemon
 configuration restart updates index enrollment, and its next reindex removes
 that source's projected documents. The retained source store is not erased by
-grant removal. Removing a grant is an authorization change, not a data wipe.
+grant removal: the reaper keeps reclaiming staging and old generations, but
+every published stream's current generation stays. Removing a grant is an
+authorization change, not a data wipe.
 
 ## macOS background collection
 

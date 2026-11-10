@@ -106,6 +106,9 @@ pub(crate) struct SharedState {
     /// What each code-source producer last reported per project (contact,
     /// code and history HEAD, pass interval), the input of doctor currency.
     pub(crate) producer_currency: Arc<super::producer_currency::ProducerCurrencyRuntime>,
+    /// Storage bounds of the native transcript landing store: the shared
+    /// ingest reservation ledger and the reaper schedule.
+    pub(crate) transcript_source: Arc<super::transcript_source_reaper::TranscriptSourceRuntime>,
     /// Durable checkout-owner project render operations and render-lane
     /// presence (`server::render_operations`).
     pub(crate) render_operations: Arc<super::render_operations::RenderOperationRuntime>,
@@ -668,6 +671,13 @@ impl SharedState {
                 super::producer_commands::ProducerCommandRuntime::new(),
             ),
             producer_currency: Arc::new(super::producer_currency::ProducerCurrencyRuntime::new()),
+            transcript_source: Arc::new(
+                super::transcript_source_reaper::TranscriptSourceRuntime::new(
+                    store_dir.join("transcript-sources"),
+                    &Default::default(),
+                    Vec::new(),
+                ),
+            ),
             project_authority,
             // `for_test` builds the bridge authority, which never has an
             // accepted-publication runtime.
