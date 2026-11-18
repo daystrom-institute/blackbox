@@ -1,13 +1,14 @@
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Output};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 
+use crate::git_spawn::{DirectoryAnchor, GitChild, spawn_git};
 use crate::json_store::NofollowDirectory;
 
 /// Exact contents of the host-local marker that opts a full independent
@@ -770,7 +771,7 @@ struct VerifiedObjectSessions {
 
 #[cfg(unix)]
 struct CatFileSession {
-    child: std::process::Child,
+    child: GitChild,
     stdin: Option<std::process::ChildStdin>,
     stdout: Option<BufReader<std::process::ChildStdout>>,
     stderr_drain: Option<std::thread::JoinHandle<(Vec<u8>, bool)>>,
@@ -1429,13 +1430,16 @@ fn configured_alternates_exist(objects: &StableDirectory) -> Result<bool> {
     })
 }
 
+/// Configure `command` to run inside the repository's held objects
+/// directory and return the anchor the spawn must honor. On macOS the anchor
+/// is applied by a fork-free `posix_spawn` file action (see `git_spawn`);
+/// elsewhere a `pre_exec` `fchdir` applies it and no anchor is returned.
 #[cfg(unix)]
 fn configure_stable_repository_command(
     command: &mut Command,
     repository: &StableRepositoryAuthority,
-) -> Result<()> {
+) -> Result<Option<DirectoryAnchor>> {
     use std::os::fd::AsRawFd;
-    use std::os::unix::process::CommandExt;
 
     configure_exact_read_environment(command, None)?;
     // macOS exposes directory descriptors under /dev/fd but does not permit
@@ -1448,24 +1452,33 @@ fn configure_stable_repository_command(
         .env("GIT_COMMON_DIR", "..")
         .env("GIT_OBJECT_DIRECTORY", ".");
     let objects_descriptor = repository.objects.file.as_raw_fd();
-    unsafe {
-        command.pre_exec(move || {
-            if libc::fchdir(objects_descriptor) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
+    #[cfg(target_os = "macos")]
+    {
+        Ok(Some(objects_descriptor))
     }
-    Ok(())
+    #[cfg(not(target_os = "macos"))]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            command.pre_exec(move || {
+                if libc::fchdir(objects_descriptor) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        Ok(None)
+    }
 }
 
 #[cfg(unix)]
 fn read_stable_repository_object_format(repository: &StableRepositoryAuthority) -> Result<usize> {
     let mut command = Command::new("git");
     command.args(["rev-parse", "--show-object-format=storage"]);
-    configure_stable_repository_command(&mut command, repository)?;
-    let output = run_bounded_with_timeout_and_stdout_limit(
+    let anchor = configure_stable_repository_command(&mut command, repository)?;
+    let output = run_anchored_bounded_with_timeout_and_stdout_limit(
         command,
+        anchor,
         &repository.root,
         "reading stable repository object format",
         GIT_OUTPUT_TIMEOUT,
@@ -1545,9 +1558,10 @@ fn resolve_stable_repository_ref(
     let specification = format!("{reference}^{{commit}}");
     let mut command = Command::new("git");
     command.args(["rev-parse", "--verify", &specification]);
-    configure_stable_repository_command(&mut command, repository)?;
-    let output = run_bounded_with_timeout_and_stdout_limit(
+    let anchor = configure_stable_repository_command(&mut command, repository)?;
+    let output = run_anchored_bounded_with_timeout_and_stdout_limit(
         command,
+        anchor,
         &repository.root,
         "resolving stable Git reference",
         GIT_OUTPUT_TIMEOUT,
@@ -1576,9 +1590,10 @@ fn resolve_stable_repository_commitish(
     let specification = format!("{commitish}^{{commit}}");
     let mut command = Command::new("git");
     command.args(["rev-parse", "--verify", "--end-of-options", &specification]);
-    configure_stable_repository_command(&mut command, repository)?;
-    let output = run_bounded_with_timeout_and_stdout_limit(
+    let anchor = configure_stable_repository_command(&mut command, repository)?;
+    let output = run_anchored_bounded_with_timeout_and_stdout_limit(
         command,
+        anchor,
         &repository.root,
         "resolving stable Git commit selector",
         GIT_OUTPUT_TIMEOUT,
@@ -1624,9 +1639,10 @@ fn run_stable_repository_stdout_bounded_with_timeout(
 ) -> Result<Vec<u8>> {
     let mut command = Command::new("git");
     command.args(args);
-    configure_stable_repository_command(&mut command, repository)?;
-    let output = run_bounded_with_timeout_and_stdout_limit(
+    let anchor = configure_stable_repository_command(&mut command, repository)?;
+    let output = run_anchored_bounded_with_timeout_and_stdout_limit(
         command,
+        anchor,
         &repository.root,
         action,
         timeout,
@@ -2042,9 +2058,10 @@ impl CatFileSession {
     fn spawn(repository: &StableRepositoryAuthority) -> Result<Self> {
         let mut command = Command::new("git");
         command.args(["cat-file", "--batch-command"]);
-        configure_stable_repository_command(&mut command, repository)?;
-        Self::spawn_command(
+        let anchor = configure_stable_repository_command(&mut command, repository)?;
+        Self::spawn_anchored_command(
             command,
+            anchor,
             GIT_OUTPUT_TIMEOUT,
             &format!(
                 "spawning stable Git object session for {}",
@@ -2053,28 +2070,27 @@ impl CatFileSession {
         )
     }
 
+    #[cfg(test)]
     fn spawn_command(
-        mut command: Command,
+        command: Command,
         request_timeout: Duration,
         spawn_context: &str,
     ) -> Result<Self> {
-        command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut child = command.spawn().with_context(|| spawn_context.to_string())?;
-        let stdin = child
-            .stdin
-            .take()
-            .context("stable Git session has no stdin")?;
-        let stdout = child
-            .stdout
-            .take()
-            .context("stable Git session has no stdout")?;
-        let mut stderr_pipe = child
-            .stderr
-            .take()
-            .context("stable Git session has no stderr")?;
+        Self::spawn_anchored_command(command, None, request_timeout, spawn_context)
+    }
+
+    fn spawn_anchored_command(
+        command: Command,
+        anchor: Option<DirectoryAnchor>,
+        request_timeout: Duration,
+        spawn_context: &str,
+    ) -> Result<Self> {
+        let spawned =
+            spawn_git(command, anchor, true).with_context(|| spawn_context.to_string())?;
+        let child = spawned.child;
+        let stdin = spawned.stdin.context("stable Git session has no stdin")?;
+        let stdout = spawned.stdout.context("stable Git session has no stdout")?;
+        let mut stderr_pipe = spawned.stderr.context("stable Git session has no stderr")?;
         let stderr_drain = std::thread::spawn(move || {
             drain_with_retention_limit(&mut stderr_pipe, Some(GIT_STDERR_RETAINED_LIMIT))
         });
@@ -3359,23 +3375,58 @@ fn run_bounded_with_timeout_and_stdout_limit(
     )
 }
 
-#[allow(clippy::disallowed_methods)]
+/// Run a stable-repository command whose child must start in `anchor`.
+#[cfg(unix)]
+fn run_anchored_bounded_with_timeout_and_stdout_limit(
+    cmd: Command,
+    anchor: Option<DirectoryAnchor>,
+    path: &Path,
+    action: &'static str,
+    timeout: Duration,
+    retained_stdout_limit: Option<usize>,
+) -> Option<BoundedGitOutput> {
+    run_bounded_spawn(
+        cmd,
+        anchor,
+        path,
+        action,
+        timeout,
+        None,
+        retained_stdout_limit,
+    )
+}
+
 fn run_bounded_with_timeout_stdin_and_stdout_limit(
-    mut cmd: Command,
+    cmd: Command,
     path: &Path,
     action: &'static str,
     timeout: Duration,
     stdin_payload: Option<Vec<u8>>,
     retained_stdout_limit: Option<usize>,
 ) -> Option<BoundedGitOutput> {
-    if stdin_payload.is_some() {
-        cmd.stdin(Stdio::piped());
-    } else {
-        cmd.stdin(Stdio::null());
-    }
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = match cmd.spawn() {
-        Ok(child) => child,
+    run_bounded_spawn(
+        cmd,
+        None,
+        path,
+        action,
+        timeout,
+        stdin_payload,
+        retained_stdout_limit,
+    )
+}
+
+#[allow(clippy::disallowed_methods)]
+fn run_bounded_spawn(
+    cmd: Command,
+    anchor: Option<DirectoryAnchor>,
+    path: &Path,
+    action: &'static str,
+    timeout: Duration,
+    stdin_payload: Option<Vec<u8>>,
+    retained_stdout_limit: Option<usize>,
+) -> Option<BoundedGitOutput> {
+    let spawned = match spawn_git(cmd, anchor, stdin_payload.is_some()) {
+        Ok(spawned) => spawned,
         Err(err) => {
             tracing::warn!(
                 path = %path.display(),
@@ -3386,14 +3437,15 @@ fn run_bounded_with_timeout_stdin_and_stdout_limit(
             return None;
         }
     };
+    let mut child = spawned.child;
     let mut stdin_writer = if let Some(payload) = stdin_payload {
-        let mut stdin_pipe = child.stdin.take()?;
+        let mut stdin_pipe = spawned.stdin?;
         Some(std::thread::spawn(move || stdin_pipe.write_all(&payload)))
     } else {
         None
     };
-    let mut stdout_pipe = child.stdout.take()?;
-    let mut stderr_pipe = child.stderr.take()?;
+    let mut stdout_pipe = spawned.stdout?;
+    let mut stderr_pipe = spawned.stderr?;
     let stdout_drain = std::thread::spawn(move || {
         drain_with_retention_limit(&mut stdout_pipe, retained_stdout_limit)
     });
@@ -3490,7 +3542,7 @@ fn drain_with_retention_limit(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
+    use std::process::{Command, Stdio};
 
     #[test]
     fn stable_history_protocol_preserves_graph_metadata_and_paths() {
