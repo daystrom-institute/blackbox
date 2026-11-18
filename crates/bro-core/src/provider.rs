@@ -713,8 +713,22 @@ const CODEX_LUNA_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 
 static CODEX_MODELS: &[ModelInfo] = &[
     ModelInfo {
+        id: "gpt-6.2-sol",
+        description: "GPT-6.2 Sol: fast, go-to model for coding and everyday work",
+        default: false,
+        efforts: CODEX_ULTRA_EFFORTS,
+        default_effort: Some("low"),
+    },
+    ModelInfo {
+        id: "gpt-6.2-astra",
+        description: "GPT-6.2 Astra: most capable model for complex coding and professional work",
+        default: false,
+        efforts: CODEX_ULTRA_EFFORTS,
+        default_effort: Some("low"),
+    },
+    ModelInfo {
         id: "gpt-6.1-sol",
-        description: "GPT-6.1 Sol: latest workhorse model for coding and everyday work",
+        description: "GPT-6.1 Sol: previous generation workhorse model for coding and everyday work",
         default: false,
         efforts: CODEX_ULTRA_EFFORTS,
         default_effort: Some("low"),
@@ -944,6 +958,8 @@ mod tests {
         assert_eq!(default_model.id, "gpt-5.6-sol");
         assert_eq!(models.iter().filter(|m| m.default).count(), 1);
         for slug in [
+            "gpt-6.2-sol",
+            "gpt-6.2-astra",
             "gpt-6.1-sol",
             "gpt-6-astra",
             "gpt-6-sol",
@@ -987,7 +1003,7 @@ mod tests {
     #[test]
     fn ultra_is_model_keyed_sol_terra_yes_luna_no() {
         let p = Provider::Codex;
-        for model in ["gpt-6.1-sol", "gpt-6-sol"] {
+        for model in ["gpt-6.2-sol", "gpt-6.2-astra", "gpt-6.1-sol", "gpt-6-sol"] {
             assert_eq!(
                 p.model_efforts(model),
                 ["low", "medium", "high", "xhigh", "max", "ultra"]
@@ -1019,6 +1035,8 @@ mod tests {
         assert!(!luna.iter().any(|e| e.id == "ultra"));
         assert_eq!(p.model_default_effort("gpt-5.6-sol"), Some("medium"));
         assert_eq!(p.model_default_effort("gpt-6-astra"), Some("medium"));
+        assert_eq!(p.model_default_effort("gpt-6.2-sol"), Some("low"));
+        assert_eq!(p.model_default_effort("gpt-6.2-astra"), Some("low"));
         assert_eq!(p.model_default_effort("gpt-6.1-sol"), Some("low"));
         assert_eq!(p.model_default_effort("gpt-6-sol"), Some("medium"));
         assert_eq!(p.model_default_effort("gpt-6-luna"), Some("medium"));
