@@ -1255,6 +1255,8 @@ fn retirement_execute_refuses_activation_content_mutation() {
 }
 
 #[test]
+// The subprocess fault hook is intentionally disabled in release builds.
+#[cfg(debug_assertions)]
 fn retirement_journal_resumes_each_artifact_tombstone_boundary() {
     for boundary in [
         "before_payload_hide",

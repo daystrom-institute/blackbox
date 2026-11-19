@@ -262,6 +262,7 @@ fn replace_materialized_replaces_not_appends() {
 }
 
 #[test]
+#[cfg(debug_assertions)]
 #[should_panic(expected = "rejected non-Derived edge")]
 fn replace_materialized_rejects_explicit() {
     let dir = tempfile::tempdir().unwrap();
