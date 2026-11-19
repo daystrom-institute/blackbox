@@ -410,13 +410,14 @@ mod tests {
         let admission = client.onboard(&config).await.unwrap();
         assert_eq!(admission["catalog_admitted"], true);
         assert_eq!(admission["reload_pending"], false);
-        let cycle = bbox_transcript_collector::publish_cycle(&config, &client)
+        let mut memo = bbox_transcript_collector::CaptureMemo::default();
+        let cycle = bbox_transcript_collector::publish_cycle(&config, &client, &mut memo)
             .await
             .unwrap();
         assert_eq!(cycle.published, 1);
         assert_eq!(cycle.failed, 0);
         assert_eq!(
-            bbox_transcript_collector::publish_cycle(&config, &client)
+            bbox_transcript_collector::publish_cycle(&config, &client, &mut memo)
                 .await
                 .unwrap()
                 .unchanged,

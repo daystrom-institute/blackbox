@@ -8,6 +8,13 @@ out explicitly under `Changed` or `Removed`.
 
 ## Unreleased
 
+- `bbox-transcript-collector watch` no longer reads and digests every
+  transcript on every cycle. It keeps each stream's capture in memory and
+  reads a file again only when its identity, length, modification stamp or
+  status-change stamp differs, or when it had changed within two seconds of
+  the capture. Every cycle still compares each stream with its durable server
+  generation, and the first cycle after a start reads every stream.
+  `publish_cycle` takes the `CaptureMemo` to use.
 - `scripts/sync-skills.sh` registers the global skills with the host's Agent
   Service Desk as publisher `blackbox` instead of copying them. ASD links each
   skill directory into `~/.agents/skills` and every Claude Code home, adopts

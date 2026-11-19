@@ -6,9 +6,11 @@ use bbox_corpus_core::project_catalog::ConnectorScope;
 use bbox_transcript_source::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -194,11 +196,68 @@ async fn decode<R: serde::de::DeserializeOwned>(mut response: reqwest::Response)
     Ok(response.json().await?)
 }
 
+/// A capture is remembered only when its file had been unchanged this long
+/// when it was read. That exceeds filesystem timestamp granularity, so a later
+/// write cannot land on the stamps the capture recorded.
+const SETTLE: Duration = Duration::from_secs(2);
+
+/// A file's identity and change stamps as one metadata read reported them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileStamp {
+    length: u64,
+    modified: SystemTime,
+    #[cfg(unix)]
+    inode: (u64, u64),
+    #[cfg(unix)]
+    changed: (i64, i64),
+}
+impl FileStamp {
+    fn of(metadata: &std::fs::Metadata) -> Result<Self> {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Ok(Self {
+            length: metadata.len(),
+            modified: metadata.modified()?,
+            #[cfg(unix)]
+            inode: (metadata.dev(), metadata.ino()),
+            #[cfg(unix)]
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+        })
+    }
+    /// Whether every change stamp is at least `SETTLE` older than `now`. A
+    /// stamp ahead of `now` is never settled.
+    fn settled(&self, now: SystemTime) -> bool {
+        let quiet = |at: SystemTime| now.duration_since(at).is_ok_and(|age| age >= SETTLE);
+        #[cfg(unix)]
+        {
+            let changed = u64::try_from(self.changed.0)
+                .ok()
+                .zip(u32::try_from(self.changed.1).ok())
+                .and_then(|(seconds, nanos)| {
+                    SystemTime::UNIX_EPOCH.checked_add(Duration::new(seconds, nanos))
+                });
+            if !changed.is_some_and(quiet) {
+                return false;
+            }
+        }
+        quiet(self.modified)
+    }
+}
+
 pub struct Captured {
     pub snapshot: StreamSnapshot,
     path: PathBuf,
-    source_length: u64,
-    modified: std::time::SystemTime,
+    stamp: FileStamp,
+}
+
+/// One stream file, opened without following a final symlink and proven to
+/// lie inside its configured root.
+struct Source {
+    file: std::fs::File,
+    opened: std::fs::Metadata,
+    path: PathBuf,
+    stream_id: String,
+    is_subagent: bool,
 }
 #[derive(Deserialize)]
 struct SessionMetadata {
@@ -213,10 +272,7 @@ struct SessionPayload {
     id: Option<String>,
 }
 
-/// Hash complete source bytes in 1MiB buffers. No full-session buffer exists,
-/// even for a 1GiB backfill stream. Unknown JSON fields are skipped while
-/// finding session metadata instead of materialized as arbitrary Values.
-pub fn capture(root: &RootConfig, path: &Path, scope: &ConnectorScope) -> Result<Option<Captured>> {
+fn open_source(root: &RootConfig, path: &Path) -> Result<Source> {
     let base = root.path.canonicalize()?;
     let canonical = path.canonicalize()?;
     ensure!(
@@ -231,12 +287,50 @@ pub fn capture(root: &RootConfig, path: &Path, scope: &ConnectorScope) -> Result
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NOFOLLOW);
     }
-    let mut file = options.open(path)?;
-    let before = file.metadata()?;
+    let file = options.open(path)?;
+    let opened = file.metadata()?;
     ensure!(
-        before.is_file() && before.len() <= MAX_STREAM_BYTES,
+        opened.is_file() && opened.len() <= MAX_STREAM_BYTES,
         "native transcript is not a bounded regular file"
     );
+    Ok(Source {
+        stream_id: sha256(
+            format!(
+                "{:?}/{}/{}",
+                root.source,
+                root.account,
+                relative.to_string_lossy()
+            )
+            .as_bytes(),
+        ),
+        is_subagent: relative
+            .components()
+            .any(|part| part.as_os_str() == "subagents"),
+        file,
+        opened,
+        path: canonical,
+    })
+}
+
+/// Hash complete source bytes in 1MiB buffers. No full-session buffer exists,
+/// even for a 1GiB backfill stream. Unknown JSON fields are skipped while
+/// finding session metadata instead of materialized as arbitrary Values.
+pub fn capture(root: &RootConfig, path: &Path, scope: &ConnectorScope) -> Result<Option<Captured>> {
+    read_source(root, open_source(root, path)?, scope)
+}
+
+fn read_source(
+    root: &RootConfig,
+    source: Source,
+    scope: &ConnectorScope,
+) -> Result<Option<Captured>> {
+    let Source {
+        mut file,
+        opened: before,
+        path,
+        stream_id,
+        is_subagent,
+    } = source;
     let mut cursor = before.len();
     let complete_length = loop {
         if cursor == 0 {
@@ -296,15 +390,6 @@ pub fn capture(root: &RootConfig, path: &Path, scope: &ConnectorScope) -> Result
         before.len() == after.len() && before.modified()? == after.modified()?,
         "native transcript changed during capture; retry next cycle"
     );
-    let stream_id = sha256(
-        format!(
-            "{:?}/{}/{}",
-            root.source,
-            root.account,
-            relative.to_string_lossy()
-        )
-        .as_bytes(),
-    );
     let snapshot = StreamSnapshot {
         schema_version: SCHEMA_VERSION,
         scope: scope.clone(),
@@ -312,9 +397,7 @@ pub fn capture(root: &RootConfig, path: &Path, scope: &ConnectorScope) -> Result
         source: root.source,
         account: root.account.clone(),
         session_id: session,
-        is_subagent: relative
-            .components()
-            .any(|part| part.as_os_str() == "subagents"),
+        is_subagent,
         content_sha256: format!("{:x}", digest.finalize()),
         byte_length: complete_length,
         chunks,
@@ -322,10 +405,71 @@ pub fn capture(root: &RootConfig, path: &Path, scope: &ConnectorScope) -> Result
     snapshot.validate()?;
     Ok(Some(Captured {
         snapshot,
-        path: canonical,
-        source_length: after.len(),
-        modified: after.modified()?,
+        path,
+        stamp: FileStamp::of(&after)?,
     }))
+}
+
+/// Captures one running collector may reuse instead of reading a stream's
+/// bytes again. A capture is reused only while the opened file still has the
+/// identity, length, and change stamps that capture saw, and only if those
+/// stamps were settled when it read. The memo lives in process memory and
+/// answers what a file's bytes hash to, never whether they are published.
+#[derive(Default)]
+pub struct CaptureMemo {
+    scan: u64,
+    streams: HashMap<String, Remembered>,
+}
+struct Remembered {
+    captured: Arc<Captured>,
+    scan: u64,
+}
+impl CaptureMemo {
+    /// Capture one stream, reading its bytes only when no remembered capture
+    /// matches the opened file. `now` is the caller's clock before the open.
+    pub fn capture(
+        &mut self,
+        root: &RootConfig,
+        path: &Path,
+        scope: &ConnectorScope,
+        now: SystemTime,
+    ) -> Result<Option<Arc<Captured>>> {
+        let source = open_source(root, path)?;
+        let opened = FileStamp::of(&source.opened)?;
+        if let Some(remembered) = self.streams.get_mut(&source.stream_id)
+            && remembered.captured.stamp == opened
+            && remembered.captured.snapshot.scope == *scope
+        {
+            remembered.scan = self.scan;
+            return Ok(Some(remembered.captured.clone()));
+        }
+        self.streams.remove(&source.stream_id);
+        let Some(captured) = read_source(root, source, scope)? else {
+            return Ok(None);
+        };
+        let captured = Arc::new(captured);
+        if captured.stamp == opened && opened.settled(now) {
+            self.streams.insert(
+                captured.snapshot.stream_id.clone(),
+                Remembered {
+                    captured: captured.clone(),
+                    scan: self.scan,
+                },
+            );
+        }
+        Ok(Some(captured))
+    }
+    fn begin_scan(&mut self) {
+        self.scan += 1;
+    }
+    /// Drop every stream the completed walk did not capture.
+    fn finish_scan(&mut self) {
+        let scan = self.scan;
+        self.streams.retain(|_, remembered| remembered.scan == scan);
+    }
+    fn forget(&mut self, stream_id: &str) {
+        self.streams.remove(stream_id);
+    }
 }
 /// Preserve transport causes (including OS errors) in host diagnostics without
 /// letting a long chain dominate the watch log. HTTP failures have already
@@ -344,14 +488,27 @@ pub fn error_diagnostic(error: &anyhow::Error) -> String {
 
 pub type CycleReport = ScanSummary;
 /// No mtime checkpoint or local cursor can suppress server reconciliation:
-/// every discovered stream compares with the durable server generation.
+/// every discovered stream compares with the durable server generation. The
+/// memo only spares reading a stream whose file is provably the one already
+/// captured. A stream whose publication fails is forgotten and read again.
 ///
 /// A daemon storage refusal aborts the cycle: no further stream is walked and
 /// no completion contact is posted, because a completion records a finished
 /// walk. The next cycle's scan-start contact replaces the in-progress scan.
-pub async fn publish_cycle(config: &Config, client: &Client) -> Result<CycleReport> {
-    let scan_id =
-        sha256(format!("{}:{:?}", std::process::id(), std::time::SystemTime::now()).as_bytes());
+pub async fn publish_cycle(
+    config: &Config,
+    client: &Client,
+    memo: &mut CaptureMemo,
+) -> Result<CycleReport> {
+    publish_cycle_at(config, client, memo, SystemTime::now).await
+}
+async fn publish_cycle_at(
+    config: &Config,
+    client: &Client,
+    memo: &mut CaptureMemo,
+    clock: impl Fn() -> SystemTime,
+) -> Result<CycleReport> {
+    let scan_id = sha256(format!("{}:{:?}", std::process::id(), SystemTime::now()).as_bytes());
     let _: SourceContact = client
         .post(
             "contact",
@@ -364,6 +521,7 @@ pub async fn publish_cycle(config: &Config, client: &Client) -> Result<CycleRepo
         .await
         .context("recording native transcript scan start failed")?;
     let mut report = CycleReport::default();
+    memo.begin_scan();
     for root in &config.roots {
         ensure!(
             root.path.is_dir(),
@@ -384,7 +542,7 @@ pub async fn publish_cycle(config: &Config, client: &Client) -> Result<CycleRepo
                 continue;
             }
             report.discovered += 1;
-            let captured = match capture(root, entry.path(), &config.scope) {
+            let captured = match memo.capture(root, entry.path(), &config.scope, clock()) {
                 Ok(Some(captured)) => captured,
                 Ok(None) => {
                     report.deferred += 1;
@@ -414,6 +572,7 @@ pub async fn publish_cycle(config: &Config, client: &Client) -> Result<CycleRepo
                     )));
                 }
                 Err(error) => {
+                    memo.forget(&captured.snapshot.stream_id);
                     report.failed += 1;
                     eprintln!(
                         "native transcript publication failed: {}",
@@ -423,6 +582,7 @@ pub async fn publish_cycle(config: &Config, client: &Client) -> Result<CycleRepo
             }
         }
     }
+    memo.finish_scan();
     let _: SourceContact = client
         .post(
             "contact",
@@ -456,8 +616,8 @@ async fn publish_captured(client: &Client, captured: &Captured) -> Result<(bool,
     let mut uploaded = 0;
     let mut source = std::fs::File::open(&captured.path)?;
     ensure!(
-        source.metadata()?.len() == captured.source_length
-            && source.metadata()?.modified()? == captured.modified,
+        source.metadata()?.len() == captured.stamp.length
+            && source.metadata()?.modified()? == captured.stamp.modified,
         "native source changed before upload; retry capture"
     );
     for (index, chunk) in snapshot.chunks.iter().enumerate() {
@@ -474,8 +634,8 @@ async fn publish_captured(client: &Client, captured: &Captured) -> Result<(bool,
         }
     }
     ensure!(
-        source.metadata()?.len() == captured.source_length
-            && source.metadata()?.modified()? == captured.modified,
+        source.metadata()?.len() == captured.stamp.length
+            && source.metadata()?.modified()? == captured.stamp.modified,
         "native source changed during upload; retry capture"
     );
     ensure!(
@@ -786,7 +946,10 @@ mod cycle_tests {
         }));
         let (_dir, config) = fixture(url);
         let client = Client::new(&config).unwrap();
-        let error = publish_cycle(&config, &client).await.unwrap_err();
+        let mut memo = CaptureMemo::default();
+        let error = publish_cycle(&config, &client, &mut memo)
+            .await
+            .unwrap_err();
         let diagnostic = error_diagnostic(&error);
         {
             let recorded = recorded.lock().unwrap();
@@ -812,7 +975,7 @@ mod cycle_tests {
 
         // The next cycle starts a new scan normally once storage admits ingest.
         let error_count = recorded.lock().unwrap().requests.len();
-        let report = publish_cycle(&config, &client).await.unwrap();
+        let report = publish_cycle(&config, &client, &mut memo).await.unwrap();
         assert_eq!(report.published, 3);
         assert_eq!(report.failed, 0);
         let recorded = recorded.lock().unwrap();
@@ -847,7 +1010,9 @@ mod cycle_tests {
             }));
             let (_dir, config) = fixture(url);
             let client = Client::new(&config).unwrap();
-            let report = publish_cycle(&config, &client).await.unwrap();
+            let report = publish_cycle(&config, &client, &mut CaptureMemo::default())
+                .await
+                .unwrap();
             assert_eq!(report.discovered, 3);
             assert_eq!(report.published, 2);
             assert_eq!(report.failed, 1);
@@ -858,5 +1023,344 @@ mod cycle_tests {
             assert!(recorded.contacts[0].completed.is_none());
             assert_eq!(recorded.contacts[1].completed.as_ref(), Some(&report));
         }
+    }
+
+    /// A clock far enough ahead that every fixture stream is settled.
+    fn settled_clock() -> SystemTime {
+        SystemTime::now() + Duration::from_secs(3600)
+    }
+
+    /// The memo's captures in stream order. Holding them keeps their
+    /// allocations alive, so a stream read again cannot reuse an address.
+    fn remembered(memo: &CaptureMemo) -> Vec<Arc<Captured>> {
+        let mut captures: Vec<_> = memo
+            .streams
+            .values()
+            .map(|remembered| remembered.captured.clone())
+            .collect();
+        captures.sort_by(|a, b| a.snapshot.stream_id.cmp(&b.snapshot.stream_id));
+        captures
+    }
+
+    fn same_captures(left: &[Arc<Captured>], right: &[Arc<Captured>]) -> bool {
+        left.len() == right.len()
+            && left
+                .iter()
+                .zip(right)
+                .all(|(left, right)| Arc::ptr_eq(left, right))
+    }
+
+    #[tokio::test]
+    async fn a_remembered_stream_is_not_read_again_and_still_reconciles() {
+        let (url, recorded) = stub_daemon(None);
+        let (_dir, config) = fixture(url);
+        let client = Client::new(&config).unwrap();
+        let mut memo = CaptureMemo::default();
+        let first = publish_cycle_at(&config, &client, &mut memo, settled_clock)
+            .await
+            .unwrap();
+        assert_eq!(first.published, 3);
+        let captures = remembered(&memo);
+        assert_eq!(captures.len(), 3, "every settled stream is remembered");
+
+        let second = publish_cycle_at(&config, &client, &mut memo, settled_clock)
+            .await
+            .unwrap();
+        assert!(
+            same_captures(&remembered(&memo), &captures),
+            "an unchanged stream is not read again"
+        );
+        // The stub never holds a generation, so reuse still asks for every
+        // stream's status and publishes it from the remembered capture.
+        assert_eq!(second, first);
+        let recorded = recorded.lock().unwrap();
+        assert_eq!(streams_requested(&recorded, "status").len(), 6);
+        assert_eq!(streams_requested(&recorded, "publish").len(), 6);
+    }
+
+    #[tokio::test]
+    async fn a_failed_publication_forgets_the_remembered_capture() {
+        let (url, recorded) = stub_daemon(Some(Refusal {
+            route: "publish",
+            nth: 5,
+            status: 500,
+            code: "internal_error",
+        }));
+        let (_dir, config) = fixture(url);
+        let client = Client::new(&config).unwrap();
+        let mut memo = CaptureMemo::default();
+        publish_cycle_at(&config, &client, &mut memo, settled_clock)
+            .await
+            .unwrap();
+        assert_eq!(memo.streams.len(), 3);
+
+        let report = publish_cycle_at(&config, &client, &mut memo, settled_clock)
+            .await
+            .unwrap();
+        assert_eq!(report.failed, 1);
+        let refused = streams_requested(&recorded.lock().unwrap(), "publish")[4].clone();
+        assert_eq!(memo.streams.len(), 2);
+        assert!(!memo.streams.contains_key(&refused));
+    }
+
+    #[tokio::test]
+    async fn a_stream_gone_from_a_completed_walk_is_dropped() {
+        let (url, _recorded) = stub_daemon(None);
+        let (_dir, config) = fixture(url);
+        let client = Client::new(&config).unwrap();
+        let mut memo = CaptureMemo::default();
+        publish_cycle_at(&config, &client, &mut memo, settled_clock)
+            .await
+            .unwrap();
+        assert_eq!(memo.streams.len(), 3);
+
+        std::fs::remove_file(config.roots[0].path.join("b.jsonl")).unwrap();
+        let report = publish_cycle_at(&config, &client, &mut memo, settled_clock)
+            .await
+            .unwrap();
+        assert_eq!(report.discovered, 2);
+        assert_eq!(memo.streams.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn an_aborted_walk_keeps_the_streams_it_never_reached() {
+        let (url, _recorded) = stub_daemon(Some(Refusal {
+            route: "status",
+            nth: 5,
+            status: 507,
+            code: "storage_exhausted",
+        }));
+        let (_dir, config) = fixture(url);
+        let client = Client::new(&config).unwrap();
+        let mut memo = CaptureMemo::default();
+        publish_cycle_at(&config, &client, &mut memo, settled_clock)
+            .await
+            .unwrap();
+        let captures = remembered(&memo);
+        assert_eq!(captures.len(), 3);
+
+        publish_cycle_at(&config, &client, &mut memo, settled_clock)
+            .await
+            .unwrap_err();
+        assert!(same_captures(&remembered(&memo), &captures));
+    }
+}
+
+#[cfg(test)]
+mod memo_tests {
+    use super::*;
+
+    fn scope() -> ConnectorScope {
+        ConnectorScope::try_new("csrc_0123456789abcdef", "native_transcript").unwrap()
+    }
+
+    /// A per-test root, canonicalized so stream paths match what capture
+    /// resolves.
+    fn fixture() -> (tempfile::TempDir, RootConfig) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = RootConfig {
+            source: NativeSource::Claude,
+            account: "fixture".into(),
+            path: dir.path().canonicalize().unwrap(),
+        };
+        (dir, root)
+    }
+
+    fn line(session: &str) -> String {
+        serde_json::json!({"sessionId": session}).to_string() + "\n"
+    }
+
+    fn write_stream(root: &RootConfig, name: &str, session: &str) -> PathBuf {
+        let path = root.path.join(name);
+        std::fs::write(&path, line(session)).unwrap();
+        path
+    }
+
+    fn modified(path: &Path) -> SystemTime {
+        std::fs::metadata(path).unwrap().modified().unwrap()
+    }
+
+    /// A clock reading `seconds` after the stream's modification stamp.
+    fn after_write(path: &Path, seconds: u64) -> SystemTime {
+        modified(path) + Duration::from_secs(seconds)
+    }
+
+    fn set_modified(path: &Path, to: SystemTime) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(to)
+            .unwrap();
+    }
+
+    #[test]
+    fn a_settled_unchanged_stream_reuses_its_capture() {
+        let (_dir, root) = fixture();
+        let path = write_stream(&root, "stream.jsonl", "native-one");
+        let now = after_write(&path, 60);
+        let mut memo = CaptureMemo::default();
+        let first = memo.capture(&root, &path, &scope(), now).unwrap().unwrap();
+        assert_eq!(memo.streams.len(), 1);
+        let second = memo.capture(&root, &path, &scope(), now).unwrap().unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn a_stream_changed_inside_the_settle_window_is_read_every_time() {
+        let (_dir, root) = fixture();
+        let path = write_stream(&root, "stream.jsonl", "native-one");
+        let now = after_write(&path, 1);
+        let mut memo = CaptureMemo::default();
+        let first = memo.capture(&root, &path, &scope(), now).unwrap().unwrap();
+        assert!(memo.streams.is_empty());
+        let second = memo.capture(&root, &path, &scope(), now).unwrap().unwrap();
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert_eq!(first.snapshot, second.snapshot);
+
+        // A clock behind the file's stamps never settles it.
+        memo.capture(&root, &path, &scope(), SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .unwrap();
+        assert!(memo.streams.is_empty());
+    }
+
+    #[test]
+    fn a_same_size_rewrite_is_read_again() {
+        let (_dir, root) = fixture();
+        let path = write_stream(&root, "stream.jsonl", "native-one");
+        let mut memo = CaptureMemo::default();
+        let first = memo
+            .capture(&root, &path, &scope(), after_write(&path, 60))
+            .unwrap()
+            .unwrap();
+        assert_eq!(memo.streams.len(), 1);
+
+        let written = modified(&path);
+        std::fs::write(&path, line("native-two")).unwrap();
+        // Pin a distinct stamp so the rewrite shows at any timestamp
+        // granularity.
+        set_modified(&path, written + Duration::from_secs(1));
+        let second = memo
+            .capture(&root, &path, &scope(), after_write(&path, 60))
+            .unwrap()
+            .unwrap();
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert_eq!(first.snapshot.byte_length, second.snapshot.byte_length);
+        assert_ne!(
+            first.snapshot.content_sha256,
+            second.snapshot.content_sha256
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_rewrite_that_restores_its_modification_stamp_is_read_again() {
+        let (_dir, root) = fixture();
+        let path = write_stream(&root, "stream.jsonl", "native-one");
+        let mut memo = CaptureMemo::default();
+        let first = memo
+            .capture(&root, &path, &scope(), after_write(&path, 60))
+            .unwrap()
+            .unwrap();
+        assert_eq!(memo.streams.len(), 1);
+
+        let written = modified(&path);
+        // Let the filesystem's status-change clock move past the first write.
+        std::thread::sleep(Duration::from_millis(50));
+        std::fs::write(&path, line("native-two")).unwrap();
+        set_modified(&path, written);
+        assert_eq!(modified(&path), written);
+        let second = memo
+            .capture(&root, &path, &scope(), after_write(&path, 60))
+            .unwrap()
+            .unwrap();
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert_eq!(first.snapshot.byte_length, second.snapshot.byte_length);
+        assert_ne!(
+            first.snapshot.content_sha256,
+            second.snapshot.content_sha256
+        );
+    }
+
+    #[test]
+    fn a_stream_that_stops_being_capturable_leaves_no_capture_behind() {
+        let (_dir, root) = fixture();
+        let path = write_stream(&root, "stream.jsonl", "native-one");
+        let mut memo = CaptureMemo::default();
+        memo.capture(&root, &path, &scope(), after_write(&path, 60))
+            .unwrap()
+            .unwrap();
+        assert_eq!(memo.streams.len(), 1);
+
+        // No complete line: the stream is deferred, not served from memory.
+        std::fs::write(&path, "{\"unfinished\":").unwrap();
+        assert!(
+            memo.capture(&root, &path, &scope(), after_write(&path, 60))
+                .unwrap()
+                .is_none()
+        );
+        assert!(memo.streams.is_empty());
+    }
+
+    #[test]
+    fn a_stream_absent_from_a_completed_scan_is_dropped() {
+        let (_dir, root) = fixture();
+        let kept = write_stream(&root, "kept.jsonl", "native-kept");
+        let gone = write_stream(&root, "gone.jsonl", "native-gone");
+        let mut memo = CaptureMemo::default();
+        memo.begin_scan();
+        let first = memo
+            .capture(&root, &kept, &scope(), after_write(&kept, 60))
+            .unwrap()
+            .unwrap();
+        memo.capture(&root, &gone, &scope(), after_write(&gone, 60))
+            .unwrap()
+            .unwrap();
+        memo.finish_scan();
+        assert_eq!(memo.streams.len(), 2);
+
+        std::fs::remove_file(&gone).unwrap();
+        memo.begin_scan();
+        let second = memo
+            .capture(&root, &kept, &scope(), after_write(&kept, 60))
+            .unwrap()
+            .unwrap();
+        assert!(
+            memo.capture(&root, &gone, &scope(), SystemTime::now())
+                .is_err()
+        );
+        memo.finish_scan();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(memo.streams.len(), 1);
+        assert!(memo.streams.contains_key(&first.snapshot.stream_id));
+    }
+
+    #[test]
+    fn a_forgotten_stream_is_read_again() {
+        let (_dir, root) = fixture();
+        let path = write_stream(&root, "stream.jsonl", "native-one");
+        let now = after_write(&path, 60);
+        let mut memo = CaptureMemo::default();
+        let first = memo.capture(&root, &path, &scope(), now).unwrap().unwrap();
+        assert_eq!(memo.streams.len(), 1);
+        memo.forget(&first.snapshot.stream_id);
+        assert!(memo.streams.is_empty());
+        let second = memo.capture(&root, &path, &scope(), now).unwrap().unwrap();
+        assert!(!Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn a_remembered_capture_is_bound_to_its_scope() {
+        let (_dir, root) = fixture();
+        let path = write_stream(&root, "stream.jsonl", "native-one");
+        let now = after_write(&path, 60);
+        let other = ConnectorScope::try_new("csrc_fedcba9876543210", "native_transcript").unwrap();
+        let mut memo = CaptureMemo::default();
+        let first = memo.capture(&root, &path, &scope(), now).unwrap().unwrap();
+        assert_eq!(memo.streams.len(), 1);
+        let second = memo.capture(&root, &path, &other, now).unwrap().unwrap();
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert_eq!(second.snapshot.scope, other);
     }
 }

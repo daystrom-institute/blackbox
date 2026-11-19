@@ -66,6 +66,14 @@ Same-size rewrites and shrinks produce new generations. Files removed from the
 producer remain retained; omission from a filesystem walk is not a deletion
 instruction.
 
+`watch` keeps each stream's capture in memory and reads a file's bytes again
+only when its identity, length, modification stamp or status-change stamp
+differs from that capture, or when the file had changed within two seconds of
+it. The first cycle after a start reads every stream, as does every `publish`
+run. A remembered capture never stands in for the server: every cycle still
+compares each stream with its durable generation, and an upload still checks
+each chunk's digest against the bytes it sends.
+
 Inventory every intended source-host root before treating a successful scan as
 complete host coverage. Configure alternate Claude-format roots explicitly with
 stable, distinct account labels; do not rename existing labels during coverage

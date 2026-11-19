@@ -12,6 +12,13 @@
 - Only the complete final JSONL prefix is published. Rewrites and shrinks are
   normal new snapshots. Local mtime or cursor state never proves publication:
   reconcile the current server generation and verify the durable receipt.
+- A running collector may reuse a stream's capture instead of reading its bytes
+  again, but only while the opened file keeps the identity, length, and
+  modification and status-change stamps that capture saw, and only when those
+  stamps had settled before it read. The memo is process memory: never persist
+  it, and never let it skip the server generation comparison or the upload
+  digest check. A failed publication forgets that stream's capture, and a
+  completed walk drops the streams it did not see.
 - Producer secrets come from token files, travel only in bearer headers, and
   are never Debug fields. Require HTTPS except loopback fixtures and disable
   redirects so a credential cannot cross authorities.
