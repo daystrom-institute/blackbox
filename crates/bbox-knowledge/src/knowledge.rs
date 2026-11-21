@@ -1441,6 +1441,15 @@ impl Knowledge {
         &self,
         deleted: Option<(KnowledgeRepoCarrier, &str)>,
     ) -> Result<()> {
+        self.persist_repo_owned_carriers_in(None, deleted)
+    }
+
+    /// [`Self::persist_repo_owned_carriers`] restricted to `only` when given.
+    fn persist_repo_owned_carriers_in(
+        &self,
+        only: Option<&BTreeSet<KnowledgeRepoCarrier>>,
+        deleted: Option<(KnowledgeRepoCarrier, &str)>,
+    ) -> Result<()> {
         // Persistence is split by scope. The central store owns only global
         // (non-project) entries and is written by StorePersister. Project-scoped
         // entries for repo-owned projects stay synchronous one-file writes here,
@@ -1471,6 +1480,9 @@ impl Knowledge {
         let redirected_ids = BTreeSet::new();
         let no_loaded_ids = BTreeSet::new();
         for (carrier, entries) in &by_carrier {
+            if only.is_some_and(|only| !only.contains(carrier)) {
+                continue;
+            }
             let purge = loaded.contains(carrier.carrier_id.as_str());
             let mut known_ids = self
                 .repo_loaded_ids
@@ -2513,7 +2525,22 @@ impl Knowledge {
                 entry.last_recalled = Some(now.clone());
             }
         }
-        self.persist_repo_owned_entries()
+        // Only the recalled entries changed, so only their repo carriers need
+        // rewriting. Recalling global entries touches no checkout at all;
+        // rewriting every project's carrier on each read made every
+        // knowledge query take a checkout lease and a filesystem transaction
+        // per registered project.
+        let touched = self
+            .store
+            .entries
+            .iter()
+            .filter(|entry| returned_ids.contains(entry.id.as_str()))
+            .filter_map(|entry| self.repo_owned_carrier(entry))
+            .collect::<BTreeSet<_>>();
+        if touched.is_empty() {
+            return Ok(());
+        }
+        self.persist_repo_owned_carriers_in(Some(&touched), None)
     }
 
     // ── Render ─────────────────────────────────────────────────────
@@ -3691,6 +3718,69 @@ mod tests {
         })
         .unwrap();
         assert!(kb.degraded_carriers().contains_key(&broken_project));
+    }
+
+    #[test]
+    fn recall_only_rewrites_carriers_of_recalled_entries() {
+        let central = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path().canonicalize().unwrap();
+        let project = "project:test".to_string();
+        let carrier = KnowledgeRepoCarrier::new(&project, "checkout:test").unwrap();
+        let dir = repo_kb_dir(&root);
+        fs::create_dir_all(&dir).unwrap();
+        let on_disk = entry("recall002", "Recall", "content", Scope::Project);
+        bbox_corpus_core::json_store::atomic_write_json_locked(
+            &dir.join("recall002.json"),
+            &on_disk,
+        )
+        .unwrap();
+        let io = Arc::new(CountingRepoIo {
+            root,
+            reads: AtomicUsize::new(0),
+            writes: AtomicUsize::new(0),
+            deny_writes: false,
+        });
+        let mut kb = Knowledge::open(&central.path().join("kb.json")).unwrap();
+        kb.configure_repo_io(io.clone(), io.clone(), vec![carrier])
+            .unwrap();
+        let global = kb
+            .learn(&LearnParams {
+                render_placement: None,
+                content: "a global rule".into(),
+                category: "convention".into(),
+                format: None,
+                title: Some("global rule".into()),
+                scope: Some("global".into()),
+                project: None,
+                project_id: None,
+                providers: None,
+                priority: None,
+                render: None,
+                cluster: None,
+                id: None,
+            })
+            .unwrap();
+        let global_id = kb
+            .store
+            .entries
+            .iter()
+            .find(|entry| entry.scope == Scope::Global)
+            .map(|entry| entry.id.clone())
+            .unwrap_or_else(|| panic!("learned global entry missing: {global}"));
+        let writes_before = io.writes.load(Ordering::SeqCst);
+
+        // A recall of only global entries touches no checkout.
+        kb.record_recall(std::slice::from_ref(&global_id)).unwrap();
+        assert_eq!(io.writes.load(Ordering::SeqCst), writes_before);
+        let global_entry = kb.entry(&global_id).unwrap();
+        assert_eq!(global_entry.recall_count, 1);
+
+        // A recall of a repo-owned entry rewrites exactly its carrier.
+        kb.record_recall(&["recall002".into(), global_id.clone()])
+            .unwrap();
+        assert_eq!(io.writes.load(Ordering::SeqCst), writes_before + 1);
+        assert_eq!(kb.entry("recall002").unwrap().recall_count, 1);
     }
 
     #[test]

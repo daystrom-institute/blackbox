@@ -50,7 +50,7 @@ pub(crate) enum PublisherAuthorizationErrorKind {
     Transient,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct PublisherAuthorizationError {
     pub(crate) kind: PublisherAuthorizationErrorKind,
     diagnostic: String,
@@ -147,6 +147,51 @@ impl PublisherAuthorizationCache {
     }
 }
 
+/// Committed-HEAD scope claims of the registered projects, in registry order.
+pub(crate) struct PublisherScopeClaims {
+    project_inventory: Vec<(String, String)>,
+    claims: Vec<(String, Option<PublishedScope>)>,
+}
+
+/// Per-view memo of [`PublisherScopeClaims`].
+///
+/// A view that authorizes S scopes over N registered projects used to prove
+/// all N committed scopes for every scope, S x N checkout leases with their
+/// Git reads, on every request. The probe proves them at most once, on first
+/// use, and only for the exact project inventory it was first asked about; a
+/// different inventory is probed afresh. Create one per view build and drop
+/// it with the view: it is not a cross-request cache.
+#[derive(Default)]
+pub(crate) struct PublisherScopeProbe {
+    claims:
+        std::cell::OnceCell<std::result::Result<PublisherScopeClaims, PublisherAuthorizationError>>,
+    #[cfg(test)]
+    probes: std::cell::Cell<usize>,
+}
+
+impl PublisherScopeProbe {
+    fn claims(
+        &self,
+        server: &BlackboxServer,
+        projects: &[ProjectRecord],
+    ) -> std::result::Result<&PublisherScopeClaims, PublisherAuthorizationError> {
+        let probed = self.claims.get_or_init(|| {
+            #[cfg(test)]
+            self.probes.set(self.probes.get() + 1);
+            server.probe_publisher_scope_claims(projects)
+        });
+        match probed {
+            Ok(claims) if claims.project_inventory == publisher_project_inventory(projects) => {
+                Ok(claims)
+            }
+            Ok(_) => Err(PublisherAuthorizationError::transient(anyhow::anyhow!(
+                "publisher scope probe was reused for a different project inventory"
+            ))),
+            Err(error) => Err(error.clone()),
+        }
+    }
+}
+
 /// One catalog project selected for an accepted published read.
 ///
 /// `catalog_scope` is the catalog's CURRENT published scope and exists only
@@ -210,6 +255,28 @@ impl BlackboxServer {
         projects: &[ProjectRecord],
         scope: &PublishedScope,
     ) -> std::result::Result<AuthorizedPublisher, PublisherAuthorizationError> {
+        self.authorize_publisher_classified_with_probe(projects, scope, None)
+    }
+
+    /// Authorize one scope of a view that authorizes several. Every scope of
+    /// that view shares `probe`, so each registered project's committed-HEAD
+    /// scope claim is proved once per view instead of once per scope.
+    pub(crate) fn authorize_publisher_with_probe(
+        &self,
+        projects: &[ProjectRecord],
+        scope: &PublishedScope,
+        probe: &PublisherScopeProbe,
+    ) -> Result<AuthorizedPublisher> {
+        self.authorize_publisher_classified_with_probe(projects, scope, Some(probe))
+            .map_err(anyhow::Error::new)
+    }
+
+    fn authorize_publisher_classified_with_probe(
+        &self,
+        projects: &[ProjectRecord],
+        scope: &PublishedScope,
+        probe: Option<&PublisherScopeProbe>,
+    ) -> std::result::Result<AuthorizedPublisher, PublisherAuthorizationError> {
         let project_inventory = publisher_project_inventory(projects);
         loop {
             let generation = {
@@ -220,7 +287,7 @@ impl BlackboxServer {
                 cache.generation(scope)
             };
 
-            let publisher = self.resolve_authorized_publisher(projects, scope)?;
+            let publisher = self.resolve_authorized_publisher(projects, scope, probe)?;
             let mut cache = self.state.publisher_authorization_cache.write();
             if !cache.insert_if_generation(
                 scope.clone(),
@@ -237,28 +304,59 @@ impl BlackboxServer {
         }
     }
 
+    /// Prove every registered project's committed-HEAD scope claim, in
+    /// registry order, stopping at the first project that cannot be checked.
+    fn probe_publisher_scope_claims(
+        &self,
+        projects: &[ProjectRecord],
+    ) -> std::result::Result<PublisherScopeClaims, PublisherAuthorizationError> {
+        let probed = super::checkout_access::map_in_parallel(
+            projects,
+            super::checkout_access::PROJECT_PROBE_CONCURRENCY,
+            |project| {
+                super::checkout_access::with_selected_project_access(
+                    &self.state.checkout_access,
+                    &project.project_id,
+                    bbox_indexing::checkout_access::CheckoutAccessKind::PublisherConfigTreeRead,
+                    bbox_indexing::checkout_access::CheckoutAccessIntent::Read,
+                    |lease| {
+                        committed_project_scope_at_root(lease.project_root(), "HEAD")
+                            .map_err(anyhow::Error::new)
+                    },
+                )
+            },
+        );
+        let mut claims = Vec::with_capacity(projects.len());
+        for (project, candidate_scope) in projects.iter().zip(probed) {
+            let candidate_scope = candidate_scope.map_err(classify_publisher_access_error)?;
+            claims.push((project.project_id.clone(), candidate_scope));
+        }
+        Ok(PublisherScopeClaims {
+            project_inventory: publisher_project_inventory(projects),
+            claims,
+        })
+    }
+
     fn resolve_authorized_publisher(
         &self,
         projects: &[ProjectRecord],
         scope: &PublishedScope,
+        probe: Option<&PublisherScopeProbe>,
     ) -> std::result::Result<AuthorizedPublisher, PublisherAuthorizationError> {
-        let mut matches = Vec::new();
-        for project in projects {
-            let candidate_scope = super::checkout_access::with_selected_project_access(
-                &self.state.checkout_access,
-                &project.project_id,
-                bbox_indexing::checkout_access::CheckoutAccessKind::PublisherConfigTreeRead,
-                bbox_indexing::checkout_access::CheckoutAccessIntent::Read,
-                |lease| {
-                    committed_project_scope_at_root(lease.project_root(), "HEAD")
-                        .map_err(anyhow::Error::new)
-                },
-            )
-            .map_err(classify_publisher_access_error)?;
-            if candidate_scope.as_ref() == Some(scope) {
-                matches.push(project.project_id.clone());
+        let probed;
+        let claims = match probe {
+            Some(probe) => probe.claims(self, projects)?,
+            None => {
+                probed = self.probe_publisher_scope_claims(projects)?;
+                &probed
             }
-        }
+        };
+        let mut matches = claims
+            .claims
+            .iter()
+            .filter(|(_, candidate_scope)| candidate_scope.as_ref() == Some(scope))
+            .map(|(project_id, _)| project_id.clone())
+            .collect::<Vec<_>>();
         matches.sort();
         let project_id = match matches.as_slice() {
             [] => {
@@ -2116,6 +2214,73 @@ mod tests {
             "updated global content"
         );
         assert!(kb.entry("global-forget").is_none());
+    }
+
+    #[test]
+    fn shared_probe_proves_each_project_once_across_scopes() {
+        let (temp, server, _base, _worktree, first_scope) = fixture();
+        let second = temp.path().canonicalize().unwrap().join("second");
+        std::fs::create_dir_all(second.join(".bbox")).unwrap();
+        git(&second, &["init", "-q"]);
+        git(&second, &["config", "user.email", "test@example.com"]);
+        git(&second, &["config", "user.name", "Test"]);
+        std::fs::write(
+            second.join(".bbox/config.toml"),
+            "[project]\nrepo_id = \"repo-family-second\"\n",
+        )
+        .unwrap();
+        git(&second, &["add", ".bbox"]);
+        git(&second, &["commit", "-q", "-m", "seed"]);
+        server
+            .state
+            .project_authority
+            .bridge_registry()
+            .unwrap()
+            .write()
+            .register_path(&second)
+            .unwrap();
+        let second_scope = PublishedScope::try_new("repo-family-second", ".").unwrap();
+        let projects = server.state.records_provider.records_snapshot().records;
+        assert_eq!(projects.len(), 2);
+
+        let probe = PublisherScopeProbe::default();
+        let first = server
+            .authorize_publisher_with_probe(&projects, &first_scope, &probe)
+            .unwrap();
+        let second_publisher = server
+            .authorize_publisher_with_probe(&projects, &second_scope, &probe)
+            .unwrap();
+        assert_eq!(probe.probes.get(), 1, "one probe serves every scope");
+        assert_ne!(first.project_id, second_publisher.project_id);
+
+        // The probed decision matches an unprobed one.
+        server.invalidate_publisher_authority_cache(&first_scope);
+        server.invalidate_publisher_authority_cache(&second_scope);
+        let unprobed_first = server.authorize_publisher(&projects, &first_scope).unwrap();
+        let unprobed_second = server
+            .authorize_publisher(&projects, &second_scope)
+            .unwrap();
+        assert_eq!(
+            (first.project_id, first.commit, first.branch_ref),
+            (
+                unprobed_first.project_id,
+                unprobed_first.commit,
+                unprobed_first.branch_ref
+            )
+        );
+        assert_eq!(second_publisher.project_id, unprobed_second.project_id);
+
+        // A probe is bound to the inventory it first saw.
+        let fresh = PublisherScopeProbe::default();
+        server.invalidate_publisher_authority_cache(&first_scope);
+        server
+            .authorize_publisher_with_probe(&projects[..1], &first_scope, &fresh)
+            .unwrap();
+        server.invalidate_publisher_authority_cache(&second_scope);
+        let err = server
+            .authorize_publisher_with_probe(&projects, &second_scope, &fresh)
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("different project inventory"));
     }
 
     #[test]

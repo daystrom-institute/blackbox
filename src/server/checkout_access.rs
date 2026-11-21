@@ -115,6 +115,69 @@ pub(crate) fn project_id_for_published_scope(
 
 /// Read one registered project's committed published scope exclusively through
 /// checkout authority. `None` is the explicit legacy-local state.
+/// Concurrency for per-project checkout probes. Each probe is a handful of
+/// short Git subprocesses that spend most of their time waiting, so a small
+/// pool cuts a view's wall time roughly by this factor without loading the
+/// host.
+pub(crate) const PROJECT_PROBE_CONCURRENCY: usize = 8;
+
+/// Map `operation` over `items` on at most `limit` scoped threads and return
+/// the results in input order. Callers keep their sequential semantics by
+/// consuming the results in order: the only difference is that later items
+/// may already have been probed when an earlier one fails.
+pub(crate) fn map_in_parallel<I, T>(
+    items: &[I],
+    limit: usize,
+    operation: impl Fn(&I) -> T + Sync,
+) -> Vec<T>
+where
+    I: Sync,
+    T: Send,
+{
+    let workers = limit.max(1).min(items.len());
+    if workers <= 1 {
+        return items.iter().map(&operation).collect();
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let mut results = std::thread::scope(|scope| {
+        let handles = (0..workers)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut produced = Vec::new();
+                    loop {
+                        let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(item) = items.get(index) else {
+                            break;
+                        };
+                        produced.push((index, operation(item)));
+                    }
+                    produced
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .flat_map(|handle| match handle.join() {
+                Ok(produced) => produced,
+                Err(panic) => std::panic::resume_unwind(panic),
+            })
+            .collect::<Vec<_>>()
+    });
+    results.sort_by_key(|(index, _)| *index);
+    results.into_iter().map(|(_, result)| result).collect()
+}
+
+/// Committed published scope of each project, probed concurrently and
+/// returned in input order.
+pub(crate) fn published_scopes_for_projects(
+    broker: &CheckoutAccessBroker,
+    projects: &[bbox_corpus_core::project_record::ProjectRecord],
+) -> Vec<Result<Option<PublishedScope>>> {
+    map_in_parallel(projects, PROJECT_PROBE_CONCURRENCY, |project| {
+        published_scope_for_project(broker, &project.project_id)
+    })
+}
+
 pub(crate) fn published_scope_for_project(
     broker: &CheckoutAccessBroker,
     project_id: &str,
@@ -679,6 +742,42 @@ impl ArtifactWatchRead for LeaseArtifactWatchRead<'_> {
 
     fn check_relative_absence(&self, relative: &Path) -> Result<bool> {
         Ok(!self.lease.relative_regular_file_exists(relative)?)
+    }
+}
+
+#[cfg(test)]
+mod parallel_probe_tests {
+    use super::map_in_parallel;
+
+    #[test]
+    fn map_in_parallel_keeps_input_order_and_runs_every_item_once() {
+        let items = (0..37).collect::<Vec<u32>>();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let results = map_in_parallel(&items, 8, |item| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // Finish out of order so ordering comes from the helper.
+            std::thread::sleep(std::time::Duration::from_millis(u64::from(37 - item) % 5));
+            item * 2
+        });
+        assert_eq!(
+            results,
+            items.iter().map(|item| item * 2).collect::<Vec<_>>()
+        );
+        assert_eq!(calls.into_inner(), items.len());
+        assert!(map_in_parallel(&Vec::<u32>::new(), 8, |item| *item).is_empty());
+        assert_eq!(map_in_parallel(&[5_u32], 8, |item| *item + 1), vec![6]);
+    }
+
+    #[test]
+    #[should_panic(expected = "probe exploded")]
+    fn map_in_parallel_propagates_a_worker_panic() {
+        let items = (0..4).collect::<Vec<u32>>();
+        let _ = map_in_parallel(&items, 4, |item| {
+            if *item == 2 {
+                panic!("probe exploded");
+            }
+            *item
+        });
     }
 }
 

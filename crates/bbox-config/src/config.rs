@@ -1811,10 +1811,32 @@ pub fn repo_id_inputs_from_project_config_source(
 /// Live identity and alias authority must use this reader rather than working
 /// tree bytes.
 pub fn load_project_at_ref(project_root: &Path, reference: &str) -> Result<ProjectConfig> {
-    let (source, config_relpath, commit) =
-        committed_project_config_source(project_root, reference)?;
-    parse_project_config(&source)
-        .with_context(|| format!("parsing committed project config {config_relpath}@{commit}"))
+    load_committed_project_config(project_root, reference).map(|loaded| loaded.config)
+}
+
+/// A committed project config with the commit and Git root it came from.
+struct CommittedProjectConfig {
+    config: ProjectConfig,
+    git_root: PathBuf,
+    commit: String,
+}
+
+fn load_committed_project_config(
+    project_root: &Path,
+    reference: &str,
+) -> Result<CommittedProjectConfig> {
+    let source = committed_project_config_source(project_root, reference)?;
+    let config = parse_project_config(&source.text).with_context(|| {
+        format!(
+            "parsing committed project config {}@{}",
+            source.config_relpath, source.commit
+        )
+    })?;
+    Ok(CommittedProjectConfig {
+        config,
+        git_root: source.git_root,
+        commit: source.commit,
+    })
 }
 
 /// Result of ensuring the committed repo-family authority in project config.
@@ -1950,14 +1972,81 @@ pub fn read_repo_id_inputs_at_ref(
     project_root: &Path,
     reference: &str,
 ) -> Result<bbox_corpus_core::identity::RepoIdInputs> {
-    let project = load_project_at_ref(project_root, reference)?.project;
-    Ok(repo_id_inputs(project_root, project))
+    let loaded = load_committed_project_config(project_root, reference)?;
+    // The computed fallback derives from the Git root's HEAD history, so the
+    // resolved commit can key it only when the config was read at HEAD.
+    let head = (reference == "HEAD").then_some((loaded.git_root.as_path(), loaded.commit.as_str()));
+    Ok(repo_id_inputs_with_head(
+        project_root,
+        loaded.config.project,
+        head,
+    ))
+}
+
+/// Upper bound on cached committed-config and first-commit entries. Each
+/// entry is one small TOML file or one object id; the bound only stops a
+/// long-lived daemon from accumulating one entry per historical commit.
+const COMMITTED_IDENTITY_CACHE_LIMIT: usize = 512;
+
+/// Content-addressed memo shared by every caller in the process.
+///
+/// Keys always include a full commit object id, and a commit id fixes the
+/// whole tree and history beneath it, so a hit returns exactly what a fresh
+/// read of that commit would. Nothing here is time-based: when a ref moves,
+/// the new commit id simply misses. The cache only skips re-verifying and
+/// re-reading immutable objects; resolving the ref to a commit still runs
+/// against the live repository on every call.
+struct CommittedIdentityCache<V> {
+    entries: std::sync::Mutex<std::collections::HashMap<(PathBuf, String, String), V>>,
+}
+
+impl<V: Clone> CommittedIdentityCache<V> {
+    fn new() -> Self {
+        Self {
+            entries: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    fn get(&self, key: &(PathBuf, String, String)) -> Option<V> {
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(key)
+            .cloned()
+    }
+
+    fn insert(&self, key: (PathBuf, String, String), value: V) {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if entries.len() >= COMMITTED_IDENTITY_CACHE_LIMIT && !entries.contains_key(&key) {
+            entries.clear();
+        }
+        entries.insert(key, value);
+    }
+}
+
+/// (Git root, config relpath, commit) -> committed config text, or `None`
+/// when that commit has no config at the path.
+static COMMITTED_CONFIG_SOURCES: std::sync::LazyLock<CommittedIdentityCache<Option<String>>> =
+    std::sync::LazyLock::new(CommittedIdentityCache::new);
+
+/// (Git root, "", HEAD commit) -> first commit reachable from that HEAD.
+static FIRST_COMMITS: std::sync::LazyLock<CommittedIdentityCache<String>> =
+    std::sync::LazyLock::new(CommittedIdentityCache::new);
+
+struct CommittedConfigSource {
+    text: String,
+    config_relpath: String,
+    commit: String,
+    git_root: PathBuf,
 }
 
 fn committed_project_config_source(
     project_root: &Path,
     reference: &str,
-) -> Result<(String, String, String)> {
+) -> Result<CommittedConfigSource> {
     let git_root = bbox_corpus_core::git::git_root_for_path(project_root)
         .with_context(|| format!("{} is not inside a git repository", project_root.display()))?;
     let git_root_directory =
@@ -1971,7 +2060,6 @@ fn committed_project_config_source(
             git_root.display()
         )
     })?;
-    let verified_commit = repository.verify_commit_oid(&commit)?;
     let bbox_root_relpath = bbox_corpus_core::identity::bbox_root_relpath(&git_root, project_root)
         .with_context(|| {
             format!(
@@ -1985,17 +2073,43 @@ fn committed_project_config_source(
     } else {
         format!("{bbox_root_relpath}/.bbox/config.toml")
     };
-    let bytes = bbox_corpus_core::git::read_verified_committed_file_bytes_bounded(
-        &verified_commit,
-        &config_relpath,
-        MAX_COMMITTED_PROJECT_CONFIG_BYTES,
-    )
-    .with_context(|| {
+    let cache_key = (git_root.clone(), config_relpath.clone(), commit.clone());
+    let text = match COMMITTED_CONFIG_SOURCES.get(&cache_key) {
+        Some(cached) => cached,
+        None => {
+            let verified_commit = repository.verify_commit_oid(&commit)?;
+            let bytes = bbox_corpus_core::git::read_verified_committed_file_bytes_optional_bounded(
+                &verified_commit,
+                &config_relpath,
+                MAX_COMMITTED_PROJECT_CONFIG_BYTES,
+            )
+            .with_context(|| {
+                format!(
+                    "committed project config {config_relpath} is missing or unsafe at {commit}"
+                )
+            })?;
+            let text = bytes
+                .map(|bytes| {
+                    String::from_utf8(bytes).with_context(|| {
+                        format!("decoding committed project config {config_relpath}@{commit}")
+                    })
+                })
+                .transpose()?;
+            // Absence at a commit is as immutable as presence, so both are
+            // memoized. Read and decode failures are not.
+            COMMITTED_CONFIG_SOURCES.insert(cache_key, text.clone());
+            text
+        }
+    };
+    let text = text.with_context(|| {
         format!("committed project config {config_relpath} is missing or unsafe at {commit}")
     })?;
-    let source = String::from_utf8(bytes)
-        .with_context(|| format!("decoding committed project config {config_relpath}@{commit}"))?;
-    Ok((source, config_relpath, commit))
+    Ok(CommittedConfigSource {
+        text,
+        config_relpath,
+        commit,
+        git_root,
+    })
 }
 
 /// Gather live repo-id inputs from committed `HEAD`.
@@ -2020,14 +2134,70 @@ fn repo_id_inputs(
     project_root: &Path,
     project: ProjectIdentityConfig,
 ) -> bbox_corpus_core::identity::RepoIdInputs {
-    let computed = bbox_corpus_core::git::git_root_for_path(project_root)
-        .and_then(|root| bbox_corpus_core::entity_ref::repo_id_for_root(&root).ok());
+    repo_id_inputs_with_head(project_root, project, None)
+}
+
+/// Like [`repo_id_inputs`], with the Git root and HEAD commit already
+/// resolved by the caller. The first commit reachable from a HEAD commit is
+/// fixed by that commit id, so it is memoized; the remote and path fallbacks
+/// of `repo_id_for_root` are not, and still run live when needed.
+fn repo_id_inputs_with_head(
+    project_root: &Path,
+    project: ProjectIdentityConfig,
+    head: Option<(&Path, &str)>,
+) -> bbox_corpus_core::identity::RepoIdInputs {
+    let computed = match head {
+        Some((git_root, head_commit)) => computed_repo_id_at_head(git_root, head_commit),
+        None => bbox_corpus_core::git::git_root_for_path(project_root)
+            .and_then(|root| bbox_corpus_core::entity_ref::repo_id_for_root(&root).ok()),
+    };
     bbox_corpus_core::identity::RepoIdInputs {
         project_key_override: project.project_key_override,
         recorded: project.repo_id,
         aka_repo_ids: project.aka_repo_ids,
         computed,
     }
+}
+
+fn computed_repo_id_at_head(git_root: &Path, head_commit: &str) -> Option<String> {
+    let key = (
+        git_root.to_path_buf(),
+        String::new(),
+        head_commit.to_string(),
+    );
+    if let Some(first_commit) = FIRST_COMMITS.get(&key) {
+        return Some(bbox_corpus_core::entity_ref::repo_id_for_first_commit(
+            &first_commit,
+        ));
+    }
+    // `git_first_commit_for_path` reads the live HEAD. Only memoize when that
+    // HEAD is still the commit the config was read from; a ref that moved in
+    // between falls through to an uncached live derivation.
+    let live_head = bbox_corpus_core::git::git_output(
+        git_root,
+        &["rev-parse", "--verify", "HEAD^{commit}"],
+        "confirming HEAD before memoizing first commit",
+    )
+    .filter(|output| output.status.success())
+    .and_then(|output| String::from_utf8(output.stdout).ok());
+    if let Some(first_commit) = bbox_corpus_core::git::git_first_commit_for_path(git_root) {
+        let still_head = bbox_corpus_core::git::git_output(
+            git_root,
+            &["rev-parse", "--verify", "HEAD^{commit}"],
+            "confirming HEAD after deriving first commit",
+        )
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok());
+        if live_head.as_deref().map(str::trim) == Some(head_commit)
+            && still_head.as_deref().map(str::trim) == Some(head_commit)
+        {
+            FIRST_COMMITS.insert(key, first_commit.clone());
+        }
+        return Some(bbox_corpus_core::entity_ref::repo_id_for_first_commit(
+            &first_commit,
+        ));
+    }
+    bbox_corpus_core::entity_ref::repo_id_for_root(git_root).ok()
 }
 
 fn apply_flag_overrides(mut raw: RawConfig, overrides: ConfigOverrides) -> RawConfig {
@@ -3816,6 +3986,90 @@ state_dir = "~"
                 .as_deref(),
             Some("committed-two")
         );
+    }
+
+    #[test]
+    fn committed_identity_cache_follows_head_through_reset_and_amend() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        init_repo(&root);
+        let run = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        let commit_config = |repo_id: &str, amend: bool| {
+            std::fs::create_dir_all(root.join(".bbox")).unwrap();
+            std::fs::write(
+                root.join(".bbox/config.toml"),
+                format!("[project]\nrepo_id = \"{repo_id}\"\n"),
+            )
+            .unwrap();
+            run(&["add", ".bbox/config.toml"]);
+            if amend {
+                run(&["commit", "-q", "--amend", "-m", repo_id]);
+            } else {
+                run(&["commit", "-q", "-m", repo_id]);
+            }
+            run(&["rev-parse", "HEAD"])
+        };
+        let recorded_at_head = || {
+            read_repo_id_inputs(&root)
+                .recorded
+                .expect("committed repo_id at HEAD")
+        };
+
+        // An absent config is memoized for its commit, and must not mask a
+        // config committed afterwards.
+        std::fs::write(root.join("README"), "x\n").unwrap();
+        run(&["add", "README"]);
+        run(&["commit", "-q", "-m", "no config yet"]);
+        let without_config = run(&["rev-parse", "HEAD"]);
+        for _ in 0..2 {
+            let err = read_repo_id_inputs_at_ref(&root, "HEAD").unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("committed project config .bbox/config.toml is missing")
+            );
+        }
+
+        let first = commit_config("first", false);
+        assert_eq!(recorded_at_head(), "first");
+        assert!(read_repo_id_inputs_at_ref(&root, &without_config).is_err());
+        // A repeat read at the same commit is served from the cache and must
+        // be identical to the fresh read.
+        assert_eq!(recorded_at_head(), "first");
+
+        commit_config("second", false);
+        assert_eq!(recorded_at_head(), "second");
+
+        // Rewinding HEAD must not serve the newer cached config.
+        run(&["reset", "-q", "--hard", &first]);
+        assert_eq!(recorded_at_head(), "first");
+
+        // Rewriting the tip produces a new commit id, so the amended config
+        // is read fresh rather than taken from the cache.
+        let amended = commit_config("amended", true);
+        assert_ne!(amended, first);
+        assert_eq!(recorded_at_head(), "amended");
+
+        // The memoized computed fallback must match an uncached derivation.
+        let computed = read_repo_id_inputs(&root).computed;
+        assert!(computed.is_some());
+        assert_eq!(
+            computed,
+            bbox_corpus_core::entity_ref::repo_id_for_root(&root).ok()
+        );
+        assert_eq!(read_repo_id_inputs(&root).computed, computed);
     }
 
     #[test]

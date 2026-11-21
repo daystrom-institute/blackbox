@@ -167,11 +167,12 @@ impl BlackboxServer {
                 .unwrap_or_else(|| projects.as_ref().clone())
         };
         let mut selected_scopes = BTreeMap::<PublishedScope, ProjectRecord>::new();
-        for project in selected_projects {
-            match super::checkout_access::published_scope_for_project(
-                &self.state.checkout_access,
-                &project.project_id,
-            ) {
+        let probed_scopes = super::checkout_access::published_scopes_for_projects(
+            &self.state.checkout_access,
+            &selected_projects,
+        );
+        for (project, probed_scope) in selected_projects.into_iter().zip(probed_scopes) {
+            match probed_scope {
                 Ok(Some(scope)) => {
                     selected_scopes.entry(scope).or_insert(project);
                 }
@@ -203,15 +204,17 @@ impl BlackboxServer {
                 )),
             }
         }
+        let publisher_probe = super::knowledge_lifecycle::PublisherScopeProbe::default();
         for (scope, project) in selected_scopes {
-            let publisher = match self.authorize_publisher(&projects, &scope) {
-                Ok(publisher) => publisher,
-                Err(err) if explicit_managed_scope => return Err(err),
-                Err(err) => {
-                    diagnostics.push(format!("scope {scope:?}: {err:#}"));
-                    continue;
-                }
-            };
+            let publisher =
+                match self.authorize_publisher_with_probe(&projects, &scope, &publisher_probe) {
+                    Ok(publisher) => publisher,
+                    Err(err) if explicit_managed_scope => return Err(err),
+                    Err(err) => {
+                        diagnostics.push(format!("scope {scope:?}: {err:#}"));
+                        continue;
+                    }
+                };
             let published =
                 self.cached_published_gap_snapshot(&publisher, &scope, &project.canonical_path);
             let published = match published {
