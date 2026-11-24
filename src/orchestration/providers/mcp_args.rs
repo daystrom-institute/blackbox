@@ -37,7 +37,7 @@ pub trait ProviderMcp {
     #[allow(dead_code)]
     fn supports_dispatch_filter(&self) -> bool;
     /// Translate the fleet MCP map into native Claude CLI arguments.
-    /// Codex configuration is delivered through its app-server adapter.
+    /// Codex and agy configuration is delivered through their adapters.
     fn build_fleet_mcp_args(&self, servers: &BTreeMap<String, mcp::McpServerConfig>)
     -> Vec<String>;
 }
@@ -104,7 +104,10 @@ impl ProviderMcp for Provider {
         // one argument so variadic CLI parsing cannot swallow following flags.
         let (deny_flag, allow_flag): (&str, Option<&str>) = match self.lane() {
             ProviderLane::ClaudeCli => ("--disallowedTools", None),
-            ProviderLane::Codex | ProviderLane::Workflow | ProviderLane::Retired => return args,
+            ProviderLane::Codex
+            | ProviderLane::Agy
+            | ProviderLane::Workflow
+            | ProviderLane::Retired => return args,
         };
         let deny = expand_filter_patterns(&filters.disallow);
         if !deny.is_empty() {
@@ -143,7 +146,10 @@ impl ProviderMcp for Provider {
             ProviderLane::ClaudeCli => {
                 vec!["--mcp-config".into(), fleet_mcp_config_json(servers)]
             }
-            ProviderLane::Codex | ProviderLane::Workflow | ProviderLane::Retired => Vec::new(),
+            ProviderLane::Codex
+            | ProviderLane::Agy
+            | ProviderLane::Workflow
+            | ProviderLane::Retired => Vec::new(),
         }
     }
 }
@@ -206,8 +212,9 @@ pub fn fleet_mcp_config_json(servers: &BTreeMap<String, mcp::McpServerConfig>) -
     serde_json::json!({"mcpServers": map}).to_string()
 }
 
-/// Codex dispatch must not silently omit malformed or unresolved servers.
-pub fn codex_fleet_mcp_servers(
+/// The fleet MCP map for a lane whose adapter takes typed settings. Such a
+/// dispatch must not silently omit malformed or unresolved servers.
+pub fn typed_fleet_mcp_servers(
     servers: &BTreeMap<String, bro_config::McpServerConfig>,
 ) -> anyhow::Result<BTreeMap<String, Value>> {
     servers

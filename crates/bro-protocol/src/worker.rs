@@ -387,6 +387,8 @@ pub struct WorkerSpawnSpec {
     pub supervisor_writes_event_log: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex: Option<crate::CodexSessionConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agy: Option<crate::AgySessionConfig>,
 }
 
 #[cfg(test)]
@@ -421,6 +423,7 @@ mod tests {
             event_log_path: PathBuf::from("/state/bro/harness-sessions/sess-xyz.events.jsonl"),
             supervisor_writes_event_log: false,
             codex: None,
+            agy: None,
         }
     }
 

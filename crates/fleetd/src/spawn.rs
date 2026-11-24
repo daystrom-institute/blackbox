@@ -131,6 +131,7 @@ pub fn dispatch_path_env() -> String {
 pub fn raw_bin_for(spec: &WorkerSpawnSpec) -> String {
     let (env, default) = match spec.provider.lane() {
         bro_core::ProviderLane::Codex => ("CODEX_BIN", "codex"),
+        bro_core::ProviderLane::Agy => ("AGY_BIN", "agy"),
         bro_core::ProviderLane::ClaudeCli => ("CLAUDE_BIN", "claude"),
         _ => return String::new(),
     };
@@ -244,6 +245,13 @@ pub async fn spawn_worker(spec: WorkerSpawnSpec) -> anyhow::Result<WorkerChild> 
     if let Some(config) = &spec.codex {
         bro_worker::codex::validate(config)?;
     }
+    anyhow::ensure!(
+        (spec.provider == bro_core::Provider::Agy) == spec.agy.is_some(),
+        "agy requires typed session settings"
+    );
+    if let Some(config) = &spec.agy {
+        bro_worker::agy::validate(config)?;
+    }
     let raw_bin = raw_bin_for(&spec);
     ensure_absolute_bin_executable(&raw_bin).await?;
     // Login-shell resolution shells out, so it must not block the reactor.
@@ -279,15 +287,16 @@ pub async fn spawn_worker(spec: WorkerSpawnSpec) -> anyhow::Result<WorkerChild> 
     }
     command.env("BRO_HOME", &spec.bro_home);
 
-    let session_log = if spec.supervisor_writes_event_log || spec.codex.is_some() {
-        Some(
-            bro_worker::SessionLogWriter::open(&spec.event_log_path)
-                .await
-                .map_err(|e| anyhow::anyhow!("cannot open worker event log: {e}"))?,
-        )
-    } else {
-        None
-    };
+    let session_log =
+        if spec.supervisor_writes_event_log || spec.codex.is_some() || spec.agy.is_some() {
+            Some(
+                bro_worker::SessionLogWriter::open(&spec.event_log_path)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("cannot open worker event log: {e}"))?,
+            )
+        } else {
+            None
+        };
 
     let mut child = command
         .spawn()
@@ -320,6 +329,20 @@ pub async fn spawn_worker(spec: WorkerSpawnSpec) -> anyhow::Result<WorkerChild> 
         Some(tokio::spawn(bro_worker::codex::run(
             config,
             spec.cwd.clone().unwrap_or_else(|| ".".into()),
+            stdin,
+            stdout,
+            control_rx,
+            events_tx,
+            session_log.expect("native worker log"),
+        )))
+    } else if let Some(config) = spec.agy.clone() {
+        let stdin = stdin.ok_or_else(|| anyhow::anyhow!("agy stdin missing"))?;
+        let stdout = stdout.ok_or_else(|| anyhow::anyhow!("agy stdout missing"))?;
+        drop(stdout_done_tx);
+        Some(tokio::spawn(bro_worker::agy::run(
+            config,
+            spec.cwd.clone().unwrap_or_else(|| ".".into()),
+            spec.env.as_map().clone(),
             stdin,
             stdout,
             control_rx,
@@ -715,6 +738,7 @@ mod tests {
             event_log_path: PathBuf::from("/state/bro/sess-1.events.jsonl"),
             supervisor_writes_event_log: false,
             codex: None,
+            agy: None,
         }
     }
 }

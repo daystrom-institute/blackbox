@@ -5,7 +5,7 @@ Domain home for the dispatch plane. Boundary contract:
 
 ## Native provider dispatch
 
-Only the Claude CLI and Codex app-server lanes execute. Archived provider
+Only the Claude CLI, Codex app-server and agy ACP lanes execute. Archived provider
 identities remain decodable but are refused by admission, re-adoption and both
 executors. Model tools, code cells, compaction and refactoring belong to the
 native provider. No daemon setting installs a custom model-turn runtime.

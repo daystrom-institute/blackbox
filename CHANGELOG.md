@@ -8,6 +8,16 @@ out explicitly under `Changed` or `Removed`.
 
 ## Unreleased
 
+- `agy` (Antigravity) is a dispatch provider on its own lane. Each dispatch
+  runs one `agy acp` server on the worker host and `bro-worker` drives it over
+  the Agent Client Protocol: session-scoped MCP servers, persona appended to
+  the system prompt, model and thinking-level selection, steer, interrupt,
+  compaction and resume. The session runs in the worker user's own agy home
+  with permission prompts off. The lane takes no recursion guard and refuses
+  tool allow or deny filters, structured output, a service tier and
+  provider-default suppression. Dispatched sessions index as `agy-dispatch`.
+  `AGY_BIN` selects the executable. Update fleetd on worker hosts together
+  with the daemon: an older fleetd refuses the provider.
 - `bbox-transcript-collector watch` no longer reads and digests every
   transcript on every cycle. It keeps each stream's capture in memory and
   reads a file again only when its identity, length, modification stamp or

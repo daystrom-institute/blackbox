@@ -93,6 +93,10 @@ fn providers_default_model_when_none_supplied() {
             assert!(args.codex.as_ref().unwrap().model.is_some());
             continue;
         }
+        if provider.lane() == bro_core::ProviderLane::Agy {
+            assert!(args.agy.as_ref().unwrap().model.is_some());
+            continue;
+        }
         assert!(
             args.contains(&"--model".to_string()),
             "{provider:?} raw dispatch must include --model"
@@ -119,7 +123,7 @@ fn dispatch_context_rides_its_own_flag_with_verbatim_prompt() {
             provider.build_resume_args("sid-9", "one-line task", Some(&payload), None),
         ] {
             // The operator's prompt rides -p VERBATIM — no preamble glue.
-            if *provider == Provider::Codex {
+            if matches!(*provider, Provider::Codex | Provider::Agy) {
                 assert_eq!(args.prompt.as_deref(), Some("one-line task"));
             } else {
                 let p_idx = args.iter().position(|a| a == "-p").expect("-p present");
@@ -163,6 +167,21 @@ fn dispatch_context_rides_its_own_flag_with_verbatim_prompt() {
                         .as_ref()
                         .unwrap()
                         .developer_instructions
+                        .as_ref()
+                        .unwrap();
+                    assert!(text.starts_with("You are a reviewer"));
+                    assert!(text.contains("- task: task-9"));
+                    assert!(text.contains("- session: sid-9"));
+                    assert!(args.argv.is_empty());
+                }
+                // The agy lane appends the same text to the session's
+                // system prompt.
+                bro_core::ProviderLane::Agy => {
+                    let text = args
+                        .agy
+                        .as_ref()
+                        .unwrap()
+                        .system_prompt_append
                         .as_ref()
                         .unwrap();
                     assert!(text.starts_with("You are a reviewer"));
@@ -625,10 +644,36 @@ fn filter_args_preserve_restrictions_or_reject_unsupported_allowlists() {
             assert!(launch.argv.is_empty());
             continue;
         }
+        if *provider == Provider::Agy {
+            // No per-tool gate exists on this lane: a restriction is refused
+            // and an empty filter set composes cleanly.
+            for filters in [
+                filters.clone(),
+                McpFilters {
+                    allow: Vec::new(),
+                    disallow: filters.disallow.clone(),
+                },
+            ] {
+                let mut launch = provider.build_exec_args("hi", None, "pending", None, None);
+                launch.apply_filters(*provider, &filters);
+                let config = launch.agy.unwrap();
+                assert_eq!(
+                    config.errors,
+                    ["agy cannot enforce tool allow or deny filters"]
+                );
+                assert!(bro_worker::agy::validate(&config).is_err());
+            }
+            let mut launch = provider.build_resume_args("session", "hi", None, None);
+            launch.apply_filters(*provider, &McpFilters::default());
+            assert!(launch.agy.unwrap().errors.is_empty());
+            continue;
+        }
         let (deny_flag, allow_flag) = match provider.lane() {
             bro_core::ProviderLane::ClaudeCli => ("--disallowedTools", None),
             bro_core::ProviderLane::Retired => ("--deny-tools", Some("--allow-tools")),
-            bro_core::ProviderLane::Codex | bro_core::ProviderLane::Workflow => unreachable!(),
+            bro_core::ProviderLane::Codex
+            | bro_core::ProviderLane::Agy
+            | bro_core::ProviderLane::Workflow => unreachable!(),
         };
         let args = provider.build_filter_args(&filters);
         let deny_idx = args
@@ -743,7 +788,7 @@ fn fleet_mcp_args_harness_providers_emit_single_config_blob() {
 
     for provider in Provider::ALL {
         let args = provider.build_fleet_mcp_args(&servers);
-        if *provider == Provider::Codex {
+        if matches!(*provider, Provider::Codex | Provider::Agy) {
             assert!(args.is_empty());
             continue;
         }
@@ -954,15 +999,149 @@ fn codex_binary_comes_from_codex_bin() {
 }
 
 #[test]
+fn agy_launch_carries_typed_settings_and_no_cli_arguments() {
+    let launch = Provider::Agy.build_exec_args("hello", None, "pending", None, None);
+    assert!(launch.argv.is_empty());
+    assert!(launch.errors.is_empty());
+    assert_eq!(launch.prompt.as_deref(), Some("hello"));
+    let config = launch.agy.unwrap();
+    // A fresh session names the catalog default and its thinking level.
+    assert_eq!(config.model.as_deref(), Some("gemini-4-neon"));
+    assert_eq!(config.effort.as_deref(), Some("high"));
+    assert!(config.resume.is_none());
+    assert!(config.errors.is_empty());
+    assert!(config.mcp_servers.is_empty());
+
+    let effort_for = |model: &str, effort: Option<&str>| {
+        let opts = ExecOpts {
+            model: Some(model.into()),
+            effort: effort.map(str::to_string),
+            ..Default::default()
+        };
+        Provider::Agy
+            .build_exec_args("hello", None, "pending", None, Some(&opts))
+            .agy
+            .unwrap()
+            .effort
+    };
+    assert_eq!(
+        effort_for("gemini-3.8-flash", None).as_deref(),
+        Some("high")
+    );
+    assert_eq!(
+        effort_for("gemini-4-neon", Some("xhigh")).as_deref(),
+        Some("xhigh")
+    );
+    // A model with no thinking levels, or an id outside the catalog, gets
+    // no level it was not given.
+    assert_eq!(effort_for("gemini-pro-orchestrator", None), None);
+    assert_eq!(effort_for("gemini-4-neon-xhigh", None), None);
+
+    // The server does not carry a session's model into a new process, so a
+    // resume names it like a fresh session does.
+    let resume = Provider::Agy
+        .build_resume_args("session-1", "again", None, None)
+        .agy
+        .unwrap();
+    assert_eq!(resume.resume.as_deref(), Some("session-1"));
+    assert_eq!(resume.model.as_deref(), Some("gemini-4-neon"));
+    assert_eq!(resume.effort.as_deref(), Some("high"));
+}
+
+#[test]
+fn agy_refuses_settings_it_cannot_honor() {
+    let opts = ExecOpts {
+        service_tier: Some("priority".into()),
+        output_schema: Some(r#"{"type":"object"}"#.into()),
+        provider_defaults: Some(
+            crate::orchestration::brofile::ProviderDefaultsMode::StrictSuppress,
+        ),
+        ..Default::default()
+    };
+    let config = Provider::Agy
+        .build_exec_args("hello", None, "pending", None, Some(&opts))
+        .agy
+        .unwrap();
+    assert_eq!(
+        config.errors,
+        [
+            "agy does not support provider-default suppression",
+            "agy does not support service_tier",
+            "agy does not support structured output",
+        ]
+    );
+    assert!(bro_worker::agy::validate(&config).is_err());
+
+    // Best-effort suppression has nothing to act on and continues.
+    let best_effort = ExecOpts {
+        provider_defaults: Some(
+            crate::orchestration::brofile::ProviderDefaultsMode::SuppressWhenSupported,
+        ),
+        ..Default::default()
+    };
+    let config = Provider::Agy
+        .build_exec_args("hello", None, "pending", None, Some(&best_effort))
+        .agy
+        .unwrap();
+    assert!(config.errors.is_empty());
+}
+
+#[test]
+fn agy_binary_comes_from_agy_bin() {
+    let mut env = crate::util::TestEnvGuard::new();
+    env.remove("AGY_BIN");
+    assert_eq!(Provider::Agy.bin(), "agy");
+    env.set("AGY_BIN", "/opt/bin/agy");
+    assert_eq!(Provider::Agy.bin(), "/opt/bin/agy");
+}
+
+#[test]
+fn agy_lane_events_parse_as_the_claude_envelope() {
+    let mut sink = empty_sink();
+    for event in [
+        serde_json::json!({"type": "system", "subtype": "init", "session_id": "session-7"}),
+        serde_json::json!({
+            "type": "system", "subtype": "context_pressure", "session_id": "session-7",
+            "context": {"last_turn_input_tokens": 15_000, "context_window": 1_048_576}
+        }),
+        serde_json::json!({
+            "type": "result", "subtype": "success", "is_error": false,
+            "session_id": "session-7", "result": "ok", "num_turns": 2,
+            "usage": {"input_tokens": 10, "output_tokens": 3, "cache_read_input_tokens": 90, "cache_creation_input_tokens": 0}
+        }),
+    ] {
+        Provider::Agy.parse_event(&event, &mut sink);
+    }
+    assert_eq!(sink.session_id.as_deref(), Some("session-7"));
+    assert_eq!(sink.last_assistant_message.as_deref(), Some("ok"));
+    assert_eq!(sink.last_turn_input_tokens, Some(15_000));
+    assert_eq!(sink.context_window, Some(1_048_576));
+    let usage = sink.usage.expect("usage");
+    assert_eq!(
+        (
+            usage.input_tokens,
+            usage.cached_input_tokens,
+            usage.output_tokens
+        ),
+        (10, 90, 3)
+    );
+}
+
+#[test]
 fn lane_properties_follow_the_lane() {
     use bro_core::ProviderLane;
-    for lane in [ProviderLane::ClaudeCli, ProviderLane::Codex] {
+    for lane in [
+        ProviderLane::ClaudeCli,
+        ProviderLane::Codex,
+        ProviderLane::Agy,
+    ] {
         assert!(supervisor_writes_event_log(lane));
         assert!(closes_input_after_result(lane));
     }
     assert!(!supervisor_writes_event_log(ProviderLane::Retired));
     assert!(!closes_input_after_result(ProviderLane::Retired));
     assert!(worker_assigns_session_id(ProviderLane::Codex));
+    assert!(worker_assigns_session_id(ProviderLane::Agy));
     assert!(!worker_assigns_session_id(ProviderLane::ClaudeCli));
     assert!(!worker_assigns_session_id(ProviderLane::Retired));
 }

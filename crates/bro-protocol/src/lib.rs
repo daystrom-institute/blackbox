@@ -6,13 +6,15 @@
 use bro_core::{BroError, Origin, Provider, SessionId, TaskId};
 use serde::{Deserialize, Serialize};
 
+mod agy;
 mod codex;
 mod dispatch;
 mod dispatch_context;
 mod fleetd;
 mod worker;
 
-pub use codex::{CodexInput, CodexSessionConfig};
+pub use agy::AgySessionConfig;
+pub use codex::CodexSessionConfig;
 
 pub use dispatch::{
     CloseoutErrorClass, CloseoutHooksWire, CloseoutOutcome, CloseoutPhase, CloseoutRequest,
@@ -37,6 +39,15 @@ pub enum SessionCommand {
     Interrupt,
     SetModel { model: String },
     Compact,
+}
+
+/// One command delivered to a native session adapter. A control command
+/// carries the id its acknowledgement echoes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionInput {
+    pub command: SessionCommand,
+    #[serde(default)]
+    pub request_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

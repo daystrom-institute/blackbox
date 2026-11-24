@@ -106,9 +106,10 @@ The ordering rules are copied deliberately and must stay in step:
 Deliberate deltas, all documented at their call sites:
 
 1. **Binary selection follows the provider lane.** An explicit spec override
-   wins, then `CODEX_BIN`, `CLAUDE_BIN`, or `BRO_HARNESS_BIN`, then the lane's
-   default executable. Codex settings are typed; `bro-worker` drives its
-   app-server RPC and shares session logging with the local executor.
+   wins, then `CODEX_BIN`, `AGY_BIN`, `CLAUDE_BIN`, or `BRO_HARNESS_BIN`, then
+   the lane's default executable. Codex and agy settings are typed;
+   `bro-worker` drives the Codex app-server RPC and the agy ACP session and
+   shares session logging with the local executor.
 2. **stderr is a bounded tail** (`STDERR_TAIL_MAX_BYTES`), not the child's
    entire stderr. The daemon hands stderr over an in-process channel and can
    afford the whole thing; fleetd has to fit it in a bounded RPC frame. Whole

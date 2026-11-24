@@ -328,6 +328,7 @@ mod tests {
             event_log_path: PathBuf::from("/state/bro/sess-1.events.jsonl"),
             supervisor_writes_event_log: false,
             codex: None,
+            agy: None,
         }
     }
 

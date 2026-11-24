@@ -267,11 +267,12 @@ impl ProviderEvents for Provider {
     /// Parse a streaming JSON event and update the sink.
     fn parse_event(&self, evt: &Value, sink: &mut EventSink) {
         match self.lane() {
-            // The claude CLI, the Codex adapter and the harness share one
-            // stream-json envelope.
-            ProviderLane::ClaudeCli | ProviderLane::Codex | ProviderLane::Retired => {
-                parse_claude_event(evt, sink)
-            }
+            // The claude CLI, the Codex and agy adapters and the harness
+            // share one stream-json envelope.
+            ProviderLane::ClaudeCli
+            | ProviderLane::Codex
+            | ProviderLane::Agy
+            | ProviderLane::Retired => parse_claude_event(evt, sink),
             ProviderLane::Workflow => {}
         }
     }

@@ -9,8 +9,8 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 
-use super::rpc::Rpc;
 use super::session::{self as session, SessionConfig};
+use crate::rpc::Rpc;
 
 const THREAD: &str = "thread-1";
 
@@ -258,7 +258,7 @@ async fn run(cfg: SessionConfig, input: &[Value]) -> Run {
         received
     });
 
-    let (rpc, notifications) = Rpc::start(BufReader::new(client_in), client_out);
+    let (rpc, notifications) = Rpc::start(BufReader::new(client_in), client_out, super::PEER);
     session::handshake(&rpc).await.expect("handshake");
     let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel();
     for command in input {
@@ -584,7 +584,7 @@ async fn unsupported_controls_fail_explicitly() {
 async fn strict_mcp_disables_every_server_the_dispatch_did_not_define() {
     let (client_out, server_in) = tokio::io::duplex(4096);
     let (mut server_out, client_in) = tokio::io::duplex(4096);
-    let (rpc, _notes) = Rpc::start(BufReader::new(client_in), client_out);
+    let (rpc, _notes) = Rpc::start(BufReader::new(client_in), client_out, super::PEER);
     let server = tokio::spawn(async move {
         let mut lines = BufReader::new(server_in).lines();
         let mut script = Script::default();
@@ -639,7 +639,7 @@ async fn strict_config_read_errors_and_malformed_results_fail_closed() {
     ] {
         let (client_out, server_in) = tokio::io::duplex(4096);
         let (mut server_out, client_in) = tokio::io::duplex(4096);
-        let (rpc, _) = Rpc::start(BufReader::new(client_in), client_out);
+        let (rpc, _) = Rpc::start(BufReader::new(client_in), client_out, super::PEER);
         let server = tokio::spawn(async move {
             let mut lines = BufReader::new(server_in).lines();
             let request: Value =

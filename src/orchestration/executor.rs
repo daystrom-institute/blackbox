@@ -242,6 +242,13 @@ impl WorkerExecutor for LocalExecutor {
         if let Some(config) = &spec.codex {
             bro_worker::codex::validate(config)?;
         }
+        anyhow::ensure!(
+            (spec.provider == bro_core::Provider::Agy) == spec.agy.is_some(),
+            "agy requires typed session settings"
+        );
+        if let Some(config) = &spec.agy {
+            bro_worker::agy::validate(config)?;
+        }
         let provider = spec.provider;
 
         // Final binary resolution stays executor-side. Login-shell resolution
@@ -287,15 +294,16 @@ impl WorkerExecutor for LocalExecutor {
         }
         cmd.env("BRO_HOME", &spec.bro_home);
 
-        let session_log = if spec.supervisor_writes_event_log || spec.codex.is_some() {
-            Some(
-                bro_worker::SessionLogWriter::open(&spec.event_log_path)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("cannot open worker event log: {e}"))?,
-            )
-        } else {
-            None
-        };
+        let session_log =
+            if spec.supervisor_writes_event_log || spec.codex.is_some() || spec.agy.is_some() {
+                Some(
+                    bro_worker::SessionLogWriter::open(&spec.event_log_path)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("cannot open worker event log: {e}"))?,
+                )
+            } else {
+                None
+            };
 
         let mut child = cmd
             .spawn()
@@ -329,6 +337,20 @@ impl WorkerExecutor for LocalExecutor {
             Some(tokio::spawn(bro_worker::codex::run(
                 config,
                 spec.cwd.clone().unwrap_or_else(|| ".".into()),
+                stdin,
+                stdout,
+                control_rx,
+                events_tx,
+                session_log.expect("native worker log"),
+            )))
+        } else if let Some(config) = spec.agy.clone() {
+            let stdin = stdin.ok_or_else(|| anyhow::anyhow!("agy stdin missing"))?;
+            let stdout = stdout.ok_or_else(|| anyhow::anyhow!("agy stdout missing"))?;
+            drop(stdout_done_tx);
+            Some(tokio::spawn(bro_worker::agy::run(
+                config,
+                spec.cwd.clone().unwrap_or_else(|| ".".into()),
+                spec.env.as_map().clone(),
                 stdin,
                 stdout,
                 control_rx,
@@ -620,6 +642,7 @@ mod child_env_tests {
             event_log_path: root.path().join("log"),
             supervisor_writes_event_log: true,
             codex: None,
+            agy: None,
         };
         spec.bin_override = Some("/bin/sh".into());
         spec.cwd = None;
@@ -694,6 +717,7 @@ mod child_env_tests {
                 event_log_path: std::env::temp_dir().join("sess-1.events.jsonl"),
                 supervisor_writes_event_log: false,
                 codex: None,
+                agy: None,
             };
             let mut child = LocalExecutor.spawn(spec).await.unwrap();
             let line = child.events.recv().await;

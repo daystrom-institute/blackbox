@@ -46,6 +46,10 @@ pub enum Provider {
     /// execution-host adapter. Accounts select a `CODEX_HOME`; the default account
     /// uses the app-server's own `~/.codex`.
     Codex,
+    /// Antigravity through one `agy acp` server per dispatch, fronted by the
+    /// execution-host adapter. The session runs in the executing user's own
+    /// agy home, with that user's sign-in and customizations.
+    Agy,
     /// Historical task/transcript identity. Not accepted for dispatch.
     #[serde(rename = "brodex")]
     #[strum(disabled)]
@@ -107,6 +111,9 @@ pub enum ProviderLane {
     ClaudeCli,
     /// Native app-server RPC, owned by the execution-host adapter.
     Codex,
+    /// Agent Client Protocol over `agy acp` stdio, owned by the
+    /// execution-host adapter.
+    Agy,
     /// Archival provider identity with no executable runtime.
     Retired,
     /// Daemon-internal workflow engine; no child process.
@@ -120,6 +127,7 @@ impl Provider {
         Provider::Minimax,
         Provider::Kimi,
         Provider::Codex,
+        Provider::Agy,
     ];
 
     pub fn is_dispatchable(&self) -> bool {
@@ -130,6 +138,7 @@ impl Provider {
                 | Provider::Minimax
                 | Provider::Kimi
                 | Provider::Codex
+                | Provider::Agy
         )
     }
 
@@ -139,6 +148,7 @@ impl Provider {
                 ProviderLane::ClaudeCli
             }
             Provider::Codex => ProviderLane::Codex,
+            Provider::Agy => ProviderLane::Agy,
             Provider::LegacyBrodex | Provider::LegacyVibeBh => ProviderLane::Retired,
             Provider::Workflow => ProviderLane::Workflow,
         }
@@ -169,6 +179,9 @@ impl Provider {
             // The app-server delivers structured output through the turn's
             // `outputSchema`.
             Provider::Codex => &[StructuredOutput, ToolUse, Resume],
+            // The Agent Client Protocol carries no output schema, so
+            // structured output is not offered on this lane.
+            Provider::Agy => &[ToolUse, Resume],
             // All harness-backed providers support structured output via the
             // forced `final_result` terminal tool (transport-agnostic — works
             // for every tool-using provider).
@@ -194,6 +207,7 @@ impl Provider {
             Self::Minimax => "minimax",
             Self::Kimi => "kimi",
             Self::Codex => "codex",
+            Self::Agy => "agy",
             Self::LegacyBrodex => "brodex",
             Self::LegacyVibeBh => "vibebh",
             Self::Workflow => "workflow",
@@ -325,6 +339,9 @@ pub enum PromptCacheCapability {
     /// stable `prompt_cache_key`; cached input is reported in
     /// `prompt_tokens_details.cached_tokens`.
     ChatCompletionsPromptCacheKey,
+    /// Server-side implicit caching with no request-side control; cached
+    /// input is reported per prompt as `cachedReadTokens`.
+    ImplicitCachedReadTokens,
     /// No known explicit context-reuse or cache-reporting surface for this
     /// provider/transport.
     NoneKnown,
@@ -337,6 +354,7 @@ fn models_for(provider: Provider) -> &'static [ModelInfo] {
         Provider::Minimax => MINIMAX_MODELS,
         Provider::Kimi => KIMI_MODELS,
         Provider::Codex => CODEX_MODELS,
+        Provider::Agy => AGY_MODELS,
         Provider::LegacyBrodex | Provider::LegacyVibeBh => &[],
         Provider::Workflow => &[],
     }
@@ -348,6 +366,7 @@ fn efforts_for(provider: Provider) -> &'static [EffortInfo] {
         Provider::Deepseek => DEEPSEEK_EFFORTS,
         Provider::Kimi => KIMI_EFFORTS,
         Provider::Codex => CODEX_EFFORTS,
+        Provider::Agy => AGY_EFFORTS,
         Provider::LegacyBrodex | Provider::LegacyVibeBh => &[],
         Provider::Workflow => &[],
     }
@@ -359,6 +378,7 @@ fn prompt_cache_for(provider: Provider) -> PromptCacheCapability {
             PromptCacheCapability::AnthropicCacheControl
         }
         Provider::Codex => PromptCacheCapability::OpenAiPromptTokenDetails,
+        Provider::Agy => PromptCacheCapability::ImplicitCachedReadTokens,
         Provider::LegacyBrodex | Provider::LegacyVibeBh => PromptCacheCapability::NoneKnown,
         Provider::Workflow => PromptCacheCapability::NoneKnown,
     }
@@ -889,6 +909,116 @@ static CODEX_EFFORTS: &[EffortInfo] = &[
     },
 ];
 
+// Model ids are the values of the ACP session's `model` option; efforts are
+// the values of its `thought_level` option, which each model offers its own
+// subset of. A model that lists no efforts here has no thinking levels: the
+// adapter sets none for it.
+static AGY_EFFORTS: &[EffortInfo] = &[
+    EffortInfo {
+        id: "low",
+        description: "Light reasoning",
+        default: false,
+    },
+    EffortInfo {
+        id: "medium",
+        description: "Balanced speed and depth",
+        default: false,
+    },
+    EffortInfo {
+        id: "high",
+        description: "Greater depth for complex problems",
+        default: true,
+    },
+    EffortInfo {
+        id: "xhigh",
+        description: "Extended reasoning depth",
+        default: false,
+    },
+];
+
+const AGY_EFFORTS_TO_HIGH: &[&str] = &["low", "medium", "high"];
+const AGY_EFFORTS_TO_XHIGH: &[&str] = &["low", "medium", "high", "xhigh"];
+
+static AGY_MODELS: &[ModelInfo] = &[
+    ModelInfo {
+        id: "gemini-4-neon",
+        description: "Gemini 4 Neon via Antigravity",
+        default: true,
+        efforts: AGY_EFFORTS_TO_XHIGH,
+        default_effort: Some("high"),
+    },
+    ModelInfo {
+        id: "gemini-4-carbon",
+        description: "Gemini 4 Carbon via Antigravity",
+        default: false,
+        efforts: AGY_EFFORTS_TO_HIGH,
+        default_effort: None,
+    },
+    ModelInfo {
+        id: "gemini-4-argon",
+        description: "Gemini 4 Argon via Antigravity",
+        default: false,
+        efforts: AGY_EFFORTS_TO_HIGH,
+        default_effort: None,
+    },
+    ModelInfo {
+        id: "gemini-4-hydrogen",
+        description: "Gemini 4 Hydrogen via Antigravity",
+        default: false,
+        efforts: AGY_EFFORTS_TO_XHIGH,
+        default_effort: None,
+    },
+    ModelInfo {
+        id: "gemini-pro-orchestrator-neon",
+        description: "Orchestrator (Neon) via Antigravity; no thinking levels",
+        default: false,
+        efforts: &[],
+        default_effort: None,
+    },
+    ModelInfo {
+        id: "gemini-pro-orchestrator",
+        description: "Orchestrator (Carbon) via Antigravity; no thinking levels",
+        default: false,
+        efforts: &[],
+        default_effort: None,
+    },
+    ModelInfo {
+        id: "gemini-pro-orchestrator-argon",
+        description: "Orchestrator (Argon) via Antigravity; no thinking levels",
+        default: false,
+        efforts: &[],
+        default_effort: None,
+    },
+    ModelInfo {
+        id: "gemini-3.8-flash",
+        description: "Gemini 3.8 Flash via Antigravity",
+        default: false,
+        efforts: AGY_EFFORTS_TO_HIGH,
+        default_effort: None,
+    },
+    ModelInfo {
+        id: "claude-opus-5-5",
+        description: "Claude Opus 5.5 via Antigravity",
+        default: false,
+        efforts: AGY_EFFORTS_TO_HIGH,
+        default_effort: None,
+    },
+    ModelInfo {
+        id: "claude-sonnet-5-5",
+        description: "Claude Sonnet 5.5 via Antigravity",
+        default: false,
+        efforts: AGY_EFFORTS_TO_HIGH,
+        default_effort: None,
+    },
+    ModelInfo {
+        id: "gpt-oss-120b-medium",
+        description: "GPT-OSS 120B via Antigravity; no thinking levels",
+        default: false,
+        efforts: &[],
+        default_effort: None,
+    },
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -998,6 +1128,43 @@ mod tests {
             PromptCacheCapability::OpenAiPromptTokenDetails
         );
         assert!(p.capabilities().contains(&Capability::StructuredOutput));
+    }
+
+    #[test]
+    fn agy_rides_its_own_lane_and_defaults_to_neon_high() {
+        let p = Provider::Agy;
+        assert_eq!(p.lane(), ProviderLane::Agy);
+        assert_eq!(p.as_str(), "agy");
+        assert_eq!("agy".parse::<Provider>().unwrap(), Provider::Agy);
+        assert_eq!(
+            serde_json::from_value::<Provider>(serde_json::json!("agy")).unwrap(),
+            Provider::Agy
+        );
+        assert_eq!(serde_json::to_value(p).unwrap(), "agy");
+        assert!(Provider::ALL.contains(&p));
+        assert!(p.is_dispatchable());
+        assert!(p.supports_resume());
+        assert_eq!(p.claude_config_dir_name(), None);
+
+        assert_eq!(p.models().iter().filter(|m| m.default).count(), 1);
+        let default_model = p.models().iter().find(|m| m.default).unwrap();
+        assert_eq!(default_model.id, "gemini-4-neon");
+        assert_eq!(p.model_default_effort("gemini-4-neon"), Some("high"));
+        assert_eq!(
+            p.model_efforts("gemini-4-neon"),
+            ["low", "medium", "high", "xhigh"]
+        );
+        assert_eq!(
+            p.model_efforts("gemini-3.8-flash"),
+            ["low", "medium", "high"]
+        );
+        assert_eq!(p.model_default_effort("claude-opus-5-5"), Some("high"));
+        assert!(!p.capabilities().contains(&Capability::StructuredOutput));
+        assert!(p.capabilities().contains(&Capability::Resume));
+        assert_eq!(
+            p.prompt_cache(),
+            PromptCacheCapability::ImplicitCachedReadTokens
+        );
     }
 
     #[test]

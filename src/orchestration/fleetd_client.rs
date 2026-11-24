@@ -2371,6 +2371,7 @@ mod tests {
             event_log_path: PathBuf::from(format!("/nowhere/{session_id}.events.jsonl")),
             supervisor_writes_event_log: false,
             codex: None,
+            agy: None,
         }
     }
 

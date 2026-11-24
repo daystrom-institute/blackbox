@@ -130,6 +130,28 @@ bro_providers()
 ```
 
 Provider binaries can be overridden with env vars such as `CLAUDE_BIN`,
+`CODEX_BIN` and `AGY_BIN`.
+
+## Agy
+
+The `agy` provider runs Antigravity through one `agy acp` server per dispatch.
+Install `agy` on each worker host that runs it and sign in as the user the
+worker runs as: the lane has no account routing.
+
+A dispatched session runs in that user's own agy home. It loads the MCP
+servers, skills and hooks configured there, alongside the MCP servers the
+dispatch attaches to the session. When that home already defines a server under
+the daemon's MCP name, agy keeps its own definition and the session does not
+use the dispatch's endpoint.
+
+The server runs with permission prompts off and nothing gates individual
+tools. A dispatch that carries tool allow or deny filters is refused, as are
+structured output, a service tier and provider-default suppression. Recursion
+is not guarded on this lane.
+
+Model ids and thinking levels come from `bro_providers()`. A resume runs on the
+model and level it names, or the catalog default; the server does not remember
+them from the earlier process.
 
 ## Codex Skills
 

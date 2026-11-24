@@ -147,11 +147,13 @@ impl ProviderDefaultsMode {
 /// through its native CLI. Retired providers fail closed before dispatch.
 pub fn provider_supports_defaults_suppression(provider: Provider) -> bool {
     // The Claude CLI honors `--system-prompt ""`. The Codex app-server has no equivalent that
-    // leaves its own tool instructions intact.
+    // leaves its own tool instructions intact, and the agy ACP server only appends.
     match provider.lane() {
         bro_core::ProviderLane::ClaudeCli => true,
         bro_core::ProviderLane::Retired => false,
-        bro_core::ProviderLane::Codex | bro_core::ProviderLane::Workflow => false,
+        bro_core::ProviderLane::Codex
+        | bro_core::ProviderLane::Agy
+        | bro_core::ProviderLane::Workflow => false,
     }
 }
 
@@ -678,10 +680,13 @@ fn synthesized_account_env_for_home(
         // GLM/DeepSeek/MiniMax/Kimi inherit credentials from fixed
         // Claude-compatible config dirs; vibe-bh authenticates via
         // MISTRAL_API_KEY, not accounts.
+        // agy signs in through the executing user's credential store, which
+        // no directory selects.
         Provider::Glm
         | Provider::Deepseek
         | Provider::Minimax
         | Provider::Kimi
+        | Provider::Agy
         | Provider::LegacyBrodex
         | Provider::LegacyVibeBh
         | Provider::Workflow => return None,
@@ -746,6 +751,9 @@ fn resolve_provider_env_for_locality(
         // The codex lane needs no transport env: `CODEX_HOME` (or the
         // app-server's default `~/.codex`) carries credentials and config.
         Provider::Codex => HashMap::new(),
+        // The agy lane needs no transport env: the server reads the executing
+        // user's own agy home and sign-in.
+        Provider::Agy => HashMap::new(),
         // Archived identities have no execution environment.
         Provider::LegacyBrodex | Provider::LegacyVibeBh => HashMap::new(),
         // vibe-bh rides the harness on the OpenAI chat-completions transport
@@ -1376,6 +1384,9 @@ mod tests {
         );
         // No suppression flag the adapter cannot honor.
         assert!(!provider_supports_defaults_suppression(Provider::Codex));
+        assert!(!provider_supports_defaults_suppression(Provider::Agy));
+        // The agy lane has no account directory and no transport env.
+        assert!(resolve_provider_env(Provider::Agy, None, None, store.path(), None).is_none());
         assert!(
             enforce_provider_defaults(
                 Provider::Codex,

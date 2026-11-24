@@ -1,11 +1,9 @@
-//! JSON-RPC over the app-server's stdio: one JSON object per line.
+//! JSON-RPC over a native provider server's stdio: one JSON object per line.
 //!
 //! Responses resolve the request that is waiting on them, notifications go
 //! to the adapter's driver in arrival order, and requests the server makes of
-//! the client (approvals, user input) are answered here. A dispatch runs
-//! with `approvalPolicy: never`, so the server should not ask; if it does,
-//! every approval is declined and anything else is refused, so a stray
-//! request can never stall a turn.
+//! the client are answered here by the adapter's [`Peer`], so a stray request
+//! can never stall a turn.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -18,7 +16,19 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 type Writer = Box<dyn AsyncWrite + Unpin + Send>;
 type Pending = Arc<std::sync::Mutex<HashMap<i64, oneshot::Sender<Result<Value, RpcError>>>>>;
 
-/// A JSON-RPC error, or the app-server going away before it answered.
+/// What differs between the servers this crate drives.
+#[derive(Clone, Copy)]
+pub struct Peer {
+    /// Names the provider in request errors.
+    pub name: &'static str,
+    /// Names the server process in connection errors.
+    pub process: &'static str,
+    /// The result for a request the server makes of this headless client, or
+    /// `None` to refuse the method as unsupported.
+    pub answer: fn(method: &str, params: &Value) -> Option<Value>,
+}
+
+/// A JSON-RPC error, or the server going away before it answered.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RpcError {
     pub message: String,
@@ -32,7 +42,7 @@ impl std::fmt::Display for RpcError {
 
 impl std::error::Error for RpcError {}
 
-/// A notification from the app-server.
+/// A notification from the server.
 #[derive(Debug, Clone)]
 pub struct Notification {
     pub method: String,
@@ -46,12 +56,29 @@ pub struct Rpc {
     pending: Pending,
     /// Set once the server's stdout has ended; nothing will answer after.
     closed: Arc<AtomicBool>,
+    peer: Peer,
+}
+
+/// The answer to a request sent with [`Rpc::call`].
+pub struct Reply(oneshot::Receiver<Result<Value, RpcError>>, Peer);
+
+impl Reply {
+    /// Wait for the answer, however long the server takes. Resolves with an
+    /// error when the server exits first.
+    pub async fn wait(self) -> Result<Value, RpcError> {
+        let Reply(receiver, peer) = self;
+        receiver.await.unwrap_or_else(|_| Err(gone(peer)))
+    }
 }
 
 impl Rpc {
     /// Start the connection: a reader task demultiplexes `reader`, and the
     /// returned receiver yields notifications until the server's stdout ends.
-    pub fn start<R, W>(reader: R, writer: W) -> (Self, mpsc::UnboundedReceiver<Notification>)
+    pub fn start<R, W>(
+        reader: R,
+        writer: W,
+        peer: Peer,
+    ) -> (Self, mpsc::UnboundedReceiver<Notification>)
     where
         R: AsyncBufRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
@@ -61,6 +88,7 @@ impl Rpc {
             next_id: Arc::new(AtomicI64::new(1)),
             pending: Arc::default(),
             closed: Arc::default(),
+            peer,
         };
         let (tx, rx) = mpsc::unbounded_channel();
         tokio::spawn(rpc.clone().read_loop(reader, tx));
@@ -69,6 +97,38 @@ impl Rpc {
 
     /// Send a request and wait for its result.
     pub async fn request(&self, method: &str, params: Value) -> Result<Value, RpcError> {
+        let (id, rx) = self.register()?;
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            self.send(&json!({"jsonrpc":"2.0", "id":id, "method":method, "params":params}))
+                .await?;
+            rx.await.unwrap_or_else(|_| Err(gone(self.peer)))
+        })
+        .await
+        .unwrap_or_else(|_| {
+            Err(RpcError {
+                message: format!("{} {method} timed out after 30 seconds", self.peer.name),
+            })
+        });
+        self.forget(id);
+        outcome
+    }
+
+    /// Send a request whose answer has no deadline, such as one the server
+    /// holds open for a whole turn. The write is bounded; the returned
+    /// [`Reply`] resolves when the server answers or exits.
+    pub async fn call(&self, method: &str, params: Value) -> Result<Reply, RpcError> {
+        let (id, rx) = self.register()?;
+        let sent = self
+            .send(&json!({"jsonrpc":"2.0", "id":id, "method":method, "params":params}))
+            .await;
+        if let Err(error) = sent {
+            self.forget(id);
+            return Err(error);
+        }
+        Ok(Reply(rx, self.peer))
+    }
+
+    fn register(&self) -> Result<(i64, oneshot::Receiver<Result<Value, RpcError>>), RpcError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending
@@ -76,28 +136,17 @@ impl Rpc {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(id, tx);
         if self.closed.load(Ordering::SeqCst) {
-            self.pending
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .remove(&id);
-            return Err(gone());
+            self.forget(id);
+            return Err(gone(self.peer));
         }
-        let outcome = tokio::time::timeout(std::time::Duration::from_secs(30), async {
-            self.send(&json!({"jsonrpc":"2.0", "id":id, "method":method, "params":params}))
-                .await?;
-            rx.await.unwrap_or_else(|_| Err(gone()))
-        })
-        .await
-        .unwrap_or_else(|_| {
-            Err(RpcError {
-                message: format!("Codex {method} timed out after 30 seconds"),
-            })
-        });
+        Ok((id, rx))
+    }
+
+    fn forget(&self, id: i64) {
         self.pending
             .lock()
-            .unwrap_or_else(|p| p.into_inner())
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&id);
-        outcome
     }
 
     pub async fn notify(&self, method: &str, params: Value) -> Result<(), RpcError> {
@@ -105,7 +154,7 @@ impl Rpc {
             .await
     }
 
-    /// Close the server's stdin. The app-server exits at end of input.
+    /// Close the server's stdin. The server exits at end of input.
     pub async fn close(&self) {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             if let Some(mut writer) = self.writer.lock().await.take() {
@@ -120,7 +169,7 @@ impl Rpc {
             .await
             .unwrap_or_else(|_| {
                 Err(RpcError {
-                    message: "Codex RPC write timed out after 30 seconds".into(),
+                    message: format!("{} RPC write timed out after 30 seconds", self.peer.name),
                 })
             })
     }
@@ -130,16 +179,17 @@ impl Rpc {
         line.push('\n');
         let mut guard = self.writer.lock().await;
         let Some(writer) = guard.as_mut() else {
-            return Err(gone());
+            return Err(gone(self.peer));
         };
+        let process = self.peer.process;
         writer
             .write_all(line.as_bytes())
             .await
             .map_err(|error| RpcError {
-                message: format!("cannot write to the codex app-server: {error}"),
+                message: format!("cannot write to {process}: {error}"),
             })?;
         writer.flush().await.map_err(|error| RpcError {
-            message: format!("cannot write to the codex app-server: {error}"),
+            message: format!("cannot write to {process}: {error}"),
         })
     }
 
@@ -162,7 +212,8 @@ impl Rpc {
             match (method, id) {
                 (None, Some(id)) => self.resolve(id, &message),
                 (Some(method), Some(id)) => {
-                    let reply = server_request_reply(method, id.clone());
+                    let params = message.get("params").unwrap_or(&Value::Null);
+                    let reply = server_request_reply(self.peer, method, params, id.clone());
                     let _ = self.send(&reply).await;
                 }
                 (Some(method), None) => {
@@ -182,7 +233,7 @@ impl Rpc {
             .drain()
             .collect();
         for (_, waiter) in waiting {
-            let _ = waiter.send(Err(gone()));
+            let _ = waiter.send(Err(gone(self.peer)));
         }
     }
 
@@ -212,23 +263,15 @@ impl Rpc {
     }
 }
 
-fn gone() -> RpcError {
+fn gone(peer: Peer) -> RpcError {
     RpcError {
-        message: "the codex app-server exited".to_string(),
+        message: format!("{} exited", peer.process),
     }
 }
 
 /// The answer to a request the server makes of a headless client.
-fn server_request_reply(method: &str, id: Value) -> Value {
-    let result = match method {
-        "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
-            Some(json!({"decision": "decline"}))
-        }
-        "execCommandApproval" | "applyPatchApproval" => Some(json!({"decision": "denied"})),
-        "mcpServer/elicitation/request" => Some(json!({"action": "decline"})),
-        _ => None,
-    };
-    match result {
+fn server_request_reply(peer: Peer, method: &str, params: &Value, id: Value) -> Value {
+    match (peer.answer)(method, params) {
         Some(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
         None => json!({
             "jsonrpc": "2.0",
@@ -243,12 +286,18 @@ mod tests {
     use super::*;
     use tokio::io::BufReader;
 
+    const PEER: Peer = Peer {
+        name: "Test",
+        process: "the test server",
+        answer: |method, params| (method == "ask").then(|| json!({"echo": params["question"]})),
+    };
+
     #[tokio::test(start_paused = true)]
     async fn unanswered_requests_and_blocked_writes_have_a_deadline() {
         for capacity in [1, 4096] {
             let (writer, _unread) = tokio::io::duplex(capacity);
             let (_silent, reader) = tokio::io::duplex(4096);
-            let (rpc, _) = Rpc::start(BufReader::new(reader), writer);
+            let (rpc, _) = Rpc::start(BufReader::new(reader), writer, PEER);
             let error = rpc.request("initialize", json!({})).await.unwrap_err();
             assert!(error.message.contains("timed out"));
             assert!(rpc.pending.lock().unwrap().is_empty());
@@ -257,10 +306,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn requests_resolve_notifications_flow_and_server_requests_are_declined() {
+    async fn requests_resolve_notifications_flow_and_server_requests_are_answered() {
         let (client_out, server_in) = tokio::io::duplex(4096);
         let (server_out, client_in) = tokio::io::duplex(4096);
-        let (rpc, mut notes) = Rpc::start(BufReader::new(client_in), client_out);
+        let (rpc, mut notes) = Rpc::start(BufReader::new(client_in), client_out, PEER);
         let server = tokio::spawn(async move {
             let mut lines = BufReader::new(server_in).lines();
             let mut out = server_out;
@@ -271,18 +320,23 @@ mod tests {
             out.write_all(b"{\"method\":\"note\",\"params\":{\"n\":1}}\n")
                 .await
                 .unwrap();
-            out.write_all(
-                b"{\"id\":99,\"method\":\"item/commandExecution/requestApproval\",\"params\":{}}\n",
-            )
-            .await
-            .unwrap();
+            out.write_all(b"{\"id\":99,\"method\":\"ask\",\"params\":{\"question\":7}}\n")
+                .await
+                .unwrap();
+            out.write_all(b"{\"id\":\"100\",\"method\":\"other\",\"params\":{}}\n")
+                .await
+                .unwrap();
             out.write_all(format!("{}\n", json!({"id": id, "result": {"pong": true}})).as_bytes())
                 .await
                 .unwrap();
             let reply: Value =
                 serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
             assert_eq!(reply["id"], 99);
-            assert_eq!(reply["result"]["decision"], "decline");
+            assert_eq!(reply["result"]["echo"], 7);
+            let refusal: Value =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            assert_eq!(refusal["id"], "100");
+            assert_eq!(refusal["error"]["code"], -32601);
             let request: Value =
                 serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
             out.write_all(

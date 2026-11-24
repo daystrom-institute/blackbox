@@ -38,11 +38,3 @@ impl std::fmt::Debug for CodexSessionConfig {
             .finish_non_exhaustive()
     }
 }
-
-/// One command delivered to the native Codex adapter.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CodexInput {
-    pub command: crate::SessionCommand,
-    #[serde(default)]
-    pub request_id: Option<String>,
-}

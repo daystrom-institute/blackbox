@@ -46,6 +46,12 @@ account routing uses `CODEX_HOME`; a profile path on the daemon host does not
 stand in for the worker host's credential home. Never copy an entire unrelated
 profile just to borrow credentials.
 
+The agy lane has no account routing. A dispatched session signs in as the
+worker host's user and loads that user's agy home, so install `agy` and sign in
+on each worker host that runs it. If that home registers an MCP server under
+the daemon's MCP name, agy keeps that registration and ignores the one a
+dispatch attaches.
+
 Dispatch MCP configuration uses the operator surface:
 
 ```sh

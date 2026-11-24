@@ -12,7 +12,7 @@ use std::time::Instant;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
-use super::rpc::{Notification, Rpc, RpcError};
+use crate::rpc::{Notification, Rpc, RpcError};
 
 /// Everything a session needs from the dispatch, resolved before the first
 /// turn.
@@ -325,7 +325,7 @@ impl Driver {
 
     // ── stdin ───────────────────────────────────────────────────────────
 
-    async fn handle_input(&mut self, input: bro_protocol::CodexInput) -> anyhow::Result<()> {
+    async fn handle_input(&mut self, input: bro_protocol::SessionInput) -> anyhow::Result<()> {
         let request_id = json!(input.request_id);
         let command = input.command;
         match command {

@@ -66,14 +66,21 @@ routing facts:
   the daemon lifts nothing out of them. Claude itself is not a dispatch
   provider. The executor that owns the child's stdout writes its session
   log; the daemon closes stdin after a turn's result so the child exits.
-- The supported execution lanes are Claude CLI and Codex app-server.
+- The supported execution lanes are Claude CLI, Codex app-server and agy ACP.
 - Codex dispatches directly through app-server on the execution host.
   Typed session settings and controls cross the executor boundary. The
   adapter normalizes provider events for daemon observation and replay.
+- Antigravity dispatches through one `agy acp` server per dispatch on the
+  execution host (`AGY_BIN` selects the executable), in the executing user's
+  own agy home. Typed session settings and controls cross the executor
+  boundary and the adapter speaks the Agent Client Protocol. Dispatch MCP
+  servers are attached to the session, never written to agy configuration.
 - Provider binary overrides belong in config/env, not hard-coded call sites.
 
 Dispatch-capable providers apply a mechanical recursion guard for recursive
 `bro_*` orchestration/control tools. `allow_recursion=true` is the explicit bypass.
+The agy lane has no per-tool gate: it takes no guard and refuses a dispatch
+that carries tool filters.
 
 Daemon startup does not rewrite provider MCP registration.
 `configure_dispatch_mcp_env` exports `BLACKBOX_MCP_URL` and

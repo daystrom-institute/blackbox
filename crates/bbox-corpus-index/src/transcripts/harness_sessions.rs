@@ -55,6 +55,7 @@ const HARNESS_PROVIDERS: &[Provider] = &[
     Provider::Minimax,
     Provider::Kimi,
     Provider::Codex,
+    Provider::Agy,
     Provider::LegacyBrodex,
     Provider::LegacyVibeBh,
 ];
@@ -501,6 +502,31 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn agy_init_attributes_the_canonical_log_and_skips_its_task_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().join("session-1.events.jsonl");
+        std::fs::write(&canonical, format!("{}\n", json!({"ts":"2026-01-01T00:00:00Z", "event":{"type":"system","subtype":"init","provider":"agy","session_id":"session-1","model":"gemini-4-neon","cwd":"/repo"}}))).unwrap();
+        std::fs::hard_link(&canonical, dir.path().join("task-1.events.jsonl")).unwrap();
+        let adapter = HarnessSessionsAdapter::new(Provider::Agy, dir.path().to_path_buf());
+        let locations = adapter
+            .scan_locations(TranscriptScanTarget::Sessions)
+            .unwrap();
+        assert_eq!(locations.len(), 1);
+        assert_eq!(locations[0].session_id.as_deref(), Some("session-1"));
+        assert_eq!(locations[0].source.label(), "agy-dispatch");
+        assert_eq!(locations[0].cwd.as_deref(), Some("/repo"));
+        for other in [Provider::Glm, Provider::Codex] {
+            let adapter = HarnessSessionsAdapter::new(other, dir.path().to_path_buf());
+            assert!(
+                adapter
+                    .scan_locations(TranscriptScanTarget::Sessions)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
     }
 
     #[test]

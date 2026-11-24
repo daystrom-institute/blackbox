@@ -257,6 +257,7 @@ mod smoke {
             event_log_path: log.to_path_buf(),
             supervisor_writes_event_log: false,
                 codex: None,
+                agy: None,
         }
     }
 

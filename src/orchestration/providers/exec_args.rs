@@ -8,7 +8,8 @@ use bro_core::ProviderLane;
 
 /// Resolve the provider binary name from env. The claude lane runs the
 /// vendor `claude` CLI (`CLAUDE_BIN` overrides); the codex lane runs the
-/// `codex app-server` adapter (`CODEX_BIN` overrides); only these native lanes are executable. Credentials
+/// `codex app-server` adapter (`CODEX_BIN` overrides); the agy lane runs the
+/// `agy acp` server (`AGY_BIN` overrides); only these native lanes are executable. Credentials
 /// and endpoints are selected via env (see brofile::resolve_provider_env).
 ///
 /// Dispatch composes a typed invocation and environment for the execution
@@ -17,6 +18,7 @@ fn bin_with_env(provider: Provider) -> String {
     match provider.lane() {
         ProviderLane::ClaudeCli => std::env::var("CLAUDE_BIN").unwrap_or_else(|_| "claude".into()),
         ProviderLane::Codex => std::env::var("CODEX_BIN").unwrap_or_else(|_| "codex".into()),
+        ProviderLane::Agy => std::env::var("AGY_BIN").unwrap_or_else(|_| "agy".into()),
         ProviderLane::Retired => String::new(),
         ProviderLane::Workflow => "workflow".into(),
     }
@@ -182,8 +184,8 @@ fn normalize_model_for_provider(provider: Provider, model: &str) -> String {
 /// catalog `.default` model here, at the single arg-building chokepoint, so
 /// every caller is covered.
 fn default_model(provider: Provider) -> Option<String> {
-    // Codex's typed composer supplies its catalog default separately.
-    if provider.lane() == ProviderLane::Codex {
+    // The typed composers supply their catalog default separately.
+    if matches!(provider.lane(), ProviderLane::Codex | ProviderLane::Agy) {
         return None;
     }
     if !provider.is_dispatchable() {
@@ -233,6 +235,7 @@ pub trait ProviderExec {
 pub struct ProviderLaunch {
     pub argv: Vec<String>,
     pub codex: Option<bro_protocol::CodexSessionConfig>,
+    pub agy: Option<bro_protocol::AgySessionConfig>,
     pub prompt: Option<String>,
     pub errors: Vec<String>,
     /// A Claude allowlist requires a closed MCP inventory owned by this daemon.
@@ -263,6 +266,14 @@ impl ProviderLaunch {
         if let Some(config) = &mut self.codex {
             config.allowed_tools = super::mcp_args::expand_filter_patterns(&filters.allow);
             config.disallowed_tools = super::mcp_args::expand_filter_patterns(&filters.disallow);
+        } else if let Some(config) = &mut self.agy {
+            // The server runs with permission prompts off and has no
+            // per-tool gate, so a restriction cannot be honored here.
+            if !filters.is_empty() {
+                config
+                    .errors
+                    .push("agy cannot enforce tool allow or deny filters".into());
+            }
         } else {
             use super::dispatch_prelude::ProviderMcp;
             if provider.lane() == ProviderLane::ClaudeCli && !filters.allow.is_empty() {
@@ -325,6 +336,7 @@ fn codex_launch(
         argv: Vec::new(),
         errors: Vec::new(),
         claude_restricted_mcp: false,
+        agy: None,
         prompt: Some(prompt.into()),
         codex: Some(bro_protocol::CodexSessionConfig {
             resume: resume.map(str::to_string),
@@ -345,6 +357,64 @@ fn codex_launch(
             errors,
             ..Default::default()
         }),
+    }
+}
+
+fn agy_launch(
+    prompt: &str,
+    resume: Option<&str>,
+    context: Option<&bro_protocol::DispatchContext>,
+    opts: Option<&ExecOpts>,
+) -> ProviderLaunch {
+    let opts = opts.cloned().unwrap_or_default();
+    let mut errors = Vec::new();
+    // Best-effort suppression continues unsuppressed; a mode that demands
+    // suppression is refused.
+    if matches!(
+        opts.provider_defaults,
+        Some(ProviderDefaultsMode::StrictSuppress | ProviderDefaultsMode::ExplicitOnly)
+    ) {
+        errors.push("agy does not support provider-default suppression".into());
+    }
+    if opts.service_tier.is_some() {
+        errors.push("agy does not support service_tier".into());
+    }
+    if opts.output_schema.is_some() {
+        errors.push("agy does not support structured output".into());
+    }
+    // The server carries neither a session's model nor its thinking level
+    // into a new process, so a resume names them exactly as a fresh session
+    // does: the dispatch's choice, else the catalog default.
+    let model = opts.model.or_else(|| {
+        Provider::Agy
+            .models()
+            .iter()
+            .find(|model| model.default)
+            .map(|model| model.id.to_string())
+    });
+    // A catalogued model's default level is set explicitly; the server would
+    // otherwise apply whatever level it last used. An id outside the catalog
+    // may carry its own level and is left as given.
+    let effort = opts.effort.or_else(|| {
+        let model = model.as_deref()?;
+        Provider::Agy
+            .models()
+            .iter()
+            .find(|info| info.id == model && !info.efforts.is_empty())
+            .and_then(|info| Provider::Agy.model_default_effort(info.id))
+            .map(str::to_string)
+    });
+    ProviderLaunch {
+        prompt: Some(prompt.into()),
+        agy: Some(bro_protocol::AgySessionConfig {
+            resume: resume.map(str::to_string),
+            model,
+            effort,
+            system_prompt_append: context.and_then(render_dispatch_context_text),
+            errors,
+            ..Default::default()
+        }),
+        ..Default::default()
     }
 }
 
@@ -419,6 +489,9 @@ impl ProviderExec for Provider {
         if *self == Provider::Codex {
             return codex_launch(prompt, None, dispatch_context, opts);
         }
+        if *self == Provider::Agy {
+            return agy_launch(prompt, None, dispatch_context, opts);
+        }
         let model = opts
             .and_then(|o| o.model.as_deref())
             .map(|m| normalize_model_for_provider(*self, m))
@@ -460,6 +533,7 @@ impl ProviderExec for Provider {
                 };
             }
             ProviderLane::Codex => unreachable!("Codex uses typed launch settings"),
+            ProviderLane::Agy => unreachable!("agy uses typed launch settings"),
             ProviderLane::Workflow => Vec::new(),
         };
         cli_launch(*self, argv, opts)
@@ -474,6 +548,9 @@ impl ProviderExec for Provider {
     ) -> ProviderLaunch {
         if *self == Provider::Codex {
             return codex_launch(prompt, Some(session_id), dispatch_context, opts);
+        }
+        if *self == Provider::Agy {
+            return agy_launch(prompt, Some(session_id), dispatch_context, opts);
         }
         let model = opts
             .and_then(|o| o.model.as_deref())
@@ -514,6 +591,7 @@ impl ProviderExec for Provider {
                 };
             }
             ProviderLane::Codex => unreachable!("Codex uses typed launch settings"),
+            ProviderLane::Agy => unreachable!("agy uses typed launch settings"),
             ProviderLane::Workflow => Vec::new(),
         };
         cli_launch(*self, argv, opts)

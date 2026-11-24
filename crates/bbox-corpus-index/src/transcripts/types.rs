@@ -58,6 +58,9 @@ impl TranscriptSource {
             // A dispatched Codex session log, distinct from the interactive
             // `codex` source the CLI's own session files belong to.
             Self::Harness(Provider::Codex) => "codex-dispatch",
+            // A dispatched agy session log. The bare `agy` label is left for
+            // the CLI's own conversation history.
+            Self::Harness(Provider::Agy) => "agy-dispatch",
             Self::Harness(Provider::LegacyBrodex) => "brodex",
             Self::Harness(Provider::LegacyVibeBh) => "vibebh",
             Self::Harness(Provider::Glm) => "glm",
@@ -98,6 +101,7 @@ impl<'de> Deserialize<'de> for TranscriptSource {
             "claude" => Ok(Self::Claude),
             "codex" => Ok(Self::Codex),
             "codex-dispatch" => Ok(Self::Harness(Provider::Codex)),
+            "agy-dispatch" => Ok(Self::Harness(Provider::Agy)),
             "slack" => Ok(Self::Slack),
             other => {
                 serde_json::from_value::<Provider>(serde_json::Value::String(other.to_string()))
@@ -668,5 +672,22 @@ mod tests {
 
         let known = serde_json::from_value::<TranscriptSource>(serde_json::json!("codex"));
         assert_eq!(known.unwrap(), TranscriptSource::Codex);
+    }
+
+    #[test]
+    fn dispatched_session_logs_carry_their_own_source_labels() {
+        for (provider, label) in [
+            (Provider::Codex, "codex-dispatch"),
+            (Provider::Agy, "agy-dispatch"),
+        ] {
+            let source = TranscriptSource::Harness(provider);
+            assert_eq!(source.label(), label);
+            let stored = serde_json::to_value(source).unwrap();
+            assert_eq!(stored, serde_json::json!(label));
+            assert_eq!(
+                serde_json::from_value::<TranscriptSource>(stored).unwrap(),
+                source
+            );
+        }
     }
 }

@@ -132,7 +132,7 @@ pub(crate) fn combine_dispatch_filters(
 /// bridge mode, the accepted store in catalog mode. This function never reads
 /// a project path itself.
 pub(crate) fn resolve_dispatch_filters(
-    _provider: Provider,
+    provider: Provider,
     project: Option<&orchestration::mcp::McpStore>,
     allow_recursion: bool,
     _task_id: &str,
@@ -142,11 +142,10 @@ pub(crate) fn resolve_dispatch_filters(
         .and_then(|p| orchestration::mcp::McpStore::load(&p).ok())
         .unwrap_or_default();
 
-    let mut eff = orchestration::mcp::resolve_effective(
-        &global,
-        project,
-        /* include_default_guard */ !allow_recursion,
-    );
+    // The agy lane has no per-tool gate, so it takes no default guard; a
+    // filter that reaches it is refused when the launch is composed.
+    let include_default_guard = !allow_recursion && provider.lane() != bro_core::ProviderLane::Agy;
+    let mut eff = orchestration::mcp::resolve_effective(&global, project, include_default_guard);
 
     // Per-dispatch overlay merges last (after global, project, and the
     // default recursion guard) so callers can tighten or open the filter set

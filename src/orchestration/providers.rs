@@ -22,7 +22,7 @@ pub use bro_core::{Capability, Provider};
 /// Native CLI lanes rely on the supervisor; archived runtimes wrote their own.
 pub fn supervisor_writes_event_log(lane: ProviderLane) -> bool {
     match lane {
-        ProviderLane::ClaudeCli | ProviderLane::Codex => true,
+        ProviderLane::ClaudeCli | ProviderLane::Codex | ProviderLane::Agy => true,
         ProviderLane::Retired | ProviderLane::Workflow => false,
     }
 }
@@ -32,18 +32,18 @@ pub fn supervisor_writes_event_log(lane: ProviderLane) -> bool {
 /// its own (`--exit-when-idle`).
 pub fn closes_input_after_result(lane: ProviderLane) -> bool {
     match lane {
-        ProviderLane::ClaudeCli | ProviderLane::Codex => true,
+        ProviderLane::ClaudeCli | ProviderLane::Codex | ProviderLane::Agy => true,
         ProviderLane::Retired | ProviderLane::Workflow => false,
     }
 }
 
 /// Whether the worker mints its own session id when a session starts. The
-/// codex app-server assigns the thread id, which then becomes the session id,
-/// so a fresh dispatch on that lane starts `pending` and adopts the id the
-/// worker's first event carries.
+/// codex app-server assigns the thread id and the agy ACP server assigns the
+/// session id, so a fresh dispatch on those lanes starts `pending` and adopts
+/// the id the worker's first event carries.
 pub fn worker_assigns_session_id(lane: ProviderLane) -> bool {
     match lane {
-        ProviderLane::Codex => true,
+        ProviderLane::Codex | ProviderLane::Agy => true,
         ProviderLane::ClaudeCli | ProviderLane::Retired | ProviderLane::Workflow => false,
     }
 }
@@ -54,7 +54,7 @@ pub use exec_args::{
 };
 #[cfg(test)]
 use mcp_args::MatchState;
-pub use mcp_args::{codex_fleet_mcp_servers, fleet_mcp_args};
+pub use mcp_args::{fleet_mcp_args, typed_fleet_mcp_servers};
 
 /// Bring every provider dispatch trait into scope with one glob import:
 /// `use crate::orchestration::providers::dispatch_prelude::*;`

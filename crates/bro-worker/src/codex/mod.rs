@@ -1,7 +1,6 @@
 //! Native Codex app-server adapter, linked by both execution hosts.
 //! The host owns the app-server process; this module owns its RPC session.
 mod mcp;
-mod rpc;
 mod session;
 #[cfg(test)]
 mod tests;
@@ -12,6 +11,23 @@ use serde_json::Value;
 use tokio::io::BufReader;
 use tokio::process::{ChildStdin, ChildStdout};
 use tokio::sync::mpsc;
+
+/// A dispatch runs with `approvalPolicy: never`, so the app-server should
+/// not ask; if it does, every approval is declined.
+pub(crate) const PEER: crate::rpc::Peer = crate::rpc::Peer {
+    name: "Codex",
+    process: "the codex app-server",
+    answer: |method, _params| match method {
+        "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
+            Some(serde_json::json!({"decision": "decline"}))
+        }
+        "execCommandApproval" | "applyPatchApproval" => {
+            Some(serde_json::json!({"decision": "denied"}))
+        }
+        "mcpServer/elicitation/request" => Some(serde_json::json!({"action": "decline"})),
+        _ => None,
+    },
+};
 
 pub fn validate(config: &CodexSessionConfig) -> anyhow::Result<()> {
     mcp::overrides(config).map(|_| ())
@@ -28,7 +44,7 @@ pub async fn run(
 ) -> anyhow::Result<()> {
     let new_session = config.resume.is_none();
     let overrides = mcp::overrides(&config)?;
-    let (rpc, notifications) = rpc::Rpc::start(BufReader::new(stdout), stdin);
+    let (rpc, notifications) = crate::rpc::Rpc::start(BufReader::new(stdout), stdin, PEER);
     let setup = async {
         session::handshake(&rpc).await?;
         let names: Vec<String> = config.mcp_servers.keys().cloned().collect();

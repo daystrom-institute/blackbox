@@ -573,7 +573,7 @@ fn harness_killers() -> &'static RwLock<HashMap<String, Arc<executor::WorkerKill
 }
 
 fn worker_user_input(lane: ProviderLane, text: String) -> Value {
-    if lane == ProviderLane::Codex {
+    if matches!(lane, ProviderLane::Codex | ProviderLane::Agy) {
         let command = if text.trim() == "/compact" {
             bro_protocol::SessionCommand::Compact
         } else {
@@ -617,8 +617,8 @@ fn claude_control_input(subtype: &str, request_id: String, fields: Value) -> Val
 fn control_input(lane: ProviderLane, subtype: &str, fields: Value) -> Value {
     let request_id = uuid::Uuid::new_v4().to_string();
     match lane {
-        // Codex controls stay typed across the execution-host boundary.
-        ProviderLane::Codex => {
+        // Adapter-lane controls stay typed across the execution-host boundary.
+        ProviderLane::Codex | ProviderLane::Agy => {
             let command = match subtype {
                 "interrupt" => bro_protocol::SessionCommand::Interrupt,
                 "set_model" => bro_protocol::SessionCommand::SetModel {
@@ -822,11 +822,11 @@ pub fn interrupt_harness_task(task_id: &str, redirect: Option<String>) -> Result
                 .ok_or_else(|| format!("task {task_id} has no live harness control channel"))?;
             let closed = |_| format!("task {task_id} harness control channel is closed");
             match control.lane {
-                // The claude CLI and the Codex adapter have no redirect payload
-                // on their interrupt: the interrupt ends the turn and the
-                // redirect, queued right behind it on stdin, starts the next
-                // one.
-                ProviderLane::ClaudeCli | ProviderLane::Codex => {
+                // The claude CLI and the Codex and agy adapters have no
+                // redirect payload on their interrupt: the interrupt ends the
+                // turn and the redirect, queued right behind it on stdin,
+                // starts the next one.
+                ProviderLane::ClaudeCli | ProviderLane::Codex | ProviderLane::Agy => {
                     control
                         .tx
                         .send(control_input(
@@ -3077,15 +3077,20 @@ async fn spawn_reserved_dispatch(task_id: String, params: SpawnTaskParams) -> Ar
     // `mcpServers`, injected as `--mcp-config` argv and merged with the
     // daemon's complete self-MCP catalog before the child is spawned.
     let mut args: providers::ProviderLaunch = args.into();
-    if let Some(config) = &mut args.codex {
+    let typed = match (&mut args.codex, &mut args.agy) {
+        (Some(config), _) => Some((&mut config.mcp_servers, &mut config.errors)),
+        (None, Some(config)) => Some((&mut config.mcp_servers, &mut config.errors)),
+        (None, None) => None,
+    };
+    if let Some((mcp_servers, errors)) = typed {
         if matches!(
             origin,
             bro_core::Origin::Control | bro_core::Origin::Cockpit
         ) {
             let fleet = bro_config::DispatchConfig::load();
-            match providers::codex_fleet_mcp_servers(&fleet.mcp_servers) {
-                Ok(servers) => config.mcp_servers.extend(servers),
-                Err(error) => config.errors.push(error.to_string()),
+            match providers::typed_fleet_mcp_servers(&fleet.mcp_servers) {
+                Ok(servers) => mcp_servers.extend(servers),
+                Err(error) => errors.push(error.to_string()),
             }
         }
     } else {
@@ -3167,11 +3172,15 @@ async fn spawn_harness_child_task(
     // id yet: the task starts pending and adopts the id the worker's first
     // event carries. A resume names the session the worker continues.
     let args: providers::ProviderLaunch = args.into();
-    let session_id = if args
+    let fresh_codex = args
         .codex
         .as_ref()
-        .is_some_and(|config| config.resume.is_none())
-    {
+        .is_some_and(|config| config.resume.is_none());
+    let fresh_agy = args
+        .agy
+        .as_ref()
+        .is_some_and(|config| config.resume.is_none());
+    let session_id = if fresh_codex || fresh_agy {
         "pending".to_string()
     } else {
         session_id
@@ -3434,6 +3443,11 @@ fn prepare_harness_child_launch(
         provider.lane() != ProviderLane::Codex || codex.is_some(),
         "Codex requires typed app-server settings"
     );
+    let mut agy = launch.agy;
+    anyhow::ensure!(
+        provider.lane() != ProviderLane::Agy || agy.is_some(),
+        "agy requires typed session settings"
+    );
     let initial_prompt = launch
         .prompt
         .or_else(|| take_cli_value_arg(&mut args, "-p"))
@@ -3441,7 +3455,7 @@ fn prepare_harness_child_launch(
         .ok_or_else(|| anyhow::anyhow!("harness child launch requires an initial prompt"))?;
 
     let lane = provider.lane();
-    if lane != ProviderLane::Codex {
+    if lane == ProviderLane::ClaudeCli {
         set_cli_value_arg(&mut args, "--input-format", "stream-json".to_string());
         ensure_cli_flag(&mut args, "--replay-user-messages");
     }
@@ -3452,10 +3466,10 @@ fn prepare_harness_child_launch(
     match lane {
         ProviderLane::Retired | ProviderLane::Workflow => anyhow::bail!("provider is retired"),
         // The claude CLI's shell children inherit the process env, as do the
-        // codex app-server's, so the non-secret project
+        // codex app-server's and the agy server's, so the non-secret project
         // build env rides the child env directly. The harness-only tool
         // defaults have no vendor CLI equivalent.
-        ProviderLane::ClaudeCli | ProviderLane::Codex => {
+        ProviderLane::ClaudeCli | ProviderLane::Codex | ProviderLane::Agy => {
             if let Some(shell_env) = shell_env {
                 shell_env_for_process = shell_env;
             }
@@ -3514,6 +3528,33 @@ fn prepare_harness_child_launch(
                 "Codex does not accept CLI dispatch arguments"
             );
             args = vec!["app-server".to_string()];
+        }
+        // The session's MCP servers ride its typed settings; the adapter
+        // attaches them to this session only. The server also loads the
+        // executing user's own agy configuration, and keeps its definition
+        // of a server whose name a dispatch server shares.
+        ProviderLane::Agy => {
+            let config = agy.as_mut().expect("typed agy invocation");
+            let mut servers: serde_json::Map<String, Value> =
+                std::mem::take(&mut config.mcp_servers)
+                    .into_iter()
+                    .collect();
+            add_transient_blackbox_mcp_server(
+                &mut servers,
+                self_mcp_url,
+                workspace_binding.is_some(),
+                worker_mcp_bearer().is_some(),
+            );
+            config.mcp_servers = servers.into_iter().collect();
+            bro_worker::agy::validate(config)?;
+            anyhow::ensure!(
+                args.is_empty(),
+                "agy does not accept CLI dispatch arguments"
+            );
+            args = bro_worker::agy::SERVER_ARGS
+                .iter()
+                .map(|arg| (*arg).to_string())
+                .collect();
         }
         ProviderLane::ClaudeCli => {
             let config =
@@ -3613,6 +3654,7 @@ fn prepare_harness_child_launch(
         // that owns its stdout writes it at the pinned path.
         supervisor_writes_event_log: providers::supervisor_writes_event_log(lane),
         codex,
+        agy,
     })
 }
 
@@ -6025,30 +6067,39 @@ mod tests {
     }
 
     #[test]
-    fn apply_session_command_maps_protocol_variants_to_codex_controls() {
+    fn apply_session_command_maps_protocol_variants_to_adapter_controls() {
         use bro_protocol::SessionCommand;
 
-        let task_id = "test-session-command-mapping-codex";
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        register_test_control(task_id, tx, ProviderLane::Codex);
+        for (task_id, lane) in [
+            ("test-session-command-mapping-codex", ProviderLane::Codex),
+            ("test-session-command-mapping-agy", ProviderLane::Agy),
+        ] {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            register_test_control(task_id, tx, lane);
 
-        apply_session_command(task_id, SessionCommand::UserTurn { text: "hi".into() }).unwrap();
-        assert_eq!(rx.try_recv().unwrap()["command"]["text"], "hi");
+            apply_session_command(task_id, SessionCommand::UserTurn { text: "hi".into() }).unwrap();
+            assert_eq!(rx.try_recv().unwrap()["command"]["text"], "hi");
 
-        // The adapter receives typed session commands.
-        apply_session_command(task_id, SessionCommand::SetModel { model: "m2".into() }).unwrap();
-        let set_model = rx.try_recv().unwrap();
-        assert_eq!(set_model["command"]["type"], "set_model");
-        assert_eq!(set_model["command"]["model"], "m2");
+            // The adapter receives typed session commands.
+            apply_session_command(task_id, SessionCommand::SetModel { model: "m2".into() })
+                .unwrap();
+            let set_model = rx.try_recv().unwrap();
+            assert_eq!(set_model["command"]["type"], "set_model");
+            assert_eq!(set_model["command"]["model"], "m2");
+            assert!(set_model["request_id"].is_string());
 
-        interrupt_harness_task(task_id, Some("go left".into())).unwrap();
-        let interrupt = rx.try_recv().unwrap();
-        assert_eq!(interrupt["command"]["type"], "interrupt");
-        assert!(interrupt["command"].get("prompt").is_none());
-        let redirect = rx.try_recv().unwrap();
-        assert_eq!(redirect["command"]["text"], "go left");
+            apply_session_command(task_id, SessionCommand::Compact).unwrap();
+            assert_eq!(rx.try_recv().unwrap()["command"]["type"], "compact");
 
-        harness_controls().write().remove(task_id);
+            interrupt_harness_task(task_id, Some("go left".into())).unwrap();
+            let interrupt = rx.try_recv().unwrap();
+            assert_eq!(interrupt["command"]["type"], "interrupt");
+            assert!(interrupt["command"].get("prompt").is_none());
+            let redirect = rx.try_recv().unwrap();
+            assert_eq!(redirect["command"]["text"], "go left");
+
+            harness_controls().write().remove(task_id);
+        }
     }
 
     #[test]
@@ -6083,6 +6134,77 @@ mod tests {
         assert!(codex.model.is_some());
         assert!(codex.disabled_skills.is_empty());
         assert!(spec.supervisor_writes_event_log);
+    }
+
+    #[test]
+    fn agy_launch_starts_the_acp_server_with_typed_session_settings() {
+        let mut env = crate::util::TestEnvGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        env.set(
+            "BLACKBOX_CONFIG",
+            root.join("missing.toml").to_str().unwrap(),
+        );
+        env.set("AGY_BIN", "/opt/bin/agy");
+        let launch = Provider::Agy.build_exec_args("initial turn", None, "pending", None, None);
+        let spec = prepare_harness_child_launch(
+            "task-agy".into(),
+            "pending".into(),
+            Provider::Agy,
+            launch,
+            root.to_str(),
+            None,
+            None,
+            &root,
+            Some("http://example.test/mcp"),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(spec.argv, ["acp", "--dangerously-skip-permissions"]);
+        assert_eq!(spec.bin_override.as_deref(), Some("/opt/bin/agy"));
+        // The supervision key stands in until the server assigns a session.
+        assert_eq!(spec.session_id, "task-agy");
+        assert_eq!(spec.initial_messages[0]["command"]["type"], "user_turn");
+        assert_eq!(spec.initial_messages[0]["command"]["text"], "initial turn");
+        assert!(spec.supervisor_writes_event_log);
+        assert!(spec.codex.is_none());
+        let agy = spec.agy.unwrap();
+        assert_eq!(agy.model.as_deref(), Some("gemini-4-neon"));
+        assert_eq!(agy.effort.as_deref(), Some("high"));
+        // The daemon's own MCP endpoint rides the session, not argv.
+        let server = &agy.mcp_servers[&crate::util::blackbox_mcp_name()];
+        assert_eq!(server["type"], "http");
+        assert_eq!(server["url"], "http://example.test/mcp");
+
+        // A filter the lane cannot enforce refuses the launch.
+        let mut restricted =
+            Provider::Agy.build_exec_args("initial turn", None, "pending", None, None);
+        restricted.apply_filters(
+            Provider::Agy,
+            &mcp::McpFilters {
+                allow: Vec::new(),
+                disallow: vec!["mcp__blackbox__bro_exec".into()],
+            },
+        );
+        let refused = prepare_harness_child_launch(
+            "task-agy".into(),
+            "pending".into(),
+            Provider::Agy,
+            restricted,
+            root.to_str(),
+            None,
+            None,
+            &root,
+            Some("http://example.test/mcp"),
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            refused.to_string().contains("cannot enforce tool"),
+            "{refused}"
+        );
     }
 
     #[test]

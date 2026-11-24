@@ -18,9 +18,9 @@ in `context`, rather than encoding configuration in the `lens` prose.
 | `explicit_only` | Request operator-supplied material only; refuse when unsupported. |
 
 The current Claude CLI dispatch lane supports suppression. The Codex
-app-server lane does not: `strict_suppress` and `explicit_only` fail with
-`error.provider_defaults_unsupported`. Best effort on Codex does not establish
-that its defaults were suppressed. Inspect `bro_providers` for available
+app-server and agy lanes do not: `strict_suppress` and `explicit_only` fail with
+`error.provider_defaults_unsupported`. Best effort on those lanes does not
+establish that their defaults were suppressed. Inspect `bro_providers` for available
 provider identities rather than copying a historical provider/model list.
 
 Keep MCP/tool and account configuration intact. A provider's bare mode is not
