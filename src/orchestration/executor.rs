@@ -426,8 +426,11 @@ impl WorkerExecutor for LocalExecutor {
         // publish the outcome. Same ordering the inline waiter enforced so a
         // fast fatal exit cannot race the stderr snapshot empty.
         let (outcome_tx, outcome_rx) = oneshot::channel::<WorkerOutcome>();
+        let task_id = spec.task_id.clone();
         tokio::spawn(async move {
-            let (exit_code, adapter_error) = if let Some(adapter) = adapter {
+            // The adapter's text is the failure on a nonzero exit. On a zero
+            // exit it notes that a finished session's worker had to be killed.
+            let (exit_code, adapter_note) = if let Some(adapter) = adapter {
                 bro_worker::wait_for_child(child, adapter, provider.as_str()).await
             } else {
                 (
@@ -435,11 +438,14 @@ impl WorkerExecutor for LocalExecutor {
                     String::new(),
                 )
             };
+            if exit_code == Some(0) && !adapter_note.is_empty() {
+                tracing::warn!(task_id = %task_id, "{adapter_note}");
+            }
             let _ = stdout_done_rx.await;
             let stderr = format!(
                 "{}{}",
                 stderr_done_rx.await.unwrap_or_default(),
-                adapter_error
+                adapter_note
             );
 
             let _ = outcome_tx.send(WorkerOutcome { exit_code, stderr });

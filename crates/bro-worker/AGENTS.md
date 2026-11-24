@@ -18,6 +18,12 @@ Drain session updates before reading a prompt answer, so a turn's last updates
 precede its result. Resolve worker-variable references in MCP definitions in
 the adapter, never into argv or a log.
 
+A session's outcome is settled when its adapter returns, which is after the
+last turn's result is durable. A worker process that then outlives the exit
+bound is killed and noted on stderr with the child processes it still had,
+and the session keeps its successful exit code. Only an adapter failure or
+the worker's own exit code makes a session fail.
+
 Open and validate durable logs before spawning. Refuse damaged tails and propagate
 persistence errors to supervision so the worker stops. Persist durable events
 with sequence numbers before relaying them. Preserve the

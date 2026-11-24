@@ -401,8 +401,11 @@ pub async fn spawn_worker(spec: WorkerSpawnSpec) -> anyhow::Result<WorkerChild> 
     // Waiter: exit, then join stdout, then join stderr, then publish. Same
     // ordering LocalExecutor enforces.
     let (outcome_tx, outcome_rx) = oneshot::channel::<WorkerOutcome>();
+    let session_id = spec.session_id.clone();
     tokio::spawn(async move {
-        let (exit_code, adapter_error) = if let Some(adapter) = adapter {
+        // The adapter's text is the failure on a nonzero exit. On a zero exit
+        // it notes that a finished session's worker had to be killed.
+        let (exit_code, adapter_note) = if let Some(adapter) = adapter {
             bro_worker::wait_for_child(child, adapter, spec.provider.as_str()).await
         } else {
             (
@@ -410,11 +413,14 @@ pub async fn spawn_worker(spec: WorkerSpawnSpec) -> anyhow::Result<WorkerChild> 
                 String::new(),
             )
         };
+        if exit_code == Some(0) && !adapter_note.is_empty() {
+            tracing::warn!(%session_id, "{adapter_note}");
+        }
         let _ = stdout_done_rx.await;
         let stderr_tail = format!(
             "{}{}",
             stderr_done_rx.await.unwrap_or_default(),
-            adapter_error
+            adapter_note
         );
 
         let _ = outcome_tx.send(WorkerOutcome {

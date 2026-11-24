@@ -8,6 +8,12 @@ out explicitly under `Changed` or `Removed`.
 
 ## Unreleased
 
+- A Codex or agy dispatch whose session ended cleanly is no longer reported
+  `failed` when the provider process is slow to exit. The process is still
+  killed once it outlives the five second exit bound, and the task keeps the
+  status its last result earned. The kill, with the child processes the worker
+  still had, is recorded on the task's stderr and as a warning in the
+  executor's log. Update fleetd on worker hosts to get the change.
 - `agy` (Antigravity) is a dispatch provider on its own lane. Each dispatch
   runs one `agy acp` server on the worker host and `bro-worker` drives it over
   the Agent Client Protocol: session-scoped MCP servers, persona appended to
